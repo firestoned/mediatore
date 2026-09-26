@@ -52,8 +52,10 @@ serde_json     = "1"
 serde_yaml_ng  = "0.10"
 
 # identity + crypto
-jsonwebtoken = "9"
-p256         = "0.13"
+# rust_crypto backend: jsonwebtoken 10+ requires exactly one crypto provider,
+# and the RustCrypto one matches the existing p256/sha2 stack (no aws-lc-sys).
+jsonwebtoken = { version = "11", features = ["rust_crypto"] }
+p256         = "0.14"
 base64       = "0.23"
 sha2         = "0.10"
 hex          = "0.4"
@@ -61,8 +63,8 @@ uuid         = { version = "1", features = ["v4", "serde"] }
 chrono       = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 
 # kubernetes
-kube        = { version = "1", default-features = false, features = ["client", "runtime", "rustls-tls"] }
-k8s-openapi = { version = "0.25", features = ["latest"] }
+kube        = { version = "4", default-features = false, features = ["client", "runtime", "rustls-tls"] }
+k8s-openapi = { version = "0.28", features = ["latest"] }
 
 # errors, logging, cli
 thiserror          = "2"

@@ -12,7 +12,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::{DateTime, Duration, Utc};
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use mediatore_proto::Subject;
-use p256::elliptic_curve::sec1::ToEncodedPoint;
+use p256::elliptic_curve::sec1::ToSec1Point;
 use p256::pkcs8::DecodePrivateKey;
 use serde::Serialize;
 use uuid::Uuid;
@@ -112,7 +112,7 @@ fn public_jwk(private_key_pem: &[u8], kid: &str) -> Result<serde_json::Value, St
         .or_else(|_| p256::SecretKey::from_sec1_pem(pem))
         .map_err(|e| StsError::Jwk(e.to_string()))?;
     let public = secret.public_key();
-    let point = public.to_encoded_point(false);
+    let point = public.to_sec1_point(false);
     let x = point
         .x()
         .ok_or_else(|| StsError::Jwk("point has no x coordinate".into()))?;

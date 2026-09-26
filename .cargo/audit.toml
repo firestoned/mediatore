@@ -1,0 +1,16 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+#
+# cargo-audit configuration (the CI security-scan composite). Accepted
+# advisories are mirrored in deny.toml with the same justification; keep the
+# two in sync.
+
+[advisories]
+ignore = [
+  # Marvin timing side channel in the `rsa` crate; no patched release exists.
+  # Pulled in by jsonwebtoken's rust_crypto backend, but mediatore signs and
+  # verifies ES256 (P-256) exclusively, so the RSA code path is never
+  # exercised. Revisit when RustCrypto/RSA gains a constant-time fix or
+  # jsonwebtoken makes the rsa dependency optional per algorithm.
+  "RUSTSEC-2023-0071",
+]
