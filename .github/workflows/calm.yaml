@@ -1,0 +1,52 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+#
+# Architecture-as-code gate (ADD step 2): the CALM model must validate against
+# the FINOS meta-schema, and the committed Mermaid diagrams must match what the
+# model renders — a diagram that lags the model is a missed ADD step, caught
+# here instead of in review.
+
+name: CALM
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'docs/architecture/**'
+      - 'Makefile'
+      - '.github/workflows/calm.yaml'
+  push:
+    branches:
+      - main
+    paths:
+      - 'docs/architecture/**'
+      - 'Makefile'
+      - '.github/workflows/calm.yaml'
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: 🏛️ Validate + diagram drift
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "20"
+
+      - name: Validate architecture against the meta-schema
+        run: make calm-validate
+
+      - name: Render diagrams
+        run: make calm-diagrams
+
+      - name: Fail on diagram drift
+        run: git diff --exit-code docs/architecture/diagrams

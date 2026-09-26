@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Erick Bourgeois, mediatore
+// SPDX-License-Identifier: Apache-2.0
+
 //! Jail supervision: run the workload until the claim's deadline, restart on crash,
 //! tear everything down at the end.
 

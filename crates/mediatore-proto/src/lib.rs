@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Erick Bourgeois, mediatore
+// SPDX-License-Identifier: Apache-2.0
+
 //! Wire contract between the mediatore server, the in-guest agent (`mediatore-guest`)
 //! and the workload-side CLI (`sandbox-token`).
 //!

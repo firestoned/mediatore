@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Erick Bourgeois, mediatore
+// SPDX-License-Identifier: Apache-2.0
+
 //! Server configuration (`mediatore.yaml`).
 
 use std::path::{Path, PathBuf};

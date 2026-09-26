@@ -1,3 +1,6 @@
+<!-- Copyright (c) 2026 Erick Bourgeois, mediatore -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # mediatore
 
 > **mediatore** (Italian: *broker*, *go-between*; IPA /me.dja.ˈto.re/, "meh-dyah-TOH-reh")
@@ -7,10 +10,10 @@
 > makes sure the two are bound to each other before anything inside the VM can act on that
 > person's behalf.
 
-[![Build](https://github.com/firestoned/mediatore/actions/workflows/ci.yaml/badge.svg?branch=main)](https://github.com/firestoned/mediatore/actions/workflows/ci.yaml)
+[![Build](https://github.com/firestoned/mediatore/actions/workflows/build.yaml/badge.svg?branch=main)](https://github.com/firestoned/mediatore/actions/workflows/build.yaml)
+[![E2E](https://github.com/firestoned/mediatore/actions/workflows/e2e.yaml/badge.svg?branch=main)](https://github.com/firestoned/mediatore/actions/workflows/e2e.yaml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 ![Rust](https://img.shields.io/badge/rust-1.96%2B-orange.svg?logo=rust)
-![Status](https://img.shields.io/badge/status-scaffold-orange.svg)
 
 banlieue schedules VMs and hands them out through `VirtualMachineClaim`s, but deliberately
 carries no credential: a claim records *who* a sandbox is for, and stops there. mediatore is
@@ -44,7 +47,20 @@ crates/
 deploy/                 raw manifests (kustomize), Traefik IngressRoute
 image/                  systemd units + cloud-config fragments baked into the VM image
 docs/adr/               architecture decision records
+docs/architecture/      FINOS CALM model + rendered Mermaid diagrams
+docs/guides/            operational guides (enterprise SPIRE topology, ...)
+docs/security/          threat model (living document, stamped per ADR range)
 ```
+
+## Methodology
+
+mediatore follows the same **Architecture Driven Development** cycle as banlieue —
+`ADR → CALM → TDD → implement → docs → threat model` — with the rules in
+[`.claude/rules/`](.claude/rules/). The architecture is modeled in
+[CALM](docs/architecture/calm/architecture.json) (`make calm-validate`,
+`make calm-diagrams`; CI fails on diagram drift), and every implemented ADR ends with a
+full pass over the [threat model](docs/security/threat-model.md). CI is Makefile-driven:
+each workflow job calls a `make` target that runs identically locally.
 
 ## Status
 

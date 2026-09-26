@@ -1,0 +1,10 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+#
+# CodeQL config consumed by .github/workflows/codeql.yaml. Keeps build
+# output out of the scanning database.
+
+name: "mediatore CodeQL Config"
+
+paths-ignore:
+  - target/**

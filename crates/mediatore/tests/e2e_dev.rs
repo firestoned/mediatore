@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Erick Bourgeois, mediatore
+// SPDX-License-Identifier: Apache-2.0
+
 //! Front-to-back exercise of the dev-mode loop over real HTTP listeners:
 //!
 //! fake `IdP` login → `POST /v1/claims` → dev bind to a registered node → `GET /v1/me` →

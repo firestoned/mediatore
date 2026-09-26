@@ -1,3 +1,6 @@
+<!-- Copyright (c) 2026 Erick Bourgeois, mediatore -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # ADR-0003: Two token backends, chosen per audience
 
 **Status:** Proposed · **Date:** 2026-09-26

@@ -1,0 +1,379 @@
+{
+  "$schema": "https://calm.finos.org/release/1.2/meta/calm.json",
+  "nodes": [
+    {
+      "unique-id": "actor-sandbox-user",
+      "node-type": "actor",
+      "name": "Sandbox User",
+      "description": "Human or orchestrating agent who logs in at the IdP and asks mediatore for a sandbox. Never talks to Kubernetes, SPIRE or the hypervisor directly; the broker is the only front door for delegated sandboxes."
+    },
+    {
+      "unique-id": "ecosystem-idp",
+      "node-type": "ecosystem",
+      "name": "Identity Provider (Entra ID / Dex)",
+      "description": "Upstream OIDC issuer. At work: Entra ID, which also performs On-Behalf-Of exchange. In the homelab: Dex bridging GitHub, login only; mediatore's own STS stands in for delegation (ADR-0003)."
+    },
+    {
+      "unique-id": "system-mediatore",
+      "node-type": "system",
+      "name": "mediatore",
+      "description": "The identity broker: one binary, two listeners (user-facing bearer HTTPS, sandbox-facing SPIFFE mTLS), a claim watcher and a token backend per audience (ADR-0002, ADR-0003)."
+    },
+    {
+      "unique-id": "service-mediatore-user-api",
+      "node-type": "service",
+      "name": "User API (bearer)",
+      "description": "POST/GET/DELETE /v1/claims. Validates the caller's IdP token (issuer, audience, signature via JWKS, group gate) and creates the VirtualMachineClaim with spec.subject taken from the validated token. crates/mediatore-api + mediatore-entra."
+    },
+    {
+      "unique-id": "service-mediatore-sandbox-api",
+      "node-type": "service",
+      "name": "Sandbox API (SPIFFE mTLS)",
+      "description": "POST /v1/nodes, GET /v1/me, POST /v1/token. Authenticates peers by SPIFFE ID: node identities may register and fetch their subject, claim identities may request audience-scoped tokens. crates/mediatore-api."
+    },
+    {
+      "unique-id": "service-mediatore-watcher",
+      "node-type": "service",
+      "name": "Claim Watcher",
+      "description": "Watches VirtualMachineClaim: on Bound resolves the node by DMI UUID / EK hash and creates the claim's SPIRE registration entry; on Releasing/Failed/deletion deletes the entry and revokes the store row (entry first, then refresh material). crates/mediatore-claims."
+    },
+    {
+      "unique-id": "service-mediatore-sts",
+      "node-type": "service",
+      "name": "STS",
+      "description": "Self-issued ES256 tokens with an RFC 8693 act claim naming the claim SVID as actor; JWKS derived from the signing key and served at /.well-known/jwks.json. Used for audiences whose backend is `sts` (ADR-0003). crates/mediatore-sts."
+    },
+    {
+      "unique-id": "data-asset-claim-store",
+      "node-type": "data-asset",
+      "name": "Claim Store",
+      "description": "Per-claim rows: subject, audiences, SPIRE entry id, node id, encrypted refresh material, revocation timestamp. In-memory in dev; PostgreSQL/SQLite via sqlx next. Refresh material is ciphertext only (OpenBao transit / age). crates/mediatore-store."
+    },
+    {
+      "unique-id": "data-asset-sts-signing-key",
+      "node-type": "data-asset",
+      "name": "STS Signing Key",
+      "description": "EC P-256 private key the STS signs with. File-based in the homelab, OpenBao transit at work. Whoever holds it can mint tokens for any configured audience: guarded asset (threat model TB-1)."
+    },
+    {
+      "unique-id": "service-kubernetes-api",
+      "node-type": "service",
+      "name": "Kubernetes API Server",
+      "description": "Management-cluster API server. mediatore creates and watches VirtualMachineClaim through it; the banlieue-claim-subject-policy VAP enforces caller-equals-subject except for allowlisted brokers."
+    },
+    {
+      "unique-id": "system-banlieue",
+      "node-type": "system",
+      "name": "banlieue Control Plane",
+      "description": "Schedules pool members and binds VirtualMachineClaims to Ready VMs. mediatore consumes its CRDs (banlieue-api types) and never bypasses it; the Kubernetes API is the only interface between the two (banlieue non-negotiable #1, mediatore ADR-0002)."
+    },
+    {
+      "unique-id": "service-spire-server",
+      "node-type": "service",
+      "name": "SPIRE Server (downstream)",
+      "description": "The environment-scoped SPIRE server: holds the TPM attestor, the EK trust bundle and the k8s_psat config for this cluster, and issues node identities and workload SVIDs. mediatore is an admin identity here only, creating exactly two entry kinds: /banlieue/node/<ek-hash> and /banlieue/claim/<uid> (ADR-0004). In the enterprise topology it chains to the root via an intermediate CA; in the homelab it is the whole tree (ADR-0005)."
+    },
+    {
+      "unique-id": "service-spire-root",
+      "node-type": "service",
+      "name": "SPIRE Root Server (desired state)",
+      "description": "Root of the trust domain on the dedicated identity cluster: HA, PostgreSQL-backed, CA keyed through an UpstreamAuthority plugin against an HSM / KMS / corporate PKI. Issues intermediate CAs to downstream servers only; no agent or workload talks to it directly. Elided in the homelab collapse (ADR-0005)."
+    },
+    {
+      "unique-id": "network-identity-cluster",
+      "node-type": "network",
+      "name": "Identity Cluster (desired state)",
+      "description": "Dedicated cluster (auth.example.com style) owned by the identity/security team, with its own change control. Hosts only the SPIRE root and its datastore; sandbox-cluster administrators have no access here (ADR-0005)."
+    },
+    {
+      "unique-id": "network-management-cluster",
+      "node-type": "network",
+      "name": "Management Cluster",
+      "description": "The banlieue management cluster: runs mediatore, the downstream SPIRE server, the Kubernetes API and the banlieue controllers. In the homelab this is the single banlieue cluster and the downstream server is the only SPIRE server."
+    },
+    {
+      "unique-id": "system-sandbox-vm",
+      "node-type": "system",
+      "name": "Sandbox VM (pool member)",
+      "description": "A banlieue pool member with a fresh vTPM, attested at boot before any claim exists. Carries the SPIRE agent, the in-guest agent and, once bound, the jailed workload."
+    },
+    {
+      "unique-id": "service-spire-agent",
+      "node-type": "service",
+      "name": "SPIRE Agent (in guest)",
+      "description": "Attests the node with the vTPM EK certificate and serves the Workload API socket, the only credential surface inside the jail."
+    },
+    {
+      "unique-id": "service-guest-agent",
+      "node-type": "service",
+      "name": "mediatore-guest",
+      "description": "Root daemon: registers the node (EK hash + DMI UUID), polls GET /v1/me for a bound claim, creates the per-subject user (sb- + 12 hex, ADR-0004), builds /mnt/sandbox and supervises the nsjail until the deadline, then tears down. crates/mediatore-guest."
+    },
+    {
+      "unique-id": "service-sandbox-workload",
+      "node-type": "service",
+      "name": "Jailed Workload",
+      "description": "Runs under nsjail as the per-subject user with only the Workload API socket mounted in. Fetches its claim SVID and trades it at POST /v1/token for one short-lived, audience-scoped token at a time (sandbox-token CLI). No token ever rests on disk."
+    },
+    {
+      "unique-id": "ecosystem-downstream-api",
+      "node-type": "ecosystem",
+      "name": "Downstream APIs",
+      "description": "Services the sandbox may call on the user's behalf: Entra-protected APIs (OBO tokens) or JWKS-validating services (STS tokens with the act claim). Each validates audience and can audit 'broker on behalf of user'."
+    },
+    {
+      "unique-id": "network-sandbox-segment",
+      "node-type": "network",
+      "name": "Sandbox Network Segment",
+      "description": "Pool members' network. Egress only: SPIRE server (TCP 8081), mediatore's sandbox listener (TCP 443) and the allowed downstream APIs. Nothing inbound to the VM; Kube API and SPIRE server are unreachable from inside the jail."
+    }
+  ],
+  "relationships": [
+    {
+      "unique-id": "rel-mediatore-composition",
+      "description": "The mediatore system is one binary composed of the two API surfaces, the claim watcher and the STS; the claim store and the STS signing key are the state it guards.",
+      "relationship-type": {
+        "composed-of": {
+          "container": "system-mediatore",
+          "nodes": [
+            "service-mediatore-user-api",
+            "service-mediatore-sandbox-api",
+            "service-mediatore-watcher",
+            "service-mediatore-sts",
+            "data-asset-claim-store",
+            "data-asset-sts-signing-key"
+          ]
+        }
+      }
+    },
+    {
+      "unique-id": "rel-sandbox-vm-composition",
+      "description": "Everything identity-bearing on a pool member: the SPIRE agent (node identity), the in-guest agent (subject plumbing) and the jailed workload (claim identity).",
+      "relationship-type": {
+        "composed-of": {
+          "container": "system-sandbox-vm",
+          "nodes": ["service-spire-agent", "service-guest-agent", "service-sandbox-workload"]
+        }
+      }
+    },
+    {
+      "unique-id": "rel-vm-deployed-in-segment",
+      "description": "Pool members live on the egress-only sandbox segment.",
+      "relationship-type": {
+        "deployed-in": {
+          "container": "network-sandbox-segment",
+          "nodes": ["system-sandbox-vm"]
+        }
+      }
+    },
+    {
+      "unique-id": "rel-mgmt-cluster-deployment",
+      "description": "Everything control-plane-side shares the management cluster; the SPIRE downstream server is scoped to it so mediatore admin rights and k8s_psat validation stay per-environment.",
+      "relationship-type": {
+        "deployed-in": {
+          "container": "network-management-cluster",
+          "nodes": [
+            "system-mediatore",
+            "service-kubernetes-api",
+            "system-banlieue",
+            "service-spire-server"
+          ]
+        }
+      }
+    },
+    {
+      "unique-id": "rel-identity-cluster-deployment",
+      "description": "The root SPIRE server lives alone on the identity cluster; the root signing key never resides where sandboxes are administered.",
+      "relationship-type": {
+        "deployed-in": {
+          "container": "network-identity-cluster",
+          "nodes": ["service-spire-root"]
+        }
+      }
+    },
+    {
+      "unique-id": "rel-spire-downstream-root",
+      "description": "Nested SPIRE: the downstream server obtains its intermediate CA from the root and chains every SVID it issues to the one trust domain. Revoking the intermediate cuts an entire environment off from above. Absent in the homelab collapse (ADR-0005).",
+      "relationship-type": {
+        "connects": {
+          "source": { "node": "service-spire-server" },
+          "destination": { "node": "service-spire-root" }
+        }
+      },
+      "protocol": "mTLS"
+    },
+    {
+      "unique-id": "rel-user-idp-login",
+      "description": "The user logs in at the IdP (PKCE via mediatore-cli or az login) and receives a token whose audience is mediatore. The user's token is only ever presented to mediatore, never to the VM.",
+      "relationship-type": {
+        "connects": {
+          "source": { "node": "actor-sandbox-user" },
+          "destination": { "node": "ecosystem-idp" }
+        }
+      },
+      "protocol": "HTTPS"
+    },
+    {
+      "unique-id": "rel-user-mediatore-claims",
+      "description": "POST /v1/claims with the IdP bearer token; GET mirrors phase, DELETE releases. Subject equality is enforced on read and delete.",
+      "relationship-type": {
+        "connects": {
+          "source": { "node": "actor-sandbox-user" },
+          "destination": { "node": "service-mediatore-user-api" }
+        }
+      },
+      "protocol": "HTTPS"
+    },
+    {
+      "unique-id": "rel-mediatore-idp",
+      "description": "JWKS discovery and signature validation for incoming tokens; Entra On-Behalf-Of / refresh-token exchange for the entra-obo backend. The user's original token is discarded after the first exchange.",
+      "relationship-type": {
+        "connects": {
+          "source": { "node": "service-mediatore-user-api" },
+          "destination": { "node": "ecosystem-idp" }
+        }
+      },
+      "protocol": "HTTPS"
+    },
+    {
+      "unique-id": "rel-mediatore-kube-api",
+      "description": "Creates the VirtualMachineClaim with spec.subject from the validated token. The mediatore ServiceAccount is in the VAP brokers allowlist, so admission skips the caller-equals-subject check for it.",
+      "relationship-type": {
+        "connects": {
+          "source": { "node": "service-mediatore-user-api" },
+          "destination": { "node": "service-kubernetes-api" }
+        }
+      },
+      "protocol": "HTTPS"
+    },
+    {
+      "unique-id": "rel-watcher-kube-api",
+      "description": "Watches VirtualMachineClaim for Bound / Releasing / Failed / deletion.",
+      "relationship-type": {
+        "connects": {
+          "source": { "node": "service-mediatore-watcher" },
+          "destination": { "node": "service-kubernetes-api" }
+        }
+      },
+      "protocol": "HTTPS"
+    },
+    {
+      "unique-id": "rel-banlieue-kube-api",
+      "description": "banlieue's claim controller binds Ready pool members to claims and destroys members on release; mediatore only observes the results. CRDs are the entire interface.",
+      "relationship-type": {
+        "connects": {
+          "source": { "node": "system-banlieue" },
+          "destination": { "node": "service-kubernetes-api" }
+        }
+      },
+      "protocol": "HTTPS"
+    },
+    {
+      "unique-id": "rel-watcher-spire",
+      "description": "Creates the claim entry (parent = the bound VM's agent ID, selector unix:user:sb-<hash>) on Bound; deletes it on release. Admin identity over the SPIRE server API, gRPC via spire-api-sdk.",
+      "relationship-type": {
+        "connects": {
+          "source": { "node": "service-mediatore-watcher" },
+          "destination": { "node": "service-spire-server" }
+        }
+      },
+      "protocol": "mTLS"
+    },
+    {
+      "unique-id": "rel-spire-agent-server",
+      "description": "TPM node attestation at boot (EK certificate + credential activation), then SVID rotation. Claim-independent: a warm member is attested before any claim exists.",
+      "relationship-type": {
+        "connects": {
+          "source": { "node": "service-spire-agent" },
+          "destination": { "node": "service-spire-server" }
+        }
+      },
+      "protocol": "TLS"
+    },
+    {
+      "unique-id": "rel-guest-agent-mediatore",
+      "description": "POST /v1/nodes (EK hash + DMI UUID + hostname) over the node SVID at boot; then polls GET /v1/me until a claim is bound and the subject comes back.",
+      "relationship-type": {
+        "connects": {
+          "source": { "node": "service-guest-agent" },
+          "destination": { "node": "service-mediatore-sandbox-api" }
+        }
+      },
+      "protocol": "mTLS"
+    },
+    {
+      "unique-id": "rel-workload-mediatore",
+      "description": "POST /v1/token over the claim SVID: one audience per request, from the claim's allowlist, capped at 15 minutes, never a refresh token.",
+      "relationship-type": {
+        "connects": {
+          "source": { "node": "service-sandbox-workload" },
+          "destination": { "node": "service-mediatore-sandbox-api" }
+        }
+      },
+      "protocol": "mTLS"
+    },
+    {
+      "unique-id": "rel-workload-downstream",
+      "description": "The sandbox calls a downstream API with the audience-scoped token; the API's audit log records both the user and the broker (azp / act).",
+      "relationship-type": {
+        "connects": {
+          "source": { "node": "service-sandbox-workload" },
+          "destination": { "node": "ecosystem-downstream-api" }
+        }
+      },
+      "protocol": "HTTPS"
+    },
+    {
+      "unique-id": "rel-user-claim-data",
+      "description": "The subject a claim is issued for; the user only ever sees their own claims.",
+      "relationship-type": {
+        "interacts": {
+          "actor": "actor-sandbox-user",
+          "nodes": ["data-asset-claim-store"]
+        }
+      }
+    }
+  ],
+  "flows": [
+    {
+      "unique-id": "flow-claim-to-token",
+      "name": "Claim a sandbox and act as the user",
+      "description": "The happy path from login to a delegated downstream call: login, claim, bind, subject fetch, jail, token.",
+      "transitions": [
+        { "sequence-number": 1, "relationship-unique-id": "rel-user-idp-login", "description": "User logs in; receives a token with aud = mediatore." },
+        { "sequence-number": 2, "relationship-unique-id": "rel-user-mediatore-claims", "description": "POST /v1/claims; mediatore validates the token and derives the subject." },
+        { "sequence-number": 3, "relationship-unique-id": "rel-mediatore-kube-api", "description": "mediatore creates the VirtualMachineClaim with spec.subject." },
+        { "sequence-number": 4, "relationship-unique-id": "rel-banlieue-kube-api", "description": "banlieue binds a Ready, already-attested pool member." },
+        { "sequence-number": 5, "relationship-unique-id": "rel-watcher-spire", "description": "The watcher creates the claim's registration entry under the bound node's agent ID." },
+        { "sequence-number": 6, "relationship-unique-id": "rel-guest-agent-mediatore", "description": "The in-guest agent fetches the subject, creates the sb- user and starts the jail." },
+        { "sequence-number": 7, "relationship-unique-id": "rel-workload-mediatore", "description": "The workload trades its claim SVID for a short-lived, audience-scoped token." },
+        { "sequence-number": 8, "relationship-unique-id": "rel-workload-downstream", "description": "The workload calls the downstream API on the user's behalf." }
+      ]
+    },
+    {
+      "unique-id": "flow-release-cutoff",
+      "name": "Release and cut-off",
+      "description": "Any of four independent cut-offs stops the sandbox acting as the user; this is the ordered normal release.",
+      "transitions": [
+        { "sequence-number": 1, "relationship-unique-id": "rel-user-mediatore-claims", "description": "DELETE /v1/claims (or the TTL fires). The store row is revoked: /v1/token refuses immediately." },
+        { "sequence-number": 2, "relationship-unique-id": "rel-watcher-spire", "description": "The SPIRE entry is deleted; the workload's SVID stops within the agent sync interval." },
+        { "sequence-number": 3, "relationship-unique-id": "rel-mediatore-kube-api", "description": "The VirtualMachineClaim is deleted (or its deletion observed)." },
+        { "sequence-number": 4, "relationship-unique-id": "rel-banlieue-kube-api", "description": "banlieue destroys the member, vTPM included; the guest agent tears down the jail and user regardless." }
+      ]
+    }
+  ],
+  "metadata": {
+    "project": "mediatore — identity broker for banlieue sandbox VMs",
+    "repository": "https://github.com/firestoned/mediatore",
+    "license": "Apache-2.0",
+    "calm-schema-version": "1.2",
+    "phase": "dev-mode loop implemented and e2e-tested; mTLS, SPIRE gRPC, Entra OBO, sqlx store and the claim watch are fail-closed stubs. SPIRE topology models the ADR-0005 desired state: root on a dedicated identity cluster, downstream per environment; the homelab collapses to the downstream server alone"
+  },
+  "adrs": [
+    "docs/adr/0001-record-architecture-decisions.md",
+    "docs/adr/0002-separate-project-from-banlieue.md",
+    "docs/adr/0003-token-backends.md",
+    "docs/adr/0004-spiffe-identity-scheme.md",
+    "docs/adr/0005-spire-topology.md"
+  ]
+}

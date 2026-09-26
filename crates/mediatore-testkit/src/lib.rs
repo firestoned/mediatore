@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Erick Bourgeois, mediatore
+// SPDX-License-Identifier: Apache-2.0
+
 //! Test-only helpers. Never a dependency of a shipped binary.
 //!
 //! [`FakeIdp`] plays the part of Dex or Entra in tests: it serves OIDC discovery and a JWKS

@@ -1,0 +1,53 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+#
+# End-to-end verification of the dev-mode loop with real binaries over real
+# HTTP listeners: fake IdP login -> POST /v1/claims -> bind to a registered
+# node -> GET /v1/me (mediatore-guest) -> POST /v1/token (sandbox-token) ->
+# STS JWT verified against mediatore's own JWKS -> release -> cut-off.
+#
+# What this proves beyond `cargo test`: the four shipped binaries agree on the
+# wire contract when started as separate processes, config files parse, ports
+# bind, and the demo a human runs (`make e2e`) is the same thing CI runs.
+#
+# When the SPIRE/mTLS tier lands, a second job here gets a real SPIRE server
+# (the runbook's Part 3 acceptance) — same Makefile-driven shape.
+
+name: E2E
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+  # Reusable: callable from a release pipeline or dependabot-auto-merge.
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  dev-loop:
+    name: 🧪 Dev-mode loop (front to back)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable (moving ref — re-pin quarterly)
+
+      - name: Cache cargo dependencies
+        uses: firestoned/github-actions/rust/cache-cargo@d0d51c638a90bffc2a1567fe7af112b37fe8854c # v1.3.7
+
+      # jq ships on ubuntu-latest runners; the target fails loudly if missing.
+      - name: Run the front-to-back loop
+        run: make e2e

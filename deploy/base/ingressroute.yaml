@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+
 # User-facing endpoint only. The sandbox listener is reached by VMs directly (mTLS), never via ingress.
 apiVersion: traefik.io/v1alpha1
 kind: IngressRoute
@@ -6,7 +9,7 @@ metadata:
 spec:
   entryPoints: [websecure]
   routes:
-    - match: Host(`mediatore.sandbox.rbc.internal`)
+    - match: Host(`mediatore.sandbox.example`)
       kind: Rule
       services:
         - { name: mediatore, port: user }

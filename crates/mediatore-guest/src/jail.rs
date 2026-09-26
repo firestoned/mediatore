@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Erick Bourgeois, mediatore
+// SPDX-License-Identifier: Apache-2.0
+
 //! nsjail configuration for the workload.
 
 use std::path::{Path, PathBuf};

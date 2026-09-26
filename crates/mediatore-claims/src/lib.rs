@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Erick Bourgeois, mediatore
+// SPDX-License-Identifier: Apache-2.0
+
 //! Claim lifecycle: watch banlieue `VirtualMachineClaim`s and react.
 //!
 //! On `Bound`: resolve the bound VM's `providerID` to a registered node (by DMI UUID),
