@@ -35,39 +35,47 @@ pub enum Action {
 #[must_use]
 pub fn next_action(phase: Option<ClaimPhase>, has_entry: bool, deleting: bool) -> Action {
     match (phase, has_entry, deleting) {
-        (_, true, true) => Action::Release,
-        (Some(ClaimPhase::Releasing | ClaimPhase::Failed), true, _) => Action::Release,
+        (_, true, true) | (Some(ClaimPhase::Releasing | ClaimPhase::Failed), true, _) => {
+            Action::Release
+        }
         (Some(ClaimPhase::Bound), false, false) => Action::Bind,
         _ => Action::Hold,
     }
 }
 
 /// Wiring the watcher needs.
-pub struct Reconciler<S: ClaimStore, E: EntryManager> {
+pub struct Reconciler {
     /// Persistence.
-    pub store: Arc<S>,
+    pub store: Arc<dyn ClaimStore>,
     /// SPIRE entries.
-    pub spire: Arc<E>,
+    pub spire: Arc<dyn EntryManager>,
     /// SPIFFE naming.
     pub naming: Naming,
 }
 
-impl<S: ClaimStore, E: EntryManager> Reconciler<S, E> {
-    /// Handle a bind: create the entry for `claim_uid` under `node_id`.
+impl Reconciler {
+    /// Handle a bind: create the entry for `claim_uid` under the node's SPIRE agent ID,
+    /// and start the claim's TTL clock.
     pub async fn bind(&self, claim_uid: Uuid, node_id: &str) -> anyhow::Result<()> {
         let mut rec = self.store.get_claim(claim_uid).await?;
         if rec.entry_id.is_some() {
             return Ok(()); // idempotent on restart
         }
-        let claim_id = self.naming.claim_id(claim_uid);
+        let spiffe_id = self.naming.claim_id(claim_uid);
         let user = rec.subject.sandbox_username();
-        let entry_id = match self.spire.create_claim_entry(node_id, &claim_id, &user).await {
-            Ok(id) => id,
-            Err(mediatore_spire::SpireError::Exists(id)) => id,
+        let entry_id = match self
+            .spire
+            .create_claim_entry(node_id, &spiffe_id, &user)
+            .await
+        {
+            Ok(id) | Err(mediatore_spire::SpireError::Exists(id)) => id,
             Err(e) => return Err(e.into()),
         };
         rec.entry_id = Some(entry_id);
         rec.node_id = Some(node_id.to_owned());
+        rec.expires_at.get_or_insert_with(|| {
+            Utc::now() + chrono::Duration::seconds(i64::from(rec.ttl_seconds))
+        });
         self.store.update_claim(rec).await?;
         tracing::info!(%claim_uid, node_id, "claim bound: SPIRE entry created");
         Ok(())
@@ -91,7 +99,7 @@ impl<S: ClaimStore, E: EntryManager> Reconciler<S, E> {
 
 /// Connect to the cluster. The typed watch on `VirtualMachineClaim` is added once
 /// `banlieue-api` is pinned; for now this proves the client wiring and returns.
-pub async fn run<S: ClaimStore, E: EntryManager>(_r: Reconciler<S, E>) -> anyhow::Result<()> {
+pub async fn run(_r: Reconciler) -> anyhow::Result<()> {
     let client = kube::Client::try_default().await?;
     let version = client.apiserver_version().await?;
     tracing::info!(git = %version.git_version, "connected to the API server; claim watcher not wired yet");
@@ -104,11 +112,26 @@ mod tests {
 
     #[test]
     fn precedence() {
-        assert_eq!(next_action(Some(ClaimPhase::Bound), false, false), Action::Bind);
-        assert_eq!(next_action(Some(ClaimPhase::Bound), true, false), Action::Hold);
-        assert_eq!(next_action(Some(ClaimPhase::Bound), true, true), Action::Release);
-        assert_eq!(next_action(Some(ClaimPhase::Releasing), true, false), Action::Release);
-        assert_eq!(next_action(Some(ClaimPhase::Failed), false, false), Action::Hold);
+        assert_eq!(
+            next_action(Some(ClaimPhase::Bound), false, false),
+            Action::Bind
+        );
+        assert_eq!(
+            next_action(Some(ClaimPhase::Bound), true, false),
+            Action::Hold
+        );
+        assert_eq!(
+            next_action(Some(ClaimPhase::Bound), true, true),
+            Action::Release
+        );
+        assert_eq!(
+            next_action(Some(ClaimPhase::Releasing), true, false),
+            Action::Release
+        );
+        assert_eq!(
+            next_action(Some(ClaimPhase::Failed), false, false),
+            Action::Hold
+        );
         assert_eq!(next_action(None, false, false), Action::Hold);
     }
 }

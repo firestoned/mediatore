@@ -28,10 +28,8 @@ pub struct StsConfig {
     pub issuer: String,
     /// Key id written into the JWS header.
     pub kid: String,
-    /// PEM file with the EC P-256 private key.
+    /// PEM file with the EC P-256 private key. The public JWKS is derived from it.
     pub signing_key_file: PathBuf,
-    /// JSON file with the public JWKS.
-    pub jwks_file: PathBuf,
 }
 
 /// Listeners.
@@ -73,7 +71,10 @@ pub struct Config {
 }
 
 fn default_listen() -> ListenConfig {
-    ListenConfig { user: default_user_addr(), sandbox: default_sandbox_addr() }
+    ListenConfig {
+        user: default_user_addr(),
+        sandbox: default_sandbox_addr(),
+    }
 }
 
 impl Config {

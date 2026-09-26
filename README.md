@@ -48,20 +48,22 @@ docs/adr/               architecture decision records
 
 ## Status
 
-Scaffold. The crate boundaries, wire types, state machine and configuration shape are the
-design; the network edges are stubs that fail closed (`501 not_implemented`):
+The dev-mode loop is implemented and tested front to back: fake IdP login → claim →
+bind → `/v1/me` → `/v1/token` → STS JWT verified against mediatore's own JWKS →
+release → cut-off. The remaining edges fail closed (`501 not_implemented`):
 
 | Piece | State |
 | --- | --- |
-| Wire types, username derivation, STS minting, in-memory store | implemented, unit-tested |
-| HTTP routing, auth extractors, audience checks, token issuance (sts) | implemented in `dev_mode` |
-| JWKS validation of upstream tokens | stub |
+| Wire types, username derivation, STS minting (JWKS derived from the key), in-memory store | implemented, unit-tested |
+| HTTP routing, auth extractors, audience checks, token issuance (sts) | implemented, e2e-tested |
+| JWKS validation of upstream tokens (discovery, cache, kid rotation, group gate) | implemented, tested against a fake IdP |
+| Claim lifecycle in `dev_mode` (create, dev bind either order, mirror, release) | implemented, e2e-tested |
+| Guest: node registration, subject fetch, user + jail supervision | implemented; jail path needs a Linux host |
 | Entra OBO exchange | request shape done, untested |
 | SPIRE entry management over `spire-api-sdk` | trait + `Noop` |
 | `VirtualMachineClaim` watch (needs `banlieue-api` pin) | client wiring only |
 | SPIFFE mTLS on the sandbox listener | stub (dev header) |
 | sqlx store (PostgreSQL / SQLite) | not started |
-| Guest: node registration, subject fetch, jail supervision | identity + jail builder only |
 
 ## Development
 
@@ -69,6 +71,9 @@ design; the network edges are stubs that fail closed (`501 not_implemented`):
 # quality gate
 cargo fmt --all && cargo clippy --all-targets --all-features -- -D warnings && cargo test --all
 cargo deny check
+
+# front-to-back dev-mode demo: fake IdP + server + guest agent + sandbox-token
+./dev/demo.sh
 
 # run the server in dev mode (header-based peer identity, in-memory store)
 openssl ecparam -name prime256v1 -genkey -noout | openssl pkcs8 -topk8 -nocrypt -out dev/sts.pem

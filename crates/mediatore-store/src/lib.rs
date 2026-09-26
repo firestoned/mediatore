@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use mediatore_proto::{Provider, Subject};
+use mediatore_proto::{Provider, Subject, Workload};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use uuid::Uuid;
@@ -43,6 +43,11 @@ pub struct ClaimRecord {
     pub node_id: Option<String>,
     /// Audiences the sandbox may request.
     pub audiences: Vec<String>,
+    /// What the sandbox runs once identity is established.
+    #[serde(default)]
+    pub workload: Workload,
+    /// Requested lifetime; the deadline counts from bind.
+    pub ttl_seconds: u32,
     /// Encrypted refresh material for the token backend. Never plaintext.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refresh_ciphertext: Option<Vec<u8>>,
@@ -94,6 +99,10 @@ pub trait ClaimStore: Send + Sync + 'static {
     async fn update_claim(&self, rec: ClaimRecord) -> Result<(), StoreError>;
     /// Mark revoked; idempotent.
     async fn revoke_claim(&self, uid: Uuid, at: DateTime<Utc>) -> Result<(), StoreError>;
+    /// The live claim bound to a node (by the node's SPIRE agent SPIFFE ID).
+    async fn get_claim_by_node(&self, node_id: &str) -> Result<ClaimRecord, StoreError>;
+    /// All claims.
+    async fn list_claims(&self) -> Result<Vec<ClaimRecord>, StoreError>;
 
     /// Register a node. Fails with `Conflict` if the EK hash is known with a different DMI UUID.
     async fn put_node(&self, rec: NodeRecord) -> Result<(), StoreError>;
@@ -103,6 +112,8 @@ pub trait ClaimStore: Send + Sync + 'static {
     async fn get_node_by_dmi(&self, dmi_uuid: Uuid) -> Result<NodeRecord, StoreError>;
     /// Ban a node.
     async fn ban_node(&self, ek_hash: &str) -> Result<(), StoreError>;
+    /// All registered nodes.
+    async fn list_nodes(&self) -> Result<Vec<NodeRecord>, StoreError>;
 }
 
 /// In-memory store. Not durable; fine for tests and `--dev`.
@@ -161,10 +172,27 @@ impl ClaimStore for MemoryStore {
 
     async fn revoke_claim(&self, uid: Uuid, at: DateTime<Utc>) -> Result<(), StoreError> {
         let mut m = self.claims.write().await;
-        let rec = m.get_mut(&uid).ok_or_else(|| StoreError::NotFound(uid.to_string()))?;
+        let rec = m
+            .get_mut(&uid)
+            .ok_or_else(|| StoreError::NotFound(uid.to_string()))?;
         rec.revoked_at.get_or_insert(at);
         rec.refresh_ciphertext = None;
         Ok(())
+    }
+
+    async fn get_claim_by_node(&self, node_id: &str) -> Result<ClaimRecord, StoreError> {
+        let now = Utc::now();
+        self.claims
+            .read()
+            .await
+            .values()
+            .find(|c| c.node_id.as_deref() == Some(node_id) && c.is_live(now))
+            .cloned()
+            .ok_or_else(|| StoreError::NotFound(node_id.to_owned()))
+    }
+
+    async fn list_claims(&self) -> Result<Vec<ClaimRecord>, StoreError> {
+        Ok(self.claims.read().await.values().cloned().collect())
     }
 
     async fn put_node(&self, rec: NodeRecord) -> Result<(), StoreError> {
@@ -204,9 +232,15 @@ impl ClaimStore for MemoryStore {
 
     async fn ban_node(&self, ek_hash: &str) -> Result<(), StoreError> {
         let mut m = self.nodes.write().await;
-        let n = m.get_mut(ek_hash).ok_or_else(|| StoreError::NotFound(ek_hash.to_string()))?;
+        let n = m
+            .get_mut(ek_hash)
+            .ok_or_else(|| StoreError::NotFound(ek_hash.to_string()))?;
         n.banned = true;
         Ok(())
+    }
+
+    async fn list_nodes(&self) -> Result<Vec<NodeRecord>, StoreError> {
+        Ok(self.nodes.read().await.values().cloned().collect())
     }
 }
 
@@ -234,27 +268,52 @@ mod tests {
         assert!(matches!(err, StoreError::Conflict(_)));
     }
 
-    #[tokio::test]
-    async fn revoke_drops_refresh_material() {
-        let s = MemoryStore::default();
-        let uid = Uuid::new_v4();
-        s.put_claim(ClaimRecord {
+    fn claim(uid: Uuid) -> ClaimRecord {
+        ClaimRecord {
             uid,
-            name: "claim-1".into(),
-            subject: Subject { issuer: "i".into(), id: "u".into(), display: None },
+            name: format!("claim-{uid}"),
+            subject: Subject {
+                issuer: "i".into(),
+                id: "u".into(),
+                display: None,
+            },
             entry_id: None,
             node_id: None,
             audiences: vec![],
+            workload: Workload::default(),
+            ttl_seconds: 3600,
             refresh_ciphertext: Some(vec![1, 2, 3]),
             created_at: Utc::now(),
             expires_at: None,
             revoked_at: None,
-        })
-        .await
-        .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn revoke_drops_refresh_material() {
+        let s = MemoryStore::default();
+        let uid = Uuid::new_v4();
+        s.put_claim(claim(uid)).await.unwrap();
         s.revoke_claim(uid, Utc::now()).await.unwrap();
         let rec = s.get_claim(uid).await.unwrap();
         assert!(rec.refresh_ciphertext.is_none());
         assert!(!rec.is_live(Utc::now()));
+    }
+
+    #[tokio::test]
+    async fn claim_by_node_finds_only_live_claims() {
+        let s = MemoryStore::default();
+        let node = "spiffe://td/spire/agent/tpm/ek1";
+        let uid = Uuid::new_v4();
+        let mut rec = claim(uid);
+        rec.node_id = Some(node.to_owned());
+        s.put_claim(rec).await.unwrap();
+        assert_eq!(s.get_claim_by_node(node).await.unwrap().uid, uid);
+
+        s.revoke_claim(uid, Utc::now()).await.unwrap();
+        assert!(matches!(
+            s.get_claim_by_node(node).await,
+            Err(StoreError::NotFound(_))
+        ));
     }
 }

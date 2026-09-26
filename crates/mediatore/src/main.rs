@@ -16,7 +16,11 @@ use tracing_subscriber::EnvFilter;
 use crate::config::Config;
 
 #[derive(Parser)]
-#[command(name = "mediatore", version, about = "Identity broker for banlieue sandbox VMs")]
+#[command(
+    name = "mediatore",
+    version,
+    about = "Identity broker for banlieue sandbox VMs"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -44,7 +48,9 @@ enum Cmd {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .init();
 
     match Cli::parse().cmd {
@@ -66,9 +72,13 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
     let sts = match &cfg.sts {
         Some(s) => {
             let pem = std::fs::read(&s.signing_key_file)?;
-            let jwks: serde_json::Value = serde_json::from_slice(&std::fs::read(&s.jwks_file)?)?;
             let max = cfg.audiences.iter().map(|a| a.max_ttl).max().unwrap_or(900);
-            Some(Sts::new(&s.issuer, &s.kid, &pem, jwks, chrono::Duration::seconds(max))?)
+            Some(Sts::new(
+                &s.issuer,
+                &s.kid,
+                &pem,
+                chrono::Duration::seconds(max),
+            )?)
         }
         None => None,
     };
@@ -76,7 +86,9 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
     let state = Arc::new(AppState {
         store: MemoryStore::shared(),
         spire: Arc::new(mediatore_spire::Noop),
-        naming: Naming { trust_domain: cfg.trust_domain.clone() },
+        naming: Naming {
+            trust_domain: cfg.trust_domain.clone(),
+        },
         validator: Validator::new(cfg.issuers.clone()),
         sts,
         audiences: cfg.audiences.iter().map(|a| a.name.clone()).collect(),
@@ -87,8 +99,10 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
     let sandbox = tokio::net::TcpListener::bind(&cfg.listen.sandbox).await?;
     tracing::info!(user = %cfg.listen.user, sandbox = %cfg.listen.sandbox, "listening");
 
-    let u = axum::serve(user, mediatore_api::user_router(state.clone())).with_graceful_shutdown(shutdown());
-    let s = axum::serve(sandbox, mediatore_api::sandbox_router(state)).with_graceful_shutdown(shutdown());
+    let u = axum::serve(user, mediatore_api::user_router(state.clone()))
+        .with_graceful_shutdown(shutdown());
+    let s = axum::serve(sandbox, mediatore_api::sandbox_router(state))
+        .with_graceful_shutdown(shutdown());
     tokio::try_join!(u, s)?;
     Ok(())
 }

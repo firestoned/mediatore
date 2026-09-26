@@ -1,6 +1,6 @@
 [package]
-name = "mediatore-sts"
-description = "Self-issued, audience-scoped delegation tokens (RFC 8693 style) for backends without OBO"
+name = "mediatore-testkit"
+description = "Test-only helpers: a fake OIDC issuer for exercising upstream token validation"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,16 +8,19 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[[bin]]
+name = "fake-idp"
+path = "src/bin/fake_idp.rs"
+
 [dependencies]
-mediatore-proto.workspace = true
+axum.workspace = true
+clap.workspace = true
+tokio.workspace = true
 jsonwebtoken.workspace = true
 p256.workspace = true
 base64.workspace = true
-serde.workspace = true
 serde_json.workspace = true
 chrono.workspace = true
-uuid.workspace = true
-thiserror.workspace = true
 
 [lints]
 workspace = true

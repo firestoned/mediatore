@@ -13,7 +13,9 @@ pub fn dmi_uuid() -> anyhow::Result<Uuid> {
 
 /// Hostname from the kernel.
 pub fn hostname() -> anyhow::Result<String> {
-    Ok(std::fs::read_to_string("/proc/sys/kernel/hostname")?.trim().to_owned())
+    Ok(std::fs::read_to_string("/proc/sys/kernel/hostname")?
+        .trim()
+        .to_owned())
 }
 
 /// SHA-256 of the EK public key, computed the same way the SPIRE TPM attestor does.
@@ -32,6 +34,10 @@ pub async fn ek_hash(tpm: &Path) -> anyhow::Result<String> {
         ))
         .output()
         .await?;
-    anyhow::ensure!(out.status.success(), "ek hash: {}", String::from_utf8_lossy(&out.stderr));
+    anyhow::ensure!(
+        out.status.success(),
+        "ek hash: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     Ok(String::from_utf8(out.stdout)?.trim().to_owned())
 }

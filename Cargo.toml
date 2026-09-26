@@ -11,6 +11,7 @@ members = [
   "crates/mediatore",
   "crates/mediatore-guest",
   "crates/sandbox-token",
+  "crates/mediatore-testkit",
 ]
 
 [workspace.package]
@@ -32,6 +33,7 @@ mediatore-sts    = { path = "crates/mediatore-sts" }
 mediatore-spire  = { path = "crates/mediatore-spire" }
 mediatore-claims = { path = "crates/mediatore-claims" }
 mediatore-store  = { path = "crates/mediatore-store" }
+mediatore-testkit = { path = "crates/mediatore-testkit" }
 
 # banlieue CRD types, pinned to a tag once one exists
 # banlieue-api = { git = "https://github.com/firestoned/banlieue", tag = "v0.1.0", package = "banlieue-api" }
@@ -51,6 +53,7 @@ serde_yaml_ng  = "0.10"
 
 # identity + crypto
 jsonwebtoken = "9"
+p256         = "0.13"
 base64       = "0.22"
 sha2         = "0.10"
 hex          = "0.4"

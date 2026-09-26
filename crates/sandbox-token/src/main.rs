@@ -8,7 +8,11 @@ use clap::Parser;
 use mediatore_proto::{TokenRequest, TokenResponse};
 
 #[derive(Parser)]
-#[command(name = "sandbox-token", version, about = "Fetch an audience-scoped token for this sandbox")]
+#[command(
+    name = "sandbox-token",
+    version,
+    about = "Fetch an audience-scoped token for this sandbox"
+)]
 struct Cli {
     /// Downstream audience
     #[arg(long)]
@@ -17,7 +21,11 @@ struct Cli {
     #[arg(long, env = "MEDIATORE_URL")]
     mediatore_url: String,
     /// SPIRE Workload API socket
-    #[arg(long, env = "SPIFFE_ENDPOINT_SOCKET", default_value = "unix:///run/spire/agent.sock")]
+    #[arg(
+        long,
+        env = "SPIFFE_ENDPOINT_SOCKET",
+        default_value = "unix:///run/spire/agent.sock"
+    )]
     workload_api_socket: String,
     /// Dev only: send this SPIFFE ID as a header instead of doing mTLS
     #[arg(long, env = "MEDIATORE_DEV_SPIFFE_ID", hide = true)]
@@ -33,7 +41,9 @@ async fn main() -> anyhow::Result<()> {
     let url = format!("{}/v1/token", cli.mediatore_url.trim_end_matches('/'));
 
     let client = reqwest::Client::builder().build()?;
-    let mut req = client.post(&url).json(&TokenRequest { audience: cli.audience });
+    let mut req = client.post(&url).json(&TokenRequest {
+        audience: cli.audience,
+    });
     if let Some(id) = &cli.dev_spiffe_id {
         req = req.header("x-mediatore-peer-spiffe-id", id);
     } else {
@@ -42,7 +52,11 @@ async fn main() -> anyhow::Result<()> {
     }
     let resp = req.send().await?;
     if !resp.status().is_success() {
-        anyhow::bail!("mediatore: {} {}", resp.status(), resp.text().await.unwrap_or_default());
+        anyhow::bail!(
+            "mediatore: {} {}",
+            resp.status(),
+            resp.text().await.unwrap_or_default()
+        );
     }
     let tok: TokenResponse = resp.json().await?;
     if cli.json {

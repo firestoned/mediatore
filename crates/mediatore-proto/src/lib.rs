@@ -19,7 +19,7 @@ pub const USERNAME_HASH_LEN: usize = 12;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Provider {
-    /// VMware vSphere (vTPM, EK certificate issued by the VMCA).
+    /// `VMware vSphere` (vTPM, EK certificate issued by the VMCA).
     Vsphere,
     /// Cloud Hypervisor with `swtpm` on a socket.
     CloudHypervisor,
@@ -85,7 +85,7 @@ pub struct Workload {
     pub args: Vec<String>,
 }
 
-/// `POST /v1/claims` body, sent by a user or agent with an IdP bearer token.
+/// `POST /v1/claims` body, sent by a user or agent with an `IdP` bearer token.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClaimRequest {
     /// `spec.poolRef` on the banlieue claim.
@@ -197,8 +197,15 @@ mod tests {
 
     #[test]
     fn username_changes_with_issuer() {
-        let mk = |iss: &str| Subject { issuer: iss.into(), id: "octocat".into(), display: None };
-        assert_ne!(mk("https://a").sandbox_username(), mk("https://b").sandbox_username());
+        let mk = |iss: &str| Subject {
+            issuer: iss.into(),
+            id: "octocat".into(),
+            display: None,
+        };
+        assert_ne!(
+            mk("https://a").sandbox_username(),
+            mk("https://b").sandbox_username()
+        );
     }
 
     #[test]
@@ -207,7 +214,10 @@ mod tests {
             pool_ref: "pool-a".into(),
             ttl_seconds: 3600,
             audiences: vec!["grafana.home.example".into()],
-            workload: Workload { image: "registry/sandbox:latest".into(), args: vec![] },
+            workload: Workload {
+                image: "registry/sandbox:latest".into(),
+                args: vec![],
+            },
         };
         let json = serde_json::to_string(&req).unwrap();
         let back: ClaimRequest = serde_json::from_str(&json).unwrap();

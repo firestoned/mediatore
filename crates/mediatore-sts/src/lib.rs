@@ -1,12 +1,16 @@
 //! mediatore as a Security Token Service.
 //!
-//! Used when the upstream IdP cannot delegate (Dex + GitHub in a homelab), and optionally at
+//! Used when the upstream `IdP` cannot delegate (Dex + GitHub in a homelab), and optionally at
 //! work for internal services that validate JWTs against a JWKS. Tokens carry an RFC 8693
 //! `act` claim naming the sandbox (its claim SVID) as the actor and the person as `sub`.
 
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::{DateTime, Duration, Utc};
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use mediatore_proto::Subject;
+use p256::elliptic_curve::sec1::ToEncodedPoint;
+use p256::pkcs8::DecodePrivateKey;
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -16,6 +20,9 @@ pub enum StsError {
     /// The signing key could not be parsed.
     #[error("signing key: {0}")]
     Key(jsonwebtoken::errors::Error),
+    /// The public JWK could not be derived from the signing key.
+    #[error("jwk derivation: {0}")]
+    Jwk(String),
     /// Encoding failed.
     #[error("encode: {0}")]
     Encode(jsonwebtoken::errors::Error),
@@ -88,25 +95,60 @@ pub struct Sts {
 
 impl std::fmt::Debug for Sts {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Sts").field("issuer", &self.issuer).field("kid", &self.kid).finish()
+        f.debug_struct("Sts")
+            .field("issuer", &self.issuer)
+            .field("kid", &self.kid)
+            .finish_non_exhaustive()
     }
 }
 
+/// Derive the public JWK for a P-256 private key in PKCS#8 or SEC1 PEM form.
+fn public_jwk(private_key_pem: &[u8], kid: &str) -> Result<serde_json::Value, StsError> {
+    let pem = std::str::from_utf8(private_key_pem).map_err(|e| StsError::Jwk(e.to_string()))?;
+    let secret = p256::SecretKey::from_pkcs8_pem(pem)
+        .or_else(|_| p256::SecretKey::from_sec1_pem(pem))
+        .map_err(|e| StsError::Jwk(e.to_string()))?;
+    let public = secret.public_key();
+    let point = public.to_encoded_point(false);
+    let x = point
+        .x()
+        .ok_or_else(|| StsError::Jwk("point has no x coordinate".into()))?;
+    let y = point
+        .y()
+        .ok_or_else(|| StsError::Jwk("point has no y coordinate".into()))?;
+    Ok(serde_json::json!({
+        "kty": "EC",
+        "crv": "P-256",
+        "use": "sig",
+        "alg": "ES256",
+        "kid": kid,
+        "x": URL_SAFE_NO_PAD.encode(x),
+        "y": URL_SAFE_NO_PAD.encode(y),
+    }))
+}
+
 impl Sts {
-    /// Build an issuer from a PKCS#8/SEC1 EC P-256 private key in PEM form and the matching
-    /// public JWKS document (served at `/.well-known/jwks.json`).
+    /// Build an issuer from an EC P-256 private key in PKCS#8 or SEC1 PEM form.
     ///
-    /// Deriving the JWK from the private key is a follow-up; for now both are supplied so
-    /// the public half can also live outside the process (e.g. OpenBao transit).
+    /// The public JWKS served at `/.well-known/jwks.json` is derived from the key, so the
+    /// two can never drift. A signer whose key lives outside the process (`OpenBao` transit)
+    /// will be a separate constructor.
     pub fn new(
         issuer: impl Into<String>,
         kid: impl Into<String>,
         private_key_pem: &[u8],
-        jwks: serde_json::Value,
         max_ttl: Duration,
     ) -> Result<Self, StsError> {
         let key = EncodingKey::from_ec_pem(private_key_pem).map_err(StsError::Key)?;
-        Ok(Self { issuer: issuer.into(), kid: kid.into(), key, max_ttl, jwks })
+        let kid: String = kid.into();
+        let jwks = serde_json::json!({ "keys": [public_jwk(private_key_pem, &kid)?] });
+        Ok(Self {
+            issuer: issuer.into(),
+            kid,
+            key,
+            max_ttl,
+            jwks,
+        })
     }
 
     /// Issuer URL as written into `iss`.
@@ -144,12 +186,18 @@ impl Sts {
             iat: now.timestamp(),
             nbf: now.timestamp() - 30,
             jti: Uuid::new_v4().to_string(),
-            act: Actor { sub: req.actor_spiffe_id },
+            act: Actor {
+                sub: req.actor_spiffe_id,
+            },
             claim_uid: req.claim_uid,
             upstream_iss: &req.subject.issuer,
             groups: req.groups.clone(),
         };
-        let header = Header { alg: Algorithm::ES256, kid: Some(self.kid.clone()), ..Default::default() };
+        let header = Header {
+            alg: Algorithm::ES256,
+            kid: Some(self.kid.clone()),
+            ..Default::default()
+        };
         let token = jsonwebtoken::encode(&header, &claims, &self.key).map_err(StsError::Encode)?;
         Ok(Minted { token, expires_at })
     }
@@ -172,17 +220,24 @@ MUX5AKaxsGDNBXbbUOvRmJfjaSyiqtitNnd5Zd7UoxcUu0EiVY9OuHW2
 -----END PRIVATE KEY-----
 ";
 
-    #[test]
-    fn rejects_ttl_over_max() {
-        let sts = Sts::new(
+    fn test_sts() -> Sts {
+        Sts::new(
             "https://mediatore.test",
             "k1",
             TEST_KEY.as_bytes(),
-            serde_json::json!({"keys": []}),
             Duration::minutes(15),
         )
-        .unwrap();
-        let subject = Subject { issuer: "https://dex.test".into(), id: "octocat".into(), display: None };
+        .unwrap()
+    }
+
+    #[test]
+    fn rejects_ttl_over_max() {
+        let sts = test_sts();
+        let subject = Subject {
+            issuer: "https://dex.test".into(),
+            id: "octocat".into(),
+            display: None,
+        };
         let req = MintRequest {
             subject: &subject,
             actor_spiffe_id: "spiffe://td/banlieue/claim/x",
@@ -196,15 +251,12 @@ MUX5AKaxsGDNBXbbUOvRmJfjaSyiqtitNnd5Zd7UoxcUu0EiVY9OuHW2
 
     #[test]
     fn mints_three_part_jws() {
-        let sts = Sts::new(
-            "https://mediatore.test",
-            "k1",
-            TEST_KEY.as_bytes(),
-            serde_json::json!({"keys": []}),
-            Duration::minutes(15),
-        )
-        .unwrap();
-        let subject = Subject { issuer: "https://dex.test".into(), id: "octocat".into(), display: None };
+        let sts = test_sts();
+        let subject = Subject {
+            issuer: "https://dex.test".into(),
+            id: "octocat".into(),
+            display: None,
+        };
         let req = MintRequest {
             subject: &subject,
             actor_spiffe_id: "spiffe://td/banlieue/claim/x",
@@ -215,5 +267,54 @@ MUX5AKaxsGDNBXbbUOvRmJfjaSyiqtitNnd5Zd7UoxcUu0EiVY9OuHW2
         };
         let m = sts.mint(&req).unwrap();
         assert_eq!(m.token.split('.').count(), 3);
+    }
+
+    #[test]
+    fn jwks_is_derived_from_the_signing_key() {
+        let sts = test_sts();
+        let keys = sts.jwks()["keys"].as_array().unwrap();
+        assert_eq!(keys.len(), 1);
+        let jwk = &keys[0];
+        assert_eq!(jwk["kty"], "EC");
+        assert_eq!(jwk["crv"], "P-256");
+        assert_eq!(jwk["alg"], "ES256");
+        assert_eq!(jwk["kid"], "k1");
+        assert!(jwk["x"].as_str().is_some_and(|x| !x.is_empty()));
+        assert!(jwk["y"].as_str().is_some_and(|y| !y.is_empty()));
+    }
+
+    #[test]
+    fn minted_token_verifies_against_the_derived_jwk() {
+        let sts = test_sts();
+        let subject = Subject {
+            issuer: "https://dex.test".into(),
+            id: "octocat".into(),
+            display: Some("octocat@example.com".into()),
+        };
+        let claim_uid = Uuid::new_v4();
+        let req = MintRequest {
+            subject: &subject,
+            actor_spiffe_id: "spiffe://td/banlieue/claim/x",
+            claim_uid,
+            audience: "grafana",
+            groups: vec![],
+            ttl: Duration::minutes(5),
+        };
+        let m = sts.mint(&req).unwrap();
+
+        let jwk = &sts.jwks()["keys"][0];
+        let key = jsonwebtoken::DecodingKey::from_ec_components(
+            jwk["x"].as_str().unwrap(),
+            jwk["y"].as_str().unwrap(),
+        )
+        .unwrap();
+        let mut validation = jsonwebtoken::Validation::new(Algorithm::ES256);
+        validation.set_audience(&["grafana"]);
+        validation.set_issuer(&["https://mediatore.test"]);
+        let data = jsonwebtoken::decode::<serde_json::Value>(&m.token, &key, &validation).unwrap();
+        assert_eq!(data.claims["sub"], "octocat");
+        assert_eq!(data.claims["act"]["sub"], "spiffe://td/banlieue/claim/x");
+        assert_eq!(data.claims["claim_uid"], claim_uid.to_string());
+        assert_eq!(data.claims["upstream_iss"], "https://dex.test");
     }
 }

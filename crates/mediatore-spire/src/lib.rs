@@ -20,10 +20,27 @@ pub struct Naming {
 }
 
 impl Naming {
+    /// `spiffe://<td>/spire/agent/tpm/<ek-hash>`: the ID the TPM attestor gives the SPIRE
+    /// agent on the VM, used as the parent of every entry on that node.
+    #[must_use]
+    pub fn agent_id(&self, ek_hash: &str) -> String {
+        format!("spiffe://{}/spire/agent/tpm/{ek_hash}", self.trust_domain)
+    }
+
     /// `spiffe://<td>/banlieue/node/<ek-hash>`
     #[must_use]
     pub fn node_id(&self, ek_hash: &str) -> String {
         format!("spiffe://{}/banlieue/node/{ek_hash}", self.trust_domain)
+    }
+
+    /// Parse the EK hash out of a peer's node SPIFFE ID, if it is one of ours.
+    #[must_use]
+    pub fn node_ek_from(&self, spiffe_id: &str) -> Option<String> {
+        let prefix = format!("spiffe://{}/banlieue/node/", self.trust_domain);
+        spiffe_id
+            .strip_prefix(&prefix)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned)
     }
 
     /// `spiffe://<td>/banlieue/claim/<uid>`
@@ -42,7 +59,9 @@ impl Naming {
     #[must_use]
     pub fn claim_uid_from(&self, spiffe_id: &str) -> Option<Uuid> {
         let prefix = format!("spiffe://{}/banlieue/claim/", self.trust_domain);
-        spiffe_id.strip_prefix(&prefix).and_then(|s| Uuid::parse_str(s).ok())
+        spiffe_id
+            .strip_prefix(&prefix)
+            .and_then(|s| Uuid::parse_str(s).ok())
     }
 }
 
@@ -75,7 +94,8 @@ pub trait EntryManager: Send + Sync + 'static {
     /// List attested agents.
     async fn list_agents(&self) -> Result<Vec<Agent>, SpireError>;
     /// Create (or find) the node bootstrap entry. Returns the entry id.
-    async fn ensure_node_entry(&self, parent_id: &str, node_id: &str) -> Result<String, SpireError>;
+    async fn ensure_node_entry(&self, parent_id: &str, node_id: &str)
+    -> Result<String, SpireError>;
     /// Create the claim entry. Returns the entry id.
     async fn create_claim_entry(
         &self,
@@ -97,7 +117,11 @@ impl EntryManager for Noop {
         Ok(vec![])
     }
 
-    async fn ensure_node_entry(&self, parent_id: &str, node_id: &str) -> Result<String, SpireError> {
+    async fn ensure_node_entry(
+        &self,
+        parent_id: &str,
+        node_id: &str,
+    ) -> Result<String, SpireError> {
         tracing::info!(parent_id, node_id, "noop: ensure node entry");
         Ok(format!("noop-{node_id}"))
     }
@@ -124,10 +148,29 @@ mod tests {
 
     #[test]
     fn claim_uid_roundtrip() {
-        let n = Naming { trust_domain: "sandbox.test".into() };
+        let n = Naming {
+            trust_domain: "sandbox.test".into(),
+        };
         let uid = Uuid::new_v4();
         assert_eq!(n.claim_uid_from(&n.claim_id(uid)), Some(uid));
         assert_eq!(n.claim_uid_from("spiffe://sandbox.test/mediatore"), None);
-        assert_eq!(n.claim_uid_from("spiffe://other.test/banlieue/claim/x"), None);
+        assert_eq!(
+            n.claim_uid_from("spiffe://other.test/banlieue/claim/x"),
+            None
+        );
+    }
+
+    #[test]
+    fn node_ek_roundtrip() {
+        let n = Naming {
+            trust_domain: "sandbox.test".into(),
+        };
+        assert_eq!(n.node_ek_from(&n.node_id("3f9a")), Some("3f9a".to_owned()));
+        assert_eq!(n.node_ek_from(&n.agent_id("3f9a")), None);
+        assert_eq!(n.node_ek_from("spiffe://sandbox.test/banlieue/node/"), None);
+        assert_eq!(
+            n.node_ek_from("spiffe://other.test/banlieue/node/3f9a"),
+            None
+        );
     }
 }

@@ -5,6 +5,9 @@ use std::path::{Path, PathBuf};
 /// Where the sandbox lives on the guest.
 pub const SANDBOX_ROOT: &str = "/mnt/sandbox";
 
+/// Default address-space limit for the workload, in MiB.
+pub const DEFAULT_RLIMIT_AS_MIB: u64 = 8192;
+
 /// Inputs to the jail.
 #[derive(Debug, Clone)]
 pub struct JailSpec {
@@ -29,23 +32,41 @@ impl JailSpec {
     #[must_use]
     pub fn to_args(&self) -> Vec<String> {
         let mut a: Vec<String> = vec![
-            "--mode".into(), "o".into(),
-            "--user".into(), self.user.clone(),
-            "--group".into(), self.user.clone(),
-            "--chroot".into(), self.rootfs.display().to_string(),
-            "--bindmount_ro".into(), format!("{}:/run/spire/agent.sock", self.workload_api_socket.display()),
-            "--bindmount".into(), format!("{}:/work", self.work.display()),
-            "--tmpfsmount".into(), "/tmp".into(),
-            "--tmpfsmount".into(), "/home/sandbox".into(),
+            "--mode".into(),
+            "o".into(),
+            "--user".into(),
+            self.user.clone(),
+            "--group".into(),
+            self.user.clone(),
+            "--chroot".into(),
+            self.rootfs.display().to_string(),
+            "--bindmount_ro".into(),
+            format!(
+                "{}:/run/spire/agent.sock",
+                self.workload_api_socket.display()
+            ),
+            "--bindmount".into(),
+            format!("{}:/work", self.work.display()),
+            "--tmpfsmount".into(),
+            "/tmp".into(),
+            "--tmpfsmount".into(),
+            "/home/sandbox".into(),
             "--disable_proc".into(),
             "--iface_no_lo=false".into(),
-            "--rlimit_as".into(), self.rlimit_as_mib.to_string(),
-            "--rlimit_nproc".into(), "512".into(),
-            "--rlimit_fsize".into(), "4096".into(),
-            "--time_limit".into(), "0".into(),
-            "--env".into(), "HOME=/home/sandbox".into(),
-            "--env".into(), "SPIFFE_ENDPOINT_SOCKET=unix:///run/spire/agent.sock".into(),
-            "--env".into(), format!("MEDIATORE_URL={}", self.mediatore_url),
+            "--rlimit_as".into(),
+            self.rlimit_as_mib.to_string(),
+            "--rlimit_nproc".into(),
+            "512".into(),
+            "--rlimit_fsize".into(),
+            "4096".into(),
+            "--time_limit".into(),
+            "0".into(),
+            "--env".into(),
+            "HOME=/home/sandbox".into(),
+            "--env".into(),
+            "SPIFFE_ENDPOINT_SOCKET=unix:///run/spire/agent.sock".into(),
+            "--env".into(),
+            format!("MEDIATORE_URL={}", self.mediatore_url),
             "--".into(),
         ];
         a.extend(self.argv.iter().cloned());

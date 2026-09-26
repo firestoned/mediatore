@@ -14,6 +14,7 @@ mediatore-store.workspace = true
 mediatore-entra.workspace = true
 mediatore-sts.workspace = true
 mediatore-spire.workspace = true
+mediatore-claims.workspace = true
 axum.workspace = true
 tower-http.workspace = true
 tokio.workspace = true

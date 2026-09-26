@@ -1,11 +1,11 @@
-# Dev config: homelab shape (Dex + GitHub, STS backend), header-based peer identity.
+# Config for dev/demo.sh: the homelab shape, with fake-idp standing in for Dex.
 trust_domain: sandbox.home.example
 dev_mode: true
 listen:
   user: 127.0.0.1:8080
   sandbox: 127.0.0.1:8443
 issuers:
-  - url: https://dex.home.example
+  - url: http://127.0.0.1:18082
     backend: sts
     client_id: mediatore
     subject_claim: preferred_username
