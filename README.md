@@ -30,6 +30,10 @@ the component that finishes the story.
 - **Cut-off.** When the claim expires or is deleted, mediatore removes the SPIFFE entry and
   stops issuing.
 
+How a user, a delegating agent (On-Behalf-Of) or an app-only service actually gets code
+running in a sandbox: [docs/guides/running-workloads.md](docs/guides/running-workloads.md).
+Phase status: [ROADMAPS.md](ROADMAPS.md).
+
 ## Repository layout
 
 ```
