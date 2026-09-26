@@ -1,0 +1,19 @@
+[Unit]
+Description=mediatore in-guest agent (banlieue sandbox)
+After=spire-agent.service network-online.target
+Requires=spire-agent.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStartPre=/opt/spire/bin/spire-agent healthcheck -socketPath /run/spire/sockets/agent.sock
+ExecStart=/usr/local/bin/mediatore-guest
+EnvironmentFile=-/etc/mediatore-guest/env
+Restart=on-failure
+RestartSec=5
+RuntimeDirectory=mediatore-guest
+NoNewPrivileges=no
+
+[Install]
+WantedBy=multi-user.target

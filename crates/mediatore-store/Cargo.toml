@@ -1,0 +1,21 @@
+[package]
+name = "mediatore-store"
+description = "Claim and node records: trait + in-memory implementation (PostgreSQL/SQLite via sqlx later)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+mediatore-proto.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+serde.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

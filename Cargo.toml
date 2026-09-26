@@ -1,0 +1,87 @@
+[workspace]
+resolver = "3"
+members = [
+  "crates/mediatore-proto",
+  "crates/mediatore-api",
+  "crates/mediatore-entra",
+  "crates/mediatore-sts",
+  "crates/mediatore-spire",
+  "crates/mediatore-claims",
+  "crates/mediatore-store",
+  "crates/mediatore",
+  "crates/mediatore-guest",
+  "crates/sandbox-token",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+license = "Apache-2.0"
+repository = "https://github.com/firestoned/mediatore"
+homepage = "https://github.com/firestoned/mediatore"
+authors = ["Erick Bourgeois"]
+publish = false
+
+[workspace.dependencies]
+# in-repo crates
+mediatore-proto  = { path = "crates/mediatore-proto" }
+mediatore-api    = { path = "crates/mediatore-api" }
+mediatore-entra  = { path = "crates/mediatore-entra" }
+mediatore-sts    = { path = "crates/mediatore-sts" }
+mediatore-spire  = { path = "crates/mediatore-spire" }
+mediatore-claims = { path = "crates/mediatore-claims" }
+mediatore-store  = { path = "crates/mediatore-store" }
+
+# banlieue CRD types, pinned to a tag once one exists
+# banlieue-api = { git = "https://github.com/firestoned/banlieue", tag = "v0.1.0", package = "banlieue-api" }
+
+# async + web
+tokio        = { version = "1", features = ["rt-multi-thread", "macros", "signal", "process", "fs", "time", "sync", "net"] }
+axum         = { version = "0.8", features = ["json", "http2"] }
+tower        = "0.5"
+tower-http   = { version = "0.6", features = ["trace", "timeout"] }
+reqwest      = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+async-trait  = "0.1"
+
+# serde + formats
+serde          = { version = "1", features = ["derive"] }
+serde_json     = "1"
+serde_yaml_ng  = "0.10"
+
+# identity + crypto
+jsonwebtoken = "9"
+base64       = "0.22"
+sha2         = "0.10"
+hex          = "0.4"
+uuid         = { version = "1", features = ["v4", "serde"] }
+chrono       = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+
+# kubernetes
+kube        = { version = "1", default-features = false, features = ["client", "runtime", "rustls-tls"] }
+k8s-openapi = { version = "0.25", features = ["latest"] }
+
+# errors, logging, cli
+thiserror          = "2"
+anyhow             = "1"
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+clap               = { version = "4", features = ["derive", "env"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+must_use_candidate = "allow"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"

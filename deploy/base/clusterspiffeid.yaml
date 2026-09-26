@@ -1,0 +1,11 @@
+apiVersion: spire.spiffe.io/v1alpha1
+kind: ClusterSPIFFEID
+metadata:
+  name: mediatore
+spec:
+  spiffeIDTemplate: "spiffe://{{ .TrustDomain }}/mediatore"
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: mediatore }
+  namespaceSelector:
+    matchNames: [banlieue-system]
+  admin: true

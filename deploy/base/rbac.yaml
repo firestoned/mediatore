@@ -1,0 +1,27 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: mediatore
+rules:
+  - apiGroups: ["banlieue.io"]
+    resources: ["virtualmachineclaims"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: ["banlieue.io"]
+    resources: ["virtualmachineclaims/status"]
+    verbs: ["get"]
+  - apiGroups: ["banlieue.io"]
+    resources: ["virtualmachines"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: mediatore
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: mediatore
+subjects:
+  - kind: ServiceAccount
+    name: mediatore
+    namespace: banlieue-system

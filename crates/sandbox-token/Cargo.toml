@@ -1,0 +1,25 @@
+[package]
+name = "sandbox-token"
+description = "Workload-side CLI: fetch the claim SVID and ask mediatore for an audience-scoped token"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "sandbox-token"
+path = "src/main.rs"
+
+[dependencies]
+mediatore-proto.workspace = true
+tokio.workspace = true
+clap.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+# spiffe = "0.6"   # X509Source for mTLS; lands with the mTLS work
+
+[lints]
+workspace = true

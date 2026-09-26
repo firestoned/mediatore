@@ -1,0 +1,21 @@
+# Dev config: homelab shape (Dex + GitHub, STS backend), header-based peer identity.
+trust_domain: sandbox.home.example
+dev_mode: true
+listen:
+  user: 127.0.0.1:8080
+  sandbox: 127.0.0.1:8443
+issuers:
+  - url: https://dex.home.example
+    backend: sts
+    client_id: mediatore
+    subject_claim: preferred_username
+    required_group: firestoned:sandbox-users
+audiences:
+  - name: grafana.home.example
+    via: sts
+    max_ttl: 900
+sts:
+  issuer: https://mediatore.home.example
+  kid: dev-1
+  signing_key_file: dev/sts.pem
+  jwks_file: dev/jwks.json

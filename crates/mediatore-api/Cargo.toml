@@ -1,0 +1,27 @@
+[package]
+name = "mediatore-api"
+description = "axum routers for the user-facing (bearer) and sandbox-facing (SPIFFE mTLS) endpoints"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+mediatore-proto.workspace = true
+mediatore-store.workspace = true
+mediatore-entra.workspace = true
+mediatore-sts.workspace = true
+mediatore-spire.workspace = true
+axum.workspace = true
+tower-http.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

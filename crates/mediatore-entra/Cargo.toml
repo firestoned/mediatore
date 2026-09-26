@@ -1,0 +1,23 @@
+[package]
+name = "mediatore-entra"
+description = "Upstream identity: token validation for Entra ID and Dex, Entra On-Behalf-Of exchange"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+mediatore-proto.workspace = true
+jsonwebtoken.workspace = true
+base64.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

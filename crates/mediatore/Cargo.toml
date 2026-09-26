@@ -1,0 +1,34 @@
+[package]
+name = "mediatore"
+description = "mediatore server: identity broker for banlieue sandbox VMs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "mediatore"
+path = "src/main.rs"
+
+[dependencies]
+mediatore-api.workspace = true
+mediatore-entra.workspace = true
+mediatore-sts.workspace = true
+mediatore-spire.workspace = true
+mediatore-store.workspace = true
+mediatore-claims.workspace = true
+tokio.workspace = true
+axum.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml_ng.workspace = true
+chrono.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

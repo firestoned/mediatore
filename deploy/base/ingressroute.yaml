@@ -1,0 +1,13 @@
+# User-facing endpoint only. The sandbox listener is reached by VMs directly (mTLS), never via ingress.
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: mediatore
+spec:
+  entryPoints: [websecure]
+  routes:
+    - match: Host(`mediatore.sandbox.rbc.internal`)
+      kind: Rule
+      services:
+        - { name: mediatore, port: user }
+  tls: {}

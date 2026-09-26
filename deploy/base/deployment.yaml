@@ -1,0 +1,43 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mediatore
+  labels: { app.kubernetes.io/name: mediatore }
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app.kubernetes.io/name: mediatore }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: mediatore }
+    spec:
+      serviceAccountName: mediatore
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: mediatore
+          image: ghcr.io/firestoned/mediatore:dev
+          args: ["serve", "--config", "/etc/mediatore/mediatore.yaml"]
+          ports:
+            - { name: user, containerPort: 8080 }
+            - { name: sandbox, containerPort: 8443 }
+          env:
+            - { name: RUST_LOG, value: "info,mediatore=debug" }
+          volumeMounts:
+            - { name: config, mountPath: /etc/mediatore, readOnly: true }
+            - { name: spire-agent-socket, mountPath: /run/spire/sockets, readOnly: true }
+          readinessProbe:
+            httpGet: { path: /healthz, port: user }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+      volumes:
+        - name: config
+          configMap: { name: mediatore-config }
+        - name: spire-agent-socket
+          csi:
+            driver: csi.spiffe.io
+            readOnly: true

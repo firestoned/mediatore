@@ -1,0 +1,17 @@
+[Unit]
+Description=SPIRE agent (TPM node attestation)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=spire
+SupplementaryGroups=tss
+ExecStart=/opt/spire/bin/spire-agent run -config /opt/spire/conf/agent.conf
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/spire /run/spire
+
+[Install]
+WantedBy=multi-user.target

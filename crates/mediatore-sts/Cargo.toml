@@ -1,0 +1,21 @@
+[package]
+name = "mediatore-sts"
+description = "Self-issued, audience-scoped delegation tokens (RFC 8693 style) for backends without OBO"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+mediatore-proto.workspace = true
+jsonwebtoken.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

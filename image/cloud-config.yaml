@@ -1,0 +1,14 @@
+#cloud-config
+# Fragment merged into the pool image's Kairos config. Nothing here is claim-specific.
+stages:
+  initramfs:
+    - name: spire-user
+      users:
+        spire: { system: true, homedir: /var/lib/spire, shell: /sbin/nologin }
+  boot:
+    - name: spire-dirs
+      commands:
+        - install -d -o spire -g spire -m 0700 /var/lib/spire/agent
+        - install -d -o spire -g spire -m 0755 /run/spire/sockets
+      systemctl:
+        enable: [spire-agent, mediatore-guest]
