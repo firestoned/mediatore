@@ -53,7 +53,7 @@ serde_yaml_ng  = "0.10"
 
 # identity + crypto
 jsonwebtoken = "9"
-p256         = "0.13"
+p256         = "0.14"
 base64       = "0.23"
 sha2         = "0.10"
 hex          = "0.4"
