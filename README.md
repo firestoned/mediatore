@@ -48,6 +48,7 @@ deploy/                 raw manifests (kustomize), Traefik IngressRoute
 image/                  systemd units + cloud-config fragments baked into the VM image
 docs/adr/               architecture decision records
 docs/architecture/      FINOS CALM model + rendered Mermaid diagrams
+docs/guides/            operational guides (enterprise SPIRE topology, ...)
 docs/security/          threat model (living document, stamped per ADR range)
 ```
 

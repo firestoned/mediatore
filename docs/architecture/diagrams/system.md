@@ -31,7 +31,10 @@ flowchart LR
     data-asset-sts-signing-key["STS Signing Key"]
     service-kubernetes-api["Kubernetes API Server"]
     system-banlieue["banlieue Control Plane"]
-    service-spire-server["SPIRE Server"]
+    service-spire-server["SPIRE Server (downstream)"]
+    service-spire-root["SPIRE Root Server (desired state)"]
+    network-identity-cluster["Identity Cluster (desired state)"]
+    network-management-cluster["Management Cluster"]
     system-sandbox-vm["Sandbox VM (pool member)"]
     service-spire-agent["SPIRE Agent (in guest)"]
     service-guest-agent["mediatore-guest"]
@@ -53,6 +56,16 @@ flowchart LR
     subgraph sg_network-sandbox-segment [Network Sandbox Segment]
         system-sandbox-vm
     end
+    subgraph sg_network-management-cluster [Network Management Cluster]
+        system-mediatore
+        service-kubernetes-api
+        system-banlieue
+        service-spire-server
+    end
+    subgraph sg_network-identity-cluster [Network Identity Cluster]
+        service-spire-root
+    end
+    service-spire-server -->|mTLS| service-spire-root
     actor-sandbox-user -->|HTTPS| ecosystem-idp
     actor-sandbox-user -->|HTTPS| service-mediatore-user-api
     service-mediatore-user-api -->|HTTPS| ecosystem-idp

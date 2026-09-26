@@ -70,8 +70,26 @@
     {
       "unique-id": "service-spire-server",
       "node-type": "service",
-      "name": "SPIRE Server",
-      "description": "Issues node identities via TPM EK attestation and workload SVIDs via registration entries. mediatore is an admin identity and creates exactly two entry kinds: /banlieue/node/<ek-hash> and /banlieue/claim/<uid> (ADR-0004)."
+      "name": "SPIRE Server (downstream)",
+      "description": "The environment-scoped SPIRE server: holds the TPM attestor, the EK trust bundle and the k8s_psat config for this cluster, and issues node identities and workload SVIDs. mediatore is an admin identity here only, creating exactly two entry kinds: /banlieue/node/<ek-hash> and /banlieue/claim/<uid> (ADR-0004). In the enterprise topology it chains to the root via an intermediate CA; in the homelab it is the whole tree (ADR-0005)."
+    },
+    {
+      "unique-id": "service-spire-root",
+      "node-type": "service",
+      "name": "SPIRE Root Server (desired state)",
+      "description": "Root of the trust domain on the dedicated identity cluster: HA, PostgreSQL-backed, CA keyed through an UpstreamAuthority plugin against an HSM / KMS / corporate PKI. Issues intermediate CAs to downstream servers only; no agent or workload talks to it directly. Elided in the homelab collapse (ADR-0005)."
+    },
+    {
+      "unique-id": "network-identity-cluster",
+      "node-type": "network",
+      "name": "Identity Cluster (desired state)",
+      "description": "Dedicated cluster (auth.example.com style) owned by the identity/security team, with its own change control. Hosts only the SPIRE root and its datastore; sandbox-cluster administrators have no access here (ADR-0005)."
+    },
+    {
+      "unique-id": "network-management-cluster",
+      "node-type": "network",
+      "name": "Management Cluster",
+      "description": "The banlieue management cluster: runs mediatore, the downstream SPIRE server, the Kubernetes API and the banlieue controllers. In the homelab this is the single banlieue cluster and the downstream server is the only SPIRE server."
     },
     {
       "unique-id": "system-sandbox-vm",
@@ -147,6 +165,42 @@
           "nodes": ["system-sandbox-vm"]
         }
       }
+    },
+    {
+      "unique-id": "rel-mgmt-cluster-deployment",
+      "description": "Everything control-plane-side shares the management cluster; the SPIRE downstream server is scoped to it so mediatore admin rights and k8s_psat validation stay per-environment.",
+      "relationship-type": {
+        "deployed-in": {
+          "container": "network-management-cluster",
+          "nodes": [
+            "system-mediatore",
+            "service-kubernetes-api",
+            "system-banlieue",
+            "service-spire-server"
+          ]
+        }
+      }
+    },
+    {
+      "unique-id": "rel-identity-cluster-deployment",
+      "description": "The root SPIRE server lives alone on the identity cluster; the root signing key never resides where sandboxes are administered.",
+      "relationship-type": {
+        "deployed-in": {
+          "container": "network-identity-cluster",
+          "nodes": ["service-spire-root"]
+        }
+      }
+    },
+    {
+      "unique-id": "rel-spire-downstream-root",
+      "description": "Nested SPIRE: the downstream server obtains its intermediate CA from the root and chains every SVID it issues to the one trust domain. Revoking the intermediate cuts an entire environment off from above. Absent in the homelab collapse (ADR-0005).",
+      "relationship-type": {
+        "connects": {
+          "source": { "node": "service-spire-server" },
+          "destination": { "node": "service-spire-root" }
+        }
+      },
+      "protocol": "mTLS"
     },
     {
       "unique-id": "rel-user-idp-login",
@@ -313,12 +367,13 @@
     "repository": "https://github.com/firestoned/mediatore",
     "license": "Apache-2.0",
     "calm-schema-version": "1.2",
-    "phase": "dev-mode loop implemented and e2e-tested; mTLS, SPIRE gRPC, Entra OBO, sqlx store and the claim watch are fail-closed stubs"
+    "phase": "dev-mode loop implemented and e2e-tested; mTLS, SPIRE gRPC, Entra OBO, sqlx store and the claim watch are fail-closed stubs. SPIRE topology models the ADR-0005 desired state: root on a dedicated identity cluster, downstream per environment; the homelab collapses to the downstream server alone"
   },
   "adrs": [
     "docs/adr/0001-record-architecture-decisions.md",
     "docs/adr/0002-separate-project-from-banlieue.md",
     "docs/adr/0003-token-backends.md",
-    "docs/adr/0004-spiffe-identity-scheme.md"
+    "docs/adr/0004-spiffe-identity-scheme.md",
+    "docs/adr/0005-spire-topology.md"
   ]
 }

@@ -5,12 +5,17 @@ SPDX-License-Identifier: Apache-2.0
 # Threat Model
 
 > **Status:** Living document. Last full pass **2026-09-26**, against the
-> architecture defined by **ADR-0001 … ADR-0004**. This is the first pass; it
-> covers the implemented dev-mode loop (upstream token validation, claim
-> lifecycle, STS issuance, release cut-off) and records every not-yet-built
-> edge (SPIFFE mTLS, SPIRE gRPC, Entra OBO, sqlx store) as either a
-> fail-closed stub or an accepted risk with a revisit condition — never as a
-> control that exists.
+> architecture defined by **ADR-0001 … ADR-0005**. The first pass covered the
+> implemented dev-mode loop (upstream token validation, claim lifecycle, STS
+> issuance, release cut-off) and recorded every not-yet-built edge (SPIFFE
+> mTLS, SPIRE gRPC, Entra OBO, sqlx store) as either a fail-closed stub or an
+> accepted risk with a revisit condition — never as a control that exists.
+> A second same-day pass covers **ADR-0005** (SPIRE on a dedicated identity
+> tier, nested per environment): **no new component in this repo and no new
+> code**, but the SPIRE server in §5/§6 is now explicitly the *downstream*
+> server, mediatore's admin rights are per-environment by design, and the
+> homelab's single flat server is recorded as accepted risk R-7 instead of an
+> unstated assumption.
 >
 > **Method:** asset/actor enumeration, trust-boundary decomposition, STRIDE
 > per boundary, control mapping to the crates in `crates/` and the manifests
@@ -83,8 +88,11 @@ holds three things an attacker wants:
        │                      │  user API │ watcher
        │ OIDC login           │           │ (TB-3) SPIRE admin gRPC
        ▼                      │           ▼
-  IdP (Entra/Dex) ◄───────────┘      SPIRE Server
-   (TB-5) JWKS / OBO                      ▲
+  IdP (Entra/Dex) ◄───────────┘      SPIRE Server (downstream)
+   (TB-5) JWKS / OBO                      ▲        │ intermediate CA
+                                          │        ▼ (enterprise only)
+                                          │   SPIRE Root ── HSM/PKI
+                                          │   [identity cluster, ADR-0005]
                                           │ (TB-4) TPM node attestation
   ┌─── sandbox network segment ───────────┼──────────────────────────────┐
   │  Pool VM:  spire-agent ───────────────┘                              │
@@ -133,6 +141,7 @@ the residue is in §8.
 | Threat | S/T/R/I/D/E | Control |
 | --- | --- | --- |
 | Forged registration entry (workload identity for free) | S/E | Planned: admin identity restricted to `/banlieue/{node,claim}/` paths, entry create only after a Bound claim resolves to a registered node: `crates/mediatore-claims/src/lib.rs` (`Reconciler::bind`) is the only call site. Today: `Noop` (`crates/mediatore-spire/src/lib.rs`), no entries exist at all |
+| Compromised broker forging entries org-wide | E | Topology (ADR-0005): `admin_ids` is granted on the *downstream* server only, so forged entries are contained to this environment. Enterprise only; the homelab has one flat server (§8 R-7) |
 | Stale entry after release | E | Entry deleted before refresh material: `Reconciler::release` ordering, unit- and e2e-tested |
 
 ### TB-4: VM → SPIRE server (node attestation)
@@ -194,11 +203,13 @@ the residue is in §8.
 | R-4 | mediatore is a single trust point: a compromised broker mints for any active claim | Inherent to the broker pattern; mitigations planned: HSM/transit-held keys, two-person deploy, immutable audit sink | The production deployment ADR (key custody, audit) |
 | R-5 | In-memory store loses claim state on restart (dev only): a restarted broker forgets revocations it has not propagated | Dev-only; the SPIRE `Noop` means no entries outlive the process either | The sqlx store lands; re-walk §6 TB-3/TB-6 ordering against real persistence |
 | R-6 | vTPM EK attestation proves "this vTPM", not "this host"; hypervisor compromise breaks node identity | Same posture as banlieue ADR-0045; hypervisor is in the TCB | PCR / measured-boot selectors become available (runbook open decision #6) |
+| R-7 | Homelab collapse: one flat SPIRE server on the management cluster, no root, no upstream authority — its signing key lives where sandboxes are administered | Single-operator homelab; ADR-0005 records the enterprise topology (root on a dedicated identity cluster, HSM-backed) as the desired state | Any multi-team or production deployment; then split per ADR-0005 and delete this row |
 
 ## 9. Assumptions and out of scope
 
 - Single-tenant management cluster; a cluster admin is trusted (they can read
-  the broker's SA token regardless).
+  the broker's SA token regardless — and, in the homelab collapse of ADR-0005,
+  the SPIRE signing key too; see §8 R-7).
 - The IdP is authoritative for authentication and group membership.
 - banlieue's own threat model covers the VM lifecycle, image supply chain and
   hypervisor credentials; this document starts where a Ready, attested pool
@@ -211,3 +222,4 @@ the residue is in §8.
 | Date | Pass | ADRs covered | Outcome |
 | --- | --- | --- | --- |
 | 2026-09-26 | Initial full pass | 0001–0004 | Document created; 6 accepted risks recorded; TB-3/TB-6 marked stub, fail-closed verified by e2e |
+| 2026-09-26 | SPIRE topology | 0001–0005 | No new code or component here; §5 diagram gains the root/downstream split, TB-3 gains the per-environment containment row, homelab flat-server posture moved from unstated assumption to R-7 |
