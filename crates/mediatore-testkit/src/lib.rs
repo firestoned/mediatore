@@ -10,7 +10,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::{Duration, Utc};
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
-use p256::elliptic_curve::sec1::ToEncodedPoint;
+use p256::elliptic_curve::sec1::ToSec1Point;
 use p256::pkcs8::DecodePrivateKey;
 
 /// Default lifetime of a minted test token.
@@ -57,7 +57,7 @@ impl FakeIdp {
     pub async fn start_on(addr: &str) -> Self {
         let secret = p256::SecretKey::from_pkcs8_pem(IDP_TEST_KEY).expect("test key");
 
-        let point = secret.public_key().to_encoded_point(false);
+        let point = secret.public_key().to_sec1_point(false);
         let jwk = serde_json::json!({
             "kty": "EC", "crv": "P-256", "use": "sig", "alg": "ES256", "kid": TEST_KID,
             "x": URL_SAFE_NO_PAD.encode(point.x().expect("x")),

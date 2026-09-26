@@ -2,7 +2,14 @@
 all-features = true
 
 [advisories]
-ignore = []
+ignore = [
+  # Marvin timing side channel in the `rsa` crate; no patched release exists.
+  # Pulled in by jsonwebtoken's rust_crypto backend, but mediatore signs and
+  # verifies ES256 (P-256) exclusively, so the RSA code path is never
+  # exercised. Revisit when RustCrypto/RSA#19 lands a constant-time fix or
+  # jsonwebtoken makes the rsa dependency optional per algorithm.
+  { id = "RUSTSEC-2023-0071", reason = "RSA never used; ES256-only token signing/verification" },
+]
 
 [licenses]
 allow = [
