@@ -52,7 +52,7 @@ serde_json     = "1"
 serde_yaml_ng  = "0.10"
 
 # identity + crypto
-jsonwebtoken = "9"
+jsonwebtoken = "11"
 p256         = "0.13"
 base64       = "0.23"
 sha2         = "0.10"
