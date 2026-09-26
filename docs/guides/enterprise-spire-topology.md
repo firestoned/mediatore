@@ -18,24 +18,22 @@ Treat it like your PKI: its own tier, its own owners, its own change control.
 
 ## Target shape
 
-```text
-      identity cluster (auth.example.com style)         owned by identity/security
-   ┌──────────────────────────────────────────────┐
-   │  SPIRE root server (HA)                      │
-   │    UpstreamAuthority → HSM / KMS / corp PKI  │
-   │    PostgreSQL (HA)                           │
-   └───────────────┬──────────────────────────────┘
-                   │ intermediate CA per environment
-       ┌───────────┴─────────────┬─────────────────────┐
-       ▼                         ▼                     ▼
-  downstream SPIRE          downstream SPIRE      downstream SPIRE
-  (sandbox mgmt cluster)    (region B)            (env C)
-   • TPM attestor + EK CA bundle
-   • k8s_psat for its own cluster
-   • mediatore admin_ids granted HERE only
-       ▲                ▲
-       │ attest 8081    │ entries gRPC
-   pool VMs         mediatore
+```mermaid
+flowchart TB
+  subgraph identity ["identity cluster (auth.example.com style), owned by identity/security"]
+    root["SPIRE root server (HA)<br/>UpstreamAuthority: HSM / KMS / corp PKI<br/>PostgreSQL (HA)"]
+  end
+
+  mgmt["downstream SPIRE<br/>(sandbox mgmt cluster)<br/>TPM attestor + EK CA bundle<br/>k8s_psat for its own cluster<br/>mediatore admin_ids granted HERE only"]
+  regionb["downstream SPIRE<br/>(region B)"]
+  envc["downstream SPIRE<br/>(env C)"]
+
+  root -- "intermediate CA per environment" --> mgmt
+  root --> regionb
+  root --> envc
+
+  vms["pool VMs"] -- "attest 8081" --> mgmt
+  mediatore["mediatore"] -- "entries gRPC" --> mgmt
 ```
 
 One trust domain across the tree. Nesting, not federation: federation (bundle
