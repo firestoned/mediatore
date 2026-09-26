@@ -3,3 +3,7 @@
 *.pem
 *.key
 .env
+
+# MkDocs site build and docs venv (make docs / docs-serve)
+/site
+/.venv

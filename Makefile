@@ -5,7 +5,7 @@
 # and call these targets, and every target runs identically locally.
 
 .PHONY: all help fmt fmt-check lint test deny audit check sbom guest image e2e \
-        calm-validate calm-diagrams clean
+        calm-validate calm-diagrams docs docs-serve docs-clean clean
 
 # CALM (FINOS Common Architecture Language Model) configuration
 CALM_CLI_VERSION  ?= 1.37.0
@@ -85,6 +85,26 @@ calm-diagrams: ## Render CALM Mermaid diagrams into $(CALM_DIAGRAMS_OUT)
 	  mv "$$f" "$${f%.hbs}"; \
 	done
 	@echo "✓ CALM diagrams written to $(CALM_DIAGRAMS_OUT)/"
+
+# ----- Documentation (MkDocs Material) -----------------------------------------
+
+docs: ## Build the MkDocs site into site/ (CALM diagrams are committed; see calm-diagrams)
+	@command -v poetry >/dev/null 2>&1 || { echo "Error: Poetry not found. Install: curl -sSL https://install.python-poetry.org | python3 -"; exit 1; }
+	@echo "Ensuring documentation dependencies are installed..."
+	@poetry install --no-interaction --quiet
+	@echo "Building MkDocs site..."
+	@poetry run mkdocs build --strict
+	@echo "✓ Documentation built at site/index.html"
+
+docs-serve: ## Serve docs locally with live reload at http://127.0.0.1:8000
+	@command -v poetry >/dev/null 2>&1 || { echo "Error: Poetry not found. Install: curl -sSL https://install.python-poetry.org | python3 -"; exit 1; }
+	@poetry install --no-interaction --quiet
+	@echo "Starting MkDocs server at http://127.0.0.1:8000 (live reload)..."
+	@poetry run mkdocs serve --livereload
+
+docs-clean: ## Remove docs build artefacts and venv
+	@rm -rf site/ .venv/
+	@echo "✓ Documentation artefacts cleaned"
 
 clean: ## Remove build artifacts
 	cargo clean

@@ -22,7 +22,7 @@ SPDX-License-Identifier: Apache-2.0
 > in `deploy/`.
 >
 > This document describes *what mediatore defends, from whom, and how*. It is
-> the companion to [`SECURITY.md`](../../SECURITY.md), which describes how to
+> the companion to [`SECURITY.md`](https://github.com/firestoned/mediatore/blob/main/SECURITY.md), which describes how to
 > **report** a vulnerability. Specific unremediated findings go through
 > [private vulnerability reporting](https://github.com/firestoned/mediatore/security/advisories/new),
 > never this page.

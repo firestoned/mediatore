@@ -1,0 +1,118 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+#
+# Documentation: build the MkDocs site on every PR that touches it, publish to
+# GitHub Pages on push to main (and on manual dispatch). All logic lives in the
+# Makefile (`make docs`); this workflow only installs tools and calls it.
+
+name: Documentation
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'docs/**'
+      - 'mkdocs.yml'
+      - 'pyproject.toml'
+      - 'poetry.lock'
+      - 'Makefile'
+      - '.github/workflows/docs.yaml'
+      - '.github/requirements/poetry.*'
+  pull_request:
+    paths:
+      - 'docs/**'
+      - 'mkdocs.yml'
+      - 'pyproject.toml'
+      - 'poetry.lock'
+      - 'Makefile'
+      - '.github/workflows/docs.yaml'
+      - '.github/requirements/poetry.*'
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Newest docs win: a superseded build (or an in-flight deploy for an older
+# main commit) is cancelled when a newer push arrives.
+concurrency:
+  group: pages-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # The CALM model must validate and the committed Mermaid diagrams must match
+  # what it renders: those diagrams are pages of the published site, so drift
+  # is a docs bug, gated here via the reusable CALM workflow.
+  calm:
+    name: 🏛️ CALM gate
+    uses: ./.github/workflows/calm.yaml
+
+  build:
+    name: 📚 Build documentation
+    needs: [calm]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # git-revision-date-localized needs full history for page dates
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.11'
+
+      - name: Install Poetry (hash-pinned; Scorecard Pinned-Dependencies)
+        # Bump the version in .github/requirements/poetry.in and regenerate with:
+        #   uv pip compile --python-version 3.11 --python-platform linux --generate-hashes \
+        #     --output-file=.github/requirements/poetry.txt .github/requirements/poetry.in
+        run: |
+          python3 -m pip install --user --require-hashes -r .github/requirements/poetry.txt
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Configure Poetry
+        run: poetry config virtualenvs.in-project true
+
+      - name: Cache Poetry dependencies
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .venv
+          key: ${{ runner.os }}-poetry-${{ hashFiles('poetry.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-poetry-
+
+      - name: Build documentation
+        run: make docs
+
+      # Pages setup + artifact upload only when this run can deploy: a push to
+      # main, or a manual dispatch. PR runs build the site to prove it compiles
+      # cleanly (strict mode: broken links fail) but never produce an artifact.
+      - name: Setup Pages
+        if: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' }}
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+
+      - name: Upload Pages artifact
+        if: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' }}
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: site
+
+  deploy:
+    name: 🚀 Deploy to GitHub Pages
+    if: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' }}
+    needs: build
+    runs-on: ubuntu-latest
+    # Job-level escalation (top level stays contents: read): deploying to
+    # Pages requires the pages scope plus an OIDC token for the deployment.
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
