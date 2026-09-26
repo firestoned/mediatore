@@ -19,3 +19,6 @@ Full rules, adapted from banlieue, live in `.claude/rules/`:
 - `rules/threat-modeling.md` — full pass over `docs/security/threat-model.md` after every implemented ADR; the header stamp is the deliverable.
 - `rules/github-workflows.md` — Makefile-driven workflows, firestoned/github-actions composites, SHA pinning, `workflow_call`.
 - `rules/no-real-infrastructure.md` — public repo; placeholders only, sweep the diff before finishing.
+- Roadmaps: status board in `ROADMAPS.md`, detail docs in `.github/community/NN-name.md`
+  (lowercase-hyphen, contiguous from 00; renumbering fixes every `roadmap NN` reference in
+  the same commit). Update the board row in the same commit that changes an item's state.
