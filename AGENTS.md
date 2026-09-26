@@ -1,3 +1,6 @@
+<!-- Copyright (c) 2026 Erick Bourgeois, mediatore -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # Working on mediatore
 
 - Read `docs/adr` first. A change to a trust boundary, token shape, SPIFFE ID scheme or storage

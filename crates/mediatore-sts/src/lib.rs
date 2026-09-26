@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Erick Bourgeois, mediatore
+// SPDX-License-Identifier: Apache-2.0
+
 //! mediatore as a Security Token Service.
 //!
 //! Used when the upstream `IdP` cannot delegate (Dex + GitHub in a homelab), and optionally at

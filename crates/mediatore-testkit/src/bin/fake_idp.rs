@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Erick Bourgeois, mediatore
+// SPDX-License-Identifier: Apache-2.0
+
 //! fake-idp: a stand-in OIDC issuer for driving a `dev_mode` mediatore by hand.
 //!
 //! `fake-idp serve` runs the issuer; `fake-idp token` prints a login token signed with the

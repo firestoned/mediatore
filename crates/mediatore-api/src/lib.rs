@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Erick Bourgeois, mediatore
+// SPDX-License-Identifier: Apache-2.0
+
 //! HTTP surface.
 //!
 //! Two routers, meant to be served on two listeners:

@@ -1,3 +1,6 @@
+<!-- Copyright (c) 2026 Erick Bourgeois, mediatore -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # ADR-0002: mediatore is a separate project, not a banlieue crate
 
 **Status:** Accepted · **Date:** 2026-09-26

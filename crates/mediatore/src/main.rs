@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Erick Bourgeois, mediatore
+// SPDX-License-Identifier: Apache-2.0
+
 //! mediatore: identity broker for banlieue sandbox VMs.
 
 mod config;

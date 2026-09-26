@@ -1,0 +1,108 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+#
+# Dependabot auto-merge, following banlieue's design:
+#   - the e2e gate (reusable e2e.yaml) must pass before anything merges;
+#   - patch / minor -> enable auto-merge (squash);
+#   - major -> leave OPEN and comment for manual review; a human approval
+#     re-triggers this workflow and counts as the sign-off;
+#   - any failure leaves the PR untouched. Fail-safe: this workflow can only
+#     ever ENABLE a merge on an explicit green run.
+#
+# Prerequisite (repo settings): Settings > General > "Allow auto-merge".
+
+name: Dependabot Auto-merge
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  pull_request_review:
+    types: [submitted]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dependabot-automerge-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  metadata:
+    name: Fetch Dependabot metadata
+    # Gate on the PR author (stable for the PR's life), not github.actor.
+    # On review events, only an approval is a merge signal.
+    if: >-
+      github.event.pull_request.user.login == 'dependabot[bot]'
+      && (github.event_name != 'pull_request_review'
+          || github.event.review.state == 'approved')
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    outputs:
+      update-type: ${{ steps.meta.outputs.update-type }}
+      auto-merge: ${{ steps.classify.outputs.auto-merge }}
+    steps:
+      - name: Fetch metadata
+        id: meta
+        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # The single place that decides "may this merge itself?":
+      # patch/minor yes; a human approval yes (it IS the manual review a held
+      # major was waiting for); everything else holds.
+      - name: Classify
+        id: classify
+        env:
+          UPDATE_TYPE: ${{ steps.meta.outputs.update-type }}
+          EVENT: ${{ github.event_name }}
+          REVIEW_STATE: ${{ github.event.review.state }}
+        run: |
+          allow=false
+          case "$UPDATE_TYPE" in
+            version-update:semver-patch|version-update:semver-minor) allow=true ;;
+          esac
+          if [ "$EVENT" = "pull_request_review" ] && [ "$REVIEW_STATE" = "approved" ]; then
+            allow=true
+          fi
+          echo "auto-merge=$allow" >> "$GITHUB_OUTPUT"
+
+  # The gate: the full dev-mode loop must pass before anything self-merges.
+  gate:
+    name: E2E gate
+    needs: [metadata]
+    uses: ./.github/workflows/e2e.yaml
+    permissions:
+      contents: read
+
+  auto-merge:
+    name: Enable auto-merge
+    needs: [metadata, gate]
+    if: needs.metadata.outputs.auto-merge == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Enable auto-merge (squash)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: gh pr merge --auto --squash "$PR_URL"
+
+  hold-major:
+    name: Hold major for review
+    needs: [metadata, gate]
+    if: needs.metadata.outputs.auto-merge != 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          UPDATE_TYPE: ${{ needs.metadata.outputs.update-type }}
+        run: |
+          gh pr comment "$PR_URL" --body \
+            "Held for manual review (update-type: \`$UPDATE_TYPE\`). The e2e gate passed; approving this PR will enable auto-merge."

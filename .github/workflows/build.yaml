@@ -1,0 +1,327 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+#
+# Build gate: license headers, signed commits, fmt, clippy, tests, cargo-audit,
+# cargo-deny, the server + guest binaries with CycloneDX SBOMs, and the server
+# container image (SBOM'd, Cosign-signed and provenance-attested on push/release).
+#
+# Mirrors banlieue's build.yaml at mediatore's scale. Deliberately not ported yet:
+# the grype/VEX triage loop and the SLSA generator (they depend on banlieue-vex
+# tooling); revisit at the first release. All logic lives in Makefile targets
+# (.claude/rules/github-workflows.md); jobs only install tools and call make.
+#
+# NOTE: no `paths:` filter — a required check that never triggers blocks the PR
+# forever (banlieue roadmap 16 #1). This repo is small enough to always build.
+
+name: Build
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+  release:
+    types:
+      - published
+  # Reusable: a release pipeline can call the whole gate.
+  workflow_call:
+
+# Top-level GITHUB_TOKEN is read-only (OpenSSF Scorecard Token-Permissions).
+# Jobs that push images, sign or attest declare elevated scopes themselves.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ───────────────────────────────────────────────────────────────────────────
+  # License headers — every file type, every PR.
+  # ───────────────────────────────────────────────────────────────────────────
+  license-check:
+    name: ⚖️ Verify SPDX License Headers
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Check license headers
+        uses: firestoned/github-actions/security/license-check@d0d51c638a90bffc2a1567fe7af112b37fe8854c # v1.3.7
+        with:
+          copyright-holder: "Erick Bourgeois, mediatore"
+          license-id: "Apache-2.0"
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Commit signatures — verify-mode differs by event type.
+  # ───────────────────────────────────────────────────────────────────────────
+  verify-commits:
+    name: 🔐 Verify Signed Commits
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Verify commits (PR)
+        if: github.event_name == 'pull_request'
+        uses: firestoned/github-actions/security/verify-signed-commits@d0d51c638a90bffc2a1567fe7af112b37fe8854c # v1.3.7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          base-ref: origin/${{ github.base_ref }}
+          verify-mode: pr
+
+      - name: Verify commits (push to main)
+        if: github.event_name == 'push'
+        uses: firestoned/github-actions/security/verify-signed-commits@d0d51c638a90bffc2a1567fe7af112b37fe8854c # v1.3.7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          verify-mode: push
+
+      - name: Verify commits (release)
+        if: github.event_name == 'release'
+        uses: firestoned/github-actions/security/verify-signed-commits@d0d51c638a90bffc2a1567fe7af112b37fe8854c # v1.3.7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          verify-mode: release
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Formatting + clippy.
+  # ───────────────────────────────────────────────────────────────────────────
+  format:
+    name: 🎨 Check Formatting
+    runs-on: ubuntu-latest
+    needs: [license-check, verify-commits]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable (moving ref — re-pin quarterly)
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: make fmt-check
+
+  clippy:
+    name: 📎 Clippy
+    runs-on: ubuntu-latest
+    needs: [format]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable (moving ref — re-pin quarterly)
+        with:
+          components: clippy
+
+      - name: Cache cargo dependencies
+        uses: firestoned/github-actions/rust/cache-cargo@d0d51c638a90bffc2a1567fe7af112b37fe8854c # v1.3.7
+
+      - name: Run clippy
+        run: make lint
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Tests — the whole workspace, dev-mode e2e included.
+  # ───────────────────────────────────────────────────────────────────────────
+  test:
+    name: 🧪 Test
+    runs-on: ubuntu-latest
+    needs: [license-check, verify-commits]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable (moving ref — re-pin quarterly)
+
+      - name: Cache cargo dependencies
+        uses: firestoned/github-actions/rust/cache-cargo@d0d51c638a90bffc2a1567fe7af112b37fe8854c # v1.3.7
+
+      - name: Run tests
+        run: make test
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Security scans — cargo-audit + cargo-deny.
+  # ───────────────────────────────────────────────────────────────────────────
+  security:
+    name: 🛡️ Security Vulnerability Scan
+    runs-on: ubuntu-latest
+    needs: [verify-commits]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable (moving ref — re-pin quarterly)
+
+      - name: Run security scan
+        uses: firestoned/github-actions/rust/security-scan@d0d51c638a90bffc2a1567fe7af112b37fe8854c # v1.3.7
+        with:
+          cargo-audit-version: "0.22.0"
+
+  cargo-deny:
+    name: 🧪 cargo-deny (License + Advisory + Sources)
+    runs-on: ubuntu-latest
+    needs: [verify-commits]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Run cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          log-level: warn
+          command: check
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Guest binaries — static musl, the artifacts banlieue-imagebuilder bakes in.
+  # ───────────────────────────────────────────────────────────────────────────
+  guest:
+    name: 🦀 Guest Binaries (musl)
+    runs-on: ubuntu-latest
+    needs: [test]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable (moving ref — re-pin quarterly)
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install musl tools
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
+
+      - name: Cache cargo dependencies
+        uses: firestoned/github-actions/rust/cache-cargo@d0d51c638a90bffc2a1567fe7af112b37fe8854c # v1.3.7
+
+      - name: Build guest binaries
+        run: make guest
+
+      - name: Generate CycloneDX SBOM
+        run: make sbom
+
+      - name: Stage SBOMs next to the binaries
+        run: |
+          find . -name "*.cdx.json" -not -path './target/*' -exec mv {} target/x86_64-unknown-linux-musl/release/ \; || true
+
+      - name: Upload guest binaries
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: guest-binaries-linux-amd64
+          path: |
+            target/x86_64-unknown-linux-musl/release/mediatore-guest
+            target/x86_64-unknown-linux-musl/release/sandbox-token
+            target/x86_64-unknown-linux-musl/release/*.cdx.json
+          if-no-files-found: error
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Server image — builds on every event, pushes + signs + SBOMs on non-PR.
+  # linux/amd64 only for now: arm64 follows banlieue's staged-binary pattern
+  # once there is a release to justify it.
+  # ───────────────────────────────────────────────────────────────────────────
+  docker:
+    name: 🐳 Server Image
+    runs-on: ubuntu-latest
+    needs: [test, clippy]
+    permissions:
+      contents: read
+      packages: write # GHCR push (non-PR only)
+      id-token: write # keyless Cosign
+    outputs:
+      digest: ${{ steps.docker_build.outputs.digest }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Docker (login + buildx)
+        uses: firestoned/github-actions/docker/setup-docker@d0d51c638a90bffc2a1567fe7af112b37fe8854c # v1.3.7
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ghcr.io/${{ github.repository }}
+          flavor: |
+            latest=false
+          tags: |
+            type=ref,event=pr
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable=${{ github.event_name == 'push' }}
+            type=semver,pattern={{version}},enable=${{ github.event_name == 'release' }}
+            type=semver,pattern={{major}}.{{minor}},enable=${{ github.event_name == 'release' }}
+
+      - name: Build and push
+        id: docker_build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          sbom: true
+          provenance: true
+
+      - name: Install Cosign
+        if: github.event_name != 'pull_request'
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Cosign sign (keyless, by digest)
+        if: github.event_name != 'pull_request'
+        run: cosign sign --yes "ghcr.io/${{ github.repository }}@${{ steps.docker_build.outputs.digest }}"
+
+      - name: Generate image SBOM
+        if: github.event_name != 'pull_request'
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        with:
+          image: ghcr.io/${{ github.repository }}@${{ steps.docker_build.outputs.digest }}
+          format: cyclonedx-json
+          output-file: docker-sbom.json
+          upload-release-assets: false
+
+      - name: Upload image SBOM artifact
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: docker-sbom
+          path: docker-sbom.json
+          if-no-files-found: error
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Attest — GitHub build-provenance attestation for the pushed image.
+  # ───────────────────────────────────────────────────────────────────────────
+  attest:
+    name: 🔏 Attest Image
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    needs: [docker]
+    permissions:
+      id-token: write
+      attestations: write
+      packages: write
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ needs.docker.outputs.digest }}
+          push-to-registry: true

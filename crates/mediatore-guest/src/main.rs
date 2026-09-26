@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Erick Bourgeois, mediatore
+// SPDX-License-Identifier: Apache-2.0
+
 //! mediatore-guest: turns a bound banlieue claim into a jailed, identity-bearing workload.
 //!
 //! State machine (runbook Part 6.1):

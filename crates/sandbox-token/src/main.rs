@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Erick Bourgeois, mediatore
+// SPDX-License-Identifier: Apache-2.0
+
 //! sandbox-token: `sandbox-token --audience <aud>` prints a bearer token for that audience.
 //!
 //! Runs inside the jail as the sandbox user. Fetches the claim SVID from the Workload API

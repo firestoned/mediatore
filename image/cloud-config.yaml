@@ -1,4 +1,7 @@
 #cloud-config
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+
 # Fragment merged into the pool image's Kairos config. Nothing here is claim-specific.
 stages:
   initramfs:

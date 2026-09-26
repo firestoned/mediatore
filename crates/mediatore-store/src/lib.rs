@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Erick Bourgeois, mediatore
+// SPDX-License-Identifier: Apache-2.0
+
 //! Persistence boundary for mediatore.
 //!
 //! The server only ever talks to [`ClaimStore`]; `MemoryStore` is for tests and single-node

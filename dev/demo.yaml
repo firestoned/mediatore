@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+
 # Config for dev/demo.sh: the homelab shape, with fake-idp standing in for Dex.
 trust_domain: sandbox.home.example
 dev_mode: true

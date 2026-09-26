@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+
 # Front-to-back dev-mode demo of the mediatore loop, runbook Part 8 shape:
 #
 #   fake IdP login -> POST /v1/claims -> bind to a registered node -> GET /v1/me

@@ -1,3 +1,6 @@
+<!-- Copyright (c) 2026 Erick Bourgeois, mediatore -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # ADR-0001: Record architecture decisions
 
 **Status:** Accepted · **Date:** 2026-09-26

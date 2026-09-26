@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Erick Bourgeois, mediatore
+// SPDX-License-Identifier: Apache-2.0
+
 //! SPIRE server API boundary.
 //!
 //! mediatore creates exactly two kinds of registration entry:
@@ -15,7 +18,7 @@ use uuid::Uuid;
 /// Trust domain plus the path prefixes we own.
 #[derive(Debug, Clone)]
 pub struct Naming {
-    /// e.g. `sandbox.rbc.internal`
+    /// e.g. `sandbox.example`
     pub trust_domain: String,
 }
 
