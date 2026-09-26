@@ -5,7 +5,7 @@
 
 > `docs/security/threat-model.md` is a living document and the **last step of the ADD
 > cycle**. After implementing any ADR, walk **every** section — components, assets,
-> actors, trust boundaries (including the ASCII diagram), STRIDE tables, hardening,
+> actors, trust boundaries (including the Mermaid diagram), STRIDE tables, hardening,
 > accepted risks — not just the table that obviously changed.
 
 ## Requirements for a pass
@@ -15,7 +15,7 @@
    *Revisit when*, or a finding to fix before the ADR counts as implemented. Never
    write a control that does not exist yet as though it does.
 2. Classify with STRIDE, per trust boundary, in the existing table format.
-3. Update the ASCII trust-boundary diagram when components or boundaries change.
+3. Update the Mermaid trust-boundary diagram when components or boundaries change.
 4. **Bump the header stamp** — date *and* ADR range
    (`Last full pass YYYY-MM-DD, against ADR-0001 … ADR-NNNN`). An unchanged stamp
    means the pass did not happen. "No change" is a valid conclusion, but it is still

@@ -82,26 +82,37 @@ holds three things an attacker wants:
 
 ## 5. Trust boundaries
 
-```text
-                 (TB-1) bearer HTTPS                (TB-2) Kubernetes API
-  Sandbox User ──────────────► mediatore ◄──────────────► banlieue / VAP
-       │                      │  user API │ watcher
-       │ OIDC login           │           │ (TB-3) SPIRE admin gRPC
-       ▼                      │           ▼
-  IdP (Entra/Dex) ◄───────────┘      SPIRE Server (downstream)
-   (TB-5) JWKS / OBO                      ▲        │ intermediate CA
-                                          │        ▼ (enterprise only)
-                                          │   SPIRE Root ── HSM/PKI
-                                          │   [identity cluster, ADR-0005]
-                                          │ (TB-4) TPM node attestation
-  ┌─── sandbox network segment ───────────┼──────────────────────────────┐
-  │  Pool VM:  spire-agent ───────────────┘                              │
-  │            mediatore-guest ──(TB-6) mTLS──► mediatore sandbox API    │
-  │            ┌─jail (nsjail)─┐                                         │
-  │            │  workload ────┼──(TB-6) mTLS──► POST /v1/token          │
-  │            │               ┼──(TB-7)──────► downstream APIs          │
-  │            └───────────────┘                                         │
-  └──────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+  user(["Sandbox user"])
+  idp["IdP (Entra / Dex)"]
+  mediatore["mediatore<br/>(user API + sandbox API)"]
+  banlieue["banlieue / VAP<br/>(Kubernetes API)"]
+  spire["SPIRE server (downstream)"]
+  root["SPIRE root<br/>[identity cluster, ADR-0005]"]
+  hsm["HSM / corp PKI"]
+  apis["downstream APIs"]
+
+  user -- "(TB-1) bearer HTTPS" --> mediatore
+  user -- "OIDC login" --> idp
+  mediatore -- "(TB-5) JWKS / OBO" --> idp
+  mediatore <-- "(TB-2) Kubernetes API: claims, watcher" --> banlieue
+  mediatore -- "(TB-3) SPIRE admin gRPC" --> spire
+  root -- "intermediate CA (enterprise only)" --> spire
+  root --- hsm
+
+  subgraph vm ["sandbox network segment: pool VM"]
+    agent["spire-agent"]
+    guest["mediatore-guest"]
+    subgraph jail ["jail (nsjail)"]
+      workload["workload"]
+    end
+  end
+
+  agent -- "(TB-4) TPM node attestation" --> spire
+  guest -- "(TB-6) mTLS" --> mediatore
+  workload -- "(TB-6) mTLS: POST /v1/token" --> mediatore
+  workload -- "(TB-7) issued token only" --> apis
 ```
 
 - **TB-1** user ↔ mediatore user API (bearer token over HTTPS)
