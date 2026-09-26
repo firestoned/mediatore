@@ -27,8 +27,11 @@ updates:
     cooldown:
       default-days: 7
     groups:
-      cargo-minor-patch:
-        update-types: ["minor", "patch"]
+      # One PR for everything. Majors are included deliberately: cargo treats a
+      # 0.x -> 0.y bump as major, so a minor/patch-only group leaves most of
+      # this workspace's pre-1.0 crates as individual PRs.
+      cargo:
+        patterns: ["*"]
 
   # Container base images (Dockerfile FROM lines).
   - package-ecosystem: "docker"
@@ -37,3 +40,6 @@ updates:
       interval: "weekly"
     cooldown:
       default-days: 7
+    groups:
+      docker:
+        patterns: ["*"]
