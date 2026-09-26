@@ -1,0 +1,152 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+#
+# mediatore documentation, MkDocs Material. The source is the existing docs/
+# tree in place (docs_dir below), so the paths the project rules reference
+# (docs/adr, docs/security/threat-model.md, docs/architecture) stay canonical.
+
+site_name: mediatore, identity broker for banlieue sandbox VMs
+site_url: https://firestoned.github.io/mediatore/
+site_description: >-
+  A trusted go-between for banlieue sandbox VMs: a person's login at the front,
+  an attested virtual machine at the back, bound to each other before anything
+  inside the VM can act on that person's behalf.
+site_author: Erick Bourgeois
+
+repo_url: https://github.com/firestoned/mediatore
+repo_name: firestoned/mediatore
+edit_uri: edit/main/docs/
+
+docs_dir: docs
+site_dir: site
+
+# CALM sources are architecture-as-code inputs, not pages; the rendered
+# Mermaid diagrams under docs/architecture/diagrams/ are the published half.
+exclude_docs: |
+  architecture/calm/
+
+copyright: Copyright &copy; 2026 Erick Bourgeois
+
+theme:
+  name: material
+  language: en
+  palette:
+    # Light mode
+    - scheme: default
+      primary: teal
+      accent: teal
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    # Dark mode
+    - scheme: slate
+      primary: teal
+      accent: teal
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  font:
+    text: Roboto
+    code: Roboto Mono
+  features:
+    - navigation.instant
+    - navigation.instant.progress
+    - navigation.tracking
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - navigation.sections
+    - navigation.expand
+    - navigation.path
+    - navigation.indexes
+    - navigation.top
+    - toc.follow
+    - search.suggest
+    - search.highlight
+    - search.share
+    - content.code.copy
+    - content.code.annotate
+    - content.tabs.link
+    - content.tooltips
+  icon:
+    repo: fontawesome/brands/github
+    edit: material/pencil
+    view: material/eye
+
+plugins:
+  - search:
+      lang: en
+      separator: '[\s\-,:!=\[\]()"/]+|(?!\b)(?=[A-Z][a-z])|\.(?!\d)|&[lg]t;'
+  - git-revision-date-localized:
+      # Creation dates stay off: a page that is new in the working tree has no
+      # git log yet, and the plugin's creation-date probe warns on it, which
+      # would fail the --strict build (kept for its broken-link checking).
+      enable_creation_date: false
+      type: timeago
+      fallback_to_build_date: true
+      enable_git_follow: false
+      strict: false
+
+markdown_extensions:
+  # Python Markdown
+  - abbr
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+      permalink_title: Anchor link to this section
+      toc_depth: 3
+  # PyMdown Extensions
+  - pymdownx.betterem:
+      smart_enable: all
+  - pymdownx.caret
+  - pymdownx.details
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.keys
+  - pymdownx.mark
+  - pymdownx.smartsymbols
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+      combine_header_slug: true
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - pymdownx.tilde
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/firestoned/mediatore
+      name: mediatore on GitHub
+  generator: true
+
+nav:
+  - Home: index.md
+  - Guides:
+      - Running workloads on a claimed VM: guides/running-workloads.md
+      - Enterprise SPIRE topology: guides/enterprise-spire-topology.md
+  - Architecture:
+      - System: architecture/diagrams/system.md
+      - Flows: architecture/diagrams/flows.md
+  - ADRs:
+      - "ADR-0001: Record architecture decisions": adr/0001-record-architecture-decisions.md
+      - "ADR-0002: A separate project, not a banlieue crate": adr/0002-separate-project-from-banlieue.md
+      - "ADR-0003: Two token backends, chosen per audience": adr/0003-token-backends.md
+      - "ADR-0004: SPIFFE identity scheme": adr/0004-spiffe-identity-scheme.md
+      - "ADR-0005: SPIRE topology": adr/0005-spire-topology.md
+  - Security:
+      - Threat model: security/threat-model.md
