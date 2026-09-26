@@ -12,6 +12,7 @@
 
 [![Build](https://github.com/firestoned/mediatore/actions/workflows/build.yaml/badge.svg?branch=main)](https://github.com/firestoned/mediatore/actions/workflows/build.yaml)
 [![E2E](https://github.com/firestoned/mediatore/actions/workflows/e2e.yaml/badge.svg?branch=main)](https://github.com/firestoned/mediatore/actions/workflows/e2e.yaml)
+[![Documentation](https://github.com/firestoned/mediatore/actions/workflows/docs.yaml/badge.svg?branch=main)](https://firestoned.github.io/mediatore/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 ![Rust](https://img.shields.io/badge/rust-1.96%2B-orange.svg?logo=rust)
 

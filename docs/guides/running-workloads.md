@@ -215,7 +215,7 @@ Because nothing inbound reaches the VM, pick one of:
 - Roadmap 01 makes the SVID legs real (mTLS); 02 gives VMs a real SPIRE server to
   attest to; 03 makes the claim a real `VirtualMachineClaim`; 04 turns on OBO
   (paths B and C at work) and Dex refresh (homelab); 06 adds the OCI unpack and the
-  egress allowlist. See [`ROADMAPS.md`](../../ROADMAPS.md).
+  egress allowlist. See [`ROADMAPS.md`](https://github.com/firestoned/mediatore/blob/main/ROADMAPS.md).
 - Threat model: the exfiltration window of the 15-minute in-workload token is
   accepted risk R-3; the dial-out pattern narrows what a leaked token can do
   (one audience), and roadmap 07 is the design that removes the window entirely.
