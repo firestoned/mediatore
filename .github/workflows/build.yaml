@@ -49,7 +49,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Check license headers
-        uses: firestoned/github-actions/security/license-check@d0d51c638a90bffc2a1567fe7af112b37fe8854c # v1.3.7
+        uses: firestoned/github-actions/security/license-check@787be16a6bed7e6c2297683bb75bc9b5f1a54397 # v1.3.8
         with:
           copyright-holder: "Erick Bourgeois, mediatore"
           license-id: "Apache-2.0"
@@ -68,7 +68,7 @@ jobs:
 
       - name: Verify commits (PR)
         if: github.event_name == 'pull_request'
-        uses: firestoned/github-actions/security/verify-signed-commits@d0d51c638a90bffc2a1567fe7af112b37fe8854c # v1.3.7
+        uses: firestoned/github-actions/security/verify-signed-commits@787be16a6bed7e6c2297683bb75bc9b5f1a54397 # v1.3.8
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           base-ref: origin/${{ github.base_ref }}
@@ -76,14 +76,14 @@ jobs:
 
       - name: Verify commits (push to main)
         if: github.event_name == 'push'
-        uses: firestoned/github-actions/security/verify-signed-commits@d0d51c638a90bffc2a1567fe7af112b37fe8854c # v1.3.7
+        uses: firestoned/github-actions/security/verify-signed-commits@787be16a6bed7e6c2297683bb75bc9b5f1a54397 # v1.3.8
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           verify-mode: push
 
       - name: Verify commits (release)
         if: github.event_name == 'release'
-        uses: firestoned/github-actions/security/verify-signed-commits@d0d51c638a90bffc2a1567fe7af112b37fe8854c # v1.3.7
+        uses: firestoned/github-actions/security/verify-signed-commits@787be16a6bed7e6c2297683bb75bc9b5f1a54397 # v1.3.8
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           verify-mode: release
@@ -121,7 +121,7 @@ jobs:
           components: clippy
 
       - name: Cache cargo dependencies
-        uses: firestoned/github-actions/rust/cache-cargo@d0d51c638a90bffc2a1567fe7af112b37fe8854c # v1.3.7
+        uses: firestoned/github-actions/rust/cache-cargo@787be16a6bed7e6c2297683bb75bc9b5f1a54397 # v1.3.8
 
       - name: Run clippy
         run: make lint
@@ -141,7 +141,7 @@ jobs:
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable (moving ref — re-pin quarterly)
 
       - name: Cache cargo dependencies
-        uses: firestoned/github-actions/rust/cache-cargo@d0d51c638a90bffc2a1567fe7af112b37fe8854c # v1.3.7
+        uses: firestoned/github-actions/rust/cache-cargo@787be16a6bed7e6c2297683bb75bc9b5f1a54397 # v1.3.8
 
       - name: Run tests
         run: make test
@@ -161,7 +161,7 @@ jobs:
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable (moving ref — re-pin quarterly)
 
       - name: Run security scan
-        uses: firestoned/github-actions/rust/security-scan@d0d51c638a90bffc2a1567fe7af112b37fe8854c # v1.3.7
+        uses: firestoned/github-actions/rust/security-scan@787be16a6bed7e6c2297683bb75bc9b5f1a54397 # v1.3.8
         with:
           cargo-audit-version: "0.22.0"
 
@@ -199,7 +199,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
 
       - name: Cache cargo dependencies
-        uses: firestoned/github-actions/rust/cache-cargo@d0d51c638a90bffc2a1567fe7af112b37fe8854c # v1.3.7
+        uses: firestoned/github-actions/rust/cache-cargo@787be16a6bed7e6c2297683bb75bc9b5f1a54397 # v1.3.8
 
       - name: Build guest binaries
         run: make guest
@@ -241,7 +241,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Docker (login + buildx)
-        uses: firestoned/github-actions/docker/setup-docker@d0d51c638a90bffc2a1567fe7af112b37fe8854c # v1.3.7
+        uses: firestoned/github-actions/docker/setup-docker@787be16a6bed7e6c2297683bb75bc9b5f1a54397 # v1.3.8
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -284,7 +284,7 @@ jobs:
 
       - name: Generate image SBOM
         if: github.event_name != 'pull_request'
-        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           image: ghcr.io/${{ github.repository }}@${{ steps.docker_build.outputs.digest }}
           format: cyclonedx-json
