@@ -1,0 +1,12 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+#
+# The kind cluster the live tests run against (`make kind-up`). One node is enough:
+# SPIRE server, controller manager, one agent and the CSI driver all fit, and the
+# entries tests never schedule a workload. Kubernetes version comes from
+# KIND_NODE_IMAGE in the Makefile (same minor as the measured homelab cluster).
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: mediatore
+nodes:
+  - role: control-plane

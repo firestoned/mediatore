@@ -39,32 +39,49 @@ dependency) for the entries. No `tonic`/`prost` of our own, no vendored protos.
 
 ## Entries (ADR-0006)
 
-- [ ] `EntryManager` trait: drop `list_agents` and `Agent`; `ensure_node_entry(ek_hash)`
-      and `create_claim_entry(ek_hash, claim_uid, unix_user)` return an entry handle
-      (resource name); `delete_entry(name)` idempotent on 404
-- [ ] `KubeEntryManager` in `mediatore-spire`: deterministic names
-      (`mediatore-node-<ek>`, `mediatore-claim-<uid>`), labels, `className` from
-      `spire.entries.class_name`, tolerate 409 on create; wait for `status.set && !masked`
-      with `spire.entries.ready_timeout` (default 30 s), `masked` fails the claim
-- [ ] EK hash from PEM: parse the certificate, DER-encode the SubjectPublicKeyInfo,
-      hex SHA-256 (`mediatore-proto`); unit test against a fixture whose hash was produced
-      by `openssl pkey -pubin -outform der | sha256sum` (the guest's computation) and
-      cross-checked against the tpm plugin's `GetPubHash`
-- [ ] Node entry trigger: `VirtualMachine.status.tpmEndorsementCertificates` (or the
-      claim mirror) observed by the watcher; no certificate, no entry, no pool membership
-- [ ] Orphan sweep on the leader at the resync interval (label selector
-      `app.kubernetes.io/managed-by=mediatore`)
-- [ ] Tests: kube-rs `tower-test` mock API server driving create/409/404 and the
-      `status.set` / `status.masked` transitions; e2e over the mock; VAP exercised by
-      `make live-admission-test` (server-side `kubectl apply` of allowed and refused
-      shapes with `--as=system:serviceaccount:banlieue-system:mediatore`, `#[ignore]`d
-      until roadmap 02's cluster target exists and failing loudly without it)
-- [ ] `spire.endpoint` (ADR-0005) never implemented; config gains `spire.entries.*`
+- [x] `EntryManager` trait: `list_agents` and `Agent` dropped; `ensure_node_entry(ek_hash)`
+      and `create_claim_entry(ek_hash, claim_uid, unix_user)` return the resource name;
+      `delete_entry(name)` idempotent on 404; `list_entries()` for the sweep.
+      `Noop` replaced by `MemoryEntries`, which validates inputs exactly like the real
+      thing and remembers declarations so tests can assert retraction
+- [x] `KubeEntryManager` (`crates/mediatore-spire/src/kube.rs`): deterministic names,
+      labels, `className` from `spire.entries.class_name`, 409 tolerated, 403 surfaced as
+      `Denied`; waits for `status.set && !masked` by polling (`poll_interval_ms`, default
+      500 ms) with `ready_timeout_secs` (default 30 s); `masked` fails the claim; inputs
+      that admission would refuse are refused before any request
+- [x] EK hash from PEM (`mediatore_proto::ek`): certificate parsed, SubjectPublicKeyInfo
+      DER-encoded, hex SHA-256; `ek_hash_from_pems` picks the RSA EK among what banlieue
+      published; fixtures hashed with the guest's pipeline
+      (`openssl pkey -pubin -outform der | sha256sum`), matching the tpm plugin's
+      `GetPubHash` (`x509.MarshalPKIXPublicKey`)
+- [ ] Node entry trigger: the function side exists (`ek_hash_from_pems` +
+      `ensure_node_entry`); the `VirtualMachine` watch that calls it when
+      `status.tpmEndorsementCertificates` appears lands with the claim watcher
+      (roadmap 03, `banlieue-api` pin). No certificate, no entry, no pool membership
+- [x] Orphan sweep: `Reconciler::sweep_orphans` retracts claim entries whose claim is
+      unknown or revoked and leaves node entries alone; scheduling it on the leader at the
+      resync interval is part of roadmap 03's loop
+- [x] Tests: scripted fake API server (`tower-test`) covering create, 409, 403, poll until
+      set, masked, timeout, delete 404 and list by label; reconciler bind/release/sweep
+      over `MemoryEntries`; e2e runs on `MemoryEntries` with a 64-hex EK hash
+- [x] Live admission test: `make live-admission-test` runs the full round trip as
+      `system:serviceaccount:banlieue-system:mediatore` against a real cluster (declare, 409,
+      wait, list, eleven refused shapes, RBAC refusing update and patch, retract);
+      `#[ignore]`d, fails loudly without its fixture. First run found that `status.set` is a
+      transient, which turned the poll into a watch (ADR-0006 decision 5)
+- [x] kind tier: `make kind-e2e` installs the homelab's chart versions into a kind cluster,
+      applies `deploy/base`'s ServiceAccount, RBAC and policy, and runs the live suite as a
+      token for that ServiceAccount; `make kind-e2e-ci` is the E2E workflow's second job.
+      Tiers and what each proves: `docs/guides/testing.md`
+- [x] `spire.endpoint` (ADR-0005) never implemented; config gains `spire.workload_api_socket`
+      and `spire.entries.{class_name, kubeconfig, ready_timeout_secs, claim_svid_ttl}`,
+      required outside `dev_mode`
 
 ## Identity and mTLS (ADR-0007)
 
-- [ ] `aws-lc-rs` as the process-wide rustls provider; `reqwest`/`kube` on their
-      no-provider features; acceptance: `cargo tree -i ring` is empty (R-8 revisit)
+- [x] `aws-lc-rs` as the process-wide rustls provider, installed first thing in each
+      binary; `reqwest` and `kube` on their no-provider features; `cargo deny` bans `ring`
+      (R-8 revisit happens in the closing threat-model pass)
 - [ ] `X509Source` from `spire.workload_api_socket`; startup fails closed without it
       outside `dev_mode`
 - [ ] Sandbox listener: `spiffe-rustls` server config, TLS 1.3, client cert required,
@@ -76,6 +93,9 @@ dependency) for the entries. No `tonic`/`prost` of our own, no vendored protos.
       `dev` cargo feature, off in release builds
 - [ ] `mediatore-testkit`: test CA minting SPIFFE X.509 SVIDs + in-memory source; e2e
       gains the mTLS variant and the negative cases from ADR-0007 decision 8
+- [ ] kind tier for ADR-0007: the broker image in the cluster on the CSI socket with the
+      `ClusterSPIFFEID`, a client pod with a claim-shaped SVID over mTLS, the negative
+      cases; `make kind-e2e-mtls` joins `kind-e2e`
 - [ ] NetworkPolicy for the broker pods: spec in ADR-0007 decision 7, manifest lands
       with roadmap 02 (CIDRs are deployment-specific)
 

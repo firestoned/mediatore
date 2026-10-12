@@ -21,6 +21,7 @@ use axum::{Json, Router};
 use chrono::{Duration, Utc};
 use mediatore_claims::Reconciler;
 use mediatore_entra::{Validated, Validator};
+use mediatore_proto::ek::is_ek_hash;
 use mediatore_proto::{
     ClaimPhase, ClaimRequest, ClaimResponse, ErrorBody, Me, NodeRegistered, NodeRegistration,
     TokenRequest, TokenResponse,
@@ -244,7 +245,7 @@ async fn create_claim(
     // node is "Ready pool member"; binding is immediate.
     if let Some(node) = free_node(&st).await? {
         reconciler(&st)
-            .bind(uid, &node.node_id)
+            .bind(uid, &node.ek_hash)
             .await
             .map_err(|e| ApiError::internal(e.to_string()))?;
     }
@@ -332,6 +333,12 @@ async fn register_node(
     Json(reg): Json<NodeRegistration>,
 ) -> Result<Json<NodeRegistered>, ApiError> {
     let peer = peer_spiffe_id(&st, &headers)?;
+    if !is_ek_hash(&reg.ek_hash) {
+        return Err(ApiError::bad_request(
+            "invalid_ek_hash",
+            "ek_hash must be 64 lowercase hex characters",
+        ));
+    }
     let expected = st.naming.node_id(&reg.ek_hash);
     if peer != expected {
         return Err(ApiError::forbidden(format!(
@@ -364,7 +371,7 @@ async fn register_node(
             .iter()
             .filter(|c| c.entry_id.is_none() && c.revoked_at.is_none())
             .min_by_key(|c| c.created_at)
-        && let Err(e) = reconciler(&st).bind(pending.uid, &agent_id).await
+        && let Err(e) = reconciler(&st).bind(pending.uid, &reg.ek_hash).await
     {
         tracing::warn!(uid = %pending.uid, error = %e, "dev bind on registration failed");
     }

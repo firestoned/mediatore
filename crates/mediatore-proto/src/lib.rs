@@ -7,6 +7,9 @@
 //! Every type here is versioned together with [`API_VERSION`]. Breaking changes to any of
 //! them are a new API version, never a silent edit.
 
+pub mod ek;
+pub mod tls;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

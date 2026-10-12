@@ -40,6 +40,7 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    mediatore_proto::tls::ensure_provider();
     let cli = Cli::parse();
     let url = format!("{}/v1/token", cli.mediatore_url.trim_end_matches('/'));
 

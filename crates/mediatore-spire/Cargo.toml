@@ -1,6 +1,6 @@
 [package]
 name = "mediatore-spire"
-description = "SPIRE server API client boundary: registration entries for claims and node bootstrap entries"
+description = "SPIRE registration entries as ClusterStaticEntry resources (ADR-0006): the boundary, the kube implementation and an in-memory fake"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,15 +9,22 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+mediatore-proto.workspace = true
 async-trait.workspace = true
+futures.workspace = true
+kube.workspace = true
+k8s-openapi.workspace = true
 serde.workspace = true
+serde_json.workspace = true   # required by kube's CustomResource derive
 thiserror.workspace = true
+tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 
-# tonic + spire-api-sdk protos land here:
-# tonic = "0.13"
-# prost = "0.13"
+[dev-dependencies]
+tower-test.workspace = true
+http.workspace = true
+http-body-util.workspace = true
 
 [lints]
 workspace = true

@@ -121,12 +121,24 @@ certificate never gets a node entry and never joins the pool: fail closed, by co
 
 **5. mediatore waits for `status.set` before it treats an entry as existing.** A
 `ClusterStaticEntry` is a declaration; the controller manager renders it asynchronously.
-The watcher records the entry as ready only when `status.set == true` and
+The watcher records the entry as ready only when it observes `status.set == true` with
 `status.masked == false`. `masked == true` (another entry already claims the same parent,
-selectors and ID) is treated as a conflict: the claim is failed, never served. Readiness
-is observed through a watch on the resource, with a bounded wait (configuration,
-`spire.entries.ready_timeout`, default 30 s) after which the bind fails and is retried by
-the reconciler. `/v1/me` does not return a subject for a claim whose entry is not set.
+selectors and ID) is treated as a conflict: the claim is failed, never served; a status
+without `rendered` means the controller manager refused the spec and fails the claim too.
+
+`set` is transient, not a steady state (measured against controller manager 0.7.0 and
+unchanged on `main`): the reconcile pass that creates or updates the server entry writes
+`set: true`, and the next pass, which that status write itself triggers, rewrites it to
+`false` about 20 ms later, since nothing was created or updated. The steady state of a
+healthy entry is therefore `rendered: true, masked: false, set: false`, which is also what a
+failed server-side create looks like (the controller manager retries those itself). Polling
+cannot tell the two apart and cannot catch the transition, so mediatore opens a watch on the
+resource name, completes the watch's initial list, and only then creates the resource; the
+API server replays every status write from that resource version, and the `set` transition
+is the acceptance. A resource that already exists (409) and is `rendered` is accepted as
+is. The wait is bounded (`spire.entries.ready_timeout_secs`, default 30 s), after which the
+bind fails and is retried by the reconciler. `/v1/me` does not return a subject for a claim
+whose entry was never observed set.
 
 **6. Admission policy constrains what the broker's ServiceAccount may declare.** A
 `ValidatingAdmissionPolicy` (`deploy/base/admission/clusterstaticentry-mediatore.yaml`),

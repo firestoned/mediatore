@@ -18,7 +18,7 @@ IDP_URL=http://127.0.0.1:18082
 TRUST_DOMAIN=sandbox.home.example
 AUDIENCE=grafana.home.example
 GROUP=firestoned:sandbox-users
-EK_HASH=$(printf 'demo%060d' 7)
+EK_HASH=$(printf 'ec%062x' 7)   # 64 lowercase hex, the attestor's shape
 
 say()  { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 fail() { printf '\033[31mFAIL: %s\033[0m\n' "$*"; exit 1; }

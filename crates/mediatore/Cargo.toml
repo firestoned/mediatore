@@ -13,10 +13,12 @@ name = "mediatore"
 path = "src/main.rs"
 
 [dependencies]
+mediatore-proto.workspace = true
 mediatore-api.workspace = true
 mediatore-entra.workspace = true
 mediatore-sts.workspace = true
 mediatore-spire.workspace = true
+kube.workspace = true
 mediatore-store.workspace = true
 mediatore-claims.workspace = true
 tokio.workspace = true
@@ -24,7 +26,7 @@ axum.workspace = true
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-serde_yaml_ng.workspace = true
+serde-saphyr.workspace = true
 chrono.workspace = true
 anyhow.workspace = true
 tracing.workspace = true

@@ -165,7 +165,10 @@ impl Validator {
     pub fn new(issuers: Vec<IssuerConfig>) -> Self {
         Self {
             issuers,
-            http: reqwest::Client::new(),
+            http: {
+                mediatore_proto::tls::ensure_provider();
+                reqwest::Client::new()
+            },
             jwks: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -328,7 +331,10 @@ impl Obo {
         Self {
             tenant_id: tenant_id.into(),
             client_id: client_id.into(),
-            http: reqwest::Client::new(),
+            http: {
+                mediatore_proto::tls::ensure_provider();
+                reqwest::Client::new()
+            },
         }
     }
 
