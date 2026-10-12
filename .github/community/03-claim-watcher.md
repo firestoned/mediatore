@@ -14,7 +14,8 @@
       vSphere) → registered node; requeue up to 60 s then fail the claim, never guess
 - [ ] EK cross-check against `status.tpmEndorsementCertificates` (ADR-0045) when present
 - [ ] `POST /v1/claims` switches from dev-store-only to creating the CR; leader
-      election for the watcher (API stays stateless)
+      election for the watcher (API stays stateless). Under ADR-0008 the CR it creates
+      becomes an `AgentSandbox`, which owns the claim (roadmap 08)
 - [ ] banlieue side: revise ADR-0049 (SPIRE attestation supersedes quote-over-nonce;
       retire `status.nonce`) — tracked here, implemented in the banlieue repo
 - [ ] Threat model pass (TB-2 controls become real)

@@ -35,7 +35,7 @@
       "unique-id": "service-mediatore-watcher",
       "node-type": "service",
       "name": "Claim Watcher",
-      "description": "Watches VirtualMachineClaim: on Bound resolves the node by DMI UUID / EK hash and declares the claim's registration entry as a ClusterStaticEntry through the Kubernetes API, waiting for status.set before the claim is live; on Releasing/Failed/deletion deletes the resource and revokes the store row (entry first, then refresh material). Derives the node entry from the EK certificate banlieue publishes. Never holds a SPIRE admin identity (ADR-0006). crates/mediatore-claims."
+      "description": "Reconciles AgentSandbox (ADR-0008, designed): creates and owns one VirtualMachineClaim per sandbox and holds a finalizer until it is gone. Watches VirtualMachineClaim: on Bound resolves the node by DMI UUID / EK hash and declares the claim's registration entry as a ClusterStaticEntry through the Kubernetes API, waiting for status.set before the claim is live; on Releasing/Failed/deletion deletes the resource and revokes the store row (entry first, then refresh material). Derives the node entry from the EK certificate banlieue publishes. Never holds a SPIRE admin identity (ADR-0006). crates/mediatore-claims."
     },
     {
       "unique-id": "service-mediatore-sts",
@@ -44,10 +44,16 @@
       "description": "Self-issued ES256 tokens with an RFC 8693 act claim naming the claim SVID as actor; JWKS derived from the signing key and served at /.well-known/jwks.json. Used for audiences whose backend is `sts` (ADR-0003). crates/mediatore-sts."
     },
     {
+      "unique-id": "data-asset-agentsandbox-cr",
+      "node-type": "data-asset",
+      "name": "AgentSandbox resources",
+      "description": "Namespaced CRD mediatore.io/v1alpha1, served and reconciled by mediatore (ADR-0008, Proposed, not built: roadmap 08). The request for one sandbox: subject, poolRef, ttlSeconds, audiences, workload. Created by the user API on POST /v1/claims or declaratively by anything with RBAC on agentsandboxes; spec.subject is pinned to the caller by the agentsandbox-subject admission policy unless the caller is mediatore's ServiceAccount or a listed broker. Never carries a credential. Owns exactly one VirtualMachineClaim; a finalizer holds it until the claim and its ClusterStaticEntry are gone. Status mirrors the claim plus whether the entry is set."
+    },
+    {
       "unique-id": "data-asset-claim-store",
       "node-type": "data-asset",
       "name": "Claim Store",
-      "description": "Per-claim rows: subject, audiences, SPIRE entry id, node id, encrypted refresh material, revocation timestamp. In-memory in dev; PostgreSQL/SQLite via sqlx next. Refresh material is ciphertext only (OpenBao transit / age). crates/mediatore-store."
+      "description": "Per-claim rows: subject, audiences, SPIRE entry id, node id, encrypted refresh material, revocation timestamp. In-memory in dev; PostgreSQL/SQLite via sqlx next. Refresh material is ciphertext only (OpenBao transit / age). crates/mediatore-store. Under ADR-0008 the non-secret request fields move to the AgentSandbox resource; the store keeps refresh ciphertext, revocations, node records and audit rows."
     },
     {
       "unique-id": "data-asset-sts-signing-key",
@@ -159,7 +165,8 @@
             "service-mediatore-watcher",
             "service-mediatore-sts",
             "data-asset-claim-store",
-            "data-asset-sts-signing-key"
+            "data-asset-sts-signing-key",
+            "data-asset-agentsandbox-cr"
           ]
         }
       }
@@ -252,7 +259,7 @@
     },
     {
       "unique-id": "rel-user-mediatore-claims",
-      "description": "POST /v1/claims with the IdP bearer token; GET mirrors phase, DELETE releases. Subject equality is enforced on read and delete.",
+      "description": "POST /v1/claims with the IdP bearer token creates an AgentSandbox with the token's subject (ADR-0008); GET answers from its status, DELETE deletes it. Subject equality is enforced on read and delete.",
       "relationship-type": {
         "connects": {
           "source": {
@@ -282,7 +289,7 @@
     },
     {
       "unique-id": "rel-mediatore-kube-api",
-      "description": "Creates the VirtualMachineClaim with spec.subject from the validated token. The mediatore ServiceAccount is in the VAP brokers allowlist, so admission skips the caller-equals-subject check for it.",
+      "description": "Creates the VirtualMachineClaim with spec.subject from the validated token. The mediatore ServiceAccount is in the VAP brokers allowlist, so admission skips the caller-equals-subject check for it. Under ADR-0008 the user API creates AgentSandbox resources here instead of claims; the watcher creates the claim.",
       "relationship-type": {
         "connects": {
           "source": {
@@ -309,6 +316,39 @@
         }
       },
       "protocol": "HTTPS"
+    },
+    {
+      "unique-id": "rel-watcher-agentsandboxes",
+      "description": "Watches AgentSandbox and creates, owns and deletes its one VirtualMachineClaim through the Kubernetes API with the broker ServiceAccount (ADR-0008, designed). RBAC: get/list/watch/update(status, finalizers) on agentsandboxes; create/delete/get/list/watch on virtualmachineclaims. Never patches a pool member: binding stays in banlieue's claim controller.",
+      "relationship-type": {
+        "connects": {
+          "source": {
+            "node": "service-mediatore-watcher"
+          },
+          "destination": {
+            "node": "service-kubernetes-api"
+          }
+        }
+      },
+      "protocol": "HTTPS",
+      "metadata": {
+        "status": "proposed"
+      }
+    },
+    {
+      "unique-id": "rel-agentsandbox-data",
+      "description": "An AgentSandbox is the sandbox user's request, attributed to them by admission; the claim, entry and tokens all derive from it.",
+      "relationship-type": {
+        "interacts": {
+          "actor": "actor-sandbox-user",
+          "nodes": [
+            "data-asset-agentsandbox-cr"
+          ]
+        }
+      },
+      "metadata": {
+        "status": "proposed"
+      }
     },
     {
       "unique-id": "rel-banlieue-kube-api",
@@ -502,7 +542,7 @@
         {
           "sequence-number": 3,
           "relationship-unique-id": "rel-mediatore-kube-api",
-          "description": "mediatore creates the VirtualMachineClaim with spec.subject."
+          "description": "mediatore creates an AgentSandbox with spec.subject; its reconciler creates the owned VirtualMachineClaim (ADR-0008, designed; today the claim is created directly)."
         },
         {
           "sequence-number": 4,
@@ -601,7 +641,7 @@
     "repository": "https://github.com/firestoned/mediatore",
     "license": "Apache-2.0",
     "calm-schema-version": "1.2",
-    "phase": "dev-mode loop implemented and e2e-tested; Entra OBO, sqlx store and the claim watch are fail-closed stubs. Roadmap 01 (ADR-0006, ADR-0007) is designed: registration entries as ClusterStaticEntry through the Kubernetes API, broker identity from the Workload API over the SPIFFE CSI driver, SPIFFE mTLS terminated in-process; implementation pending. SPIRE topology models the ADR-0005 desired state: root on a dedicated identity cluster, downstream per environment; the homelab collapses to the downstream server alone"
+    "phase": "dev-mode loop implemented and e2e-tested; Entra OBO, sqlx store and the claim watch are fail-closed stubs. Roadmap 01 (ADR-0006, ADR-0007) is designed: registration entries as ClusterStaticEntry through the Kubernetes API, broker identity from the Workload API over the SPIFFE CSI driver, SPIFFE mTLS terminated in-process; implementation pending. SPIRE topology models the ADR-0005 desired state: root on a dedicated identity cluster, downstream per environment; the homelab collapses to the downstream server alone. ADR-0008 (Proposed) adds the AgentSandbox CRD, moved from banlieue's unbuilt ADR-0055: designed, not built (roadmap 08)"
   },
   "adrs": [
     "docs/adr/0001-record-architecture-decisions.md",
@@ -610,6 +650,9 @@
     "docs/adr/0004-spiffe-identity-scheme.md",
     "docs/adr/0005-spire-topology.md",
     "docs/adr/0006-registration-entries-as-clusterstaticentry.md",
-    "docs/adr/0007-broker-identity-and-spiffe-mtls.md"
+    "docs/adr/0007-broker-identity-and-spiffe-mtls.md",
+    "docs/adr/0008-agentsandbox-crd-owned-by-mediatore.md",
+    "docs/adr/0009-kubernetes-orchestrates-vms-run-agents.md",
+    "docs/adr/0010-no-inbound-to-sandboxes.md"
   ]
 }
