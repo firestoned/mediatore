@@ -11,7 +11,7 @@ use std::sync::Arc;
 use clap::{Parser, Subcommand};
 use mediatore_api::AppState;
 use mediatore_entra::Validator;
-use mediatore_spire::Naming;
+use mediatore_spire::{EntryManager, KubeEntryManager, MemoryEntries, Naming};
 use mediatore_store::MemoryStore;
 use mediatore_sts::Sts;
 use tracing_subscriber::EnvFilter;
@@ -67,10 +67,16 @@ async fn main() -> anyhow::Result<()> {
 
 async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
     let cfg = Config::load(path)?;
+    let naming = Naming {
+        trust_domain: cfg.trust_domain.clone(),
+    };
+    let spire = entry_manager(&cfg, naming.clone()).await?;
     if !cfg.dev_mode {
-        anyhow::bail!("only dev_mode is runnable in this scaffold: mTLS + sqlx store are next");
+        anyhow::bail!(
+            "only dev_mode is runnable in this scaffold: the mTLS listener (ADR-0007) and the sqlx store are next"
+        );
     }
-    tracing::warn!("dev_mode: peer identity from header, in-memory store, no mTLS");
+    tracing::warn!("dev_mode: peer identity from header, in-memory store and entries, no mTLS");
 
     let sts = match &cfg.sts {
         Some(s) => {
@@ -88,10 +94,8 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
 
     let state = Arc::new(AppState {
         store: MemoryStore::shared(),
-        spire: Arc::new(mediatore_spire::Noop),
-        naming: Naming {
-            trust_domain: cfg.trust_domain.clone(),
-        },
+        spire,
+        naming,
         validator: Validator::new(cfg.issuers.clone()),
         sts,
         audiences: cfg.audiences.iter().map(|a| a.name.clone()).collect(),
@@ -108,6 +112,32 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
         .with_graceful_shutdown(shutdown());
     tokio::try_join!(u, s)?;
     Ok(())
+}
+
+/// In `dev_mode` entries live in memory; otherwise they are `ClusterStaticEntry` resources
+/// in the cluster `spire.entries.kubeconfig` names (in-cluster when unset), ADR-0006.
+async fn entry_manager(cfg: &Config, naming: Naming) -> anyhow::Result<Arc<dyn EntryManager>> {
+    let Some(spire) = (!cfg.dev_mode).then_some(cfg.spire.as_ref()).flatten() else {
+        return Ok(Arc::new(MemoryEntries::default()));
+    };
+    let client = match &spire.entries.kubeconfig {
+        Some(path) => {
+            let kc = kube::config::Kubeconfig::read_from(path)?;
+            let opts = kube::config::KubeConfigOptions::default();
+            kube::Client::try_from(kube::Config::from_custom_kubeconfig(kc, &opts).await?)?
+        }
+        None => kube::Client::try_default().await?,
+    };
+    tracing::info!(
+        class_name = %spire.entries.class_name,
+        workload_api_socket = %spire.workload_api_socket,
+        "entries: ClusterStaticEntry via the Kubernetes API; own SVID from the Workload API (listener lands with ADR-0007)"
+    );
+    Ok(Arc::new(KubeEntryManager::new(
+        client,
+        naming,
+        (&spire.entries).into(),
+    )))
 }
 
 async fn shutdown() {

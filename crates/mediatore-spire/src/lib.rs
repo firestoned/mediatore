@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Erick Bourgeois, mediatore
 // SPDX-License-Identifier: Apache-2.0
 
-//! SPIRE server API boundary.
+//! SPIRE registration entries, declared rather than pushed (ADR-0006).
 //!
 //! mediatore creates exactly two kinds of registration entry:
 //! * a node bootstrap entry `spiffe://<td>/banlieue/node/<ek-hash>` for the in-guest agent
@@ -9,11 +9,35 @@
 //! * a claim entry `spiffe://<td>/banlieue/claim/<uid>` for the jailed workload
 //!   (selector `unix:user:<sandbox user>`).
 //!
-//! The gRPC implementation over `spire-api-sdk` is the next step; `Noop` lets the rest of
-//! the server run in `--dev` mode.
+//! Both are parented to the node's tpm agent ID, which is computable from the EK hash.
+//! [`KubeEntryManager`] writes them as `ClusterStaticEntry` resources through the Kubernetes
+//! API and waits for the SPIRE Controller Manager to report them set; mediatore never holds
+//! a SPIRE admin identity. [`MemoryEntries`] is the fake for `dev_mode` and tests, and it
+//! validates inputs exactly as the real one does.
+
+pub mod kube;
+
+use std::collections::BTreeMap;
+use std::sync::Mutex;
 
 use async_trait::async_trait;
+use mediatore_proto::ek::is_ek_hash;
 use uuid::Uuid;
+
+pub use crate::kube::{
+    ClusterStaticEntry, ClusterStaticEntrySpec, EntriesConfig, KubeEntryManager,
+};
+
+/// Label every mediatore-declared entry carries; the orphan sweep selects on it.
+pub const MANAGED_BY_LABEL: &str = "app.kubernetes.io/managed-by";
+/// Value of [`MANAGED_BY_LABEL`].
+pub const MANAGED_BY: &str = "mediatore";
+/// Label naming the entry kind: `node` or `claim`.
+pub const KIND_LABEL: &str = "mediatore.io/kind";
+/// Label carrying the claim UID on a claim entry.
+pub const CLAIM_UID_LABEL: &str = "mediatore.io/claim-uid";
+/// Path of the in-guest agent binary, pinned by the node entry's `unix:path` selector.
+pub const GUEST_AGENT_PATH: &str = "/usr/local/bin/mediatore-guest";
 
 /// Trust domain plus the path prefixes we own.
 #[derive(Debug, Clone)]
@@ -68,86 +92,191 @@ impl Naming {
     }
 }
 
-/// An attested agent as `ListAgents` reports it.
-#[derive(Debug, Clone)]
-pub struct Agent {
-    /// Agent SPIFFE ID, e.g. `spiffe://<td>/spire/agent/tpm/<ek-hash>`.
-    pub spiffe_id: String,
-    /// Attestation type (`tpm`, `k8s_psat`, ...).
-    pub attestation_type: String,
+/// `mediatore-node-<ek-hash>`: deterministic, so "ensure" is a create that tolerates 409.
+#[must_use]
+pub fn node_entry_name(ek_hash: &str) -> String {
+    format!("mediatore-node-{ek_hash}")
 }
 
-/// Errors from the SPIRE API.
+/// `mediatore-claim-<uid>`.
+#[must_use]
+pub fn claim_entry_name(claim_uid: Uuid) -> String {
+    format!("mediatore-claim-{claim_uid}")
+}
+
+/// Which of the two shapes an entry is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryKind {
+    /// In-guest agent identity for a node.
+    Node,
+    /// Jailed-workload identity for a claim.
+    Claim,
+}
+
+impl EntryKind {
+    /// The `mediatore.io/kind` label value.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Node => "node",
+            Self::Claim => "claim",
+        }
+    }
+}
+
+/// A declared entry, as mediatore tracks it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntryRef {
+    /// Resource name (`mediatore-node-…` or `mediatore-claim-…`).
+    pub name: String,
+    /// Shape.
+    pub kind: EntryKind,
+    /// The claim a claim entry belongs to.
+    pub claim_uid: Option<Uuid>,
+}
+
+/// Errors from declaring or retracting entries.
 #[derive(Debug, thiserror::Error)]
 pub enum SpireError {
-    /// Transport or RPC error.
-    #[error("rpc: {0}")]
-    Rpc(String),
-    /// Entry already exists (idempotent callers ignore this).
-    #[error("entry exists: {0}")]
-    Exists(String),
+    /// The API server could not be reached or answered unexpectedly.
+    #[error("api: {0}")]
+    Api(String),
+    /// Admission refused the declaration (the policy in `deploy/base/admission`).
+    #[error("refused at admission: {0}")]
+    Denied(String),
+    /// Another entry with the same parent and selectors already exists; the claim must fail.
+    #[error("entry {0} is masked by another entry")]
+    Masked(String),
+    /// The controller manager did not set the entry within the ready timeout.
+    #[error("entry {0} was not set within the ready timeout")]
+    Timeout(String),
+    /// Input that would never pass admission; refused before any request.
+    #[error("invalid input: {0}")]
+    Invalid(String),
     /// Not wired yet.
     #[error("not implemented: {0}")]
     NotImplemented(&'static str),
 }
 
-/// Registration entry operations mediatore needs.
-#[async_trait]
-pub trait EntryManager: Send + Sync + 'static {
-    /// List attested agents.
-    async fn list_agents(&self) -> Result<Vec<Agent>, SpireError>;
-    /// Create (or find) the node bootstrap entry. Returns the entry id.
-    async fn ensure_node_entry(&self, parent_id: &str, node_id: &str)
-    -> Result<String, SpireError>;
-    /// Create the claim entry. Returns the entry id.
-    async fn create_claim_entry(
-        &self,
-        parent_id: &str,
-        claim_id: &str,
-        unix_user: &str,
-    ) -> Result<String, SpireError>;
-    /// Delete an entry by id; idempotent.
-    async fn delete_entry(&self, entry_id: &str) -> Result<(), SpireError>;
+/// Refuse anything that is not the attestor's hash shape; the admission policy would too.
+pub fn validate_ek_hash(ek_hash: &str) -> Result<(), SpireError> {
+    if is_ek_hash(ek_hash) {
+        Ok(())
+    } else {
+        Err(SpireError::Invalid(
+            "ek hash must be 64 lowercase hex characters".into(),
+        ))
+    }
 }
 
-/// Logs what it would do. For `--dev` and tests.
+/// Refuse a user that is not `sb-` plus 12 lowercase hex (ADR-0004), as admission would.
+pub fn validate_unix_user(user: &str) -> Result<(), SpireError> {
+    let ok = user.strip_prefix("sb-").is_some_and(|h| {
+        h.len() == 12
+            && h.bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    });
+    if ok {
+        Ok(())
+    } else {
+        Err(SpireError::Invalid(
+            "unix user must be sb- followed by 12 lowercase hex characters".into(),
+        ))
+    }
+}
+
+/// Registration entry operations mediatore needs. Every method returns the entry's resource
+/// name; a declaration only succeeds once the entry is set on the SPIRE server.
+#[async_trait]
+pub trait EntryManager: Send + Sync + 'static {
+    /// Declare (or find) the node bootstrap entry for a VM whose EK hash is known.
+    async fn ensure_node_entry(&self, ek_hash: &str) -> Result<String, SpireError>;
+    /// Declare the claim entry under the node's agent. Idempotent on the name.
+    async fn create_claim_entry(
+        &self,
+        ek_hash: &str,
+        claim_uid: Uuid,
+        unix_user: &str,
+    ) -> Result<String, SpireError>;
+    /// Retract an entry by name; a missing entry is success.
+    async fn delete_entry(&self, name: &str) -> Result<(), SpireError>;
+    /// Every entry mediatore has declared, for the orphan sweep.
+    async fn list_entries(&self) -> Result<Vec<EntryRef>, SpireError>;
+}
+
+/// In-memory entries for `dev_mode` and tests. Validates like [`KubeEntryManager`] and
+/// remembers what was declared, so a test can assert that release really retracted the
+/// entry.
 #[derive(Debug, Default)]
-pub struct Noop;
+pub struct MemoryEntries {
+    entries: Mutex<BTreeMap<String, EntryRef>>,
+}
+
+impl MemoryEntries {
+    /// Names currently declared, in order.
+    ///
+    /// # Panics
+    /// If the lock is poisoned (a test already failed).
+    #[must_use]
+    pub fn names(&self) -> Vec<String> {
+        self.entries.lock().unwrap().keys().cloned().collect()
+    }
+}
 
 #[async_trait]
-impl EntryManager for Noop {
-    async fn list_agents(&self) -> Result<Vec<Agent>, SpireError> {
-        Ok(vec![])
-    }
-
-    async fn ensure_node_entry(
-        &self,
-        parent_id: &str,
-        node_id: &str,
-    ) -> Result<String, SpireError> {
-        tracing::info!(parent_id, node_id, "noop: ensure node entry");
-        Ok(format!("noop-{node_id}"))
+impl EntryManager for MemoryEntries {
+    async fn ensure_node_entry(&self, ek_hash: &str) -> Result<String, SpireError> {
+        validate_ek_hash(ek_hash)?;
+        let name = node_entry_name(ek_hash);
+        self.entries.lock().unwrap().insert(
+            name.clone(),
+            EntryRef {
+                name: name.clone(),
+                kind: EntryKind::Node,
+                claim_uid: None,
+            },
+        );
+        tracing::info!(name, "memory: node entry declared");
+        Ok(name)
     }
 
     async fn create_claim_entry(
         &self,
-        parent_id: &str,
-        claim_id: &str,
+        ek_hash: &str,
+        claim_uid: Uuid,
         unix_user: &str,
     ) -> Result<String, SpireError> {
-        tracing::info!(parent_id, claim_id, unix_user, "noop: create claim entry");
-        Ok(format!("noop-{claim_id}"))
+        validate_ek_hash(ek_hash)?;
+        validate_unix_user(unix_user)?;
+        let name = claim_entry_name(claim_uid);
+        self.entries.lock().unwrap().insert(
+            name.clone(),
+            EntryRef {
+                name: name.clone(),
+                kind: EntryKind::Claim,
+                claim_uid: Some(claim_uid),
+            },
+        );
+        tracing::info!(name, %claim_uid, unix_user, "memory: claim entry declared");
+        Ok(name)
     }
 
-    async fn delete_entry(&self, entry_id: &str) -> Result<(), SpireError> {
-        tracing::info!(entry_id, "noop: delete entry");
+    async fn delete_entry(&self, name: &str) -> Result<(), SpireError> {
+        let removed = self.entries.lock().unwrap().remove(name).is_some();
+        tracing::info!(name, removed, "memory: entry retracted");
         Ok(())
+    }
+
+    async fn list_entries(&self) -> Result<Vec<EntryRef>, SpireError> {
+        Ok(self.entries.lock().unwrap().values().cloned().collect())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const EK: &str = "72c566555391e835a15c522680b51ec3b840561ed70af5605a5ae4835f040ee8";
 
     #[test]
     fn claim_uid_roundtrip() {
@@ -168,12 +297,60 @@ mod tests {
         let n = Naming {
             trust_domain: "sandbox.test".into(),
         };
-        assert_eq!(n.node_ek_from(&n.node_id("3f9a")), Some("3f9a".to_owned()));
-        assert_eq!(n.node_ek_from(&n.agent_id("3f9a")), None);
+        assert_eq!(n.node_ek_from(&n.node_id(EK)), Some(EK.to_owned()));
+        assert_eq!(n.node_ek_from(&n.agent_id(EK)), None);
         assert_eq!(n.node_ek_from("spiffe://sandbox.test/banlieue/node/"), None);
         assert_eq!(
-            n.node_ek_from("spiffe://other.test/banlieue/node/3f9a"),
+            n.node_ek_from(&format!("spiffe://other.test/banlieue/node/{EK}")),
             None
         );
+    }
+
+    #[test]
+    fn input_validation_matches_admission() {
+        assert!(validate_ek_hash(EK).is_ok());
+        assert!(validate_ek_hash("3f9a").is_err());
+        assert!(validate_ek_hash(&EK.to_uppercase()).is_err());
+        assert!(validate_unix_user("sb-0123456789ab").is_ok());
+        assert!(validate_unix_user("sb-0123456789AB").is_err());
+        assert!(validate_unix_user("root").is_err());
+        assert!(validate_unix_user("sb-0123").is_err());
+    }
+
+    #[tokio::test]
+    async fn memory_fake_declares_and_retracts() {
+        let m = MemoryEntries::default();
+        let uid = Uuid::new_v4();
+        let node = m.ensure_node_entry(EK).await.unwrap();
+        let claim = m
+            .create_claim_entry(EK, uid, "sb-0123456789ab")
+            .await
+            .unwrap();
+        assert_eq!(node, node_entry_name(EK));
+        assert_eq!(claim, claim_entry_name(uid));
+        let listed = m.list_entries().await.unwrap();
+        assert_eq!(listed.len(), 2);
+        assert!(
+            listed
+                .iter()
+                .any(|e| e.kind == EntryKind::Claim && e.claim_uid == Some(uid))
+        );
+        m.delete_entry(&claim).await.unwrap();
+        m.delete_entry("never-declared").await.unwrap();
+        assert_eq!(m.names(), vec![node]);
+    }
+
+    #[tokio::test]
+    async fn memory_fake_is_no_more_permissive_than_the_real_thing() {
+        let m = MemoryEntries::default();
+        assert!(matches!(
+            m.ensure_node_entry("3f9a").await,
+            Err(SpireError::Invalid(_))
+        ));
+        assert!(matches!(
+            m.create_claim_entry(EK, Uuid::new_v4(), "root").await,
+            Err(SpireError::Invalid(_))
+        ));
+        assert_eq!(m.names(), Vec::<String>::new());
     }
 }

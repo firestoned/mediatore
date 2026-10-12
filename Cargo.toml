@@ -59,11 +59,13 @@ p256         = "0.14"
 base64       = "0.23"
 sha2         = "0.11"
 hex          = "0.4"
+# EK certificate parsing: the SubjectPublicKeyInfo is what the tpm attestor hashes (ADR-0006)
+x509-cert    = { version = "0.3", default-features = false, features = ["pem"] }
 uuid         = { version = "1", features = ["v4", "serde"] }
 chrono       = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 
 # kubernetes
-kube        = { version = "4", default-features = false, features = ["client", "runtime", "rustls-tls"] }
+kube        = { version = "4", default-features = false, features = ["client", "config", "derive", "runtime", "rustls-tls"] }
 k8s-openapi = { version = "0.28", features = ["latest"] }
 
 # errors, logging, cli
@@ -72,6 +74,11 @@ anyhow             = "1"
 tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 clap               = { version = "4", features = ["derive", "env"] }
+
+# test-only (mock API server for the kube entry manager)
+tower-test     = "0.4"
+http           = "1"
+http-body-util = "0.1"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

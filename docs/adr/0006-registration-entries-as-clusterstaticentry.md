@@ -124,9 +124,10 @@ certificate never gets a node entry and never joins the pool: fail closed, by co
 The watcher records the entry as ready only when `status.set == true` and
 `status.masked == false`. `masked == true` (another entry already claims the same parent,
 selectors and ID) is treated as a conflict: the claim is failed, never served. Readiness
-is observed through a watch on the resource, with a bounded wait (configuration,
-`spire.entries.ready_timeout`, default 30 s) after which the bind fails and is retried by
-the reconciler. `/v1/me` does not return a subject for a claim whose entry is not set.
+is observed by re-reading the resource at a short interval (`spire.entries.poll_interval_ms`,
+default 500 ms; binds are rare and short, so a watch buys nothing here), with a bounded wait
+(`spire.entries.ready_timeout_secs`, default 30 s) after which the bind fails and is retried
+by the reconciler. `/v1/me` does not return a subject for a claim whose entry is not set.
 
 **6. Admission policy constrains what the broker's ServiceAccount may declare.** A
 `ValidatingAdmissionPolicy` (`deploy/base/admission/clusterstaticentry-mediatore.yaml`),

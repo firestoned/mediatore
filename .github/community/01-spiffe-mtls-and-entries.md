@@ -39,27 +39,37 @@ dependency) for the entries. No `tonic`/`prost` of our own, no vendored protos.
 
 ## Entries (ADR-0006)
 
-- [ ] `EntryManager` trait: drop `list_agents` and `Agent`; `ensure_node_entry(ek_hash)`
-      and `create_claim_entry(ek_hash, claim_uid, unix_user)` return an entry handle
-      (resource name); `delete_entry(name)` idempotent on 404
-- [ ] `KubeEntryManager` in `mediatore-spire`: deterministic names
-      (`mediatore-node-<ek>`, `mediatore-claim-<uid>`), labels, `className` from
-      `spire.entries.class_name`, tolerate 409 on create; wait for `status.set && !masked`
-      with `spire.entries.ready_timeout` (default 30 s), `masked` fails the claim
-- [ ] EK hash from PEM: parse the certificate, DER-encode the SubjectPublicKeyInfo,
-      hex SHA-256 (`mediatore-proto`); unit test against a fixture whose hash was produced
-      by `openssl pkey -pubin -outform der | sha256sum` (the guest's computation) and
-      cross-checked against the tpm plugin's `GetPubHash`
-- [ ] Node entry trigger: `VirtualMachine.status.tpmEndorsementCertificates` (or the
-      claim mirror) observed by the watcher; no certificate, no entry, no pool membership
-- [ ] Orphan sweep on the leader at the resync interval (label selector
-      `app.kubernetes.io/managed-by=mediatore`)
-- [ ] Tests: kube-rs `tower-test` mock API server driving create/409/404 and the
-      `status.set` / `status.masked` transitions; e2e over the mock; VAP exercised by
-      `make live-admission-test` (server-side `kubectl apply` of allowed and refused
-      shapes with `--as=system:serviceaccount:banlieue-system:mediatore`, `#[ignore]`d
-      until roadmap 02's cluster target exists and failing loudly without it)
-- [ ] `spire.endpoint` (ADR-0005) never implemented; config gains `spire.entries.*`
+- [x] `EntryManager` trait: `list_agents` and `Agent` dropped; `ensure_node_entry(ek_hash)`
+      and `create_claim_entry(ek_hash, claim_uid, unix_user)` return the resource name;
+      `delete_entry(name)` idempotent on 404; `list_entries()` for the sweep.
+      `Noop` replaced by `MemoryEntries`, which validates inputs exactly like the real
+      thing and remembers declarations so tests can assert retraction
+- [x] `KubeEntryManager` (`crates/mediatore-spire/src/kube.rs`): deterministic names,
+      labels, `className` from `spire.entries.class_name`, 409 tolerated, 403 surfaced as
+      `Denied`; waits for `status.set && !masked` by polling (`poll_interval_ms`, default
+      500 ms) with `ready_timeout_secs` (default 30 s); `masked` fails the claim; inputs
+      that admission would refuse are refused before any request
+- [x] EK hash from PEM (`mediatore_proto::ek`): certificate parsed, SubjectPublicKeyInfo
+      DER-encoded, hex SHA-256; `ek_hash_from_pems` picks the RSA EK among what banlieue
+      published; fixtures hashed with the guest's pipeline
+      (`openssl pkey -pubin -outform der | sha256sum`), matching the tpm plugin's
+      `GetPubHash` (`x509.MarshalPKIXPublicKey`)
+- [ ] Node entry trigger: the function side exists (`ek_hash_from_pems` +
+      `ensure_node_entry`); the `VirtualMachine` watch that calls it when
+      `status.tpmEndorsementCertificates` appears lands with the claim watcher
+      (roadmap 03, `banlieue-api` pin). No certificate, no entry, no pool membership
+- [x] Orphan sweep: `Reconciler::sweep_orphans` retracts claim entries whose claim is
+      unknown or revoked and leaves node entries alone; scheduling it on the leader at the
+      resync interval is part of roadmap 03's loop
+- [x] Tests: scripted fake API server (`tower-test`) covering create, 409, 403, poll until
+      set, masked, timeout, delete 404 and list by label; reconciler bind/release/sweep
+      over `MemoryEntries`; e2e runs on `MemoryEntries` with a 64-hex EK hash
+- [ ] Live admission test: `make live-admission-test` applies allowed and refused shapes
+      server-side as `system:serviceaccount:banlieue-system:mediatore` (`#[ignore]`d until
+      roadmap 02's cluster target exists, failing loudly without it)
+- [x] `spire.endpoint` (ADR-0005) never implemented; config gains `spire.workload_api_socket`
+      and `spire.entries.{class_name, kubeconfig, ready_timeout_secs, poll_interval_ms,
+      claim_svid_ttl}`, required outside `dev_mode`
 
 ## Identity and mTLS (ADR-0007)
 

@@ -81,7 +81,7 @@ release → cut-off. The remaining edges fail closed (`501 not_implemented`):
 | Claim lifecycle in `dev_mode` (create, dev bind either order, mirror, release) | implemented, e2e-tested |
 | Guest: node registration, subject fetch, user + jail supervision | implemented; jail path needs a Linux host |
 | Entra OBO exchange | request shape done, untested |
-| SPIRE entries as `ClusterStaticEntry` through the Kubernetes API (ADR-0006, no gRPC) | designed; trait + `Noop` |
+| SPIRE entries as `ClusterStaticEntry` through the Kubernetes API (ADR-0006, no gRPC) | implemented (`KubeEntryManager`), tested against a scripted fake API server; live-cluster test pending |
 | `VirtualMachineClaim` watch (needs `banlieue-api` pin) | client wiring only |
 | SPIFFE mTLS on the sandbox listener, broker SVID via the SPIFFE CSI driver (ADR-0007) | designed; stub (dev header) |
 | sqlx store (PostgreSQL / SQLite) | not started |

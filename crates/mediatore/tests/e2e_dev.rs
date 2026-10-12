@@ -7,7 +7,7 @@
 //! `POST /v1/token` → STS JWT verified against mediatore's own JWKS → release → cut-off.
 //!
 //! What stays faked here, on purpose: the peer identity is a header (`dev_mode`), the SPIRE
-//! server is `Noop`, and banlieue's claim controller is the dev binder. Everything else --
+//! entries live in memory (`MemoryEntries`), and banlieue's claim controller is the dev binder. Everything else --
 //! upstream token validation, claim lifecycle, audience checks, token minting, revocation --
 //! is the production code path.
 
@@ -37,7 +37,7 @@ const TRUST_DOMAIN: &str = "sandbox.test";
 const AUDIENCE: &str = "grafana.test";
 const REQUIRED_GROUP: &str = "firestoned:sandbox-users";
 const PEER_HEADER: &str = "x-mediatore-peer-spiffe-id";
-const EK_HASH: &str = "3f9a1c2b7e4d3f9a1c2b7e4d3f9a1c2b";
+const EK_HASH: &str = "72c566555391e835a15c522680b51ec3b840561ed70af5605a5ae4835f040ee8";
 
 fn node_svid() -> String {
     format!("spiffe://{TRUST_DOMAIN}/banlieue/node/{EK_HASH}")
@@ -66,7 +66,7 @@ impl Harness {
         .expect("sts");
         let state = Arc::new(AppState {
             store: MemoryStore::shared(),
-            spire: Arc::new(mediatore_spire::Noop),
+            spire: Arc::new(mediatore_spire::MemoryEntries::default()),
             naming: Naming {
                 trust_domain: TRUST_DOMAIN.into(),
             },
