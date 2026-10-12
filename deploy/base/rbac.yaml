@@ -1,6 +1,15 @@
 # Copyright (c) 2026 Erick Bourgeois, mediatore
 # SPDX-License-Identifier: Apache-2.0
-
+#
+# Least privilege for the broker ServiceAccount:
+# - VirtualMachineClaim: create/delete/watch (ADR-0002); status read for binding.
+# - VirtualMachine: read-only, for node resolution and the EK certificate
+#   (banlieue ADR-0045) the node entry is derived from.
+# - ClusterStaticEntry: declare and retract the two entry shapes (ADR-0006).
+#   No update/patch (entries are replaced, never edited) and nothing on
+#   ClusterSPIFFEID or ClusterFederatedTrustDomain. The shape of what this
+#   ServiceAccount may declare is further restricted at admission by
+#   deploy/base/admission/clusterstaticentry-mediatore.yaml.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -15,6 +24,9 @@ rules:
   - apiGroups: ["banlieue.io"]
     resources: ["virtualmachines"]
     verbs: ["get", "list", "watch"]
+  - apiGroups: ["spire.spiffe.io"]
+    resources: ["clusterstaticentries"]
+    verbs: ["get", "list", "watch", "create", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

@@ -1,0 +1,111 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+#
+# What the broker's ServiceAccount may declare as a SPIRE registration entry
+# (ADR-0006 decision 6). mediatore creates exactly two shapes (ADR-0004):
+#
+#   node   spiffe://<td>/banlieue/node/<ek>   parent spiffe://<td>/spire/agent/tpm/<ek>
+#   claim  spiffe://<td>/banlieue/claim/<uid> parent spiffe://<td>/spire/agent/tpm/<ek>
+#
+# Everything else is refused at admission, in the API server, by CEL (no
+# webhook), so the restriction holds even if mediatore's own code is wrong.
+# A SPIRE admin identity cannot be scoped like this; a ServiceAccount can.
+# Requires Kubernetes 1.30+ (ValidatingAdmissionPolicy GA).
+#
+# <ek> is the hex SHA-256 of the EK's DER SubjectPublicKeyInfo (64 hex chars),
+# the same value the tpm node attestor puts in the agent ID.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: mediatore-clusterstaticentry
+  labels:
+    app.kubernetes.io/name: mediatore
+    app.kubernetes.io/component: admission
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["spire.spiffe.io"]
+        apiVersions: ["v1alpha1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["clusterstaticentries"]
+  # Only the broker's ServiceAccount is constrained here. Other principals are
+  # governed by RBAC (and should have no create on this resource at all).
+  matchConditions:
+    - name: is-mediatore-serviceaccount
+      expression: "request.userInfo.username == 'system:serviceaccount:banlieue-system:mediatore'"
+  variables:
+    - name: td
+      expression: "'^spiffe://[a-z0-9.-]+'"
+    - name: hex64
+      expression: "'[0-9a-f]{64}'"
+    - name: uuid
+      expression: "'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'"
+    - name: isNode
+      expression: "object.spec.spiffeID.contains('/banlieue/node/')"
+    - name: isClaim
+      expression: "object.spec.spiffeID.contains('/banlieue/claim/')"
+  validations:
+    - expression: "object.metadata.name.startsWith('mediatore-')"
+      message: "mediatore may only declare entries named mediatore-*"
+      reason: Forbidden
+    - expression: >-
+        object.spec.spiffeID.matches(variables.td + '/banlieue/(node/' + variables.hex64 + '|claim/' + variables.uuid + ')$')
+      message: "spiffeID must be spiffe://<td>/banlieue/node/<ek-hash> or spiffe://<td>/banlieue/claim/<uuid>"
+      reason: Forbidden
+    - expression: >-
+        object.spec.parentID.matches(variables.td + '/spire/agent/tpm/' + variables.hex64 + '$')
+      message: "parentID must be a tpm agent ID: spiffe://<td>/spire/agent/tpm/<ek-hash>"
+      reason: Forbidden
+    - expression: "object.spec.spiffeID.split('/')[2] == object.spec.parentID.split('/')[2]"
+      message: "spiffeID and parentID must be in the same trust domain"
+      reason: Forbidden
+    # A node entry may only be parented to its own agent: same EK hash on both sides.
+    - expression: >-
+        !variables.isNode ||
+        object.spec.spiffeID.split('/banlieue/node/')[1] == object.spec.parentID.split('/spire/agent/tpm/')[1]
+      message: "a node entry's EK hash must equal its parent agent's EK hash"
+      reason: Forbidden
+    - expression: "size(object.spec.selectors) > 0 && object.spec.selectors.all(s, s.startsWith('unix:'))"
+      message: "selectors must be unix workload selectors"
+      reason: Forbidden
+    - expression: "!variables.isNode || object.spec.selectors.exists(s, s == 'unix:uid:0')"
+      message: "a node entry must select unix:uid:0"
+      reason: Forbidden
+    - expression: >-
+        !variables.isClaim ||
+        (size(object.spec.selectors) == 1 && object.spec.selectors[0].matches('^unix:user:sb-[0-9a-f]{12}$'))
+      message: "a claim entry must select exactly one unix:user:sb-<12 hex> (ADR-0004)"
+      reason: Forbidden
+    - expression: "!has(object.spec.admin) || !object.spec.admin"
+      message: "mediatore entries are never admin"
+      reason: Forbidden
+    - expression: "!has(object.spec.downstream) || !object.spec.downstream"
+      message: "mediatore entries are never downstream"
+      reason: Forbidden
+    - expression: "!has(object.spec.storeSVID) || !object.spec.storeSVID"
+      message: "mediatore entries never use an SVIDStore"
+      reason: Forbidden
+    - expression: "!has(object.spec.federatesWith) || size(object.spec.federatesWith) == 0"
+      message: "mediatore entries never federate"
+      reason: Forbidden
+    - expression: "!has(object.spec.dnsNames) || size(object.spec.dnsNames) == 0"
+      message: "mediatore entries carry no DNS names"
+      reason: Forbidden
+    - expression: "has(object.spec.className) && object.spec.className != ''"
+      message: "className is required (the controller manager ignores classless resources)"
+      reason: Invalid
+    - expression: "!has(object.spec.x509SVIDTTL) || duration(object.spec.x509SVIDTTL) <= duration('4h')"
+      message: "x509SVIDTTL must be at most 4h"
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: mediatore-clusterstaticentry
+  labels:
+    app.kubernetes.io/name: mediatore
+    app.kubernetes.io/component: admission
+spec:
+  policyName: mediatore-clusterstaticentry
+  validationActions: ["Deny"]

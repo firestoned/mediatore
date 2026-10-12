@@ -28,6 +28,9 @@ spec:
             - { name: sandbox, containerPort: 8443 }
           env:
             - { name: RUST_LOG, value: "info,mediatore=debug" }
+            # Workload API socket delivered by the SPIFFE CSI driver (ADR-0007):
+            # the SVID and its key are fetched into memory, never written to a volume.
+            - { name: SPIFFE_ENDPOINT_SOCKET, value: "unix:///run/spire/sockets/spire-agent.sock" }
           volumeMounts:
             - { name: config, mountPath: /etc/mediatore, readOnly: true }
             - { name: spire-agent-socket, mountPath: /run/spire/sockets, readOnly: true }
@@ -40,6 +43,9 @@ spec:
       volumes:
         - name: config
           configMap: { name: mediatore-config }
+        # Inline ephemeral CSI volume: a read-only bind mount of the agent's socket
+        # directory. Admissible under Pod Security Standard "restricted", unlike a
+        # hostPath (ADR-0007).
         - name: spire-agent-socket
           csi:
             driver: csi.spiffe.io

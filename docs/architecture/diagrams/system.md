@@ -32,6 +32,9 @@ flowchart LR
     service-kubernetes-api["Kubernetes API Server"]
     system-banlieue["banlieue Control Plane"]
     service-spire-server["SPIRE Server (downstream)"]
+    service-spire-controller-manager["SPIRE Controller Manager"]
+    data-asset-cluster-static-entries["ClusterStaticEntry resources"]
+    service-spire-agent-k8s["SPIRE Agent + SPIFFE CSI driver (k8s node)"]
     service-spire-root["SPIRE Root Server (desired state)"]
     network-identity-cluster["Identity Cluster (desired state)"]
     network-management-cluster["Management Cluster"]
@@ -61,6 +64,9 @@ flowchart LR
         service-kubernetes-api
         system-banlieue
         service-spire-server
+        service-spire-controller-manager
+        service-spire-agent-k8s
+        data-asset-cluster-static-entries
     end
     subgraph sg_network-identity-cluster [Network Identity Cluster]
         service-spire-root
@@ -72,12 +78,17 @@ flowchart LR
     service-mediatore-user-api -->|HTTPS| service-kubernetes-api
     service-mediatore-watcher -->|HTTPS| service-kubernetes-api
     system-banlieue -->|HTTPS| service-kubernetes-api
-    service-mediatore-watcher -->|mTLS| service-spire-server
+    service-mediatore-watcher -->|HTTPS| service-kubernetes-api
+    service-spire-controller-manager -->|HTTPS| service-kubernetes-api
+    service-spire-controller-manager --> service-spire-server
+    system-mediatore --> service-spire-agent-k8s
+    service-spire-agent-k8s -->|TLS| service-spire-server
     service-spire-agent -->|TLS| service-spire-server
     service-guest-agent -->|mTLS| service-mediatore-sandbox-api
     service-sandbox-workload -->|mTLS| service-mediatore-sandbox-api
     service-sandbox-workload -->|HTTPS| ecosystem-downstream-api
     actor-sandbox-user --> data-asset-claim-store
+    actor-sandbox-user --> data-asset-cluster-static-entries
 ```
 
 <sub>Source: nodes and relationships in `architecture.json`.</sub>

@@ -1,14 +1,30 @@
 # Copyright (c) 2026 Erick Bourgeois, mediatore
 # SPDX-License-Identifier: Apache-2.0
-
+#
+# The broker's SPIFFE identity (ADR-0007). A transport identity only: it has no
+# `admin` flag, because mediatore never talks to the SPIRE admin API (ADR-0006;
+# registration entries are ClusterStaticEntry resources). The selector set binds
+# the ID to the namespace, the pod label, the ServiceAccount and the container
+# name, all attested by the SPIRE agent through a kubelet whose serving
+# certificate it verifies.
+#
+# `className` must match the SPIRE Controller Manager's configured class: the
+# hardened chart runs with `watchClassless: false`, so a classless resource is
+# silently ignored. Override it in an overlay if the release name differs.
 apiVersion: spire.spiffe.io/v1alpha1
 kind: ClusterSPIFFEID
 metadata:
   name: mediatore
+  labels: { app.kubernetes.io/name: mediatore }
 spec:
+  className: spire-server-spire
   spiffeIDTemplate: "spiffe://{{ .TrustDomain }}/mediatore"
   podSelector:
     matchLabels: { app.kubernetes.io/name: mediatore }
   namespaceSelector:
-    matchNames: [banlieue-system]
-  admin: true
+    matchLabels: { kubernetes.io/metadata.name: banlieue-system }
+  workloadSelectorTemplates:
+    - "k8s:sa:mediatore"
+    - "k8s:container-name:mediatore"
+  ttl: 1h
+  hint: mediatore

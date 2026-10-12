@@ -5,8 +5,9 @@ apiVersion: v1
 kind: Service
 metadata:
   name: mediatore
+# The user-facing port only; the sandbox listener has its own Service
+# (service-sandbox.yaml) so it is never reachable through the ingress path.
 spec:
   selector: { app.kubernetes.io/name: mediatore }
   ports:
     - { name: user, port: 8080, targetPort: user }
-    - { name: sandbox, port: 8443, targetPort: sandbox }
