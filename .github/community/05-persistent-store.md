@@ -5,6 +5,10 @@
 
 **Status: not started.** Claims, nodes and revocations that survive a broker restart;
 deletes threat-model accepted risk **R-5**.
+Under [ADR-0008](../../docs/adr/0008-agentsandbox-crd-owned-by-mediatore.md) the non-secret
+request fields (subject, pool, TTL, audiences, workload) live on the `AgentSandbox` resource
+instead (roadmap 08); the store keeps refresh ciphertext, revocations, node records and audit
+rows.
 
 - [ ] sqlx behind the existing `ClaimStore` trait: PostgreSQL (work) and SQLite
       (homelab) — both are configuration, not code paths (runbook 4b.7)

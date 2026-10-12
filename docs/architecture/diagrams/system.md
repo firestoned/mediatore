@@ -27,6 +27,7 @@ flowchart LR
     service-mediatore-sandbox-api["Sandbox API (SPIFFE mTLS)"]
     service-mediatore-watcher["Claim Watcher"]
     service-mediatore-sts["STS"]
+    data-asset-agentsandbox-cr["AgentSandbox resources"]
     data-asset-claim-store["Claim Store"]
     data-asset-sts-signing-key["STS Signing Key"]
     service-kubernetes-api["Kubernetes API Server"]
@@ -50,6 +51,7 @@ flowchart LR
         service-mediatore-sts
         data-asset-claim-store
         data-asset-sts-signing-key
+        data-asset-agentsandbox-cr
     end
     subgraph sg_system-sandbox-vm [System Sandbox Vm]
         service-spire-agent
@@ -77,6 +79,8 @@ flowchart LR
     service-mediatore-user-api -->|HTTPS| ecosystem-idp
     service-mediatore-user-api -->|HTTPS| service-kubernetes-api
     service-mediatore-watcher -->|HTTPS| service-kubernetes-api
+    service-mediatore-watcher -->|HTTPS| service-kubernetes-api
+    actor-sandbox-user --> data-asset-agentsandbox-cr
     system-banlieue -->|HTTPS| service-kubernetes-api
     service-mediatore-watcher -->|HTTPS| service-kubernetes-api
     service-spire-controller-manager -->|HTTPS| service-kubernetes-api

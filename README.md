@@ -85,6 +85,7 @@ release → cut-off. The remaining edges fail closed (`501 not_implemented`):
 | `VirtualMachineClaim` watch (needs `banlieue-api` pin) | client wiring only |
 | SPIFFE mTLS on the sandbox listener, broker SVID via the SPIFFE CSI driver (ADR-0007) | designed; stub (dev header) |
 | sqlx store (PostgreSQL / SQLite) | not started |
+| `AgentSandbox` CRD and reconciler, moved from banlieue (ADR-0008) | designed |
 
 ## Development
 
