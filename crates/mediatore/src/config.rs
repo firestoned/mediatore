@@ -66,9 +66,6 @@ pub struct EntriesSection {
     /// Seconds a declaration may take to become `set` before the bind fails (default 30).
     #[serde(default = "default_ready_timeout_secs")]
     pub ready_timeout_secs: u64,
-    /// Milliseconds between status reads while waiting (default 500).
-    #[serde(default = "default_poll_interval_ms")]
-    pub poll_interval_ms: u64,
     /// `x509SVIDTTL` on claim entries (default `1h`; admission caps it at `4h`).
     #[serde(default = "default_claim_svid_ttl")]
     pub claim_svid_ttl: String,
@@ -76,9 +73,6 @@ pub struct EntriesSection {
 
 fn default_ready_timeout_secs() -> u64 {
     30
-}
-fn default_poll_interval_ms() -> u64 {
-    500
 }
 fn default_claim_svid_ttl() -> String {
     "1h".into()
@@ -89,7 +83,6 @@ impl From<&EntriesSection> for mediatore_spire::EntriesConfig {
         Self {
             class_name: e.class_name.clone(),
             ready_timeout: std::time::Duration::from_secs(e.ready_timeout_secs),
-            poll_interval: std::time::Duration::from_millis(e.poll_interval_ms),
             claim_svid_ttl: e.claim_svid_ttl.clone(),
         }
     }
@@ -144,7 +137,7 @@ impl Config {
 
     /// Parse YAML and enforce the cross-field rules.
     pub fn parse(text: &str) -> anyhow::Result<Self> {
-        let cfg: Self = serde_yaml_ng::from_str(text)?;
+        let cfg: Self = serde_saphyr::from_str(text)?;
         if cfg.audiences.iter().any(|a| a.via == Backend::Sts) && cfg.sts.is_none() {
             anyhow::bail!("an audience uses the sts backend but no `sts` section is configured");
         }
@@ -155,8 +148,8 @@ impl Config {
             if e.class_name.trim().is_empty() {
                 anyhow::bail!("spire.entries.class_name must not be empty");
             }
-            if e.ready_timeout_secs == 0 || e.poll_interval_ms == 0 {
-                anyhow::bail!("spire.entries timeouts must be positive");
+            if e.ready_timeout_secs == 0 {
+                anyhow::bail!("spire.entries.ready_timeout_secs must be positive");
             }
         }
         Ok(cfg)
@@ -198,7 +191,6 @@ listen: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }
         let e: mediatore_spire::EntriesConfig = (&cfg.spire.unwrap().entries).into();
         assert_eq!(e.class_name, "spire-server-spire");
         assert_eq!(e.ready_timeout, std::time::Duration::from_secs(30));
-        assert_eq!(e.poll_interval, std::time::Duration::from_millis(500));
         assert_eq!(e.claim_svid_ttl, "1h");
     }
 

@@ -18,7 +18,8 @@ use chrono::Duration;
 use mediatore_api::AppState;
 use mediatore_entra::{Backend, IssuerConfig, Validator};
 use mediatore_proto::{
-    ClaimRequest, ClaimResponse, Me, NodeRegistered, NodeRegistration, TokenResponse, Workload,
+    ClaimRequest, ClaimResponse, ErrorBody, Me, NodeRegistered, NodeRegistration, TokenResponse,
+    Workload,
 };
 use mediatore_spire::Naming;
 use mediatore_store::MemoryStore;
@@ -97,7 +98,10 @@ impl Harness {
             idp,
             user_url,
             sandbox_url,
-            http: reqwest::Client::new(),
+            http: {
+                mediatore_proto::tls::ensure_provider();
+                reqwest::Client::new()
+            },
         }
     }
 
@@ -401,6 +405,33 @@ async fn a_peer_cannot_register_someone_elses_ek() {
         .await
         .expect("register");
     assert_eq!(resp.status(), 403);
+}
+
+#[tokio::test]
+async fn a_malformed_ek_hash_is_refused_at_registration() {
+    // Not the attestor's shape: the admission policy and the entry manager would refuse
+    // it later, so the front door refuses it now instead of a 500 at bind.
+    let h = Harness::start().await;
+    let bad = format!("demo{:060}", 7);
+    let resp = h
+        .http
+        .post(format!("{}/v1/nodes", h.sandbox_url))
+        .header(
+            PEER_HEADER,
+            format!("spiffe://{TRUST_DOMAIN}/banlieue/node/{bad}"),
+        )
+        .json(&NodeRegistration {
+            ek_hash: bad,
+            dmi_uuid: uuid::Uuid::new_v4(),
+            hostname: "pool-a-7".into(),
+            provider: None,
+        })
+        .send()
+        .await
+        .expect("register");
+    assert_eq!(resp.status(), 400);
+    let body: ErrorBody = resp.json().await.expect("error body");
+    assert_eq!(body.error, "invalid_ek_hash");
 }
 
 #[tokio::test]

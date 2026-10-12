@@ -64,17 +64,24 @@ dependency) for the entries. No `tonic`/`prost` of our own, no vendored protos.
 - [x] Tests: scripted fake API server (`tower-test`) covering create, 409, 403, poll until
       set, masked, timeout, delete 404 and list by label; reconciler bind/release/sweep
       over `MemoryEntries`; e2e runs on `MemoryEntries` with a 64-hex EK hash
-- [ ] Live admission test: `make live-admission-test` applies allowed and refused shapes
-      server-side as `system:serviceaccount:banlieue-system:mediatore` (`#[ignore]`d until
-      roadmap 02's cluster target exists, failing loudly without it)
+- [x] Live admission test: `make live-admission-test` runs the full round trip as
+      `system:serviceaccount:banlieue-system:mediatore` against a real cluster (declare, 409,
+      wait, list, eleven refused shapes, RBAC refusing update and patch, retract);
+      `#[ignore]`d, fails loudly without its fixture. First run found that `status.set` is a
+      transient, which turned the poll into a watch (ADR-0006 decision 5)
+- [x] kind tier: `make kind-e2e` installs the homelab's chart versions into a kind cluster,
+      applies `deploy/base`'s ServiceAccount, RBAC and policy, and runs the live suite as a
+      token for that ServiceAccount; `make kind-e2e-ci` is the E2E workflow's second job.
+      Tiers and what each proves: `docs/guides/testing.md`
 - [x] `spire.endpoint` (ADR-0005) never implemented; config gains `spire.workload_api_socket`
-      and `spire.entries.{class_name, kubeconfig, ready_timeout_secs, poll_interval_ms,
-      claim_svid_ttl}`, required outside `dev_mode`
+      and `spire.entries.{class_name, kubeconfig, ready_timeout_secs, claim_svid_ttl}`,
+      required outside `dev_mode`
 
 ## Identity and mTLS (ADR-0007)
 
-- [ ] `aws-lc-rs` as the process-wide rustls provider; `reqwest`/`kube` on their
-      no-provider features; acceptance: `cargo tree -i ring` is empty (R-8 revisit)
+- [x] `aws-lc-rs` as the process-wide rustls provider, installed first thing in each
+      binary; `reqwest` and `kube` on their no-provider features; `cargo deny` bans `ring`
+      (R-8 revisit happens in the closing threat-model pass)
 - [ ] `X509Source` from `spire.workload_api_socket`; startup fails closed without it
       outside `dev_mode`
 - [ ] Sandbox listener: `spiffe-rustls` server config, TLS 1.3, client cert required,
@@ -86,6 +93,9 @@ dependency) for the entries. No `tonic`/`prost` of our own, no vendored protos.
       `dev` cargo feature, off in release builds
 - [ ] `mediatore-testkit`: test CA minting SPIFFE X.509 SVIDs + in-memory source; e2e
       gains the mTLS variant and the negative cases from ADR-0007 decision 8
+- [ ] kind tier for ADR-0007: the broker image in the cluster on the CSI socket with the
+      `ClusterSPIFFEID`, a client pod with a claim-shaped SVID over mTLS, the negative
+      cases; `make kind-e2e-mtls` joins `kind-e2e`
 - [ ] NetworkPolicy for the broker pods: spec in ADR-0007 decision 7, manifest lands
       with roadmap 02 (CIDRs are deployment-specific)
 

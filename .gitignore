@@ -1,4 +1,6 @@
 /target
+# kind cluster kubeconfigs (make kind-up); the SA token one is a credential
+/.kind/
 **/*.rs.bk
 *.pem
 *.key

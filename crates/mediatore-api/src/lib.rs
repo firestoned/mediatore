@@ -21,6 +21,7 @@ use axum::{Json, Router};
 use chrono::{Duration, Utc};
 use mediatore_claims::Reconciler;
 use mediatore_entra::{Validated, Validator};
+use mediatore_proto::ek::is_ek_hash;
 use mediatore_proto::{
     ClaimPhase, ClaimRequest, ClaimResponse, ErrorBody, Me, NodeRegistered, NodeRegistration,
     TokenRequest, TokenResponse,
@@ -332,6 +333,12 @@ async fn register_node(
     Json(reg): Json<NodeRegistration>,
 ) -> Result<Json<NodeRegistered>, ApiError> {
     let peer = peer_spiffe_id(&st, &headers)?;
+    if !is_ek_hash(&reg.ek_hash) {
+        return Err(ApiError::bad_request(
+            "invalid_ek_hash",
+            "ek_hash must be 64 lowercase hex characters",
+        ));
+    }
     let expected = st.naming.node_id(&reg.ek_hash);
     if peer != expected {
         return Err(ApiError::forbidden(format!(

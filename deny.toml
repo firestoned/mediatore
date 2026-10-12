@@ -27,6 +27,7 @@ wildcards = "deny"
 allow-wildcard-paths = true
 deny = [
   { name = "openssl-sys", reason = "rustls only" },
+  { name = "ring", reason = "aws-lc-rs is the only rustls provider (ADR-0007)" },
 ]
 
 [sources]

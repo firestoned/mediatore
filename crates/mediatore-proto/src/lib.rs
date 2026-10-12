@@ -8,6 +8,7 @@
 //! them are a new API version, never a silent edit.
 
 pub mod ek;
+pub mod tls;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
