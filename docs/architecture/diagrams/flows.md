@@ -31,12 +31,13 @@ flowchart TD
     t1["1. User logs in; receives a token with aud = mediatore."]
     t2["2. POST /v1/claims; mediatore validates the token and derives the subject."]
     t3["3. mediatore creates the VirtualMachineClaim with spec.subject."]
-    t4["4. banlieue binds a Ready, already-attested pool member."]
-    t5["5. The watcher creates the claim's registration entry under the bound node's agent ID."]
-    t6["6. The in-guest agent fetches the subject, creates the sb- user and starts the jail."]
-    t7["7. The workload trades its claim SVID for a short-lived, audience-scoped token."]
-    t8["8. The workload calls the downstream API on the user's behalf."]
-    t1 --> t2 --> t3 --> t4 --> t5 --> t6 --> t7 --> t8
+    t4["4. banlieue binds a Ready, already-attested pool member and mirrors its EK certificate onto the claim."]
+    t5["5. The watcher hashes the EK certificate's public key, resolves the node, and declares the claim's ClusterStaticEntry (admission policy checks the shape)."]
+    t6["6. The controller manager renders the entry over the private socket and reports status.set; the watcher marks the claim live."]
+    t7["7. The in-guest agent fetches the subject over its node SVID, creates the sb- user and starts the jail."]
+    t8["8. The workload presents its claim SVID over mTLS and trades it for a short-lived, audience-scoped token."]
+    t9["9. The workload calls the downstream API on the user's behalf."]
+    t1 --> t2 --> t3 --> t4 --> t5 --> t6 --> t7 --> t8 --> t9
 ```
 
 <sub>Source: flow `flow-claim-to-token` in `architecture.json`.</sub>
@@ -49,11 +50,28 @@ Any of four independent cut-offs stops the sandbox acting as the user; this is t
 ```mermaid
 flowchart TD
     t1["1. DELETE /v1/claims (or the TTL fires). The store row is revoked: /v1/token refuses immediately."]
-    t2["2. The SPIRE entry is deleted; the workload's SVID stops within the agent sync interval."]
+    t2["2. The ClusterStaticEntry is deleted; the controller manager removes the server entry and the workload's SVID stops within the agent sync interval."]
     t3["3. The VirtualMachineClaim is deleted (or its deletion observed)."]
     t4["4. banlieue destroys the member, vTPM included; the guest agent tears down the jail and user regardless."]
     t1 --> t2 --> t3 --> t4
 ```
 
 <sub>Source: flow `flow-release-cutoff` in `architecture.json`.</sub>
+
+
+## Node bootstrap: from EK certificate to node SVID
+
+How a fresh pool member gets the in-guest agent's identity without the broker ever listing agents or holding a SPIRE admin credential (ADR-0006, ADR-0007).
+
+```mermaid
+flowchart TD
+    t1["1. banlieue publishes the member's vTPM EK certificate on VirtualMachine.status (banlieue ADR-0045) before GuestReady."]
+    t2["2. The watcher computes sha256(DER SubjectPublicKeyInfo) of the EK, which is the tpm attestor's agent ID hash, and declares mediatore-node-<ek-hash> parented to that agent."]
+    t3["3. The controller manager renders the node entry; it waits in the server until the agent attests."]
+    t4["4. The VM's agent attests with the EK; on sync it receives the node entry and issues the node SVID to mediatore-guest (unix:uid:0, binary path)."]
+    t5["5. mediatore-guest registers the node over mTLS with that SVID; the broker checks the SVID's EK hash equals the registered one and refuses a cloned EK with 409."]
+    t1 --> t2 --> t3 --> t4 --> t5
+```
+
+<sub>Source: flow `flow-node-bootstrap` in `architecture.json`.</sub>
 

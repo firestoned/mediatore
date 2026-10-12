@@ -9,5 +9,7 @@ resources:
   - rbac.yaml
   - deployment.yaml
   - service.yaml
+  - service-sandbox.yaml
   - ingressroute.yaml
   - clusterspiffeid.yaml
+  - admission/clusterstaticentry-mediatore.yaml

@@ -24,7 +24,7 @@ flowchart TB
     root["SPIRE root server (HA)<br/>UpstreamAuthority: HSM / KMS / corp PKI<br/>PostgreSQL (HA)"]
   end
 
-  mgmt["downstream SPIRE<br/>(sandbox mgmt cluster)<br/>TPM attestor + EK CA bundle<br/>k8s_psat for its own cluster<br/>mediatore admin_ids granted HERE only"]
+  mgmt["downstream SPIRE + controller manager<br/>(sandbox mgmt cluster)<br/>TPM attestor + EK CA bundle<br/>k8s_psat for its own cluster<br/>mediatore's ClusterStaticEntry resources live HERE only"]
   regionb["downstream SPIRE<br/>(region B)"]
   envc["downstream SPIRE<br/>(env C)"]
 
@@ -33,7 +33,7 @@ flowchart TB
   root --> envc
 
   vms["pool VMs"] -- "attest 8081" --> mgmt
-  mediatore["mediatore"] -- "entries gRPC" --> mgmt
+  mediatore["mediatore"] -- "ClusterStaticEntry via this cluster's API server (ADR-0006)" --> mgmt
 ```
 
 One trust domain across the tree. Nesting, not federation: federation (bundle
@@ -48,21 +48,30 @@ exchange) is for genuinely separate trust domains, e.g. two organisations.
    attestation surface: the TPM attestor with the EK CA bundle for its hypervisors
    (vCenter VMCA roots, swtpm fleet CAs), and a `k8s_psat` config that can validate
    ServiceAccount tokens from that environment's cluster only.
-3. **mediatore's `admin_ids` entry on the downstream server, never the root.** A
-   compromised broker can then forge entries only in its own environment; the
-   containment row in the threat model (TB-3) depends on this.
+3. **mediatore declares entries in the downstream server's cluster, never the root's, and
+   never holds a SPIRE admin identity.** Entries are `ClusterStaticEntry` resources that
+   the downstream server's controller manager renders over its private socket
+   ([ADR-0006](../adr/0006-registration-entries-as-clusterstaticentry.md)); an admission
+   policy restricts the broker to two shapes under `/banlieue/`. A compromised broker can
+   then forge at most those shapes, only in its own environment; the containment row in
+   the threat model (TB-3) depends on this.
 4. **Revocation flows down.** Rotating or revoking one environment's intermediate cuts
    that environment off without touching the others.
 5. **Network:** pool VMs reach only their downstream server (TCP 8081); mediatore
-   reaches only its downstream server's API. Nothing in any workload cluster needs a
-   route to the identity cluster except the downstream servers themselves.
+   reaches only the Kubernetes API of the cluster that hosts its downstream server, and
+   never any SPIRE server port. Nothing in any workload cluster needs a route to the
+   identity cluster except the downstream servers themselves.
 
 ## What changes in mediatore configuration
 
 Nothing structural — the SPIRE endpoint is already configuration, not an assumption:
 
-- `spire.endpoint` points at the environment's downstream server (in-cluster DNS in
-  the homelab, a proper address in the enterprise).
+- `spire.entries.kubeconfig` points at the cluster that hosts the environment's
+  downstream server and controller manager (unset, meaning in-cluster, in the homelab; a
+  kubeconfig with the same narrow RBAC and admission policy in the enterprise).
+- `spire.workload_api_socket` is the broker pod's own agent socket, delivered by the
+  SPIFFE CSI driver ([ADR-0007](../adr/0007-broker-identity-and-spiffe-mtls.md)); it is
+  the same in every topology.
 - The trust bundle baked into the VM image (runbook Part 1.5) is the trust domain
   bundle, which is identical whether the tree has one server or ten.
 - Registration entry shapes, SPIFFE ID paths and the username derivation
@@ -73,6 +82,7 @@ Nothing structural — the SPIRE endpoint is already configuration, not an assum
 1. Stand up the identity cluster; install the root with the `UpstreamAuthority` plugin.
 2. Install a downstream server in the management cluster, configured with the existing
    TPM attestor, EK bundle and datastore; point it at the root.
-3. Move mediatore's `admin_ids` grant and `spire.endpoint` to the downstream server.
+3. Point `spire.entries.kubeconfig` at the downstream server's cluster and apply
+   `deploy/base/rbac.yaml` and the admission policy there.
 4. Roll the pool (new members attest to the downstream server; old ones drain by TTL).
 5. Decommission the flat server and delete threat-model row R-7.

@@ -4,8 +4,18 @@ SPDX-License-Identifier: Apache-2.0
 -->
 # Threat Model
 
-> **Status:** Living document. Last full pass **2026-09-26**, against the
-> architecture defined by **ADR-0001 … ADR-0005**. The first pass covered the
+> **Status:** Living document. Last full pass **2026-10-04**, against the
+> architecture defined by **ADR-0001 … ADR-0005**. The 2026-10-03 pass is
+> driven by evidence, not an ADR: the homelab SPIRE server and the Dex issuer
+> this document assumed were **deployed** on the management cluster and their
+> configuration and cryptography measured. No component, asset or boundary in
+> this repo changes. R-7 now describes the deployment concretely; TB-4 and
+> TB-5 gain rows for the deployed controls and gaps; two risks are new: R-8,
+> every TLS connection mediatore makes uses classical key exchange (rustls
+> with the `ring` provider), and R-9, the SPIRE datastore's transport. R-9
+> was **deleted** on 2026-10-04: the datastore moved to PostgreSQL 18 with
+> X25519MLKEM768-only key exchange, TLS 1.3 and `sslmode=verify-full`
+> against a private CA, which is the revisit condition it named. The first pass covered the
 > implemented dev-mode loop (upstream token validation, claim lifecycle, STS
 > issuance, release cut-off) and recorded every not-yet-built edge (SPIFFE
 > mTLS, SPIRE gRPC, Entra OBO, sqlx store) as either a fail-closed stub or an
@@ -162,6 +172,8 @@ the residue is in §8.
 | Cloned TPM state (two VMs, one EK) | S | Second registration of an EK with a different DMI UUID refused 409: `crates/mediatore-store/src/lib.rs` (`put_node`), e2e-tested |
 | Impostor node claiming someone's EK | S | Peer must present the node SVID matching the EK it registers: `crates/mediatore-api/src/lib.rs` (`register_node`) |
 | EK cert from an untrusted CA | S | SPIRE server's `ek-ca.pem` allowlist — control lives in the SPIRE deployment (runbook Part 1), not in this repo |
+| A spoofed kubelet feeds the agent false pod metadata, so a pod (the broker included) is issued another workload's SVID | S, E | Deployment control, not in this repo: the agent's `k8s` workload attestor verifies the kubelet's serving certificate against the cluster CA over the node IP (`skip_kubelet_verification: false`). The hardened chart's default **skips** this check; the deployed homelab sets it explicitly |
+| An agent attests from outside the cluster | S | `k8s_psat` node attestation: a projected, audience-bound service-account token validated against the API server, bound to the cluster name. Observed: every agent's SPIFFE ID is bound to a node UID |
 
 ### TB-5: mediatore → IdP
 
@@ -170,6 +182,8 @@ the residue is in §8.
 | JWKS substitution / MITM | S | HTTPS via rustls (`reqwest` `rustls-tls`, `Cargo.toml`); issuer URL is config, never taken from a token or CR |
 | Key rotation lockout / stale keys | D | 300 s JWKS cache with forced refetch on unknown `kid`: `crates/mediatore-entra/src/lib.rs` (`key_for`) |
 | Revoked upstream session still delegating | E | Design (ADR-0003): refresh-before-issue so upstream revocation propagates; OBO/refresh not implemented yet — see §8 R-2 |
+| The homelab issuer (Dex) runs on the management cluster, so whoever can read its signing keys (stored as cluster resources) mints any upstream identity | S, E | Deployment control: only `cluster-admin` and core controllers can read the issuer's storage group (verified by RBAC review). Residual is R-7's: the cluster admin is trusted |
+| A stolen upstream ID token is replayed at mediatore within its lifetime | S | `aud` must equal mediatore's `client_id` (e2e-tested). The deployed issuer's ID tokens live **24 h** (Dex default) until configured shorter; mediatore's own STS tokens stay ≤ 15 min regardless |
 
 ### TB-6: VM / jail → sandbox API *(stub — the load-bearing one)*
 
@@ -214,7 +228,8 @@ the residue is in §8.
 | R-4 | mediatore is a single trust point: a compromised broker mints for any active claim | Inherent to the broker pattern; mitigations planned: HSM/transit-held keys, two-person deploy, immutable audit sink | The production deployment ADR (key custody, audit) |
 | R-5 | In-memory store loses claim state on restart (dev only): a restarted broker forgets revocations it has not propagated | Dev-only; the SPIRE `Noop` means no entries outlive the process either | The sqlx store lands; re-walk §6 TB-3/TB-6 ordering against real persistence |
 | R-6 | vTPM EK attestation proves "this vTPM", not "this host"; hypervisor compromise breaks node identity | Same posture as banlieue ADR-0045; hypervisor is in the TCB | PCR / measured-boot selectors become available (runbook open decision #6) |
-| R-7 | Homelab collapse: one flat SPIRE server on the management cluster, no root, no upstream authority — its signing key lives where sandboxes are administered | Single-operator homelab; ADR-0005 records the enterprise topology (root on a dedicated identity cluster, HSM-backed) as the desired state | Any multi-team or production deployment; then split per ADR-0005 and delete this row |
+| R-7 | Homelab collapse: one flat SPIRE trust domain on the management cluster, no root, no upstream authority: its signing key lives where sandboxes are administered. As deployed (2026-10-03): two servers sharing an external PostgreSQL datastore, each with a self-signed RSA-2048 CA whose key sits on a node-local volume in plaintext, audit log off (chart default) | Single-operator homelab; ADR-0005 records the enterprise topology (root on a dedicated identity cluster, HSM-backed) as the desired state | Any multi-team or production deployment; then split per ADR-0005 and delete this row. Before then: P-384 CA keys and the audit log on |
+| R-8 | Every TLS connection mediatore makes (IdP/JWKS, Kubernetes API, and the future SPIFFE mTLS) uses classical key exchange: rustls with the `ring` provider has no ML-KEM, so recorded traffic, including issued tokens, is exposed to "harvest now, decrypt later". Its STS tokens (ES256) and the SVIDs they bind to (RSA/ECDSA) are classical signatures | `ring` was inherited from the kube/reqwest defaults, not chosen; post-quantum signatures are not supported by SPIRE or JOSE implementations yet | Switch rustls to the aws-lc-rs provider (X25519MLKEM768 by default) before the sandbox listener's mTLS lands (R-1); ML-DSA support in SPIRE and JOSE |
 
 ## 9. Assumptions and out of scope
 
@@ -234,3 +249,5 @@ the residue is in §8.
 | --- | --- | --- | --- |
 | 2026-09-26 | Initial full pass | 0001–0004 | Document created; 6 accepted risks recorded; TB-3/TB-6 marked stub, fail-closed verified by e2e |
 | 2026-09-26 | SPIRE topology | 0001–0005 | No new code or component here; §5 diagram gains the root/downstream split, TB-3 gains the per-environment containment row, homelab flat-server posture moved from unstated assumption to R-7 |
+| 2026-10-03 | Homelab deployment, measured | 0001–0005 | SPIRE and Dex deployed on the management cluster and measured. R-7 made concrete; TB-4 gains kubelet-verification and `k8s_psat` rows; TB-5 gains the in-cluster issuer and token-lifetime rows; new R-8 (classical key exchange in every mediatore TLS client) and R-9 (SPIRE datastore transport). No code change |
+| 2026-10-04 | Datastore remediated | 0001–0005 | R-9 deleted: the homelab SPIRE datastore runs PostgreSQL 18 with X25519MLKEM768-only key exchange, TLS 1.3 and `verify-full`; the SPIRE servers reconnected under the post-quantum-only offer |

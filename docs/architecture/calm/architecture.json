@@ -17,7 +17,7 @@
       "unique-id": "system-mediatore",
       "node-type": "system",
       "name": "mediatore",
-      "description": "The identity broker: one binary, two listeners (user-facing bearer HTTPS, sandbox-facing SPIFFE mTLS), a claim watcher and a token backend per audience (ADR-0002, ADR-0003)."
+      "description": "The identity broker: one binary, two listeners (user-facing bearer HTTPS behind the ingress, sandbox-facing SPIFFE mTLS terminated in-process on aws-lc-rs), a claim watcher and a token backend per audience (ADR-0002, ADR-0003, ADR-0007). Runs as a restricted, non-root Deployment in banlieue-system; its SVID lives only in process memory."
     },
     {
       "unique-id": "service-mediatore-user-api",
@@ -29,13 +29,13 @@
       "unique-id": "service-mediatore-sandbox-api",
       "node-type": "service",
       "name": "Sandbox API (SPIFFE mTLS)",
-      "description": "POST /v1/nodes, GET /v1/me, POST /v1/token. Authenticates peers by SPIFFE ID: node identities may register and fetch their subject, claim identities may request audience-scoped tokens. crates/mediatore-api."
+      "description": "POST /v1/nodes, GET /v1/me, POST /v1/token over SPIFFE mTLS: client certificate required, chain verified against the trust-domain bundle, peer SPIFFE ID taken from the verified URI SAN and restricted to /banlieue/node/* and /banlieue/claim/*. Node identities may register and fetch their subject, claim identities may request audience-scoped tokens. The dev header exists only under dev_mode on a loopback listener (ADR-0007). crates/mediatore-api."
     },
     {
       "unique-id": "service-mediatore-watcher",
       "node-type": "service",
       "name": "Claim Watcher",
-      "description": "Watches VirtualMachineClaim: on Bound resolves the node by DMI UUID / EK hash and creates the claim's SPIRE registration entry; on Releasing/Failed/deletion deletes the entry and revokes the store row (entry first, then refresh material). crates/mediatore-claims."
+      "description": "Watches VirtualMachineClaim: on Bound resolves the node by DMI UUID / EK hash and declares the claim's registration entry as a ClusterStaticEntry through the Kubernetes API, waiting for status.set before the claim is live; on Releasing/Failed/deletion deletes the resource and revokes the store row (entry first, then refresh material). Derives the node entry from the EK certificate banlieue publishes. Never holds a SPIRE admin identity (ADR-0006). crates/mediatore-claims."
     },
     {
       "unique-id": "service-mediatore-sts",
@@ -59,7 +59,7 @@
       "unique-id": "service-kubernetes-api",
       "node-type": "service",
       "name": "Kubernetes API Server",
-      "description": "Management-cluster API server. mediatore creates and watches VirtualMachineClaim through it; the banlieue-claim-subject-policy VAP enforces caller-equals-subject except for allowlisted brokers."
+      "description": "Management-cluster API server. mediatore creates and watches VirtualMachineClaim through it, and declares SPIRE registration entries as ClusterStaticEntry resources through it. The banlieue-claim-subject-policy VAP enforces caller-equals-subject except for allowlisted brokers; the mediatore-clusterstaticentry VAP restricts the broker's ServiceAccount to the two entry shapes under /banlieue/ (ADR-0006)."
     },
     {
       "unique-id": "system-banlieue",
@@ -71,7 +71,25 @@
       "unique-id": "service-spire-server",
       "node-type": "service",
       "name": "SPIRE Server (downstream)",
-      "description": "The environment-scoped SPIRE server: holds the TPM attestor, the EK trust bundle and the k8s_psat config for this cluster, and issues node identities and workload SVIDs. mediatore is an admin identity here only, creating exactly two entry kinds: /banlieue/node/<ek-hash> and /banlieue/claim/<uid> (ADR-0004). In the enterprise topology it chains to the root via an intermediate CA; in the homelab it is the whole tree (ADR-0005)."
+      "description": "The environment-scoped SPIRE server: holds the TPM attestor, the EK trust bundle and the k8s_psat config for this cluster, and issues node identities and workload SVIDs. Its registration entries are rendered by the SPIRE Controller Manager in the same pod over a private Unix socket; no admin API is reachable over the network. mediatore's two entry kinds (/banlieue/node/<ek-hash>, /banlieue/claim/<uid>, ADR-0004) arrive as ClusterStaticEntry resources (ADR-0006). In the enterprise topology it chains to the root via an intermediate CA; in the homelab it is the whole tree (ADR-0005)."
+    },
+    {
+      "unique-id": "service-spire-controller-manager",
+      "node-type": "service",
+      "name": "SPIRE Controller Manager",
+      "description": "Runs beside the SPIRE server in the same pod (leader-elected across replicas). Watches ClusterSPIFFEID and ClusterStaticEntry resources and renders them into server registration entries over a private Unix socket. The only writer of entries in the cluster; reports status.rendered / masked / set on each resource (ADR-0006)."
+    },
+    {
+      "unique-id": "data-asset-cluster-static-entries",
+      "node-type": "data-asset",
+      "name": "ClusterStaticEntry resources",
+      "description": "Cluster-scoped declarations of mediatore's registration entries: mediatore-node-<ek-hash> and mediatore-claim-<uid>, labelled app.kubernetes.io/managed-by=mediatore. Shape enforced at admission by CEL policy: spiffeID under /banlieue/, parentID a tpm agent with the same EK hash, unix selectors only, no admin/downstream/storeSVID. Auditable through the API server audit log and restorable from a cluster backup (ADR-0006)."
+    },
+    {
+      "unique-id": "service-spire-agent-k8s",
+      "node-type": "service",
+      "name": "SPIRE Agent + SPIFFE CSI driver (k8s node)",
+      "description": "Per-node DaemonSets from the hardened chart. The agent attests the node with k8s_psat, attests pods through a kubelet whose serving certificate it verifies, and serves the Workload API on a hostPath socket directory. The CSI driver bind-mounts that directory read-only into pods that declare a csi.spiffe.io inline volume, so no workload needs a hostPath. Both are node-level TCB, the same tier as the kubelet (ADR-0007)."
     },
     {
       "unique-id": "service-spire-root",
@@ -89,7 +107,7 @@
       "unique-id": "network-management-cluster",
       "node-type": "network",
       "name": "Management Cluster",
-      "description": "The banlieue management cluster: runs mediatore, the downstream SPIRE server, the Kubernetes API and the banlieue controllers. In the homelab this is the single banlieue cluster and the downstream server is the only SPIRE server."
+      "description": "The banlieue management cluster: runs mediatore, the downstream SPIRE server with its controller manager, the SPIRE agent and SPIFFE CSI driver DaemonSets, the Kubernetes API and the banlieue controllers. In the homelab this is the single banlieue cluster and the downstream server is the only SPIRE server."
     },
     {
       "unique-id": "system-sandbox-vm",
@@ -152,7 +170,11 @@
       "relationship-type": {
         "composed-of": {
           "container": "system-sandbox-vm",
-          "nodes": ["service-spire-agent", "service-guest-agent", "service-sandbox-workload"]
+          "nodes": [
+            "service-spire-agent",
+            "service-guest-agent",
+            "service-sandbox-workload"
+          ]
         }
       }
     },
@@ -162,13 +184,15 @@
       "relationship-type": {
         "deployed-in": {
           "container": "network-sandbox-segment",
-          "nodes": ["system-sandbox-vm"]
+          "nodes": [
+            "system-sandbox-vm"
+          ]
         }
       }
     },
     {
       "unique-id": "rel-mgmt-cluster-deployment",
-      "description": "Everything control-plane-side shares the management cluster; the SPIRE downstream server is scoped to it so mediatore admin rights and k8s_psat validation stay per-environment.",
+      "description": "Everything control-plane-side shares the management cluster; the SPIRE downstream server, its controller manager and the per-node agent and CSI driver are scoped to it so entry rendering, k8s_psat validation and pod attestation stay per-environment.",
       "relationship-type": {
         "deployed-in": {
           "container": "network-management-cluster",
@@ -176,7 +200,10 @@
             "system-mediatore",
             "service-kubernetes-api",
             "system-banlieue",
-            "service-spire-server"
+            "service-spire-server",
+            "service-spire-controller-manager",
+            "service-spire-agent-k8s",
+            "data-asset-cluster-static-entries"
           ]
         }
       }
@@ -187,7 +214,9 @@
       "relationship-type": {
         "deployed-in": {
           "container": "network-identity-cluster",
-          "nodes": ["service-spire-root"]
+          "nodes": [
+            "service-spire-root"
+          ]
         }
       }
     },
@@ -196,8 +225,12 @@
       "description": "Nested SPIRE: the downstream server obtains its intermediate CA from the root and chains every SVID it issues to the one trust domain. Revoking the intermediate cuts an entire environment off from above. Absent in the homelab collapse (ADR-0005).",
       "relationship-type": {
         "connects": {
-          "source": { "node": "service-spire-server" },
-          "destination": { "node": "service-spire-root" }
+          "source": {
+            "node": "service-spire-server"
+          },
+          "destination": {
+            "node": "service-spire-root"
+          }
         }
       },
       "protocol": "mTLS"
@@ -207,8 +240,12 @@
       "description": "The user logs in at the IdP (PKCE via mediatore-cli or az login) and receives a token whose audience is mediatore. The user's token is only ever presented to mediatore, never to the VM.",
       "relationship-type": {
         "connects": {
-          "source": { "node": "actor-sandbox-user" },
-          "destination": { "node": "ecosystem-idp" }
+          "source": {
+            "node": "actor-sandbox-user"
+          },
+          "destination": {
+            "node": "ecosystem-idp"
+          }
         }
       },
       "protocol": "HTTPS"
@@ -218,8 +255,12 @@
       "description": "POST /v1/claims with the IdP bearer token; GET mirrors phase, DELETE releases. Subject equality is enforced on read and delete.",
       "relationship-type": {
         "connects": {
-          "source": { "node": "actor-sandbox-user" },
-          "destination": { "node": "service-mediatore-user-api" }
+          "source": {
+            "node": "actor-sandbox-user"
+          },
+          "destination": {
+            "node": "service-mediatore-user-api"
+          }
         }
       },
       "protocol": "HTTPS"
@@ -229,8 +270,12 @@
       "description": "JWKS discovery and signature validation for incoming tokens; Entra On-Behalf-Of / refresh-token exchange for the entra-obo backend. The user's original token is discarded after the first exchange.",
       "relationship-type": {
         "connects": {
-          "source": { "node": "service-mediatore-user-api" },
-          "destination": { "node": "ecosystem-idp" }
+          "source": {
+            "node": "service-mediatore-user-api"
+          },
+          "destination": {
+            "node": "ecosystem-idp"
+          }
         }
       },
       "protocol": "HTTPS"
@@ -240,8 +285,12 @@
       "description": "Creates the VirtualMachineClaim with spec.subject from the validated token. The mediatore ServiceAccount is in the VAP brokers allowlist, so admission skips the caller-equals-subject check for it.",
       "relationship-type": {
         "connects": {
-          "source": { "node": "service-mediatore-user-api" },
-          "destination": { "node": "service-kubernetes-api" }
+          "source": {
+            "node": "service-mediatore-user-api"
+          },
+          "destination": {
+            "node": "service-kubernetes-api"
+          }
         }
       },
       "protocol": "HTTPS"
@@ -251,8 +300,12 @@
       "description": "Watches VirtualMachineClaim for Bound / Releasing / Failed / deletion.",
       "relationship-type": {
         "connects": {
-          "source": { "node": "service-mediatore-watcher" },
-          "destination": { "node": "service-kubernetes-api" }
+          "source": {
+            "node": "service-mediatore-watcher"
+          },
+          "destination": {
+            "node": "service-kubernetes-api"
+          }
         }
       },
       "protocol": "HTTPS"
@@ -262,30 +315,100 @@
       "description": "banlieue's claim controller binds Ready pool members to claims and destroys members on release; mediatore only observes the results. CRDs are the entire interface.",
       "relationship-type": {
         "connects": {
-          "source": { "node": "system-banlieue" },
-          "destination": { "node": "service-kubernetes-api" }
+          "source": {
+            "node": "system-banlieue"
+          },
+          "destination": {
+            "node": "service-kubernetes-api"
+          }
         }
       },
       "protocol": "HTTPS"
     },
     {
-      "unique-id": "rel-watcher-spire",
-      "description": "Creates the claim entry (parent = the bound VM's agent ID, selector unix:user:sb-<hash>) on Bound; deletes it on release. Admin identity over the SPIRE server API, gRPC via spire-api-sdk.",
+      "unique-id": "rel-watcher-entries",
+      "description": "Declares the claim entry (parent = the bound VM's tpm agent ID, selector unix:user:sb-<hash>) as a ClusterStaticEntry on Bound and deletes it on release, through the Kubernetes API with the broker ServiceAccount. RBAC: create/delete/get/list/watch on clusterstaticentries only; the mediatore-clusterstaticentry admission policy rejects any other shape. Waits for status.set. No gRPC, no admin SVID (ADR-0006).",
       "relationship-type": {
         "connects": {
-          "source": { "node": "service-mediatore-watcher" },
-          "destination": { "node": "service-spire-server" }
+          "source": {
+            "node": "service-mediatore-watcher"
+          },
+          "destination": {
+            "node": "service-kubernetes-api"
+          }
         }
       },
-      "protocol": "mTLS"
+      "protocol": "HTTPS"
+    },
+    {
+      "unique-id": "rel-controller-manager-kube-api",
+      "description": "Watches ClusterSPIFFEID and ClusterStaticEntry resources and reports rendering status on them.",
+      "relationship-type": {
+        "connects": {
+          "source": {
+            "node": "service-spire-controller-manager"
+          },
+          "destination": {
+            "node": "service-kubernetes-api"
+          }
+        }
+      },
+      "protocol": "HTTPS"
+    },
+    {
+      "unique-id": "rel-controller-manager-spire",
+      "description": "Unix domain socket, not a network protocol (CALM's protocol enum has no value for it). Renders declared resources into registration entries over the server's private Unix socket inside the pod. The admin API is never exposed on the network.",
+      "relationship-type": {
+        "connects": {
+          "source": {
+            "node": "service-spire-controller-manager"
+          },
+          "destination": {
+            "node": "service-spire-server"
+          }
+        }
+      }
+    },
+    {
+      "unique-id": "rel-broker-workload-api",
+      "description": "Unix domain socket, not a network protocol (CALM's protocol enum has no value for it). The broker pod fetches spiffe://<td>/mediatore and the trust-domain bundle from the node's SPIRE agent over the Workload API socket, mounted read-only by the SPIFFE CSI driver (no hostPath). SVID and key stay in process memory and rotate on the stream (ADR-0007).",
+      "relationship-type": {
+        "connects": {
+          "source": {
+            "node": "system-mediatore"
+          },
+          "destination": {
+            "node": "service-spire-agent-k8s"
+          }
+        }
+      }
+    },
+    {
+      "unique-id": "rel-k8s-agent-server",
+      "description": "k8s_psat node attestation with a projected, audience-bound ServiceAccount token, then SVID fetching for attested pods.",
+      "relationship-type": {
+        "connects": {
+          "source": {
+            "node": "service-spire-agent-k8s"
+          },
+          "destination": {
+            "node": "service-spire-server"
+          }
+        }
+      },
+      "protocol": "TLS"
     },
     {
       "unique-id": "rel-spire-agent-server",
       "description": "TPM node attestation at boot (EK certificate + credential activation), then SVID rotation. Claim-independent: a warm member is attested before any claim exists.",
       "relationship-type": {
         "connects": {
-          "source": { "node": "service-spire-agent" },
-          "destination": { "node": "service-spire-server" }
+          "source": {
+            "node": "service-spire-agent"
+          },
+          "destination": {
+            "node": "service-spire-server"
+          }
         }
       },
       "protocol": "TLS"
@@ -295,8 +418,12 @@
       "description": "POST /v1/nodes (EK hash + DMI UUID + hostname) over the node SVID at boot; then polls GET /v1/me until a claim is bound and the subject comes back.",
       "relationship-type": {
         "connects": {
-          "source": { "node": "service-guest-agent" },
-          "destination": { "node": "service-mediatore-sandbox-api" }
+          "source": {
+            "node": "service-guest-agent"
+          },
+          "destination": {
+            "node": "service-mediatore-sandbox-api"
+          }
         }
       },
       "protocol": "mTLS"
@@ -306,8 +433,12 @@
       "description": "POST /v1/token over the claim SVID: one audience per request, from the claim's allowlist, capped at 15 minutes, never a refresh token.",
       "relationship-type": {
         "connects": {
-          "source": { "node": "service-sandbox-workload" },
-          "destination": { "node": "service-mediatore-sandbox-api" }
+          "source": {
+            "node": "service-sandbox-workload"
+          },
+          "destination": {
+            "node": "service-mediatore-sandbox-api"
+          }
         }
       },
       "protocol": "mTLS"
@@ -317,8 +448,12 @@
       "description": "The sandbox calls a downstream API with the audience-scoped token; the API's audit log records both the user and the broker (azp / act).",
       "relationship-type": {
         "connects": {
-          "source": { "node": "service-sandbox-workload" },
-          "destination": { "node": "ecosystem-downstream-api" }
+          "source": {
+            "node": "service-sandbox-workload"
+          },
+          "destination": {
+            "node": "ecosystem-downstream-api"
+          }
         }
       },
       "protocol": "HTTPS"
@@ -329,7 +464,21 @@
       "relationship-type": {
         "interacts": {
           "actor": "actor-sandbox-user",
-          "nodes": ["data-asset-claim-store"]
+          "nodes": [
+            "data-asset-claim-store"
+          ]
+        }
+      }
+    },
+    {
+      "unique-id": "rel-entries-data",
+      "description": "Declared registration entries are state the watcher owns and the controller manager consumes; a sweep deletes any whose claim is gone.",
+      "relationship-type": {
+        "interacts": {
+          "actor": "actor-sandbox-user",
+          "nodes": [
+            "data-asset-cluster-static-entries"
+          ]
         }
       }
     }
@@ -340,14 +489,51 @@
       "name": "Claim a sandbox and act as the user",
       "description": "The happy path from login to a delegated downstream call: login, claim, bind, subject fetch, jail, token.",
       "transitions": [
-        { "sequence-number": 1, "relationship-unique-id": "rel-user-idp-login", "description": "User logs in; receives a token with aud = mediatore." },
-        { "sequence-number": 2, "relationship-unique-id": "rel-user-mediatore-claims", "description": "POST /v1/claims; mediatore validates the token and derives the subject." },
-        { "sequence-number": 3, "relationship-unique-id": "rel-mediatore-kube-api", "description": "mediatore creates the VirtualMachineClaim with spec.subject." },
-        { "sequence-number": 4, "relationship-unique-id": "rel-banlieue-kube-api", "description": "banlieue binds a Ready, already-attested pool member." },
-        { "sequence-number": 5, "relationship-unique-id": "rel-watcher-spire", "description": "The watcher creates the claim's registration entry under the bound node's agent ID." },
-        { "sequence-number": 6, "relationship-unique-id": "rel-guest-agent-mediatore", "description": "The in-guest agent fetches the subject, creates the sb- user and starts the jail." },
-        { "sequence-number": 7, "relationship-unique-id": "rel-workload-mediatore", "description": "The workload trades its claim SVID for a short-lived, audience-scoped token." },
-        { "sequence-number": 8, "relationship-unique-id": "rel-workload-downstream", "description": "The workload calls the downstream API on the user's behalf." }
+        {
+          "sequence-number": 1,
+          "relationship-unique-id": "rel-user-idp-login",
+          "description": "User logs in; receives a token with aud = mediatore."
+        },
+        {
+          "sequence-number": 2,
+          "relationship-unique-id": "rel-user-mediatore-claims",
+          "description": "POST /v1/claims; mediatore validates the token and derives the subject."
+        },
+        {
+          "sequence-number": 3,
+          "relationship-unique-id": "rel-mediatore-kube-api",
+          "description": "mediatore creates the VirtualMachineClaim with spec.subject."
+        },
+        {
+          "sequence-number": 4,
+          "relationship-unique-id": "rel-banlieue-kube-api",
+          "description": "banlieue binds a Ready, already-attested pool member and mirrors its EK certificate onto the claim."
+        },
+        {
+          "sequence-number": 5,
+          "relationship-unique-id": "rel-watcher-entries",
+          "description": "The watcher hashes the EK certificate's public key, resolves the node, and declares the claim's ClusterStaticEntry (admission policy checks the shape)."
+        },
+        {
+          "sequence-number": 6,
+          "relationship-unique-id": "rel-controller-manager-spire",
+          "description": "The controller manager renders the entry over the private socket and reports status.set; the watcher marks the claim live."
+        },
+        {
+          "sequence-number": 7,
+          "relationship-unique-id": "rel-guest-agent-mediatore",
+          "description": "The in-guest agent fetches the subject over its node SVID, creates the sb- user and starts the jail."
+        },
+        {
+          "sequence-number": 8,
+          "relationship-unique-id": "rel-workload-mediatore",
+          "description": "The workload presents its claim SVID over mTLS and trades it for a short-lived, audience-scoped token."
+        },
+        {
+          "sequence-number": 9,
+          "relationship-unique-id": "rel-workload-downstream",
+          "description": "The workload calls the downstream API on the user's behalf."
+        }
       ]
     },
     {
@@ -355,10 +541,58 @@
       "name": "Release and cut-off",
       "description": "Any of four independent cut-offs stops the sandbox acting as the user; this is the ordered normal release.",
       "transitions": [
-        { "sequence-number": 1, "relationship-unique-id": "rel-user-mediatore-claims", "description": "DELETE /v1/claims (or the TTL fires). The store row is revoked: /v1/token refuses immediately." },
-        { "sequence-number": 2, "relationship-unique-id": "rel-watcher-spire", "description": "The SPIRE entry is deleted; the workload's SVID stops within the agent sync interval." },
-        { "sequence-number": 3, "relationship-unique-id": "rel-mediatore-kube-api", "description": "The VirtualMachineClaim is deleted (or its deletion observed)." },
-        { "sequence-number": 4, "relationship-unique-id": "rel-banlieue-kube-api", "description": "banlieue destroys the member, vTPM included; the guest agent tears down the jail and user regardless." }
+        {
+          "sequence-number": 1,
+          "relationship-unique-id": "rel-user-mediatore-claims",
+          "description": "DELETE /v1/claims (or the TTL fires). The store row is revoked: /v1/token refuses immediately."
+        },
+        {
+          "sequence-number": 2,
+          "relationship-unique-id": "rel-watcher-entries",
+          "description": "The ClusterStaticEntry is deleted; the controller manager removes the server entry and the workload's SVID stops within the agent sync interval."
+        },
+        {
+          "sequence-number": 3,
+          "relationship-unique-id": "rel-mediatore-kube-api",
+          "description": "The VirtualMachineClaim is deleted (or its deletion observed)."
+        },
+        {
+          "sequence-number": 4,
+          "relationship-unique-id": "rel-banlieue-kube-api",
+          "description": "banlieue destroys the member, vTPM included; the guest agent tears down the jail and user regardless."
+        }
+      ]
+    },
+    {
+      "unique-id": "flow-node-bootstrap",
+      "name": "Node bootstrap: from EK certificate to node SVID",
+      "description": "How a fresh pool member gets the in-guest agent's identity without the broker ever listing agents or holding a SPIRE admin credential (ADR-0006, ADR-0007).",
+      "transitions": [
+        {
+          "sequence-number": 1,
+          "relationship-unique-id": "rel-banlieue-kube-api",
+          "description": "banlieue publishes the member's vTPM EK certificate on VirtualMachine.status (banlieue ADR-0045) before GuestReady."
+        },
+        {
+          "sequence-number": 2,
+          "relationship-unique-id": "rel-watcher-entries",
+          "description": "The watcher computes sha256(DER SubjectPublicKeyInfo) of the EK, which is the tpm attestor's agent ID hash, and declares mediatore-node-<ek-hash> parented to that agent."
+        },
+        {
+          "sequence-number": 3,
+          "relationship-unique-id": "rel-controller-manager-spire",
+          "description": "The controller manager renders the node entry; it waits in the server until the agent attests."
+        },
+        {
+          "sequence-number": 4,
+          "relationship-unique-id": "rel-spire-agent-server",
+          "description": "The VM's agent attests with the EK; on sync it receives the node entry and issues the node SVID to mediatore-guest (unix:uid:0, binary path)."
+        },
+        {
+          "sequence-number": 5,
+          "relationship-unique-id": "rel-guest-agent-mediatore",
+          "description": "mediatore-guest registers the node over mTLS with that SVID; the broker checks the SVID's EK hash equals the registered one and refuses a cloned EK with 409."
+        }
       ]
     }
   ],
@@ -367,13 +601,15 @@
     "repository": "https://github.com/firestoned/mediatore",
     "license": "Apache-2.0",
     "calm-schema-version": "1.2",
-    "phase": "dev-mode loop implemented and e2e-tested; mTLS, SPIRE gRPC, Entra OBO, sqlx store and the claim watch are fail-closed stubs. SPIRE topology models the ADR-0005 desired state: root on a dedicated identity cluster, downstream per environment; the homelab collapses to the downstream server alone"
+    "phase": "dev-mode loop implemented and e2e-tested; Entra OBO, sqlx store and the claim watch are fail-closed stubs. Roadmap 01 (ADR-0006, ADR-0007) is designed: registration entries as ClusterStaticEntry through the Kubernetes API, broker identity from the Workload API over the SPIFFE CSI driver, SPIFFE mTLS terminated in-process; implementation pending. SPIRE topology models the ADR-0005 desired state: root on a dedicated identity cluster, downstream per environment; the homelab collapses to the downstream server alone"
   },
   "adrs": [
     "docs/adr/0001-record-architecture-decisions.md",
     "docs/adr/0002-separate-project-from-banlieue.md",
     "docs/adr/0003-token-backends.md",
     "docs/adr/0004-spiffe-identity-scheme.md",
-    "docs/adr/0005-spire-topology.md"
+    "docs/adr/0005-spire-topology.md",
+    "docs/adr/0006-registration-entries-as-clusterstaticentry.md",
+    "docs/adr/0007-broker-identity-and-spiffe-mtls.md"
   ]
 }

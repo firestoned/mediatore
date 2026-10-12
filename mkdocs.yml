@@ -148,5 +148,7 @@ nav:
       - "ADR-0003: Two token backends, chosen per audience": adr/0003-token-backends.md
       - "ADR-0004: SPIFFE identity scheme": adr/0004-spiffe-identity-scheme.md
       - "ADR-0005: SPIRE topology": adr/0005-spire-topology.md
+      - "ADR-0006: Entries as ClusterStaticEntry": adr/0006-registration-entries-as-clusterstaticentry.md
+      - "ADR-0007: Broker identity and SPIFFE mTLS": adr/0007-broker-identity-and-spiffe-mtls.md
   - Security:
       - Threat model: security/threat-model.md

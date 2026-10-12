@@ -1,0 +1,19 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+#
+# The sandbox listener's address for pool VMs (ADR-0007 decision 4). TLS is
+# terminated by mediatore itself (SPIFFE mTLS, client certificate required);
+# nothing in the path inspects or re-terminates it, so no ingress controller is
+# involved. The address is deployment configuration (set a loadBalancerIP or
+# annotations in an overlay); guests verify the broker by SPIFFE ID, never by
+# hostname, so the address carries no trust.
+apiVersion: v1
+kind: Service
+metadata:
+  name: mediatore-sandbox
+  labels: { app.kubernetes.io/name: mediatore }
+spec:
+  type: LoadBalancer
+  selector: { app.kubernetes.io/name: mediatore }
+  ports:
+    - { name: sandbox, port: 443, targetPort: sandbox }

@@ -11,7 +11,7 @@ board is [`ROADMAPS.md`](../../ROADMAPS.md) at the repo root.
 | # | Doc | One line |
 | --- | --- | --- |
 | 00 | [00-dev-mode-loop.md](00-dev-mode-loop.md) | The loop, end to end, with every network edge faked and fail-closed |
-| 01 | [01-spiffe-mtls-and-entries.md](01-spiffe-mtls-and-entries.md) | Real peer identity and real registration entries |
+| 01 | [01-spiffe-mtls-and-entries.md](01-spiffe-mtls-and-entries.md) | Real peer identity (SPIFFE mTLS) and entries as `ClusterStaticEntry`, no gRPC |
 | 02 | [02-spire-on-the-cluster.md](02-spire-on-the-cluster.md) | A SPIRE server VMs can attest to (runbook Parts 1–3) |
 | 03 | [03-claim-watcher.md](03-claim-watcher.md) | Watch real `VirtualMachineClaim`s; bind on Bound |
 | 04 | [04-token-backends-live.md](04-token-backends-live.md) | Entra OBO at work, Dex-refreshed STS at home |
