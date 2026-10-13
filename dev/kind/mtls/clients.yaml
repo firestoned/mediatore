@@ -1,0 +1,202 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+#
+# Client pods for `make kind-e2e-mtls` (dev/kind/mtls-e2e.sh). Each one gets its SVID
+# from the real agent through the CSI volume, exactly as the broker does, and talks to
+# the sandbox listener with the shipped guest binaries. The identities are what the
+# listener's authorizer must accept (a claim, a node) and refuse (anything outside
+# /banlieue/, including the broker's own ID in another pod). The ClusterSPIFFEIDs are
+# test fixtures an admin creates; nothing here goes through mediatore's own entry path.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mediatore-e2e
+---
+apiVersion: spire.spiffe.io/v1alpha1
+kind: ClusterSPIFFEID
+metadata:
+  name: mediatore-e2e-claim
+spec:
+  className: spire-server-spire
+  spiffeIDTemplate: "spiffe://{{ .TrustDomain }}/banlieue/claim/6b0a3e9c-1f4d-4c2e-9a7b-0d1e2f3a4b5c"
+  podSelector:
+    matchLabels: { mediatore.dev/e2e-role: claim }
+  namespaceSelector:
+    matchLabels: { kubernetes.io/metadata.name: mediatore-e2e }
+  ttl: 1h
+---
+apiVersion: spire.spiffe.io/v1alpha1
+kind: ClusterSPIFFEID
+metadata:
+  name: mediatore-e2e-node
+spec:
+  className: spire-server-spire
+  spiffeIDTemplate: "spiffe://{{ .TrustDomain }}/banlieue/node/ec00000000000000000000000000000000000000000000000000000000000007"
+  podSelector:
+    matchLabels: { mediatore.dev/e2e-role: node }
+  namespaceSelector:
+    matchLabels: { kubernetes.io/metadata.name: mediatore-e2e }
+  ttl: 1h
+---
+apiVersion: spire.spiffe.io/v1alpha1
+kind: ClusterSPIFFEID
+metadata:
+  name: mediatore-e2e-intruder
+spec:
+  className: spire-server-spire
+  spiffeIDTemplate: "spiffe://{{ .TrustDomain }}/intruder"
+  podSelector:
+    matchLabels: { mediatore.dev/e2e-role: intruder }
+  namespaceSelector:
+    matchLabels: { kubernetes.io/metadata.name: mediatore-e2e }
+  ttl: 1h
+---
+# The threat ADR-0007 argues about: another pod that managed to obtain the broker's
+# identity. The sandbox listener must refuse it as a client.
+apiVersion: spire.spiffe.io/v1alpha1
+kind: ClusterSPIFFEID
+metadata:
+  name: mediatore-e2e-impersonator
+spec:
+  className: spire-server-spire
+  spiffeIDTemplate: "spiffe://{{ .TrustDomain }}/mediatore"
+  podSelector:
+    matchLabels: { mediatore.dev/e2e-role: impersonator }
+  namespaceSelector:
+    matchLabels: { kubernetes.io/metadata.name: mediatore-e2e }
+  ttl: 1h
+---
+# A claim-shaped SVID: the handshake completes and the listener derives the claim UID
+# from the certificate. The broker knows no such claim, so /v1/token answers 403
+# "unknown claim", which is the proof: an HTTP answer about this claim UID.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: claim
+  namespace: mediatore-e2e
+  labels: { mediatore.dev/e2e-role: claim }
+spec:
+  restartPolicy: Never
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    seccompProfile: { type: RuntimeDefault }
+  containers:
+    - name: sandbox-token
+      image: localhost/mediatore-guest:kind
+      imagePullPolicy: Never
+      command: ["/usr/local/bin/sandbox-token", "--audience", "e2e"]
+      env:
+        - { name: MEDIATORE_URL, value: "https://mediatore-sandbox.banlieue-system.svc" }
+        - { name: SPIFFE_ENDPOINT_SOCKET, value: "unix:///run/spire/sockets/spire-agent.sock" }
+      volumeMounts:
+        - { name: spire-agent-socket, mountPath: /run/spire/sockets, readOnly: true }
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities: { drop: ["ALL"] }
+  volumes:
+    - name: spire-agent-socket
+      csi: { driver: csi.spiffe.io, readOnly: true }
+---
+# A node-shaped SVID: mediatore-guest registers the node (POST /v1/nodes, accepted only
+# because the peer ID matches the EK hash it claims) and then polls /v1/me for a claim
+# that never comes. The TPM and DMI reads are replaced by the hidden dev flags.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: node
+  namespace: mediatore-e2e
+  labels: { mediatore.dev/e2e-role: node }
+spec:
+  restartPolicy: Never
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    seccompProfile: { type: RuntimeDefault }
+  containers:
+    - name: mediatore-guest
+      image: localhost/mediatore-guest:kind
+      imagePullPolicy: Never
+      command:
+        - /usr/local/bin/mediatore-guest
+        - --dev-ek-hash
+        - "ec00000000000000000000000000000000000000000000000000000000000007"
+        - --dev-dmi-uuid
+        - 1d2c3b4a-5f6e-4d7c-8b9a-0f1e2d3c4b5a
+        - --dev-skip-setup
+      env:
+        - { name: MEDIATORE_URL, value: "https://mediatore-sandbox.banlieue-system.svc" }
+        - { name: SPIFFE_ENDPOINT_SOCKET, value: "unix:///run/spire/sockets/spire-agent.sock" }
+      volumeMounts:
+        - { name: spire-agent-socket, mountPath: /run/spire/sockets, readOnly: true }
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities: { drop: ["ALL"] }
+  volumes:
+    - name: spire-agent-socket
+      csi: { driver: csi.spiffe.io, readOnly: true }
+---
+# A valid SVID of the trust domain outside /banlieue/: refused in the handshake, no
+# HTTP is ever parsed.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: intruder
+  namespace: mediatore-e2e
+  labels: { mediatore.dev/e2e-role: intruder }
+spec:
+  restartPolicy: Never
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    seccompProfile: { type: RuntimeDefault }
+  containers:
+    - name: sandbox-token
+      image: localhost/mediatore-guest:kind
+      imagePullPolicy: Never
+      command: ["/usr/local/bin/sandbox-token", "--audience", "e2e"]
+      env:
+        - { name: MEDIATORE_URL, value: "https://mediatore-sandbox.banlieue-system.svc" }
+        - { name: SPIFFE_ENDPOINT_SOCKET, value: "unix:///run/spire/sockets/spire-agent.sock" }
+      volumeMounts:
+        - { name: spire-agent-socket, mountPath: /run/spire/sockets, readOnly: true }
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities: { drop: ["ALL"] }
+  volumes:
+    - name: spire-agent-socket
+      csi: { driver: csi.spiffe.io, readOnly: true }
+---
+# The broker's own identity presented as a client: refused in the handshake.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: impersonator
+  namespace: mediatore-e2e
+  labels: { mediatore.dev/e2e-role: impersonator }
+spec:
+  restartPolicy: Never
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    seccompProfile: { type: RuntimeDefault }
+  containers:
+    - name: sandbox-token
+      image: localhost/mediatore-guest:kind
+      imagePullPolicy: Never
+      command: ["/usr/local/bin/sandbox-token", "--audience", "e2e"]
+      env:
+        - { name: MEDIATORE_URL, value: "https://mediatore-sandbox.banlieue-system.svc" }
+        - { name: SPIFFE_ENDPOINT_SOCKET, value: "unix:///run/spire/sockets/spire-agent.sock" }
+      volumeMounts:
+        - { name: spire-agent-socket, mountPath: /run/spire/sockets, readOnly: true }
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities: { drop: ["ALL"] }
+  volumes:
+    - name: spire-agent-socket
+      csi: { driver: csi.spiffe.io, readOnly: true }

@@ -207,8 +207,13 @@ CA-shaped leaf, a node SVID calling `/v1/token`, the dev header on an mTLS conne
 (ignored) and outside `dev_mode` (refused), a server whose SPIFFE ID is not the broker's,
 and a rotation that new handshakes must pick up. The fake is never more permissive than
 the real thing (`rules/testing.md`): only the certificates differ between the suite and
-production, never the verification path. A kind tier with a real agent and the CSI driver
-is roadmap 01's remaining item.
+production, never the verification path. The kind tier (`make kind-e2e-mtls`,
+`dev/kind/mtls-e2e.sh`, landed 2026-10-13) runs the broker image from `deploy/base` on
+the CSI driver's socket and four client pods whose SVIDs a real agent issued: a claim, a
+node, an identity outside `/banlieue/` and a second pod holding the broker's own ID. The
+first two get HTTP answers about their identities, the last two fail the handshake, and
+the broker's log shows X25519MLKEM768 with AES-256-GCM-SHA384 between two agent-issued
+SVIDs.
 
 ## Security analysis
 

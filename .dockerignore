@@ -1,0 +1,8 @@
+# Build context for the Dockerfiles. The source tree goes in (the container build
+# stage compiles it); build output stays out, except `dist/`, where `make dist` puts
+# the host-built musl binaries that the `BINARY_FROM=host` stage copies.
+target
+.git
+.kind
+site
+.venv

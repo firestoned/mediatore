@@ -12,7 +12,7 @@ a real cluster address or a real credential in a tracked file.
 | --- | --- | --- | --- |
 | Unit | `make check` | Every crate's own contract, over fakes that validate like production | everywhere, every commit |
 | Dev-mode loop | `make e2e` | The four shipped binaries agree on the wire contract as separate processes | everywhere, every PR |
-| Live against SPIRE in kind | `make kind-e2e` | Kubernetes, the SPIRE Controller Manager and the admission policy behave as the ADRs say, as the broker's own ServiceAccount | CI on every PR, any laptop with a container runtime |
+| Live against SPIRE in kind | `make kind-e2e` | Kubernetes, the SPIRE Controller Manager and the admission policy behave as the ADRs say, as the broker's own ServiceAccount; the broker image runs on the CSI driver's socket and agent-issued SVIDs meet on the sandbox listener | CI on every PR, any laptop with a container runtime |
 | Live against a real cluster | `make live-admission-test` | The same, against a deployment you operate | by hand, before a release or after changing the deployment |
 
 ## Unit: `make check`
@@ -112,15 +112,42 @@ Suites today:
 | Target | ADR | Suite |
 | --- | --- | --- |
 | `make kind-e2e-entries` | 0006 | the live entries round trip above |
+| `make kind-e2e-mtls` | 0007 | the broker image on the CSI socket, agent-issued client SVIDs over SPIFFE mTLS, below |
 
-Planned, as the roadmap lands (`.github/community/01-spiffe-mtls-and-entries.md`):
+Planned, as the roadmap lands: the claim watcher binding a `VirtualMachineClaim` to a
+node entry derived from a published EK certificate (roadmap 03), with banlieue's CRDs
+installed but no VM.
 
-- the broker pod in the cluster with the CSI driver socket, fetching its own SVID from
-  the `ClusterSPIFFEID` in `deploy/base` (ADR-0007), a client pod with a claim-shaped
-  SVID reaching the sandbox listener over mTLS, and the negative cases from ADR-0007
-  decision 8;
-- the claim watcher binding a `VirtualMachineClaim` to a node entry derived from a
-  published EK certificate (roadmap 03), with banlieue's CRDs installed but no VM.
+### Broker and client pods over SPIFFE mTLS
+
+`make kind-broker` builds the three musl binaries on the host (`make dist`), packages
+the broker with the shipped `Dockerfile` (`BINARY_FROM=host`: the same runtime stage
+over the host-built binary) and the two guest binaries into a test-only image
+(`dev/kind/Dockerfile.guest`), loads both into the cluster with `kind load`, and
+applies `dev/kind/broker`: a kustomize overlay of `deploy/base` as shipped, with the
+Traefik route removed, one replica and the image tag changed. The Deployment's CSI
+inline volume, ServiceAccount, `ClusterSPIFFEID`, RBAC and admission policy are the
+production manifests. The rollout succeeds only once the broker has its SVID: the
+listeners answer nothing before `broker_identity` returns.
+
+`dev/kind/mtls-e2e.sh` then applies `dev/kind/mtls/clients.yaml`: a namespace, four
+`ClusterSPIFFEID` fixtures an admin creates (nothing goes through mediatore's own entry
+path), and four pods that get their SVIDs from the real agent through the same CSI
+volume and run the shipped guest binaries against `mediatore-sandbox`:
+
+| Pod | SVID the agent issues | Expected |
+| --- | --- | --- |
+| `claim` | `spiffe://<td>/banlieue/claim/<fixture uid>` | `sandbox-token` gets `403 unknown claim`: the handshake completed and the listener derived that UID from the certificate |
+| `node` | `spiffe://<td>/banlieue/node/<fixture EK hash>` | `mediatore-guest` logs `node registered`: `POST /v1/nodes` accepted because the peer ID matches the EK hash it claims |
+| `intruder` | `spiffe://<td>/intruder` | refused in the handshake, no HTTP answer; the broker logs `peer authenticated but not authorized here` |
+| `impersonator` | `spiffe://<td>/mediatore` | the same: the broker's own identity is not a client identity, even when a real agent issued it |
+
+The script also reads the broker's log: the claim connection negotiated X25519MLKEM768
+and AES-256-GCM-SHA384, the node connected, both refusals were logged by the authorizer.
+What this tier proves and the hermetic suite cannot: the `ClusterSPIFFEID` in
+`deploy/base` renders to `spiffe://<td>/mediatore` for the broker pod; the CSI inline
+volume delivers the Workload API under PSS `restricted`; SVIDs the `k8s` workload
+attestor issued chain to the bundle the broker got from the same agent.
 
 What kind cannot do, and the real-cluster tier covers: TPM node attestation (the
 parent agent `spiffe://<td>/spire/agent/tpm/<ek>` never exists in kind; the server
@@ -131,9 +158,11 @@ Pins live at the top of the `Makefile`: kind, the node image by digest (same
 Kubernetes minor as the homelab), both chart versions, the placeholder trust domain
 `sandbox.test`. Dependabot does not see them; bump them when the homelab moves.
 
-Runtimes: kind needs Docker or rootless Podman (`KIND_EXPERIMENTAL_PROVIDER=podman`),
-`kubectl` and `helm`. `make kind-install` fetches the pinned kind CLI, checksum
-verified, into `KIND_BIN_DIR` (default `/usr/local/bin`).
+Runtimes: kind needs Docker or rootless Podman (`KIND_EXPERIMENTAL_PROVIDER=podman`
+and `CONTAINER_CLI=podman` for the image builds), `kubectl` and `helm`; the images need
+the `x86_64-unknown-linux-musl` target and a musl C compiler (`musl-tools`) for
+`aws-lc-rs`. `make kind-install` fetches the pinned kind CLI, checksum verified, into
+`KIND_BIN_DIR` (default `/usr/local/bin`).
 
 ## Live against a real cluster: `make live-admission-test`
 

@@ -10,7 +10,7 @@ the same commit that changes a roadmap item's state.
 | # | Roadmap | Status | Detail |
 | --- | --- | --- | --- |
 | 00 | Dev-mode loop | ✅ done | [00-dev-mode-loop.md](.github/community/00-dev-mode-loop.md) |
-| 01 | SPIFFE mTLS + SPIRE entries | 🔶 in progress | [01-spiffe-mtls-and-entries.md](.github/community/01-spiffe-mtls-and-entries.md) |
+| 01 | SPIFFE mTLS + SPIRE entries | ✅ done | [01-spiffe-mtls-and-entries.md](.github/community/01-spiffe-mtls-and-entries.md) |
 | 02 | SPIRE on the homelab cluster | ⛔ not started | [02-spire-on-the-cluster.md](.github/community/02-spire-on-the-cluster.md) |
 | 03 | Claim watcher against banlieue | ⛔ not started | [03-claim-watcher.md](.github/community/03-claim-watcher.md) |
 | 04 | Token backends live (OBO + Dex/STS) | ⛔ not started | [04-token-backends-live.md](.github/community/04-token-backends-live.md) |

@@ -4,9 +4,9 @@
 # All CI logic lives here (rules/github-workflows.md): workflows install tools
 # and call these targets, and every target runs identically locally.
 
-.PHONY: all help fmt fmt-check lint test deny audit check sbom guest image e2e live-admission-test \
+.PHONY: all help fmt fmt-check lint test deny audit check sbom guest dist image e2e live-admission-test \
         kind-install kind-create kind-delete kind-down kind-spire kind-deploy kind-up \
-        kind-e2e-entries kind-e2e kind-e2e-ci kind-e2e-logs \
+        kind-images kind-broker kind-e2e-entries kind-e2e-mtls kind-e2e kind-e2e-ci kind-e2e-logs \
         calm-validate calm-diagrams docs docs-serve docs-clean clean
 
 # kind: a throwaway cluster with SPIRE for the live tests (docs/guides/testing.md).
@@ -28,6 +28,12 @@ SPIRE_CRDS_VERSION  ?= 0.6.1
 SPIRE_TRUST_DOMAIN  ?= sandbox.test
 SPIRE_NAMESPACE     := spire-server
 SPIRE_CLASS_NAME    := spire-server-spire
+# Images: `docker` or `podman` (kind follows KIND_EXPERIMENTAL_PROVIDER). The kind tags
+# are loaded into the cluster with `kind load`, never pulled, never pushed.
+CONTAINER_CLI      ?= docker
+MUSL_TARGET        := x86_64-unknown-linux-musl
+KIND_IMAGE         := ghcr.io/firestoned/mediatore:kind
+KIND_GUEST_IMAGE   := localhost/mediatore-guest:kind
 
 # CALM (FINOS Common Architecture Language Model) configuration
 CALM_CLI_VERSION  ?= 1.37.0
@@ -77,8 +83,13 @@ sbom: ## Generate CycloneDX SBOM(s) for the workspace (*.cdx.json per crate)
 guest: ## Static musl builds of the two guest binaries
 	cargo build --release --target x86_64-unknown-linux-musl -p mediatore-guest -p sandbox-token
 
-image: ## Build the server container image locally
-	docker build -t ghcr.io/firestoned/mediatore:dev .
+dist: ## Host-built musl binaries into dist/ (what the images copy with BINARY_FROM=host)
+	cargo build --release --target $(MUSL_TARGET) -p mediatore -p mediatore-guest -p sandbox-token
+	@mkdir -p dist
+	cp target/$(MUSL_TARGET)/release/mediatore target/$(MUSL_TARGET)/release/mediatore-guest target/$(MUSL_TARGET)/release/sandbox-token dist/
+
+image: ## Build the server container image locally (the binary is compiled inside the image)
+	$(CONTAINER_CLI) build -t ghcr.io/firestoned/mediatore:dev .
 
 # ----- End to end --------------------------------------------------------------
 
@@ -147,19 +158,39 @@ kind-deploy: kind-create ## Apply the broker's ServiceAccount, RBAC and admissio
 
 kind-up: kind-create kind-spire kind-deploy ## Cluster + SPIRE + the broker's identity, ready for the live tests
 
+kind-images: kind-create dist ## Server image (the shipped Dockerfile's runtime stage) and the test-only guest image, loaded into the cluster
+	$(CONTAINER_CLI) build --build-arg BINARY_FROM=host -t $(KIND_IMAGE) .
+	$(CONTAINER_CLI) build -f dev/kind/Dockerfile.guest -t $(KIND_GUEST_IMAGE) .
+	@# One image per call: under the podman provider a multi-image load ends up with one manifest.
+	kind load docker-image --name $(KIND_CLUSTER_NAME) $(KIND_IMAGE)
+	kind load docker-image --name $(KIND_CLUSTER_NAME) $(KIND_GUEST_IMAGE)
+
+kind-broker: kind-up kind-images ## deploy/base in kind on the CSI driver's socket (dev/kind/broker overlay), rolled out
+	$(KIND_KUBECTL) apply -k dev/kind/broker
+	@# Same tag, new image: a restart is what makes the loaded image the running one.
+	$(KIND_KUBECTL) -n banlieue-system rollout restart deploy/mediatore
+	$(KIND_KUBECTL) -n banlieue-system rollout status deploy/mediatore --timeout=300s
+
 kind-e2e-entries: kind-up ## Live entries round trip (ADR-0006) as the broker ServiceAccount against SPIRE in kind
 	MEDIATORE_LIVE_KUBECONFIG=$(CURDIR)/$(KIND_SA_KUBECONFIG) MEDIATORE_LIVE_IDENTITY=self \
 	MEDIATORE_LIVE_TRUST_DOMAIN=$(SPIRE_TRUST_DOMAIN) MEDIATORE_LIVE_CLASS_NAME=$(SPIRE_CLASS_NAME) \
 	$(MAKE) live-admission-test
 
-kind-e2e: kind-e2e-entries ## Every live suite against kind (grows with the roadmap)
+kind-e2e-mtls: kind-broker ## ADR-0007 live: broker SVID over the CSI driver, agent-issued client SVIDs over SPIFFE mTLS, the refusals
+	./dev/kind/mtls-e2e.sh $(KIND_KUBECONFIG) $(SPIRE_TRUST_DOMAIN)
+
+kind-e2e: kind-e2e-entries kind-e2e-mtls ## Every live suite against kind (grows with the roadmap)
 
 kind-e2e-ci: ## CI shape: the suites, cluster state on failure, cluster deleted after
 	@$(MAKE) kind-e2e || { $(MAKE) kind-e2e-logs; $(MAKE) kind-delete; exit 1; }
 	@$(MAKE) kind-delete
 
-kind-e2e-logs: ## What a failing live suite needs: entries, policy, controller-manager and server logs
+kind-e2e-logs: ## What a failing live suite needs: entries, policy, broker and client pods, controller-manager and server logs
 	-$(KIND_KUBECTL) get clusterstaticentries -o yaml
+	-$(KIND_KUBECTL) get clusterspiffeids -o yaml
+	-$(KIND_KUBECTL) -n banlieue-system get pods -o wide
+	-$(KIND_KUBECTL) -n banlieue-system logs deploy/mediatore --tail=200
+	-$(KIND_KUBECTL) -n mediatore-e2e get pods -o wide
 	-$(KIND_KUBECTL) get validatingadmissionpolicy mediatore-clusterstaticentry -o yaml
 	-$(KIND_KUBECTL) -n $(SPIRE_NAMESPACE) logs statefulset/spire-server -c spire-controller-manager --tail=200
 	-$(KIND_KUBECTL) -n $(SPIRE_NAMESPACE) logs statefulset/spire-server -c spire-server --tail=100
@@ -210,3 +241,4 @@ docs-clean: ## Remove docs build artefacts and venv
 
 clean: ## Remove build artifacts
 	cargo clean
+	rm -rf dist

@@ -13,6 +13,10 @@
 - [ ] Node resolution per runbook 7.4: `providerID` → DMI UUID (both byte orders on
       vSphere) → registered node; requeue up to 60 s then fail the claim, never guess
 - [ ] EK cross-check against `status.tpmEndorsementCertificates` (ADR-0045) when present
+- [ ] Node entry trigger (from roadmap 01): when `status.tpmEndorsementCertificates`
+      appears on a `VirtualMachine`, `ek_hash_from_pems` + `EntryManager::ensure_node_entry`;
+      no certificate, no entry, no pool membership. The orphan sweep
+      (`Reconciler::sweep_orphans`) runs on the leader at the resync interval
 - [ ] `POST /v1/claims` switches from dev-store-only to creating the CR; leader
       election for the watcher (API stays stateless). Under ADR-0008 the CR it creates
       becomes an `AgentSandbox`, which owns the claim (roadmap 08)

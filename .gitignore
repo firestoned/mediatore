@@ -1,4 +1,6 @@
 /target
+# host-built musl binaries for the container images (make dist)
+/dist/
 # kind cluster kubeconfigs (make kind-up); the SA token one is a credential
 /.kind/
 **/*.rs.bk
