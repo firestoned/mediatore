@@ -1,0 +1,47 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+#
+# The broker in kind (`make kind-broker`): deploy/base as shipped, with only what a
+# throwaway cluster lacks patched out. The Deployment's CSI volume, ServiceAccount,
+# ClusterSPIFFEID, RBAC and admission policy are untouched; they are what the tier
+# verifies (ADR-0007). The trust domain in mediatore.yaml is the Makefile's
+# SPIRE_TRUST_DOMAIN placeholder.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: banlieue-system
+resources:
+  - ../../../deploy/base
+images:
+  - name: ghcr.io/firestoned/mediatore
+    newTag: kind
+configMapGenerator:
+  - name: mediatore-config
+    files:
+      - mediatore.yaml
+generatorOptions:
+  disableNameSuffixHash: true
+patches:
+  # No Traefik in kind, and the user API is not what this tier is about.
+  - patch: |-
+      apiVersion: traefik.io/v1alpha1
+      kind: IngressRoute
+      metadata:
+        name: mediatore
+      $patch: delete
+  # One replica; the image was loaded with `kind load`, never pulled; the listener's
+  # per-connection line (peer SPIFFE ID, key exchange group, cipher suite) is at debug.
+  - patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: mediatore
+      spec:
+        replicas: 1
+        template:
+          spec:
+            containers:
+              - name: mediatore
+                imagePullPolicy: Never
+                env:
+                  - name: RUST_LOG
+                    value: info,mediatore_tls=debug

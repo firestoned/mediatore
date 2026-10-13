@@ -1,0 +1,17 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+#
+# The broker's config in kind. Identity and entries are the production paths (the
+# Workload API over the CSI mount, ClusterStaticEntry through the API server). No
+# identity provider or audience is wired: the tier stops at the sandbox listener and
+# what it establishes about the peer; the claim loop above it is the dev tier's job.
+trust_domain: sandbox.test
+listen:
+  user: 0.0.0.0:8080
+  sandbox: 0.0.0.0:8443
+spire:
+  workload_api_socket: unix:///run/spire/sockets/spire-agent.sock
+  entries:
+    class_name: spire-server-spire
+issuers: []
+audiences: []

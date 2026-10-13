@@ -18,4 +18,9 @@ is documented in `docs/guides/enterprise-spire-topology.md` and is not this road
 - [ ] Part 3 acceptance on libvirt: a fresh member appears in `agent list` as type
       `tpm` within 60 s, EK hash matches the local computation, reboot does not create
       a second agent
-- [ ] Un-`#[ignore]` roadmap 01's live-SPIRE tests; wire them as a live-test make target
+- [ ] `NetworkPolicy` for the broker pods (ADR-0007 decision 7, from roadmap 01):
+      ingress 8443 from the sandbox segment's CIDR only, 8080 from the ingress controller
+      only; egress to the API server and the IdP's discovery and token endpoints
+- [ ] Run roadmap 01's live tiers against this cluster (`make live-admission-test`; the
+      broker Deployment from `deploy/base` on the CSI socket as `make kind-e2e-mtls` does
+      in kind)

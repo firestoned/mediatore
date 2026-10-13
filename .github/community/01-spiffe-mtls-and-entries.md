@@ -3,10 +3,11 @@
 
 # 01: SPIFFE mTLS + SPIRE entries
 
-**Status: in progress.** Replace the two load-bearing fakes: the dev peer-identity
+**Status: done (2026-10-13).** Replace the two load-bearing fakes: the dev peer-identity
 header becomes SPIFFE mTLS, and the `Noop` entry manager becomes a declarative writer of
 `ClusterStaticEntry` resources. Deletes threat-model accepted risk **R-1** and narrows
-**R-8** to signatures.
+**R-8** to signatures. Two items were deployment- or watcher-shaped and moved: the broker
+`NetworkPolicy` to roadmap 02, the node-entry trigger to roadmap 03 (see the end).
 
 Design (decided 2026-10-10, no gRPC anywhere in mediatore's own code):
 
@@ -56,10 +57,10 @@ which would have put a fake Workload API, so gRPC, into the hermetic suite). `ku
       published; fixtures hashed with the guest's pipeline
       (`openssl pkey -pubin -outform der | sha256sum`), matching the tpm plugin's
       `GetPubHash` (`x509.MarshalPKIXPublicKey`)
-- [ ] Node entry trigger: the function side exists (`ek_hash_from_pems` +
-      `ensure_node_entry`); the `VirtualMachine` watch that calls it when
-      `status.tpmEndorsementCertificates` appears lands with the claim watcher
-      (roadmap 03, `banlieue-api` pin). No certificate, no entry, no pool membership
+- [x] Node entry trigger, function side: `ek_hash_from_pems` + `ensure_node_entry`.
+      The `VirtualMachine` watch that calls it when `status.tpmEndorsementCertificates`
+      appears is roadmap 03's (`banlieue-api` pin). No certificate, no entry, no pool
+      membership
 - [x] Orphan sweep: `Reconciler::sweep_orphans` retracts claim entries whose claim is
       unknown or revoked and leaves node entries alone; scheduling it on the leader at the
       resync interval is part of roadmap 03's loop
@@ -111,11 +112,16 @@ which would have put a fake Workload API, so gRPC, into the hermetic suite). `ku
       foreign trust domain, the broker's own identity as a client, expired SVID, CA-shaped
       leaf, node SVID at `/v1/token`, dev header on an mTLS connection, dev header outside
       `dev_mode`, server with another identity, rotation picked up by new handshakes
-- [ ] kind tier for ADR-0007: the broker image in the cluster on the CSI socket with the
-      `ClusterSPIFFEID`, a client pod with a claim-shaped SVID over mTLS, the negative
-      cases; `make kind-e2e-mtls` joins `kind-e2e`
-- [ ] NetworkPolicy for the broker pods: spec in ADR-0007 decision 7, manifest lands
-      with roadmap 02 (CIDRs are deployment-specific)
+- [x] kind tier for ADR-0007 (2026-10-13): `make kind-broker` builds the musl binaries on
+      the host (`make dist`), packages the broker with the shipped `Dockerfile`
+      (`BINARY_FROM=host`) and the guests into a test-only image, and applies
+      `dev/kind/broker` (a kustomize overlay of `deploy/base` as shipped) so the broker
+      runs on the CSI socket with the `ClusterSPIFFEID`; `dev/kind/mtls-e2e.sh` runs four
+      client pods with agent-issued SVIDs (claim, node, intruder, broker impersonator)
+      through the shipped guest binaries and reads the broker's log; `make kind-e2e-mtls`
+      is part of `kind-e2e` and the E2E workflow
+- [x] NetworkPolicy for the broker pods: spec in ADR-0007 decision 7; the manifest is
+      roadmap 02's (CIDRs are deployment-specific)
 
 ## Closing the roadmap
 
@@ -126,4 +132,4 @@ which would have put a fake Workload API, so gRPC, into the hermetic suite). `ku
       and cites `crates/mediatore-tls` and the mTLS suite; new TB-8 (broker pod → agent over
       the CSI mount); R-1 deleted; R-5 widened; R-8 narrowed to signatures; stamp bumped to
       ADR-0007
-- [ ] ROADMAPS.md row to done
+- [x] ROADMAPS.md row to done (2026-10-13)
