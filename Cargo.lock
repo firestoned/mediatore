@@ -305,6 +305,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "banlieue-api"
+version = "0.4.2"
+source = "git+https://github.com/firestoned/banlieue?rev=a6f0941d776e819e8b0a16921087633a6c386b6a#a6f0941d776e819e8b0a16921087633a6c386b6a"
+dependencies = [
+ "k8s-openapi",
+ "kube",
+ "schemars",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "base16ct"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1841,6 +1853,7 @@ checksum = "d9c6922f6afe80418dd6019818af5d0d34584c371780ff09b9752370c25b4abb"
 dependencies = [
  "base64 0.22.1",
  "jiff",
+ "schemars",
  "serde",
  "serde_json",
 ]
@@ -2067,12 +2080,17 @@ name = "mediatore-claims"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "banlieue-api",
  "chrono",
+ "futures",
  "k8s-openapi",
  "kube",
  "mediatore-proto",
  "mediatore-spire",
  "mediatore-store",
+ "mediatore-testkit",
+ "serde_json",
  "thiserror",
  "tokio",
  "tracing",
@@ -2184,11 +2202,13 @@ name = "mediatore-testkit"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "banlieue-api",
  "base64 0.23.1",
  "chrono",
  "clap",
  "futures",
  "jsonwebtoken",
+ "kube",
  "mediatore-proto",
  "mediatore-tls",
  "p256 0.14.0",

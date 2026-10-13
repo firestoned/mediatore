@@ -5,15 +5,18 @@ SPDX-License-Identifier: Apache-2.0
 # Threat Model
 
 > **Status:** Living document. Last full pass **2026-10-13**, against the
-> architecture defined by **ADR-0001 … ADR-0007** (ADR-0008 is Proposed and
-> unbuilt; it adds nothing reachable yet). This pass covers the implementation
-> of roadmap 01: registration entries as `ClusterStaticEntry` resources through
-> the Kubernetes API with no SPIRE admin identity (ADR-0006), and SPIFFE mTLS
-> on the sandbox listener with the broker's SVID from the Workload API over
-> the SPIFFE CSI driver (ADR-0007). TB-3 is rewritten around the admission
-> policy and the controller manager; TB-6 loses its *(stub)* marker and every
-> row cites code; a new boundary TB-8 (broker pod → SPIRE agent) is added;
-> accepted risk **R-1 is deleted**, R-5 is widened and R-8 is narrowed to
+> architecture defined by **ADR-0001 … ADR-0011** (ADR-0008 is Proposed and
+> unbuilt; ADR-0009 and ADR-0010 are adopted platform ADRs with no code of
+> their own). This pass covers roadmap 03's claim watcher (ADR-0011): a
+> `VirtualMachineClaim` is bound by the EK hash banlieue mirrors onto it and
+> nothing else, an unresolved bind fails closed, node entries come from pool
+> members that publish a certificate, and one replica leads by Lease. TB-2
+> gains five rows and TB-4 one, all citing code and tests; R-5 is reworded
+> around the watcher. Earlier the same day, roadmap 01: registration entries
+> as `ClusterStaticEntry` resources through the Kubernetes API with no SPIRE
+> admin identity (ADR-0006), and SPIFFE mTLS on the sandbox listener with the
+> broker's SVID from the Workload API over the SPIFFE CSI driver (ADR-0007);
+> TB-3 rewritten, TB-6 real, TB-8 added, **R-1 deleted**, R-8 narrowed to
 > signatures. The pre-history: the first pass (2026-09-26) covered the
 > dev-mode loop and recorded every unbuilt edge as a fail-closed stub or an
 > accepted risk, never as a control that exists; 2026-10-03 measured the
@@ -170,6 +173,11 @@ the residue is in §8. No boundary carries the marker as of this pass.
 | Broker SA stolen → arbitrary-subject claims | S/E | RBAC limits the SA to claims + VM reads: `deploy/base/rbac.yaml`; VAP still validates shape. Residue in §8 R-4 |
 | Anyone else creating a claim for another subject | S | banlieue's `banlieue-claim-subject-policy` VAP (caller-equals-subject unless in `brokers` allowlist); the control lives in the banlieue repo |
 | Broker SA used to declare an entry outside its lane | S/E | See TB-3: the entries admission policy bounds what the SA may declare regardless of who holds its token |
+| A claim bound to the wrong node: an identity issued for a VM the subject did not get | S/E | The watcher resolves a `Bound` claim only by the EK hash of the certificate banlieue mirrored onto it, among nodes that registered that EK over mTLS (`crates/mediatore-claims/src/watch.rs`, `Watcher::resolve`); nothing is guessed. Unresolved for `watcher.resolve_timeout_secs` (default 60) and the record is revoked and the claim deleted (`Watcher::fail`). Tests `a_bound_claim_with_a_registered_node_is_bound_by_its_ek`, `unresolved_is_retried_then_failed_after_the_timeout`, `a_banned_node_or_an_unusable_certificate_fails_the_claim_at_once` |
+| A claim labelled as mediatore's by someone else | S | The label only selects what the watcher reads; a bind still needs a store record for that UID, which only mediatore writes, and a registered node for the EK (`a_claim_without_a_record_binds_nothing`; live in kind, `make kind-e2e-watcher`, the claim without a record). Who may create claims at all is banlieue's claim-subject policy, above |
+| Two replicas bind or release the same claim | T/D | One leader by `Lease` `mediatore-watcher` (`crates/mediatore-claims/src/lease.rs`; namespaced Role `mediatore-watcher-lease`, `deploy/base/rbac.yaml`): a holder that fails to renew stops its controllers before another can acquire. Second line: `Reconciler::bind` is idempotent and `KubeEntryManager` tolerates 409 |
+| A deleted or expired claim keeps minting tokens | E | `Releasing`, `Failed` or a deletion timestamp releases (entry retracted, record revoked: `releasing_failed_and_deletion_retract_the_entry_and_cut_off`); at every resync the leader releases bound records whose claim is gone and sweeps orphan entries (`Watcher::resync`, `resync_releases_bound_records_whose_claim_is_gone_and_sweeps_orphans`) |
+| Broker SA used to delete claims at will | D | The watcher deletes only a claim it holds a record for and could not resolve within the timeout, logged with the UID and the reason (`Watcher::fail`); RBAC `delete` on `virtualmachineclaims` is what ADR-0008 needs anyway |
 
 ### TB-3: mediatore → Kubernetes API (`ClusterStaticEntry`) → controller manager → SPIRE server
 
@@ -183,6 +191,7 @@ the residue is in §8. No boundary carries the marker as of this pass.
 | Controller manager unavailable or its class misconfigured | D | Fail closed: entries never become set, binds fail within the timeout, no claim is served. `spec.className` is configuration (`spire.entries.class_name`), required outside `dev_mode` (`crates/mediatore/src/config.rs`) |
 
 ### TB-4: VM → SPIRE server (node attestation)
+| A VM without a vTPM, or one whose certificate banlieue never published, becomes a node | S | No certificate, no entry: `Watcher::reconcile_machine` declares `ensure_node_entry` only from a non-empty `status.tpmEndorsementCertificates` on a pool member (`a_member_with_a_certificate_gets_a_node_entry_and_one_without_gets_nothing`; kind tier `member-2`). The entries admission policy bounds the shape regardless |
 
 | Threat | S/T/R/I/D/E | Control |
 | --- | --- | --- |
@@ -264,6 +273,10 @@ the residue is in §8. No boundary carries the marker as of this pass.
   the identity-provider client is TLS 1.3 only over the Mozilla roots.
 - `dev_mode` is loopback-only by construction (`Config::parse`); the guests'
   header path is a `dev` cargo feature that release builds do not have.
+- Claim watcher: binds only by the EK banlieue mirrored onto the claim, fails an
+  unresolved bind after 60 s instead of guessing, declares node entries only from
+  a published certificate, and runs on one replica elected by a namespaced Lease
+  (`crates/mediatore-claims/src/watch.rs`, `src/lease.rs`, `deploy/base/rbac.yaml`).
 
 ## 8. Accepted risks
 
@@ -273,7 +286,7 @@ the residue is in §8. No boundary carries the marker as of this pass.
 | R-2 | Entra OBO / Dex refresh-before-issue is unimplemented, so upstream revocation does not yet propagate to STS issuance | Only the STS backend works, and only in dev where the fake IdP has no sessions | The OBO / refresh path lands (ADR-0003 implementation) |
 | R-3 | A prompt-injected workload can exfiltrate its ≤ 15-min single-audience token | Bounded by TTL, audience allowlist and full attribution; the credential-injecting egress proxy is the designed phase 2 (runbook open decision #7) | The egress-proxy ADR is written |
 | R-4 | mediatore is a single trust point: a compromised broker mints for any active claim | Inherent to the broker pattern; mitigations planned: HSM/transit-held keys, two-person deploy, immutable audit sink | The production deployment ADR (key custody, audit) |
-| R-5 | In-memory store loses claim state on restart: a restarted broker forgets its claims and nodes. Since 2026-10-13 the binary also starts outside `dev_mode` (with a startup warning), where the entries are real `ClusterStaticEntry` resources that outlive the process | Fail-closed consequences only: a forgotten claim cannot be served (`/v1/token` refuses an unknown claim) and `Reconciler::sweep_orphans` retracts its entry; nothing is issued that the store does not know. Until the claim watcher (roadmap 03) there is no production binder anyway | The sqlx store lands (roadmap 05); re-walk §6 TB-3/TB-6 ordering against real persistence |
+| R-5 | In-memory store loses claim state on restart: a restarted broker forgets its claims and nodes. Since 2026-10-13 the binary also starts outside `dev_mode` (with a startup warning), where the entries are real `ClusterStaticEntry` resources that outlive the process | Fail-closed consequences only: a forgotten claim cannot be served (`/v1/token` refuses an unknown claim) and `Reconciler::sweep_orphans` retracts its entry; nothing is issued that the store does not know. Since ADR-0011 the watcher is the production binder, but it binds only claims the store holds a record for, and records are created outside `dev_mode` only once ADR-0008 lands: after a restart the resync releases nothing it does not know and `sweep_orphans` retracts the entries | The sqlx store lands (roadmap 05); re-walk §6 TB-3/TB-6 ordering against real persistence |
 | R-6 | vTPM EK attestation proves "this vTPM", not "this host"; hypervisor compromise breaks node identity | Same posture as banlieue ADR-0045; hypervisor is in the TCB | PCR / measured-boot selectors become available (runbook open decision #6) |
 | R-7 | Homelab collapse: one flat SPIRE trust domain on the management cluster, no root, no upstream authority: its signing key lives where sandboxes are administered. As deployed (2026-10-03): two servers sharing an external PostgreSQL datastore, each with a self-signed RSA-2048 CA whose key sits on a node-local volume in plaintext, audit log off (chart default) | Single-operator homelab; ADR-0005 records the enterprise topology (root on a dedicated identity cluster, HSM-backed) as the desired state | Any multi-team or production deployment; then split per ADR-0005 and delete this row. Before then: P-384 CA keys and the audit log on |
 | R-8 | Signatures are classical: the STS tokens (ES256) and the SVIDs they bind to (ECDSA or RSA, issued by SPIRE) could be forged by a cryptographically relevant quantum computer. Key exchange is no longer part of this risk: since 2026-10-13 the sandbox leg accepts X25519MLKEM768 only, and every other TLS client mediatore builds offers it first (rustls `prefer-post-quantum`; `ring` banned). What is not ours keeps a classical fallback: the identity provider and the Kubernetes API server choose the group from that offer | Post-quantum signatures are not supported by SPIRE or JOSE implementations yet; the exposure is forgery in the future, not disclosure of recorded traffic. The verifiers already accept ML-DSA SVIDs, so this repo needs no change when SPIRE issues them | ML-DSA support in SPIRE (SVIDs) and in JOSE (STS tokens) |
@@ -302,4 +315,5 @@ the residue is in §8. No boundary carries the marker as of this pass.
 | 2026-10-03 | Homelab deployment, measured | 0001–0005 | SPIRE and Dex deployed on the management cluster and measured. R-7 made concrete; TB-4 gains kubelet-verification and `k8s_psat` rows; TB-5 gains the in-cluster issuer and token-lifetime rows; new R-8 (classical key exchange in every mediatore TLS client) and R-9 (SPIRE datastore transport). No code change |
 | 2026-10-04 | Datastore remediated | 0001–0005 | R-9 deleted: the homelab SPIRE datastore runs PostgreSQL 18 with X25519MLKEM768-only key exchange, TLS 1.3 and `verify-full`; the SPIRE servers reconnected under the post-quantum-only offer |
 | 2026-10-13 | Roadmap 01 implemented | 0001–0007 | ADR-0006: TB-3 rewritten around `ClusterStaticEntry`, the admission policy and the controller manager, *(stub)* removed, three rows added (unbound entry, unrendered entry, controller manager down); §1 item 3, §2, A-7 and §4 updated. ADR-0007: TB-6 *(stub)* removed, every row cites `crates/mediatore-tls` and the mTLS e2e suite; new TB-8 (broker pod → agent over the CSI mount) and A-8 (broker SVID); TB-4 gains the `ClusterSPIFFEID` selector row; §7 gains five lines. **R-1 deleted**, R-5 widened to the non-dev start, R-8 narrowed to signatures. Diagram: TB-3 through the API server and controller manager, TB-8 on the management node. Same day, post-quantum review: found rustls's `prefer-post-quantum` missing from the feature list (the hybrid was offered last), fixed and pinned by test; the sandbox leg now accepts X25519MLKEM768 and AES-256-GCM-SHA384 only; the identity-provider client is TLS 1.3 only; ML-DSA SVIDs verified end to end against the same verifiers |
+| 2026-10-13 | Roadmap 03: claim watcher (ADR-0011) | 0001–0011 | TB-2 gains five rows (wrong node, forged label, concurrent replicas, deleted claim, SA deleting claims) and TB-4 one (member without a vTPM), every control cited by file and test; §7 one line; R-5 reworded around the watcher; stamp moved to ADR-0011 |
 | 2026-10-13 | ADR-0007 kind tier | 0001–0007 | No control change, no new component or boundary. TB-6 (peer identity forgery, harvest-now-decrypt-later) and TB-8 (another pod with the broker SVID) now also cite the live run against a real agent and the CSI driver (`make kind-e2e-mtls`), which is the evidence ADR-0007 decision 8 was missing. Same-day pass, stamp unchanged |

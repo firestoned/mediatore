@@ -40,3 +40,32 @@ subjects:
   - kind: ServiceAccount
     name: mediatore
     namespace: banlieue-system
+---
+# Leader election for the claim watcher (ADR-0011 decision 6): one Lease, in the broker's
+# own namespace. A Role rather than a ClusterRole rule because `create` cannot be bounded
+# by resourceName; the namespace bounds it instead.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: mediatore-watcher-lease
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["create"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    resourceNames: ["mediatore-watcher"]
+    verbs: ["get", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: mediatore-watcher-lease
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: mediatore-watcher-lease
+subjects:
+  - kind: ServiceAccount
+    name: mediatore
+    namespace: banlieue-system

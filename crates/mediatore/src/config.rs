@@ -98,6 +98,44 @@ pub struct SpireConfig {
     pub entries: EntriesSection,
 }
 
+/// The claim watcher (ADR-0011). Runs only outside `dev_mode`; every field has a default.
+// The `_secs` suffix is the unit, part of the config file's contract (as in `EntriesSection`).
+#[allow(clippy::struct_field_names)]
+#[derive(Debug, Clone, Deserialize)]
+pub struct WatcherSection {
+    /// Seconds between resyncs: records whose claim is gone are released and orphan
+    /// entries swept (default 300).
+    #[serde(default = "default_resync_secs")]
+    pub resync_secs: u64,
+    /// Seconds a `Bound` claim may stay unresolved (no certificate, no registered node)
+    /// before it is failed and deleted (default 60).
+    #[serde(default = "default_resolve_timeout_secs")]
+    pub resolve_timeout_secs: u64,
+    /// Lease duration in seconds for leader election; renewed every third (default 15).
+    #[serde(default = "default_lease_duration_secs")]
+    pub lease_duration_secs: u64,
+}
+
+fn default_resync_secs() -> u64 {
+    300
+}
+fn default_resolve_timeout_secs() -> u64 {
+    60
+}
+fn default_lease_duration_secs() -> u64 {
+    15
+}
+
+impl Default for WatcherSection {
+    fn default() -> Self {
+        Self {
+            resync_secs: default_resync_secs(),
+            resolve_timeout_secs: default_resolve_timeout_secs(),
+            lease_duration_secs: default_lease_duration_secs(),
+        }
+    }
+}
+
 /// Top-level config.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
@@ -119,6 +157,9 @@ pub struct Config {
     /// Accept a peer-identity header instead of mTLS and use the in-memory store.
     #[serde(default)]
     pub dev_mode: bool,
+    /// Claim watcher timings (ADR-0011).
+    #[serde(default)]
+    pub watcher: WatcherSection,
 }
 
 fn default_listen() -> ListenConfig {
@@ -148,6 +189,14 @@ impl Config {
             anyhow::bail!(
                 "dev_mode accepts a peer-identity header, so listen.sandbox must be a loopback address (ADR-0007); got {}",
                 cfg.listen.sandbox
+            );
+        }
+        if cfg.watcher.resync_secs == 0
+            || cfg.watcher.resolve_timeout_secs == 0
+            || cfg.watcher.lease_duration_secs < 3
+        {
+            anyhow::bail!(
+                "watcher.resync_secs and resolve_timeout_secs must be positive and lease_duration_secs at least 3"
             );
         }
         if let Some(e) = cfg.spire.as_ref().map(|s| &s.entries) {
@@ -235,6 +284,24 @@ listen: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }
         assert_eq!(e.class_name, "spire-server-spire");
         assert_eq!(e.ready_timeout, std::time::Duration::from_secs(30));
         assert_eq!(e.claim_svid_ttl, "1h");
+    }
+
+    #[test]
+    fn watcher_timings_default_and_are_bounded() {
+        let cfg = Config::parse(&format!("{BASE}dev_mode: true\n")).unwrap();
+        assert_eq!(cfg.watcher.resync_secs, 300);
+        assert_eq!(cfg.watcher.resolve_timeout_secs, 60);
+        assert_eq!(cfg.watcher.lease_duration_secs, 15);
+        let err = Config::parse(&format!(
+            "{BASE}dev_mode: true\nwatcher: {{ lease_duration_secs: 1 }}\n"
+        ))
+        .unwrap_err();
+        assert!(err.to_string().contains("lease_duration_secs"), "{err}");
+        let err = Config::parse(&format!(
+            "{BASE}dev_mode: true\nwatcher: {{ resolve_timeout_secs: 0 }}\n"
+        ))
+        .unwrap_err();
+        assert!(err.to_string().contains("resolve_timeout_secs"), "{err}");
     }
 
     #[test]
