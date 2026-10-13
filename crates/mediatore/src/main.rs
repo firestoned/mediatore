@@ -118,7 +118,10 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
     let u = axum::serve(user, mediatore_api::user_router(state.clone()))
         .with_graceful_shutdown(shutdown());
     let sandbox_router = mediatore_api::sandbox_router(state.clone());
-    if let (Some(spire), Some(client)) = ((!cfg.dev_mode).then_some(cfg.spire.as_ref()).flatten(), client) {
+    if let (Some(spire), Some(client)) = (
+        (!cfg.dev_mode).then_some(cfg.spire.as_ref()).flatten(),
+        client,
+    ) {
         let configs = broker_identity(&spire.workload_api_socket, &naming).await?;
         let s = mediatore_tls::serve(sandbox, configs, sandbox_router, shutdown());
         let w = async {
@@ -219,7 +222,10 @@ fn entry_manager(
     naming: Naming,
     client: Option<&kube::Client>,
 ) -> Arc<dyn EntryManager> {
-    let (Some(spire), Some(client)) = ((!cfg.dev_mode).then_some(cfg.spire.as_ref()).flatten(), client) else {
+    let (Some(spire), Some(client)) = (
+        (!cfg.dev_mode).then_some(cfg.spire.as_ref()).flatten(),
+        client,
+    ) else {
         return Arc::new(MemoryEntries::default());
     };
     tracing::info!(

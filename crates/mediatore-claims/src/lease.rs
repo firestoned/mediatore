@@ -51,7 +51,8 @@ pub fn judge(spec: Option<&LeaseSpec>, me: &str, now: Timestamp) -> Verdict {
         None | Some("") => Verdict::Acquire,
         Some(holder) if holder == me => Verdict::Renew,
         Some(holder) => {
-            let valid_for = SignedDuration::from_secs(i64::from(spec.lease_duration_seconds.unwrap_or(0)));
+            let valid_for =
+                SignedDuration::from_secs(i64::from(spec.lease_duration_seconds.unwrap_or(0)));
             let expired = spec
                 .renew_time
                 .as_ref()
@@ -122,7 +123,8 @@ async fn try_hold(api: &Api<Lease>, cfg: &LeaseConfig) -> anyhow::Result<Verdict
                 now,
                 cfg.duration,
             ));
-            api.replace(&cfg.name, &PostParams::default(), &lease).await?;
+            api.replace(&cfg.name, &PostParams::default(), &lease)
+                .await?;
             Ok(verdict)
         }
     }
@@ -206,7 +208,10 @@ mod tests {
     #[test]
     fn an_absent_or_empty_lease_is_acquired() {
         assert_eq!(judge(None, "a", at(0)), Verdict::Acquire);
-        assert_eq!(judge(Some(&LeaseSpec::default()), "a", at(0)), Verdict::Acquire);
+        assert_eq!(
+            judge(Some(&LeaseSpec::default()), "a", at(0)),
+            Verdict::Acquire
+        );
         let empty = LeaseSpec {
             holder_identity: Some(String::new()),
             ..LeaseSpec::default()
@@ -236,14 +241,26 @@ mod tests {
     #[test]
     fn a_takeover_counts_a_transition_and_a_renewal_does_not() {
         let prev = held_by("a", 0, 15);
-        let taken = next_spec(Some(&prev), &Verdict::Acquire, "b", at(20), Duration::from_secs(15));
+        let taken = next_spec(
+            Some(&prev),
+            &Verdict::Acquire,
+            "b",
+            at(20),
+            Duration::from_secs(15),
+        );
         assert_eq!(taken.holder_identity.as_deref(), Some("b"));
         assert_eq!(taken.lease_transitions, Some(1));
         assert_eq!(taken.acquire_time, Some(MicroTime(at(20))));
         assert_eq!(taken.renew_time, Some(MicroTime(at(20))));
         assert_eq!(taken.lease_duration_seconds, Some(15));
 
-        let renewed = next_spec(Some(&taken), &Verdict::Renew, "b", at(25), Duration::from_secs(15));
+        let renewed = next_spec(
+            Some(&taken),
+            &Verdict::Renew,
+            "b",
+            at(25),
+            Duration::from_secs(15),
+        );
         assert_eq!(renewed.lease_transitions, Some(1));
         assert_eq!(renewed.acquire_time, Some(MicroTime(at(20))));
         assert_eq!(renewed.renew_time, Some(MicroTime(at(25))));

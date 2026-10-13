@@ -20,7 +20,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use banlieue_api::banlieue::{ClaimPhase as BanlieuePhase, LABEL_POOL, VirtualMachine, VirtualMachineClaim};
+use banlieue_api::banlieue::{
+    ClaimPhase as BanlieuePhase, LABEL_POOL, VirtualMachine, VirtualMachineClaim,
+};
 use futures::StreamExt;
 use kube::api::{DeleteParams, ListParams};
 use kube::runtime::controller::{Action, Controller};
@@ -218,7 +220,9 @@ impl Watcher {
             .as_ref()
             .map_or(&[][..], |s| s.tpm_endorsement_certificates.as_slice());
         if certs.is_empty() {
-            return Ok(Resolution::NotYet("no endorsement certificate on the claim"));
+            return Ok(Resolution::NotYet(
+                "no endorsement certificate on the claim",
+            ));
         }
         let ek_hash = match ek_hash_from_pems(certs) {
             Ok(h) => h,
@@ -227,14 +231,21 @@ impl Watcher {
         match self.reconciler.store.get_node(&ek_hash).await {
             Ok(node) if node.banned => Ok(Resolution::Refused(format!("node {ek_hash} is banned"))),
             Ok(_) => Ok(Resolution::Node(ek_hash)),
-            Err(StoreError::NotFound(_)) => Ok(Resolution::NotYet("no node registered for the claim's EK")),
+            Err(StoreError::NotFound(_)) => {
+                Ok(Resolution::NotYet("no node registered for the claim's EK"))
+            }
             Err(e) => Err(e.into()),
         }
     }
 
     /// Decision 3: the record is revoked (no entry was ever created for it) and the claim
     /// deleted, which makes banlieue destroy the member.
-    async fn fail(&self, claim: &VirtualMachineClaim, uid: Uuid, reason: &str) -> Result<Action, WatchError> {
+    async fn fail(
+        &self,
+        claim: &VirtualMachineClaim,
+        uid: Uuid,
+        reason: &str,
+    ) -> Result<Action, WatchError> {
         let name = claim.name_any();
         let namespace = claim.namespace().unwrap_or_default();
         tracing::warn!(%uid, %name, %namespace, reason, "claim failed: record revoked, claim deleted");
@@ -246,7 +257,10 @@ impl Watcher {
 
     /// How long this claim has been `Bound` without a node, from the first unresolved pass.
     fn waited(&self, uid: Uuid) -> Duration {
-        let mut seen = self.first_unresolved.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut seen = self
+            .first_unresolved
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         seen.entry(uid).or_insert_with(Instant::now).elapsed()
     }
 
@@ -318,7 +332,11 @@ impl Watcher {
 /// The claim UID (ADR-0011 decision 1): the object's `metadata.uid`.
 #[must_use]
 pub fn claim_uid_of(claim: &VirtualMachineClaim) -> Option<Uuid> {
-    claim.metadata.uid.as_deref().and_then(|u| Uuid::parse_str(u).ok())
+    claim
+        .metadata
+        .uid
+        .as_deref()
+        .and_then(|u| Uuid::parse_str(u).ok())
 }
 
 /// banlieue's phase as mediatore's; an absent status is `Pending`.
@@ -411,7 +429,10 @@ mod tests {
     #[async_trait]
     impl ClaimsApi for FakeClaims {
         async fn delete_claim(&self, namespace: &str, name: &str) -> Result<(), WatchError> {
-            self.deleted.lock().unwrap().push((namespace.into(), name.into()));
+            self.deleted
+                .lock()
+                .unwrap()
+                .push((namespace.into(), name.into()));
             Ok(())
         }
         async fn list_claim_uids(&self) -> Result<HashSet<Uuid>, WatchError> {
@@ -538,15 +559,29 @@ mod tests {
         let r = rig(WatcherConfig::default());
         r.store.put_claim(record(uid())).await.unwrap();
         r.store.put_node(node(RSA_EK_HASH, false)).await.unwrap();
-        let action = r.watcher.reconcile_claim(&claim("Bound", &[RSA_EK_PEM], false)).await.unwrap();
+        let action = r
+            .watcher
+            .reconcile_claim(&claim("Bound", &[RSA_EK_PEM], false))
+            .await
+            .unwrap();
         assert_eq!(action, Action::await_change());
         let rec = r.store.get_claim(uid()).await.unwrap();
-        assert_eq!(rec.entry_id.as_deref(), Some(claim_entry_name(uid()).as_str()));
-        assert_eq!(rec.node_id.as_deref(), Some(node(RSA_EK_HASH, false).node_id.as_str()));
+        assert_eq!(
+            rec.entry_id.as_deref(),
+            Some(claim_entry_name(uid()).as_str())
+        );
+        assert_eq!(
+            rec.node_id.as_deref(),
+            Some(node(RSA_EK_HASH, false).node_id.as_str())
+        );
         assert!(rec.expires_at.is_some());
         assert!(r.entries.names().contains(&claim_entry_name(uid())));
         // a repeated event is a no-op
-        let again = r.watcher.reconcile_claim(&claim("Bound", &[RSA_EK_PEM], false)).await.unwrap();
+        let again = r
+            .watcher
+            .reconcile_claim(&claim("Bound", &[RSA_EK_PEM], false))
+            .await
+            .unwrap();
         assert_eq!(again, Action::await_change());
         assert_eq!(r.entries.names().len(), 1);
     }
@@ -555,10 +590,17 @@ mod tests {
     async fn a_claim_without_a_record_binds_nothing() {
         let r = rig(WatcherConfig::default());
         r.store.put_node(node(RSA_EK_HASH, false)).await.unwrap();
-        let action = r.watcher.reconcile_claim(&claim("Bound", &[RSA_EK_PEM], false)).await.unwrap();
+        let action = r
+            .watcher
+            .reconcile_claim(&claim("Bound", &[RSA_EK_PEM], false))
+            .await
+            .unwrap();
         assert_eq!(action, Action::await_change());
         assert_eq!(r.entries.names(), Vec::<String>::new());
-        assert_eq!(*r.claims.deleted.lock().unwrap(), Vec::<(String, String)>::new());
+        assert_eq!(
+            *r.claims.deleted.lock().unwrap(),
+            Vec::<(String, String)>::new()
+        );
     }
 
     #[tokio::test]
@@ -570,29 +612,57 @@ mod tests {
         });
         r.store.put_claim(record(uid())).await.unwrap();
         // no certificate yet
-        let action = r.watcher.reconcile_claim(&claim("Bound", &[], false)).await.unwrap();
+        let action = r
+            .watcher
+            .reconcile_claim(&claim("Bound", &[], false))
+            .await
+            .unwrap();
         assert_eq!(action, Action::requeue(Duration::from_millis(5)));
         // certificate, but the node never registered
-        let action = r.watcher.reconcile_claim(&claim("Bound", &[RSA_EK_PEM], false)).await.unwrap();
+        let action = r
+            .watcher
+            .reconcile_claim(&claim("Bound", &[RSA_EK_PEM], false))
+            .await
+            .unwrap();
         assert_eq!(action, Action::requeue(Duration::from_millis(5)));
-        assert_eq!(*r.claims.deleted.lock().unwrap(), Vec::<(String, String)>::new());
+        assert_eq!(
+            *r.claims.deleted.lock().unwrap(),
+            Vec::<(String, String)>::new()
+        );
         tokio::time::sleep(Duration::from_millis(70)).await;
-        let action = r.watcher.reconcile_claim(&claim("Bound", &[RSA_EK_PEM], false)).await.unwrap();
+        let action = r
+            .watcher
+            .reconcile_claim(&claim("Bound", &[RSA_EK_PEM], false))
+            .await
+            .unwrap();
         assert_eq!(action, Action::await_change());
         let rec = r.store.get_claim(uid()).await.unwrap();
         assert!(rec.revoked_at.is_some(), "record revoked");
         assert!(rec.entry_id.is_none(), "no entry was ever declared");
         assert_eq!(r.entries.names(), Vec::<String>::new());
-        assert_eq!(*r.claims.deleted.lock().unwrap(), vec![("sandboxes".to_owned(), "claim-x".to_owned())]);
+        assert_eq!(
+            *r.claims.deleted.lock().unwrap(),
+            vec![("sandboxes".to_owned(), "claim-x".to_owned())]
+        );
     }
 
     #[tokio::test]
     async fn a_banned_node_or_an_unusable_certificate_fails_the_claim_at_once() {
-        for (certs, banned) in [(vec![RSA_EK_PEM], true), (vec!["-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n"], false)] {
+        for (certs, banned) in [
+            (vec![RSA_EK_PEM], true),
+            (
+                vec!["-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n"],
+                false,
+            ),
+        ] {
             let r = rig(WatcherConfig::default());
             r.store.put_claim(record(uid())).await.unwrap();
             r.store.put_node(node(RSA_EK_HASH, banned)).await.unwrap();
-            let action = r.watcher.reconcile_claim(&claim("Bound", &certs, false)).await.unwrap();
+            let action = r
+                .watcher
+                .reconcile_claim(&claim("Bound", &certs, false))
+                .await
+                .unwrap();
             assert_eq!(action, Action::await_change());
             assert!(r.store.get_claim(uid()).await.unwrap().revoked_at.is_some());
             assert_eq!(r.claims.deleted.lock().unwrap().len(), 1);
@@ -606,13 +676,35 @@ mod tests {
             let r = rig(WatcherConfig::default());
             r.store.put_claim(record(uid())).await.unwrap();
             r.store.put_node(node(RSA_EK_HASH, false)).await.unwrap();
-            r.watcher.reconcile_claim(&claim("Bound", &[RSA_EK_PEM], false)).await.unwrap();
+            r.watcher
+                .reconcile_claim(&claim("Bound", &[RSA_EK_PEM], false))
+                .await
+                .unwrap();
             assert_eq!(r.entries.names().len(), 1);
-            let action = r.watcher.reconcile_claim(&claim(phase, &[RSA_EK_PEM], deleting)).await.unwrap();
-            assert_eq!(action, Action::await_change(), "{phase} deleting={deleting}");
-            assert_eq!(r.entries.names(), Vec::<String>::new(), "{phase}: entry retracted");
-            assert!(r.store.get_claim(uid()).await.unwrap().revoked_at.is_some(), "{phase}: revoked");
-            assert_eq!(*r.claims.deleted.lock().unwrap(), Vec::<(String, String)>::new(), "release never deletes the claim");
+            let action = r
+                .watcher
+                .reconcile_claim(&claim(phase, &[RSA_EK_PEM], deleting))
+                .await
+                .unwrap();
+            assert_eq!(
+                action,
+                Action::await_change(),
+                "{phase} deleting={deleting}"
+            );
+            assert_eq!(
+                r.entries.names(),
+                Vec::<String>::new(),
+                "{phase}: entry retracted"
+            );
+            assert!(
+                r.store.get_claim(uid()).await.unwrap().revoked_at.is_some(),
+                "{phase}: revoked"
+            );
+            assert_eq!(
+                *r.claims.deleted.lock().unwrap(),
+                Vec::<(String, String)>::new(),
+                "release never deletes the claim"
+            );
         }
     }
 
@@ -621,24 +713,62 @@ mod tests {
         let r = rig(WatcherConfig::default());
         r.store.put_claim(record(uid())).await.unwrap();
         r.store.put_node(node(RSA_EK_HASH, false)).await.unwrap();
-        assert_eq!(r.watcher.reconcile_claim(&claim("Pending", &[], false)).await.unwrap(), Action::await_change());
+        assert_eq!(
+            r.watcher
+                .reconcile_claim(&claim("Pending", &[], false))
+                .await
+                .unwrap(),
+            Action::await_change()
+        );
         assert_eq!(r.entries.names(), Vec::<String>::new());
         // released once, then Bound again (cannot happen in banlieue, must not rebind here)
-        r.watcher.reconcile_claim(&claim("Bound", &[RSA_EK_PEM], false)).await.unwrap();
-        r.watcher.reconcile_claim(&claim("Releasing", &[RSA_EK_PEM], false)).await.unwrap();
-        r.watcher.reconcile_claim(&claim("Bound", &[RSA_EK_PEM], false)).await.unwrap();
-        assert_eq!(r.entries.names(), Vec::<String>::new(), "a revoked record is never bound again");
+        r.watcher
+            .reconcile_claim(&claim("Bound", &[RSA_EK_PEM], false))
+            .await
+            .unwrap();
+        r.watcher
+            .reconcile_claim(&claim("Releasing", &[RSA_EK_PEM], false))
+            .await
+            .unwrap();
+        r.watcher
+            .reconcile_claim(&claim("Bound", &[RSA_EK_PEM], false))
+            .await
+            .unwrap();
+        assert_eq!(
+            r.entries.names(),
+            Vec::<String>::new(),
+            "a revoked record is never bound again"
+        );
     }
 
     #[tokio::test]
     async fn a_member_with_a_certificate_gets_a_node_entry_and_one_without_gets_nothing() {
         let r = rig(WatcherConfig::default());
-        assert_eq!(r.watcher.reconcile_machine(&machine(&[])).await.unwrap(), Action::await_change());
+        assert_eq!(
+            r.watcher.reconcile_machine(&machine(&[])).await.unwrap(),
+            Action::await_change()
+        );
         assert_eq!(r.entries.names(), Vec::<String>::new());
-        assert_eq!(r.watcher.reconcile_machine(&machine(&["garbage"])).await.unwrap(), Action::await_change());
-        assert_eq!(r.entries.names(), Vec::<String>::new(), "an unusable certificate declares nothing");
-        r.watcher.reconcile_machine(&machine(&[RSA_EK_PEM])).await.unwrap();
-        r.watcher.reconcile_machine(&machine(&[RSA_EK_PEM])).await.unwrap();
+        assert_eq!(
+            r.watcher
+                .reconcile_machine(&machine(&["garbage"]))
+                .await
+                .unwrap(),
+            Action::await_change()
+        );
+        assert_eq!(
+            r.entries.names(),
+            Vec::<String>::new(),
+            "an unusable certificate declares nothing"
+        );
+        r.watcher
+            .reconcile_machine(&machine(&[RSA_EK_PEM]))
+            .await
+            .unwrap();
+        r.watcher
+            .reconcile_machine(&machine(&[RSA_EK_PEM]))
+            .await
+            .unwrap();
         assert_eq!(r.entries.names(), vec![node_entry_name(RSA_EK_HASH)]);
     }
 
@@ -652,18 +782,32 @@ mod tests {
             r.store.put_claim(record(u)).await.unwrap();
         }
         r.store.put_node(node(RSA_EK_HASH, false)).await.unwrap();
-        r.watcher.reconcile_claim(&claim("Bound", &[RSA_EK_PEM], false)).await.unwrap();
+        r.watcher
+            .reconcile_claim(&claim("Bound", &[RSA_EK_PEM], false))
+            .await
+            .unwrap();
         let mut kept_claim = claim("Bound", &[RSA_EK_PEM], false);
         kept_claim.metadata.uid = Some(kept.to_string());
         r.watcher.reconcile_claim(&kept_claim).await.unwrap();
         // an entry nobody's record knows about
-        r.entries.create_claim_entry(RSA_EK_HASH, Uuid::new_v4(), "sb-0123456789ab").await.unwrap();
+        r.entries
+            .create_claim_entry(RSA_EK_HASH, Uuid::new_v4(), "sb-0123456789ab")
+            .await
+            .unwrap();
         r.claims.existing.lock().unwrap().insert(kept);
         let (released, swept) = r.watcher.resync().await.unwrap();
         assert_eq!((released, swept), (1, 1));
         assert!(r.store.get_claim(gone).await.unwrap().revoked_at.is_some());
         assert!(r.store.get_claim(kept).await.unwrap().revoked_at.is_none());
-        assert!(r.store.get_claim(unbound).await.unwrap().revoked_at.is_none(), "never-bound records are not the resync's call");
+        assert!(
+            r.store
+                .get_claim(unbound)
+                .await
+                .unwrap()
+                .revoked_at
+                .is_none(),
+            "never-bound records are not the resync's call"
+        );
         assert_eq!(r.entries.names(), vec![claim_entry_name(kept)]);
     }
 }
