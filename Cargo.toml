@@ -37,11 +37,11 @@ mediatore-claims = { path = "crates/mediatore-claims" }
 mediatore-store  = { path = "crates/mediatore-store" }
 mediatore-testkit = { path = "crates/mediatore-testkit" }
 
-# banlieue CRD types (ADR-0002, ADR-0011), pinned by hash: banlieue PR #98 (banlieue-api on
-# kube's derive feature only, so no `ring` enters this graph). Re-pin to its merge commit on
-# main once merged, and to a tag when banlieue cuts a release with VirtualMachineClaim.
-# cargo deny allows this one git source.
-banlieue-api = { git = "https://github.com/firestoned/banlieue", rev = "a6f0941d776e819e8b0a16921087633a6c386b6a", package = "banlieue-api", default-features = false }
+# banlieue CRD types (ADR-0002, ADR-0011), pinned by hash: banlieue main at the merge of
+# PR #98 (banlieue-api on kube's derive feature only, so no `ring` enters this graph).
+# Becomes a tag pin when banlieue cuts a release with VirtualMachineClaim. cargo deny
+# allows this one git source.
+banlieue-api = { git = "https://github.com/firestoned/banlieue", rev = "20666eb0cf1011673b4b319e33b96c1f57d8a8ab", package = "banlieue-api", default-features = false }
 
 # async + web
 tokio        = { version = "1", features = ["rt-multi-thread", "macros", "signal", "process", "fs", "time", "sync", "net"] }
