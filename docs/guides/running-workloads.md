@@ -60,10 +60,11 @@ If you need interactivity, the workload dials **out** (see
 
 3. mediatore validates the token, writes `spec.subject` = *you* (`oid` on Entra, the
    GitHub login via Dex), and creates the `VirtualMachineClaim`. banlieue binds a
-   warm, already-attested pool member; mediatore creates the claim's SPIFFE entry;
-   the in-guest agent fetches the subject, creates your `sb-` user, unpacks the
-   image, and starts your command under nsjail. No further input from you is needed
-   or possible.
+   warm, already-attested pool member; mediatore declares the claim's SPIFFE entry as
+   a `ClusterStaticEntry` and the SPIRE Controller Manager creates it (no entry ever
+   exists any other way, ADR-0006); the in-guest agent fetches the subject over mTLS,
+   creates your `sb-` user, unpacks the image, and starts your command under nsjail.
+   No further input from you is needed or possible.
 
 ```mermaid
 sequenceDiagram
@@ -84,7 +85,8 @@ sequenceDiagram
     M->>M: validate iss/aud/sig/group, derive subject
     M->>K: create VirtualMachineClaim (spec.subject)
     K-->>M: claim Bound to VM (banlieue picked a Ready member)
-    M->>S: create entry spiffe://td/banlieue/claim/(uid),<br/>parent = VM node, selector unix:user:sb-hash
+    M->>K: declare ClusterStaticEntry spiffe://td/banlieue/claim/(uid),<br/>parent = VM node, selector unix:user:sb-hash
+    K-->>S: controller manager renders the entry; status.set observed
     G->>M: GET /v1/me (mTLS, node SVID)
     M-->>G: subject, expires_at, workload {image, args}
     G->>G: useradd sb-hash, unpack image, nsjail as sb-hash

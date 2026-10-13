@@ -14,12 +14,17 @@ path = "src/main.rs"
 
 [dependencies]
 mediatore-proto.workspace = true
+mediatore-tls.workspace = true
 tokio.workspace = true
 clap.workspace = true
 reqwest.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
-# spiffe = "0.6"   # X509Source for mTLS; lands with the mTLS work
+
+[features]
+# `--dev-spiffe-id`: a peer-identity header instead of mTLS, for the loopback dev loop only.
+# Off in release builds (ADR-0007 decision 5).
+dev = []
 
 [lints]
 workspace = true

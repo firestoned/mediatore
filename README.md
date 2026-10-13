@@ -83,7 +83,8 @@ release → cut-off. The remaining edges fail closed (`501 not_implemented`):
 | Entra OBO exchange | request shape done, untested |
 | SPIRE entries as `ClusterStaticEntry` through the Kubernetes API (ADR-0006, no gRPC) | implemented (`KubeEntryManager`), tested against a scripted fake API server, live against SPIRE in kind on every PR (`make kind-e2e`) and live against a real cluster (`make live-admission-test`), both as the broker ServiceAccount |
 | `VirtualMachineClaim` watch (needs `banlieue-api` pin) | client wiring only |
-| SPIFFE mTLS on the sandbox listener, broker SVID via the SPIFFE CSI driver (ADR-0007) | designed; stub (dev header) |
+| SPIFFE mTLS on the sandbox listener, broker SVID from the Workload API over the SPIFFE CSI driver, guests verifying the broker by SPIFFE ID (ADR-0007) | implemented (`mediatore-tls` on rustls, `spiffe` for the Workload API), e2e-tested with a test CA (`make check`); the `dev_mode` header path is loopback-only; live against SPIRE in kind is next |
+| Post-quantum key exchange: X25519MLKEM768 only on the sandbox leg (AES-256-GCM-SHA384 only), offered first everywhere else; ML-DSA SVIDs already verified end to end | implemented, pinned by tests (`crates/mediatore-tls/tests/handshake.rs`); signatures wait on SPIRE and JOSE (threat model R-8) |
 | sqlx store (PostgreSQL / SQLite) | not started |
 | `AgentSandbox` CRD and reconciler, moved from banlieue (ADR-0008) | designed |
 

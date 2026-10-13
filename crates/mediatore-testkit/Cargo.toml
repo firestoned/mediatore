@@ -1,6 +1,6 @@
 [package]
 name = "mediatore-testkit"
-description = "Test-only helpers: a fake OIDC issuer for exercising upstream token validation"
+description = "Test-only helpers: a fake OIDC issuer, and a test CA minting SPIFFE SVIDs for the mTLS suite"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,7 +13,13 @@ name = "fake-idp"
 path = "src/bin/fake_idp.rs"
 
 [dependencies]
+mediatore-proto.workspace = true
+mediatore-tls.workspace = true
 axum.workspace = true
+futures.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
+time.workspace = true
 clap.workspace = true
 tokio.workspace = true
 jsonwebtoken.workspace = true

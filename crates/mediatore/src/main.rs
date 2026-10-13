@@ -14,6 +14,7 @@ use mediatore_entra::Validator;
 use mediatore_spire::{EntryManager, KubeEntryManager, MemoryEntries, Naming};
 use mediatore_store::MemoryStore;
 use mediatore_sts::Sts;
+use mediatore_tls::MaterialSource;
 use tracing_subscriber::EnvFilter;
 
 use crate::config::Config;
@@ -72,12 +73,13 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
         trust_domain: cfg.trust_domain.clone(),
     };
     let spire = entry_manager(&cfg, naming.clone()).await?;
-    if !cfg.dev_mode {
-        anyhow::bail!(
-            "only dev_mode is runnable in this scaffold: the mTLS listener (ADR-0007) and the sqlx store are next"
+    if cfg.dev_mode {
+        tracing::warn!("dev_mode: peer identity from header, in-memory store and entries, no mTLS");
+    } else {
+        tracing::warn!(
+            "store: in-memory until roadmap 05; claims do not survive a restart and bind only through the dev binder until roadmap 03"
         );
     }
-    tracing::warn!("dev_mode: peer identity from header, in-memory store and entries, no mTLS");
 
     let sts = match &cfg.sts {
         Some(s) => {
@@ -96,7 +98,7 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
     let state = Arc::new(AppState {
         store: MemoryStore::shared(),
         spire,
-        naming,
+        naming: naming.clone(),
         validator: Validator::new(cfg.issuers.clone()),
         sts,
         audiences: cfg.audiences.iter().map(|a| a.name.clone()).collect(),
@@ -109,10 +111,40 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
 
     let u = axum::serve(user, mediatore_api::user_router(state.clone()))
         .with_graceful_shutdown(shutdown());
-    let s = axum::serve(sandbox, mediatore_api::sandbox_router(state))
-        .with_graceful_shutdown(shutdown());
-    tokio::try_join!(u, s)?;
+    let sandbox_router = mediatore_api::sandbox_router(state);
+    if let Some(spire) = (!cfg.dev_mode).then_some(cfg.spire.as_ref()).flatten() {
+        let configs = broker_identity(&spire.workload_api_socket, &naming).await?;
+        let s = mediatore_tls::serve(sandbox, configs, sandbox_router, shutdown());
+        tokio::try_join!(u, s)?;
+    } else {
+        let s = axum::serve(sandbox, sandbox_router).with_graceful_shutdown(shutdown());
+        tokio::try_join!(u, s)?;
+    }
     Ok(())
+}
+
+/// The broker's own SVID from the Workload API, and the sandbox listener's rotating TLS
+/// config over it (ADR-0007 decisions 1 and 2). Fails closed: no socket, no SVID, or an
+/// SVID that is not `spiffe://<td>/mediatore` (a wrong `ClusterSPIFFEID`) and the process
+/// does not start.
+async fn broker_identity(
+    workload_api_socket: &str,
+    naming: &Naming,
+) -> anyhow::Result<Arc<mediatore_tls::TlsConfigs>> {
+    let source = mediatore_tls::WorkloadApiSource::connect(workload_api_socket).await?;
+    let own = source.current()?;
+    anyhow::ensure!(
+        own.spiffe_id.to_string() == naming.broker_id(),
+        "the Workload API issued {} but the broker identity is {}: check the ClusterSPIFFEID",
+        own.spiffe_id,
+        naming.broker_id()
+    );
+    tracing::info!(spiffe_id = %own.spiffe_id, "broker identity from the Workload API");
+    let configs = mediatore_tls::TlsConfigs::spawn(
+        Arc::new(source),
+        mediatore_api::sandbox_authorizer(naming.clone()),
+    )?;
+    Ok(configs)
 }
 
 /// In `dev_mode` entries live in memory; otherwise they are `ClusterStaticEntry` resources
@@ -132,7 +164,7 @@ async fn entry_manager(cfg: &Config, naming: Naming) -> anyhow::Result<Arc<dyn E
     tracing::info!(
         class_name = %spire.entries.class_name,
         workload_api_socket = %spire.workload_api_socket,
-        "entries: ClusterStaticEntry via the Kubernetes API; own SVID from the Workload API (listener lands with ADR-0007)"
+        "entries: ClusterStaticEntry via the Kubernetes API"
     );
     Ok(Arc::new(KubeEntryManager::new(
         client,

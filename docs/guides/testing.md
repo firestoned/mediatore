@@ -31,7 +31,24 @@ same change.
 real HTTP listeners with the fake IdP from `mediatore-testkit`: login, claim, bind,
 `/v1/me`, `/v1/token`, verify against the broker's own JWKS, release, cut-off. The peer
 identity is a header (`dev_mode`), entries live in memory. Negative cases are part of it:
-wrong audience, wrong SVID type, wrong subject, revoked claim.
+wrong audience, wrong SVID type, wrong subject, revoked claim. The demo builds the two
+guest binaries with their `dev` cargo feature, which is the only build that has the
+header path at all.
+
+`crates/mediatore/tests/e2e_mtls.rs` runs the same sandbox API over the production mTLS
+listener (`crates/mediatore-tls`: the verifiers, the accept loop, the client configs) with
+the testkit's `TestCa` minting SPIFFE-shaped SVIDs in place of a SPIRE agent. It proves
+the handshake refuses what ADR-0007 says it refuses, before any HTTP is parsed: no client
+certificate, a foreign trust domain, the broker's own identity used as a client, an
+expired SVID, a CA-shaped leaf, a server that is not `spiffe://<td>/mediatore`. It also
+proves the dev header is ignored on an mTLS connection and refused outside `dev_mode`,
+and that a rotated SVID is used by the next handshake. It is part of `make check`.
+
+`crates/mediatore-tls/tests/handshake.rs` looks at the handshake itself: TLS 1.3,
+X25519MLKEM768 and AES-256-GCM-SHA384 negotiated, a client offering only classical key
+exchange refused, and a trust domain whose CA and SVIDs are ML-DSA-65 accepted by the same
+verifiers. The unit test in `crates/mediatore-proto/src/tls.rs` pins the provider's group
+order so the post-quantum hybrid stays the first key share every client offers.
 
 ## Live entries round trip
 

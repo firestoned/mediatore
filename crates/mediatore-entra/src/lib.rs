@@ -161,14 +161,18 @@ fn string_array(claims: &serde_json::Value, key: &str) -> Vec<String> {
 
 impl Validator {
     /// Build from config.
+    ///
+    /// # Panics
+    /// If `reqwest` cannot build a client over the workspace TLS config, which would be a
+    /// broken build rather than a runtime condition.
     #[must_use]
     pub fn new(issuers: Vec<IssuerConfig>) -> Self {
         Self {
             issuers,
-            http: {
-                mediatore_proto::tls::ensure_provider();
-                reqwest::Client::new()
-            },
+            http: reqwest::Client::builder()
+                .use_preconfigured_tls(mediatore_proto::tls::https_client_config())
+                .build()
+                .expect("reqwest client over the workspace TLS config"),
             jwks: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -326,15 +330,19 @@ pub struct Exchanged {
 
 impl Obo {
     /// Construct for a tenant and our app id. The client assertion signer is injected per call.
+    ///
+    /// # Panics
+    /// If `reqwest` cannot build a client over the workspace TLS config, which would be a
+    /// broken build rather than a runtime condition.
     #[must_use]
     pub fn new(tenant_id: impl Into<String>, client_id: impl Into<String>) -> Self {
         Self {
             tenant_id: tenant_id.into(),
             client_id: client_id.into(),
-            http: {
-                mediatore_proto::tls::ensure_provider();
-                reqwest::Client::new()
-            },
+            http: reqwest::Client::builder()
+                .use_preconfigured_tls(mediatore_proto::tls::https_client_config())
+                .build()
+                .expect("reqwest client over the workspace TLS config"),
         }
     }
 

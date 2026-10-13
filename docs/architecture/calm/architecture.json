@@ -641,7 +641,7 @@
     "repository": "https://github.com/firestoned/mediatore",
     "license": "Apache-2.0",
     "calm-schema-version": "1.2",
-    "phase": "dev-mode loop implemented and e2e-tested; Entra OBO, sqlx store and the claim watch are fail-closed stubs. Roadmap 01 (ADR-0006, ADR-0007) is designed: registration entries as ClusterStaticEntry through the Kubernetes API, broker identity from the Workload API over the SPIFFE CSI driver, SPIFFE mTLS terminated in-process; implementation pending. SPIRE topology models the ADR-0005 desired state: root on a dedicated identity cluster, downstream per environment; the homelab collapses to the downstream server alone. ADR-0008 (Proposed) adds the AgentSandbox CRD, moved from banlieue's unbuilt ADR-0055: designed, not built (roadmap 08)"
+    "phase": "dev-mode loop implemented and e2e-tested; Entra OBO, sqlx store and the claim watch are fail-closed stubs. Roadmap 01 (ADR-0006, ADR-0007) is implemented in code: registration entries as ClusterStaticEntry through the Kubernetes API (live-tested against SPIRE in kind), broker identity from the Workload API over the SPIFFE CSI driver, SPIFFE mTLS terminated in-process (crates/mediatore-tls, e2e-tested with a test CA); the kind tier for the listener is pending. SPIRE topology models the ADR-0005 desired state: root on a dedicated identity cluster, downstream per environment; the homelab collapses to the downstream server alone. ADR-0008 (Proposed) adds the AgentSandbox CRD, moved from banlieue's unbuilt ADR-0055: designed, not built (roadmap 08)"
   },
   "adrs": [
     "docs/adr/0001-record-architecture-decisions.md",

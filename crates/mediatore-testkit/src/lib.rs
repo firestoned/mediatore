@@ -5,6 +5,13 @@
 //!
 //! [`FakeIdp`] plays the part of Dex or Entra in tests: it serves OIDC discovery and a JWKS
 //! over a real HTTP listener, and mints ES256 tokens with whatever claims a test asks for.
+//! [`TestCa`] plays the part of the SPIRE server's CA: it mints SPIFFE-shaped X.509 SVIDs
+//! that the real mTLS verifiers accept, and [`MemoryMaterial`] stands in for the Workload
+//! API so rotation can be driven by hand.
+
+pub mod svid;
+
+pub use svid::{MemoryMaterial, TestCa};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;

@@ -17,6 +17,7 @@ hex.workspace = true
 thiserror.workspace = true
 x509-cert.workspace = true
 rustls.workspace = true   # the aws-lc-rs provider, installed by tls::ensure_provider (ADR-0007)
+webpki-roots.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

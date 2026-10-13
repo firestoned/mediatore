@@ -26,7 +26,9 @@ fail() { printf '\033[31mFAIL: %s\033[0m\n' "$*"; exit 1; }
 command -v jq >/dev/null || fail "jq is required"
 
 say "build"
-cargo build -q -p mediatore -p mediatore-testkit -p mediatore-guest -p sandbox-token
+# The guests take a peer-identity header only with their `dev` feature; release builds have none.
+cargo build -q -p mediatore -p mediatore-testkit -p mediatore-guest -p sandbox-token \
+  --features mediatore-guest/dev,sandbox-token/dev
 BIN=target/debug
 
 [ -f dev/sts.pem ] || { say "generate STS signing key"; openssl ecparam -name prime256v1 -genkey -noout | openssl pkcs8 -topk8 -nocrypt -out dev/sts.pem; }
