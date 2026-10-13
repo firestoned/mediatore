@@ -6,7 +6,8 @@
 
 .PHONY: all help fmt fmt-check lint test deny audit check sbom guest dist image e2e live-admission-test \
         kind-install kind-create kind-delete kind-down kind-spire kind-deploy kind-up \
-        kind-images kind-broker kind-e2e-entries kind-e2e-mtls kind-e2e kind-e2e-ci kind-e2e-logs \
+        kind-images kind-broker kind-banlieue-crds kind-e2e-entries kind-e2e-mtls kind-e2e-watcher \
+        kind-e2e kind-e2e-ci kind-e2e-logs \
         calm-validate calm-diagrams docs docs-serve docs-clean clean
 
 # kind: a throwaway cluster with SPIRE for the live tests (docs/guides/testing.md).
@@ -179,7 +180,20 @@ kind-e2e-entries: kind-up ## Live entries round trip (ADR-0006) as the broker Se
 kind-e2e-mtls: kind-broker ## ADR-0007 live: broker SVID over the CSI driver, agent-issued client SVIDs over SPIFFE mTLS, the refusals
 	./dev/kind/mtls-e2e.sh $(KIND_KUBECONFIG) $(SPIRE_TRUST_DOMAIN)
 
-kind-e2e: kind-e2e-entries kind-e2e-mtls ## Every live suite against kind (grows with the roadmap)
+kind-banlieue-crds: kind-create ## banlieue's VirtualMachine and VirtualMachineClaim CRDs, rendered from the pinned banlieue-api, applied
+	cargo run -q -p mediatore-testkit --bin banlieue-crds > $(KIND_DIR)/banlieue-crds.json
+	@# A nullable enum carries `null`, which kubectl's client-side check refuses and the API server's structural validation accepts (banlieue applies the same file).
+	$(KIND_KUBECTL) apply --validate=false -f $(KIND_DIR)/banlieue-crds.json
+	cargo run -q -p mediatore-testkit --bin ek-fixture > $(KIND_DIR)/ek.pem
+	cargo run -q -p mediatore-testkit --bin ek-fixture -- --hash > $(KIND_DIR)/ek.hash
+
+kind-e2e-watcher: kind-banlieue-crds kind-broker ## ADR-0011 live: the Lease, a member's certificate becoming a node entry, a claim without a record binding nothing
+	@# The controllers must start against existing CRDs: a broker that came up before them backs off for minutes.
+	$(KIND_KUBECTL) -n banlieue-system rollout restart deploy/mediatore
+	$(KIND_KUBECTL) -n banlieue-system rollout status deploy/mediatore --timeout=300s
+	./dev/kind/watcher-e2e.sh $(KIND_KUBECONFIG) $(SPIRE_TRUST_DOMAIN) $(KIND_DIR)/ek.pem $(KIND_DIR)/ek.hash
+
+kind-e2e: kind-e2e-entries kind-e2e-mtls kind-e2e-watcher ## Every live suite against kind (grows with the roadmap)
 
 kind-e2e-ci: ## CI shape: the suites, cluster state on failure, cluster deleted after
 	@$(MAKE) kind-e2e || { $(MAKE) kind-e2e-logs; $(MAKE) kind-delete; exit 1; }
@@ -191,6 +205,8 @@ kind-e2e-logs: ## What a failing live suite needs: entries, policy, broker and c
 	-$(KIND_KUBECTL) -n banlieue-system get pods -o wide
 	-$(KIND_KUBECTL) -n banlieue-system logs deploy/mediatore --tail=200
 	-$(KIND_KUBECTL) -n mediatore-e2e get pods -o wide
+	-$(KIND_KUBECTL) -n banlieue-system get lease mediatore-watcher -o yaml
+	-$(KIND_KUBECTL) -n mediatore-e2e-watcher get virtualmachines,virtualmachineclaims -o yaml
 	-$(KIND_KUBECTL) get validatingadmissionpolicy mediatore-clusterstaticentry -o yaml
 	-$(KIND_KUBECTL) -n $(SPIRE_NAMESPACE) logs statefulset/spire-server -c spire-controller-manager --tail=200
 	-$(KIND_KUBECTL) -n $(SPIRE_NAMESPACE) logs statefulset/spire-server -c spire-server --tail=100

@@ -20,7 +20,13 @@ thiserror.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 chrono.workspace = true
-# banlieue-api.workspace = true   # pinned CRD types; see workspace Cargo.toml
+banlieue-api.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+
+[dev-dependencies]
+mediatore-testkit.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true

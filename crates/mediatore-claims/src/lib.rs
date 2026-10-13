@@ -1,15 +1,13 @@
 // Copyright (c) 2026 Erick Bourgeois, mediatore
 // SPDX-License-Identifier: Apache-2.0
 
-//! Claim lifecycle: watch banlieue `VirtualMachineClaim`s and react.
+//! Claim lifecycle: watch banlieue `VirtualMachineClaim`s and react (ADR-0011).
 //!
-//! On `Bound`: resolve the bound VM's `providerID` to a registered node (by DMI UUID),
-//! cross-check the EK hash against `status.tpmEndorsementCertificates` when present, declare
-//! the claim's registration entry (ADR-0006) and record it. On `Releasing`/`Failed`/deletion:
-//! retract the entry and revoke the record. Order: entry first, then refresh material.
-//!
-//! The typed CRD watch depends on `banlieue-api`; until that pin exists this crate holds the
-//! state machine, the orphan sweep and a `run` that connects to the cluster and stops.
+//! On `Bound`: resolve the node by the EK hash of the certificate banlieue mirrored onto the
+//! claim, declare the claim's registration entry (ADR-0006) and record it. On
+//! `Releasing`/`Failed`/deletion: retract the entry and revoke the record. Order: entry
+//! first, then refresh material. The state machine and the [`Reconciler`] are here; the
+//! typed watch over `banlieue-api` is [`watch`], and [`lease`] elects the replica that runs it.
 
 use std::sync::Arc;
 
@@ -18,6 +16,9 @@ use mediatore_proto::ClaimPhase;
 use mediatore_spire::{EntryKind, EntryManager, Naming};
 use mediatore_store::{ClaimStore, StoreError};
 use uuid::Uuid;
+
+pub mod lease;
+pub mod watch;
 
 /// Decision for one observed claim.
 #[derive(Debug, PartialEq, Eq)]
@@ -124,14 +125,6 @@ impl Reconciler {
 }
 
 /// Connect to the cluster. The typed watch on `VirtualMachineClaim` is added once
-/// `banlieue-api` is pinned; for now this proves the client wiring and returns.
-pub async fn run(_r: Reconciler) -> anyhow::Result<()> {
-    let client = kube::Client::try_default().await?;
-    let version = client.apiserver_version().await?;
-    tracing::info!(git = %version.git_version, "connected to the API server; claim watcher not wired yet");
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use chrono::Utc;

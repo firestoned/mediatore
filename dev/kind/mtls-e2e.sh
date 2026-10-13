@@ -27,14 +27,17 @@ CLAIM_UID=6b0a3e9c-1f4d-4c2e-9a7b-0d1e2f3a4b5c
 EK_HASH=$(printf 'ec%062x' 7)
 TIMEOUT=${MEDIATORE_KIND_TIMEOUT:-180}
 
+command -v jq >/dev/null || { echo "jq is required" >&2; exit 1; }
+
 say()  { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 fail() { printf '\033[31mFAIL: %s\033[0m\n' "$*"; dump; exit 1; }
 
 # Logs with any ANSI colour stripped, so a field and its value stay adjacent.
 plain()       { sed "s/$(printf '\033')\[[0-9;]*m//g"; }
-# The newest Running broker pod, resolved once: after a rollout restart the old pod may
-# still exist, and its log has none of this run's connections.
-broker_pod()  { "${K[@]}" -n "$BROKER_NS" get pods -l app.kubernetes.io/name=mediatore --field-selector=status.phase=Running --sort-by=.metadata.creationTimestamp -o name 2>/dev/null | tail -1; }
+# The newest broker pod that is Running and not being deleted, resolved once: after a
+# rollout restart the old pod lingers in phase Running with a deletion timestamp, and its
+# log has none of this run's connections.
+broker_pod()  { "${K[@]}" -n "$BROKER_NS" get pods -l app.kubernetes.io/name=mediatore -o json 2>/dev/null | jq -r '[.items[] | select(.metadata.deletionTimestamp == null and .status.phase == "Running")] | sort_by(.metadata.creationTimestamp) | last | select(. != null) | "pod/" + .metadata.name'; }
 BROKER_POD=""
 broker_logs() { [ -n "$BROKER_POD" ] && "${K[@]}" -n "$BROKER_NS" logs "$BROKER_POD" 2>/dev/null | plain || true; }
 pod_logs()    { "${K[@]}" -n "$NS" logs "pod/$1" 2>/dev/null | plain || true; }

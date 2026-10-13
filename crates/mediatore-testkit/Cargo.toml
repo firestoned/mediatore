@@ -12,9 +12,19 @@ publish.workspace = true
 name = "fake-idp"
 path = "src/bin/fake_idp.rs"
 
+[[bin]]
+name = "banlieue-crds"
+path = "src/bin/banlieue_crds.rs"
+
+[[bin]]
+name = "ek-fixture"
+path = "src/bin/ek_fixture.rs"
+
 [dependencies]
 mediatore-proto.workspace = true
 mediatore-tls.workspace = true
+banlieue-api.workspace = true
+kube.workspace = true
 axum.workspace = true
 futures.workspace = true
 rcgen.workspace = true

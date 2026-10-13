@@ -113,10 +113,11 @@ Suites today:
 | --- | --- | --- |
 | `make kind-e2e-entries` | 0006 | the live entries round trip above |
 | `make kind-e2e-mtls` | 0007 | the broker image on the CSI socket, agent-issued client SVIDs over SPIFFE mTLS, below |
+| `make kind-e2e-watcher` | 0011 | the watcher Lease, a member's certificate becoming a node entry, a claim without a record binding nothing, below |
 
-Planned, as the roadmap lands: the claim watcher binding a `VirtualMachineClaim` to a
-node entry derived from a published EK certificate (roadmap 03), with banlieue's CRDs
-installed but no VM.
+Planned, as the roadmap lands: a claim the broker holds a record for, bound end to end
+from `VirtualMachineClaim` to claim entry, once ADR-0008 creates records outside
+`dev_mode` (roadmap 08).
 
 ### Broker and client pods over SPIFFE mTLS
 
@@ -144,6 +145,33 @@ volume and run the shipped guest binaries against `mediatore-sandbox`:
 
 The script also reads the broker's log: the claim connection negotiated X25519MLKEM768
 and AES-256-GCM-SHA384, the node connected, both refusals were logged by the authorizer.
+
+### Claim watcher against banlieue's CRDs
+
+`make kind-banlieue-crds` renders `VirtualMachine` and `VirtualMachineClaim` from the
+pinned `banlieue-api` (`cargo run -p mediatore-testkit --bin banlieue-crds`, a `v1/List`
+of the CRDs the watcher was compiled against, post-processed by banlieue's own
+`crdgen_support::prepared`) and applies them with kubectl's client-side validation off,
+because a nullable enum in the schema carries a `null` that only the API server's
+structural validation accepts; `make kind-e2e-watcher`
+then restarts the broker so its controllers start against existing CRDs and runs
+`dev/kind/watcher-e2e.sh`. No banlieue controller runs: the script patches the statuses
+banlieue would have written. It proves, as the broker ServiceAccount against the real
+admission policy:
+
+| Step | Expected |
+| --- | --- |
+| the broker pod holds `Lease` `mediatore-watcher` and logs `claim watcher running` | one leader, elected through the namespaced Role in `deploy/base/rbac.yaml` |
+| `member-1` (label `banlieue.io/pool`) gets the fixture endorsement certificate patched into `status.tpmEndorsementCertificates` | `ClusterStaticEntry` `mediatore-node-<hash>` appears with `spiffe://<td>/banlieue/node/<hash>`; the broker logs `node entry declared` |
+| `member-2` never publishes a certificate | no entry |
+| `claim-orphan`, labelled `app.kubernetes.io/managed-by=mediatore`, patched to `Bound` with the same certificate, while the broker has no record for its UID | no claim entry, the claim is not deleted |
+
+The certificate is `mediatore_testkit::ek::RSA_EK_PEM` (`cargo run -p mediatore-testkit
+--bin ek-fixture`), a throwaway self-signed key whose hash the guest, the attestor and
+the unit tests agree on. The watcher's own logic (bind by EK, the 60 s resolution
+timeout, release on every phase, the resync) is unit-tested in
+`crates/mediatore-claims/src/watch.rs` over the in-memory store and entries, and the
+Lease verdicts in `crates/mediatore-claims/src/lease.rs`.
 What this tier proves and the hermetic suite cannot: the `ClusterSPIFFEID` in
 `deploy/base` renders to `spiffe://<td>/mediatore` for the broker pod; the CSI inline
 volume delivers the Workload API under PSS `restricted`; SVIDs the `k8s` workload

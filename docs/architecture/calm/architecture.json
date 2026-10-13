@@ -35,7 +35,7 @@
       "unique-id": "service-mediatore-watcher",
       "node-type": "service",
       "name": "Claim Watcher",
-      "description": "Reconciles AgentSandbox (ADR-0008, designed): creates and owns one VirtualMachineClaim per sandbox and holds a finalizer until it is gone. Watches VirtualMachineClaim: on Bound resolves the node by DMI UUID / EK hash and declares the claim's registration entry as a ClusterStaticEntry through the Kubernetes API, waiting for status.set before the claim is live; on Releasing/Failed/deletion deletes the resource and revokes the store row (entry first, then refresh material). Derives the node entry from the EK certificate banlieue publishes. Never holds a SPIRE admin identity (ADR-0006). crates/mediatore-claims."
+      "description": "Reconciles AgentSandbox (ADR-0008, designed): creates and owns one VirtualMachineClaim per sandbox and holds a finalizer until it is gone. Watches VirtualMachineClaim (managed-by label) and VirtualMachine (pool members): on Bound resolves the node by the EK hash the claim mirrors (never by name, address or UUID), binds through the Reconciler, fails an unresolved bind after a bounded wait by deleting the claim, releases on Releasing / Failed / deletion and at resync; declares a node entry when a member publishes its vTPM endorsement certificate; one replica leads by Lease (ADR-0011, built).set before the claim is live; on Releasing/Failed/deletion deletes the resource and revokes the store row (entry first, then refresh material). Derives the node entry from the EK certificate banlieue publishes. Never holds a SPIRE admin identity (ADR-0006). crates/mediatore-claims."
     },
     {
       "unique-id": "service-mediatore-sts",
@@ -304,7 +304,7 @@
     },
     {
       "unique-id": "rel-watcher-kube-api",
-      "description": "Watches VirtualMachineClaim for Bound / Releasing / Failed / deletion.",
+      "description": "Watches VirtualMachineClaim (label app.kubernetes.io/managed-by=mediatore) for Bound / Releasing / Failed / deletion and VirtualMachine (banlieue.io/pool) for a published vTPM endorsement certificate; binds by the EK hash the claim mirrors, fails an unresolved bind after 60 s by deleting the claim, declares node entries from members (ADR-0011). Runs on the replica holding the coordination.k8s.io Lease mediatore-watcher.",
       "relationship-type": {
         "connects": {
           "source": {

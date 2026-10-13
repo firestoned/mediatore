@@ -9,6 +9,7 @@
 //! that the real mTLS verifiers accept, and [`MemoryMaterial`] stands in for the Workload
 //! API so rotation can be driven by hand.
 
+pub mod ek;
 pub mod svid;
 
 pub use svid::{MemoryMaterial, TestCa};
