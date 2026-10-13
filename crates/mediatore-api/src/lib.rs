@@ -8,8 +8,10 @@
 //! * [`sandbox_router`]: `POST /v1/nodes`, `GET /v1/me`, `POST /v1/token`, authenticated by
 //!   the peer's SPIFFE ID from mTLS.
 //!
-//! mTLS termination with SPIFFE X.509 SVIDs is the next step; until then the sandbox router
-//! reads the peer identity from `x-mediatore-peer-spiffe-id`, and only when `dev_mode` is on.
+//! The sandbox router takes the peer identity from the [`PeerSpiffeId`] extension that
+//! `mediatore_tls::serve` attaches after verifying the client certificate (ADR-0007). Only a
+//! `dev_mode` server, on a plain loopback listener, reads it from `x-mediatore-peer-spiffe-id`
+//! instead.
 
 use std::sync::Arc;
 
@@ -17,7 +19,7 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use chrono::{Duration, Utc};
 use mediatore_claims::Reconciler;
 use mediatore_entra::{Validated, Validator};
@@ -29,6 +31,7 @@ use mediatore_proto::{
 use mediatore_spire::{EntryManager, Naming};
 use mediatore_store::{ClaimRecord, ClaimStore, NodeRecord, StoreError};
 use mediatore_sts::{MintRequest, Sts};
+use mediatore_tls::PeerSpiffeId;
 use uuid::Uuid;
 
 /// Hex characters of the claim UID used in the generated object name.
@@ -131,7 +134,18 @@ fn bearer(headers: &HeaderMap) -> Result<&str, ApiError> {
 }
 
 /// Peer SPIFFE ID from mTLS (or the dev header).
-fn peer_spiffe_id(st: &AppState, headers: &HeaderMap) -> Result<String, ApiError> {
+/// The caller's SPIFFE ID. On an mTLS connection it is the verified client certificate's
+/// URI SAN, attached by the listener as a [`PeerSpiffeId`] extension; the header is never
+/// consulted then. Without one, only a `dev_mode` server reads the header (ADR-0007
+/// decision 3); anything else has no peer identity and is refused.
+fn peer_spiffe_id(
+    st: &AppState,
+    peer: Option<&PeerSpiffeId>,
+    headers: &HeaderMap,
+) -> Result<String, ApiError> {
+    if let Some(peer) = peer {
+        return Ok(peer.0.clone());
+    }
     if st.dev_mode {
         return headers
             .get("x-mediatore-peer-spiffe-id")
@@ -139,7 +153,19 @@ fn peer_spiffe_id(st: &AppState, headers: &HeaderMap) -> Result<String, ApiError
             .map(ToOwned::to_owned)
             .ok_or_else(|| ApiError::unauthorized("no peer identity (dev header missing)"));
     }
-    Err(ApiError::not_implemented("SPIFFE mTLS peer identity"))
+    Err(ApiError::unauthorized(
+        "no peer identity: not an mTLS connection",
+    ))
+}
+
+/// Who may complete a handshake with the sandbox listener: node and claim identities of
+/// this trust domain, parsed by the same rules the handlers apply, and nothing else, not
+/// even another broker (ADR-0007 decision 2).
+pub fn sandbox_authorizer(naming: Naming) -> mediatore_tls::Authorizer {
+    Arc::new(move |id: &mediatore_tls::SpiffeId| {
+        let id = id.to_string();
+        naming.node_ek_from(&id).is_some() || naming.claim_uid_from(&id).is_some()
+    })
 }
 
 // ---------- user-facing ----------
@@ -330,9 +356,10 @@ pub fn user_router(state: Shared) -> Router {
 async fn register_node(
     State(st): State<Shared>,
     headers: HeaderMap,
+    peer: Option<Extension<PeerSpiffeId>>,
     Json(reg): Json<NodeRegistration>,
 ) -> Result<Json<NodeRegistered>, ApiError> {
-    let peer = peer_spiffe_id(&st, &headers)?;
+    let peer = peer_spiffe_id(&st, peer.as_ref().map(|e| &e.0), &headers)?;
     if !is_ek_hash(&reg.ek_hash) {
         return Err(ApiError::bad_request(
             "invalid_ek_hash",
@@ -379,8 +406,12 @@ async fn register_node(
     Ok(Json(NodeRegistered { node_id: agent_id }))
 }
 
-async fn me(State(st): State<Shared>, headers: HeaderMap) -> Result<Json<Me>, ApiError> {
-    let peer = peer_spiffe_id(&st, &headers)?;
+async fn me(
+    State(st): State<Shared>,
+    headers: HeaderMap,
+    peer: Option<Extension<PeerSpiffeId>>,
+) -> Result<Json<Me>, ApiError> {
+    let peer = peer_spiffe_id(&st, peer.as_ref().map(|e| &e.0), &headers)?;
     let ek_hash = st
         .naming
         .node_ek_from(&peer)
@@ -415,9 +446,10 @@ async fn me(State(st): State<Shared>, headers: HeaderMap) -> Result<Json<Me>, Ap
 async fn token(
     State(st): State<Shared>,
     headers: HeaderMap,
+    peer: Option<Extension<PeerSpiffeId>>,
     Json(req): Json<TokenRequest>,
 ) -> Result<Json<TokenResponse>, ApiError> {
-    let peer = peer_spiffe_id(&st, &headers)?;
+    let peer = peer_spiffe_id(&st, peer.as_ref().map(|e| &e.0), &headers)?;
     let claim_uid = st
         .naming
         .claim_uid_from(&peer)

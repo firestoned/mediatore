@@ -6,9 +6,10 @@
 //! State machine (runbook Part 6.1):
 //! boot → node registered → subject fetched → user created → jail running → torn down.
 //!
-//! Transport: mTLS with the node SVID from the Workload API is the production path and is
-//! not wired yet. Until it is, the binary only talks to a `dev_mode` server, sending the
-//! peer identity as a header; without `--dev-spiffe-id` it fails closed.
+//! Transport: SPIFFE mTLS with the node SVID from the Workload API, verifying the broker
+//! as exactly `spiffe://<td>/mediatore` (ADR-0007 decision 5). With the `dev` cargo
+//! feature only, `--dev-spiffe-id` sends the identity as a header to a loopback `dev_mode`
+//! server instead; release builds have no such path.
 
 mod identity;
 mod jail;
@@ -19,10 +20,14 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use mediatore_proto::{Me, NodeRegistered, NodeRegistration, Provider};
+use mediatore_tls::{MaterialSource, SpiffeId, WorkloadApiSource};
+use reqwest::Method;
+use serde::Serialize;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 /// Header carrying the peer SPIFFE ID against a `dev_mode` server.
+#[cfg(feature = "dev")]
 const DEV_PEER_HEADER: &str = "x-mediatore-peer-spiffe-id";
 /// Seconds between registration retries while mediatore is unreachable.
 const REGISTER_RETRY_SECS: u64 = 5;
@@ -56,6 +61,7 @@ struct Cli {
     #[arg(long, default_value = jail::SANDBOX_ROOT)]
     sandbox_root: PathBuf,
     /// Dev only: send this SPIFFE ID as a header instead of doing mTLS
+    #[cfg(feature = "dev")]
     #[arg(long, env = "MEDIATORE_DEV_SPIFFE_ID", hide = true)]
     dev_spiffe_id: Option<String>,
     /// Dev only: use this EK hash instead of reading the TPM
@@ -86,34 +92,85 @@ impl From<ProviderArg> for Provider {
     }
 }
 
-/// HTTP client for the sandbox listener. Dev header now, SPIFFE mTLS next.
+/// HTTP client for the sandbox listener.
 struct SandboxClient {
     base: String,
-    http: reqwest::Client,
-    dev_spiffe_id: String,
+    transport: Transport,
+}
+
+enum Transport {
+    /// The node SVID from the Workload API as the client certificate; the broker accepted
+    /// only as `spiffe://<td>/mediatore`.
+    Mtls {
+        source: WorkloadApiSource,
+        server: SpiffeId,
+    },
+    /// The peer identity as a header, for a loopback `dev_mode` server.
+    #[cfg(feature = "dev")]
+    DevHeader(String),
 }
 
 impl SandboxClient {
-    fn new(base: &str, dev_spiffe_id: &str) -> anyhow::Result<Self> {
+    /// Obtain the transport identity. Fails closed: no Workload API, no client.
+    async fn connect(cli: &Cli) -> anyhow::Result<Self> {
+        let base = cli.mediatore_url.trim_end_matches('/').to_owned();
+        #[cfg(feature = "dev")]
+        if let Some(id) = &cli.dev_spiffe_id {
+            tracing::warn!(
+                "dev: peer identity sent as a header; only a loopback dev_mode server accepts this"
+            );
+            return Ok(Self {
+                base,
+                transport: Transport::DevHeader(id.clone()),
+            });
+        }
+        let endpoint = mediatore_tls::endpoint(&cli.workload_api_socket.to_string_lossy());
+        let source = WorkloadApiSource::connect(&endpoint)
+            .await
+            .map_err(|e| anyhow::anyhow!("Workload API at {endpoint}: {e}"))?;
+        let own = source.current()?;
+        let server = SpiffeId::new(format!("spiffe://{}/mediatore", own.trust_domain()))?;
+        tracing::info!(spiffe_id = %own.spiffe_id, broker = %server, "node SVID from the Workload API");
         Ok(Self {
-            base: base.trim_end_matches('/').to_owned(),
-            http: reqwest::Client::builder().build()?,
-            dev_spiffe_id: dev_spiffe_id.to_owned(),
+            base,
+            transport: Transport::Mtls { source, server },
         })
+    }
+
+    /// Send one request with this node's identity. The mTLS client is built per request
+    /// from the current material, so a rotated SVID is used by the next call.
+    async fn send(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&impl Serialize>,
+    ) -> anyhow::Result<reqwest::Response> {
+        let url = format!("{}{path}", self.base);
+        let req = match &self.transport {
+            Transport::Mtls { source, server } => {
+                let cfg = mediatore_tls::client_config(source.current()?.as_ref(), server)?;
+                reqwest::Client::builder()
+                    .use_preconfigured_tls(cfg)
+                    .build()?
+                    .request(method, url)
+            }
+            #[cfg(feature = "dev")]
+            Transport::DevHeader(id) => reqwest::Client::new()
+                .request(method, url)
+                .header(DEV_PEER_HEADER, id),
+        };
+        let req = match body {
+            Some(b) => req.json(b),
+            None => req,
+        };
+        Ok(req.send().await?)
     }
 
     /// Register this node until mediatore accepts it. A 409 is fatal: it means this EK is
     /// already known under another VM, which is exactly the cloned-TPM case.
     async fn register(&self, reg: &NodeRegistration) -> anyhow::Result<NodeRegistered> {
         loop {
-            let resp = self
-                .http
-                .post(format!("{}/v1/nodes", self.base))
-                .header(DEV_PEER_HEADER, &self.dev_spiffe_id)
-                .json(reg)
-                .send()
-                .await;
-            match resp {
+            match self.send(Method::POST, "/v1/nodes", Some(reg)).await {
                 Ok(r) if r.status().is_success() => return Ok(r.json().await?),
                 Ok(r) if r.status() == reqwest::StatusCode::CONFLICT => {
                     anyhow::bail!(
@@ -135,13 +192,7 @@ impl SandboxClient {
     /// Poll until a claim is bound to this node.
     async fn wait_for_subject(&self) -> anyhow::Result<Me> {
         loop {
-            let resp = self
-                .http
-                .get(format!("{}/v1/me", self.base))
-                .header(DEV_PEER_HEADER, &self.dev_spiffe_id)
-                .send()
-                .await;
-            match resp {
+            match self.send(Method::GET, "/v1/me", None::<&()>).await {
                 Ok(r) if r.status().is_success() => return Ok(r.json().await?),
                 Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => {
                     tracing::debug!("no claim bound yet");
@@ -192,10 +243,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(ek_hash = %reg.ek_hash, dmi = %reg.dmi_uuid, "node identity computed");
 
     // 2. Talk to mediatore. Fail closed without a transport identity.
-    let Some(dev_id) = &cli.dev_spiffe_id else {
-        anyhow::bail!("mTLS not wired yet; set --dev-spiffe-id against a dev_mode server");
-    };
-    let client = SandboxClient::new(&cli.mediatore_url, dev_id)?;
+    let client = SandboxClient::connect(&cli).await?;
     let registered = client.register(&reg).await?;
     tracing::info!(node_id = %registered.node_id, "node registered");
 

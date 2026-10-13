@@ -3,10 +3,24 @@
 
 # ADR-0007: Broker identity from the Workload API over the SPIFFE CSI driver; the sandbox listener terminates SPIFFE mTLS in-process
 
-**Status:** Accepted · **Date:** 2026-10-10 · **Accepted:** 2026-10-11
+**Status:** Accepted · **Date:** 2026-10-10 · **Accepted:** 2026-10-11 · **Amended:** 2026-10-13
+(TLS layer: `mediatore-tls` instead of `spiffe-rustls`; decisions 2, 5, 6 and 8, see the
+amendment note)
 
 Companion: [ADR-0006](0006-registration-entries-as-clusterstaticentry.md) (registration
 entries). Together they are roadmap 01 and delete threat-model accepted risk **R-1**.
+
+> **Amendment, 2026-10-13.** Implementation found that `spiffe-rustls` builds its configs
+> only from a live `spiffe::X509Source`, which exists only with a Workload API to talk to.
+> Decision 8's hermetic suite would therefore have needed a fake Workload API server, that
+> is a gRPC service and a vendored proto, which this project does not want. The TLS layer
+> is instead the in-repo `crates/mediatore-tls`: rustls verifiers that make the same four
+> checks `spiffe-rustls` makes (leaf constraints, local trust domain, chain to the bundle
+> through rustls's webpki path validation, authorizer), built over a `MaterialSource` trait
+> that the `spiffe` crate's `X509Source` implements in production and a test CA implements
+> in tests. The `spiffe` crate stays for the Workload API client and SPIFFE ID and SVID
+> parsing. Nothing in the trust boundaries, identities or deployment changes; the text
+> below is amended in place where it named the crate.
 
 ## Context
 
@@ -46,9 +60,10 @@ the same tier as the kubelet, which already holds every pod's ServiceAccount tok
 node, so the driver adds no authority the node does not already have.
 
 The Workload API is gRPC, but the `spiffe` crate (Apache-2.0, `maxlambrecht/rust-spiffe`,
-0.18) wraps it: `X509Source` keeps the SVID and its key in process memory, re-fetches on
-rotation, and `spiffe-rustls` turns it into rustls client and server configs with SPIFFE
-authorizers. No proto is vendored and no RPC is written by hand. Compared with
+0.18) wraps it: `X509Source` keeps the SVID and its key in process memory and re-fetches on
+rotation. `crates/mediatore-tls` turns that material into rustls client and server configs
+with SPIFFE verifiers and authorizers (amended: `spiffe-rustls` was the first choice, see
+the note above). No proto is vendored and no RPC is written by hand. Compared with
 `spiffe-helper`, the private key never touches a filesystem, rotation is push rather than
 poll, and there is one fewer image to patch.
 
@@ -84,7 +99,7 @@ flowchart TB
     subgraph pod ["mediatore pod, namespace banlieue-system (PSS restricted)"]
       vol["csi.spiffe.io inline volume<br/>read-only at /run/spire/sockets"]
       src["X509Source<br/>SVID + key in memory, rotated"]
-      l8443["sandbox listener :8443<br/>spiffe-rustls, TLS 1.3, client cert required"]
+      l8443["sandbox listener :8443<br/>mediatore-tls on rustls, TLS 1.3, client cert required"]
       l8080["user listener :8080<br/>HTTP, TLS at the ingress"]
       vol --> src --> l8443
     end
@@ -102,15 +117,20 @@ flowchart TB
   ing --> l8080
 ```
 
-**2. The sandbox listener terminates SPIFFE mTLS in-process.** `spiffe-rustls` builds the
-server config from the `X509Source`: server certificate is the broker SVID; TLS 1.3 only;
-client certificate **required**; the client chain is verified against the trust domain's
-X.509 bundle from the same Workload API stream; the authorizer accepts a peer whose SPIFFE
-ID is under `spiffe://<td>/banlieue/node/` or `spiffe://<td>/banlieue/claim/` and
-nothing else (not even another broker). The verified URI SAN becomes the request's peer
-identity as a typed connection extension; the existing per-route checks (`/v1/nodes`,
-`/v1/me` for node IDs, `/v1/token` for claim IDs, `Naming::claim_uid_from`) run on it
-unchanged.
+**2. The sandbox listener terminates SPIFFE mTLS in-process.** `crates/mediatore-tls`
+builds the server config from the `X509Source` (through `MaterialSource`): server
+certificate is the broker SVID; TLS 1.3 only; session resumption off, since a resumed
+handshake would skip the verifier; client certificate **required**; the client leaf must
+be SVID-shaped (not a CA, `digitalSignature`, no `keyCertSign`, one URI SAN with a path),
+of the local trust domain, and its chain is verified against the trust domain's X.509
+bundle from the same Workload API stream; the authorizer accepts a peer whose SPIFFE ID is
+under `spiffe://<td>/banlieue/node/` or `spiffe://<td>/banlieue/claim/` and nothing else
+(not even another broker), using the same `Naming` parsers the handlers use. The verified
+URI SAN becomes the request's peer identity as a typed connection extension
+(`PeerSpiffeId`); the existing per-route checks (`/v1/nodes`, `/v1/me` for node IDs,
+`/v1/token` for claim IDs, `Naming::claim_uid_from`) run on it unchanged. The config is
+rebuilt on every rotation the source reports; a rotation that fails to build keeps the
+previous config, which expires on its own.
 
 **3. The dev header survives only under `dev_mode`, and `dev_mode` is refused unless the
 sandbox listener binds a loopback address.** `Config::load` rejects
@@ -127,8 +147,10 @@ hostname, so the address is free to change and SNI carries no trust.
 their SVIDs from the VM agent's socket (`/run/spire/sockets/agent.sock` on the host,
 bind-mounted into the jail as `/run/spire/agent.sock`, already in `JailSpec`), present them
 as client certificates, and accept the server only if its SPIFFE ID is exactly
-`spiffe://<td>/mediatore`. Both binaries remove their `--dev-spiffe-id` path except under
-a `dev` cargo feature that the release build does not enable.
+`spiffe://<td>/mediatore`, where `<td>` is the trust domain of their own SVID (no flag can
+point them at another broker). SNI and hostnames carry no trust. Both binaries have their
+`--dev-spiffe-id` path only under a `dev` cargo feature that `make e2e` enables and the
+release build does not.
 
 ```mermaid
 sequenceDiagram
@@ -153,11 +175,22 @@ sequenceDiagram
 ```
 
 **6. One cryptographic provider, post-quantum key exchange.** The process installs
-`aws-lc-rs` as the rustls default provider at startup; `spiffe-rustls` is built with its
-`aws-lc-rs` feature, and `reqwest` and `kube` are built with their no-provider features so
-that `cargo tree -i ring` is empty. Every TLS connection mediatore makes or accepts then
-negotiates X25519MLKEM768 by default, which is the revisit condition of threat-model R-8.
-R-8 narrows to signatures (SVIDs, JWS), which SPIRE and JOSE cannot yet make post-quantum.
+`aws-lc-rs` as the rustls default provider at startup; `rustls` and `tokio-rustls` carry
+only that provider feature, `reqwest` and `kube` are built with their no-provider features,
+and `cargo deny` bans `ring`, so that `cargo tree -i ring` is empty. rustls is built with
+`prefer-post-quantum`, so every key share mediatore offers lists X25519MLKEM768 first
+(amended 2026-10-13: without that feature rustls lists the hybrid last, which the first
+implementation had missed; a unit test now pins the order). On the sandbox leg both ends
+are ours, so nothing is negotiated: `mediatore_tls::sandbox_provider` is `aws-lc-rs` with
+X25519MLKEM768 as the only key exchange group and TLS 1.3 AES-256-GCM-SHA384 as the only
+cipher suite, on the listener and in the guests' client configs alike; a peer offering only
+classical groups does not complete the handshake (`crates/mediatore-tls/tests/handshake.rs`).
+Outbound clients to systems mediatore does not operate keep a classical fallback: the
+identity-provider client is TLS 1.3 only over the Mozilla roots
+(`mediatore_proto::tls::https_client_config`), the Kubernetes client is kube-rs's own
+config on the same provider. Signatures stay classical because SPIRE and JOSE issue nothing
+else yet; the verifiers already accept ML-DSA SVIDs (tested with an ML-DSA-65 test CA), so
+the day SPIRE issues them nothing here changes. That residue is threat-model R-8.
 
 **7. Network policy (deployment).** The namespace carries a `NetworkPolicy` for the broker
 pods: ingress to 8443 from the sandbox segment's CIDR only and to 8080 from the ingress
@@ -165,12 +198,17 @@ controller only; egress to the API server, the IdP's discovery and token endpoin
 nothing else. The Workload API is a socket, not a network path, so no egress rule is needed
 for it. The manifest is deployment-specific (CIDRs) and lands with roadmap 02.
 
-**8. Tests.** `mediatore-testkit` gains a test CA that mints SPIFFE-shaped X.509 SVIDs
-(URI SAN, short TTL) and an in-memory source, so the e2e suite runs the real
-`spiffe-rustls` server and clients over loopback with no SPIRE. Negative cases: no client
-certificate, certificate from another trust domain, a `/mediatore` peer calling the
-sandbox API, an expired SVID, a node SVID calling `/v1/token`, the dev header outside
-`dev_mode`. The fake is never more permissive than the real thing (`rules/testing.md`).
+**8. Tests.** `mediatore-testkit` gains a test CA (`TestCa`) that mints SPIFFE-shaped X.509
+SVIDs (URI SAN, short TTL) and an in-memory, rotatable `MaterialSource`, so the e2e suite
+(`crates/mediatore/tests/e2e_mtls.rs`) runs the real listener, verifiers and client configs
+over loopback with no SPIRE. Negative cases: no client certificate, certificate from
+another trust domain, a `/mediatore` peer calling the sandbox API, an expired SVID, a
+CA-shaped leaf, a node SVID calling `/v1/token`, the dev header on an mTLS connection
+(ignored) and outside `dev_mode` (refused), a server whose SPIFFE ID is not the broker's,
+and a rotation that new handshakes must pick up. The fake is never more permissive than
+the real thing (`rules/testing.md`): only the certificates differ between the suite and
+production, never the verification path. A kind tier with a real agent and the CSI driver
+is roadmap 01's remaining item.
 
 ## Security analysis
 
@@ -204,9 +242,11 @@ sandbox API, an expired SVID, a node SVID calling `/v1/token`, the dev header ou
 
 - mediatore is admissible under PSS `restricted` and has no secret on any volume: its
   identity lives and dies with the process.
-- The `spiffe`, `spiffe-rustls` and `spiffe-rustls-tokio` crates enter the tree (with
-  `tonic` as their transitive dependency for the Workload API only). `cargo deny` already
-  allows Apache-2.0. The `ring` provider leaves the tree.
+- The `spiffe` crate enters the tree (with `tonic` as its transitive dependency for the
+  Workload API only), plus `tokio-rustls` and `hyper-util` for the listener; the SPIFFE
+  verifiers are `crates/mediatore-tls`, about three hundred lines that mirror
+  `spiffe-rustls`'s checks over rustls's own path validation. `cargo deny` already allows
+  Apache-2.0. The `ring` provider leaves the tree.
 - The sandbox listener is reachable only by holders of a `/banlieue/` SVID; everything
   else fails the handshake before a byte of HTTP is parsed.
 - The broker and the guests agree on one trust source (the trust domain bundle from their

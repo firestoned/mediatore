@@ -144,6 +144,12 @@ impl Config {
         if !cfg.dev_mode && cfg.spire.is_none() {
             anyhow::bail!("`spire` (workload_api_socket, entries) is required outside dev_mode");
         }
+        if cfg.dev_mode && !is_loopback(&cfg.listen.sandbox) {
+            anyhow::bail!(
+                "dev_mode accepts a peer-identity header, so listen.sandbox must be a loopback address (ADR-0007); got {}",
+                cfg.listen.sandbox
+            );
+        }
         if let Some(e) = cfg.spire.as_ref().map(|s| &s.entries) {
             if e.class_name.trim().is_empty() {
                 anyhow::bail!("spire.entries.class_name must not be empty");
@@ -154,6 +160,13 @@ impl Config {
         }
         Ok(cfg)
     }
+}
+
+/// True only for a literal loopback socket address: a hostname, even `localhost`, is not
+/// enough to know where the listener ends up.
+fn is_loopback(addr: &str) -> bool {
+    addr.parse::<std::net::SocketAddr>()
+        .is_ok_and(|a| a.ip().is_loopback())
 }
 
 #[cfg(test)]
@@ -170,6 +183,36 @@ listen: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }
     fn dev_mode_needs_no_spire_section() {
         let cfg = Config::parse(&format!("{BASE}dev_mode: true\n")).unwrap();
         assert!(cfg.spire.is_none());
+    }
+
+    #[test]
+    fn dev_mode_is_refused_off_loopback() {
+        for addr in [
+            "0.0.0.0:8443",
+            "192.0.2.10:8443",
+            "localhost:8443",
+            "[::]:8443",
+        ] {
+            let err = Config::parse(&format!(
+                "trust_domain: sandbox.test\nissuers: []\naudiences: []\nlisten: {{ user: 127.0.0.1:8080, sandbox: \"{addr}\" }}\ndev_mode: true\n"
+            ))
+            .unwrap_err();
+            assert!(err.to_string().contains("loopback"), "{addr}: {err}");
+        }
+        for addr in ["127.0.0.1:8443", "[::1]:8443", "127.0.0.2:0"] {
+            Config::parse(&format!(
+                "trust_domain: sandbox.test\nissuers: []\naudiences: []\nlisten: {{ user: 127.0.0.1:8080, sandbox: \"{addr}\" }}\ndev_mode: true\n"
+            ))
+            .unwrap_or_else(|e| panic!("{addr}: {e}"));
+        }
+    }
+
+    #[test]
+    fn production_may_listen_anywhere() {
+        Config::parse(
+            "trust_domain: sandbox.test\nissuers: []\naudiences: []\nlisten: { user: 0.0.0.0:8080, sandbox: 0.0.0.0:8443 }\nspire:\n  workload_api_socket: unix:///run/spire/sockets/spire-agent.sock\n  entries:\n    class_name: spire-server-spire\n",
+        )
+        .unwrap();
     }
 
     #[test]
