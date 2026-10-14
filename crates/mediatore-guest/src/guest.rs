@@ -42,6 +42,10 @@ pub struct GuestArgs {
     /// Sandbox root
     #[arg(long, default_value = jail::SANDBOX_ROOT)]
     pub sandbox_root: PathBuf,
+    /// The mediatore binary to mount read-only into the jail: the path the node entry pins,
+    /// never the path this process happens to run from
+    #[arg(long, default_value = mediatore_proto::AGENT_BINARY_PATH)]
+    pub agent_binary: PathBuf,
     /// Dev only: send this SPIFFE ID as a header instead of doing mTLS
     #[cfg(feature = "dev")]
     #[arg(long, env = "MEDIATORE_DEV_SPIFFE_ID", hide = true)]
@@ -197,14 +201,20 @@ pub async fn run(args: GuestArgs) -> anyhow::Result<()> {
         me.workload.image
     );
     std::fs::create_dir_all(&work)?;
+    // The pinned path (ADR-0014 decision 5), not `current_exe`: what the node entry selects
+    // is what the workload gets, and a guest started from elsewhere mounts nothing else.
+    anyhow::ensure!(
+        args.agent_binary.is_file(),
+        "agent binary {} is not a file; the jail needs the pinned binary",
+        args.agent_binary.display()
+    );
     let spec = jail::JailSpec {
         user: username.clone(),
         rootfs,
         work,
         workload_api_socket: args.workload_api_socket.clone(),
         mediatore_url: args.mediatore_url.clone(),
-        // The same binary, so `mediatore token` is on the workload's path (ADR-0014).
-        agent_binary: std::env::current_exe()?,
+        agent_binary: args.agent_binary.clone(),
         argv: me.workload.args.clone(),
         rlimit_as_mib: jail::DEFAULT_RLIMIT_AS_MIB,
     };

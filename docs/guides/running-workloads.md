@@ -206,7 +206,7 @@ per-subject user. The jail gives it:
 | `/run/spire/agent.sock` (read-only) | The **only** credential surface: fetch the claim SVID |
 | `MEDIATORE_URL` env | Where to trade the SVID for tokens |
 | `/work` (writable), tmpfs `/tmp` + `$HOME` | Scratch space, wiped at teardown |
-| `/usr/local/bin/mediatore` (read-only, the guest's own binary) | `mediatore token --audience api://trading-data` prints a 15-min bearer; the rootfs ships no client ([ADR-0014](../adr/0014-one-binary-roles-as-subcommands.md)) |
+| `/usr/local/bin/mediatore` (read-only, the same file the guest runs from) | `mediatore token --audience api://trading-data` prints a 15-min bearer; the rootfs ships no client ([ADR-0014](../adr/0014-one-binary-roles-as-subcommands.md)) |
 
 No token files, no baked-in secrets, no network beyond the broker and the claim's
 audiences. For tools that read a bearer from the environment:

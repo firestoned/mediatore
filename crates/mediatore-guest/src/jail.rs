@@ -11,8 +11,8 @@ pub const SANDBOX_ROOT: &str = "/mnt/sandbox";
 /// Default address-space limit for the workload, in MiB.
 pub const DEFAULT_RLIMIT_AS_MIB: u64 = 8192;
 
-/// Where the mediatore binary appears inside the jail.
-pub const JAIL_BINARY: &str = "/usr/local/bin/mediatore";
+/// Where the mediatore binary appears inside the jail: the same path as on the host.
+pub const JAIL_BINARY: &str = mediatore_proto::AGENT_BINARY_PATH;
 
 /// Inputs to the jail.
 #[derive(Debug, Clone)]
@@ -27,8 +27,9 @@ pub struct JailSpec {
     pub workload_api_socket: PathBuf,
     /// mediatore sandbox-facing URL.
     pub mediatore_url: String,
-    /// The one mediatore binary on the host, mounted read-only at [`JAIL_BINARY`] so the
-    /// workload can run `mediatore token` (ADR-0014 decision 4).
+    /// The one mediatore binary on the host (the pinned path, not `current_exe`), mounted
+    /// read-only at [`JAIL_BINARY`] so the workload can run `mediatore token` (ADR-0014
+    /// decision 4).
     pub agent_binary: PathBuf,
     /// Command to exec.
     pub argv: Vec<String>,

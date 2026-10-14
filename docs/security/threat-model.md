@@ -10,7 +10,7 @@ SPDX-License-Identifier: Apache-2.0
 > one binary with the roles as subcommands: `mediatore serve`, `guest`,
 > `token`, `login`, `sandbox` and `session` are one static musl artifact that
 > the server image, the VM image and the kind pods all carry; the guest
-> bind-mounts its own binary read-only into the jail so `mediatore token` is
+> bind-mounts the binary at the pinned path read-only into the jail so `mediatore token` is
 > on every workload's path; the node entry pins `/usr/local/bin/mediatore` and
 > `unix:uid:0` is the selector that tells the guest role from a jailed
 > workload. No new boundary, asset or actor; §2 three rows reworded, the
@@ -100,7 +100,7 @@ holds three things an attacker wants:
 | STS | `crates/mediatore-sts` | same pod | Holds the signing key handle |
 | Claim store | `crates/mediatore-store` (`SqlStore`, one query set) | PostgreSQL at work, SQLite for one replica; in-memory only under `dev_mode` | Sealed refresh envelopes, revocations, the node registry, audit rows; the request fields are a copy of the `AgentSandbox` spec. Migrated at startup; swept at resync |
 | Store database | the operator's PostgreSQL, or a SQLite file on the pod's volume (`dev/kind/postgres/` in kind) | management cluster or beside it | Holds every row; reached with the URL in Secret `mediatore-store` over TLS `verify-full` |
-| In-guest agent (`mediatore guest`) | `crates/mediatore-guest` (`guest.rs`), the same static binary as the broker (ADR-0014) | root on each pool member | `useradd`, mount, nsjail; bind-mounts its own binary read-only into the jail |
+| In-guest agent (`mediatore guest`) | `crates/mediatore-guest` (`guest.rs`), the same static binary as the broker (ADR-0014) | root on each pool member | `useradd`, mount, nsjail; bind-mounts the binary at the pinned path read-only into the jail |
 | Workload client (`mediatore token`) | `crates/mediatore-guest` (`token.rs`), the binary the guest mounted at `/usr/local/bin/mediatore` | inside the jail, as the `sb-` user | Holds one token in memory; nothing but the token on standard output |
 | Deployment | `deploy/base/*.yaml` | management cluster | SA, RBAC, `ClusterSPIFFEID`, the `AgentSandbox` CRD (`crds/`, generated), the entries and the sandbox-subject admission policies, the CSI inline volume for the agent socket, the `LoadBalancer` service for :8443, ingress for :8080, the store URL from Secret `mediatore-store` (operator-created) |
 | SPIRE Controller Manager | hardened chart (not this repo) | `spire-server` pod | Renders `ClusterStaticEntry` into server entries over the server's private socket |
@@ -305,7 +305,7 @@ the residue is in §8. No boundary carries the marker as of this pass.
 | --- | --- | --- |
 | Token exfiltration by the (assumed hostile) workload | I | Tokens are memory-only, ≤ 15 min (`Sts::max_ttl`, cap in `crates/mediatore-api/src/lib.rs`), single-audience; the exfiltration window is the design trade-off recorded in ADR-0003 and §8 R-3 |
 | Acting without attribution | R | STS tokens carry `act` (claim SVID) + `claim_uid` + `upstream_iss`: `crates/mediatore-sts/src/lib.rs`; OBO tokens carry `azp` (Entra) |
-| Escaping the jail to steal the node identity | E | nsjail: chroot, no proc, rlimits, tmpfs home, only the Workload API socket and the mediatore binary mounted, both read-only: `crates/mediatore-guest/src/jail.rs` (`JailSpec::to_args`, unit `the_agent_binary_is_mounted_read_only_and_nothing_else_is_writable_but_work`); root processes are outside the jail |
+| Escaping the jail to steal the node identity | E | nsjail: chroot, no proc, rlimits, tmpfs home, only the Workload API socket and the mediatore binary mounted, both read-only: `crates/mediatore-guest/src/jail.rs` (`JailSpec::to_args`, unit `the_agent_binary_is_mounted_read_only_and_nothing_else_is_writable_but_work`). The mounted file is the pinned path `AGENT_BINARY_PATH` that the node entry selects, never `current_exe()` (`crates/mediatore-guest/src/guest.rs`; unit `the_guest_mounts_the_path_the_node_entry_pins`, `crates/mediatore/src/main.rs`); root processes are outside the jail |
 | The whole binary inside the jail: every role (`serve`, `guest`, `login`) is a command the workload can run (ADR-0014 decision 4) | E | The file is static, read-only, not setuid and holds no secret; a role's authority is what it can reach, not which subcommand ran: `serve` has no broker SVID (TB-8) and no config, `guest` has no TPM and is not root, `login` has no session file; the agent socket in the jail yields the claim SVID only (TB-4 row above, `unix:user:<sb-user>`). The same holds for any binary the workload brings in its rootfs |
 
 ### TB-8: broker pod → SPIRE agent (Workload API over the CSI mount)

@@ -401,6 +401,24 @@ mod tests {
         ));
     }
 
+    /// The jail mounts the path the node entry selects (ADR-0014 decision 5), so the two
+    /// constants are one.
+    #[test]
+    fn the_guest_mounts_the_path_the_node_entry_pins() {
+        let guest = parse(&["mediatore", "guest", "--mediatore-url", "https://b"]);
+        let Ok(Cmd::Guest(args)) = guest else {
+            panic!("{guest:?}");
+        };
+        assert_eq!(
+            args.agent_binary.to_str(),
+            Some(mediatore_spire::GUEST_AGENT_PATH)
+        );
+        assert_eq!(
+            mediatore_guest::jail::JAIL_BINARY,
+            mediatore_spire::GUEST_AGENT_PATH
+        );
+    }
+
     #[test]
     fn the_old_binary_names_are_not_subcommands() {
         for old in ["mediatore-guest", "sandbox-token", "mediatore-cli", "claim"] {

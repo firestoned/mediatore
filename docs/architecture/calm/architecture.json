@@ -137,7 +137,7 @@
       "unique-id": "service-guest-agent",
       "node-type": "service",
       "name": "mediatore guest",
-      "description": "Root daemon, the guest role of the one mediatore binary (ADR-0014): registers the node (EK hash + DMI UUID), polls GET /v1/me for a bound claim, creates the per-subject user (sb- + 12 hex, ADR-0004), builds /mnt/sandbox, bind-mounts its own binary read-only into the jail and supervises the nsjail until the deadline, then tears down. crates/mediatore-guest."
+      "description": "Root daemon, the guest role of the one mediatore binary (ADR-0014): registers the node (EK hash + DMI UUID), polls GET /v1/me for a bound claim, creates the per-subject user (sb- + 12 hex, ADR-0004), builds /mnt/sandbox, bind-mounts the binary at the pinned path read-only into the jail and supervises the nsjail until the deadline, then tears down. crates/mediatore-guest."
     },
     {
       "unique-id": "service-sandbox-workload",

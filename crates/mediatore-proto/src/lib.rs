@@ -18,6 +18,11 @@ use uuid::Uuid;
 /// Path prefix all endpoints live under.
 pub const API_VERSION: &str = "v1";
 
+/// Where the one mediatore binary lives on a pool member (ADR-0014). The node entry's
+/// `unix:path` selector pins it, and the guest role bind-mounts this exact path, never the
+/// path it happens to run from, into the jail at the same place.
+pub const AGENT_BINARY_PATH: &str = "/usr/local/bin/mediatore";
+
 /// Length of the hex suffix in a derived sandbox username (`sb-` + this many hex chars).
 pub const USERNAME_HASH_LEN: usize = 12;
 

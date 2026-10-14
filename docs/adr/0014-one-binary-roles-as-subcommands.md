@@ -60,9 +60,12 @@ the server image, the VM image and the kind tiers carry. The test-only guest ima
 server image with a different subcommand. The build workflow publishes the one binary with
 its SBOM instead of a guest pair.
 
-**4. The jail gets the same binary, bind-mounted read-only.** The guest adds its own
-executable (`std::env::current_exe()`) to the nsjail spec as a read-only bind mount at
-`/usr/local/bin/mediatore`, so the workload rootfs no longer has to ship a client:
+**4. The jail gets the same binary, bind-mounted read-only.** The guest adds the binary at
+the pinned path (`AGENT_BINARY_PATH`, `/usr/local/bin/mediatore`; `--agent-binary` to
+override, and the file must exist) to the nsjail spec as a read-only bind mount at the same
+path inside, so the workload rootfs no longer has to ship a client. It is deliberately not
+`current_exe()`: that value is whatever the process was started from and is not to be
+trusted for a mount decision; what the node entry selects is what the jail gets. So
 `mediatore token` is on the path of every sandbox. The binary is static, read-only, not
 setuid and holds no secret, so the mount adds no authority inside the jail: `mediatore
 serve` in there has no broker SVID, `mediatore guest` has no TPM and no root, and the
