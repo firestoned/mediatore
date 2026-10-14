@@ -82,10 +82,10 @@ spec:
     runAsUser: 65532
     seccompProfile: { type: RuntimeDefault }
   containers:
-    - name: sandbox-token
-      image: localhost/mediatore-guest:kind
+    - name: token
+      image: ghcr.io/firestoned/mediatore:kind
       imagePullPolicy: Never
-      command: ["/usr/local/bin/sandbox-token", "--audience", "e2e"]
+      command: ["/usr/local/bin/mediatore", "token", "--audience", "e2e"]
       env:
         - { name: MEDIATORE_URL, value: "https://mediatore-sandbox.banlieue-system.svc" }
         - { name: SPIFFE_ENDPOINT_SOCKET, value: "unix:///run/spire/sockets/spire-agent.sock" }
@@ -99,7 +99,7 @@ spec:
     - name: spire-agent-socket
       csi: { driver: csi.spiffe.io, readOnly: true }
 ---
-# A node-shaped SVID: mediatore-guest registers the node (POST /v1/nodes, accepted only
+# A node-shaped SVID: the guest role registers the node (POST /v1/nodes, accepted only
 # because the peer ID matches the EK hash it claims) and then polls /v1/me for a claim
 # that never comes. The TPM and DMI reads are replaced by the hidden dev flags.
 apiVersion: v1
@@ -115,11 +115,12 @@ spec:
     runAsUser: 65532
     seccompProfile: { type: RuntimeDefault }
   containers:
-    - name: mediatore-guest
-      image: localhost/mediatore-guest:kind
+    - name: guest
+      image: ghcr.io/firestoned/mediatore:kind
       imagePullPolicy: Never
       command:
-        - /usr/local/bin/mediatore-guest
+        - /usr/local/bin/mediatore
+        - guest
         - --dev-ek-hash
         - "ec00000000000000000000000000000000000000000000000000000000000007"
         - --dev-dmi-uuid
@@ -153,10 +154,10 @@ spec:
     runAsUser: 65532
     seccompProfile: { type: RuntimeDefault }
   containers:
-    - name: sandbox-token
-      image: localhost/mediatore-guest:kind
+    - name: token
+      image: ghcr.io/firestoned/mediatore:kind
       imagePullPolicy: Never
-      command: ["/usr/local/bin/sandbox-token", "--audience", "e2e"]
+      command: ["/usr/local/bin/mediatore", "token", "--audience", "e2e"]
       env:
         - { name: MEDIATORE_URL, value: "https://mediatore-sandbox.banlieue-system.svc" }
         - { name: SPIFFE_ENDPOINT_SOCKET, value: "unix:///run/spire/sockets/spire-agent.sock" }
@@ -184,10 +185,10 @@ spec:
     runAsUser: 65532
     seccompProfile: { type: RuntimeDefault }
   containers:
-    - name: sandbox-token
-      image: localhost/mediatore-guest:kind
+    - name: token
+      image: ghcr.io/firestoned/mediatore:kind
       imagePullPolicy: Never
-      command: ["/usr/local/bin/sandbox-token", "--audience", "e2e"]
+      command: ["/usr/local/bin/mediatore", "token", "--audience", "e2e"]
       env:
         - { name: MEDIATORE_URL, value: "https://mediatore-sandbox.banlieue-system.svc" }
         - { name: SPIFFE_ENDPOINT_SOCKET, value: "unix:///run/spire/sockets/spire-agent.sock" }

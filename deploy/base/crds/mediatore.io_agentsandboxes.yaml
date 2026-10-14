@@ -101,7 +101,7 @@ spec:
                       type: string
                     type: array
                   image:
-                    description: OCI reference of the rootfs `mediatore-guest` unpacks into the jail.
+                    description: OCI reference of the rootfs the guest agent unpacks into the jail.
                     minLength: 1
                     type: string
                 required:

@@ -136,14 +136,14 @@
     {
       "unique-id": "service-guest-agent",
       "node-type": "service",
-      "name": "mediatore-guest",
-      "description": "Root daemon: registers the node (EK hash + DMI UUID), polls GET /v1/me for a bound claim, creates the per-subject user (sb- + 12 hex, ADR-0004), builds /mnt/sandbox and supervises the nsjail until the deadline, then tears down. crates/mediatore-guest."
+      "name": "mediatore guest",
+      "description": "Root daemon, the guest role of the one mediatore binary (ADR-0014): registers the node (EK hash + DMI UUID), polls GET /v1/me for a bound claim, creates the per-subject user (sb- + 12 hex, ADR-0004), builds /mnt/sandbox, bind-mounts its own binary read-only into the jail and supervises the nsjail until the deadline, then tears down. crates/mediatore-guest."
     },
     {
       "unique-id": "service-sandbox-workload",
       "node-type": "service",
       "name": "Jailed Workload",
-      "description": "Runs under nsjail as the per-subject user with only the Workload API socket mounted in. Fetches its claim SVID and trades it at POST /v1/token for one short-lived, audience-scoped token at a time (sandbox-token CLI). No token ever rests on disk."
+      "description": "Runs under nsjail as the per-subject user with only the Workload API socket mounted in. Fetches its claim SVID and trades it at POST /v1/token for one short-lived, audience-scoped token at a time (mediatore token, the same binary mounted read-only into the jail; ADR-0014). No token ever rests on disk."
     },
     {
       "unique-id": "ecosystem-downstream-api",
@@ -251,7 +251,7 @@
     },
     {
       "unique-id": "rel-user-idp-login",
-      "description": "The user logs in at the IdP (PKCE via mediatore-cli or az login) and receives a token whose audience is mediatore. The user's token is only ever presented to mediatore, never to the VM.",
+      "description": "The user logs in at the IdP (PKCE via mediatore login or az login) and receives a token whose audience is mediatore. The user's token is only ever presented to mediatore, never to the VM.",
       "relationship-type": {
         "connects": {
           "source": {
@@ -266,7 +266,7 @@
     },
     {
       "unique-id": "rel-user-mediatore-claims",
-      "description": "POST /v1/claims with the IdP bearer token creates an AgentSandbox with the token's subject (ADR-0008); GET answers from its status, DELETE deletes it. Subject equality is enforced on read and delete. For a session issuer the request also carries the caller's refresh token (mediatore-cli login, PKCE as client mediatore; ADR-0013), which is sealed with the AgentSandbox UID into a sessions row before the response and follows the claim into its record; it never touches the resource.",
+      "description": "POST /v1/claims with the IdP bearer token creates an AgentSandbox with the token's subject (ADR-0008); GET answers from its status, DELETE deletes it. Subject equality is enforced on read and delete. For a session issuer the request also carries the caller's refresh token (mediatore login, PKCE as client mediatore; ADR-0013), which is sealed with the AgentSandbox UID into a sessions row before the response and follows the claim into its record; it never touches the resource.",
       "relationship-type": {
         "connects": {
           "source": {
@@ -642,12 +642,12 @@
         {
           "sequence-number": 4,
           "relationship-unique-id": "rel-spire-agent-server",
-          "description": "The VM's agent attests with the EK; on sync it receives the node entry and issues the node SVID to mediatore-guest (unix:uid:0, binary path)."
+          "description": "The VM's agent attests with the EK; on sync it receives the node entry and issues the node SVID to the guest role (unix:uid:0 and the path of the one mediatore binary)."
         },
         {
           "sequence-number": 5,
           "relationship-unique-id": "rel-guest-agent-mediatore",
-          "description": "mediatore-guest registers the node over mTLS with that SVID; the broker checks the SVID's EK hash equals the registered one and refuses a cloned EK with 409."
+          "description": "mediatore guest registers the node over mTLS with that SVID; the broker checks the SVID's EK hash equals the registered one and refuses a cloned EK with 409."
         }
       ]
     }
@@ -657,7 +657,7 @@
     "repository": "https://github.com/firestoned/mediatore",
     "license": "Apache-2.0",
     "calm-schema-version": "1.2",
-    "phase": "dev-mode loop implemented and e2e-tested; Entra OBO is a fail-closed stub. Roadmap 01 (ADR-0006, ADR-0007) implemented and live-tested in kind: registration entries as ClusterStaticEntry through the Kubernetes API, broker identity from the Workload API over the SPIFFE CSI driver, SPIFFE mTLS terminated in-process (crates/mediatore-tls). Roadmap 03 (ADR-0011): the claim watcher, node resolution by EK, node entries from pool members, leader election by Lease. Roadmap 08 (ADR-0008): the AgentSandbox CRD, its reconciler on the same loop, the subject admission policy and the user API creating the resource; records now exist outside dev_mode. SPIRE topology models the ADR-0005 desired state: root on a dedicated identity cluster, downstream per environment; the homelab collapses to the downstream server alone. Roadmap 05 (ADR-0012): one sqlx store over SQLite or PostgreSQL, the sealed refresh envelope, rows swept into an audit table; every kind tier runs the broker on PostgreSQL over verify-full. Roadmap 04, first slice (ADR-0013): the Dex path, with the upstream session delegated at claim creation, sealed, refreshed before every issue and revoked on refusal; mediatore-cli; per-claim rate limiting. Entra OBO and the transit sealer are the roadmap's next slices."
+    "phase": "dev-mode loop implemented and e2e-tested; Entra OBO is a fail-closed stub. Roadmap 01 (ADR-0006, ADR-0007) implemented and live-tested in kind: registration entries as ClusterStaticEntry through the Kubernetes API, broker identity from the Workload API over the SPIFFE CSI driver, SPIFFE mTLS terminated in-process (crates/mediatore-tls). Roadmap 03 (ADR-0011): the claim watcher, node resolution by EK, node entries from pool members, leader election by Lease. Roadmap 08 (ADR-0008): the AgentSandbox CRD, its reconciler on the same loop, the subject admission policy and the user API creating the resource; records now exist outside dev_mode. SPIRE topology models the ADR-0005 desired state: root on a dedicated identity cluster, downstream per environment; the homelab collapses to the downstream server alone. Roadmap 05 (ADR-0012): one sqlx store over SQLite or PostgreSQL, the sealed refresh envelope, rows swept into an audit table; every kind tier runs the broker on PostgreSQL over verify-full. Roadmap 04, first slice (ADR-0013): the Dex path, with the upstream session delegated at claim creation, sealed, refreshed before every issue and revoked on refusal; mediatore-cli; per-claim rate limiting. Entra OBO and the transit sealer are the roadmap's next slices. ADR-0014: one binary, the roles as subcommands (serve, guest, token, login, sandbox, session), one musl artifact for every host, the jail mounting it read-only; the node entry pins /usr/local/bin/mediatore."
   },
   "adrs": [
     "docs/adr/0001-record-architecture-decisions.md",

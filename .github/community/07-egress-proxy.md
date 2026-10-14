@@ -14,7 +14,7 @@ to learn from. Design questions to answer in the ADR when this activates:
 - Where the proxy runs (in-guest beside the agent vs on the host vs central) and what
   identity it holds
 - How the audience is chosen per request (SNI/host allowlist vs explicit CONNECT)
-- What replaces `sandbox-token` for tools that want raw tokens (nothing, ideally)
+- What replaces `mediatore token` for tools that want raw tokens (nothing, ideally)
 - TLS: MITM-with-installed-CA vs CONNECT-only header injection for known APIs
 - What R-3 becomes afterwards (exfiltration window shrinks to the proxy's per-request
   scope)

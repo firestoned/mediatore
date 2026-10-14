@@ -46,10 +46,9 @@ crates/
 ├── mediatore-spire/    SPIRE server API boundary (registration entries)
 ├── mediatore-claims/   AgentSandbox CRD + reconciler; kube-rs watcher: Bound → entry, Releasing → cut-off
 ├── mediatore-store/    ClaimStore trait; sqlx store over SQLite or PostgreSQL; sealed refresh envelope; in-memory impl for dev_mode
-├── mediatore/          server binary
-├── mediatore-guest/    in-guest agent (static musl)
-├── sandbox-token/      workload-side CLI (static musl)
-└── mediatore-cli/      user-side CLI: PKCE login at the issuer, claims with the session delegated (ADR-0013)
+├── mediatore/          the one binary (ADR-0014): `serve`, `guest`, `token`, `login`, `sandbox`, `session`
+├── mediatore-guest/    the VM side as a library: the guest role (root agent) and the token role (inside the jail)
+└── mediatore-client/   the user side as a library: PKCE login at the issuer, claims with the session delegated (ADR-0013)
 deploy/                 raw manifests (kustomize), Traefik IngressRoute
 image/                  systemd units + cloud-config fragments baked into the VM image
 docs/adr/               architecture decision records
@@ -81,7 +80,8 @@ release → cut-off. The remaining edges fail closed (`501 not_implemented`):
 | JWKS validation of upstream tokens (discovery, cache, kid rotation, group gate) | implemented, tested against a fake IdP |
 | Claim lifecycle in `dev_mode` (create, dev bind either order, mirror, release) | implemented, e2e-tested |
 | Guest: node registration, subject fetch, user + jail supervision | implemented; jail path needs a Linux host |
-| Dex path (ADR-0013): the session delegated with the claim as a sealed envelope, refreshed before every issue with the fresh groups minted, `invalid_grant` or a failed group gate releasing the claim at once, an outage a `503` that revokes nothing, per-claim rate limiting, `mediatore-cli` (PKCE as mediatore's public client) | implemented (`mediatore-entra::Validator::refresh`, `mediatore-api`, `mediatore-cli`), e2e-tested against the fake issuer's real authorization-code and refresh grants (`crates/mediatore/tests/e2e_session.rs`); a Dex in kind is the next slice |
+| One binary, the roles as subcommands (ADR-0014): `mediatore serve`, `guest`, `token`, `login`, `sandbox create\|get\|delete`, `session`; one static musl artifact for the server image, the VM image and the kind pods; the jail mounts it read-only so `mediatore token` is on every workload's path | implemented (`crates/mediatore/src/main.rs` composes `mediatore-guest` and `mediatore-client`), the tree pinned by test, the demo and every kind tier running the roles from the one file |
+| Dex path (ADR-0013): the session delegated with the claim as a sealed envelope, refreshed before every issue with the fresh groups minted, `invalid_grant` or a failed group gate releasing the claim at once, an outage a `503` that revokes nothing, per-claim rate limiting, `mediatore login` (PKCE as mediatore's public client) | implemented (`mediatore-entra::Validator::refresh`, `mediatore-api`, `mediatore-client`), e2e-tested against the fake issuer's real authorization-code and refresh grants (`crates/mediatore/tests/e2e_session.rs`); a Dex in kind is the next slice |
 | Entra OBO exchange | request shape done, untested; next slice of roadmap 04 |
 | SPIRE entries as `ClusterStaticEntry` through the Kubernetes API (ADR-0006, no gRPC) | implemented (`KubeEntryManager`), tested against a scripted fake API server, live against SPIRE in kind on every PR (`make kind-e2e`) and live against a real cluster (`make live-admission-test`), both as the broker ServiceAccount |
 | `VirtualMachineClaim` watch: bind by the EK hash banlieue mirrors onto the claim, release on Releasing / Failed / deletion and at resync, node entries from pool members, one leader by Lease (ADR-0011, `banlieue-api` pinned) | implemented (`mediatore-claims::watch`, `::lease`), unit-tested over the in-memory store and entries, live in kind (`make kind-e2e-watcher`: the Lease, the node-entry trigger, a claim without a record binding nothing) |
@@ -97,15 +97,15 @@ release → cut-off. The remaining edges fail closed (`501 not_implemented`):
 cargo fmt --all && cargo clippy --all-targets --all-features -- -D warnings && cargo test --all
 cargo deny check
 
-# front-to-back dev-mode demo: fake IdP + server + guest agent + sandbox-token
+# front-to-back dev-mode demo: fake IdP, then mediatore serve, guest and token as separate processes
 ./dev/demo.sh
 
 # run the server in dev mode (header-based peer identity, in-memory store)
 openssl ecparam -name prime256v1 -genkey -noout | openssl pkcs8 -topk8 -nocrypt -out dev/sts.pem
 cargo run -p mediatore -- serve --config dev/mediatore.yaml
 
-# static guest binaries
-cargo xguest
+# the one static musl binary (what the server image and the VM image carry)
+cargo xdist
 ```
 
 See [`docs/adr`](docs/adr) for decisions and the runbook for the end-to-end setup.

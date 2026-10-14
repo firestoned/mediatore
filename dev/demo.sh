@@ -26,9 +26,9 @@ fail() { printf '\033[31mFAIL: %s\033[0m\n' "$*"; exit 1; }
 command -v jq >/dev/null || fail "jq is required"
 
 say "build"
-# The guests take a peer-identity header only with their `dev` feature; release builds have none.
-cargo build -q -p mediatore -p mediatore-testkit -p mediatore-guest -p sandbox-token \
-  --features mediatore-guest/dev,sandbox-token/dev
+# The guest and token roles take a peer-identity header only under the `dev` feature;
+# release builds have none (ADR-0014 decision 2).
+cargo build -q -p mediatore -p mediatore-testkit --features mediatore/dev
 BIN=target/debug
 
 [ -f dev/sts.pem ] || { say "generate STS signing key"; openssl ecparam -name prime256v1 -genkey -noout | openssl pkcs8 -topk8 -nocrypt -out dev/sts.pem; }
@@ -45,9 +45,9 @@ for url in "$IDP_URL/jwks" "$USER_URL/healthz" "$SANDBOX_URL/healthz"; do
   curl -fsS "$url" >/dev/null || fail "$url never came up"
 done
 
-say "boot the 'pool member': mediatore-guest registers and waits for a claim"
+say "boot the 'pool member': mediatore guest registers and waits for a claim"
 NODE_SVID="spiffe://$TRUST_DOMAIN/banlieue/node/$EK_HASH"
-"$BIN/mediatore-guest" \
+"$BIN/mediatore" guest \
   --mediatore-url "$SANDBOX_URL" \
   --dev-spiffe-id "$NODE_SVID" \
   --dev-ek-hash "$EK_HASH" \
@@ -75,11 +75,11 @@ done
 echo "phase: $PHASE"
 
 say "the guest agent fetches its subject and exits (dev_skip_setup)"
-wait "$GUEST" || fail "mediatore-guest failed"
+wait "$GUEST" || fail "mediatore guest failed"
 
 say "the 'jailed workload' trades its claim SVID for an audience token"
 CLAIM_SVID="spiffe://$TRUST_DOMAIN/banlieue/claim/$UID_"
-ACCESS=$(MEDIATORE_DEV_SPIFFE_ID="$CLAIM_SVID" "$BIN/sandbox-token" \
+ACCESS=$(MEDIATORE_DEV_SPIFFE_ID="$CLAIM_SVID" "$BIN/mediatore" token \
   --audience "$AUDIENCE" --mediatore-url "$SANDBOX_URL")
 echo "payload:"
 PAYLOAD=$(echo "$ACCESS" | cut -d. -f2)
@@ -87,20 +87,20 @@ while [ $(( ${#PAYLOAD} % 4 )) -ne 0 ]; do PAYLOAD="$PAYLOAD="; done
 printf '%s' "$PAYLOAD" | base64 -d | jq '{iss, sub, aud, act, claim_uid, exp}'
 
 say "negative: an audience outside the allowlist is refused"
-if MEDIATORE_DEV_SPIFFE_ID="$CLAIM_SVID" "$BIN/sandbox-token" --audience api://something-else --mediatore-url "$SANDBOX_URL" 2>/dev/null; then
+if MEDIATORE_DEV_SPIFFE_ID="$CLAIM_SVID" "$BIN/mediatore" token --audience api://something-else --mediatore-url "$SANDBOX_URL" 2>/dev/null; then
   fail "unknown audience was issued a token"
 fi
 echo "refused, as it must be"
 
 say "negative: the node identity gets no token"
-if MEDIATORE_DEV_SPIFFE_ID="$NODE_SVID" "$BIN/sandbox-token" --audience "$AUDIENCE" --mediatore-url "$SANDBOX_URL" 2>/dev/null; then
+if MEDIATORE_DEV_SPIFFE_ID="$NODE_SVID" "$BIN/mediatore" token --audience "$AUDIENCE" --mediatore-url "$SANDBOX_URL" 2>/dev/null; then
   fail "node SVID was issued a token"
 fi
 echo "refused, as it must be"
 
 say "release the claim and confirm the cut-off"
 curl -fsS -X DELETE "$USER_URL/v1/claims/$NAME" -H "Authorization: Bearer $TOKEN" -o /dev/null -w 'DELETE -> %{http_code}\n'
-if MEDIATORE_DEV_SPIFFE_ID="$CLAIM_SVID" "$BIN/sandbox-token" --audience "$AUDIENCE" --mediatore-url "$SANDBOX_URL" 2>/dev/null; then
+if MEDIATORE_DEV_SPIFFE_ID="$CLAIM_SVID" "$BIN/mediatore" token --audience "$AUDIENCE" --mediatore-url "$SANDBOX_URL" 2>/dev/null; then
   fail "revoked claim was issued a token"
 fi
 echo "no more tokens after release"

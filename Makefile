@@ -4,7 +4,7 @@
 # All CI logic lives here (rules/github-workflows.md): workflows install tools
 # and call these targets, and every target runs identically locally.
 
-.PHONY: all help fmt fmt-check lint test deny audit check sbom guest dist image crds e2e live-admission-test \
+.PHONY: all help fmt fmt-check lint test deny audit check sbom dist image crds e2e live-admission-test \
         kind-install kind-create kind-delete kind-down kind-spire kind-deploy kind-up \
         kind-images kind-postgres kind-broker kind-banlieue-crds kind-e2e-entries kind-e2e-mtls kind-e2e-watcher kind-e2e-sandbox \
         kind-e2e-store kind-e2e kind-e2e-ci kind-e2e-logs \
@@ -34,7 +34,6 @@ SPIRE_CLASS_NAME    := spire-server-spire
 CONTAINER_CLI      ?= docker
 MUSL_TARGET        := x86_64-unknown-linux-musl
 KIND_IMAGE         := ghcr.io/firestoned/mediatore:kind
-KIND_GUEST_IMAGE   := localhost/mediatore-guest:kind
 
 # CALM (FINOS Common Architecture Language Model) configuration
 CALM_CLI_VERSION  ?= 1.37.0
@@ -81,13 +80,10 @@ sbom: ## Generate CycloneDX SBOM(s) for the workspace (*.cdx.json per crate)
 
 # ----- Artifacts ---------------------------------------------------------------
 
-guest: ## Static musl builds of the two guest binaries
-	cargo build --release --target x86_64-unknown-linux-musl -p mediatore-guest -p sandbox-token
-
-dist: ## Host-built musl binaries into dist/ (what the images copy with BINARY_FROM=host)
-	cargo build --release --target $(MUSL_TARGET) -p mediatore -p mediatore-guest -p sandbox-token
+dist: ## The one static musl binary into dist/ (ADR-0014): what the server image copies with BINARY_FROM=host and what the VM image bakes in
+	cargo build --release --target $(MUSL_TARGET) -p mediatore
 	@mkdir -p dist
-	cp target/$(MUSL_TARGET)/release/mediatore target/$(MUSL_TARGET)/release/mediatore-guest target/$(MUSL_TARGET)/release/sandbox-token dist/
+	cp target/$(MUSL_TARGET)/release/mediatore dist/
 
 image: ## Build the server container image locally (the binary is compiled inside the image)
 	$(CONTAINER_CLI) build -t ghcr.io/firestoned/mediatore:dev .
@@ -97,7 +93,7 @@ crds: ## Render mediatore's CRDs from their Rust types into deploy/base/crds/ (A
 
 # ----- End to end --------------------------------------------------------------
 
-e2e: ## Front-to-back dev-mode loop with real binaries (fake IdP, server, guest, sandbox-token)
+e2e: ## Front-to-back dev-mode loop with the real binary (fake IdP; mediatore serve, guest and token as separate processes)
 	./dev/demo.sh
 
 live-admission-test: ## ClusterStaticEntry round trip as the mediatore ServiceAccount against a real cluster (MEDIATORE_LIVE_KUBECONFIG, MEDIATORE_LIVE_TRUST_DOMAIN, MEDIATORE_LIVE_CLASS_NAME; MEDIATORE_LIVE_IDENTITY=impersonate|self)
@@ -162,12 +158,9 @@ kind-deploy: kind-create ## Apply the broker's CRD, ServiceAccount, RBAC and adm
 
 kind-up: kind-create kind-spire kind-deploy ## Cluster + SPIRE + the broker's identity, ready for the live tests
 
-kind-images: kind-create dist ## Server image (the shipped Dockerfile's runtime stage) and the test-only guest image, loaded into the cluster
+kind-images: kind-create dist ## The server image (the shipped Dockerfile's runtime stage over dist/), loaded into the cluster; the node and workload pods run it too (ADR-0014)
 	$(CONTAINER_CLI) build --build-arg BINARY_FROM=host -t $(KIND_IMAGE) .
-	$(CONTAINER_CLI) build -f dev/kind/Dockerfile.guest -t $(KIND_GUEST_IMAGE) .
-	@# One image per call: under the podman provider a multi-image load ends up with one manifest.
 	kind load docker-image --name $(KIND_CLUSTER_NAME) $(KIND_IMAGE)
-	kind load docker-image --name $(KIND_CLUSTER_NAME) $(KIND_GUEST_IMAGE)
 
 kind-postgres: kind-create ## PostgreSQL in kind with a certificate this target mints (ADR-0012); the broker's store
 	@$(KIND_KUBECTL) get ns banlieue-system >/dev/null 2>&1 || $(KIND_KUBECTL) create ns banlieue-system

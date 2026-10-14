@@ -38,7 +38,7 @@ If you need interactivity, the workload dials **out** (see
              --query accessToken -o tsv)
 
    # Dex (homelab): PKCE flow as mediatore's own public client, loopback redirect
-   mediatore-cli login --issuer https://dex.home.example
+   mediatore login --issuer https://dex.home.example
    ```
 
    The token's `aud` is mediatore and (on Entra) `scp` contains `sandbox.access`.
@@ -56,7 +56,7 @@ If you need interactivity, the workload dials **out** (see
 
    ```bash
    # Dex: the CLI posts the claim with the session delegated
-   mediatore-cli claim --mediatore https://mediatore.sandbox.example \
+   mediatore sandbox create --mediatore https://mediatore.sandbox.example \
      --pool pool-a --ttl 3600 --audience api://trading-data \
      --image registry.internal:5000/sandbox/claude:latest \
      --arg /usr/bin/claude --arg -p --arg "reconcile the ledgers"
@@ -125,7 +125,7 @@ user's identity:
 ```mermaid
 flowchart LR
     subgraph A["Path A: human"]
-        A1[az login / mediatore-cli<br/>PKCE] --> A2[token: aud=mediatore<br/>scp=sandbox.access<br/>oid = the user]
+        A1[az login / mediatore login<br/>PKCE] --> A2[token: aud=mediatore<br/>scp=sandbox.access<br/>oid = the user]
     end
     subgraph B["Path B: agent for a user"]
         B1[user token for the<br/>agent's own API] --> B2[agent's OBO exchange:<br/>assertion = user token<br/>scope = api://mediatore/sandbox.access] --> B3[token: aud=mediatore<br/>oid = the user<br/>azp = the agent app]
@@ -206,11 +206,11 @@ per-subject user. The jail gives it:
 | `/run/spire/agent.sock` (read-only) | The **only** credential surface: fetch the claim SVID |
 | `MEDIATORE_URL` env | Where to trade the SVID for tokens |
 | `/work` (writable), tmpfs `/tmp` + `$HOME` | Scratch space, wiped at teardown |
-| `sandbox-token` on `$PATH` | `sandbox-token --audience api://trading-data` prints a 15-min bearer |
+| `/usr/local/bin/mediatore` (read-only, the guest's own binary) | `mediatore token --audience api://trading-data` prints a 15-min bearer; the rootfs ships no client ([ADR-0014](../adr/0014-one-binary-roles-as-subcommands.md)) |
 
 No token files, no baked-in secrets, no network beyond the broker and the claim's
 audiences. For tools that read a bearer from the environment:
-`TOKEN=$(sandbox-token --audience ...) exec your-tool`.
+`TOKEN=$(mediatore token --audience ...) exec your-tool`; logs go to standard error, the token alone to standard output.
 
 ## Interaction patterns
 

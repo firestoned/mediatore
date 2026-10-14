@@ -11,6 +11,9 @@ pub const SANDBOX_ROOT: &str = "/mnt/sandbox";
 /// Default address-space limit for the workload, in MiB.
 pub const DEFAULT_RLIMIT_AS_MIB: u64 = 8192;
 
+/// Where the mediatore binary appears inside the jail.
+pub const JAIL_BINARY: &str = "/usr/local/bin/mediatore";
+
 /// Inputs to the jail.
 #[derive(Debug, Clone)]
 pub struct JailSpec {
@@ -24,6 +27,9 @@ pub struct JailSpec {
     pub workload_api_socket: PathBuf,
     /// mediatore sandbox-facing URL.
     pub mediatore_url: String,
+    /// The one mediatore binary on the host, mounted read-only at [`JAIL_BINARY`] so the
+    /// workload can run `mediatore token` (ADR-0014 decision 4).
+    pub agent_binary: PathBuf,
     /// Command to exec.
     pub argv: Vec<String>,
     /// Address-space limit in MiB.
@@ -48,6 +54,8 @@ impl JailSpec {
                 "{}:/run/spire/agent.sock",
                 self.workload_api_socket.display()
             ),
+            "--bindmount_ro".into(),
+            format!("{}:{JAIL_BINARY}", self.agent_binary.display()),
             "--bindmount".into(),
             format!("{}:/work", self.work.display()),
             "--tmpfsmount".into(),
@@ -95,6 +103,7 @@ mod tests {
             work: "/mnt/sandbox/work".into(),
             workload_api_socket: "/run/spire/sockets/agent.sock".into(),
             mediatore_url: "https://mediatore.test".into(),
+            agent_binary: "/usr/local/bin/mediatore".into(),
             argv: vec!["/bin/sh".into(), "-c".into(), "id".into()],
             rlimit_as_mib: 8192,
         };
@@ -102,5 +111,38 @@ mod tests {
         let sep = a.iter().position(|x| x == "--").unwrap();
         assert_eq!(&a[sep + 1..], &["/bin/sh", "-c", "id"]);
         assert!(a.iter().any(|x| x == "--disable_proc"));
+    }
+
+    #[test]
+    fn the_agent_binary_is_mounted_read_only_and_nothing_else_is_writable_but_work() {
+        let s = JailSpec {
+            user: "sb-abc".into(),
+            rootfs: "/mnt/sandbox/rootfs".into(),
+            work: "/mnt/sandbox/work".into(),
+            workload_api_socket: "/run/spire/sockets/agent.sock".into(),
+            mediatore_url: "https://mediatore.test".into(),
+            agent_binary: "/opt/mediatore/bin/mediatore".into(),
+            argv: vec!["/bin/sh".into()],
+            rlimit_as_mib: 8192,
+        };
+        let a = s.to_args();
+        let ro: Vec<&str> = a
+            .windows(2)
+            .filter(|w| w[0] == "--bindmount_ro")
+            .map(|w| w[1].as_str())
+            .collect();
+        assert_eq!(
+            ro,
+            [
+                "/run/spire/sockets/agent.sock:/run/spire/agent.sock",
+                "/opt/mediatore/bin/mediatore:/usr/local/bin/mediatore",
+            ]
+        );
+        let rw: Vec<&str> = a
+            .windows(2)
+            .filter(|w| w[0] == "--bindmount")
+            .map(|w| w[1].as_str())
+            .collect();
+        assert_eq!(rw, ["/mnt/sandbox/work:/work"]);
     }
 }

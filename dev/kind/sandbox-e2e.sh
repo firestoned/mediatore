@@ -147,11 +147,12 @@ spec:
     runAsUser: 65532
     seccompProfile: { type: RuntimeDefault }
   containers:
-    - name: mediatore-guest
-      image: localhost/mediatore-guest:kind
+    - name: guest
+      image: ghcr.io/firestoned/mediatore:kind
       imagePullPolicy: Never
       command:
-        - /usr/local/bin/mediatore-guest
+        - /usr/local/bin/mediatore
+        - guest
         - --dev-ek-hash
         - "$EK_HASH"
         - --dev-dmi-uuid

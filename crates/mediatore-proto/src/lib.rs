@@ -1,8 +1,8 @@
 // Copyright (c) 2026 Erick Bourgeois, mediatore
 // SPDX-License-Identifier: Apache-2.0
 
-//! Wire contract between the mediatore server, the in-guest agent (`mediatore-guest`)
-//! and the workload-side CLI (`sandbox-token`).
+//! Wire contract between the broker (`mediatore serve`), the in-guest agent (`mediatore guest`)
+//! and the workload-side client (`mediatore token`).
 //!
 //! Every type here is versioned together with [`API_VERSION`]. Breaking changes to any of
 //! them are a new API version, never a silent edit.

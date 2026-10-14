@@ -30,8 +30,8 @@ curl -sS https://mediatore.sandbox.example/v1/claims \
 For an issuer configured with a `session` (Dex in the homelab,
 [ADR-0013](../adr/0013-dex-session-delegation.md)) the body also carries the caller's
 `refresh_token`, which mediatore seals and keeps in its store, never on the resource, and
-refreshes before every token it mints for the sandbox; `mediatore-cli claim` does this for
-you (see [Running workloads](running-workloads.md)). A claim without it is refused with
+refreshes before every token it mints for the sandbox; `mediatore sandbox create` does this
+for you (see [Running workloads](running-workloads.md)). A claim without it is refused with
 `400 session_required`; one for an issuer that takes none, with `400 session_unexpected`.
 
 `GET /v1/claims/sandbox-3f9a1c2e` answers from the resource's status: `phase` mirrors the
@@ -150,7 +150,7 @@ A sandbox is only as ready as the pool's readiness signal. `spec.readiness` on a
 `VirtualMachinePool` is required and has two values: `InfrastructureReady`, which fires
 when the hypervisor reports the VM up, and `GuestReady` (banlieue ADR-0043), which fires
 when the installed guest has booted and said so. Pools that serve sandboxes must use
-`GuestReady`: `mediatore-guest` needs the vTPM attested and the Workload API up before it
+`GuestReady`: `mediatore guest` needs the vTPM attested and the Workload API up before it
 can register the node, and with `InfrastructureReady` a deferred-install image is handed
 out while the install is still running. The claim then binds, the sandbox turns `Bound`,
 and `ready` waits on a node registration that comes late or never, until the watcher's

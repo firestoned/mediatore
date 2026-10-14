@@ -1,16 +1,12 @@
 [package]
 name = "mediatore-guest"
-description = "In-guest agent: attest, fetch the subject, create the sandbox user, jail the workload"
+description = "The VM side of the one mediatore binary (ADR-0014): the guest role (attest, fetch the subject, create the sandbox user, jail the workload) and the token role inside the jail"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 publish.workspace = true
-
-[[bin]]
-name = "mediatore-guest"
-path = "src/main.rs"
 
 [dependencies]
 mediatore-proto.workspace = true

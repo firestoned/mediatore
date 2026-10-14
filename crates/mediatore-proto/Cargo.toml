@@ -1,6 +1,6 @@
 [package]
 name = "mediatore-proto"
-description = "Shared wire types between mediatore, mediatore-guest and sandbox-token"
+description = "Shared wire types between the broker, the guest role and the token role of the one mediatore binary"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

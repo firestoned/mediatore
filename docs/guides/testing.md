@@ -12,7 +12,7 @@ a real cluster address or a real credential in a tracked file.
 | --- | --- | --- | --- |
 | Unit | `make check` | Every crate's own contract, over fakes that validate like production | everywhere, every commit |
 | Dev-mode loop | `make e2e` | The four shipped binaries agree on the wire contract as separate processes | everywhere, every PR |
-| Session e2e | `make check` (`crates/mediatore/tests/e2e_session.rs`) | The Dex path (ADR-0013) over real listeners against the fake issuer's real authorization-code and refresh grants: delegation, rotation, fresh groups, outage, revocation, the group gate at refresh, the per-claim limit; the CLI's PKCE login in `crates/mediatore-cli` | everywhere, every commit |
+| Session e2e | `make check` (`crates/mediatore/tests/e2e_session.rs`) | The Dex path (ADR-0013) over real listeners against the fake issuer's real authorization-code and refresh grants: delegation, rotation, fresh groups, outage, revocation, the group gate at refresh, the per-claim limit; the CLI's PKCE login in `crates/mediatore-client` | everywhere, every commit |
 | Live against SPIRE in kind | `make kind-e2e` | Kubernetes, the SPIRE Controller Manager and the admission policy behave as the ADRs say, as the broker's own ServiceAccount; the broker image runs on the CSI driver's socket and agent-issued SVIDs meet on the sandbox listener | CI on every PR, any laptop with a container runtime |
 | Live against a real cluster | `make live-admission-test` | The same, against a deployment you operate | by hand, before a release or after changing the deployment |
 
@@ -32,9 +32,9 @@ same change.
 real HTTP listeners with the fake IdP from `mediatore-testkit`: login, claim, bind,
 `/v1/me`, `/v1/token`, verify against the broker's own JWKS, release, cut-off. The peer
 identity is a header (`dev_mode`), entries live in memory. Negative cases are part of it:
-wrong audience, wrong SVID type, wrong subject, revoked claim. The demo builds the two
-guest binaries with their `dev` cargo feature, which is the only build that has the
-header path at all.
+wrong audience, wrong SVID type, wrong subject, revoked claim. The demo builds the one
+binary with the `mediatore/dev` cargo feature, which is the only build whose `guest` and
+`token` roles have the header path at all.
 
 `crates/mediatore/tests/e2e_mtls.rs` runs the same sandbox API over the production mTLS
 listener (`crates/mediatore-tls`: the verifiers, the accept loop, the client configs) with
@@ -144,10 +144,10 @@ released row archived.
 
 ### Broker and client pods over SPIFFE mTLS
 
-`make kind-broker` builds the three musl binaries on the host (`make dist`), packages
-the broker with the shipped `Dockerfile` (`BINARY_FROM=host`: the same runtime stage
-over the host-built binary) and the two guest binaries into a test-only image
-(`dev/kind/Dockerfile.guest`), loads both into the cluster with `kind load`, and
+`make kind-broker` builds the one musl binary on the host (`make dist`), packages it
+with the shipped `Dockerfile` (`BINARY_FROM=host`: the same runtime stage over the
+host-built binary), loads that image into the cluster with `kind load` (the node and
+workload pods run the same image with the `guest` and `token` subcommands, ADR-0014), and
 applies `dev/kind/broker`: a kustomize overlay of `deploy/base` as shipped, with the
 Traefik route removed, one replica and the image tag changed. The Deployment's CSI
 inline volume, ServiceAccount, `ClusterSPIFFEID`, RBAC and admission policy are the
@@ -157,12 +157,12 @@ listeners answer nothing before `broker_identity` returns.
 `dev/kind/mtls-e2e.sh` then applies `dev/kind/mtls/clients.yaml`: a namespace, four
 `ClusterSPIFFEID` fixtures an admin creates (nothing goes through mediatore's own entry
 path), and four pods that get their SVIDs from the real agent through the same CSI
-volume and run the shipped guest binaries against `mediatore-sandbox`:
+volume and run the shipped binary's `guest` and `token` roles against `mediatore-sandbox` (the same server image, ADR-0014):
 
 | Pod | SVID the agent issues | Expected |
 | --- | --- | --- |
-| `claim` | `spiffe://<td>/banlieue/claim/<fixture uid>` | `sandbox-token` gets `403 unknown claim`: the handshake completed and the listener derived that UID from the certificate |
-| `node` | `spiffe://<td>/banlieue/node/<fixture EK hash>` | `mediatore-guest` logs `node registered`: `POST /v1/nodes` accepted because the peer ID matches the EK hash it claims |
+| `claim` | `spiffe://<td>/banlieue/claim/<fixture uid>` | `mediatore token` gets `403 unknown claim`: the handshake completed and the listener derived that UID from the certificate |
+| `node` | `spiffe://<td>/banlieue/node/<fixture EK hash>` | `mediatore guest` logs `node registered`: `POST /v1/nodes` accepted because the peer ID matches the EK hash it claims |
 | `intruder` | `spiffe://<td>/intruder` | refused in the handshake, no HTTP answer; the broker logs `peer authenticated but not authorized here` |
 | `impersonator` | `spiffe://<td>/mediatore` | the same: the broker's own identity is not a client identity, even when a real agent issued it |
 
@@ -210,7 +210,7 @@ restarted so its controllers start against existing CRDs, then
 
 | Step | Expected |
 | --- | --- |
-| a `node` pod runs `mediatore-guest` with the fixture EK hash and a `ClusterSPIFFEID` for `spiffe://<td>/banlieue/node/<hash>` | `node registered` over its agent-issued SVID: the broker now knows the node the bind will resolve to |
+| a `node` pod runs `mediatore guest` with the fixture EK hash and a `ClusterSPIFFEID` for `spiffe://<td>/banlieue/node/<hash>` | `node registered` over its agent-issued SVID: the broker now knows the node the bind will resolve to |
 | the admin creates an `AgentSandbox` naming `octocat`; an impersonated stranger does the same | both denied at admission with `spec.subject.id is ...`: the default is caller-equals-subject |
 | the admin names itself; `e2e-broker` (listed) names `octocat`; the broker ServiceAccount names `octocat` | all three admitted: the two exemptions of ADR-0008 decision 5, and the ordinary case |
 | `kubectl patch` of `spec.ttlSeconds` on the existing sandbox | denied: `spec is immutable` |

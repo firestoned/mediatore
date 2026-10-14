@@ -4,7 +4,7 @@
 #
 # ADR-0007 against a real SPIRE (`make kind-e2e-mtls`): the broker Deployment from
 # deploy/base running on the CSI driver's socket, and client pods whose SVIDs a real
-# agent issued, talking to the sandbox listener with the shipped guest binaries.
+# agent issued, talking to the sandbox listener with the shipped binary's guest and token roles.
 #
 #   mtls-e2e.sh <kubeconfig> [trust domain]
 #

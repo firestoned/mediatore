@@ -42,7 +42,7 @@ flowchart LR
     network-management-cluster["Management Cluster"]
     system-sandbox-vm["Sandbox VM (pool member)"]
     service-spire-agent["SPIRE Agent (in guest)"]
-    service-guest-agent["mediatore-guest"]
+    service-guest-agent["mediatore guest"]
     service-sandbox-workload["Jailed Workload"]
     network-sandbox-segment["Sandbox Network Segment"]
     subgraph sg_system-mediatore [System Mediatore]

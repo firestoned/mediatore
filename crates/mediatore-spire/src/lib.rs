@@ -5,7 +5,7 @@
 //!
 //! mediatore creates exactly two kinds of registration entry:
 //! * a node bootstrap entry `spiffe://<td>/banlieue/node/<ek-hash>` for the in-guest agent
-//!   (selectors `unix:uid:0` + `unix:path:/usr/local/bin/mediatore-guest`), and
+//!   (selectors `unix:uid:0` + `unix:path:/usr/local/bin/mediatore`, ADR-0014), and
 //! * a claim entry `spiffe://<td>/banlieue/claim/<uid>` for the jailed workload
 //!   (selector `unix:user:<sandbox user>`).
 //!
@@ -36,8 +36,10 @@ pub const MANAGED_BY: &str = "mediatore";
 pub const KIND_LABEL: &str = "mediatore.io/kind";
 /// Label carrying the claim UID on a claim entry.
 pub const CLAIM_UID_LABEL: &str = "mediatore.io/claim-uid";
-/// Path of the in-guest agent binary, pinned by the node entry's `unix:path` selector.
-pub const GUEST_AGENT_PATH: &str = "/usr/local/bin/mediatore-guest";
+/// Path of the one mediatore binary on a pool member, pinned by the node entry's `unix:path`
+/// selector (ADR-0014). The jail mounts the same file, so `unix:uid:0` is the selector that
+/// tells the guest role from a jailed workload.
+pub const GUEST_AGENT_PATH: &str = "/usr/local/bin/mediatore";
 
 /// Trust domain plus the path prefixes we own.
 #[derive(Debug, Clone)]

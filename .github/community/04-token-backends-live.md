@@ -13,10 +13,11 @@ the transit sealer are the next slices.
       `sessions` row and moved into the record by the reconciler; every `POST /v1/token`
       refreshes it first (rotation re-sealed, the fresh groups minted) so upstream
       revocation propagates, then mints STS (ADR-0013; `crates/mediatore/tests/e2e_session.rs`)
-- [x] `mediatore-cli login` (PKCE with a loopback redirect, as mediatore's own public
-      client; `offline_access` for the refresh token), `claim` (delegates and forgets the
-      refresh token), `get`, `delete`, `status` (`crates/mediatore-cli`, tested against
-      the fake issuer's authorization-code flow)
+- [x] `mediatore login` (PKCE with a loopback redirect, as mediatore's own public
+      client; `offline_access` for the refresh token), `sandbox create` (delegates and
+      forgets the refresh token), `sandbox get`, `sandbox delete`, `session`
+      (`crates/mediatore-client`, tested against the fake issuer's authorization-code
+      flow; subcommands of the one binary since ADR-0014)
 - [x] Refusal handling: `invalid_grant`, a fresh ID token outside the group, or one naming
       another subject releases the claim at once (entry retracted, record revoked,
       envelope dropped) and answers `403 session_revoked`; an issuer outage is

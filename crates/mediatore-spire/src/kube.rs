@@ -579,7 +579,7 @@ mod tests {
             );
             assert_eq!(
                 v["spec"]["selectors"],
-                json!(["unix:uid:0", "unix:path:/usr/local/bin/mediatore-guest"])
+                json!(["unix:uid:0", "unix:path:/usr/local/bin/mediatore"])
             );
             assert_eq!(v["metadata"]["labels"]["mediatore.io/kind"], "node");
             assert!(

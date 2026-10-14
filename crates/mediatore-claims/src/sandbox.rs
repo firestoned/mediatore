@@ -65,7 +65,7 @@ pub struct SandboxSubject {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SandboxWorkload {
-    /// OCI reference of the rootfs `mediatore-guest` unpacks into the jail.
+    /// OCI reference of the rootfs the guest agent unpacks into the jail.
     #[schemars(length(min = 1))]
     pub image: String,
     /// Command and arguments to exec inside the jail.
