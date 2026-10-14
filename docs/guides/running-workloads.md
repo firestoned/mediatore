@@ -11,9 +11,12 @@ How code actually ends up executing inside a sandbox, for each kind of caller:
 - **C** — a service acting *as itself*, with an app-only JWT from another Entra ID app
   registration.
 
-All three converge on the same call — `POST /v1/claims` with a bearer token whose
-audience is mediatore — and everything after that call is identical. The differences
+All three converge on the same call, `POST /v1/claims` with a bearer token whose
+audience is mediatore, and everything after that call is identical. The differences
 are only in how the token was obtained and who the sandbox's *subject* ends up being.
+The call creates an `AgentSandbox` resource with that subject (ADR-0008); a caller with
+RBAC on the cluster can create the same resource directly, see
+[Requesting a sandbox](requesting-a-sandbox.md).
 
 ## The one rule that shapes everything
 

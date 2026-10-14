@@ -80,6 +80,8 @@ impl Harness {
             }]),
             sts: Some(sts),
             audiences: vec![AUDIENCE.into()],
+            sandboxes: None,
+            sandbox_namespace: "sandboxes".into(),
             dev_mode: true,
         });
 
@@ -197,6 +199,7 @@ async fn full_loop_from_login_to_cutoff() {
         mediatore_proto::ClaimPhase::Bound,
         "dev binder should bind immediately"
     );
+    assert!(claim.ready, "bound with the entry set in memory: ready");
     let uid = claim.uid.expect("uid");
     assert!(claim.expires_at.is_some(), "bound claim has a deadline");
 

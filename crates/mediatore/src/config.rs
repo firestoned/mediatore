@@ -136,6 +136,27 @@ impl Default for WatcherSection {
     }
 }
 
+/// `AgentSandbox` resources the user API creates (ADR-0008 decision 4).
+#[derive(Debug, Clone, Deserialize)]
+pub struct SandboxesSection {
+    /// Namespace `POST /v1/claims` creates sandboxes in. The `VirtualMachinePool` a request
+    /// names must live there (the claim's `poolRef` is a same-namespace reference).
+    #[serde(default = "default_sandbox_namespace")]
+    pub namespace: String,
+}
+
+fn default_sandbox_namespace() -> String {
+    "sandboxes".into()
+}
+
+impl Default for SandboxesSection {
+    fn default() -> Self {
+        Self {
+            namespace: default_sandbox_namespace(),
+        }
+    }
+}
+
 /// Top-level config.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
@@ -160,6 +181,9 @@ pub struct Config {
     /// Claim watcher timings (ADR-0011).
     #[serde(default)]
     pub watcher: WatcherSection,
+    /// Where the user API's sandboxes go (ADR-0008).
+    #[serde(default)]
+    pub sandboxes: SandboxesSection,
 }
 
 fn default_listen() -> ListenConfig {
@@ -198,6 +222,9 @@ impl Config {
             anyhow::bail!(
                 "watcher.resync_secs and resolve_timeout_secs must be positive and lease_duration_secs at least 3"
             );
+        }
+        if cfg.sandboxes.namespace.trim().is_empty() {
+            anyhow::bail!("sandboxes.namespace must not be empty");
         }
         if let Some(e) = cfg.spire.as_ref().map(|s| &s.entries) {
             if e.class_name.trim().is_empty() {
@@ -302,6 +329,22 @@ listen: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }
         ))
         .unwrap_err();
         assert!(err.to_string().contains("resolve_timeout_secs"), "{err}");
+    }
+
+    #[test]
+    fn the_sandbox_namespace_defaults_and_must_not_be_empty() {
+        let cfg = Config::parse(&format!("{BASE}dev_mode: true\n")).unwrap();
+        assert_eq!(cfg.sandboxes.namespace, "sandboxes");
+        let cfg = Config::parse(&format!(
+            "{BASE}dev_mode: true\nsandboxes: {{ namespace: agents }}\n"
+        ))
+        .unwrap();
+        assert_eq!(cfg.sandboxes.namespace, "agents");
+        let err = Config::parse(&format!(
+            "{BASE}dev_mode: true\nsandboxes: {{ namespace: \" \" }}\n"
+        ))
+        .unwrap_err();
+        assert!(err.to_string().contains("sandboxes.namespace"), "{err}");
     }
 
     #[test]

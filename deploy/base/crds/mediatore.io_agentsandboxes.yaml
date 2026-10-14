@@ -1,0 +1,191 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+#
+# Generated from crates/mediatore-claims/src/sandbox.rs by `make crds` (ADR-0008
+# decision 1). Do not edit: the unit test `the_crd_in_deploy_is_what_the_type_renders`
+# fails on a stale file.
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: agentsandboxes.mediatore.io
+spec:
+  group: mediatore.io
+  names:
+    kind: AgentSandbox
+    plural: agentsandboxes
+    shortNames:
+    - asb
+    singular: agentsandbox
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.subject.id
+      name: Subject
+      type: string
+    - jsonPath: .spec.poolRef.name
+      name: Pool
+      type: string
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .status.ready
+      name: Ready
+      type: boolean
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: "AgentSandbox is the record of one sandbox request (ADR-0008): mediatore creates and owns one VirtualMachineClaim for it, pins spec.subject to the caller at admission, and reports the claim's status plus whether the claim's registration entry is set."
+        properties:
+          spec:
+            description: |-
+              The request mediatore already accepts on `POST /v1/claims`, as a resource (decision 7).
+              Immutable after creation: the admission policy in
+              `deploy/base/admission/agentsandbox-subject.yaml` freezes it.
+            properties:
+              audiences:
+                default: []
+                description: |-
+                  Downstream audiences the sandbox may request tokens for. Each must be one mediatore
+                  is configured to serve; otherwise the sandbox fails before any claim exists.
+                items:
+                  type: string
+                type: array
+              poolRef:
+                description: The `VirtualMachinePool` to claim from, in this namespace; copied to the claim.
+                properties:
+                  name:
+                    type: string
+                required:
+                - name
+                type: object
+              subject:
+                description: Who the sandbox is for.
+                properties:
+                  display:
+                    description: Human-readable name, informational only.
+                    nullable: true
+                    type: string
+                  id:
+                    description: |-
+                      Raw subject identifier as the issuer spells it (Entra `oid`, GitHub login via Dex).
+                      Pinned to the caller at admission (decision 5).
+                    minLength: 1
+                    type: string
+                  issuer:
+                    description: |-
+                      OIDC issuer URL, byte-for-byte as it appears in `iss`. Must be one of the issuers
+                      mediatore is configured with (decision 7).
+                    minLength: 1
+                    type: string
+                required:
+                - id
+                - issuer
+                type: object
+              ttlSeconds:
+                description: |-
+                  Lifetime in seconds, counted from bind; copied to the claim, which enforces it
+                  (decision 9).
+                format: uint32
+                minimum: 1.0
+                type: integer
+              workload:
+                description: What to run.
+                properties:
+                  args:
+                    default: []
+                    description: Command and arguments to exec inside the jail.
+                    items:
+                      type: string
+                    type: array
+                  image:
+                    description: OCI reference of the rootfs `mediatore-guest` unpacks into the jail.
+                    minLength: 1
+                    type: string
+                required:
+                - image
+                type: object
+            required:
+            - poolRef
+            - subject
+            - ttlSeconds
+            - workload
+            type: object
+          status:
+            description: "What the reconciler reports: the claim's status, plus the one fact only mediatore knows."
+            nullable: true
+            properties:
+              addresses:
+                description: The member's addresses, from the claim.
+                items:
+                  type: string
+                type: array
+              boundAt:
+                description: From the claim.
+                format: date-time
+                nullable: true
+                type: string
+              claimRef:
+                description: The owned claim, set once it has been created; never cleared.
+                nullable: true
+                properties:
+                  name:
+                    type: string
+                required:
+                - name
+                type: object
+              claimUid:
+                description: "The claim's UID: the claim identity's key (ADR-0004, ADR-0011 decision 1)."
+                nullable: true
+                type: string
+              entrySet:
+                default: false
+                description: The claim's registration entry is set on the SPIRE server (ADR-0006 decision 5).
+                type: boolean
+              expiresAt:
+                description: "From the claim: when banlieue destroys the member."
+                format: date-time
+                nullable: true
+                type: string
+              observedGeneration:
+                description: The generation this status was computed from.
+                format: int64
+                nullable: true
+                type: integer
+              phase:
+                default: Pending
+                description: Mirrored from the claim.
+                enum:
+                - Pending
+                - Bound
+                - Releasing
+                - Failed
+                type: string
+              ready:
+                default: false
+                description: "`phase == Bound && entry_set` (decision 11)."
+                type: boolean
+              reason:
+                description: Why the sandbox is `Failed`, when it is.
+                nullable: true
+                type: string
+              virtualMachineRef:
+                description: The bound member, from the claim.
+                nullable: true
+                properties:
+                  name:
+                    type: string
+                required:
+                - name
+                type: object
+            type: object
+        required:
+        - spec
+        title: AgentSandbox
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

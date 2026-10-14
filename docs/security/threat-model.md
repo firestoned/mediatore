@@ -4,15 +4,22 @@ SPDX-License-Identifier: Apache-2.0
 -->
 # Threat Model
 
-> **Status:** Living document. Last full pass **2026-10-13**, against the
-> architecture defined by **ADR-0001 … ADR-0011** (ADR-0008 is Proposed and
-> unbuilt; ADR-0009 and ADR-0010 are adopted platform ADRs with no code of
-> their own). This pass covers roadmap 03's claim watcher (ADR-0011): a
-> `VirtualMachineClaim` is bound by the EK hash banlieue mirrors onto it and
-> nothing else, an unresolved bind fails closed, node entries come from pool
-> members that publish a certificate, and one replica leads by Lease. TB-2
-> gains five rows and TB-4 one, all citing code and tests; R-5 is reworded
-> around the watcher. Earlier the same day, roadmap 01: registration entries
+> **Status:** Living document. Last full pass **2026-10-14**, against the
+> architecture defined by **ADR-0001 … ADR-0011** (ADR-0009 and ADR-0010 are
+> adopted platform ADRs with no code of their own). This pass covers roadmap
+> 08's `AgentSandbox` (ADR-0008, now built): the request for a sandbox is a
+> custom resource whose `spec.subject` is pinned to the caller at admission,
+> mediatore creates and owns one `VirtualMachineClaim` per sandbox and the
+> store record keyed by its UID, refuses an audience or issuer outside its
+> configuration before any claim exists, and holds a finalizer until the
+> claim is gone. TB-1 gains three rows and TB-2 seven; new asset A-9 (the
+> `brokers` lists) and a new actor (the declarative requester); A-7 widened;
+> R-5 narrowed, since records are now rebuilt from the resource. The day
+> before, roadmap 03's claim watcher (ADR-0011): a `VirtualMachineClaim` is
+> bound by the EK hash banlieue mirrors onto it and nothing else, an
+> unresolved bind fails closed, node entries come from pool members that
+> publish a certificate, and one replica leads by Lease. Earlier the same
+> day, roadmap 01: registration entries
 > as `ClusterStaticEntry` resources through the Kubernetes API with no SPIRE
 > admin identity (ADR-0006), and SPIFFE mTLS on the sandbox listener with the
 > broker's SVID from the Workload API over the SPIFFE CSI driver (ADR-0007);
@@ -43,9 +50,11 @@ holds three things an attacker wants:
 1. **The power to mint delegated tokens.** Via Entra On-Behalf-Of refresh
    material or its own STS signing key, mediatore can produce a token that
    downstream APIs accept as "on behalf of user X".
-2. **The subject binding.** It writes `spec.subject` on every
-   `VirtualMachineClaim` it creates; corrupt that and a sandbox is issued to
-   the wrong person.
+2. **The subject binding.** It writes `spec.subject` on every `AgentSandbox`
+   it creates for an API caller and on every `VirtualMachineClaim` it creates
+   for a sandbox, and admission exempts it from the caller-equals-subject
+   rule for exactly that; corrupt that and a sandbox is issued to the wrong
+   person.
 3. **Entry declaration.** It declares which SPIFFE identity exists on which
    node, as `ClusterStaticEntry` resources under `/banlieue/` that admission
    policy constrains; a forged entry is a forged workload identity. mediatore
@@ -55,15 +64,15 @@ holds three things an attacker wants:
 
 | Component | Crate / manifest | Runs where | Privilege |
 | --- | --- | --- | --- |
-| User API (bearer) | `crates/mediatore-api`, `crates/mediatore-entra` | `banlieue-system` pod | Creates claims as the broker ServiceAccount |
+| User API (bearer) | `crates/mediatore-api`, `crates/mediatore-entra` | `banlieue-system` pod | Creates, reads and deletes `AgentSandbox` resources as the broker ServiceAccount, which the subject admission policy exempts; its token validation is the control |
 | Sandbox API (SPIFFE) | `crates/mediatore-api` | same pod | Issues tokens; reads the node/claim identity the listener verified |
 | Sandbox listener | `crates/mediatore-tls` | same pod, :8443 | Terminates SPIFFE mTLS; holds the broker SVID and key in memory |
-| Claim reconciler | `crates/mediatore-claims`, `crates/mediatore-spire` | same pod (leader-elected) | `clusterstaticentries` create/delete/list/watch through the Kubernetes API, admission-constrained; no SPIRE admin |
+| Claim reconciler and `AgentSandbox` reconciler | `crates/mediatore-claims`, `crates/mediatore-spire` | same pod (leader-elected) | `clusterstaticentries` create/delete/list/watch through the Kubernetes API, admission-constrained; no SPIRE admin. `virtualmachineclaims` create/delete, `agentsandboxes` patch (status, finalizer) |
 | STS | `crates/mediatore-sts` | same pod | Holds the signing key handle |
-| Claim store | `crates/mediatore-store` | in-memory today; PostgreSQL/SQLite next | Refresh ciphertext, subject rows |
+| Claim store | `crates/mediatore-store` | in-memory today; PostgreSQL/SQLite next | Refresh ciphertext, revocations, node records; the request fields are a copy of the `AgentSandbox` spec |
 | In-guest agent | `crates/mediatore-guest` | root on each pool member | `useradd`, mount, nsjail |
 | Workload CLI | `crates/sandbox-token` | inside the jail, as the `sb-` user | Holds one token in memory |
-| Deployment | `deploy/base/*.yaml` | management cluster | SA, RBAC, `ClusterSPIFFEID`, the entries admission policy, the CSI inline volume for the agent socket, the `LoadBalancer` service for :8443, ingress for :8080 |
+| Deployment | `deploy/base/*.yaml` | management cluster | SA, RBAC, `ClusterSPIFFEID`, the `AgentSandbox` CRD (`crds/`, generated), the entries and the sandbox-subject admission policies, the CSI inline volume for the agent socket, the `LoadBalancer` service for :8443, ingress for :8080 |
 | SPIRE Controller Manager | hardened chart (not this repo) | `spire-server` pod | Renders `ClusterStaticEntry` into server entries over the server's private socket |
 
 ## 3. Assets
@@ -76,14 +85,16 @@ holds three things an attacker wants:
 | A-4 | Issued access tokens | workload memory, ≤ 15 min | One audience, until expiry |
 | A-5 | Claim ↔ subject ↔ node binding | store + SPIRE entries | Sandbox issued to, or read by, the wrong person |
 | A-6 | EK-hash ↔ DMI-UUID registry | store `nodes` table | A cloned or impostor VM accepted as a pool member |
-| A-7 | Broker Kubernetes ServiceAccount | pod token | Create claims with arbitrary `spec.subject` (VAP-exempt); declare `/banlieue/{node,claim}/` entries, within what the entries admission policy allows |
+| A-7 | Broker Kubernetes ServiceAccount | pod token | Create `AgentSandbox` resources and claims with arbitrary `spec.subject` (exempt from both subject policies); patch any sandbox's status; declare `/banlieue/{node,claim}/` entries, within what the entries admission policy allows |
 | A-8 | Broker SVID and private key (`spiffe://<td>/mediatore`) | process memory only, from the Workload API | Impersonate the broker to every guest; terminate the sandbox listener elsewhere |
+| A-9 | The `brokers` lists: ConfigMaps `mediatore-agentsandbox-subject-policy` and `banlieue-claim-subject-policy` | `banlieue-system` | List a principal and it may attribute a sandbox, and every token minted for it, to anyone; both ship empty |
 
 ## 4. Actors
 
 | Actor | Trust level | Notes |
 | --- | --- | --- |
 | Sandbox user | Authenticated, not trusted | May only claim for themself; group-gated |
+| Declarative requester (GitOps, CI, an app-only service with `create` on `agentsandboxes`) | Authenticated by the API server, not trusted | May only request a sandbox for the subject it is, unless listed in A-9; never sees a token |
 | Jailed workload | Hostile by assumption | Prompt-injected agents run here; that is the design case |
 | In-guest agent | Trusted root on the VM | Bounded by the VM's own blast radius |
 | Pool VM (pre-claim) | Attested hardware identity, no subject | Holds a node SVID only |
@@ -109,8 +120,9 @@ flowchart TB
 
   user -- "(TB-1) bearer HTTPS" --> mediatore
   user -- "OIDC login" --> idp
+  requester(["Declarative requester<br/>(GitOps, CI)"]) -- "(TB-2) AgentSandbox,<br/>subject policy" --> banlieue
   mediatore -- "(TB-5) JWKS / OBO" --> idp
-  mediatore <-- "(TB-2) Kubernetes API: claims, watcher" --> banlieue
+  mediatore <-- "(TB-2) Kubernetes API: AgentSandbox,<br/>claims, watcher" --> banlieue
   mediatore -- "(TB-3) Kubernetes API: ClusterStaticEntry<br/>admission policy, RBAC" --> apiserver["Kubernetes API server"]
   apiserver -- "watch" --> cm["SPIRE Controller Manager"]
   cm -- "private socket (deployment control)" --> spire
@@ -138,7 +150,8 @@ flowchart TB
 ```
 
 - **TB-1** user ↔ mediatore user API (bearer token over HTTPS)
-- **TB-2** mediatore ↔ Kubernetes API (claims; VAP `brokers` allowlist)
+- **TB-2** mediatore and declarative requesters ↔ Kubernetes API (`AgentSandbox` and
+  claims; the two subject admission policies and their `brokers` lists)
 - **TB-3** mediatore ↔ Kubernetes API (`ClusterStaticEntry`; entries admission policy and
   RBAC), then controller manager → SPIRE server over its private socket (a deployment
   control; mediatore never reaches the server)
@@ -162,19 +175,29 @@ the residue is in §8. No boundary carries the marker as of this pass.
 | Forged / replayed bearer token | S | JWKS signature, `iss`/`aud`/`exp`/`nbf` validation: `crates/mediatore-entra/src/lib.rs` (`Validator::validate`) |
 | Token minted for another client (e.g. the kubernetes Dex client) | S | `aud` must equal mediatore's `client_id`; e2e-tested (`crates/mediatore/tests/e2e_dev.rs::a_token_for_another_audience_client_is_unauthorized`) |
 | Authenticated but unauthorized user | E | Per-issuer `required_group` gate: `crates/mediatore-entra/src/lib.rs`; refused as 403 |
-| Reading / deleting another subject's claim | I/T | Subject equality on GET/DELETE: `crates/mediatore-api/src/lib.rs` (`owned_claim`) |
-| Audience smuggling at claim creation | E | Requested audiences must be a subset of configured ones: `crates/mediatore-api/src/lib.rs` (`create_claim`) |
+| Reading / deleting another subject's claim | I/T | Subject equality on GET/DELETE against the resource's `spec.subject` (`owned_sandbox`) or the dev record (`owned_claim`), `crates/mediatore-api/src/lib.rs`; e2e `another_subject_cannot_read_or_delete_and_an_unknown_name_is_not_found` (`crates/mediatore/tests/e2e_sandbox.rs`) and the dev-mode twin |
+| Audience smuggling at claim creation | E | Requested audiences must be a subset of configured ones: `crates/mediatore-api/src/lib.rs` (`create_claim`), refused with `400` before any resource exists (e2e `an_unknown_audience_is_refused_before_anything_is_created`); the reconciler refuses the same again on the resource (TB-2) |
+| The API attributes the sandbox to a subject other than the token's | S | `ClaimRequest` has no subject field (`crates/mediatore-proto/src/lib.rs`); `spec.subject` is built from `Validated.subject` only (`create_sandbox`); e2e `post_creates_an_agentsandbox_with_the_callers_subject` |
+| A claim endpoint reached before the Kubernetes front door exists | E | Fail closed: outside `dev_mode` with no front door the endpoints answer `501` (`AppState.sandboxes`, e2e `without_a_front_door_the_claim_endpoints_fail_closed`) |
+| A sandbox name guessed | I | Names are `sandbox-` + 8 random hex and the subject check is the control, not obscurity: a stranger's guess is `403`, a miss `404`, nothing about the object is returned either way |
 | Token logged | I | Never log tokens, only claims/subjects (`CLAUDE.md` rule; `tracing` calls log uid/audience/subject only) |
 
 ### TB-2: mediatore → Kubernetes API
 
 | Threat | S/T/R/I/D/E | Control |
 | --- | --- | --- |
-| Broker SA stolen → arbitrary-subject claims | S/E | RBAC limits the SA to claims + VM reads: `deploy/base/rbac.yaml`; VAP still validates shape. Residue in §8 R-4 |
-| Anyone else creating a claim for another subject | S | banlieue's `banlieue-claim-subject-policy` VAP (caller-equals-subject unless in `brokers` allowlist); the control lives in the banlieue repo |
+| Broker SA stolen → arbitrary-subject sandboxes and claims | S/E | RBAC limits the SA to `agentsandboxes`, claims, VM reads and its entry lane: `deploy/base/rbac.yaml`; both subject policies exempt it by design (it validates tokens for the subjects it names), so the residue is §8 R-4 |
+| Anyone else creating a claim for another subject | S | banlieue's `banlieue-claim-subject-policy` VAP (caller-equals-subject unless in `brokers`); mediatore's ServiceAccount must be listed there, and is the only principal that creates claims under ADR-0008. The control lives in the banlieue repo |
+| Anyone with `create` on `agentsandboxes` attributing a sandbox, and the tokens minted for it, to another subject | S | `deploy/base/admission/agentsandbox-subject.yaml`: `spec.subject.id`, with the cluster's username prefix, must equal the requesting username, except for the broker ServiceAccount and the `brokers` list (A-9, empty by default); `parameterNotFoundAction: Deny`. Live in kind, as the admin, an impersonated stranger, the listed `e2e-broker` and the ServiceAccount (`dev/kind/sandbox-e2e.sh`, `make kind-e2e-sandbox`) |
+| The spec patched after admission: subject swapped, TTL extended, audiences widened | T | The policy's second validation makes the whole `spec` immutable on update; the reconciler reads it once, at claim creation (`claim_for`, `record_for`); live in kind (`spec is immutable`) |
+| A sandbox naming an audience or issuer the operator never configured, to obtain tokens for it | E | `Watcher::refuse` (`crates/mediatore-claims/src/sandbox.rs`) marks the sandbox `Failed` with the reason and creates neither claim nor record (`an_audience_or_issuer_outside_the_configuration_fails_the_sandbox_without_a_claim`; kind tier `sb-bad`). `WatcherConfig` defaults to no audience and no issuer, so an unconfigured broker refuses everything |
+| A sandbox deleted while its VM still runs, leaving an identity that can mint | E | Finalizer `mediatore.io/sandbox` (`finalize_sandbox`): entry retracted and record revoked (`Reconciler::release`), then the claim deleted, and the finalizer removed only on a pass that finds no claim (`deletion_releases_then_waits_for_the_claim_to_go`; kind tier: entry gone, claim gone, then the object). The claim's owner reference sets `blockOwnerDeletion`, so garbage collection cannot remove it first |
+| An old authorization reused for a second VM once the first claim expired | E | One claim per sandbox, ever: once `status.claimRef` is set a missing claim turns the sandbox `Failed` and nothing is recreated (`a_claim_that_disappears_is_never_recreated`) |
+| A claim of the sandbox's name created by someone else adopted as its own (a stranger's VM given the subject's identity) | S | The reconciler acts only on a claim whose controller owner reference carries the sandbox's UID (`owned_by`); anything else fails the sandbox without a record (`a_claim_of_the_same_name_not_owned_by_the_sandbox_is_refused`). A record is written only for an owned claim, so the watcher never binds the stranger's |
+| A sandbox's status forged by its creator (`ready: true` before the entry exists) | T | `status` is a subresource; RBAC grants `agentsandboxes/status` to the broker ServiceAccount only (`deploy/base/rbac.yaml`); the user API answers from it but nothing downstream trusts it: the guest's identity comes from the entry, the tokens from the record |
 | Broker SA used to declare an entry outside its lane | S/E | See TB-3: the entries admission policy bounds what the SA may declare regardless of who holds its token |
 | A claim bound to the wrong node: an identity issued for a VM the subject did not get | S/E | The watcher resolves a `Bound` claim only by the EK hash of the certificate banlieue mirrored onto it, among nodes that registered that EK over mTLS (`crates/mediatore-claims/src/watch.rs`, `Watcher::resolve`); nothing is guessed. Unresolved for `watcher.resolve_timeout_secs` (default 60) and the record is revoked and the claim deleted (`Watcher::fail`). Tests `a_bound_claim_with_a_registered_node_is_bound_by_its_ek`, `unresolved_is_retried_then_failed_after_the_timeout`, `a_banned_node_or_an_unusable_certificate_fails_the_claim_at_once` |
-| A claim labelled as mediatore's by someone else | S | The label only selects what the watcher reads; a bind still needs a store record for that UID, which only mediatore writes, and a registered node for the EK (`a_claim_without_a_record_binds_nothing`; live in kind, `make kind-e2e-watcher`, the claim without a record). Who may create claims at all is banlieue's claim-subject policy, above |
+| A claim labelled as mediatore's by someone else | S | The label only selects what the watcher reads; a bind still needs a store record for that UID, which only the `AgentSandbox` reconciler writes and only for a claim it owns, and a registered node for the EK (`a_claim_without_a_record_binds_nothing`; live in kind, `make kind-e2e-watcher`, the claim without a record). Who may create claims at all is banlieue's claim-subject policy, above |
 | Two replicas bind or release the same claim | T/D | One leader by `Lease` `mediatore-watcher` (`crates/mediatore-claims/src/lease.rs`; namespaced Role `mediatore-watcher-lease`, `deploy/base/rbac.yaml`): a holder that fails to renew stops its controllers before another can acquire. Second line: `Reconciler::bind` is idempotent and `KubeEntryManager` tolerates 409 |
 | A deleted or expired claim keeps minting tokens | E | `Releasing`, `Failed` or a deletion timestamp releases (entry retracted, record revoked: `releasing_failed_and_deletion_retract_the_entry_and_cut_off`); at every resync the leader releases bound records whose claim is gone and sweeps orphan entries (`Watcher::resync`, `resync_releases_bound_records_whose_claim_is_gone_and_sweeps_orphans`) |
 | Broker SA used to delete claims at will | D | The watcher deletes only a claim it holds a record for and could not resolve within the timeout, logged with the UID and the reason (`Watcher::fail`); RBAC `delete` on `virtualmachineclaims` is what ADR-0008 needs anyway |
@@ -277,6 +300,12 @@ the residue is in §8. No boundary carries the marker as of this pass.
   unresolved bind after 60 s instead of guessing, declares node entries only from
   a published certificate, and runs on one replica elected by a namespaced Lease
   (`crates/mediatore-claims/src/watch.rs`, `src/lease.rs`, `deploy/base/rbac.yaml`).
+- `AgentSandbox`: the subject pinned to the caller at admission and the spec
+  immutable after it (`deploy/base/admission/agentsandbox-subject.yaml`), the
+  `brokers` list empty, one owned claim per sandbox ever, audiences and issuers
+  outside the configuration refused before any claim exists, a finalizer that
+  retracts the entry and revokes the record before the claim goes, no credential
+  on the resource (`crates/mediatore-claims/src/sandbox.rs`).
 
 ## 8. Accepted risks
 
@@ -286,7 +315,7 @@ the residue is in §8. No boundary carries the marker as of this pass.
 | R-2 | Entra OBO / Dex refresh-before-issue is unimplemented, so upstream revocation does not yet propagate to STS issuance | Only the STS backend works, and only in dev where the fake IdP has no sessions | The OBO / refresh path lands (ADR-0003 implementation) |
 | R-3 | A prompt-injected workload can exfiltrate its ≤ 15-min single-audience token | Bounded by TTL, audience allowlist and full attribution; the credential-injecting egress proxy is the designed phase 2 (runbook open decision #7) | The egress-proxy ADR is written |
 | R-4 | mediatore is a single trust point: a compromised broker mints for any active claim | Inherent to the broker pattern; mitigations planned: HSM/transit-held keys, two-person deploy, immutable audit sink | The production deployment ADR (key custody, audit) |
-| R-5 | In-memory store loses claim state on restart: a restarted broker forgets its claims and nodes. Since 2026-10-13 the binary also starts outside `dev_mode` (with a startup warning), where the entries are real `ClusterStaticEntry` resources that outlive the process | Fail-closed consequences only: a forgotten claim cannot be served (`/v1/token` refuses an unknown claim) and `Reconciler::sweep_orphans` retracts its entry; nothing is issued that the store does not know. Since ADR-0011 the watcher is the production binder, but it binds only claims the store holds a record for, and records are created outside `dev_mode` only once ADR-0008 lands: after a restart the resync releases nothing it does not know and `sweep_orphans` retracts the entries | The sqlx store lands (roadmap 05); re-walk §6 TB-3/TB-6 ordering against real persistence |
+| R-5 | In-memory store loses state on restart. Since ADR-0008 the request fields are rebuilt from the `AgentSandbox` resources: the reconciler rewrites the record of a sandbox whose claim still exists and the watcher rebinds it under the same entry name (`a_record_lost_in_a_restart_is_rebuilt_from_the_resource_and_the_claim_rebound`). What is still lost: the node registry (a member must register again before its claim can be rebound; until then the sandbox is `Bound` and not `ready`), revocations the resource does not record, and refresh ciphertext once it exists | Fail-closed consequences only: a claim the store does not know cannot be served (`/v1/token` refuses it), `Reconciler::sweep_orphans` retracts its entry until the rebind, and nothing is issued that the store does not know | The sqlx store lands (roadmap 05); re-walk §6 TB-3/TB-6 ordering against real persistence |
 | R-6 | vTPM EK attestation proves "this vTPM", not "this host"; hypervisor compromise breaks node identity | Same posture as banlieue ADR-0045; hypervisor is in the TCB | PCR / measured-boot selectors become available (runbook open decision #6) |
 | R-7 | Homelab collapse: one flat SPIRE trust domain on the management cluster, no root, no upstream authority: its signing key lives where sandboxes are administered. As deployed (2026-10-03): two servers sharing an external PostgreSQL datastore, each with a self-signed RSA-2048 CA whose key sits on a node-local volume in plaintext, audit log off (chart default) | Single-operator homelab; ADR-0005 records the enterprise topology (root on a dedicated identity cluster, HSM-backed) as the desired state | Any multi-team or production deployment; then split per ADR-0005 and delete this row. Before then: P-384 CA keys and the audit log on |
 | R-8 | Signatures are classical: the STS tokens (ES256) and the SVIDs they bind to (ECDSA or RSA, issued by SPIRE) could be forged by a cryptographically relevant quantum computer. Key exchange is no longer part of this risk: since 2026-10-13 the sandbox leg accepts X25519MLKEM768 only, and every other TLS client mediatore builds offers it first (rustls `prefer-post-quantum`; `ring` banned). What is not ours keeps a classical fallback: the identity provider and the Kubernetes API server choose the group from that offer | Post-quantum signatures are not supported by SPIRE or JOSE implementations yet; the exposure is forgery in the future, not disclosure of recorded traffic. The verifiers already accept ML-DSA SVIDs, so this repo needs no change when SPIRE issues them | ML-DSA support in SPIRE (SVIDs) and in JOSE (STS tokens) |
@@ -317,3 +346,4 @@ the residue is in §8. No boundary carries the marker as of this pass.
 | 2026-10-13 | Roadmap 01 implemented | 0001–0007 | ADR-0006: TB-3 rewritten around `ClusterStaticEntry`, the admission policy and the controller manager, *(stub)* removed, three rows added (unbound entry, unrendered entry, controller manager down); §1 item 3, §2, A-7 and §4 updated. ADR-0007: TB-6 *(stub)* removed, every row cites `crates/mediatore-tls` and the mTLS e2e suite; new TB-8 (broker pod → agent over the CSI mount) and A-8 (broker SVID); TB-4 gains the `ClusterSPIFFEID` selector row; §7 gains five lines. **R-1 deleted**, R-5 widened to the non-dev start, R-8 narrowed to signatures. Diagram: TB-3 through the API server and controller manager, TB-8 on the management node. Same day, post-quantum review: found rustls's `prefer-post-quantum` missing from the feature list (the hybrid was offered last), fixed and pinned by test; the sandbox leg now accepts X25519MLKEM768 and AES-256-GCM-SHA384 only; the identity-provider client is TLS 1.3 only; ML-DSA SVIDs verified end to end against the same verifiers |
 | 2026-10-13 | Roadmap 03: claim watcher (ADR-0011) | 0001–0011 | TB-2 gains five rows (wrong node, forged label, concurrent replicas, deleted claim, SA deleting claims) and TB-4 one (member without a vTPM), every control cited by file and test; §7 one line; R-5 reworded around the watcher; stamp moved to ADR-0011 |
 | 2026-10-13 | ADR-0007 kind tier | 0001–0007 | No control change, no new component or boundary. TB-6 (peer identity forgery, harvest-now-decrypt-later) and TB-8 (another pod with the broker SVID) now also cite the live run against a real agent and the CSI driver (`make kind-e2e-mtls`), which is the evidence ADR-0007 decision 8 was missing. Same-day pass, stamp unchanged |
+| 2026-10-14 | Roadmap 08: `AgentSandbox` (ADR-0008 built) | 0001–0011 | New CRD, admission policy and RBAC. §1 item 2, §2 (user API, reconciler, store, deployment rows), A-7 widened, **A-9 new** (the `brokers` lists), new actor (declarative requester), diagram and TB-2 bullet. TB-1 gains three rows (subject from the token only, fail-closed front door, guessed names) and one reworded; TB-2 gains seven (attribution at admission, immutability, unconfigured audience or issuer, deletion ordering, one claim ever, a stranger's claim, forged status), every control cited by file, test or the kind tier. §7 one item. R-5 narrowed: records are rebuilt from the resource |

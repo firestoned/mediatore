@@ -44,7 +44,7 @@ crates/
 ├── mediatore-entra/    upstream token validation (Entra, Dex), Entra On-Behalf-Of
 ├── mediatore-sts/      self-issued ES256 tokens with an RFC 8693 `act` claim
 ├── mediatore-spire/    SPIRE server API boundary (registration entries)
-├── mediatore-claims/   kube-rs watcher: Bound → entry, Releasing → cut-off
+├── mediatore-claims/   AgentSandbox CRD + reconciler; kube-rs watcher: Bound → entry, Releasing → cut-off
 ├── mediatore-store/    ClaimStore trait + in-memory impl (sqlx next)
 ├── mediatore/          server binary
 ├── mediatore-guest/    in-guest agent (static musl)
@@ -82,11 +82,11 @@ release → cut-off. The remaining edges fail closed (`501 not_implemented`):
 | Guest: node registration, subject fetch, user + jail supervision | implemented; jail path needs a Linux host |
 | Entra OBO exchange | request shape done, untested |
 | SPIRE entries as `ClusterStaticEntry` through the Kubernetes API (ADR-0006, no gRPC) | implemented (`KubeEntryManager`), tested against a scripted fake API server, live against SPIRE in kind on every PR (`make kind-e2e`) and live against a real cluster (`make live-admission-test`), both as the broker ServiceAccount |
-| `VirtualMachineClaim` watch: bind by the EK hash banlieue mirrors onto the claim, release on Releasing / Failed / deletion and at resync, node entries from pool members, one leader by Lease (ADR-0011, `banlieue-api` pinned) | implemented (`mediatore-claims::watch`, `::lease`), unit-tested over the in-memory store and entries, live in kind (`make kind-e2e-watcher`: the Lease, the node-entry trigger, a claim without a record binding nothing); production records arrive with ADR-0008 |
+| `VirtualMachineClaim` watch: bind by the EK hash banlieue mirrors onto the claim, release on Releasing / Failed / deletion and at resync, node entries from pool members, one leader by Lease (ADR-0011, `banlieue-api` pinned) | implemented (`mediatore-claims::watch`, `::lease`), unit-tested over the in-memory store and entries, live in kind (`make kind-e2e-watcher`: the Lease, the node-entry trigger, a claim without a record binding nothing) |
 | SPIFFE mTLS on the sandbox listener, broker SVID from the Workload API over the SPIFFE CSI driver, guests verifying the broker by SPIFFE ID (ADR-0007) | implemented (`mediatore-tls` on rustls, `spiffe` for the Workload API), e2e-tested with a test CA (`make check`) and live against SPIRE in kind on every PR (`make kind-e2e-mtls`: the broker image on the CSI driver's socket, agent-issued client SVIDs on the listener); the `dev_mode` header path is loopback-only |
 | Post-quantum key exchange: X25519MLKEM768 only on the sandbox leg (AES-256-GCM-SHA384 only), offered first everywhere else; ML-DSA SVIDs already verified end to end | implemented, pinned by tests (`crates/mediatore-tls/tests/handshake.rs`); signatures wait on SPIRE and JOSE (threat model R-8) |
 | sqlx store (PostgreSQL / SQLite) | not started |
-| `AgentSandbox` CRD and reconciler, moved from banlieue (ADR-0008) | designed |
+| `AgentSandbox` CRD and reconciler (ADR-0008): one owned `VirtualMachineClaim` per sandbox, the store record keyed by the claim's UID, status mirrored plus `ready`, the subject pinned to the caller at admission, a finalizer that releases before the object goes; `POST /v1/claims` creates the resource | implemented (`mediatore-claims::sandbox`, `deploy/base/crds`, `deploy/base/admission/agentsandbox-subject.yaml`), unit-tested, the user API e2e-tested over a fake API server, live in kind on every PR (`make kind-e2e-sandbox`: policy, owned claim, bind to Ready with the guest fetching the subject, finalizer) |
 
 ## Development
 

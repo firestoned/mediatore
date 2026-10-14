@@ -25,7 +25,7 @@ flowchart LR
     system-mediatore["mediatore"]
     service-mediatore-user-api["User API (bearer)"]
     service-mediatore-sandbox-api["Sandbox API (SPIFFE mTLS)"]
-    service-mediatore-watcher["Claim Watcher"]
+    service-mediatore-watcher["Claim Watcher and AgentSandbox Reconciler"]
     service-mediatore-sts["STS"]
     data-asset-agentsandbox-cr["AgentSandbox resources"]
     data-asset-claim-store["Claim Store"]

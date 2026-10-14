@@ -2,6 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Least privilege for the broker ServiceAccount:
+# - AgentSandbox (ADR-0008): the user API creates and deletes them for the
+#   subjects it validated; the reconciler reads them and patches the status
+#   and its finalizer. `agentsandboxes/finalizers` update is what the API
+#   server's owner-references plugin demands for the claim's
+#   blockOwnerDeletion. The subject admission policy exempts this
+#   ServiceAccount from the caller-equals-subject check; its token validation
+#   is the control there.
 # - VirtualMachineClaim: create/delete/watch (ADR-0002); status read for binding.
 # - VirtualMachine: read-only, for node resolution and the EK certificate
 #   (banlieue ADR-0045) the node entry is derived from.
@@ -15,6 +22,15 @@ kind: ClusterRole
 metadata:
   name: mediatore
 rules:
+  - apiGroups: ["mediatore.io"]
+    resources: ["agentsandboxes"]
+    verbs: ["get", "list", "watch", "patch", "create", "delete"]
+  - apiGroups: ["mediatore.io"]
+    resources: ["agentsandboxes/status"]
+    verbs: ["patch"]
+  - apiGroups: ["mediatore.io"]
+    resources: ["agentsandboxes/finalizers"]
+    verbs: ["update"]
   - apiGroups: ["banlieue.io"]
     resources: ["virtualmachineclaims"]
     verbs: ["get", "list", "watch", "create", "delete"]

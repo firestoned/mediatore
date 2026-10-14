@@ -4,9 +4,9 @@
 # All CI logic lives here (rules/github-workflows.md): workflows install tools
 # and call these targets, and every target runs identically locally.
 
-.PHONY: all help fmt fmt-check lint test deny audit check sbom guest dist image e2e live-admission-test \
+.PHONY: all help fmt fmt-check lint test deny audit check sbom guest dist image crds e2e live-admission-test \
         kind-install kind-create kind-delete kind-down kind-spire kind-deploy kind-up \
-        kind-images kind-broker kind-banlieue-crds kind-e2e-entries kind-e2e-mtls kind-e2e-watcher \
+        kind-images kind-broker kind-banlieue-crds kind-e2e-entries kind-e2e-mtls kind-e2e-watcher kind-e2e-sandbox \
         kind-e2e kind-e2e-ci kind-e2e-logs \
         calm-validate calm-diagrams docs docs-serve docs-clean clean
 
@@ -92,6 +92,9 @@ dist: ## Host-built musl binaries into dist/ (what the images copy with BINARY_F
 image: ## Build the server container image locally (the binary is compiled inside the image)
 	$(CONTAINER_CLI) build -t ghcr.io/firestoned/mediatore:dev .
 
+crds: ## Render mediatore's CRDs from their Rust types into deploy/base/crds/ (ADR-0008; never hand-edited, a unit test fails on a stale file)
+	cargo run -q -p mediatore-claims --bin crdgen -- --out-dir deploy/base/crds
+
 # ----- End to end --------------------------------------------------------------
 
 e2e: ## Front-to-back dev-mode loop with real binaries (fake IdP, server, guest, sandbox-token)
@@ -152,9 +155,9 @@ kind-spire: kind-create ## Install SPIRE (server, controller manager, agent, CSI
 	@$(KIND_KUBECTL) -n spire-system rollout status daemonset/spire-agent --timeout=300s
 	@echo "✓ SPIRE $(SPIRE_CHART_VERSION) up; controller manager className $(SPIRE_CLASS_NAME)"
 
-kind-deploy: kind-create ## Apply the broker's ServiceAccount, RBAC and admission policy; mint its kubeconfig
+kind-deploy: kind-create ## Apply the broker's CRD, ServiceAccount, RBAC and admission policies; mint its kubeconfig
 	@$(KIND_KUBECTL) get ns banlieue-system >/dev/null 2>&1 || $(KIND_KUBECTL) create ns banlieue-system
-	$(KIND_KUBECTL) apply -n banlieue-system -f deploy/base/serviceaccount.yaml -f deploy/base/rbac.yaml -f deploy/base/admission/clusterstaticentry-mediatore.yaml
+	$(KIND_KUBECTL) apply -n banlieue-system -f deploy/base/crds -f deploy/base/serviceaccount.yaml -f deploy/base/rbac.yaml -f deploy/base/admission/clusterstaticentry-mediatore.yaml -f deploy/base/admission/agentsandbox-subject.yaml
 	@./dev/kind/sa-kubeconfig.sh $(KIND_KUBECONFIG) $(KIND_SA_KUBECONFIG)
 
 kind-up: kind-create kind-spire kind-deploy ## Cluster + SPIRE + the broker's identity, ready for the live tests
@@ -193,7 +196,12 @@ kind-e2e-watcher: kind-banlieue-crds kind-broker ## ADR-0011 live: the Lease, a 
 	$(KIND_KUBECTL) -n banlieue-system rollout status deploy/mediatore --timeout=300s
 	./dev/kind/watcher-e2e.sh $(KIND_KUBECONFIG) $(SPIRE_TRUST_DOMAIN) $(KIND_DIR)/ek.pem $(KIND_DIR)/ek.hash
 
-kind-e2e: kind-e2e-entries kind-e2e-mtls kind-e2e-watcher ## Every live suite against kind (grows with the roadmap)
+kind-e2e-sandbox: kind-banlieue-crds kind-broker ## ADR-0008 live: the subject policy, an AgentSandbox becoming an owned claim and a record, bound to a claim entry, deleted through the finalizer
+	$(KIND_KUBECTL) -n banlieue-system rollout restart deploy/mediatore
+	$(KIND_KUBECTL) -n banlieue-system rollout status deploy/mediatore --timeout=300s
+	./dev/kind/sandbox-e2e.sh $(KIND_KUBECONFIG) $(KIND_SA_KUBECONFIG) $(SPIRE_TRUST_DOMAIN) $(KIND_DIR)/ek.pem $(KIND_DIR)/ek.hash
+
+kind-e2e: kind-e2e-entries kind-e2e-mtls kind-e2e-watcher kind-e2e-sandbox ## Every live suite against kind (grows with the roadmap)
 
 kind-e2e-ci: ## CI shape: the suites, cluster state on failure, cluster deleted after
 	@$(MAKE) kind-e2e || { $(MAKE) kind-e2e-logs; $(MAKE) kind-delete; exit 1; }
@@ -207,7 +215,9 @@ kind-e2e-logs: ## What a failing live suite needs: entries, policy, broker and c
 	-$(KIND_KUBECTL) -n mediatore-e2e get pods -o wide
 	-$(KIND_KUBECTL) -n banlieue-system get lease mediatore-watcher -o yaml
 	-$(KIND_KUBECTL) -n mediatore-e2e-watcher get virtualmachines,virtualmachineclaims -o yaml
-	-$(KIND_KUBECTL) get validatingadmissionpolicy mediatore-clusterstaticentry -o yaml
+	-$(KIND_KUBECTL) -n mediatore-e2e-sandbox get agentsandboxes,virtualmachineclaims,pods -o yaml
+	-$(KIND_KUBECTL) -n mediatore-e2e-sandbox logs pod/node --tail=50
+	-$(KIND_KUBECTL) get validatingadmissionpolicy mediatore-clusterstaticentry mediatore-agentsandbox-subject -o yaml
 	-$(KIND_KUBECTL) -n $(SPIRE_NAMESPACE) logs statefulset/spire-server -c spire-controller-manager --tail=200
 	-$(KIND_KUBECTL) -n $(SPIRE_NAMESPACE) logs statefulset/spire-server -c spire-server --tail=100
 	-$(KIND_KUBECTL) get pods -A

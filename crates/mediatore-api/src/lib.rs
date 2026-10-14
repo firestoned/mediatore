@@ -5,6 +5,9 @@
 //!
 //! Two routers, meant to be served on two listeners:
 //! * [`user_router`]: `POST/GET/DELETE /v1/claims`, authenticated by an upstream bearer token.
+//!   Outside `dev_mode` the record of a request is an `AgentSandbox` resource (ADR-0008):
+//!   `POST` creates one with the token's subject, `GET` answers from its status, `DELETE`
+//!   deletes it and the reconciler's finalizer does the rest.
 //! * [`sandbox_router`]: `POST /v1/nodes`, `GET /v1/me`, `POST /v1/token`, authenticated by
 //!   the peer's SPIFFE ID from mTLS.
 //!
@@ -20,8 +23,13 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
+use banlieue_api::common::LocalObjectReference;
 use chrono::{Duration, Utc};
 use mediatore_claims::Reconciler;
+use mediatore_claims::sandbox::{
+    AgentSandbox, AgentSandboxSpec, FrontDoorError, SandboxFrontDoor, SandboxSubject,
+    SandboxWorkload, chrono_of,
+};
 use mediatore_entra::{Validated, Validator};
 use mediatore_proto::ek::is_ek_hash;
 use mediatore_proto::{
@@ -51,6 +59,12 @@ pub struct AppState {
     pub sts: Option<Sts>,
     /// Audiences we are allowed to serve, from config.
     pub audiences: Vec<String>,
+    /// `AgentSandbox` resources through the Kubernetes API (ADR-0008); `None` under
+    /// `dev_mode`, where the store and the dev binder stand in. Absent outside `dev_mode`,
+    /// the claim endpoints fail closed with `501`.
+    pub sandboxes: Option<Arc<dyn SandboxFrontDoor>>,
+    /// Namespace `POST /v1/claims` creates sandboxes in; the pool must live there.
+    pub sandbox_namespace: String,
     /// Accept a peer-identity header instead of mTLS. Never in production.
     pub dev_mode: bool,
 }
@@ -101,6 +115,20 @@ impl ApiError {
             "internal",
             Some(detail.into()),
         )
+    }
+    fn not_found(detail: impl Into<String>) -> Self {
+        Self::new(StatusCode::NOT_FOUND, "not_found", Some(detail.into()))
+    }
+}
+
+impl From<FrontDoorError> for ApiError {
+    fn from(e: FrontDoorError) -> Self {
+        match e {
+            FrontDoorError::Conflict(d) => Self::new(StatusCode::CONFLICT, "conflict", Some(d)),
+            FrontDoorError::Denied(d) => Self::forbidden(d),
+            FrontDoorError::Invalid(d) => Self::bad_request("invalid_request", d),
+            FrontDoorError::Api(d) => Self::internal(d),
+        }
     }
 }
 
@@ -236,18 +264,15 @@ async fn create_claim(
             "ttl_seconds must be positive",
         ));
     }
+    let name = format!(
+        "sandbox-{}",
+        &Uuid::new_v4().simple().to_string()[..CLAIM_NAME_SUFFIX_LEN]
+    );
     if !st.dev_mode {
-        // Next: create the VirtualMachineClaim via kube-rs and let the watcher bind it.
-        return Err(ApiError::not_implemented(
-            "claim creation via the kubernetes api",
-        ));
+        return create_sandbox(&st, &validated, &name, &req).await;
     }
 
     let uid = Uuid::new_v4();
-    let name = format!(
-        "claim-{}",
-        &uid.simple().to_string()[..CLAIM_NAME_SUFFIX_LEN]
-    );
     st.store
         .put_claim(ClaimRecord {
             uid,
@@ -287,10 +312,86 @@ async fn create_claim(
             name,
             uid: Some(uid),
             phase: phase_of(&rec),
+            ready: rec.entry_id.is_some() && rec.revoked_at.is_none(),
             expires_at: rec.expires_at,
             addresses: vec![],
         }),
     ))
+}
+
+/// The production front door (ADR-0008 decision 4): the request becomes an `AgentSandbox`
+/// in the configured namespace, `spec.subject` from the validated token. mediatore's
+/// `ServiceAccount` is exempt from the subject admission check for exactly this, so the
+/// token validation above is the control.
+async fn create_sandbox(
+    st: &AppState,
+    validated: &Validated,
+    name: &str,
+    req: &ClaimRequest,
+) -> Result<(StatusCode, Json<ClaimResponse>), ApiError> {
+    let Some(front) = st.sandboxes.as_ref() else {
+        return Err(ApiError::not_implemented(
+            "claim creation via the kubernetes api",
+        ));
+    };
+    let mut sandbox = AgentSandbox::new(
+        name,
+        AgentSandboxSpec {
+            subject: SandboxSubject::from(&validated.subject),
+            pool_ref: LocalObjectReference {
+                name: req.pool_ref.clone(),
+            },
+            ttl_seconds: req.ttl_seconds,
+            audiences: req.audiences.clone(),
+            workload: SandboxWorkload::from(&req.workload),
+        },
+    );
+    sandbox.metadata.namespace = Some(st.sandbox_namespace.clone());
+    let created = front.create(sandbox).await?;
+    tracing::info!(subject = %validated.subject.id, pool = %req.pool_ref, sandbox = %name, namespace = %st.sandbox_namespace, "sandbox created");
+    Ok((StatusCode::CREATED, Json(response_of(&created))))
+}
+
+/// What the user sees of a sandbox: its status, mirrored from the claim (decision 11).
+fn response_of(sb: &AgentSandbox) -> ClaimResponse {
+    let st = sb.status.clone().unwrap_or_default();
+    ClaimResponse {
+        name: sb.metadata.name.clone().unwrap_or_default(),
+        uid: st
+            .claim_uid
+            .as_deref()
+            .and_then(|u| Uuid::parse_str(u).ok()),
+        phase: st.phase.into(),
+        ready: st.ready,
+        expires_at: st.expires_at.as_ref().and_then(chrono_of),
+        addresses: st.addresses,
+    }
+}
+
+/// Fetch a sandbox by name and require the caller to be its subject. A sandbox that does
+/// not exist and one that belongs to someone else are told apart (404 / 403): the names
+/// are random and the subject check is the control, not obscurity.
+async fn owned_sandbox(
+    st: &AppState,
+    headers: &HeaderMap,
+    name: &str,
+) -> Result<AgentSandbox, ApiError> {
+    let validated = caller(st, headers).await?;
+    let Some(front) = st.sandboxes.as_ref() else {
+        return Err(ApiError::not_implemented(
+            "claim lookup via the kubernetes api",
+        ));
+    };
+    let sb = front
+        .get(&st.sandbox_namespace, name)
+        .await?
+        .ok_or_else(|| ApiError::not_found(format!("no sandbox named {name}")))?;
+    if sb.spec.subject.issuer != validated.subject.issuer
+        || sb.spec.subject.id != validated.subject.id
+    {
+        return Err(ApiError::forbidden("claim belongs to another subject"));
+    }
+    Ok(sb)
 }
 
 /// Fetch a claim by name and require the caller to be its subject.
@@ -304,7 +405,7 @@ async fn owned_claim(
         .store
         .get_claim_by_name(name)
         .await
-        .map_err(|e| ApiError::new(StatusCode::NOT_FOUND, "not_found", Some(e.to_string())))?;
+        .map_err(|e| ApiError::not_found(e.to_string()))?;
     if rec.subject.issuer != validated.subject.issuer || rec.subject.id != validated.subject.id {
         return Err(ApiError::forbidden("claim belongs to another subject"));
     }
@@ -316,11 +417,16 @@ async fn get_claim(
     headers: HeaderMap,
     Path(name): Path<String>,
 ) -> Result<Json<ClaimResponse>, ApiError> {
+    if !st.dev_mode {
+        let sb = owned_sandbox(&st, &headers, &name).await?;
+        return Ok(Json(response_of(&sb)));
+    }
     let rec = owned_claim(&st, &headers, &name).await?;
     Ok(Json(ClaimResponse {
         name: rec.name.clone(),
         uid: Some(rec.uid),
         phase: phase_of(&rec),
+        ready: rec.entry_id.is_some() && rec.revoked_at.is_none(),
         expires_at: rec.expires_at,
         addresses: vec![],
     }))
@@ -331,6 +437,18 @@ async fn delete_claim(
     headers: HeaderMap,
     Path(name): Path<String>,
 ) -> Result<StatusCode, ApiError> {
+    if !st.dev_mode {
+        let sb = owned_sandbox(&st, &headers, &name).await?;
+        // The reconciler's finalizer retracts the entry, revokes the record and deletes
+        // the claim (ADR-0008 decision 10); the API only asks.
+        st.sandboxes
+            .as_ref()
+            .ok_or_else(|| ApiError::not_implemented("claim deletion via the kubernetes api"))?
+            .delete(&st.sandbox_namespace, &name)
+            .await?;
+        tracing::info!(sandbox = %name, subject = %sb.spec.subject.id, "sandbox deleted by its subject");
+        return Ok(StatusCode::NO_CONTENT);
+    }
     let rec = owned_claim(&st, &headers, &name).await?;
     reconciler(&st)
         .release(rec.uid)

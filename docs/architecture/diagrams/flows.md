@@ -30,7 +30,7 @@ The happy path from login to a delegated downstream call: login, claim, bind, su
 flowchart TD
     t1["1. User logs in; receives a token with aud = mediatore."]
     t2["2. POST /v1/claims; mediatore validates the token and derives the subject."]
-    t3["3. mediatore creates an AgentSandbox with spec.subject; its reconciler creates the owned VirtualMachineClaim (ADR-0008, designed; today the claim is created directly)."]
+    t3["3. mediatore creates an AgentSandbox with spec.subject; its reconciler creates the owned VirtualMachineClaim and the store record keyed by the claim's UID (ADR-0008)."]
     t4["4. banlieue binds a Ready, already-attested pool member and mirrors its EK certificate onto the claim."]
     t5["5. The watcher hashes the EK certificate's public key, resolves the node, and declares the claim's ClusterStaticEntry (admission policy checks the shape)."]
     t6["6. The controller manager renders the entry over the private socket and reports status.set; the watcher marks the claim live."]

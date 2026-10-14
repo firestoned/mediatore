@@ -124,11 +124,15 @@ pub enum ClaimPhase {
 pub struct ClaimResponse {
     /// Kubernetes object name.
     pub name: String,
-    /// Kubernetes object UID once persisted.
+    /// The claim's UID, once the claim exists: the key of the claim's SPIFFE identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uid: Option<Uuid>,
     /// Current phase.
     pub phase: ClaimPhase,
+    /// `Bound` and the claim's registration entry is set: the sandbox can fetch its SVID
+    /// (ADR-0008 decision 11).
+    #[serde(default)]
+    pub ready: bool,
     /// Deadline, once bound.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<DateTime<Utc>>,

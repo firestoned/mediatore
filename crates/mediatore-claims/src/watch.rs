@@ -5,10 +5,10 @@
 //! events drive [`Reconciler::bind`] and [`Reconciler::release`] and declare node entries.
 //!
 //! One [`Watcher`] holds the reconciler and the per-claim state (when a `Bound` claim was
-//! first seen unresolved). Its two reconcile functions are plain async methods, tested
-//! against the in-memory store and entries; [`run`] wraps them in kube-runtime
-//! `Controller`s and is meant to execute on the replica holding the Lease
-//! (`crate::lease`).
+//! first seen unresolved). Its reconcile functions (two here, the `AgentSandbox` one in
+//! [`crate::sandbox`]) are plain async methods, tested against the in-memory store and
+//! entries; [`run`] wraps them in kube-runtime `Controller`s and is meant to execute on
+//! the replica holding the Lease (`crate::lease`).
 //!
 //! What binds a claim: its `metadata.uid` is the claim UID, and the node is the one that
 //! registered under the EK hash of the certificate banlieue mirrored onto the claim.
@@ -24,7 +24,7 @@ use banlieue_api::banlieue::{
     ClaimPhase as BanlieuePhase, LABEL_POOL, VirtualMachine, VirtualMachineClaim,
 };
 use futures::StreamExt;
-use kube::api::{DeleteParams, ListParams};
+use kube::api::{DeleteParams, ListParams, Patch, PatchParams, PostParams};
 use kube::runtime::controller::{Action, Controller};
 use kube::runtime::watcher;
 use kube::{Api, Client, ResourceExt};
@@ -34,20 +34,28 @@ use mediatore_spire::SpireError;
 use mediatore_store::StoreError;
 use uuid::Uuid;
 
+use crate::sandbox::{AgentSandbox, AgentSandboxStatus, FINALIZER};
 use crate::{Action as Intent, Reconciler, next_action};
 
 /// Label mediatore puts on every object it creates; the watcher looks at nothing else.
 pub const MANAGED_BY_SELECTOR: &str = "app.kubernetes.io/managed-by=mediatore";
 
-/// Timings (ADR-0011 decisions 3 and 4).
+/// Timings (ADR-0011 decisions 3 and 4) and what an `AgentSandbox` may ask for
+/// (ADR-0008 decision 7). The defaults configure nothing: a sandbox naming any audience
+/// or issuer is refused until `mediatore.yaml` lists them (fail closed).
 #[derive(Clone, Debug)]
 pub struct WatcherConfig {
     /// Between resyncs: release records whose claim is gone, sweep orphan entries.
     pub resync: Duration,
     /// How long a `Bound` claim may stay unresolved before it is failed.
     pub resolve_timeout: Duration,
-    /// Between retries while unresolved.
+    /// Between retries while unresolved, and between polls of a sandbox whose claim is
+    /// `Bound` but whose entry is not set yet.
     pub requeue: Duration,
+    /// Audiences mediatore serves; a sandbox may request a subset.
+    pub audiences: Vec<String>,
+    /// Issuers mediatore trusts; a sandbox's subject must come from one.
+    pub issuers: Vec<String>,
 }
 
 impl Default for WatcherConfig {
@@ -56,18 +64,45 @@ impl Default for WatcherConfig {
             resync: Duration::from_secs(300),
             resolve_timeout: Duration::from_secs(60),
             requeue: Duration::from_secs(5),
+            audiences: vec![],
+            issuers: vec![],
         }
     }
 }
 
-/// The two writes the watcher makes to claims through the API, behind a trait so the
-/// reconcile logic is tested without a cluster.
+/// What the controllers write through the API (claims, and the `AgentSandbox` status and
+/// finalizer), behind a trait so the reconcile logic is tested without a cluster.
 #[async_trait]
 pub trait ClaimsApi: Send + Sync + 'static {
     /// Delete a claim; one that is already gone is success.
     async fn delete_claim(&self, namespace: &str, name: &str) -> Result<(), WatchError>;
     /// UIDs of every managed claim that exists, for the resync.
     async fn list_claim_uids(&self) -> Result<HashSet<Uuid>, WatchError>;
+    /// One claim, if it exists.
+    async fn get_claim(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> Result<Option<VirtualMachineClaim>, WatchError>;
+    /// Create a claim; a name already taken returns the existing object.
+    async fn create_claim(
+        &self,
+        claim: VirtualMachineClaim,
+    ) -> Result<VirtualMachineClaim, WatchError>;
+    /// Replace a sandbox's status (the `status` subresource).
+    async fn patch_sandbox_status(
+        &self,
+        namespace: &str,
+        name: &str,
+        status: &AgentSandboxStatus,
+    ) -> Result<(), WatchError>;
+    /// Add or remove mediatore's finalizer on a sandbox, against the version `sandbox`
+    /// carries (a concurrent change is a conflict, retried by the controller).
+    async fn set_sandbox_finalizer(
+        &self,
+        sandbox: &AgentSandbox,
+        present: bool,
+    ) -> Result<(), WatchError>;
 }
 
 /// The real thing.
@@ -100,6 +135,82 @@ impl ClaimsApi for KubeClaimsApi {
             .await
             .map_err(|e| WatchError::Api(e.to_string()))?;
         Ok(list.items.iter().filter_map(claim_uid_of).collect())
+    }
+
+    async fn get_claim(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> Result<Option<VirtualMachineClaim>, WatchError> {
+        Api::<VirtualMachineClaim>::namespaced(self.client.clone(), namespace)
+            .get_opt(name)
+            .await
+            .map_err(|e| WatchError::Api(e.to_string()))
+    }
+
+    async fn create_claim(
+        &self,
+        claim: VirtualMachineClaim,
+    ) -> Result<VirtualMachineClaim, WatchError> {
+        let namespace = claim.namespace().unwrap_or_default();
+        let api = Api::<VirtualMachineClaim>::namespaced(self.client.clone(), &namespace);
+        match api.create(&PostParams::default(), &claim).await {
+            Ok(created) => Ok(created),
+            Err(kube::Error::Api(e)) if e.code == 409 => api
+                .get(&claim.name_any())
+                .await
+                .map_err(|e| WatchError::Api(e.to_string())),
+            Err(e) => Err(WatchError::Api(e.to_string())),
+        }
+    }
+
+    async fn patch_sandbox_status(
+        &self,
+        namespace: &str,
+        name: &str,
+        status: &AgentSandboxStatus,
+    ) -> Result<(), WatchError> {
+        Api::<AgentSandbox>::namespaced(self.client.clone(), namespace)
+            .patch_status(
+                name,
+                &PatchParams::default(),
+                &Patch::Merge(serde_json::json!({ "status": status })),
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| WatchError::Api(e.to_string()))
+    }
+
+    async fn set_sandbox_finalizer(
+        &self,
+        sandbox: &AgentSandbox,
+        present: bool,
+    ) -> Result<(), WatchError> {
+        let namespace = sandbox.namespace().unwrap_or_default();
+        let mut finalizers: Vec<String> = sandbox
+            .finalizers()
+            .iter()
+            .filter(|f| *f != FINALIZER)
+            .cloned()
+            .collect();
+        if present {
+            finalizers.push(FINALIZER.to_owned());
+        }
+        // A merge patch carrying the resourceVersion is an optimistic update: a concurrent
+        // change is a 409, and the controller retries.
+        let patch = serde_json::json!({ "metadata": {
+            "resourceVersion": sandbox.resource_version(),
+            "finalizers": finalizers,
+        }});
+        Api::<AgentSandbox>::namespaced(self.client.clone(), &namespace)
+            .patch(
+                &sandbox.name_any(),
+                &PatchParams::default(),
+                &Patch::Merge(patch),
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| WatchError::Api(e.to_string()))
     }
 }
 
@@ -139,9 +250,9 @@ enum Resolution {
 
 /// The reconciler, the claims API and the per-claim wait clock.
 pub struct Watcher {
-    reconciler: Reconciler,
-    claims: Arc<dyn ClaimsApi>,
-    cfg: WatcherConfig,
+    pub(crate) reconciler: Reconciler,
+    pub(crate) claims: Arc<dyn ClaimsApi>,
+    pub(crate) cfg: WatcherConfig,
     first_unresolved: Mutex<HashMap<Uuid, Instant>>,
     declared: Mutex<HashSet<String>>,
 }
@@ -177,8 +288,15 @@ impl Watcher {
         let record = match self.reconciler.store.get_claim(uid).await {
             Ok(r) => r,
             Err(StoreError::NotFound(_)) => {
+                // A Bound claim's record may be about to arrive (the sandbox reconciler
+                // writes it right after creating the claim, ADR-0008); nothing else raises
+                // an event here when it does, so poll. Anything not Bound has nothing to do.
                 tracing::debug!(%uid, %name, %namespace, ?phase, "claim without a record; held");
-                return Ok(Action::await_change());
+                return Ok(if phase == ClaimPhase::Bound && !deleting {
+                    Action::requeue(self.cfg.requeue)
+                } else {
+                    Action::await_change()
+                });
             }
             Err(e) => return Err(e.into()),
         };
@@ -350,10 +468,33 @@ pub fn phase_of(claim: &VirtualMachineClaim) -> ClaimPhase {
     }
 }
 
-/// Both controllers and the resync ticker, until the first one ends (they do not end on
-/// their own). Run this on the Lease holder only.
+/// The three controllers (claims, pool members, sandboxes) and the resync ticker, until
+/// the first one ends (they do not end on their own). Run this on the Lease holder only.
 pub async fn run(client: Client, watcher: Arc<Watcher>) -> anyhow::Result<()> {
     let requeue = watcher.config().requeue;
+    let sandboxes = Controller::new(
+        Api::<AgentSandbox>::all(client.clone()),
+        watcher::Config::default(),
+    )
+    // A change to the owned claim (banlieue's status writes, its deletion) reconciles the
+    // sandbox that owns it.
+    .owns(
+        Api::<VirtualMachineClaim>::all(client.clone()),
+        watcher::Config::default().labels(MANAGED_BY_SELECTOR),
+    )
+    .run(
+        |sb, w: Arc<Watcher>| async move { w.reconcile_sandbox(&sb).await },
+        move |sb, err, _| {
+            tracing::warn!(sandbox = %sb.name_any(), error = %err, "sandbox reconcile failed; retrying");
+            Action::requeue(requeue)
+        },
+        watcher.clone(),
+    )
+    .for_each(|r| async move {
+        if let Err(e) = r {
+            tracing::warn!(error = %e, "sandbox controller");
+        }
+    });
     let claims = Controller::new(
         Api::<VirtualMachineClaim>::all(client.clone()),
         watcher::Config::default().labels(MANAGED_BY_SELECTOR),
@@ -403,6 +544,7 @@ pub async fn run(client: Client, watcher: Arc<Watcher>) -> anyhow::Result<()> {
     tokio::select! {
         () = claims => {}
         () = machines => {}
+        () = sandboxes => {}
         () = resync => {}
     }
     anyhow::bail!("claim watcher stopped")
@@ -412,63 +554,15 @@ pub async fn run(client: Client, watcher: Arc<Watcher>) -> anyhow::Result<()> {
 mod tests {
     use chrono::Utc;
     use mediatore_proto::{Subject, Workload};
-    use mediatore_spire::{EntryManager, MemoryEntries, Naming, claim_entry_name, node_entry_name};
-    use mediatore_store::{ClaimRecord, ClaimStore, MemoryStore, NodeRecord};
+    use mediatore_spire::{EntryManager, claim_entry_name, node_entry_name};
+    use mediatore_store::{ClaimRecord, ClaimStore};
     use mediatore_testkit::ek::{RSA_EK_HASH, RSA_EK_PEM};
     use serde_json::json;
 
     use super::*;
+    use crate::fakes::{node, rig};
 
     const UID: &str = "6b0a3e9c-1f4d-4c2e-9a7b-0d1e2f3a4b5c";
-
-    struct FakeClaims {
-        existing: Mutex<HashSet<Uuid>>,
-        deleted: Mutex<Vec<(String, String)>>,
-    }
-
-    #[async_trait]
-    impl ClaimsApi for FakeClaims {
-        async fn delete_claim(&self, namespace: &str, name: &str) -> Result<(), WatchError> {
-            self.deleted
-                .lock()
-                .unwrap()
-                .push((namespace.into(), name.into()));
-            Ok(())
-        }
-        async fn list_claim_uids(&self) -> Result<HashSet<Uuid>, WatchError> {
-            Ok(self.existing.lock().unwrap().clone())
-        }
-    }
-
-    struct Rig {
-        watcher: Watcher,
-        store: Arc<MemoryStore>,
-        entries: Arc<MemoryEntries>,
-        claims: Arc<FakeClaims>,
-    }
-
-    fn rig(cfg: WatcherConfig) -> Rig {
-        let store = Arc::new(MemoryStore::default());
-        let entries = Arc::new(MemoryEntries::default());
-        let claims = Arc::new(FakeClaims {
-            existing: Mutex::new(HashSet::new()),
-            deleted: Mutex::new(vec![]),
-        });
-        let reconciler = Reconciler {
-            store: store.clone(),
-            spire: entries.clone(),
-            naming: Naming {
-                trust_domain: "sandbox.test".into(),
-            },
-        };
-        let watcher = Watcher::new(reconciler, claims.clone(), cfg);
-        Rig {
-            watcher,
-            store,
-            entries,
-            claims,
-        }
-    }
 
     fn record(uid: Uuid) -> ClaimRecord {
         ClaimRecord {
@@ -491,18 +585,6 @@ mod tests {
             created_at: Utc::now(),
             expires_at: None,
             revoked_at: None,
-        }
-    }
-
-    fn node(ek_hash: &str, banned: bool) -> NodeRecord {
-        NodeRecord {
-            ek_hash: ek_hash.into(),
-            node_id: format!("spiffe://sandbox.test/spire/agent/tpm/{ek_hash}"),
-            dmi_uuid: Uuid::new_v4(),
-            hostname: "member".into(),
-            provider: None,
-            banned,
-            registered_at: Utc::now(),
         }
     }
 
@@ -588,19 +670,27 @@ mod tests {
 
     #[tokio::test]
     async fn a_claim_without_a_record_binds_nothing() {
-        let r = rig(WatcherConfig::default());
+        let r = rig(WatcherConfig {
+            requeue: Duration::from_millis(5),
+            ..WatcherConfig::default()
+        });
         r.store.put_node(node(RSA_EK_HASH, false)).await.unwrap();
+        // Bound: polled, in case the record is about to be written.
         let action = r
             .watcher
             .reconcile_claim(&claim("Bound", &[RSA_EK_PEM], false))
             .await
             .unwrap();
+        assert_eq!(action, Action::requeue(Duration::from_millis(5)));
+        // Pending: nothing to wait for.
+        let action = r
+            .watcher
+            .reconcile_claim(&claim("Pending", &[], false))
+            .await
+            .unwrap();
         assert_eq!(action, Action::await_change());
         assert_eq!(r.entries.names(), Vec::<String>::new());
-        assert_eq!(
-            *r.claims.deleted.lock().unwrap(),
-            Vec::<(String, String)>::new()
-        );
+        assert_eq!(r.claims.deleted(), Vec::<(String, String)>::new());
     }
 
     #[tokio::test]
@@ -625,10 +715,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(action, Action::requeue(Duration::from_millis(5)));
-        assert_eq!(
-            *r.claims.deleted.lock().unwrap(),
-            Vec::<(String, String)>::new()
-        );
+        assert_eq!(r.claims.deleted(), Vec::<(String, String)>::new());
         tokio::time::sleep(Duration::from_millis(70)).await;
         let action = r
             .watcher
@@ -641,7 +728,7 @@ mod tests {
         assert!(rec.entry_id.is_none(), "no entry was ever declared");
         assert_eq!(r.entries.names(), Vec::<String>::new());
         assert_eq!(
-            *r.claims.deleted.lock().unwrap(),
+            r.claims.deleted(),
             vec![("sandboxes".to_owned(), "claim-x".to_owned())]
         );
     }
@@ -665,7 +752,7 @@ mod tests {
                 .unwrap();
             assert_eq!(action, Action::await_change());
             assert!(r.store.get_claim(uid()).await.unwrap().revoked_at.is_some());
-            assert_eq!(r.claims.deleted.lock().unwrap().len(), 1);
+            assert_eq!(r.claims.deleted().len(), 1);
             assert_eq!(r.entries.names(), Vec::<String>::new());
         }
     }
@@ -701,7 +788,7 @@ mod tests {
                 "{phase}: revoked"
             );
             assert_eq!(
-                *r.claims.deleted.lock().unwrap(),
+                r.claims.deleted(),
                 Vec::<(String, String)>::new(),
                 "release never deletes the claim"
             );
@@ -794,7 +881,7 @@ mod tests {
             .create_claim_entry(RSA_EK_HASH, Uuid::new_v4(), "sb-0123456789ab")
             .await
             .unwrap();
-        r.claims.existing.lock().unwrap().insert(kept);
+        r.claims.mark_existing(kept);
         let (released, swept) = r.watcher.resync().await.unwrap();
         assert_eq!((released, swept), (1, 1));
         assert!(r.store.get_claim(gone).await.unwrap().revoked_at.is_some());

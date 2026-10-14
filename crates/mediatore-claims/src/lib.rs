@@ -1,13 +1,16 @@
 // Copyright (c) 2026 Erick Bourgeois, mediatore
 // SPDX-License-Identifier: Apache-2.0
 
-//! Claim lifecycle: watch banlieue `VirtualMachineClaim`s and react (ADR-0011).
+//! Claim lifecycle: the `AgentSandbox` resource (ADR-0008) and the watch on banlieue's
+//! `VirtualMachineClaim` (ADR-0011).
 //!
-//! On `Bound`: resolve the node by the EK hash of the certificate banlieue mirrored onto the
-//! claim, declare the claim's registration entry (ADR-0006) and record it. On
-//! `Releasing`/`Failed`/deletion: retract the entry and revoke the record. Order: entry
-//! first, then refresh material. The state machine and the [`Reconciler`] are here; the
-//! typed watch over `banlieue-api` is [`watch`], and [`lease`] elects the replica that runs it.
+//! An `AgentSandbox` ([`sandbox`]) is the request: its reconciler creates and owns one claim
+//! and the store record keyed by the claim's UID. On `Bound`: resolve the node by the EK
+//! hash of the certificate banlieue mirrored onto the claim, declare the claim's
+//! registration entry (ADR-0006) and record it. On `Releasing`/`Failed`/deletion: retract
+//! the entry and revoke the record. Order: entry first, then refresh material. The state
+//! machine and the [`Reconciler`] are here; the typed watches over `banlieue-api` are
+//! [`watch`], and [`lease`] elects the replica that runs them.
 
 use std::sync::Arc;
 
@@ -17,7 +20,10 @@ use mediatore_spire::{EntryKind, EntryManager, Naming};
 use mediatore_store::{ClaimStore, StoreError};
 use uuid::Uuid;
 
+#[cfg(test)]
+pub(crate) mod fakes;
 pub mod lease;
+pub mod sandbox;
 pub mod watch;
 
 /// Decision for one observed claim.
@@ -124,7 +130,6 @@ impl Reconciler {
     }
 }
 
-/// Connect to the cluster. The typed watch on `VirtualMachineClaim` is added once
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
