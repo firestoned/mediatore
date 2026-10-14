@@ -27,6 +27,13 @@ curl -sS https://mediatore.sandbox.example/v1/claims \
 # {"name":"sandbox-3f9a1c2e","phase":"Pending","ready":false,"addresses":[]}
 ```
 
+For an issuer configured with a `session` (Dex in the homelab,
+[ADR-0013](../adr/0013-dex-session-delegation.md)) the body also carries the caller's
+`refresh_token`, which mediatore seals and keeps in its store, never on the resource, and
+refreshes before every token it mints for the sandbox; `mediatore-cli claim` does this for
+you (see [Running workloads](running-workloads.md)). A claim without it is refused with
+`400 session_required`; one for an issuer that takes none, with `400 session_unexpected`.
+
 `GET /v1/claims/sandbox-3f9a1c2e` answers from the resource's status: `phase` mirrors the
 claim, `uid` is the claim's UID once the claim exists, `ready` is true once the claim is
 `Bound` and its registration entry is set. `DELETE` deletes the resource; the finalizer

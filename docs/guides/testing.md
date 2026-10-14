@@ -12,6 +12,7 @@ a real cluster address or a real credential in a tracked file.
 | --- | --- | --- | --- |
 | Unit | `make check` | Every crate's own contract, over fakes that validate like production | everywhere, every commit |
 | Dev-mode loop | `make e2e` | The four shipped binaries agree on the wire contract as separate processes | everywhere, every PR |
+| Session e2e | `make check` (`crates/mediatore/tests/e2e_session.rs`) | The Dex path (ADR-0013) over real listeners against the fake issuer's real authorization-code and refresh grants: delegation, rotation, fresh groups, outage, revocation, the group gate at refresh, the per-claim limit; the CLI's PKCE login in `crates/mediatore-cli` | everywhere, every commit |
 | Live against SPIRE in kind | `make kind-e2e` | Kubernetes, the SPIRE Controller Manager and the admission policy behave as the ADRs say, as the broker's own ServiceAccount; the broker image runs on the CSI driver's socket and agent-issued SVIDs meet on the sandbox listener | CI on every PR, any laptop with a container runtime |
 | Live against a real cluster | `make live-admission-test` | The same, against a deployment you operate | by hand, before a release or after changing the deployment |
 

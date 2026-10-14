@@ -91,6 +91,16 @@ refresh material fails that claim rather than store plaintext. The homelab shape
 the wrapping key in the broker's memory; the work shape, an OpenBao transit sealer that
 never does, lands with roadmap 04, the first roadmap that has a refresh token to seal.
 
+A session issuer ([ADR-0013](../adr/0013-dex-session-delegation.md)) is where envelopes
+come from today: the refresh token `POST /v1/claims` receives is sealed with the
+`AgentSandbox` UID (the associated data, so the envelope opens only for that sandbox's
+record) and parked in `sessions` until the reconciler creates the record and moves it
+there; `claims.sandbox_uid` records which UID opens it. Every `POST /v1/token` opens the
+envelope, refreshes upstream, and re-seals the rotated token. A session no record ever
+took (a refused or deleted sandbox) is removed by the reconciler, and anything older than
+an hour is swept at resync. An issuer with a `session` block and no `sealing` key refuses
+to start.
+
 ## Retention and the audit table
 
 A claim row outlives its claim by `retention_secs` (default one hour). At every resync

@@ -12,6 +12,7 @@ members = [
   "crates/mediatore",
   "crates/mediatore-guest",
   "crates/sandbox-token",
+  "crates/mediatore-cli",
   "crates/mediatore-testkit",
 ]
 

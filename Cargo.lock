@@ -2167,6 +2167,7 @@ dependencies = [
  "anyhow",
  "axum",
  "banlieue-api",
+ "base64 0.23.1",
  "chrono",
  "clap",
  "jsonwebtoken",
@@ -2196,6 +2197,7 @@ dependencies = [
 name = "mediatore-api"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "axum",
  "banlieue-api",
  "chrono",
@@ -2237,6 +2239,24 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "mediatore-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "aws-lc-rs",
+ "base64 0.23.1",
+ "clap",
+ "mediatore-proto",
+ "mediatore-testkit",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "tokio",
  "uuid",
 ]
 
@@ -2367,6 +2387,7 @@ dependencies = [
  "rcgen",
  "rustls",
  "serde_json",
+ "sha2 0.11.1",
  "time",
  "tokio",
  "uuid",

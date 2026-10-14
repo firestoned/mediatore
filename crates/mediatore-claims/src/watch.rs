@@ -448,6 +448,15 @@ impl Watcher {
         let before = chrono::Utc::now()
             - chrono::Duration::from_std(self.config().retention).unwrap_or(chrono::Duration::MAX);
         let archived = self.reconciler.store.sweep(before).await?;
+        // Sessions parked by the API that no record ever took (ADR-0013 decision 2).
+        let stale = self
+            .reconciler
+            .store
+            .sweep_sessions(chrono::Utc::now() - chrono::Duration::seconds(SESSION_GRACE_SECS))
+            .await?;
+        if stale > 0 {
+            tracing::info!(stale, "stale sessions swept");
+        }
         self.declared
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -455,6 +464,9 @@ impl Watcher {
         Ok((released, swept, archived))
     }
 }
+
+/// How long a parked session may wait for its record before the resync sweeps it.
+const SESSION_GRACE_SECS: i64 = 3600;
 
 /// The claim UID (ADR-0011 decision 1): the object's `metadata.uid`.
 #[must_use]
@@ -596,6 +608,7 @@ mod tests {
             created_at: Utc::now(),
             expires_at: None,
             revoked_at: None,
+            sandbox_uid: None,
         }
     }
 

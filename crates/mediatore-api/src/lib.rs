@@ -16,6 +16,7 @@
 //! `dev_mode` server, on a plain loopback listener, reads it from `x-mediatore-peer-spiffe-id`
 //! instead.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
@@ -30,7 +31,7 @@ use mediatore_claims::sandbox::{
     AgentSandbox, AgentSandboxSpec, FrontDoorError, SandboxFrontDoor, SandboxSubject,
     SandboxWorkload, chrono_of,
 };
-use mediatore_entra::{Validated, Validator};
+use mediatore_entra::{IdpError, Validated, Validator};
 use mediatore_proto::ek::is_ek_hash;
 use mediatore_proto::{
     ClaimPhase, ClaimRequest, ClaimResponse, ErrorBody, Me, NodeRegistered, NodeRegistration,
@@ -38,7 +39,7 @@ use mediatore_proto::{
 };
 use mediatore_spire::{EntryManager, Naming};
 use mediatore_store::seal::Sealer;
-use mediatore_store::{ClaimRecord, ClaimStore, NodeRecord, StoreError};
+use mediatore_store::{ClaimRecord, ClaimStore, NodeRecord, SessionRecord, StoreError};
 use mediatore_sts::{MintRequest, Sts};
 use mediatore_tls::PeerSpiffeId;
 use uuid::Uuid;
@@ -69,8 +70,72 @@ pub struct AppState {
     /// Seals refresh material before it reaches the store (ADR-0012 decision 3); `None`
     /// until `store.sealing` is configured. Roadmap 04 brings its first caller.
     pub sealer: Option<Arc<dyn Sealer>>,
+    /// Per-claim limit on `POST /v1/token` (ADR-0013 decision 5).
+    pub limiter: Limiter,
     /// Accept a peer-identity header instead of mTLS. Never in production.
     pub dev_mode: bool,
+}
+
+/// The per-claim gate on `POST /v1/token`: a token bucket (`per_minute` issues a minute,
+/// the same number as the burst) and a lock that serialises the upstream refresh, since
+/// the issuer rotates the refresh token and two concurrent issues must not both spend
+/// the same one. In process memory, per replica.
+pub struct Limiter {
+    per_minute: u32,
+    buckets: std::sync::Mutex<HashMap<Uuid, (f64, std::time::Instant)>>,
+    locks: std::sync::Mutex<HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+/// Buckets idle this long are dropped when the table is pruned.
+const BUCKET_IDLE: std::time::Duration = std::time::Duration::from_secs(600);
+/// Prune the table past this many claims.
+const BUCKET_PRUNE_AT: usize = 4096;
+
+impl Limiter {
+    /// `per_minute` issues a minute per claim (at least 1).
+    #[must_use]
+    pub fn new(per_minute: u32) -> Self {
+        Self {
+            per_minute: per_minute.max(1),
+            buckets: std::sync::Mutex::new(HashMap::new()),
+            locks: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The lock a refresh for `claim_uid` runs under.
+    pub fn refresh_lock(&self, claim_uid: Uuid) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self
+            .locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if locks.len() > BUCKET_PRUNE_AT {
+            locks.retain(|_, l| Arc::strong_count(l) > 1);
+        }
+        locks.entry(claim_uid).or_default().clone()
+    }
+
+    /// Spend one issue for `claim_uid` if the bucket has it.
+    pub fn allow(&self, claim_uid: Uuid) -> bool {
+        let now = std::time::Instant::now();
+        let cap = f64::from(self.per_minute);
+        let mut buckets = self
+            .buckets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if buckets.len() > BUCKET_PRUNE_AT {
+            buckets.retain(|_, (_, last)| now.duration_since(*last) < BUCKET_IDLE);
+        }
+        let (tokens, last) = buckets.entry(claim_uid).or_insert((cap, now));
+        let refill = now.duration_since(*last).as_secs_f64() / 60.0 * cap;
+        *tokens = (*tokens + refill).min(cap);
+        *last = now;
+        if *tokens >= 1.0 {
+            *tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// Shared handle.
@@ -270,6 +335,27 @@ async fn create_claim(
     if let Some(bad) = req.audiences.iter().find(|a| !st.audiences.contains(a)) {
         return Err(ApiError::bad_request("unknown_audience", bad.clone()));
     }
+    // ADR-0013 decision 1: a session issuer requires the delegation, any other refuses it.
+    match (&validated.issuer.session, &req.refresh_token) {
+        (Some(_), None) => {
+            return Err(ApiError::bad_request(
+                "session_required",
+                "this issuer requires a refresh_token to be delegated with the claim",
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(ApiError::bad_request(
+                "session_unexpected",
+                "this issuer takes no refresh_token",
+            ));
+        }
+        _ => {}
+    }
+    let sealer = match (&validated.issuer.session, st.sealer.as_ref()) {
+        (Some(_), None) => return Err(ApiError::not_implemented("sealing")),
+        (Some(_), Some(s)) => Some(s.clone()),
+        (None, _) => None,
+    };
     if req.ttl_seconds == 0 {
         return Err(ApiError::bad_request(
             "invalid_ttl",
@@ -281,10 +367,20 @@ async fn create_claim(
         &Uuid::new_v4().simple().to_string()[..CLAIM_NAME_SUFFIX_LEN]
     );
     if !st.dev_mode {
-        return create_sandbox(&st, &validated, &name, &req).await;
+        return create_sandbox(&st, &validated, &name, &req, sealer.as_deref()).await;
     }
 
     let uid = Uuid::new_v4();
+    // The dev binder writes the record itself, so the envelope binds to the record's UID.
+    let refresh = match (sealer.as_deref(), &req.refresh_token) {
+        (Some(sealer), Some(token)) => Some(
+            sealer
+                .seal(uid, token.0.as_bytes())
+                .await
+                .map_err(|e| ApiError::internal(e.to_string()))?,
+        ),
+        _ => None,
+    };
     st.store
         .put_claim(ClaimRecord {
             uid,
@@ -295,10 +391,11 @@ async fn create_claim(
             audiences: req.audiences.clone(),
             workload: req.workload.clone(),
             ttl_seconds: req.ttl_seconds,
-            refresh: None,
+            refresh,
             created_at: Utc::now(),
             expires_at: None,
             revoked_at: None,
+            sandbox_uid: None,
         })
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
@@ -340,6 +437,7 @@ async fn create_sandbox(
     validated: &Validated,
     name: &str,
     req: &ClaimRequest,
+    sealer: Option<&dyn Sealer>,
 ) -> Result<(StatusCode, Json<ClaimResponse>), ApiError> {
     let Some(front) = st.sandboxes.as_ref() else {
         return Err(ApiError::not_implemented(
@@ -361,7 +459,46 @@ async fn create_sandbox(
     sandbox.metadata.namespace = Some(st.sandbox_namespace.clone());
     let created = front.create(sandbox).await?;
     tracing::info!(subject = %validated.subject.id, pool = %req.pool_ref, sandbox = %name, namespace = %st.sandbox_namespace, "sandbox created");
+    // ADR-0013 decision 2: the session is parked under the sandbox's UID, sealed with it,
+    // before the caller hears back; a failure here undoes the resource.
+    if let (Some(sealer), Some(token)) = (sealer, &req.refresh_token)
+        && let Err(e) = park_session(st, sealer, &created, validated, token).await
+    {
+        tracing::warn!(sandbox = %name, error = %e, "session not parked; sandbox withdrawn");
+        if let Err(d) = front.delete(&st.sandbox_namespace, name).await {
+            tracing::warn!(sandbox = %name, error = %d, "sandbox withdrawal failed");
+        }
+        return Err(ApiError::internal("session could not be stored"));
+    }
     Ok((StatusCode::CREATED, Json(response_of(&created))))
+}
+
+/// Seal `token` with the sandbox's UID and park it until the reconciler creates the record.
+async fn park_session(
+    st: &AppState,
+    sealer: &dyn Sealer,
+    created: &AgentSandbox,
+    validated: &Validated,
+    token: &mediatore_proto::Secret,
+) -> anyhow::Result<()> {
+    let sandbox_uid = created
+        .metadata
+        .uid
+        .as_deref()
+        .and_then(|u| Uuid::parse_str(u).ok())
+        .ok_or_else(|| anyhow::anyhow!("the created sandbox has no UUID uid"))?;
+    let refresh = sealer.seal(sandbox_uid, token.0.as_bytes()).await?;
+    st.store
+        .put_session(SessionRecord {
+            sandbox_uid,
+            subject: validated.subject.clone(),
+            issuer: validated.issuer.url.clone(),
+            refresh,
+            created_at: Utc::now(),
+        })
+        .await?;
+    tracing::info!(%sandbox_uid, subject = %validated.subject.id, "session parked");
+    Ok(())
 }
 
 /// What the user sees of a sandbox: its status, mirrored from the claim (decision 11).
@@ -573,6 +710,81 @@ async fn me(
     }))
 }
 
+/// Refresh the delegated session behind `rec` and re-seal the rotated token into it.
+/// `invalid_grant` or a fresh token that fails the gate releases the claim (entry
+/// retracted, record revoked) and answers `403`; an issuer outage answers `503` and
+/// releases nothing. Returns the groups the fresh token carries.
+async fn refresh_session(
+    st: &AppState,
+    rec: &ClaimRecord,
+    issuer: &mediatore_entra::IssuerConfig,
+) -> Result<Vec<String>, ApiError> {
+    let Some(envelope) = rec.refresh.as_ref() else {
+        return Err(ApiError::forbidden("no delegated session for this claim"));
+    };
+    let Some(sealer) = st.sealer.as_ref() else {
+        return Err(ApiError::not_implemented("sealing"));
+    };
+    let plaintext = sealer
+        .unseal(rec.seal_binding(), envelope)
+        .await
+        .map_err(|e| {
+            tracing::warn!(claim_uid = %rec.uid, error = %e, "session envelope did not open");
+            ApiError::forbidden("delegated session unreadable")
+        })?;
+    let token = std::str::from_utf8(&plaintext)
+        .map_err(|_| ApiError::forbidden("delegated session unreadable"))?;
+    let refreshed = match st.validator.refresh(issuer, token).await {
+        Ok(r) if r.validated.subject.id == rec.subject.id => r,
+        Ok(_) => {
+            tracing::warn!(claim_uid = %rec.uid, "refreshed session names another subject; claim released");
+            release_quietly(st, rec.uid).await;
+            return Err(session_revoked());
+        }
+        Err(IdpError::SessionRevoked(why) | IdpError::Forbidden(why)) => {
+            tracing::warn!(claim_uid = %rec.uid, subject = %rec.subject.id, %why, "upstream session refused; claim released");
+            release_quietly(st, rec.uid).await;
+            return Err(session_revoked());
+        }
+        Err(e) => {
+            tracing::warn!(claim_uid = %rec.uid, error = %e, "upstream refresh unavailable");
+            return Err(ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "upstream_unavailable",
+                Some("the identity provider did not answer the refresh".to_owned()),
+            ));
+        }
+    };
+    let envelope = sealer
+        .seal(rec.seal_binding(), refreshed.refresh_token.as_bytes())
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let mut updated = rec.clone();
+    updated.refresh = Some(envelope);
+    st.store
+        .update_claim(updated)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(refreshed.validated.groups)
+}
+
+/// `403 session_revoked`: the delegated session is gone and so is the claim.
+fn session_revoked() -> ApiError {
+    ApiError::new(
+        StatusCode::FORBIDDEN,
+        "session_revoked",
+        Some("the upstream session was refused; the claim is released".to_owned()),
+    )
+}
+
+/// `Reconciler::release` for a refusal, logged rather than surfaced: the caller is told
+/// `403` either way, and a store or entry error here must not hide the revocation.
+async fn release_quietly(st: &AppState, claim_uid: Uuid) {
+    if let Err(e) = reconciler(st).release(claim_uid).await {
+        tracing::error!(%claim_uid, error = %e, "release after an upstream refusal failed");
+    }
+}
+
 async fn token(
     State(st): State<Shared>,
     headers: HeaderMap,
@@ -595,8 +807,35 @@ async fn token(
     if !rec.audiences.iter().any(|a| a == &req.audience) {
         return Err(ApiError::bad_request("unknown_audience", req.audience));
     }
+    if !st.limiter.allow(claim_uid) {
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limited",
+            Some("too many token requests for this claim".to_owned()),
+        ));
+    }
     let Some(sts) = st.sts.as_ref() else {
         return Err(ApiError::not_implemented("entra-obo backend"));
+    };
+    // ADR-0013 decision 4: a session issuer's record is refreshed upstream first; the
+    // fresh token's groups are what the minted token carries. One refresh at a time per
+    // claim, over the record as it is once the lock is held: the previous one may have
+    // rotated the envelope, or released the claim.
+    let groups = match st.validator.issuer_named(&rec.subject.issuer) {
+        Some(issuer) if issuer.session.is_some() => {
+            let lock = st.limiter.refresh_lock(claim_uid);
+            let _held = lock.lock().await;
+            let rec = st
+                .store
+                .get_claim(claim_uid)
+                .await
+                .map_err(|_| ApiError::forbidden("unknown claim"))?;
+            if !rec.is_live(Utc::now()) {
+                return Err(ApiError::forbidden("claim revoked or expired"));
+            }
+            refresh_session(&st, &rec, issuer).await?
+        }
+        _ => vec![],
     };
     let minted = sts
         .mint(&MintRequest {
@@ -604,7 +843,7 @@ async fn token(
             actor_spiffe_id: &peer,
             claim_uid,
             audience: &req.audience,
-            groups: vec![],
+            groups,
             ttl: Duration::minutes(15).min(sts.max_ttl()),
         })
         .map_err(|e| ApiError::internal(e.to_string()))?;
@@ -627,4 +866,23 @@ pub fn sandbox_router(state: Shared) -> Router {
         .route("/v1/token", post(token))
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_limiter_allows_the_burst_then_refuses_per_claim() {
+        let l = Limiter::new(3);
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        assert!(l.allow(a) && l.allow(a) && l.allow(a));
+        assert!(!l.allow(a), "the burst is spent");
+        assert!(l.allow(b), "another claim has its own bucket");
+        assert!(
+            Limiter::new(0).allow(a),
+            "zero means one a minute, never none"
+        );
+    }
 }

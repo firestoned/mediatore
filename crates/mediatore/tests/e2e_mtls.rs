@@ -15,7 +15,7 @@ use std::future::IntoFuture;
 use std::sync::Arc;
 use std::time::Duration;
 
-use mediatore_api::AppState;
+use mediatore_api::{AppState, Limiter};
 use mediatore_entra::{Backend, IssuerConfig, Validator};
 use mediatore_proto::{
     ClaimRequest, ClaimResponse, Me, NodeRegistered, NodeRegistration, TokenRequest, TokenResponse,
@@ -74,12 +74,14 @@ fn state(idp: &FakeIdp, dev_mode: bool) -> Arc<AppState> {
             client_id: "mediatore".into(),
             subject_claim: "preferred_username".into(),
             required_group: Some(REQUIRED_GROUP.into()),
+            session: None,
         }]),
         sts: Some(sts),
         audiences: vec![AUDIENCE.into()],
         sandboxes: None,
         sandbox_namespace: "sandboxes".into(),
         sealer: None,
+        limiter: Limiter::new(10),
         dev_mode,
     })
 }
@@ -207,6 +209,7 @@ impl Harness {
                     image: "registry.internal:5000/sandbox:latest".into(),
                     args: vec![],
                 },
+                refresh_token: None,
             })
             .send()
             .await

@@ -91,6 +91,17 @@ pub struct Workload {
     pub args: Vec<String>,
 }
 
+/// A credential in a request body: serialises as the plain string, never prints.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Secret(pub String);
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[redacted]")
+    }
+}
+
 /// `POST /v1/claims` body, sent by a user or agent with an `IdP` bearer token.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClaimRequest {
@@ -104,6 +115,11 @@ pub struct ClaimRequest {
     pub audiences: Vec<String>,
     /// What to run.
     pub workload: Workload,
+    /// The caller's upstream refresh token, delegated to mediatore so it can refresh the
+    /// session before every issue (ADR-0013). Required for an issuer configured with a
+    /// `session`, refused for any other. Sealed before it is stored; never returned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_token: Option<Secret>,
 }
 
 /// Claim lifecycle as mirrored from banlieue.
@@ -228,6 +244,7 @@ mod tests {
                 image: "registry/sandbox:latest".into(),
                 args: vec![],
             },
+            refresh_token: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let back: ClaimRequest = serde_json::from_str(&json).unwrap();

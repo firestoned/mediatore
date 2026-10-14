@@ -207,6 +207,27 @@ impl Default for StoreSection {
     }
 }
 
+/// `POST /v1/token` limits (ADR-0013 decision 5).
+#[derive(Debug, Clone, Deserialize)]
+pub struct TokenSection {
+    /// Issues one claim may ask for per minute, and the burst it may spend at once
+    /// (default 10). Checked before any upstream refresh.
+    #[serde(default = "default_rate_per_minute")]
+    pub rate_per_minute: u32,
+}
+
+fn default_rate_per_minute() -> u32 {
+    10
+}
+
+impl Default for TokenSection {
+    fn default() -> Self {
+        Self {
+            rate_per_minute: default_rate_per_minute(),
+        }
+    }
+}
+
 /// Top-level config.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
@@ -237,6 +258,9 @@ pub struct Config {
     /// The claim store (ADR-0012).
     #[serde(default)]
     pub store: StoreSection,
+    /// Token issuance limits (ADR-0013).
+    #[serde(default)]
+    pub token: TokenSection,
 }
 
 fn default_listen() -> ListenConfig {
@@ -297,6 +321,17 @@ impl Config {
             }
         }
         cfg.check_store()?;
+        if cfg.token.rate_per_minute == 0 {
+            anyhow::bail!("token.rate_per_minute must be positive");
+        }
+        if let Some(i) = cfg.issuers.iter().find(|i| i.session.is_some())
+            && cfg.store.sealing.is_none()
+        {
+            anyhow::bail!(
+                "issuer {} requires a delegated session, which is sealed before it is stored: set store.sealing.key_file (ADR-0013)",
+                i.url
+            );
+        }
         Ok(cfg)
     }
 }
@@ -524,6 +559,34 @@ store: {{ url: \"sqlite:///var/lib/mediatore/store.db\" }}
         ))
         .unwrap_err();
         assert!(err.to_string().contains("max_connections"), "{err}");
+    }
+
+    #[test]
+    fn a_session_issuer_needs_a_sealing_key_and_the_rate_limit_is_positive() {
+        let issuer = "issuers:
+  - url: https://dex.home.example
+    backend: sts
+    client_id: mediatore
+    subject_claim: preferred_username
+    session: { client_id: mediatore }
+";
+        let base = "trust_domain: sandbox.test\naudiences: []\nlisten: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }\ndev_mode: true\n";
+        let err = Config::parse(&format!("{base}{issuer}")).unwrap_err();
+        assert!(err.to_string().contains("store.sealing"), "{err}");
+        let cfg = Config::parse(&format!(
+            "{base}{issuer}store: {{ sealing: {{ key_file: /etc/mediatore-sealing/key }} }}\n"
+        ))
+        .unwrap();
+        assert_eq!(cfg.token.rate_per_minute, 10);
+        assert_eq!(
+            cfg.issuers[0].session.as_ref().unwrap().client_id,
+            "mediatore"
+        );
+        let err = Config::parse(&format!(
+            "{BASE}dev_mode: true\ntoken: {{ rate_per_minute: 0 }}\n"
+        ))
+        .unwrap_err();
+        assert!(err.to_string().contains("rate_per_minute"), "{err}");
     }
 
     #[test]

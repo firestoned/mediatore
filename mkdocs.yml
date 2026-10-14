@@ -158,5 +158,6 @@ nav:
       - "ADR-0010: No inbound to sandboxes": adr/0010-no-inbound-to-sandboxes.md
       - "ADR-0011: The claim watcher": adr/0011-claim-watcher.md
       - "ADR-0012: The persistent store": adr/0012-persistent-store.md
+      - "ADR-0013: The Dex path, the session delegated": adr/0013-dex-session-delegation.md
   - Security:
       - Threat model: security/threat-model.md

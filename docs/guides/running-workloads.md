@@ -37,17 +37,31 @@ If you need interactivity, the workload dials **out** (see
    TOKEN=$(az account get-access-token --scope api://mediatore/sandbox.access \
              --query accessToken -o tsv)
 
-   # Dex (homelab): PKCE flow, cross-client audience
-   TOKEN=$(mediatore-cli login)
+   # Dex (homelab): PKCE flow as mediatore's own public client, loopback redirect
+   mediatore-cli login --issuer https://dex.home.example
    ```
 
    The token's `aud` is mediatore and (on Entra) `scp` contains `sandbox.access`.
-   A kubectl/kubelogin token for the Kubernetes API does **not** work here — wrong
+   A kubectl/kubelogin token for the Kubernetes API does **not** work here: wrong
    audience, rejected with 401 by design.
+
+   On Dex the login also yields a refresh token (`offline_access`), which the next
+   step delegates to mediatore: an issuer configured with a `session` requires it, and
+   mediatore refreshes the session before every token it mints for the sandbox, so a
+   login revoked at Dex, or removed from the required group, stops the sandbox at its
+   next token ([ADR-0013](../adr/0013-dex-session-delegation.md)). The CLI forgets the
+   refresh token once delegated (Dex rotates it); a second claim is a second login.
 
 2. Claim, naming the workload:
 
    ```bash
+   # Dex: the CLI posts the claim with the session delegated
+   mediatore-cli claim --mediatore https://mediatore.sandbox.example \
+     --pool pool-a --ttl 3600 --audience api://trading-data \
+     --image registry.internal:5000/sandbox/claude:latest \
+     --arg /usr/bin/claude --arg -p --arg "reconcile the ledgers"
+
+   # Entra, or any issuer without a session: the same call by hand
    curl -sS https://mediatore.sandbox.example/v1/claims \
      -H "Authorization: Bearer $TOKEN" \
      -d '{
@@ -150,10 +164,13 @@ Two properties worth noticing:
   Access / revocation applies to the whole chain.
 
 **Homelab note (Dex):** Dex has no OBO. The equivalent is the `trustedPeers`
-cross-client flow — the agent's Dex client lists `mediatore` in its audience request
+cross-client flow: the agent's Dex client lists `mediatore` in its audience request
 (`audience:server:client_id:mediatore` scope), producing an ID token with
 `aud: [agent, mediatore]` and the user's login as subject. Same shape, weaker
-attestation of the agent; acceptable at homelab trust levels.
+attestation of the agent; acceptable at homelab trust levels. Such a token logs in,
+but a session issuer also needs a refresh token issued to mediatore's own client
+(ADR-0013 decision 3), which an agent gets by running the same PKCE flow as the CLI
+against the `mediatore` client.
 
 ## Path C: a service with an app-only JWT (another Entra app)
 
@@ -215,12 +232,14 @@ Because nothing inbound reaches the VM, pick one of:
 
 ## Status and caveats
 
-- Implemented today (dev mode, `make e2e`): the whole loop with the peer identity
-  faked; path A end to end against the fake IdP.
-- Roadmap 01 makes the SVID legs real (mTLS); 02 gives VMs a real SPIRE server to
-  attest to; 03 makes the claim a real `VirtualMachineClaim`; 04 turns on OBO
-  (paths B and C at work) and Dex refresh (homelab); 06 adds the OCI unpack and the
-  egress allowlist. See [`ROADMAPS.md`](https://github.com/firestoned/mediatore/blob/main/ROADMAPS.md).
+- Implemented today: path A end to end on Dex-shaped issuers, with the session
+  delegated and refreshed before every issue (ADR-0013, `make check` runs it against
+  the fake issuer's real grants); the SVID legs over SPIFFE mTLS (roadmap 01); the
+  claim as a real `VirtualMachineClaim` behind an `AgentSandbox` (roadmaps 03 and 08);
+  the persistent store (roadmap 05).
+- Still to come: roadmap 04's Entra half (OBO for paths B and C at work, the transit
+  sealer); 02 gives VMs a real SPIRE server to attest to; 06 adds the OCI unpack and
+  the egress allowlist. See [`ROADMAPS.md`](https://github.com/firestoned/mediatore/blob/main/ROADMAPS.md).
 - Threat model: the exfiltration window of the 15-minute in-workload token is
   accepted risk R-3; the dial-out pattern narrows what a leaked token can do
   (one audience), and roadmap 07 is the design that removes the window entirely.

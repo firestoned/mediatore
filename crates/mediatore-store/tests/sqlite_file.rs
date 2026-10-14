@@ -31,6 +31,7 @@ fn claim(uid: Uuid) -> ClaimRecord {
         created_at: Utc::now(),
         expires_at: None,
         revoked_at: None,
+        sandbox_uid: None,
     }
 }
 

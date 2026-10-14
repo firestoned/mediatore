@@ -48,7 +48,8 @@ crates/
 ├── mediatore-store/    ClaimStore trait; sqlx store over SQLite or PostgreSQL; sealed refresh envelope; in-memory impl for dev_mode
 ├── mediatore/          server binary
 ├── mediatore-guest/    in-guest agent (static musl)
-└── sandbox-token/      workload-side CLI (static musl)
+├── sandbox-token/      workload-side CLI (static musl)
+└── mediatore-cli/      user-side CLI: PKCE login at the issuer, claims with the session delegated (ADR-0013)
 deploy/                 raw manifests (kustomize), Traefik IngressRoute
 image/                  systemd units + cloud-config fragments baked into the VM image
 docs/adr/               architecture decision records
@@ -80,7 +81,8 @@ release → cut-off. The remaining edges fail closed (`501 not_implemented`):
 | JWKS validation of upstream tokens (discovery, cache, kid rotation, group gate) | implemented, tested against a fake IdP |
 | Claim lifecycle in `dev_mode` (create, dev bind either order, mirror, release) | implemented, e2e-tested |
 | Guest: node registration, subject fetch, user + jail supervision | implemented; jail path needs a Linux host |
-| Entra OBO exchange | request shape done, untested |
+| Dex path (ADR-0013): the session delegated with the claim as a sealed envelope, refreshed before every issue with the fresh groups minted, `invalid_grant` or a failed group gate releasing the claim at once, an outage a `503` that revokes nothing, per-claim rate limiting, `mediatore-cli` (PKCE as mediatore's public client) | implemented (`mediatore-entra::Validator::refresh`, `mediatore-api`, `mediatore-cli`), e2e-tested against the fake issuer's real authorization-code and refresh grants (`crates/mediatore/tests/e2e_session.rs`); a Dex in kind is the next slice |
+| Entra OBO exchange | request shape done, untested; next slice of roadmap 04 |
 | SPIRE entries as `ClusterStaticEntry` through the Kubernetes API (ADR-0006, no gRPC) | implemented (`KubeEntryManager`), tested against a scripted fake API server, live against SPIRE in kind on every PR (`make kind-e2e`) and live against a real cluster (`make live-admission-test`), both as the broker ServiceAccount |
 | `VirtualMachineClaim` watch: bind by the EK hash banlieue mirrors onto the claim, release on Releasing / Failed / deletion and at resync, node entries from pool members, one leader by Lease (ADR-0011, `banlieue-api` pinned) | implemented (`mediatore-claims::watch`, `::lease`), unit-tested over the in-memory store and entries, live in kind (`make kind-e2e-watcher`: the Lease, the node-entry trigger, a claim without a record binding nothing) |
 | SPIFFE mTLS on the sandbox listener, broker SVID from the Workload API over the SPIFFE CSI driver, guests verifying the broker by SPIFFE ID (ADR-0007) | implemented (`mediatore-tls` on rustls, `spiffe` for the Workload API), e2e-tested with a test CA (`make check`) and live against SPIRE in kind on every PR (`make kind-e2e-mtls`: the broker image on the CSI driver's socket, agent-issued client SVIDs on the listener); the `dev_mode` header path is loopback-only |
