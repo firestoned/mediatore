@@ -1,11 +1,12 @@
 // Copyright (c) 2026 Erick Bourgeois, mediatore
 // SPDX-License-Identifier: Apache-2.0
 
-//! Persistence boundary for mediatore.
+//! Persistence boundary for mediatore (ADR-0012).
 //!
-//! The server only ever talks to [`ClaimStore`]; `MemoryStore` is for tests and single-node
-//! homelab use. A `sqlx`-backed implementation (PostgreSQL at work, SQLite at home) slots in
-//! behind the same trait.
+//! The server only ever talks to [`ClaimStore`]. [`sql::SqlStore`] is the shipped
+//! implementation, one query set over SQLite or PostgreSQL chosen by the URL; `MemoryStore`
+//! is for `dev_mode` and tests, and the conformance suite holds it to the SQL store's
+//! behaviour. Refresh material enters the store only as a [`seal::Sealed`] envelope.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -16,6 +17,13 @@ use mediatore_proto::{Provider, Subject, Workload};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use uuid::Uuid;
+
+#[cfg(test)]
+mod conformance;
+pub mod seal;
+pub mod sql;
+
+pub use seal::Sealed;
 
 /// Errors from any store implementation.
 #[derive(Debug, thiserror::Error)]
@@ -31,7 +39,8 @@ pub enum StoreError {
     Backend(String),
 }
 
-/// One claim mediatore has brokered.
+/// One claim mediatore has brokered. The request fields are a copy of the `AgentSandbox`
+/// spec (ADR-0008); the resource is their source of truth.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClaimRecord {
     /// Kubernetes UID of the `VirtualMachineClaim`.
@@ -51,9 +60,10 @@ pub struct ClaimRecord {
     pub workload: Workload,
     /// Requested lifetime; the deadline counts from bind.
     pub ttl_seconds: u32,
-    /// Encrypted refresh material for the token backend. Never plaintext.
+    /// Refresh material for the token backend, sealed (ADR-0012 decision 3). Never
+    /// plaintext: the type has no constructor that takes any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub refresh_ciphertext: Option<Vec<u8>>,
+    pub refresh: Option<Sealed>,
     /// When mediatore created the claim.
     pub created_at: DateTime<Utc>,
     /// Bind deadline, once bound.
@@ -67,6 +77,13 @@ impl ClaimRecord {
     #[must_use]
     pub fn is_live(&self, now: DateTime<Utc>) -> bool {
         self.revoked_at.is_none() && self.expires_at.is_none_or(|e| e > now)
+    }
+
+    /// When the claim ended: its revocation, or its deadline once that has passed. `None`
+    /// while it may still issue, or while it was never bound and never revoked.
+    #[must_use]
+    pub fn ended_at(&self) -> Option<DateTime<Utc>> {
+        self.revoked_at.or(self.expires_at)
     }
 }
 
@@ -89,6 +106,28 @@ pub struct NodeRecord {
     pub registered_at: DateTime<Utc>,
 }
 
+/// What survives a claim row: written when [`ClaimStore::sweep`] removes it (ADR-0012
+/// decision 4). mediatore never deletes these.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimAudit {
+    /// The claim's UID.
+    pub uid: Uuid,
+    /// The claim's name.
+    pub name: String,
+    /// Who it was for.
+    pub subject: Subject,
+    /// The node it was bound to, if it ever was.
+    pub node_id: Option<String>,
+    /// When the record was created.
+    pub created_at: DateTime<Utc>,
+    /// The bind deadline, if it was bound.
+    pub expires_at: Option<DateTime<Utc>>,
+    /// When it was revoked, if it was.
+    pub revoked_at: Option<DateTime<Utc>>,
+    /// When the row was swept.
+    pub swept_at: DateTime<Utc>,
+}
+
 /// Storage contract.
 #[async_trait]
 pub trait ClaimStore: Send + Sync + 'static {
@@ -100,7 +139,7 @@ pub trait ClaimStore: Send + Sync + 'static {
     async fn get_claim_by_name(&self, name: &str) -> Result<ClaimRecord, StoreError>;
     /// Replace an existing claim record.
     async fn update_claim(&self, rec: ClaimRecord) -> Result<(), StoreError>;
-    /// Mark revoked; idempotent.
+    /// Mark revoked and drop the refresh envelope; idempotent (the first timestamp wins).
     async fn revoke_claim(&self, uid: Uuid, at: DateTime<Utc>) -> Result<(), StoreError>;
     /// The live claim bound to a node (by the node's SPIRE agent SPIFFE ID).
     async fn get_claim_by_node(&self, node_id: &str) -> Result<ClaimRecord, StoreError>;
@@ -117,13 +156,22 @@ pub trait ClaimStore: Send + Sync + 'static {
     async fn ban_node(&self, ek_hash: &str) -> Result<(), StoreError>;
     /// All registered nodes.
     async fn list_nodes(&self) -> Result<Vec<NodeRecord>, StoreError>;
+
+    /// Remove every claim row that ended ([`ClaimRecord::ended_at`]) before `before`,
+    /// writing a [`ClaimAudit`] row for each in the same transaction. Returns how many.
+    async fn sweep(&self, before: DateTime<Utc>) -> Result<usize, StoreError>;
+    /// Every audit row, oldest sweep first.
+    async fn list_audit(&self) -> Result<Vec<ClaimAudit>, StoreError>;
+    /// A round trip to the backend; what `/healthz` reports.
+    async fn ping(&self) -> Result<(), StoreError>;
 }
 
-/// In-memory store. Not durable; fine for tests and `--dev`.
+/// In-memory store. Not durable; for `dev_mode` and tests.
 #[derive(Default)]
 pub struct MemoryStore {
     claims: RwLock<HashMap<Uuid, ClaimRecord>>,
     nodes: RwLock<HashMap<String, NodeRecord>>,
+    audit: RwLock<Vec<ClaimAudit>>,
 }
 
 impl MemoryStore {
@@ -179,7 +227,7 @@ impl ClaimStore for MemoryStore {
             .get_mut(&uid)
             .ok_or_else(|| StoreError::NotFound(uid.to_string()))?;
         rec.revoked_at.get_or_insert(at);
-        rec.refresh_ciphertext = None;
+        rec.refresh = None;
         Ok(())
     }
 
@@ -189,7 +237,8 @@ impl ClaimStore for MemoryStore {
             .read()
             .await
             .values()
-            .find(|c| c.node_id.as_deref() == Some(node_id) && c.is_live(now))
+            .filter(|c| c.node_id.as_deref() == Some(node_id) && c.is_live(now))
+            .max_by_key(|c| c.created_at)
             .cloned()
             .ok_or_else(|| StoreError::NotFound(node_id.to_owned()))
     }
@@ -245,78 +294,44 @@ impl ClaimStore for MemoryStore {
     async fn list_nodes(&self) -> Result<Vec<NodeRecord>, StoreError> {
         Ok(self.nodes.read().await.values().cloned().collect())
     }
+
+    async fn sweep(&self, before: DateTime<Utc>) -> Result<usize, StoreError> {
+        let mut claims = self.claims.write().await;
+        let mut audit = self.audit.write().await;
+        let swept_at = Utc::now();
+        let gone: Vec<Uuid> = claims
+            .values()
+            .filter(|c| c.ended_at().is_some_and(|e| e < before))
+            .map(|c| c.uid)
+            .collect();
+        for uid in &gone {
+            let c = claims.remove(uid).expect("selected above");
+            audit.push(ClaimAudit {
+                uid: c.uid,
+                name: c.name,
+                subject: c.subject,
+                node_id: c.node_id,
+                created_at: c.created_at,
+                expires_at: c.expires_at,
+                revoked_at: c.revoked_at,
+                swept_at,
+            });
+        }
+        Ok(gone.len())
+    }
+
+    async fn list_audit(&self) -> Result<Vec<ClaimAudit>, StoreError> {
+        Ok(self.audit.read().await.clone())
+    }
+
+    async fn ping(&self) -> Result<(), StoreError> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn node(ek: &str, dmi: Uuid) -> NodeRecord {
-        NodeRecord {
-            ek_hash: ek.into(),
-            node_id: format!("spiffe://td/spire/agent/tpm/{ek}"),
-            dmi_uuid: dmi,
-            hostname: "h".into(),
-            provider: Some(Provider::Libvirt),
-            banned: false,
-            registered_at: Utc::now(),
-        }
-    }
-
-    #[tokio::test]
-    async fn duplicate_ek_with_other_dmi_is_conflict() {
-        let s = MemoryStore::default();
-        s.put_node(node("ek1", Uuid::new_v4())).await.unwrap();
-        let err = s.put_node(node("ek1", Uuid::new_v4())).await.unwrap_err();
-        assert!(matches!(err, StoreError::Conflict(_)));
-    }
-
-    fn claim(uid: Uuid) -> ClaimRecord {
-        ClaimRecord {
-            uid,
-            name: format!("claim-{uid}"),
-            subject: Subject {
-                issuer: "i".into(),
-                id: "u".into(),
-                display: None,
-            },
-            entry_id: None,
-            node_id: None,
-            audiences: vec![],
-            workload: Workload::default(),
-            ttl_seconds: 3600,
-            refresh_ciphertext: Some(vec![1, 2, 3]),
-            created_at: Utc::now(),
-            expires_at: None,
-            revoked_at: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn revoke_drops_refresh_material() {
-        let s = MemoryStore::default();
-        let uid = Uuid::new_v4();
-        s.put_claim(claim(uid)).await.unwrap();
-        s.revoke_claim(uid, Utc::now()).await.unwrap();
-        let rec = s.get_claim(uid).await.unwrap();
-        assert!(rec.refresh_ciphertext.is_none());
-        assert!(!rec.is_live(Utc::now()));
-    }
-
-    #[tokio::test]
-    async fn claim_by_node_finds_only_live_claims() {
-        let s = MemoryStore::default();
-        let node = "spiffe://td/spire/agent/tpm/ek1";
-        let uid = Uuid::new_v4();
-        let mut rec = claim(uid);
-        rec.node_id = Some(node.to_owned());
-        s.put_claim(rec).await.unwrap();
-        assert_eq!(s.get_claim_by_node(node).await.unwrap().uid, uid);
-
-        s.revoke_claim(uid, Utc::now()).await.unwrap();
-        assert!(matches!(
-            s.get_claim_by_node(node).await,
-            Err(StoreError::NotFound(_))
-        ));
-    }
+    crate::conformance::suite!(memory, MemoryStore::default());
 }

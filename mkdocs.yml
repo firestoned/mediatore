@@ -139,6 +139,7 @@ nav:
   - Guides:
       - Running workloads on a claimed VM: guides/running-workloads.md
       - Requesting a sandbox: guides/requesting-a-sandbox.md
+      - The store: guides/the-store.md
       - Enterprise SPIRE topology: guides/enterprise-spire-topology.md
       - Testing tiers: guides/testing.md
   - Architecture:
@@ -156,5 +157,6 @@ nav:
       - "ADR-0009: Kubernetes orchestrates, VMs run agents": adr/0009-kubernetes-orchestrates-vms-run-agents.md
       - "ADR-0010: No inbound to sandboxes": adr/0010-no-inbound-to-sandboxes.md
       - "ADR-0011: The claim watcher": adr/0011-claim-watcher.md
+      - "ADR-0012: The persistent store": adr/0012-persistent-store.md
   - Security:
       - Threat model: security/threat-model.md

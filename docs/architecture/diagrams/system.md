@@ -29,6 +29,7 @@ flowchart LR
     service-mediatore-sts["STS"]
     data-asset-agentsandbox-cr["AgentSandbox resources"]
     data-asset-claim-store["Claim Store"]
+    database-store["Store Database (PostgreSQL / SQLite)"]
     data-asset-sts-signing-key["STS Signing Key"]
     service-kubernetes-api["Kubernetes API Server"]
     system-banlieue["banlieue Control Plane"]
@@ -69,6 +70,7 @@ flowchart LR
         service-spire-controller-manager
         service-spire-agent-k8s
         data-asset-cluster-static-entries
+        database-store
     end
     subgraph sg_network-identity-cluster [Network Identity Cluster]
         service-spire-root
@@ -92,6 +94,7 @@ flowchart LR
     service-sandbox-workload -->|mTLS| service-mediatore-sandbox-api
     service-sandbox-workload -->|HTTPS| ecosystem-downstream-api
     actor-sandbox-user --> data-asset-claim-store
+    system-mediatore -->|TLS| database-store
     actor-sandbox-user --> data-asset-cluster-static-entries
 ```
 

@@ -157,6 +157,56 @@ impl Default for SandboxesSection {
     }
 }
 
+/// The wrapping key for refresh material (ADR-0012 decision 3).
+#[derive(Debug, Clone, Deserialize)]
+pub struct SealingSection {
+    /// File holding the 32-byte key (raw, or 64 hex characters): a Secret volume. Read at
+    /// startup; a missing or malformed key stops the process.
+    pub key_file: PathBuf,
+}
+
+/// The claim store (ADR-0012). Outside `dev_mode` a URL is required; `MEDIATORE_STORE_URL`
+/// in the environment overrides `url` so the PostgreSQL password can live in a Secret.
+// The `_secs` suffix is the unit, part of the config file's contract (as in `EntriesSection`).
+#[allow(clippy::struct_field_names)]
+#[derive(Debug, Clone, Deserialize)]
+pub struct StoreSection {
+    /// `sqlite:///path/to/store.db?mode=rwc` (one replica only) or
+    /// `postgres://user:password@host:5432/db?sslmode=verify-full`. Unset under `dev_mode`
+    /// means the in-memory store.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Seconds a claim row outlives its claim before the resync sweeps it into the audit
+    /// table (default 3600).
+    #[serde(default = "default_retention_secs")]
+    pub retention_secs: u64,
+    /// Connection pool size (default 8; a memory SQLite always gets 1).
+    #[serde(default = "default_max_connections")]
+    pub max_connections: u32,
+    /// The local sealer's key. Unset means refresh material cannot be persisted, which
+    /// fails the claim that needs it rather than storing plaintext.
+    #[serde(default)]
+    pub sealing: Option<SealingSection>,
+}
+
+fn default_retention_secs() -> u64 {
+    3600
+}
+fn default_max_connections() -> u32 {
+    8
+}
+
+impl Default for StoreSection {
+    fn default() -> Self {
+        Self {
+            url: None,
+            retention_secs: default_retention_secs(),
+            max_connections: default_max_connections(),
+            sealing: None,
+        }
+    }
+}
+
 /// Top-level config.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
@@ -184,6 +234,9 @@ pub struct Config {
     /// Where the user API's sandboxes go (ADR-0008).
     #[serde(default)]
     pub sandboxes: SandboxesSection,
+    /// The claim store (ADR-0012).
+    #[serde(default)]
+    pub store: StoreSection,
 }
 
 fn default_listen() -> ListenConfig {
@@ -194,15 +247,24 @@ fn default_listen() -> ListenConfig {
 }
 
 impl Config {
-    /// Load and sanity-check.
+    /// Load and sanity-check. `MEDIATORE_STORE_URL` in the environment overrides `store.url`.
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let text = std::fs::read_to_string(path)?;
-        Self::parse(&text)
+        Self::parse_with_store_url(&text, std::env::var("MEDIATORE_STORE_URL").ok())
     }
 
-    /// Parse YAML and enforce the cross-field rules.
+    /// Parse YAML and enforce the cross-field rules, with nothing from the environment.
+    #[cfg(test)]
     pub fn parse(text: &str) -> anyhow::Result<Self> {
-        let cfg: Self = serde_saphyr::from_str(text)?;
+        Self::parse_with_store_url(text, None)
+    }
+
+    /// [`Self::parse`] with `store_url` taking precedence over the file's `store.url`.
+    pub fn parse_with_store_url(text: &str, store_url: Option<String>) -> anyhow::Result<Self> {
+        let mut cfg: Self = serde_saphyr::from_str(text)?;
+        if let Some(url) = store_url.filter(|u| !u.trim().is_empty()) {
+            cfg.store.url = Some(url);
+        }
         if cfg.audiences.iter().any(|a| a.via == Backend::Sts) && cfg.sts.is_none() {
             anyhow::bail!("an audience uses the sts backend but no `sts` section is configured");
         }
@@ -234,7 +296,44 @@ impl Config {
                 anyhow::bail!("spire.entries.ready_timeout_secs must be positive");
             }
         }
+        cfg.check_store()?;
         Ok(cfg)
+    }
+}
+
+impl Config {
+    /// ADR-0012 decision 2: a real store outside `dev_mode`, PostgreSQL only over TLS the
+    /// client verifies, and no memory SQLite (as lossy as the in-memory store).
+    fn check_store(&self) -> anyhow::Result<()> {
+        use mediatore_store::sql::{Engine, is_memory_sqlite};
+        if self.store.max_connections == 0 {
+            anyhow::bail!("store.max_connections must be positive");
+        }
+        let Some(url) = self.store.url.as_deref() else {
+            if self.dev_mode {
+                return Ok(());
+            }
+            anyhow::bail!(
+                "store.url (or MEDIATORE_STORE_URL) is required outside dev_mode: the in-memory store does not survive a restart (ADR-0012)"
+            );
+        };
+        let Some(engine) = Engine::of(url) else {
+            anyhow::bail!("store.url: unsupported scheme; use sqlite: or postgres:");
+        };
+        if self.dev_mode {
+            return Ok(());
+        }
+        if is_memory_sqlite(url) {
+            anyhow::bail!(
+                "store.url: a memory SQLite is as lossy as the in-memory store; give it a file"
+            );
+        }
+        if engine == Engine::Postgres && !url.contains("sslmode=verify-full") {
+            anyhow::bail!(
+                "store.url: PostgreSQL is reached only over TLS the client verifies; the URL must carry sslmode=verify-full (ADR-0012)"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -286,7 +385,7 @@ listen: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }
     #[test]
     fn production_may_listen_anywhere() {
         Config::parse(
-            "trust_domain: sandbox.test\nissuers: []\naudiences: []\nlisten: { user: 0.0.0.0:8080, sandbox: 0.0.0.0:8443 }\nspire:\n  workload_api_socket: unix:///run/spire/sockets/spire-agent.sock\n  entries:\n    class_name: spire-server-spire\n",
+            "trust_domain: sandbox.test\nissuers: []\naudiences: []\nlisten: { user: 0.0.0.0:8080, sandbox: 0.0.0.0:8443 }\nspire:\n  workload_api_socket: unix:///run/spire/sockets/spire-agent.sock\n  entries:\n    class_name: spire-server-spire\nstore: { url: \"sqlite:///var/lib/mediatore/store.db\" }\n",
         )
         .unwrap();
     }
@@ -304,6 +403,7 @@ listen: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }
   workload_api_socket: unix:///run/spire/sockets/spire-agent.sock
   entries:
     class_name: spire-server-spire
+store: {{ url: \"sqlite:///var/lib/mediatore/store.db\" }}
 "
         ))
         .unwrap();
@@ -345,6 +445,85 @@ listen: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }
         ))
         .unwrap_err();
         assert!(err.to_string().contains("sandboxes.namespace"), "{err}");
+    }
+
+    const SPIRE: &str = "spire:
+  workload_api_socket: unix:///run/spire/sockets/spire-agent.sock
+  entries:
+    class_name: spire-server-spire
+";
+
+    #[test]
+    fn the_store_defaults_to_memory_only_under_dev_mode() {
+        let cfg = Config::parse(&format!("{BASE}dev_mode: true\n")).unwrap();
+        assert_eq!(cfg.store.url, None);
+        assert_eq!(cfg.store.retention_secs, 3600);
+        assert_eq!(cfg.store.max_connections, 8);
+        assert!(cfg.store.sealing.is_none());
+        let err = Config::parse(&format!("{BASE}{SPIRE}")).unwrap_err();
+        assert!(err.to_string().contains("store.url"), "{err}");
+    }
+
+    #[test]
+    fn the_environment_overrides_the_store_url() {
+        let cfg = Config::parse_with_store_url(
+            &format!("{BASE}{SPIRE}store: {{ url: \"sqlite:///var/lib/mediatore/a.db\" }}\n"),
+            Some("sqlite:///var/lib/mediatore/b.db".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.store.url.as_deref(),
+            Some("sqlite:///var/lib/mediatore/b.db")
+        );
+        let cfg = Config::parse_with_store_url(
+            &format!("{BASE}{SPIRE}store: {{ url: \"sqlite:///var/lib/mediatore/a.db\" }}\n"),
+            Some(String::new()),
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.store.url.as_deref(),
+            Some("sqlite:///var/lib/mediatore/a.db")
+        );
+    }
+
+    #[test]
+    fn a_production_store_is_a_file_or_tls_verified_postgres() {
+        for (url, why) in [
+            ("sqlite::memory:", "memory"),
+            ("sqlite:file:x?mode=memory&cache=shared", "memory"),
+            ("postgres://u:p@db.home.example/mediatore", "verify-full"),
+            (
+                "postgres://u:p@db.home.example/mediatore?sslmode=require",
+                "verify-full",
+            ),
+            ("mysql://u:p@db/mediatore", "unsupported"),
+        ] {
+            let err =
+                Config::parse(&format!("{BASE}{SPIRE}store: {{ url: \"{url}\" }}\n")).unwrap_err();
+            assert!(err.to_string().contains(why), "{url}: {err}");
+        }
+        for url in [
+            "sqlite:///var/lib/mediatore/store.db?mode=rwc",
+            "postgres://u:p@db.home.example:5432/mediatore?sslmode=verify-full&sslrootcert=/etc/mediatore-pg/ca.pem",
+        ] {
+            Config::parse(&format!("{BASE}{SPIRE}store: {{ url: \"{url}\" }}\n"))
+                .unwrap_or_else(|e| panic!("{url}: {e}"));
+        }
+        // dev_mode may point at any supported engine, memory included, but not an unknown one.
+        Config::parse(&format!(
+            "{BASE}dev_mode: true\nstore: {{ url: \"sqlite::memory:\" }}\n"
+        ))
+        .unwrap();
+        let err = Config::parse(&format!(
+            "{BASE}dev_mode: true\nstore: {{ url: \"mysql://x\" }}\n"
+        ))
+        .unwrap_err();
+        assert!(err.to_string().contains("unsupported"), "{err}");
+        let err = Config::parse(&format!(
+            "{BASE}dev_mode: true\nstore: {{ max_connections: 0 }}\n"
+        ))
+        .unwrap_err();
+        assert!(err.to_string().contains("max_connections"), "{err}");
     }
 
     #[test]

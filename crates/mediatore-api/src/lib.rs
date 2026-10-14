@@ -37,6 +37,7 @@ use mediatore_proto::{
     TokenRequest, TokenResponse,
 };
 use mediatore_spire::{EntryManager, Naming};
+use mediatore_store::seal::Sealer;
 use mediatore_store::{ClaimRecord, ClaimStore, NodeRecord, StoreError};
 use mediatore_sts::{MintRequest, Sts};
 use mediatore_tls::PeerSpiffeId;
@@ -65,6 +66,9 @@ pub struct AppState {
     pub sandboxes: Option<Arc<dyn SandboxFrontDoor>>,
     /// Namespace `POST /v1/claims` creates sandboxes in; the pool must live there.
     pub sandbox_namespace: String,
+    /// Seals refresh material before it reaches the store (ADR-0012 decision 3); `None`
+    /// until `store.sealing` is configured. Roadmap 04 brings its first caller.
+    pub sealer: Option<Arc<dyn Sealer>>,
     /// Accept a peer-identity header instead of mTLS. Never in production.
     pub dev_mode: bool,
 }
@@ -138,9 +142,17 @@ impl IntoResponse for ApiError {
     }
 }
 
-/// Health for probes.
-async fn healthz() -> &'static str {
-    "ok"
+/// Health for probes: a broker that cannot reach its store is not ready (ADR-0012).
+async fn healthz(State(st): State<Shared>) -> Result<&'static str, ApiError> {
+    st.store.ping().await.map_err(|e| {
+        tracing::warn!(error = %e, "store unreachable");
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "store_unavailable",
+            Some("store unreachable".to_owned()),
+        )
+    })?;
+    Ok("ok")
 }
 
 /// Public JWKS for the STS backend.
@@ -283,7 +295,7 @@ async fn create_claim(
             audiences: req.audiences.clone(),
             workload: req.workload.clone(),
             ttl_seconds: req.ttl_seconds,
-            refresh_ciphertext: None,
+            refresh: None,
             created_at: Utc::now(),
             expires_at: None,
             revoked_at: None,

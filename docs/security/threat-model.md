@@ -5,8 +5,15 @@ SPDX-License-Identifier: Apache-2.0
 # Threat Model
 
 > **Status:** Living document. Last full pass **2026-10-14**, against the
-> architecture defined by **ADR-0001 … ADR-0011** (ADR-0009 and ADR-0010 are
+> architecture defined by **ADR-0001 … ADR-0012** (ADR-0009 and ADR-0010 are
 > adopted platform ADRs with no code of their own). This pass covers roadmap
+> 05's persistent store (ADR-0012): one sqlx store over SQLite or PostgreSQL,
+> PostgreSQL only over TLS the client verifies with the URL in a Secret,
+> refresh material as a sealed envelope bound to its claim, claim rows swept
+> into an audit table, revocations and the node registry surviving a restart.
+> New boundary TB-9 (broker to database) with twelve rows, new assets A-10
+> and A-11, **R-5 deleted**, R-4 widened to the local sealer, new R-10. Earlier
+> the same day, roadmap
 > 08's `AgentSandbox` (ADR-0008, now built): the request for a sandbox is a
 > custom resource whose `spec.subject` is pinned to the caller at admission,
 > mediatore creates and owns one `VirtualMachineClaim` per sandbox and the
@@ -49,7 +56,8 @@ holds three things an attacker wants:
 
 1. **The power to mint delegated tokens.** Via Entra On-Behalf-Of refresh
    material or its own STS signing key, mediatore can produce a token that
-   downstream APIs accept as "on behalf of user X".
+   downstream APIs accept as "on behalf of user X". Refresh material rests in
+   the store only as a sealed envelope (ADR-0012).
 2. **The subject binding.** It writes `spec.subject` on every `AgentSandbox`
    it creates for an API caller and on every `VirtualMachineClaim` it creates
    for a sandbox, and admission exempts it from the caller-equals-subject
@@ -69,10 +77,11 @@ holds three things an attacker wants:
 | Sandbox listener | `crates/mediatore-tls` | same pod, :8443 | Terminates SPIFFE mTLS; holds the broker SVID and key in memory |
 | Claim reconciler and `AgentSandbox` reconciler | `crates/mediatore-claims`, `crates/mediatore-spire` | same pod (leader-elected) | `clusterstaticentries` create/delete/list/watch through the Kubernetes API, admission-constrained; no SPIRE admin. `virtualmachineclaims` create/delete, `agentsandboxes` patch (status, finalizer) |
 | STS | `crates/mediatore-sts` | same pod | Holds the signing key handle |
-| Claim store | `crates/mediatore-store` | in-memory today; PostgreSQL/SQLite next | Refresh ciphertext, revocations, node records; the request fields are a copy of the `AgentSandbox` spec |
+| Claim store | `crates/mediatore-store` (`SqlStore`, one query set) | PostgreSQL at work, SQLite for one replica; in-memory only under `dev_mode` | Sealed refresh envelopes, revocations, the node registry, audit rows; the request fields are a copy of the `AgentSandbox` spec. Migrated at startup; swept at resync |
+| Store database | the operator's PostgreSQL, or a SQLite file on the pod's volume (`dev/kind/postgres/` in kind) | management cluster or beside it | Holds every row; reached with the URL in Secret `mediatore-store` over TLS `verify-full` |
 | In-guest agent | `crates/mediatore-guest` | root on each pool member | `useradd`, mount, nsjail |
 | Workload CLI | `crates/sandbox-token` | inside the jail, as the `sb-` user | Holds one token in memory |
-| Deployment | `deploy/base/*.yaml` | management cluster | SA, RBAC, `ClusterSPIFFEID`, the `AgentSandbox` CRD (`crds/`, generated), the entries and the sandbox-subject admission policies, the CSI inline volume for the agent socket, the `LoadBalancer` service for :8443, ingress for :8080 |
+| Deployment | `deploy/base/*.yaml` | management cluster | SA, RBAC, `ClusterSPIFFEID`, the `AgentSandbox` CRD (`crds/`, generated), the entries and the sandbox-subject admission policies, the CSI inline volume for the agent socket, the `LoadBalancer` service for :8443, ingress for :8080, the store URL from Secret `mediatore-store` (operator-created) |
 | SPIRE Controller Manager | hardened chart (not this repo) | `spire-server` pod | Renders `ClusterStaticEntry` into server entries over the server's private socket |
 
 ## 3. Assets
@@ -80,7 +89,7 @@ holds three things an attacker wants:
 | # | Asset | Where | Impact if stolen / forged |
 | --- | --- | --- | --- |
 | A-1 | STS signing key | file (`sts.signing_key_file`) or OpenBao transit | Mint tokens for any configured audience and any subject |
-| A-2 | Entra refresh material | store rows, ciphertext only | Act as the user for the claim's TTL against consented APIs |
+| A-2 | Refresh material (Entra OBO, Dex) | store rows as `Sealed` envelopes only: key id, nonce, AES-256-GCM with the claim UID as associated data; nothing produces one until roadmap 04 | Act as the user for the claim's TTL against consented APIs |
 | A-3 | Upstream bearer tokens in flight | `POST /v1/claims` request | Create claims as the user until `exp` |
 | A-4 | Issued access tokens | workload memory, ≤ 15 min | One audience, until expiry |
 | A-5 | Claim ↔ subject ↔ node binding | store + SPIRE entries | Sandbox issued to, or read by, the wrong person |
@@ -88,6 +97,8 @@ holds three things an attacker wants:
 | A-7 | Broker Kubernetes ServiceAccount | pod token | Create `AgentSandbox` resources and claims with arbitrary `spec.subject` (exempt from both subject policies); patch any sandbox's status; declare `/banlieue/{node,claim}/` entries, within what the entries admission policy allows |
 | A-8 | Broker SVID and private key (`spiffe://<td>/mediatore`) | process memory only, from the Workload API | Impersonate the broker to every guest; terminate the sandbox listener elsewhere |
 | A-9 | The `brokers` lists: ConfigMaps `mediatore-agentsandbox-subject-policy` and `banlieue-claim-subject-policy` | `banlieue-system` | List a principal and it may attribute a sandbox, and every token minted for it, to anyone; both ship empty |
+| A-10 | The sealing key (`store.sealing.key_file`) | a Secret volume, read into broker memory at start | With the rows, open every envelope in the store; a rotated key strands envelopes under the old id, which then fail to open (fail closed) |
+| A-11 | The store URL and its password (Secret `mediatore-store`) | the broker pod's environment, never logged | Read and alter every row: resurrect a revoked claim, rebind a node, register a clone's DMI under a known EK, delete audit rows |
 
 ## 4. Actors
 
@@ -104,6 +115,7 @@ holds three things an attacker wants:
 | SPIRE agent + SPIFFE CSI driver (node DaemonSets) | Node TCB | Same tier as the kubelet, which already holds every pod's ServiceAccount token on that node |
 | Upstream IdP | Trusted for authentication | Entra / Dex; group membership is the authz gate |
 | Cluster operator | Trusted | Can read anything in the namespace; see §8 |
+| Store database (PostgreSQL / SQLite) and its administrator | Trusted | Holds the rows; a compromise there is a compromise of A-2, A-5 and A-6 directly. mediatore never deletes audit rows; whether its database role can is the operator's grant (§9) |
 
 ## 5. Trust boundaries
 
@@ -121,6 +133,8 @@ flowchart TB
   user -- "(TB-1) bearer HTTPS" --> mediatore
   user -- "OIDC login" --> idp
   requester(["Declarative requester<br/>(GitOps, CI)"]) -- "(TB-2) AgentSandbox,<br/>subject policy" --> banlieue
+  store[("Claim store<br/>(PostgreSQL / SQLite)")]
+  mediatore -- "(TB-9) TLS verify-full,<br/>URL from a Secret" --> store
   mediatore -- "(TB-5) JWKS / OBO" --> idp
   mediatore <-- "(TB-2) Kubernetes API: AgentSandbox,<br/>claims, watcher" --> banlieue
   mediatore -- "(TB-3) Kubernetes API: ClusterStaticEntry<br/>admission policy, RBAC" --> apiserver["Kubernetes API server"]
@@ -161,6 +175,8 @@ flowchart TB
 - **TB-7** jail ↔ downstream APIs (issued token only)
 - **TB-8** broker pod ↔ SPIRE agent (Workload API over the SPIFFE CSI driver's read-only
   mount: the broker's own SVID)
+- **TB-9** mediatore ↔ store database (sqlx over TLS `verify-full` to PostgreSQL, or a
+  SQLite file; the rows that outlive the process)
 
 ## 6. STRIDE, per boundary
 
@@ -248,7 +264,7 @@ the residue is in §8. No boundary carries the marker as of this pass.
 | Stale broker SVID after rotation | D | The listener's config is rebuilt on every rotation the Workload API reports (`TlsConfigs::spawn`); a rebuild that fails keeps the previous config, which expires on its own. e2e `rotated_material_is_used_by_new_handshakes` |
 | Node SVID requesting tokens | E | Only claim IDs reach `/v1/token`: `Naming::claim_uid_from` + 403, e2e-tested (`a_node_svid_gets_no_token`) |
 | Token for an audience outside the claim | E | Allowlist check, 400 (not 403, no enumeration): `crates/mediatore-api/src/lib.rs` (`token`) |
-| Issuance after release / expiry | E | `ClaimRecord::is_live` gate + revocation drops refresh material: `crates/mediatore-store/src/lib.rs`, e2e-tested (cut-off in `full_loop_from_login_to_cutoff`) |
+| Issuance after release / expiry | E | `ClaimRecord::is_live` gate + revocation drops the refresh envelope: `crates/mediatore-store/src/lib.rs`, on every engine (`revoke_is_idempotent_and_drops_the_refresh_envelope`, conformance), e2e-tested (cut-off in `full_loop_from_login_to_cutoff`); the revocation is durable (TB-9) |
 | Refresh token reaching the VM | I | `TokenResponse` has no refresh field by construction: `crates/mediatore-proto/src/lib.rs` |
 
 ### TB-7: jail → downstream
@@ -267,6 +283,24 @@ the residue is in §8. No boundary carries the marker as of this pass.
 | Broker SVID or key read from disk | I | Never on disk: the `spiffe` crate's `X509Source` holds it in memory (`crates/mediatore-tls/src/material.rs`, `WorkloadApiSource`), the pod's root filesystem is read-only and there is no sidecar or PEM volume (`deploy/base/deployment.yaml`: a read-only `csi.spiffe.io` inline volume, no `hostPath`); `Material`'s `Debug` never prints the key |
 | CSI driver or agent compromised on the node | E | Same tier as the kubelet, which already holds every pod's ServiceAccount token on that node: no new authority. Both DaemonSets come from the hardened chart (deployment control, §9) |
 | Driver or agent unavailable | D | Fail closed: without the socket the broker has no identity and does not start (`WorkloadApiSource::connect` is awaited before any listener binds); the readiness probe stays false |
+
+### TB-9: mediatore → store database
+
+| Threat | S/T/R/I/D/E | Control |
+| --- | --- | --- |
+| Rows read or altered in transit; the database impersonated | I/T/S | PostgreSQL only with `sslmode=verify-full` outside `dev_mode`: `Config::check_store` (`crates/mediatore/src/config.rs`, `a_production_store_is_a_file_or_tls_verified_postgres`); the client is rustls on aws-lc-rs through sqlx's `tls-rustls-aws-lc-rs` (`Cargo.toml`), with the same post-quantum-first offer as every other client. SQLite is a file on the pod's own volume. Live in kind against a PostgreSQL with a certificate the tier mints (`make kind-e2e-store`, `dev/kind/store-e2e.sh`) |
+| The URL's password leaked through logs or config | I | The URL comes from the environment (`MEDIATORE_STORE_URL`, Secret `mediatore-store` in `deploy/base/deployment.yaml`) and only its scheme and host are logged (`redacted`, `crates/mediatore-store/src/sql.rs`, unit-tested; the kind tier asserts the password is absent from the broker log); sqlx statement logging is off |
+| Plaintext refresh material at rest | I | `ClaimRecord::refresh` is `Option<Sealed>`: the record has no plaintext field. `LocalKeySealer` is AES-256-GCM with a fresh nonce per envelope and the key from a Secret volume (`crates/mediatore-store/src/seal.rs`; `an_envelope_opens_only_for_its_claim_under_its_key`, `every_envelope_has_its_own_nonce`). Revocation nulls the three columns on both engines (`revoke_is_idempotent_and_drops_the_refresh_envelope`) |
+| An envelope moved onto another claim's row, or opened under another key | S/T | The claim UID is the associated data and the key id is checked first: a moved envelope and a foreign key are both refused (`SealError::Rejected`, `SealError::UnknownKey`; same test) |
+| A revocation or a ban forgotten in a restart | E | Rows are durable: `a_reopened_file_keeps_revocations_nodes_and_entries` (SQLite file), the conformance suite on PostgreSQL in kind; the kind sandbox tier restarts the broker on PostgreSQL and finds the record, the entry id and the node, with nothing redone (`dev/kind/sandbox-e2e.sh`, the restart step) |
+| A restart declaring a second entry or a second record | T | `Reconciler::bind` returns early on a record with an entry id and the reconciler finds the record by the claim's UID; the kind tier asserts one claim entry and no `record created` after the restart |
+| A cloned VM registering under a known EK after a restart | S | The node registry survives, so the DMI conflict (`put_node`, 409) holds across restarts on both engines (`duplicate_ek_with_another_dmi_is_a_conflict`); the kind tiers share one fixture VM for that reason |
+| An in-memory or memory-SQLite store in production | E | `Config::check_store` refuses a missing URL and a memory SQLite outside `dev_mode` (`the_store_defaults_to_memory_only_under_dev_mode`); `main.rs` builds `MemoryStore` only when `dev_mode` left the URL unset |
+| Rows accumulating subjects and node identities with no reader | I | `ClaimStore::sweep` at every resync for rows that ended before `store.retention_secs` (`Watcher::resync`, `a_resync_archives_rows_whose_claim_ended_before_the_retention`; kind tier: `archived` at resync). The audit row keeps the UID, name, subject, node and timestamps and has no envelope field (`ClaimAudit`) |
+| Audit rows deleted to hide a claim | R | mediatore has no delete path on `claim_audit` (`crates/mediatore-store/src/sql.rs`: inserts and reads only, `a_sweep_moves_ended_claims_into_the_audit_table` on both engines). Whether the broker's database role may `DELETE` there is the operator's grant (§9) |
+| A migration tampered with or the schema drifted | T | sqlx's migration table carries each migration's checksum: a changed migration fails `SqlStore::connect` and the broker does not start (`the_migration_runs_once_and_a_second_connect_is_fine`) |
+| SQL injection through a name, subject or hostname | T | Every value is a bound parameter; the only formatted SQL is the fixed column lists (`CLAIM_COLUMNS`, `NODE_COLUMNS`) under `AssertSqlSafe` (`crates/mediatore-store/src/sql.rs`) |
+| Database unreachable | D | `/healthz` pings the store (`crates/mediatore-api/src/lib.rs`), so the pod leaves the Service; a store that cannot be reached or migrated at start stops the process (`store()` in `crates/mediatore/src/main.rs`) |
 
 ## 7. Hardening that exists today
 
@@ -306,6 +340,12 @@ the residue is in §8. No boundary carries the marker as of this pass.
   outside the configuration refused before any claim exists, a finalizer that
   retracts the entry and revokes the record before the claim goes, no credential
   on the resource (`crates/mediatore-claims/src/sandbox.rs`).
+- Store: one query set over SQLite or PostgreSQL, PostgreSQL only with
+  `sslmode=verify-full` and the URL from a Secret, refresh material typed as a
+  sealed envelope bound to its claim, migrations checksummed and applied at
+  start, ended rows swept into an audit table mediatore never deletes from,
+  `/healthz` false when the store is unreachable (`crates/mediatore-store`,
+  ADR-0012).
 
 ## 8. Accepted risks
 
@@ -314,10 +354,11 @@ the residue is in §8. No boundary carries the marker as of this pass.
 | R-1 | *Deleted 2026-10-13.* The sandbox listener terminates SPIFFE mTLS (TB-6); the dev header survives only under `dev_mode`, which `Config::parse` confines to loopback | | |
 | R-2 | Entra OBO / Dex refresh-before-issue is unimplemented, so upstream revocation does not yet propagate to STS issuance | Only the STS backend works, and only in dev where the fake IdP has no sessions | The OBO / refresh path lands (ADR-0003 implementation) |
 | R-3 | A prompt-injected workload can exfiltrate its ≤ 15-min single-audience token | Bounded by TTL, audience allowlist and full attribution; the credential-injecting egress proxy is the designed phase 2 (runbook open decision #7) | The egress-proxy ADR is written |
-| R-4 | mediatore is a single trust point: a compromised broker mints for any active claim | Inherent to the broker pattern; mitigations planned: HSM/transit-held keys, two-person deploy, immutable audit sink | The production deployment ADR (key custody, audit) |
-| R-5 | In-memory store loses state on restart. Since ADR-0008 the request fields are rebuilt from the `AgentSandbox` resources: the reconciler rewrites the record of a sandbox whose claim still exists and the watcher rebinds it under the same entry name (`a_record_lost_in_a_restart_is_rebuilt_from_the_resource_and_the_claim_rebound`). What is still lost: the node registry (a member must register again before its claim can be rebound; until then the sandbox is `Bound` and not `ready`), revocations the resource does not record, and refresh ciphertext once it exists | Fail-closed consequences only: a claim the store does not know cannot be served (`/v1/token` refuses it), `Reconciler::sweep_orphans` retracts its entry until the rebind, and nothing is issued that the store does not know | The sqlx store lands (roadmap 05); re-walk §6 TB-3/TB-6 ordering against real persistence |
+| R-4 | mediatore is a single trust point: a compromised broker mints for any active claim and, with the local sealer of ADR-0012, holds the key that opens every refresh envelope in the store | Inherent to the broker pattern; mitigations planned: HSM/transit-held keys (the transit sealer of roadmap 04 takes the wrapping key out of the process), two-person deploy, immutable audit sink | The production deployment ADR (key custody, audit); the transit sealer |
+| R-5 | *Deleted 2026-10-14.* The sqlx store (ADR-0012, TB-9) keeps records, revocations and the node registry across a restart, proven on a SQLite file and on PostgreSQL in kind | | |
 | R-6 | vTPM EK attestation proves "this vTPM", not "this host"; hypervisor compromise breaks node identity | Same posture as banlieue ADR-0045; hypervisor is in the TCB | PCR / measured-boot selectors become available (runbook open decision #6) |
 | R-7 | Homelab collapse: one flat SPIRE trust domain on the management cluster, no root, no upstream authority: its signing key lives where sandboxes are administered. As deployed (2026-10-03): two servers sharing an external PostgreSQL datastore, each with a self-signed RSA-2048 CA whose key sits on a node-local volume in plaintext, audit log off (chart default) | Single-operator homelab; ADR-0005 records the enterprise topology (root on a dedicated identity cluster, HSM-backed) as the desired state | Any multi-team or production deployment; then split per ADR-0005 and delete this row. Before then: P-384 CA keys and the audit log on |
+| R-10 | SQLite behind two replicas is two stores, and mediatore cannot tell: it does not know the Deployment's replica count. The API on one pod would not see what the watcher wrote on the other | ADR-0012 decision 2 documents SQLite as single-replica only; `deploy/base` keeps two replicas and reads a PostgreSQL URL from the Secret, so the shipped manifests cannot be misconfigured this way without editing both | A Lease-derived guard (the watcher knows the holder count) or the replica count reaching the config |
 | R-8 | Signatures are classical: the STS tokens (ES256) and the SVIDs they bind to (ECDSA or RSA, issued by SPIRE) could be forged by a cryptographically relevant quantum computer. Key exchange is no longer part of this risk: since 2026-10-13 the sandbox leg accepts X25519MLKEM768 only, and every other TLS client mediatore builds offers it first (rustls `prefer-post-quantum`; `ring` banned). What is not ours keeps a classical fallback: the identity provider and the Kubernetes API server choose the group from that offer | Post-quantum signatures are not supported by SPIRE or JOSE implementations yet; the exposure is forgery in the future, not disclosure of recorded traffic. The verifiers already accept ML-DSA SVIDs, so this repo needs no change when SPIRE issues them | ML-DSA support in SPIRE (SVIDs) and in JOSE (STS tokens) |
 
 ## 9. Assumptions and out of scope
@@ -334,6 +375,10 @@ the residue is in §8. No boundary carries the marker as of this pass.
   member exists.
 - Denial of service beyond per-claim rate limiting (planned, `5.6` in the
   runbook) is out of scope pre-1.0.
+- The database role mediatore connects as is scoped by the operator: it needs
+  `SELECT`, `INSERT`, `UPDATE` and `DELETE` on `claims` and `nodes`, `SELECT`
+  and `INSERT` on `claim_audit`, and DDL for the migrations; `DELETE` on
+  `claim_audit` is not needed and should not be granted.
 
 ## 10. Revision log
 
@@ -347,3 +392,4 @@ the residue is in §8. No boundary carries the marker as of this pass.
 | 2026-10-13 | Roadmap 03: claim watcher (ADR-0011) | 0001–0011 | TB-2 gains five rows (wrong node, forged label, concurrent replicas, deleted claim, SA deleting claims) and TB-4 one (member without a vTPM), every control cited by file and test; §7 one line; R-5 reworded around the watcher; stamp moved to ADR-0011 |
 | 2026-10-13 | ADR-0007 kind tier | 0001–0007 | No control change, no new component or boundary. TB-6 (peer identity forgery, harvest-now-decrypt-later) and TB-8 (another pod with the broker SVID) now also cite the live run against a real agent and the CSI driver (`make kind-e2e-mtls`), which is the evidence ADR-0007 decision 8 was missing. Same-day pass, stamp unchanged |
 | 2026-10-14 | Roadmap 08: `AgentSandbox` (ADR-0008 built) | 0001–0011 | New CRD, admission policy and RBAC. §1 item 2, §2 (user API, reconciler, store, deployment rows), A-7 widened, **A-9 new** (the `brokers` lists), new actor (declarative requester), diagram and TB-2 bullet. TB-1 gains three rows (subject from the token only, fail-closed front door, guessed names) and one reworded; TB-2 gains seven (attribution at admission, immutability, unconfigured audience or issuer, deletion ordering, one claim ever, a stranger's claim, forged status), every control cited by file, test or the kind tier. §7 one item. R-5 narrowed: records are rebuilt from the resource |
+| 2026-10-14 | Roadmap 05: the persistent store (ADR-0012) | 0001–0012 | New boundary TB-9 (broker to database): twelve rows, every control cited by file, test or the kind tier (`make kind-e2e-store`, the restart step of the sandbox tier). §1 item 1, §2 (store and database rows, the Secret in the deployment row), A-2 reworded, **A-10 and A-11 new** (sealing key, store URL), a new actor (the database and its administrator), the diagram and the boundary list. TB-6's revocation row cites the durable store. §7 one item; §9 the database role. **R-5 deleted**; R-4 widened to the local sealer; **R-10 new** (SQLite behind two replicas) |

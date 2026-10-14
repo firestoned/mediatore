@@ -22,3 +22,9 @@ audiences:
   - { name: e2e, via: entra-obo }
 sandboxes:
   namespace: mediatore-e2e-sandbox
+# The store URL comes from the environment (Secret mediatore-store). Ended rows are kept
+# for 0 s and the resync runs every 15 s so the sandbox tier sees the audit sweep.
+store:
+  retention_secs: 0
+watcher:
+  resync_secs: 15

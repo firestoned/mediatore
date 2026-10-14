@@ -82,7 +82,14 @@ spiffe       = { version = "0.18", default-features = false, features = ["x509-s
 # EK certificate parsing: the SubjectPublicKeyInfo is what the tpm attestor hashes (ADR-0006)
 x509-cert    = { version = "0.3", default-features = false, features = ["pem"] }
 uuid         = { version = "1", features = ["v4", "serde"] }
+# The refresh envelope's AES-256-GCM (ADR-0012): the provider rustls already runs on.
+aws-lc-rs    = "1"
 chrono       = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+
+# store (ADR-0012): one query set over the Any driver on SQLite or PostgreSQL; rustls on
+# aws-lc-rs for the PostgreSQL leg; no macros (the migrator is built from include_str!),
+# no MySQL (its `rsa` path stays out).
+sqlx        = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-aws-lc-rs", "sqlite-bundled", "postgres", "any", "migrate"] }
 
 # kubernetes
 kube        = { version = "4", default-features = false, features = ["client", "config", "derive", "runtime", "rustls-tls"] }

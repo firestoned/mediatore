@@ -1,0 +1,87 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+#
+# PostgreSQL for the kind tiers (`make kind-postgres`, ADR-0012): one pod, no persistence,
+# TLS 1.3 only with the certificate `make kind-postgres` mints into Secret
+# mediatore-postgres-tls (tls-fixture, DNS name mediatore-postgres.banlieue-system.svc).
+# The broker reaches it with sslmode=verify-full against that CA, as it would a real
+# datastore. The password is a fixture for a throwaway cluster, not a secret.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mediatore-postgres
+  namespace: banlieue-system
+type: Opaque
+stringData:
+  password: e2e
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mediatore-postgres
+  namespace: banlieue-system
+spec:
+  selector: { app.kubernetes.io/name: mediatore-postgres }
+  ports:
+    - { name: postgres, port: 5432, targetPort: 5432 }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mediatore-postgres
+  namespace: banlieue-system
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector:
+    matchLabels: { app.kubernetes.io/name: mediatore-postgres }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: mediatore-postgres }
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: postgres
+          # postgres:18, index digest (every architecture), pulled by kind's nodes.
+          image: docker.io/library/postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336
+          args:
+            - -c
+            - ssl=on
+            - -c
+            - ssl_cert_file=/tls/server.pem
+            - -c
+            - ssl_key_file=/tls/server-key.pem
+            - -c
+            - ssl_min_protocol_version=TLSv1.3
+          env:
+            - { name: POSTGRES_USER, value: mediatore }
+            - { name: POSTGRES_DB, value: mediatore }
+            - { name: PGDATA, value: /var/lib/postgresql/data/pgdata }
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: mediatore-postgres, key: password }
+          ports:
+            - { name: postgres, containerPort: 5432 }
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "mediatore", "-d", "mediatore"]
+            periodSeconds: 2
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/postgresql/data }
+            - { name: tls, mountPath: /tls, readOnly: true }
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+      volumes:
+        - name: data
+          emptyDir: {}
+        - name: tls
+          secret:
+            secretName: mediatore-postgres-tls
+            # Owned by root, group-readable by the fsGroup: what postgres accepts for a key.
+            defaultMode: 0640

@@ -53,7 +53,13 @@
       "unique-id": "data-asset-claim-store",
       "node-type": "data-asset",
       "name": "Claim Store",
-      "description": "Per-claim rows: subject, audiences, SPIRE entry id, node id, encrypted refresh material, revocation timestamp. In-memory in dev; PostgreSQL/SQLite via sqlx next. Refresh material is ciphertext only (OpenBao transit / age). crates/mediatore-store. Under ADR-0008 the non-secret request fields move to the AgentSandbox resource; the store keeps refresh ciphertext, revocations, node records and audit rows."
+      "description": "Per-claim rows keyed by the claim's UID: a copy of the AgentSandbox request fields (subject, audiences, workload, TTL), the SPIRE entry id, the node id, the sealed refresh envelope (key id, nonce, AES-256-GCM ciphertext bound to the claim UID; ADR-0012 decision 3), the bind deadline and the revocation timestamp; node rows keyed by EK hash; audit rows written when a claim row is swept. One sqlx implementation over SQLite or PostgreSQL (ADR-0012, built: roadmap 05), the engine chosen by store.url; in-memory only under dev_mode. The resource is the source of truth for the request fields; the store is where revocation and the node registry survive a restart. crates/mediatore-store."
+    },
+    {
+      "unique-id": "database-store",
+      "node-type": "database",
+      "name": "Store Database (PostgreSQL / SQLite)",
+      "description": "The engine behind the claim store, chosen by configuration (ADR-0012): PostgreSQL at work, reached only over TLS with sslmode=verify-full on rustls (aws-lc-rs, post-quantum-first key exchange) with the URL in a Secret; SQLite in WAL mode on a volume for a single-replica homelab. Migrations are embedded in the broker and applied at startup under sqlx's lock. Refresh material reaches it sealed; the wrapping key is a Secret volume (local sealer) or stays in OpenBao (transit sealer, roadmap 04)."
     },
     {
       "unique-id": "data-asset-sts-signing-key",
@@ -210,7 +216,8 @@
             "service-spire-server",
             "service-spire-controller-manager",
             "service-spire-agent-k8s",
-            "data-asset-cluster-static-entries"
+            "data-asset-cluster-static-entries",
+            "database-store"
           ]
         }
       }
@@ -494,7 +501,7 @@
     },
     {
       "unique-id": "rel-user-claim-data",
-      "description": "The subject a claim is issued for; the user only ever sees their own claims.",
+      "description": "The subject a claim is issued for; the user only ever sees their own claims. The row outlives nothing: a claim that ended is swept into the audit table after store.retention_secs (ADR-0012).",
       "relationship-type": {
         "interacts": {
           "actor": "actor-sandbox-user",
@@ -503,6 +510,21 @@
           ]
         }
       }
+    },
+    {
+      "unique-id": "rel-mediatore-store-db",
+      "description": "Every store read and write from both API surfaces and the reconcilers: the record on create, the entry id and deadline on bind, revocation on release, the node registry on registration, the sweep into the audit table at resync (ADR-0012). TLS verify-full to PostgreSQL; a file for SQLite.",
+      "relationship-type": {
+        "connects": {
+          "source": {
+            "node": "system-mediatore"
+          },
+          "destination": {
+            "node": "database-store"
+          }
+        }
+      },
+      "protocol": "TLS"
     },
     {
       "unique-id": "rel-entries-data",
@@ -635,7 +657,7 @@
     "repository": "https://github.com/firestoned/mediatore",
     "license": "Apache-2.0",
     "calm-schema-version": "1.2",
-    "phase": "dev-mode loop implemented and e2e-tested; Entra OBO and the sqlx store are fail-closed stubs. Roadmap 01 (ADR-0006, ADR-0007) implemented and live-tested in kind: registration entries as ClusterStaticEntry through the Kubernetes API, broker identity from the Workload API over the SPIFFE CSI driver, SPIFFE mTLS terminated in-process (crates/mediatore-tls). Roadmap 03 (ADR-0011): the claim watcher, node resolution by EK, node entries from pool members, leader election by Lease. Roadmap 08 (ADR-0008): the AgentSandbox CRD, its reconciler on the same loop, the subject admission policy and the user API creating the resource; records now exist outside dev_mode. SPIRE topology models the ADR-0005 desired state: root on a dedicated identity cluster, downstream per environment; the homelab collapses to the downstream server alone."
+    "phase": "dev-mode loop implemented and e2e-tested; Entra OBO is a fail-closed stub. Roadmap 01 (ADR-0006, ADR-0007) implemented and live-tested in kind: registration entries as ClusterStaticEntry through the Kubernetes API, broker identity from the Workload API over the SPIFFE CSI driver, SPIFFE mTLS terminated in-process (crates/mediatore-tls). Roadmap 03 (ADR-0011): the claim watcher, node resolution by EK, node entries from pool members, leader election by Lease. Roadmap 08 (ADR-0008): the AgentSandbox CRD, its reconciler on the same loop, the subject admission policy and the user API creating the resource; records now exist outside dev_mode. SPIRE topology models the ADR-0005 desired state: root on a dedicated identity cluster, downstream per environment; the homelab collapses to the downstream server alone. Roadmap 05 (ADR-0012): one sqlx store over SQLite or PostgreSQL, the sealed refresh envelope, rows swept into an audit table; every kind tier runs the broker on PostgreSQL over verify-full."
   },
   "adrs": [
     "docs/adr/0001-record-architecture-decisions.md",

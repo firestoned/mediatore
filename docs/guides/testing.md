@@ -114,7 +114,32 @@ Suites today:
 | `make kind-e2e-entries` | 0006 | the live entries round trip above |
 | `make kind-e2e-mtls` | 0007 | the broker image on the CSI socket, agent-issued client SVIDs over SPIFFE mTLS, below |
 | `make kind-e2e-watcher` | 0011 | the watcher Lease, a member's certificate becoming a node entry, a claim without a record binding nothing, below |
-| `make kind-e2e-sandbox` | 0008 | the `AgentSandbox` CRD and its subject policy, a sandbox becoming an owned claim and a record, the claim bound end to end to a claim entry and the guest fetching the subject, deletion through the finalizer, below |
+| `make kind-e2e-sandbox` | 0008, 0012 | the `AgentSandbox` CRD and its subject policy, a sandbox becoming an owned claim and a record, the claim bound end to end to a claim entry and the guest fetching the subject, a broker restart on the store with the sandbox staying `Ready`, deletion through the finalizer, the released row swept into the audit table, below |
+| `make kind-e2e-store` | 0012 | the broker on PostgreSQL over `verify-full`, the store conformance suite against that database, below |
+
+### The store: PostgreSQL over TLS the client verifies
+
+Every kind tier runs the broker on the store it would run on in production.
+`make kind-postgres` (a dependency of `make kind-broker`) mints a CA and a server
+certificate for `mediatore-postgres.banlieue-system.svc` and `localhost`
+(`tls-fixture`, a testkit binary), puts them in a Secret, applies
+`dev/kind/postgres/postgres.yaml` (PostgreSQL 18, one pod, no persistence, TLS 1.3
+only) and waits for it. The broker overlay generates Secret `mediatore-store` with a
+`postgres://...?sslmode=verify-full&sslrootcert=/etc/mediatore-pg/ca.pem` URL and
+mounts the CA; the base Deployment reads the URL from that Secret as shipped.
+
+`make kind-e2e-store` (`dev/kind/store-e2e.sh`) then checks the broker log says it
+migrated and connected to PostgreSQL and that the password is nowhere in it,
+port-forwards the database and runs the store conformance suite (the one `make check`
+runs over `MemoryStore` and over SQLite in memory) against it as the `#[ignore]`
+`sql::tests::postgres` cases, with `MEDIATORE_LIVE_STORE_URL` pointing through the
+port-forward and `--test-threads=1`, since the cases share one database and each empties
+it first. The same suite on three backends is what makes the one query set of
+ADR-0012 a tested claim rather than a hope. The sandbox tier adds the restart: with a
+sandbox `Ready`, the broker is restarted and must come back finding the record, the
+entry id and the node in the store, with no second record and no second entry; after
+the deletion, the kind config's zero retention and 15 s resync let the tier see the
+released row archived.
 
 ### Broker and client pods over SPIFFE mTLS
 
