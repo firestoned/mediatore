@@ -49,6 +49,7 @@ impl Harness {
             audiences: vec![AUDIENCE.into()],
             sandboxes: front_door.then(|| sandboxes.clone() as _),
             sandbox_namespace: NAMESPACE.into(),
+            sealer: None,
             dev_mode: false,
         });
         let user = tokio::net::TcpListener::bind("127.0.0.1:0")

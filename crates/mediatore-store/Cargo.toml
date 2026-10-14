@@ -1,6 +1,6 @@
 [package]
 name = "mediatore-store"
-description = "Claim and node records: trait + in-memory implementation (PostgreSQL/SQLite via sqlx later)"
+description = "Claim, node and audit records: the ClaimStore trait, the sqlx store over SQLite or PostgreSQL, the sealed refresh envelope, and the in-memory store for dev_mode (ADR-0012)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -16,6 +16,11 @@ serde.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 thiserror.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+aws-lc-rs.workspace = true
+sha2.workspace = true
+hex.workspace = true
 
 [lints]
 workspace = true

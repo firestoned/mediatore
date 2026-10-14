@@ -79,6 +79,7 @@ fn state(idp: &FakeIdp, dev_mode: bool) -> Arc<AppState> {
         audiences: vec![AUDIENCE.into()],
         sandboxes: None,
         sandbox_namespace: "sandboxes".into(),
+        sealer: None,
         dev_mode,
     })
 }

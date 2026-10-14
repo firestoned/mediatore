@@ -31,6 +31,8 @@ the component that finishes the story.
   app-only paths, end to end.
 - [Requesting a sandbox](guides/requesting-a-sandbox.md): the `AgentSandbox` resource,
   through the API or declaratively, who may name which subject, and what its status says.
+- [The store](guides/the-store.md): SQLite or PostgreSQL by URL, what survives a restart,
+  sealed refresh material, retention and the audit table.
 - [System architecture](architecture/diagrams/system.md) and
   [flows](architecture/diagrams/flows.md), rendered from the
   [CALM](https://calm.finos.org/) architecture-as-code model.

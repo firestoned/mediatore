@@ -56,6 +56,9 @@ pub struct WatcherConfig {
     pub audiences: Vec<String>,
     /// Issuers mediatore trusts; a sandbox's subject must come from one.
     pub issuers: Vec<String>,
+    /// How long a claim row outlives its claim before the resync sweeps it into the audit
+    /// table (ADR-0012 decision 4).
+    pub retention: Duration,
 }
 
 impl Default for WatcherConfig {
@@ -66,6 +69,7 @@ impl Default for WatcherConfig {
             requeue: Duration::from_secs(5),
             audiences: vec![],
             issuers: vec![],
+            retention: Duration::from_secs(3600),
         }
     }
 }
@@ -426,8 +430,10 @@ impl Watcher {
     }
 
     /// Decision 4's backstop: release every bound record whose claim no longer exists,
-    /// then sweep orphan entries. Returns (records released, entries swept).
-    pub async fn resync(&self) -> Result<(usize, usize), WatchError> {
+    /// then sweep orphan entries, then sweep the rows of claims that ended before the
+    /// retention window into the audit table (ADR-0012). Returns (records released,
+    /// entries swept, rows archived).
+    pub async fn resync(&self) -> Result<(usize, usize, usize), WatchError> {
         let existing = self.claims.list_claim_uids().await?;
         let mut released = 0;
         for rec in self.reconciler.store.list_claims().await? {
@@ -439,11 +445,14 @@ impl Watcher {
             }
         }
         let swept = self.reconciler.sweep_orphans().await?;
+        let before = chrono::Utc::now()
+            - chrono::Duration::from_std(self.config().retention).unwrap_or(chrono::Duration::MAX);
+        let archived = self.reconciler.store.sweep(before).await?;
         self.declared
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
-        Ok((released, swept))
+        Ok((released, swept, archived))
     }
 }
 
@@ -535,7 +544,9 @@ pub async fn run(client: Client, watcher: Arc<Watcher>) -> anyhow::Result<()> {
         loop {
             tick.tick().await;
             match watcher.resync().await {
-                Ok((released, swept)) => tracing::info!(released, swept, "resync"),
+                Ok((released, swept, archived)) => {
+                    tracing::info!(released, swept, archived, "resync");
+                }
                 Err(e) => tracing::warn!(error = %e, "resync failed"),
             }
         }
@@ -581,7 +592,7 @@ mod tests {
                 args: vec!["sh".into()],
             },
             ttl_seconds: 600,
-            refresh_ciphertext: None,
+            refresh: None,
             created_at: Utc::now(),
             expires_at: None,
             revoked_at: None,
@@ -882,8 +893,8 @@ mod tests {
             .await
             .unwrap();
         r.claims.mark_existing(kept);
-        let (released, swept) = r.watcher.resync().await.unwrap();
-        assert_eq!((released, swept), (1, 1));
+        let (released, swept, archived) = r.watcher.resync().await.unwrap();
+        assert_eq!((released, swept, archived), (1, 1, 0));
         assert!(r.store.get_claim(gone).await.unwrap().revoked_at.is_some());
         assert!(r.store.get_claim(kept).await.unwrap().revoked_at.is_none());
         assert!(
@@ -896,5 +907,31 @@ mod tests {
             "never-bound records are not the resync's call"
         );
         assert_eq!(r.entries.names(), vec![claim_entry_name(kept)]);
+    }
+
+    #[tokio::test]
+    async fn a_resync_archives_rows_whose_claim_ended_before_the_retention() {
+        let r = rig(WatcherConfig {
+            retention: Duration::ZERO,
+            ..WatcherConfig::default()
+        });
+        let ended = uid();
+        let live = Uuid::new_v4();
+        for u in [ended, live] {
+            r.store.put_claim(record(u)).await.unwrap();
+            r.claims.mark_existing(u);
+        }
+        r.store.revoke_claim(ended, Utc::now()).await.unwrap();
+        let (released, swept, archived) = r.watcher.resync().await.unwrap();
+        assert_eq!((released, swept, archived), (0, 0, 1));
+        assert!(matches!(
+            r.store.get_claim(ended).await,
+            Err(mediatore_store::StoreError::NotFound(_))
+        ));
+        assert!(r.store.get_claim(live).await.is_ok());
+        let audit = r.store.list_audit().await.unwrap();
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].uid, ended);
+        assert!(audit[0].revoked_at.is_some());
     }
 }

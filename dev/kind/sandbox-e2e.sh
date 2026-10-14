@@ -155,7 +155,9 @@ spec:
         - --dev-ek-hash
         - "$EK_HASH"
         - --dev-dmi-uuid
-        - 2e3d4c5b-6a7f-4e8d-9c0b-1a2f3e4d5c6b
+        # The same VM as the mTLS and watcher tiers (same EK, same DMI): the node row now
+        # outlives the broker (ADR-0012), and another DMI under this EK would be a clone.
+        - 1d2c3b4a-5f6e-4d7c-8b9a-0f1e2d3c4b5a
         - --dev-skip-setup
       env:
         - { name: MEDIATORE_URL, value: "https://mediatore-sandbox.banlieue-system.svc" }
@@ -229,6 +231,22 @@ wait_for "$TIMEOUT" "'subject fetched' with claim $CLAIM_UID in the node pod log
 node_logs | grep -F "subject fetched" | grep -qF "subject=octocat" || fail "the guest did not get octocat as the subject"
 echo "entry declared through the admission policy; sandbox Bound, entry set, Ready; the guest fetched octocat's claim $CLAIM_UID"
 
+say "restart: the broker comes back on the store; the record, the node and the entry survive (ADR-0012)"
+"${K[@]}" -n "$BROKER_NS" rollout restart deploy/mediatore >/dev/null
+"${K[@]}" -n "$BROKER_NS" rollout status deploy/mediatore --timeout=120s >/dev/null
+BROKER_POD=$(broker_pod)
+[ -n "$BROKER_POD" ] || fail "no Running broker pod after the restart"
+wait_for "$TIMEOUT" "lease mediatore-watcher held by ${BROKER_POD#pod/}" holder_is_pod
+wait_for "$TIMEOUT" "'claim watcher running' in the new broker log" log_has "claim watcher running"
+resynced() { broker_logs | grep -F "resync" | grep -q "archived="; }
+wait_for "$TIMEOUT" "a resync in the new broker log" resynced
+ready || fail "sb-e2e is no longer Ready after the restart"
+log_has "record created" "$CLAIM_UID" && fail "the record was created again: the store did not keep it"
+log_has "claim bound: entry set" && fail "the claim was bound again: the store did not keep the entry id"
+n=$(entries | grep -c "mediatore-claim-$CLAIM_UID " || true)
+[ "$n" -eq 1 ] || fail "expected one claim entry after the restart, found $n"
+echo "still Ready on ${BROKER_POD#pod/}: record, entry id and node found in the store, nothing redone"
+
 say "refused: a sandbox naming an audience the broker does not serve creates nothing"
 manifest sb-bad octocat '["nope"]' | "${KSA[@]}" create -f - >/dev/null
 failed_bad() { [ "$(field sb-bad '.status.phase')" = "Failed" ]; }
@@ -250,4 +268,10 @@ n=$(entries | grep -c '/banlieue/claim/' || true)
 [ "$n" -eq 0 ] || fail "claim entries left behind: $n"
 echo "entry retracted, claim deleted, sandbox gone"
 
-say "PASS: ADR-0008 holds against a real cluster (subject policy, owned claim and record, bind to Ready, fail-closed audience, finalizer)"
+say "audit: the released record is swept into the audit table at the next resync (ADR-0012)"
+# The kind config keeps ended rows for 0 s and resyncs every 15 s.
+archived() { broker_logs | grep -F "resync" | grep -qE 'archived=[1-9]'; }
+wait_for "$TIMEOUT" "a resync archiving at least one row" archived
+echo "archived at resync"
+
+say "PASS: ADR-0008 holds against a real cluster (subject policy, owned claim and record, bind to Ready, a restart on the store, fail-closed audience, finalizer, the audit sweep)"

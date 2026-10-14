@@ -6,8 +6,8 @@
 
 .PHONY: all help fmt fmt-check lint test deny audit check sbom guest dist image crds e2e live-admission-test \
         kind-install kind-create kind-delete kind-down kind-spire kind-deploy kind-up \
-        kind-images kind-broker kind-banlieue-crds kind-e2e-entries kind-e2e-mtls kind-e2e-watcher kind-e2e-sandbox \
-        kind-e2e kind-e2e-ci kind-e2e-logs \
+        kind-images kind-postgres kind-broker kind-banlieue-crds kind-e2e-entries kind-e2e-mtls kind-e2e-watcher kind-e2e-sandbox \
+        kind-e2e-store kind-e2e kind-e2e-ci kind-e2e-logs \
         calm-validate calm-diagrams docs docs-serve docs-clean clean
 
 # kind: a throwaway cluster with SPIRE for the live tests (docs/guides/testing.md).
@@ -169,7 +169,17 @@ kind-images: kind-create dist ## Server image (the shipped Dockerfile's runtime 
 	kind load docker-image --name $(KIND_CLUSTER_NAME) $(KIND_IMAGE)
 	kind load docker-image --name $(KIND_CLUSTER_NAME) $(KIND_GUEST_IMAGE)
 
-kind-broker: kind-up kind-images ## deploy/base in kind on the CSI driver's socket (dev/kind/broker overlay), rolled out
+kind-postgres: kind-create ## PostgreSQL in kind with a certificate this target mints (ADR-0012); the broker's store
+	@$(KIND_KUBECTL) get ns banlieue-system >/dev/null 2>&1 || $(KIND_KUBECTL) create ns banlieue-system
+	cargo run -q -p mediatore-testkit --bin tls-fixture -- --out-dir $(KIND_DIR)/pg --dns mediatore-postgres.banlieue-system.svc --dns localhost
+	$(KIND_KUBECTL) -n banlieue-system create secret generic mediatore-postgres-tls --from-file=$(KIND_DIR)/pg/server.pem --from-file=$(KIND_DIR)/pg/server-key.pem --dry-run=client -o yaml | $(KIND_KUBECTL) apply -f -
+	$(KIND_KUBECTL) -n banlieue-system create configmap mediatore-pg-ca --from-file=$(KIND_DIR)/pg/ca.pem --dry-run=client -o yaml | $(KIND_KUBECTL) apply -f -
+	$(KIND_KUBECTL) apply -f dev/kind/postgres/postgres.yaml
+	@# A new certificate needs a new pod.
+	$(KIND_KUBECTL) -n banlieue-system rollout restart deploy/mediatore-postgres
+	$(KIND_KUBECTL) -n banlieue-system rollout status deploy/mediatore-postgres --timeout=300s
+
+kind-broker: kind-up kind-images kind-postgres ## deploy/base in kind on the CSI driver's socket and the kind PostgreSQL (dev/kind/broker overlay), rolled out
 	$(KIND_KUBECTL) apply -k dev/kind/broker
 	@# Same tag, new image: a restart is what makes the loaded image the running one.
 	$(KIND_KUBECTL) -n banlieue-system rollout restart deploy/mediatore
@@ -201,7 +211,10 @@ kind-e2e-sandbox: kind-banlieue-crds kind-broker ## ADR-0008 live: the subject p
 	$(KIND_KUBECTL) -n banlieue-system rollout status deploy/mediatore --timeout=300s
 	./dev/kind/sandbox-e2e.sh $(KIND_KUBECONFIG) $(KIND_SA_KUBECONFIG) $(SPIRE_TRUST_DOMAIN) $(KIND_DIR)/ek.pem $(KIND_DIR)/ek.hash
 
-kind-e2e: kind-e2e-entries kind-e2e-mtls kind-e2e-watcher kind-e2e-sandbox ## Every live suite against kind (grows with the roadmap)
+kind-e2e-store: kind-broker ## ADR-0012 live: the broker on PostgreSQL over verify-full, the store conformance suite against that database
+	./dev/kind/store-e2e.sh $(KIND_KUBECONFIG) $(KIND_DIR)/pg/ca.pem
+
+kind-e2e: kind-e2e-entries kind-e2e-mtls kind-e2e-watcher kind-e2e-sandbox kind-e2e-store ## Every live suite against kind (grows with the roadmap)
 
 kind-e2e-ci: ## CI shape: the suites, cluster state on failure, cluster deleted after
 	@$(MAKE) kind-e2e || { $(MAKE) kind-e2e-logs; $(MAKE) kind-delete; exit 1; }
@@ -212,6 +225,7 @@ kind-e2e-logs: ## What a failing live suite needs: entries, policy, broker and c
 	-$(KIND_KUBECTL) get clusterspiffeids -o yaml
 	-$(KIND_KUBECTL) -n banlieue-system get pods -o wide
 	-$(KIND_KUBECTL) -n banlieue-system logs deploy/mediatore --tail=200
+	-$(KIND_KUBECTL) -n banlieue-system logs deploy/mediatore-postgres --tail=50
 	-$(KIND_KUBECTL) -n mediatore-e2e get pods -o wide
 	-$(KIND_KUBECTL) -n banlieue-system get lease mediatore-watcher -o yaml
 	-$(KIND_KUBECTL) -n mediatore-e2e-watcher get virtualmachines,virtualmachineclaims -o yaml

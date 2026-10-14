@@ -16,7 +16,9 @@ use mediatore_claims::sandbox::{KubeSandboxes, SandboxFrontDoor};
 use mediatore_claims::watch::{KubeClaimsApi, Watcher, WatcherConfig};
 use mediatore_entra::Validator;
 use mediatore_spire::{EntryManager, KubeEntryManager, MemoryEntries, Naming};
-use mediatore_store::MemoryStore;
+use mediatore_store::seal::{LocalKeySealer, Sealer};
+use mediatore_store::sql::{SqlStore, redacted};
+use mediatore_store::{ClaimStore, MemoryStore};
 use mediatore_sts::Sts;
 use mediatore_tls::MaterialSource;
 use tracing_subscriber::EnvFilter;
@@ -81,12 +83,10 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
     let client = kube_client(&cfg).await?;
     let spire = entry_manager(&cfg, naming.clone(), client.as_ref());
     if cfg.dev_mode {
-        tracing::warn!("dev_mode: peer identity from header, in-memory store and entries, no mTLS");
-    } else {
-        tracing::warn!(
-            "store: in-memory until roadmap 05; records and nodes do not survive a restart (a restarted broker releases nothing it does not know and sweeps the entries)"
-        );
+        tracing::warn!("dev_mode: peer identity from header, in-memory entries, no mTLS");
     }
+    let store = store(&cfg).await?;
+    let sealer = sealer(&cfg)?;
     let sandboxes: Option<Arc<dyn SandboxFrontDoor>> = client
         .as_ref()
         .map(|c| Arc::new(KubeSandboxes::new(c.clone())) as Arc<dyn SandboxFrontDoor>);
@@ -106,7 +106,7 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
     };
 
     let state = Arc::new(AppState {
-        store: MemoryStore::shared(),
+        store,
         spire,
         naming: naming.clone(),
         validator: Validator::new(cfg.issuers.clone()),
@@ -114,6 +114,7 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
         audiences: cfg.audiences.iter().map(|a| a.name.clone()).collect(),
         sandboxes,
         sandbox_namespace: cfg.sandboxes.namespace.clone(),
+        sealer,
         dev_mode: cfg.dev_mode,
     });
 
@@ -162,6 +163,7 @@ async fn claim_watcher(
             resolve_timeout: std::time::Duration::from_secs(cfg.watcher.resolve_timeout_secs),
             audiences: cfg.audiences.iter().map(|a| a.name.clone()).collect(),
             issuers: cfg.issuers.iter().map(|i| i.url.clone()).collect(),
+            retention: std::time::Duration::from_secs(cfg.store.retention_secs),
             ..WatcherConfig::default()
         },
     ));
@@ -204,6 +206,35 @@ async fn broker_identity(
         mediatore_api::sandbox_authorizer(naming.clone()),
     )?;
     Ok(configs)
+}
+
+/// The claim store (ADR-0012): sqlx over the configured URL, migrated at startup; in
+/// memory only under `dev_mode` with no URL (`Config::parse` refuses that elsewhere).
+async fn store(cfg: &Config) -> anyhow::Result<Arc<dyn ClaimStore>> {
+    let Some(url) = cfg.store.url.as_deref() else {
+        tracing::warn!("store: in-memory (dev_mode); nothing survives a restart");
+        return Ok(MemoryStore::shared());
+    };
+    let store = SqlStore::connect(url, cfg.store.max_connections).await?;
+    tracing::info!(
+        store = %redacted(url),
+        engine = ?store.engine(),
+        retention_secs = cfg.store.retention_secs,
+        "store: migrated and connected"
+    );
+    Ok(Arc::new(store))
+}
+
+/// The refresh-material sealer (ADR-0012 decision 3), when `store.sealing` names a key.
+/// The key is read and checked now so a bad Secret fails the start, not the first claim.
+fn sealer(cfg: &Config) -> anyhow::Result<Option<Arc<dyn Sealer>>> {
+    let Some(sealing) = &cfg.store.sealing else {
+        tracing::info!("sealing: no key configured; refresh material cannot be persisted");
+        return Ok(None);
+    };
+    let sealer = LocalKeySealer::from_file(&sealing.key_file)?;
+    tracing::info!(key_id = sealer.key_id(), "sealing: local key loaded");
+    Ok(Some(Arc::new(sealer)))
 }
 
 /// The Kubernetes client outside `dev_mode`: the cluster `spire.entries.kubeconfig` names,

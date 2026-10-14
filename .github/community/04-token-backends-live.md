@@ -7,8 +7,11 @@
 deletes threat-model accepted risk **R-2**.
 
 - [ ] Dex path first (everything before OBO is testable without Entra): store the Dex
-      refresh token at claim creation, refresh-before-issue on every `POST /v1/token`
-      so upstream revocation propagates, then mint STS
+      refresh token at claim creation as a sealed envelope (`Sealer`, roadmap 05),
+      refresh-before-issue on every `POST /v1/token` so upstream revocation propagates,
+      then mint STS
+- [ ] OpenBao transit `Sealer` (ADR-0012 decision 3): the work shape, where the broker
+      never holds the wrapping key; the local key file stays the homelab shape
 - [ ] `mediatore-cli login` (PKCE against Dex, `audience:server:client_id:mediatore`
       cross-client scope)
 - [ ] Entra OBO: client_assertion signing (key via OpenBao transit or file for now),

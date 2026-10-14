@@ -180,7 +180,7 @@ mod tests {
             audiences: vec![],
             workload: Workload::default(),
             ttl_seconds: 600,
-            refresh_ciphertext: None,
+            refresh: None,
             created_at: Utc::now(),
             expires_at: None,
             revoked_at: None,

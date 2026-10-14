@@ -295,7 +295,7 @@ pub fn record_for(sb: &AgentSandbox, claim_uid: Uuid) -> ClaimRecord {
         audiences: sb.spec.audiences.clone(),
         workload: Workload::from(&sb.spec.workload),
         ttl_seconds: sb.spec.ttl_seconds,
-        refresh_ciphertext: None,
+        refresh: None,
         created_at: Utc::now(),
         expires_at: None,
         revoked_at: None,

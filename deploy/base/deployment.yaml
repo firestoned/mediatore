@@ -31,6 +31,11 @@ spec:
             # Workload API socket delivered by the SPIFFE CSI driver (ADR-0007):
             # the SVID and its key are fetched into memory, never written to a volume.
             - { name: SPIFFE_ENDPOINT_SOCKET, value: "unix:///run/spire/sockets/spire-agent.sock" }
+            # The store URL (ADR-0012): postgres://...?sslmode=verify-full with its password,
+            # from a Secret the operator creates (deploy/base ships none); overrides store.url.
+            - name: MEDIATORE_STORE_URL
+              valueFrom:
+                secretKeyRef: { name: mediatore-store, key: url }
           volumeMounts:
             - { name: config, mountPath: /etc/mediatore, readOnly: true }
             - { name: spire-agent-socket, mountPath: /run/spire/sockets, readOnly: true }

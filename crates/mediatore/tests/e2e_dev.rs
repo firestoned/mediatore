@@ -82,6 +82,7 @@ impl Harness {
             audiences: vec![AUDIENCE.into()],
             sandboxes: None,
             sandbox_namespace: "sandboxes".into(),
+            sealer: None,
             dev_mode: true,
         });
 
