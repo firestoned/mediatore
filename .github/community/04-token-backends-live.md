@@ -3,21 +3,31 @@
 
 # 04: Token backends live
 
-**Status: not started.** Both delegation paths issue real tokens (runbook Parts 4/4b);
-deletes threat-model accepted risk **R-2**.
+**Status: in progress.** Both delegation paths issue real tokens (runbook Parts 4/4b);
+deletes threat-model accepted risk **R-2**. The Dex half is built
+([ADR-0013](../../docs/adr/0013-dex-session-delegation.md), 2026-10-14); the Entra half and
+the transit sealer are the next slices.
 
-- [ ] Dex path first (everything before OBO is testable without Entra): store the Dex
-      refresh token at claim creation as a sealed envelope (`Sealer`, roadmap 05),
-      refresh-before-issue on every `POST /v1/token` so upstream revocation propagates,
-      then mint STS
-- [ ] OpenBao transit `Sealer` (ADR-0012 decision 3): the work shape, where the broker
-      never holds the wrapping key; the local key file stays the homelab shape
-- [ ] `mediatore-cli login` (PKCE against Dex, `audience:server:client_id:mediatore`
-      cross-client scope)
+- [x] Dex path first (everything before OBO is testable without Entra): the refresh token
+      is delegated with `POST /v1/claims`, sealed with the `AgentSandbox` UID into a
+      `sessions` row and moved into the record by the reconciler; every `POST /v1/token`
+      refreshes it first (rotation re-sealed, the fresh groups minted) so upstream
+      revocation propagates, then mints STS (ADR-0013; `crates/mediatore/tests/e2e_session.rs`)
+- [x] `mediatore-cli login` (PKCE with a loopback redirect, as mediatore's own public
+      client; `offline_access` for the refresh token), `claim` (delegates and forgets the
+      refresh token), `get`, `delete`, `status` (`crates/mediatore-cli`, tested against
+      the fake issuer's authorization-code flow)
+- [x] Refusal handling: `invalid_grant`, a fresh ID token outside the group, or one naming
+      another subject releases the claim at once (entry retracted, record revoked,
+      envelope dropped) and answers `403 session_revoked`; an issuer outage is
+      `503 upstream_unavailable` and revokes nothing (runbook 5.6 rule 5)
+- [x] Per-claim rate limiting on `/v1/token`: a token bucket per claim UID,
+      `token.rate_per_minute` (default 10), `429 rate_limited` before any upstream call
+- [ ] Dex in kind (`make kind-e2e-dex`): the same flow against a real Dex with a static
+      password connector, the CLI driven from inside the cluster; the runbook 8.7
+      negative case "Dex org removal" becomes a group change there
 - [ ] Entra OBO: client_assertion signing (key via OpenBao transit or file for now),
       first exchange at claim creation, refresh within TTL, 15-minute re-issue cap
-- [ ] Refusal handling: upstream refuses → revoke row + delete entry in one step
-      (runbook 5.6 rule 5)
-- [ ] Per-claim rate limiting on `/v1/token`
-- [ ] Negative tests from runbook 8.7 that need real backends (revoked Entra session,
-      Dex org removal)
+- [ ] OpenBao transit `Sealer` (ADR-0012 decision 3): the work shape, where the broker
+      never holds the wrapping key; the local key file stays the homelab shape
+- [ ] Negative tests from runbook 8.7 that need real backends (revoked Entra session)

@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
-use mediatore_api::AppState;
+use mediatore_api::{AppState, Limiter};
 use mediatore_claims::Reconciler;
 use mediatore_claims::lease::LeaseConfig;
 use mediatore_claims::sandbox::{KubeSandboxes, SandboxFrontDoor};
@@ -115,6 +115,7 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
         sandboxes,
         sandbox_namespace: cfg.sandboxes.namespace.clone(),
         sealer,
+        limiter: Limiter::new(cfg.token.rate_per_minute),
         dev_mode: cfg.dev_mode,
     });
 

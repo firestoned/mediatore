@@ -10,7 +10,7 @@ use mediatore_proto::{Provider, Subject, Workload};
 use uuid::Uuid;
 
 use crate::seal::{LocalKeySealer, Sealer};
-use crate::{ClaimRecord, ClaimStore, NodeRecord, StoreError};
+use crate::{ClaimRecord, ClaimStore, NodeRecord, SessionRecord, StoreError};
 
 /// One `#[tokio::test]` per listed case, each over a fresh store from `$make`.
 macro_rules! cases {
@@ -42,6 +42,7 @@ macro_rules! suite {
                 duplicate_ek_with_another_dmi_is_a_conflict,
                 ban_marks_the_node_and_needs_an_existing_row,
                 a_sweep_moves_ended_claims_into_the_audit_table,
+                a_session_is_taken_once_deleted_on_demand_and_swept_when_stale,
                 ping_answers,
             );
         }
@@ -80,6 +81,7 @@ pub(crate) fn claim(uid: Uuid) -> ClaimRecord {
         created_at: at(0),
         expires_at: None,
         revoked_at: None,
+        sandbox_uid: None,
     }
 }
 
@@ -104,7 +106,9 @@ pub(crate) async fn a_claim_round_trips_every_field(s: &dyn ClaimStore) {
     let mut rec = claim(uid);
     rec.entry_id = Some("mediatore-claim-x".into());
     rec.node_id = Some("spiffe://sandbox.test/spire/agent/tpm/ek1".into());
-    rec.refresh = Some(sealer().seal(uid, b"refresh-token").await.unwrap());
+    let sandbox_uid = Uuid::new_v4();
+    rec.sandbox_uid = Some(sandbox_uid);
+    rec.refresh = Some(sealer().seal(sandbox_uid, b"refresh-token").await.unwrap());
     rec.expires_at = Some(at(3600));
     s.put_claim(rec.clone()).await.unwrap();
 
@@ -124,10 +128,16 @@ pub(crate) async fn a_claim_round_trips_every_field(s: &dyn ClaimStore) {
         assert_eq!(got.created_at, rec.created_at);
         assert_eq!(got.expires_at, rec.expires_at);
         assert_eq!(got.revoked_at, None);
+        assert_eq!(got.sandbox_uid, Some(sandbox_uid));
+        assert_eq!(got.seal_binding(), sandbox_uid);
         let env = got.refresh.as_ref().expect("envelope survives");
         assert_eq!(env, rec.refresh.as_ref().unwrap());
         assert_eq!(
-            sealer().unseal(uid, env).await.unwrap().as_slice(),
+            sealer()
+                .unseal(got.seal_binding(), env)
+                .await
+                .unwrap()
+                .as_slice(),
             b"refresh-token"
         );
     }
@@ -332,6 +342,50 @@ pub(crate) async fn a_sweep_moves_ended_claims_into_the_audit_table(s: &dyn Clai
     // A second sweep finds nothing and the audit rows stay.
     assert_eq!(s.sweep(at(1000)).await.unwrap(), 0);
     assert_eq!(s.list_audit().await.unwrap().len(), 2);
+}
+
+pub(crate) async fn a_session_is_taken_once_deleted_on_demand_and_swept_when_stale(
+    s: &dyn ClaimStore,
+) {
+    let sandbox_uid = Uuid::new_v4();
+    let session = SessionRecord {
+        sandbox_uid,
+        subject: subject(),
+        issuer: "https://issuer.example.com".into(),
+        refresh: sealer().seal(sandbox_uid, b"dex-refresh").await.unwrap(),
+        created_at: at(0),
+    };
+    s.put_session(session.clone()).await.unwrap();
+    let err = s.put_session(session.clone()).await.unwrap_err();
+    assert!(matches!(err, StoreError::Conflict(_)), "{err}");
+
+    let taken = s.take_session(sandbox_uid).await.unwrap().expect("parked");
+    assert_eq!(taken, session);
+    assert_eq!(
+        sealer().unseal(sandbox_uid, &taken.refresh).await.unwrap(),
+        b"dex-refresh"
+    );
+    assert!(
+        s.take_session(sandbox_uid).await.unwrap().is_none(),
+        "taken once"
+    );
+
+    s.put_session(session.clone()).await.unwrap();
+    s.delete_session(sandbox_uid).await.unwrap();
+    s.delete_session(sandbox_uid).await.unwrap();
+    assert!(s.take_session(sandbox_uid).await.unwrap().is_none());
+
+    let mut old = session.clone();
+    old.sandbox_uid = Uuid::new_v4();
+    old.created_at = at(0);
+    let mut fresh = session;
+    fresh.sandbox_uid = Uuid::new_v4();
+    fresh.created_at = at(100);
+    s.put_session(old.clone()).await.unwrap();
+    s.put_session(fresh.clone()).await.unwrap();
+    assert_eq!(s.sweep_sessions(at(50)).await.unwrap(), 1);
+    assert!(s.take_session(old.sandbox_uid).await.unwrap().is_none());
+    assert!(s.take_session(fresh.sandbox_uid).await.unwrap().is_some());
 }
 
 pub(crate) async fn ping_answers(s: &dyn ClaimStore) {

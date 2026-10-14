@@ -53,7 +53,7 @@
       "unique-id": "data-asset-claim-store",
       "node-type": "data-asset",
       "name": "Claim Store",
-      "description": "Per-claim rows keyed by the claim's UID: a copy of the AgentSandbox request fields (subject, audiences, workload, TTL), the SPIRE entry id, the node id, the sealed refresh envelope (key id, nonce, AES-256-GCM ciphertext bound to the claim UID; ADR-0012 decision 3), the bind deadline and the revocation timestamp; node rows keyed by EK hash; audit rows written when a claim row is swept. One sqlx implementation over SQLite or PostgreSQL (ADR-0012, built: roadmap 05), the engine chosen by store.url; in-memory only under dev_mode. The resource is the source of truth for the request fields; the store is where revocation and the node registry survive a restart. crates/mediatore-store."
+      "description": "Per-claim rows keyed by the claim's UID: a copy of the AgentSandbox request fields (subject, audiences, workload, TTL), the SPIRE entry id, the node id, the sealed refresh envelope (key id, nonce, AES-256-GCM ciphertext bound to the claim UID; ADR-0012 decision 3), the bind deadline and the revocation timestamp; node rows keyed by EK hash; audit rows written when a claim row is swept; sessions rows (a delegated refresh token, sealed, keyed by the AgentSandbox UID) between the API call and the record (ADR-0013). One sqlx implementation over SQLite or PostgreSQL (ADR-0012, built: roadmap 05), the engine chosen by store.url; in-memory only under dev_mode. The resource is the source of truth for the request fields; the store is where revocation and the node registry survive a restart. crates/mediatore-store."
     },
     {
       "unique-id": "database-store",
@@ -266,7 +266,7 @@
     },
     {
       "unique-id": "rel-user-mediatore-claims",
-      "description": "POST /v1/claims with the IdP bearer token creates an AgentSandbox with the token's subject (ADR-0008); GET answers from its status, DELETE deletes it. Subject equality is enforced on read and delete.",
+      "description": "POST /v1/claims with the IdP bearer token creates an AgentSandbox with the token's subject (ADR-0008); GET answers from its status, DELETE deletes it. Subject equality is enforced on read and delete. For a session issuer the request also carries the caller's refresh token (mediatore-cli login, PKCE as client mediatore; ADR-0013), which is sealed with the AgentSandbox UID into a sessions row before the response and follows the claim into its record; it never touches the resource.",
       "relationship-type": {
         "connects": {
           "source": {
@@ -281,7 +281,7 @@
     },
     {
       "unique-id": "rel-mediatore-idp",
-      "description": "JWKS discovery and signature validation for incoming tokens; Entra On-Behalf-Of / refresh-token exchange for the entra-obo backend. The user's original token is discarded after the first exchange.",
+      "description": "JWKS discovery and signature validation for incoming tokens; for a session issuer (ADR-0013, built), a refresh_token grant before every token issue, as mediatore's own public client: the fresh ID token is validated like a login (group gate included), the rotated refresh token re-sealed into the record, and invalid_grant releases the claim at once. Entra On-Behalf-Of exchange for the entra-obo backend (next slice of roadmap 04). The user's original token is discarded after validation.",
       "relationship-type": {
         "connects": {
           "source": {
@@ -471,7 +471,7 @@
     },
     {
       "unique-id": "rel-workload-mediatore",
-      "description": "POST /v1/token over the claim SVID: one audience per request, from the claim's allowlist, capped at 15 minutes, never a refresh token.",
+      "description": "POST /v1/token over the claim SVID: one audience per request, from the claim's allowlist, capped at 15 minutes, never a refresh token. Rate-limited per claim (token.rate_per_minute, 429 beyond it) ahead of any upstream call (ADR-0013).",
       "relationship-type": {
         "connects": {
           "source": {
@@ -657,7 +657,7 @@
     "repository": "https://github.com/firestoned/mediatore",
     "license": "Apache-2.0",
     "calm-schema-version": "1.2",
-    "phase": "dev-mode loop implemented and e2e-tested; Entra OBO is a fail-closed stub. Roadmap 01 (ADR-0006, ADR-0007) implemented and live-tested in kind: registration entries as ClusterStaticEntry through the Kubernetes API, broker identity from the Workload API over the SPIFFE CSI driver, SPIFFE mTLS terminated in-process (crates/mediatore-tls). Roadmap 03 (ADR-0011): the claim watcher, node resolution by EK, node entries from pool members, leader election by Lease. Roadmap 08 (ADR-0008): the AgentSandbox CRD, its reconciler on the same loop, the subject admission policy and the user API creating the resource; records now exist outside dev_mode. SPIRE topology models the ADR-0005 desired state: root on a dedicated identity cluster, downstream per environment; the homelab collapses to the downstream server alone. Roadmap 05 (ADR-0012): one sqlx store over SQLite or PostgreSQL, the sealed refresh envelope, rows swept into an audit table; every kind tier runs the broker on PostgreSQL over verify-full."
+    "phase": "dev-mode loop implemented and e2e-tested; Entra OBO is a fail-closed stub. Roadmap 01 (ADR-0006, ADR-0007) implemented and live-tested in kind: registration entries as ClusterStaticEntry through the Kubernetes API, broker identity from the Workload API over the SPIFFE CSI driver, SPIFFE mTLS terminated in-process (crates/mediatore-tls). Roadmap 03 (ADR-0011): the claim watcher, node resolution by EK, node entries from pool members, leader election by Lease. Roadmap 08 (ADR-0008): the AgentSandbox CRD, its reconciler on the same loop, the subject admission policy and the user API creating the resource; records now exist outside dev_mode. SPIRE topology models the ADR-0005 desired state: root on a dedicated identity cluster, downstream per environment; the homelab collapses to the downstream server alone. Roadmap 05 (ADR-0012): one sqlx store over SQLite or PostgreSQL, the sealed refresh envelope, rows swept into an audit table; every kind tier runs the broker on PostgreSQL over verify-full. Roadmap 04, first slice (ADR-0013): the Dex path, with the upstream session delegated at claim creation, sealed, refreshed before every issue and revoked on refusal; mediatore-cli; per-claim rate limiting. Entra OBO and the transit sealer are the roadmap's next slices."
   },
   "adrs": [
     "docs/adr/0001-record-architecture-decisions.md",

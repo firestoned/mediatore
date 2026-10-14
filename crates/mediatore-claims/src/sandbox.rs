@@ -282,6 +282,15 @@ pub fn claim_for(sb: &AgentSandbox) -> Result<VirtualMachineClaim, WatchError> {
     })
 }
 
+/// The sandbox's `metadata.uid` as a UUID.
+#[must_use]
+pub fn sandbox_uid_of(sb: &AgentSandbox) -> Option<Uuid> {
+    sb.metadata
+        .uid
+        .as_deref()
+        .and_then(|u| Uuid::parse_str(u).ok())
+}
+
 /// The store record for a sandbox whose claim has UID `claim_uid` (decision 12): the
 /// request fields the sandbox API answers from, nothing bound yet.
 #[must_use]
@@ -299,6 +308,7 @@ pub fn record_for(sb: &AgentSandbox, claim_uid: Uuid) -> ClaimRecord {
         created_at: Utc::now(),
         expires_at: None,
         revoked_at: None,
+        sandbox_uid: sandbox_uid_of(sb),
     }
 }
 
@@ -412,6 +422,7 @@ impl Watcher {
             && let Some(reason) = self.refuse(&sb.spec)
         {
             tracing::warn!(sandbox = %name, %namespace, %reason, "sandbox refused; no claim created");
+            self.drop_session(sb).await?;
             self.mirror(
                 sb,
                 AgentSandboxStatus {
@@ -471,16 +482,7 @@ impl Watcher {
             tracing::warn!(sandbox = %name, %namespace, "owned claim without a UUID uid; held");
             return Ok(Action::await_change());
         };
-        let record = match self.reconciler.store.get_claim(uid).await {
-            Ok(r) => r,
-            Err(StoreError::NotFound(_)) => {
-                let r = record_for(sb, uid);
-                self.reconciler.store.put_claim(r.clone()).await?;
-                tracing::info!(sandbox = %name, %namespace, claim_uid = %uid, "record created");
-                r
-            }
-            Err(e) => return Err(e.into()),
-        };
+        let record = self.record_of(sb, uid).await?;
         let status = mirror_status(sb, &claim, &record);
         // The entry is set (on Bound) or retracted (on Releasing / Failed) by the claim
         // watcher and recorded in the store, which raises no event here: poll until the
@@ -496,6 +498,36 @@ impl Watcher {
         } else {
             Ok(Action::await_change())
         }
+    }
+
+    /// The record for the sandbox's claim, created on first sight. ADR-0013 decision 2:
+    /// the delegated session the API parked under the sandbox's UID becomes the record's
+    /// envelope, taken once.
+    async fn record_of(&self, sb: &AgentSandbox, uid: Uuid) -> Result<ClaimRecord, WatchError> {
+        match self.reconciler.store.get_claim(uid).await {
+            Ok(r) => Ok(r),
+            Err(StoreError::NotFound(_)) => {
+                let mut r = record_for(sb, uid);
+                if let Some(sandbox_uid) = r.sandbox_uid
+                    && let Some(session) = self.reconciler.store.take_session(sandbox_uid).await?
+                {
+                    r.refresh = Some(session.refresh);
+                }
+                let delegated = r.refresh.is_some();
+                self.reconciler.store.put_claim(r.clone()).await?;
+                tracing::info!(sandbox = %sb.name_any(), namespace = %sb.namespace().unwrap_or_default(), claim_uid = %uid, delegated, "record created");
+                Ok(r)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// A parked session the sandbox will never consume (refused, or going away).
+    async fn drop_session(&self, sb: &AgentSandbox) -> Result<(), WatchError> {
+        if let Some(uid) = sandbox_uid_of(sb) {
+            self.reconciler.store.delete_session(uid).await?;
+        }
+        Ok(())
     }
 
     /// Decision 10, on a sandbox being deleted: release the record (entry first), delete
@@ -530,6 +562,7 @@ impl Watcher {
                 {
                     self.reconciler.release(uid).await?;
                 }
+                self.drop_session(sb).await?;
                 self.claims.set_sandbox_finalizer(sb, false).await?;
                 tracing::info!(sandbox = %name, %namespace, "sandbox released");
                 Ok(Action::await_change())
@@ -706,6 +739,73 @@ mod tests {
             cur = next;
         }
         cur
+    }
+
+    fn parked_session() -> mediatore_store::SessionRecord {
+        mediatore_store::SessionRecord {
+            sandbox_uid: Uuid::parse_str(SB_UID).unwrap(),
+            subject: Subject {
+                issuer: ISSUER.into(),
+                id: "octocat".into(),
+                display: None,
+            },
+            issuer: ISSUER.into(),
+            refresh: mediatore_store::Sealed {
+                key_id: "k".into(),
+                nonce: vec![0; 12],
+                ciphertext: vec![1, 2, 3],
+            },
+            created_at: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_parked_session_follows_the_claim_into_the_record_once() {
+        let r = rig(cfg());
+        r.store.put_session(parked_session()).await.unwrap();
+        settle(&r, &sandbox(false, false)).await;
+        let claim = r.claims.claim("sandboxes", "sb-1").expect("claim created");
+        let uid = claim_uid_of(&claim).unwrap();
+        let rec = r.store.get_claim(uid).await.unwrap();
+        assert_eq!(rec.sandbox_uid, Some(Uuid::parse_str(SB_UID).unwrap()));
+        assert_eq!(rec.refresh, Some(parked_session().refresh));
+        assert_eq!(rec.seal_binding(), Uuid::parse_str(SB_UID).unwrap());
+        assert!(
+            r.store
+                .take_session(Uuid::parse_str(SB_UID).unwrap())
+                .await
+                .unwrap()
+                .is_none(),
+            "taken once"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_or_deleted_sandbox_drops_its_parked_session() {
+        let sb_uid = Uuid::parse_str(SB_UID).unwrap();
+        let r = rig(WatcherConfig {
+            audiences: vec![],
+            ..cfg()
+        });
+        r.store.put_session(parked_session()).await.unwrap();
+        let cur = settle(&r, &sandbox(false, false)).await;
+        assert_eq!(cur.status.unwrap().phase, SandboxPhase::Failed);
+        assert!(r.store.take_session(sb_uid).await.unwrap().is_none());
+
+        let r = rig(cfg());
+        r.store.put_session(parked_session()).await.unwrap();
+        let sb = sandbox(true, true);
+        r.claims.put_sandbox(sb.clone());
+        r.watcher.reconcile_sandbox(&sb).await.unwrap();
+        assert!(r.store.take_session(sb_uid).await.unwrap().is_none());
+        assert_eq!(
+            r.claims
+                .sandbox("sandboxes", "sb-1")
+                .unwrap()
+                .finalizers()
+                .len(),
+            0
+        );
     }
 
     #[test]

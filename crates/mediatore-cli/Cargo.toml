@@ -1,0 +1,32 @@
+[package]
+name = "mediatore-cli"
+description = "User-side CLI: log in at the issuer as mediatore's public client (PKCE) and delegate the session with a claim (ADR-0013)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "mediatore-cli"
+path = "src/main.rs"
+
+[dependencies]
+mediatore-proto.workspace = true
+tokio.workspace = true
+clap.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+base64.workspace = true
+sha2.workspace = true
+aws-lc-rs.workspace = true
+
+[dev-dependencies]
+mediatore-testkit.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

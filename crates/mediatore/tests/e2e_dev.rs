@@ -15,7 +15,7 @@ use std::future::IntoFuture;
 use std::sync::Arc;
 
 use chrono::Duration;
-use mediatore_api::AppState;
+use mediatore_api::{AppState, Limiter};
 use mediatore_entra::{Backend, IssuerConfig, Validator};
 use mediatore_proto::{
     ClaimRequest, ClaimResponse, ErrorBody, Me, NodeRegistered, NodeRegistration, TokenResponse,
@@ -77,12 +77,14 @@ impl Harness {
                 client_id: "mediatore".into(),
                 subject_claim: "preferred_username".into(),
                 required_group: Some(REQUIRED_GROUP.into()),
+                session: None,
             }]),
             sts: Some(sts),
             audiences: vec![AUDIENCE.into()],
             sandboxes: None,
             sandbox_namespace: "sandboxes".into(),
             sealer: None,
+            limiter: Limiter::new(10),
             dev_mode: true,
         });
 
@@ -158,6 +160,7 @@ impl Harness {
                     image: "registry.internal:5000/sandbox:latest".into(),
                     args: vec![],
                 },
+                refresh_token: None,
             })
             .send()
             .await
@@ -334,6 +337,7 @@ async fn a_token_for_another_audience_client_is_unauthorized() {
             ttl_seconds: 3600,
             audiences: vec![],
             workload: Workload::default(),
+            refresh_token: None,
         })
         .send()
         .await
@@ -358,6 +362,7 @@ async fn a_login_outside_the_required_group_is_forbidden() {
             ttl_seconds: 3600,
             audiences: vec![],
             workload: Workload::default(),
+            refresh_token: None,
         })
         .send()
         .await
@@ -509,4 +514,29 @@ async fn duplicate_ek_with_a_different_dmi_uuid_is_a_conflict() {
         409,
         "cloned TPM state must be refused loudly"
     );
+}
+
+#[tokio::test]
+async fn an_issuer_without_a_session_refuses_a_delegated_refresh_token() {
+    let h = Harness::start().await;
+    let resp = h
+        .http
+        .post(format!("{}/v1/claims", h.user_url))
+        .bearer_auth(h.login("octocat"))
+        .json(&ClaimRequest {
+            pool_ref: "pool-a".into(),
+            ttl_seconds: 3600,
+            audiences: vec![AUDIENCE.into()],
+            workload: Workload {
+                image: "registry.internal:5000/sandbox:latest".into(),
+                args: vec![],
+            },
+            refresh_token: Some(mediatore_proto::Secret("rt-unwanted".into())),
+        })
+        .send()
+        .await
+        .expect("create claim");
+    assert_eq!(resp.status(), 400);
+    let body: ErrorBody = resp.json().await.expect("error body");
+    assert_eq!(body.error, "session_unexpected");
 }

@@ -70,9 +70,19 @@ pub struct ClaimRecord {
     pub expires_at: Option<DateTime<Utc>>,
     /// Set on release or revocation; a revoked claim never issues again.
     pub revoked_at: Option<DateTime<Utc>>,
+    /// The `AgentSandbox` the record came from (ADR-0013): the associated data that opens
+    /// `refresh`. `None` for a record the dev binder wrote, which seals with its own UID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_uid: Option<Uuid>,
 }
 
 impl ClaimRecord {
+    /// The UID a sealer binds this record's refresh envelope to.
+    #[must_use]
+    pub fn seal_binding(&self) -> Uuid {
+        self.sandbox_uid.unwrap_or(self.uid)
+    }
+
     /// True when tokens may still be issued for this claim.
     #[must_use]
     pub fn is_live(&self, now: DateTime<Utc>) -> bool {
@@ -128,6 +138,23 @@ pub struct ClaimAudit {
     pub swept_at: DateTime<Utc>,
 }
 
+/// A delegated upstream session between the API call that received it and the record
+/// it ends up in (ADR-0013 decision 2). Keyed by the `AgentSandbox` UID, which is also the
+/// envelope's associated data.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRecord {
+    /// The sandbox the session was delegated for.
+    pub sandbox_uid: Uuid,
+    /// Who delegated it.
+    pub subject: Subject,
+    /// The issuer whose token endpoint refreshes it.
+    pub issuer: String,
+    /// The refresh token, sealed with `sandbox_uid`.
+    pub refresh: Sealed,
+    /// When it was delegated; stale sessions are swept.
+    pub created_at: DateTime<Utc>,
+}
+
 /// Storage contract.
 #[async_trait]
 pub trait ClaimStore: Send + Sync + 'static {
@@ -162,6 +189,15 @@ pub trait ClaimStore: Send + Sync + 'static {
     async fn sweep(&self, before: DateTime<Utc>) -> Result<usize, StoreError>;
     /// Every audit row, oldest sweep first.
     async fn list_audit(&self) -> Result<Vec<ClaimAudit>, StoreError>;
+    /// Park a delegated session until the reconciler creates the record. `Conflict` if
+    /// the sandbox already has one.
+    async fn put_session(&self, rec: SessionRecord) -> Result<(), StoreError>;
+    /// Remove and return the session for `sandbox_uid`, if any (one transaction).
+    async fn take_session(&self, sandbox_uid: Uuid) -> Result<Option<SessionRecord>, StoreError>;
+    /// Remove the session for `sandbox_uid`; nothing to remove is fine.
+    async fn delete_session(&self, sandbox_uid: Uuid) -> Result<(), StoreError>;
+    /// Remove every session delegated before `before`. Returns how many.
+    async fn sweep_sessions(&self, before: DateTime<Utc>) -> Result<usize, StoreError>;
     /// A round trip to the backend; what `/healthz` reports.
     async fn ping(&self) -> Result<(), StoreError>;
 }
@@ -172,6 +208,7 @@ pub struct MemoryStore {
     claims: RwLock<HashMap<Uuid, ClaimRecord>>,
     nodes: RwLock<HashMap<String, NodeRecord>>,
     audit: RwLock<Vec<ClaimAudit>>,
+    sessions: RwLock<HashMap<Uuid, SessionRecord>>,
 }
 
 impl MemoryStore {
@@ -322,6 +359,31 @@ impl ClaimStore for MemoryStore {
 
     async fn list_audit(&self) -> Result<Vec<ClaimAudit>, StoreError> {
         Ok(self.audit.read().await.clone())
+    }
+
+    async fn put_session(&self, rec: SessionRecord) -> Result<(), StoreError> {
+        let mut m = self.sessions.write().await;
+        if m.contains_key(&rec.sandbox_uid) {
+            return Err(StoreError::Conflict(rec.sandbox_uid.to_string()));
+        }
+        m.insert(rec.sandbox_uid, rec);
+        Ok(())
+    }
+
+    async fn take_session(&self, sandbox_uid: Uuid) -> Result<Option<SessionRecord>, StoreError> {
+        Ok(self.sessions.write().await.remove(&sandbox_uid))
+    }
+
+    async fn delete_session(&self, sandbox_uid: Uuid) -> Result<(), StoreError> {
+        self.sessions.write().await.remove(&sandbox_uid);
+        Ok(())
+    }
+
+    async fn sweep_sessions(&self, before: DateTime<Utc>) -> Result<usize, StoreError> {
+        let mut m = self.sessions.write().await;
+        let n = m.len();
+        m.retain(|_, s| s.created_at >= before);
+        Ok(n - m.len())
     }
 
     async fn ping(&self) -> Result<(), StoreError> {

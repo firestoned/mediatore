@@ -10,7 +10,7 @@ use std::future::IntoFuture;
 use std::sync::Arc;
 
 use banlieue_api::common::LocalObjectReference;
-use mediatore_api::AppState;
+use mediatore_api::{AppState, Limiter};
 use mediatore_claims::sandbox::{AgentSandboxStatus, SandboxPhase};
 use mediatore_entra::{Backend, IssuerConfig, Validator};
 use mediatore_proto::{ClaimPhase, ClaimRequest, ClaimResponse, ErrorBody, Workload};
@@ -44,12 +44,14 @@ impl Harness {
                 client_id: "mediatore".into(),
                 subject_claim: "preferred_username".into(),
                 required_group: None,
+                session: None,
             }]),
             sts: None,
             audiences: vec![AUDIENCE.into()],
             sandboxes: front_door.then(|| sandboxes.clone() as _),
             sandbox_namespace: NAMESPACE.into(),
             sealer: None,
+            limiter: Limiter::new(10),
             dev_mode: false,
         });
         let user = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -86,6 +88,7 @@ impl Harness {
                     image: "registry.internal:5000/sandbox:latest".into(),
                     args: vec!["sh".into()],
                 },
+                refresh_token: None,
             })
             .send()
             .await

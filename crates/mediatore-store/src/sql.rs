@@ -22,7 +22,7 @@ use sqlx::{AnyPool, ConnectOptions, Row, SqlSafeStr};
 use uuid::Uuid;
 
 use crate::seal::Sealed;
-use crate::{ClaimAudit, ClaimRecord, ClaimStore, NodeRecord, StoreError};
+use crate::{ClaimAudit, ClaimRecord, ClaimStore, NodeRecord, SessionRecord, StoreError};
 
 /// Which engine a URL names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,18 +46,47 @@ impl Engine {
     }
 
     fn migrator(self) -> Migrator {
-        let sql: &'static str = match self {
-            Self::Sqlite => include_str!("../migrations/sqlite/0001_init.sql"),
-            Self::Postgres => include_str!("../migrations/postgres/0001_init.sql"),
+        let steps: [(i64, &'static str, &'static str); 2] = match self {
+            Self::Sqlite => [
+                (
+                    1,
+                    "init",
+                    include_str!("../migrations/sqlite/0001_init.sql"),
+                ),
+                (
+                    2,
+                    "sessions",
+                    include_str!("../migrations/sqlite/0002_sessions.sql"),
+                ),
+            ],
+            Self::Postgres => [
+                (
+                    1,
+                    "init",
+                    include_str!("../migrations/postgres/0001_init.sql"),
+                ),
+                (
+                    2,
+                    "sessions",
+                    include_str!("../migrations/postgres/0002_sessions.sql"),
+                ),
+            ],
         };
         Migrator {
-            migrations: Cow::Owned(vec![Migration::new(
-                1,
-                Cow::Borrowed("init"),
-                MigrationType::Simple,
-                sql.into_sql_str(),
-                false,
-            )]),
+            migrations: Cow::Owned(
+                steps
+                    .into_iter()
+                    .map(|(version, name, sql)| {
+                        Migration::new(
+                            version,
+                            Cow::Borrowed(name),
+                            MigrationType::Simple,
+                            sql.into_sql_str(),
+                            false,
+                        )
+                    })
+                    .collect(),
+            ),
             ..Migrator::DEFAULT
         }
     }
@@ -132,7 +161,39 @@ fn is_unique_violation(e: &sqlx::Error) -> bool {
 }
 
 const CLAIM_COLUMNS: &str = "uid, name, subject, entry_id, node_id, audiences, workload, ttl_seconds, \
-     refresh_key_id, refresh_nonce, refresh_ciphertext, created_at, expires_at, revoked_at";
+     refresh_key_id, refresh_nonce, refresh_ciphertext, created_at, expires_at, revoked_at, \
+     sandbox_uid";
+
+/// The three columns of a [`Sealed`] envelope, or three `NULL`s.
+fn sealed_columns(s: Option<&Sealed>) -> (Option<String>, Option<Vec<u8>>, Option<Vec<u8>>) {
+    match s {
+        Some(s) => (
+            Some(s.key_id.clone()),
+            Some(s.nonce.clone()),
+            Some(s.ciphertext.clone()),
+        ),
+        None => (None, None, None),
+    }
+}
+
+const SESSION_COLUMNS: &str =
+    "sandbox_uid, subject, issuer, refresh_key_id, refresh_nonce, refresh_ciphertext, created_at";
+
+fn session_of(row: &AnyRow) -> Result<SessionRecord, StoreError> {
+    let sandbox_uid: String = row.try_get("sandbox_uid").map_err(backend)?;
+    let subject: String = row.try_get("subject").map_err(backend)?;
+    Ok(SessionRecord {
+        sandbox_uid: uuid(&sandbox_uid)?,
+        subject: unjson(&subject)?,
+        issuer: row.try_get("issuer").map_err(backend)?,
+        refresh: Sealed {
+            key_id: row.try_get("refresh_key_id").map_err(backend)?,
+            nonce: row.try_get("refresh_nonce").map_err(backend)?,
+            ciphertext: row.try_get("refresh_ciphertext").map_err(backend)?,
+        },
+        created_at: from_micros(row.try_get("created_at").map_err(backend)?)?,
+    })
+}
 
 fn claim_of(row: &AnyRow) -> Result<ClaimRecord, StoreError> {
     let uid: String = row.try_get("uid").map_err(backend)?;
@@ -164,6 +225,12 @@ fn claim_of(row: &AnyRow) -> Result<ClaimRecord, StoreError> {
         created_at: from_micros(row.try_get("created_at").map_err(backend)?)?,
         expires_at: opt_micros(row.try_get("expires_at").map_err(backend)?)?,
         revoked_at: opt_micros(row.try_get("revoked_at").map_err(backend)?)?,
+        sandbox_uid: row
+            .try_get::<Option<String>, _>("sandbox_uid")
+            .map_err(backend)?
+            .as_deref()
+            .map(uuid)
+            .transpose()?,
     })
 }
 
@@ -229,16 +296,9 @@ impl SqlStore {
 #[async_trait]
 impl ClaimStore for SqlStore {
     async fn put_claim(&self, rec: ClaimRecord) -> Result<(), StoreError> {
-        let (key_id, nonce, ciphertext) = match &rec.refresh {
-            Some(s) => (
-                Some(s.key_id.clone()),
-                Some(s.nonce.clone()),
-                Some(s.ciphertext.clone()),
-            ),
-            None => (None, None, None),
-        };
+        let (key_id, nonce, ciphertext) = sealed_columns(rec.refresh.as_ref());
         let sql = format!(
-            "INSERT INTO claims ({CLAIM_COLUMNS}) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)"
+            "INSERT INTO claims ({CLAIM_COLUMNS}) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)"
         );
         let result = sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(rec.uid.to_string())
@@ -255,6 +315,7 @@ impl ClaimStore for SqlStore {
             .bind(micros(rec.created_at))
             .bind(rec.expires_at.map(micros))
             .bind(rec.revoked_at.map(micros))
+            .bind(rec.sandbox_uid.map(|u| u.to_string()))
             .execute(&self.pool)
             .await;
         match result {
@@ -289,19 +350,12 @@ impl ClaimStore for SqlStore {
     }
 
     async fn update_claim(&self, rec: ClaimRecord) -> Result<(), StoreError> {
-        let (key_id, nonce, ciphertext) = match &rec.refresh {
-            Some(s) => (
-                Some(s.key_id.clone()),
-                Some(s.nonce.clone()),
-                Some(s.ciphertext.clone()),
-            ),
-            None => (None, None, None),
-        };
+        let (key_id, nonce, ciphertext) = sealed_columns(rec.refresh.as_ref());
         let done = sqlx::query(
             "UPDATE claims SET name = $1, subject = $2, entry_id = $3, node_id = $4, audiences = $5, \
              workload = $6, ttl_seconds = $7, refresh_key_id = $8, refresh_nonce = $9, \
-             refresh_ciphertext = $10, created_at = $11, expires_at = $12, revoked_at = $13 \
-             WHERE uid = $14",
+             refresh_ciphertext = $10, created_at = $11, expires_at = $12, revoked_at = $13, \
+             sandbox_uid = $14 WHERE uid = $15",
         )
         .bind(&rec.name)
         .bind(json(&rec.subject)?)
@@ -316,6 +370,7 @@ impl ClaimStore for SqlStore {
         .bind(micros(rec.created_at))
         .bind(rec.expires_at.map(micros))
         .bind(rec.revoked_at.map(micros))
+        .bind(rec.sandbox_uid.map(|u| u.to_string()))
         .bind(rec.uid.to_string())
         .execute(&self.pool)
         .await
@@ -522,6 +577,67 @@ impl ClaimStore for SqlStore {
             .collect()
     }
 
+    async fn put_session(&self, rec: SessionRecord) -> Result<(), StoreError> {
+        let sql =
+            format!("INSERT INTO sessions ({SESSION_COLUMNS}) VALUES ($1, $2, $3, $4, $5, $6, $7)");
+        let result = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(rec.sandbox_uid.to_string())
+            .bind(json(&rec.subject)?)
+            .bind(&rec.issuer)
+            .bind(&rec.refresh.key_id)
+            .bind(&rec.refresh.nonce)
+            .bind(&rec.refresh.ciphertext)
+            .bind(micros(rec.created_at))
+            .execute(&self.pool)
+            .await;
+        match result {
+            Ok(_) => Ok(()),
+            Err(e) if is_unique_violation(&e) => {
+                Err(StoreError::Conflict(rec.sandbox_uid.to_string()))
+            }
+            Err(e) => Err(backend(e)),
+        }
+    }
+
+    async fn take_session(&self, sandbox_uid: Uuid) -> Result<Option<SessionRecord>, StoreError> {
+        let mut tx = self.pool.begin().await.map_err(backend)?;
+        let sql = format!("SELECT {SESSION_COLUMNS} FROM sessions WHERE sandbox_uid = $1");
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(sandbox_uid.to_string())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(backend)?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let session = session_of(&row)?;
+        sqlx::query("DELETE FROM sessions WHERE sandbox_uid = $1")
+            .bind(sandbox_uid.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(backend)?;
+        tx.commit().await.map_err(backend)?;
+        Ok(Some(session))
+    }
+
+    async fn delete_session(&self, sandbox_uid: Uuid) -> Result<(), StoreError> {
+        sqlx::query("DELETE FROM sessions WHERE sandbox_uid = $1")
+            .bind(sandbox_uid.to_string())
+            .execute(&self.pool)
+            .await
+            .map(|_| ())
+            .map_err(backend)
+    }
+
+    async fn sweep_sessions(&self, before: DateTime<Utc>) -> Result<usize, StoreError> {
+        let done = sqlx::query("DELETE FROM sessions WHERE created_at < $1")
+            .bind(micros(before))
+            .execute(&self.pool)
+            .await
+            .map_err(backend)?;
+        usize::try_from(done.rows_affected()).map_err(backend)
+    }
+
     async fn ping(&self) -> Result<(), StoreError> {
         sqlx::query("SELECT 1")
             .execute(&self.pool)
@@ -557,7 +673,7 @@ mod tests {
             );
             let store = SqlStore::connect(&url, 4).await.unwrap();
             // Each case assumes an empty store, as the in-memory runs get one.
-            for t in ["claim_audit", "claims", "nodes"] {
+            for t in ["claim_audit", "claims", "nodes", "sessions"] {
                 sqlx::query(sqlx::AssertSqlSafe(format!("DELETE FROM {t}")))
                     .execute(&store.pool)
                     .await
@@ -590,6 +706,7 @@ mod tests {
             duplicate_ek_with_another_dmi_is_a_conflict,
             ban_marks_the_node_and_needs_an_existing_row,
             a_sweep_moves_ended_claims_into_the_audit_table,
+            a_session_is_taken_once_deleted_on_demand_and_swept_when_stale,
             ping_answers,
         );
     }
