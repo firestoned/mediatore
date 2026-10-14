@@ -5,6 +5,7 @@ apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 namespace: banlieue-system
 resources:
+  - crds/mediatore.io_agentsandboxes.yaml
   - serviceaccount.yaml
   - rbac.yaml
   - deployment.yaml
@@ -13,3 +14,4 @@ resources:
   - ingressroute.yaml
   - clusterspiffeid.yaml
   - admission/clusterstaticentry-mediatore.yaml
+  - admission/agentsandbox-subject.yaml

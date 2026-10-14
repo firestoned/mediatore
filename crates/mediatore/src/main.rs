@@ -12,6 +12,7 @@ use clap::{Parser, Subcommand};
 use mediatore_api::AppState;
 use mediatore_claims::Reconciler;
 use mediatore_claims::lease::LeaseConfig;
+use mediatore_claims::sandbox::{KubeSandboxes, SandboxFrontDoor};
 use mediatore_claims::watch::{KubeClaimsApi, Watcher, WatcherConfig};
 use mediatore_entra::Validator;
 use mediatore_spire::{EntryManager, KubeEntryManager, MemoryEntries, Naming};
@@ -83,9 +84,12 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
         tracing::warn!("dev_mode: peer identity from header, in-memory store and entries, no mTLS");
     } else {
         tracing::warn!(
-            "store: in-memory until roadmap 05; claims do not survive a restart and bind only through the dev binder until roadmap 03"
+            "store: in-memory until roadmap 05; records and nodes do not survive a restart (a restarted broker releases nothing it does not know and sweeps the entries)"
         );
     }
+    let sandboxes: Option<Arc<dyn SandboxFrontDoor>> = client
+        .as_ref()
+        .map(|c| Arc::new(KubeSandboxes::new(c.clone())) as Arc<dyn SandboxFrontDoor>);
 
     let sts = match &cfg.sts {
         Some(s) => {
@@ -108,6 +112,8 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
         validator: Validator::new(cfg.issuers.clone()),
         sts,
         audiences: cfg.audiences.iter().map(|a| a.name.clone()).collect(),
+        sandboxes,
+        sandbox_namespace: cfg.sandboxes.namespace.clone(),
         dev_mode: cfg.dev_mode,
     });
 
@@ -154,6 +160,8 @@ async fn claim_watcher(
         WatcherConfig {
             resync: std::time::Duration::from_secs(cfg.watcher.resync_secs),
             resolve_timeout: std::time::Duration::from_secs(cfg.watcher.resolve_timeout_secs),
+            audiences: cfg.audiences.iter().map(|a| a.name.clone()).collect(),
+            issuers: cfg.issuers.iter().map(|i| i.url.clone()).collect(),
             ..WatcherConfig::default()
         },
     ));

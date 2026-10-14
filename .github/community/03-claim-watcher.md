@@ -31,9 +31,9 @@ Decisions: [ADR-0011](../../docs/adr/0011-claim-watcher.md) (2026-10-13).
       (`mediatore-testkit`'s `banlieue-crds`), then proves the Lease, the node-entry
       trigger through the admission policy, a member without a certificate getting
       nothing, and a labelled claim without a record binding nothing
-- [ ] `POST /v1/claims` creating the resource: moved to roadmap 08, where the resource is
-      an `AgentSandbox` (ADR-0008 decision 4); building it against `VirtualMachineClaim`
-      first would be built twice
+- [x] `POST /v1/claims` creating the resource: done in roadmap 08 (2026-10-14), where the
+      resource is an `AgentSandbox` (ADR-0008 decision 4) and the reconciler creates the
+      claim and the record
 - [ ] banlieue side: revise ADR-0049 (SPIRE attestation supersedes quote-over-nonce;
       retire `status.nonce`) — tracked here, implemented in the banlieue repo
 - [x] Threat model pass (2026-10-13): TB-2 gains five rows, TB-4 one; stamp to ADR-0011

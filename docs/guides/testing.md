@@ -114,10 +114,7 @@ Suites today:
 | `make kind-e2e-entries` | 0006 | the live entries round trip above |
 | `make kind-e2e-mtls` | 0007 | the broker image on the CSI socket, agent-issued client SVIDs over SPIFFE mTLS, below |
 | `make kind-e2e-watcher` | 0011 | the watcher Lease, a member's certificate becoming a node entry, a claim without a record binding nothing, below |
-
-Planned, as the roadmap lands: a claim the broker holds a record for, bound end to end
-from `VirtualMachineClaim` to claim entry, once ADR-0008 creates records outside
-`dev_mode` (roadmap 08).
+| `make kind-e2e-sandbox` | 0008 | the `AgentSandbox` CRD and its subject policy, a sandbox becoming an owned claim and a record, the claim bound end to end to a claim entry and the guest fetching the subject, deletion through the finalizer, below |
 
 ### Broker and client pods over SPIFFE mTLS
 
@@ -172,6 +169,38 @@ the unit tests agree on. The watcher's own logic (bind by EK, the 60 s resolutio
 timeout, release on every phase, the resync) is unit-tested in
 `crates/mediatore-claims/src/watch.rs` over the in-memory store and entries, and the
 Lease verdicts in `crates/mediatore-claims/src/lease.rs`.
+### AgentSandbox: from request to Ready and back
+
+`make kind-e2e-sandbox` needs both sets of CRDs: banlieue's from the pin (above) and
+mediatore's own `agentsandboxes.mediatore.io` from `deploy/base/crds/`, which
+`make crds` renders from `crates/mediatore-claims/src/sandbox.rs` and the broker overlay
+applies with the subject admission policy
+(`deploy/base/admission/agentsandbox-subject.yaml`). The overlay's config names a
+placeholder issuer and audience so the reconciler has something to accept, and lists
+`e2e-broker` in the policy's `brokers` so the exemption can be exercised. The broker is
+restarted so its controllers start against existing CRDs, then
+`dev/kind/sandbox-e2e.sh` runs, as the admin and as the broker ServiceAccount
+(`.kind/mediatore-sa.yaml`):
+
+| Step | Expected |
+| --- | --- |
+| a `node` pod runs `mediatore-guest` with the fixture EK hash and a `ClusterSPIFFEID` for `spiffe://<td>/banlieue/node/<hash>` | `node registered` over its agent-issued SVID: the broker now knows the node the bind will resolve to |
+| the admin creates an `AgentSandbox` naming `octocat`; an impersonated stranger does the same | both denied at admission with `spec.subject.id is ...`: the default is caller-equals-subject |
+| the admin names itself; `e2e-broker` (listed) names `octocat`; the broker ServiceAccount names `octocat` | all three admitted: the two exemptions of ADR-0008 decision 5, and the ordinary case |
+| `kubectl patch` of `spec.ttlSeconds` on the existing sandbox | denied: `spec is immutable` |
+| the reconciler sees `sb-e2e` | a finalizer `mediatore.io/sandbox`; a `VirtualMachineClaim` `sb-e2e` with a controller `ownerReference` to the sandbox, the managed-by label and the sandbox's `subject`, `poolRef` and `ttlSeconds`; the broker logs `record created` with the claim's UID; status `Pending` with `claimUid` |
+| the claim is patched `Bound` with the fixture certificate and a `virtualMachineRef` | `ClusterStaticEntry` `mediatore-claim-<uid>` appears; the sandbox's status mirrors the member and `expiresAt`, `entrySet` and `ready` turn true; the `node` pod logs `subject fetched` for `octocat` and that claim UID (`GET /v1/me` over the node SVID) |
+| the broker ServiceAccount creates `sb-bad` with audience `nope` | status `Failed`, reason `audience nope is not configured`, no claim |
+| `kubectl delete agentsandbox sb-e2e` | the claim entry is retracted, the claim deleted, the sandbox gone, the broker logs `sandbox released`; no claim entry remains |
+
+No banlieue controller runs, so the bind is the script's patch; everything else (the
+policy, the owner reference, the record, the entry through the entries admission policy,
+the guest's subject fetch, the finalizer) is the production path. The reconciler's own
+logic is unit-tested in `crates/mediatore-claims/src/sandbox.rs` over the in-memory store,
+entries and a fake API that refuses what the API server refuses; the user API's front door
+(`POST/GET/DELETE /v1/claims` creating, reading and deleting the resource) in
+`crates/mediatore/tests/e2e_sandbox.rs` over `mediatore_testkit::MemorySandboxes`.
+
 What this tier proves and the hermetic suite cannot: the `ClusterSPIFFEID` in
 `deploy/base` renders to `spiffe://<td>/mediatore` for the broker pod; the CSI inline
 volume delivers the Workload API under PSS `restricted`; SVIDs the `k8s` workload
@@ -180,7 +209,8 @@ attestor issued chain to the bundle the broker got from the same agent.
 What kind cannot do, and the real-cluster tier covers: TPM node attestation (the
 parent agent `spiffe://<td>/spire/agent/tpm/<ek>` never exists in kind; the server
 accepts entries for a parent that has not attested, which is exactly the order a node
-entry is declared in), real VMs and jails, and the broker's `LoadBalancer` exposure.
+entry is declared in), real VMs and jails, banlieue's claim controller binding a real
+member, and the broker's `LoadBalancer` exposure.
 
 Pins live at the top of the `Makefile`: kind, the node image by digest (same
 Kubernetes minor as the homelab), both chart versions, the placeholder trust domain

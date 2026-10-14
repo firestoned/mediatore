@@ -3,7 +3,7 @@
 
 # ADR-0008: AgentSandbox is a mediatore CRD, reconciled by mediatore
 
-**Status:** Proposed · **Date:** 2026-10-12
+**Status:** Accepted · **Date:** 2026-10-12 · **Accepted:** 2026-10-14
 
 Supersedes banlieue
 [ADR-0055](https://github.com/firestoned/banlieue/blob/main/docs/adr/0055-agentsandbox.md)
@@ -151,9 +151,45 @@ revocations still survive a restart.
 - The readiness caveat from ADR-0055 still applies: a sandbox is only as ready as the pool's
   readiness signal. Pools that serve sandboxes must use `GuestReady` (banlieue ADR-0043),
   and mediatore's AgentSandbox user guide says so.
-- This is designed, not built. Implementation is roadmap 08, after roadmap 03, and the
-  threat-model pass (`docs/security/threat-model.md`) runs when it lands, not before.
+- Built in roadmap 08 (2026-10-14), after roadmap 03; the threat-model pass
+  (`docs/security/threat-model.md`) ran with it. The implementation notes below record the
+  choices the decisions left open.
 - Rejected: keeping the request only in the store (no declarative path); a separate
   controller project (a second binary and a second release to coordinate claim creation,
   with no isolation gain because both would hold the same RBAC); leaving the CRD in banlieue
   (its only consumer would be another repository).
+
+## Implementation notes (2026-10-14)
+
+What roadmap 08 fixed within the decisions above, so a reader of the code finds it here:
+
+- **One claim per sandbox, ever.** The claim is named after the `AgentSandbox` and created
+  in its namespace, so creation is idempotent without a status round trip. Once
+  `status.claimRef` is set, a claim that later disappears (banlieue deleted it after the
+  TTL, or the watcher failed it) turns the sandbox `Failed`; it is never recreated. A new
+  VM is a new request.
+- **The store record follows the claim's UID.** The reconciler creates the claim, then
+  writes the `ClaimRecord` keyed by the claim's `metadata.uid` (decision 12; ADR-0011
+  decision 1). The claim watcher requeues a `Bound` claim it has no record for, so a
+  record written late, after a restart between the two steps, is still picked up.
+- **Fail closed at reconcile, before any claim exists.** A sandbox naming an audience
+  outside `audiences` in `mediatore.yaml`, or an issuer outside `issuers`, is marked
+  `Failed` with the reason in `status.reason` and creates nothing. The user API refuses
+  the same request with `400 unknown_audience` before creating the resource.
+- **`spec` is immutable.** The admission policy freezes the whole spec on update, not only
+  `subject`: every other field is read once, when the claim is created, so an edit would
+  appear to work and change nothing.
+- **Status** carries `phase` (mirrored from the claim: `Pending`, `Bound`, `Releasing`,
+  `Failed`), `claimRef`, `claimUid`, `virtualMachineRef`, `addresses`, `boundAt`,
+  `expiresAt`, `entrySet`, `ready` (decision 11), `reason` and `observedGeneration`. The
+  user API's `ClaimResponse` gains `ready`.
+- **Namespace.** `POST /v1/claims` creates the resource in `sandboxes.namespace` from
+  `mediatore.yaml`; the pool it names must live there, since `poolRef` is a same-namespace
+  reference on the claim.
+- **RBAC** on `agentsandboxes` is get, list, watch, patch (the finalizer), create and
+  delete (the user API, decisions 4 and 5), plus `agentsandboxes/status` and
+  `agentsandboxes/finalizers` (the claim's `ownerReference` sets `blockOwnerDeletion`,
+  which the API server's owner-references admission plugin checks against the latter).
+- **Finalizer** `mediatore.io/sandbox`. Deletion releases the record (entry first), deletes
+  the claim and removes the finalizer only on a later pass that finds no claim.
+

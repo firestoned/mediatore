@@ -29,6 +29,8 @@ the component that finishes the story.
 
 - [Running workloads on a claimed VM](guides/running-workloads.md): the user, OBO-agent and
   app-only paths, end to end.
+- [Requesting a sandbox](guides/requesting-a-sandbox.md): the `AgentSandbox` resource,
+  through the API or declaratively, who may name which subject, and what its status says.
 - [System architecture](architecture/diagrams/system.md) and
   [flows](architecture/diagrams/flows.md), rendered from the
   [CALM](https://calm.finos.org/) architecture-as-code model.

@@ -1,0 +1,165 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+#
+# AgentSandbox subject authorization (ADR-0008 decision 5).
+#
+# `spec.subject` records WHO a sandbox is for. Everything downstream derives
+# from it: the VirtualMachineClaim's subject, the sb- user in the guest, and
+# every token mediatore mints. Without this policy anyone holding
+# `create agentsandboxes` could attribute a sandbox, and the tokens it mints,
+# to anyone else, and the audit log would record it as genuine.
+#
+# Checked at ADMISSION, while the requesting principal still exists; the
+# reconciler only ever sees an object. The shape is banlieue's claim-subject
+# policy (banlieue ADR-0047 decision 10), restated for this resource:
+#
+#   subject.id     == the authenticated username, once this cluster's
+#                     username prefix is applied. The API server vouches for
+#                     the username, so this is a real binding. The field holds
+#                     the RAW subject as the issuer spells it, because that is
+#                     what a token carries and what the guest compares against.
+#   subject.issuer  is not checked here: the API server cannot tell which
+#                     issuer minted the caller's token. mediatore refuses, at
+#                     reconcile and before any claim exists, an issuer it is
+#                     not configured with (crates/mediatore-claims/src/sandbox.rs).
+#
+# Two exemptions from the id check, both deliberate trust concentrations:
+#
+#   mediatore's own ServiceAccount, which creates sandboxes for the subjects it
+#   has validated bearer tokens for (POST /v1/claims, decision 4). Its token
+#   validation is the control there.
+#
+#   an explicit list of brokers, EMPTY by default. Add a principal only when
+#   something really does hand sandboxes to other people, and audit changes
+#   to the ConfigMap: a listed broker can attribute a sandbox to anyone.
+#
+# The whole spec is immutable after creation: subject because the attribution
+# was authorized then, the rest because the reconciler reads it once, when it
+# creates the claim, so an edit would appear to work and change nothing.
+#
+# Requires Kubernetes 1.30+ (ValidatingAdmissionPolicy GA) and CEL variables.
+# The ConfigMap comes first: the binding sets parameterNotFoundAction: Deny,
+# so it must exist or every AgentSandbox is rejected.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mediatore-agentsandbox-subject-policy
+  namespace: banlieue-system
+  labels:
+    app.kubernetes.io/name: mediatore
+    app.kubernetes.io/component: admission
+data:
+  # The prefix this cluster's API server prepends to authenticated usernames
+  # (`--oidc-username-prefix`, or `claimMappings.username.prefix` in an
+  # AuthenticationConfiguration). Empty for certificate or ServiceAccount
+  # auth. The policy adds it when checking; the resource stores the raw id.
+  usernamePrefix: |
+
+  # Per-issuer prefixes, for an API server that trusts more than one issuer:
+  # one `<issuer> <prefix>` pair per line, each exactly as the
+  # AuthenticationConfiguration spells it. A sandbox naming an issuer listed
+  # here is checked against that issuer's prefix; any other issuer falls back
+  # to `usernamePrefix`. Empty by default.
+  #
+  #   issuerPrefixes: |
+  #     https://dex.example.com github:
+  #     https://login.microsoftonline.com/<tenant>/v2.0 entra:
+  issuerPrefixes: |
+
+  # Principals allowed to set an arbitrary `spec.subject.id`, one username per
+  # line, as the API server spells it (a ServiceAccount is
+  # `system:serviceaccount:<namespace>:<name>`). mediatore's own ServiceAccount
+  # is exempt without being listed. Deliberately empty.
+  brokers: |
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: mediatore-agentsandbox-subject
+  labels:
+    app.kubernetes.io/name: mediatore
+    app.kubernetes.io/component: admission
+spec:
+  failurePolicy: Fail
+  paramKind:
+    apiVersion: v1
+    kind: ConfigMap
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["mediatore.io"]
+        apiVersions: ["v1alpha1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["agentsandboxes"]
+  variables:
+    - name: isMediatore
+      expression: "request.userInfo.username == 'system:serviceaccount:banlieue-system:mediatore'"
+    # Split on newlines and drop blanks, so a trailing newline or an empty
+    # list never yields a phantom "" entry.
+    - name: brokers
+      expression: >-
+        params.data.?brokers.orValue('').split('\n')
+          .filter(l, l.trim() != '').map(l, l.trim())
+    - name: isBroker
+      expression: "request.userInfo.username in variables.brokers"
+    # Trailing newline stripped; an empty prefix is a valid value.
+    - name: usernamePrefix
+      expression: "params.data.?usernamePrefix.orValue('').trim()"
+    - name: issuerPrefixes
+      expression: >-
+        params.data.?issuerPrefixes.orValue('').split('\n')
+          .map(l, l.trim().split(' ').filter(w, w != ''))
+          .filter(e, size(e) == 2)
+    - name: expectedPrefix
+      expression: >-
+        variables.issuerPrefixes.exists(e, e[0] == object.spec.subject.issuer)
+          ? variables.issuerPrefixes.filter(e, e[0] == object.spec.subject.issuer)[0][1]
+          : variables.usernamePrefix
+  validations:
+    # 1. The binding the API server can vouch for. CREATE only: on UPDATE the
+    #    requester is mediatore's reconciler writing its finalizer, and
+    #    validation 2 makes the spec immutable anyway.
+    - expression: >-
+        request.operation != 'CREATE'
+        || variables.isMediatore
+        || variables.isBroker
+        || variables.expectedPrefix + object.spec.subject.id
+             == request.userInfo.username
+      messageExpression: >-
+        'spec.subject.id is ' + object.spec.subject.id
+        + ' (which this cluster would spell '
+        + variables.expectedPrefix + object.spec.subject.id
+        + ') but you are authenticated as ' + request.userInfo.username
+        + '. An AgentSandbox records who a sandbox is for, so it may only name'
+        + ' its own creator. Requesting one for somebody else is a broker'
+        + " privilege: add the broker's username to the 'brokers' list in"
+        + ' ConfigMap mediatore-agentsandbox-subject-policy, or go through'
+        + ' mediatore (POST /v1/claims).'
+      reason: Forbidden
+
+    # 2. Immutability of the whole spec. Without it, check 1 is bypassed by
+    #    creating a sandbox for oneself and patching the subject afterwards;
+    #    the other fields are read once, at claim creation.
+    - expression: >-
+        request.operation != 'UPDATE'
+        || object.spec == oldObject.spec
+      messageExpression: >-
+        'spec is immutable: it records a request that was authorized when the'
+        + ' AgentSandbox was created and that mediatore acted on then. Delete'
+        + ' it and make a new one (which releases the VM, by design).'
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: mediatore-agentsandbox-subject
+  labels:
+    app.kubernetes.io/name: mediatore
+    app.kubernetes.io/component: admission
+spec:
+  policyName: mediatore-agentsandbox-subject
+  validationActions: ["Deny"]
+  paramRef:
+    name: mediatore-agentsandbox-subject-policy
+    namespace: banlieue-system
+    # Fail closed: no policy object, no sandboxes.
+    parameterNotFoundAction: Deny

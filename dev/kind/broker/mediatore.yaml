@@ -2,9 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # The broker's config in kind. Identity and entries are the production paths (the
-# Workload API over the CSI mount, ClusterStaticEntry through the API server). No
-# identity provider or audience is wired: the tier stops at the sandbox listener and
-# what it establishes about the peer; the claim loop above it is the dev tier's job.
+# Workload API over the CSI mount, ClusterStaticEntry through the API server). The
+# issuer and audience are placeholders no token is ever validated against: they exist
+# so the AgentSandbox reconciler (ADR-0008) accepts a sandbox naming them and refuses
+# one that does not. The user API is not exercised in kind (no identity provider).
 trust_domain: sandbox.test
 listen:
   user: 0.0.0.0:8080
@@ -13,5 +14,11 @@ spire:
   workload_api_socket: unix:///run/spire/sockets/spire-agent.sock
   entries:
     class_name: spire-server-spire
-issuers: []
-audiences: []
+issuers:
+  - url: https://issuer.example.com
+    backend: sts
+    client_id: mediatore
+audiences:
+  - { name: e2e, via: entra-obo }
+sandboxes:
+  namespace: mediatore-e2e-sandbox

@@ -23,8 +23,12 @@ path = "src/bin/ek_fixture.rs"
 [dependencies]
 mediatore-proto.workspace = true
 mediatore-tls.workspace = true
+mediatore-claims.workspace = true
 banlieue-api.workspace = true
+async-trait.workspace = true
+uuid.workspace = true
 kube.workspace = true
+k8s-openapi.workspace = true
 axum.workspace = true
 futures.workspace = true
 rcgen.workspace = true

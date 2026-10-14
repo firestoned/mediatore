@@ -36,6 +36,9 @@ uuid.workspace = true
 
 [dev-dependencies]
 mediatore-proto.workspace = true
+banlieue-api.workspace = true
+k8s-openapi.workspace = true
+serde_json.workspace = true
 rustls.workspace = true
 mediatore-testkit.workspace = true
 reqwest.workspace = true

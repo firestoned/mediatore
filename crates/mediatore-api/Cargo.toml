@@ -16,6 +16,7 @@ mediatore-sts.workspace = true
 mediatore-spire.workspace = true
 mediatore-tls.workspace = true
 mediatore-claims.workspace = true
+banlieue-api.workspace = true
 axum.workspace = true
 tower-http.workspace = true
 tokio.workspace = true

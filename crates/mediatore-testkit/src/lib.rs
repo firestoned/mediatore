@@ -7,11 +7,14 @@
 //! over a real HTTP listener, and mints ES256 tokens with whatever claims a test asks for.
 //! [`TestCa`] plays the part of the SPIRE server's CA: it mints SPIFFE-shaped X.509 SVIDs
 //! that the real mTLS verifiers accept, and [`MemoryMaterial`] stands in for the Workload
-//! API so rotation can be driven by hand.
+//! API so rotation can be driven by hand. [`MemorySandboxes`] stands in for the Kubernetes
+//! API behind the user API's `AgentSandbox` front door.
 
 pub mod ek;
+pub mod sandboxes;
 pub mod svid;
 
+pub use sandboxes::MemorySandboxes;
 pub use svid::{MemoryMaterial, TestCa};
 
 use base64::Engine as _;

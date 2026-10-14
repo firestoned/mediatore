@@ -21,6 +21,17 @@ configMapGenerator:
 generatorOptions:
   disableNameSuffixHash: true
 patches:
+  # The sandbox tier impersonates `e2e-broker` to prove the brokers exemption; the
+  # shipped list is empty.
+  - patch: |-
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: mediatore-agentsandbox-subject-policy
+        namespace: banlieue-system
+      data:
+        brokers: |
+          e2e-broker
   # No Traefik in kind, and the user API is not what this tier is about.
   - patch: |-
       apiVersion: traefik.io/v1alpha1

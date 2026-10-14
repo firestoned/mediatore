@@ -138,6 +138,7 @@ nav:
   - Home: index.md
   - Guides:
       - Running workloads on a claimed VM: guides/running-workloads.md
+      - Requesting a sandbox: guides/requesting-a-sandbox.md
       - Enterprise SPIRE topology: guides/enterprise-spire-topology.md
       - Testing tiers: guides/testing.md
   - Architecture:
