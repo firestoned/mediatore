@@ -65,6 +65,16 @@ patches:
                     value: info,mediatore_tls=debug
                 volumeMounts:
                   - { name: pg-ca, mountPath: /etc/mediatore-pg, readOnly: true }
+                  - { name: dex-ca, mountPath: /etc/mediatore-dex, readOnly: true }
+                  - { name: sts, mountPath: /etc/mediatore-sts, readOnly: true }
+                  - { name: sealing, mountPath: /etc/mediatore-sealing, readOnly: true }
             volumes:
               - name: pg-ca
                 configMap: { name: mediatore-pg-ca }
+              # The Dex CA, the STS signing key and the sealing key: `make kind-dex`.
+              - name: dex-ca
+                configMap: { name: mediatore-dex-ca }
+              - name: sts
+                secret: { secretName: mediatore-sts }
+              - name: sealing
+                secret: { secretName: mediatore-sealing }

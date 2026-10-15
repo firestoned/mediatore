@@ -39,6 +39,8 @@ If you need interactivity, the workload dials **out** (see
 
    # Dex (homelab): PKCE flow as mediatore's own public client, loopback redirect
    mediatore login --issuer https://dex.home.example
+   # an issuer on a private PKI: trust exactly that CA (the broker's issuers[].ca_file)
+   mediatore login --issuer https://dex.home.example --ca-file ~/.config/mediatore/dex-ca.pem
    ```
 
    The token's `aud` is mediatore and (on Entra) `scp` contains `sandbox.access`.

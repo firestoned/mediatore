@@ -124,7 +124,7 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
         store,
         spire,
         naming: naming.clone(),
-        validator: Validator::new(cfg.issuers.clone()),
+        validator: validator(&cfg)?,
         sts,
         audiences: cfg.audiences.iter().map(|a| a.name.clone()).collect(),
         sandboxes,
@@ -239,6 +239,22 @@ async fn store(cfg: &Config) -> anyhow::Result<Arc<dyn ClaimStore>> {
         "store: migrated and connected"
     );
     Ok(Arc::new(store))
+}
+
+/// The upstream validator, with each issuer that names a `ca_file` pinned to that CA. The
+/// file is read now so a missing or empty one fails the start, not the first login.
+fn validator(cfg: &Config) -> anyhow::Result<Validator> {
+    let mut v = Validator::new(cfg.issuers.clone());
+    for issuer in &cfg.issuers {
+        if let Some(path) = &issuer.ca_file {
+            let pem = std::fs::read(path).map_err(|e| {
+                anyhow::anyhow!("issuer {} ca_file {}: {e}", issuer.url, path.display())
+            })?;
+            v = v.with_issuer_ca(&issuer.url, &pem)?;
+            tracing::info!(issuer = %issuer.url, ca_file = %path.display(), "issuer pinned to a private CA");
+        }
+    }
+    Ok(v)
 }
 
 /// The refresh-material sealer (ADR-0012 decision 3), when `store.sealing` names a key.

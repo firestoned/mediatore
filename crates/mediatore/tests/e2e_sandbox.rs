@@ -45,6 +45,7 @@ impl Harness {
                 subject_claim: "preferred_username".into(),
                 required_group: None,
                 session: None,
+                ca_file: None,
             }]),
             sts: None,
             audiences: vec![AUDIENCE.into()],

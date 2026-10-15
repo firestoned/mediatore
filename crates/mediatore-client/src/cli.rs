@@ -71,6 +71,10 @@ pub struct LoginArgs {
     /// A login hint for the issuer
     #[arg(long)]
     pub login_hint: Option<String>,
+    /// A PEM file with the CA that signs the issuer's certificate (private PKI); when
+    /// given, nothing else is trusted
+    #[arg(long)]
+    pub ca_file: Option<PathBuf>,
     /// The session file.
     #[command(flatten)]
     pub session: SessionFile,
@@ -177,11 +181,18 @@ pub async fn run(cmd: UserCmd) -> anyhow::Result<()> {
 
 async fn login(args: LoginArgs) -> anyhow::Result<()> {
     let path = args.session.path()?;
+    let ca_pem = match &args.ca_file {
+        Some(p) => {
+            Some(std::fs::read(p).map_err(|e| anyhow::anyhow!("--ca-file {}: {e}", p.display()))?)
+        }
+        None => None,
+    };
     let opts = LoginOptions {
         issuer: args.issuer,
         client_id: args.client_id,
         scopes: LoginOptions::default_scopes(),
         login_hint: args.login_hint,
+        ca_pem,
     };
     let open = |url: &str| {
         if args.no_browser {

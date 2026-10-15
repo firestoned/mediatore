@@ -1,16 +1,15 @@
 // Copyright (c) 2026 Erick Bourgeois, mediatore
 // SPDX-License-Identifier: Apache-2.0
 
-//! A throwaway CA and a server certificate for the kind tier's PostgreSQL (ADR-0012): the
-//! broker connects with `sslmode=verify-full` against this CA, so the live store runs the
-//! same TLS path as the real deployment. Writes `ca.pem`, `server.pem` and
+//! A throwaway CA and a server certificate for a kind fixture (the tier's PostgreSQL,
+//! ADR-0012; its Dex, ADR-0013): the broker verifies the fixture against this CA, so the
+//! live tiers run the same TLS path as the real deployment. Writes `ca.pem`, `server.pem` and
 //! `server-key.pem` (PKCS#8) into `--out-dir`, valid for a day.
 
 use std::path::PathBuf;
 
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD;
 use clap::Parser;
+use mediatore_testkit::pem::armour as pem;
 use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
     Issuer, KeyPair, KeyUsagePurpose, SanType,
@@ -20,7 +19,7 @@ use time::{Duration, OffsetDateTime};
 #[derive(Parser)]
 #[command(
     name = "tls-fixture",
-    about = "A test CA and a server certificate for the kind tier's PostgreSQL"
+    about = "A test CA and a server certificate for a kind fixture"
 )]
 struct Cli {
     /// Directory to write ca.pem, server.pem and server-key.pem into.
@@ -42,7 +41,7 @@ fn main() -> anyhow::Result<()> {
     ca.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
     let mut dn = DistinguishedName::new();
     dn.push(DnType::OrganizationName, "mediatore-testkit");
-    dn.push(DnType::CommonName, "kind store CA");
+    dn.push(DnType::CommonName, "kind fixture CA");
     ca.distinguished_name = dn;
     ca.not_before = now - Duration::hours(1);
     ca.not_after = now + Duration::days(1);
@@ -78,18 +77,4 @@ fn main() -> anyhow::Result<()> {
         pem("PRIVATE KEY", &key.serialize_der()),
     )?;
     Ok(())
-}
-
-/// PEM armour (rcgen is built without its `pem` feature).
-fn pem(label: &str, der: &[u8]) -> String {
-    let body = STANDARD.encode(der);
-    let lines: Vec<&str> = body
-        .as_bytes()
-        .chunks(64)
-        .map(|c| std::str::from_utf8(c).expect("base64 is ascii"))
-        .collect();
-    format!(
-        "-----BEGIN {label}-----\n{}\n-----END {label}-----\n",
-        lines.join("\n")
-    )
 }

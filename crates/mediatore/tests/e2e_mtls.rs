@@ -75,6 +75,7 @@ fn state(idp: &FakeIdp, dev_mode: bool) -> Arc<AppState> {
             subject_claim: "preferred_username".into(),
             required_group: Some(REQUIRED_GROUP.into()),
             session: None,
+            ca_file: None,
         }]),
         sts: Some(sts),
         audiences: vec![AUDIENCE.into()],
