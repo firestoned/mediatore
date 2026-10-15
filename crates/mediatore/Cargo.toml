@@ -1,6 +1,6 @@
 [package]
 name = "mediatore"
-description = "mediatore server: identity broker for banlieue sandbox VMs"
+description = "mediatore: identity broker for banlieue sandbox VMs; the one binary with every role as a subcommand (ADR-0014)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -22,6 +22,8 @@ mediatore-tls.workspace = true
 kube.workspace = true
 mediatore-store.workspace = true
 mediatore-claims.workspace = true
+mediatore-guest.workspace = true
+mediatore-client.workspace = true
 tokio.workspace = true
 axum.workspace = true
 clap.workspace = true
@@ -33,6 +35,12 @@ anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
+
+[features]
+# The loopback header path of the guest and token roles (`--dev-spiffe-id`), for the dev
+# loop only. `make dist`, the Dockerfile and the build workflow never enable it (ADR-0007
+# decision 5, ADR-0014 decision 2).
+dev = ["mediatore-guest/dev"]
 
 [dev-dependencies]
 mediatore-proto.workspace = true

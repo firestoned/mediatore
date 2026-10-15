@@ -2175,7 +2175,9 @@ dependencies = [
  "kube",
  "mediatore-api",
  "mediatore-claims",
+ "mediatore-client",
  "mediatore-entra",
+ "mediatore-guest",
  "mediatore-proto",
  "mediatore-spire",
  "mediatore-store",
@@ -2243,7 +2245,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "mediatore-cli"
+name = "mediatore-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -3245,19 +3247,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
 dependencies = [
  "winapi-util",
-]
-
-[[package]]
-name = "sandbox-token"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "mediatore-proto",
- "mediatore-tls",
- "reqwest",
- "serde_json",
- "tokio",
 ]
 
 [[package]]

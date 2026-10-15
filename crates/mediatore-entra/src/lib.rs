@@ -42,7 +42,7 @@ pub enum Backend {
 /// refreshes it before every issue.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionConfig {
-    /// The OAuth client the refresh token was issued to; `mediatore-cli login` uses
+    /// The OAuth client the refresh token was issued to; `mediatore login` uses
     /// mediatore's own public client, so this is normally the issuer's `client_id`.
     pub client_id: String,
 }

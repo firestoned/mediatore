@@ -1,16 +1,12 @@
 [package]
-name = "mediatore-cli"
-description = "User-side CLI: log in at the issuer as mediatore's public client (PKCE) and delegate the session with a claim (ADR-0013)"
+name = "mediatore-client"
+description = "The user side of the one mediatore binary (ADR-0014): log in at the issuer as mediatore's public client (PKCE) and delegate the session with a claim (ADR-0013)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 publish.workspace = true
-
-[[bin]]
-name = "mediatore-cli"
-path = "src/main.rs"
 
 [dependencies]
 mediatore-proto.workspace = true

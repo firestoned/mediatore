@@ -3,11 +3,11 @@
 #
 # End-to-end verification of the dev-mode loop with real binaries over real
 # HTTP listeners: fake IdP login -> POST /v1/claims -> bind to a registered
-# node -> GET /v1/me (mediatore-guest) -> POST /v1/token (sandbox-token) ->
+# node -> GET /v1/me (mediatore guest) -> POST /v1/token (mediatore token) ->
 # STS JWT verified against mediatore's own JWKS -> release -> cut-off.
 #
-# What this proves beyond `cargo test`: the four shipped binaries agree on the
-# wire contract when started as separate processes, config files parse, ports
+# What this proves beyond `cargo test`: the roles of the one binary agree on the
+# wire contract when started as separate processes (ADR-0014), config files parse, ports
 # bind, and the demo a human runs (`make e2e`) is the same thing CI runs.
 #
 # The second job runs the live tiers against a real SPIRE (server, controller

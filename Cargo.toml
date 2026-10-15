@@ -11,8 +11,7 @@ members = [
   "crates/mediatore-store",
   "crates/mediatore",
   "crates/mediatore-guest",
-  "crates/sandbox-token",
-  "crates/mediatore-cli",
+  "crates/mediatore-client",
   "crates/mediatore-testkit",
 ]
 
@@ -36,6 +35,8 @@ mediatore-spire  = { path = "crates/mediatore-spire" }
 mediatore-tls    = { path = "crates/mediatore-tls" }
 mediatore-claims = { path = "crates/mediatore-claims" }
 mediatore-store  = { path = "crates/mediatore-store" }
+mediatore-guest  = { path = "crates/mediatore-guest" }
+mediatore-client = { path = "crates/mediatore-client" }
 mediatore-testkit = { path = "crates/mediatore-testkit" }
 
 # banlieue CRD types (ADR-0002, ADR-0011), pinned by hash: banlieue main at the merge of

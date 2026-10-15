@@ -1,7 +1,9 @@
 // Copyright (c) 2026 Erick Bourgeois, mediatore
 // SPDX-License-Identifier: Apache-2.0
 
-//! mediatore: identity broker for banlieue sandbox VMs.
+//! mediatore: identity broker for banlieue sandbox VMs. One binary, every role a subcommand
+//! (ADR-0014): `serve` is the broker, `guest` and `token` are the VM side, `login`,
+//! `sandbox` and `session` are the user's tools, `revoke` the admin stub.
 
 mod config;
 
@@ -36,14 +38,21 @@ struct Cli {
     cmd: Cmd,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Debug)]
 enum Cmd {
-    /// Run the server.
+    /// Run the broker.
     Serve {
         /// Path to mediatore.yaml
         #[arg(long, env = "MEDIATORE_CONFIG", default_value = "mediatore.yaml")]
         config: PathBuf,
     },
+    /// The in-guest agent on a pool member: register the node, fetch the subject, jail the workload.
+    Guest(mediatore_guest::guest::GuestArgs),
+    /// Inside the jail: trade the claim SVID for one audience-scoped token.
+    Token(mediatore_guest::token::TokenArgs),
+    /// The user's tools: `login`, `sandbox create|get|delete`, `session`.
+    #[command(flatten)]
+    User(mediatore_client::cli::UserCmd),
     /// Revoke a claim immediately: delete its SPIRE entry, stop issuing, optionally ban the node.
     Revoke {
         /// Claim name
@@ -59,8 +68,11 @@ enum Cmd {
 async fn main() -> anyhow::Result<()> {
     mediatore_proto::tls::ensure_provider();
     tracing_subscriber::fmt()
-        // Colour only on a terminal: pod logs are read by programs.
-        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
+        // Logs on stderr for every role, so stdout is the role's result alone (`token`
+        // prints a token, `sandbox create --json` a document). Colour only on a terminal:
+        // pod logs are read by programs.
+        .with_writer(std::io::stderr)
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
@@ -68,6 +80,9 @@ async fn main() -> anyhow::Result<()> {
 
     match Cli::parse().cmd {
         Cmd::Serve { config } => serve(&config).await,
+        Cmd::Guest(args) => mediatore_guest::guest::run(args).await,
+        Cmd::Token(args) => mediatore_guest::token::run(args).await,
+        Cmd::User(cmd) => mediatore_client::cli::run(cmd).await,
         Cmd::Revoke { claim, ban_node } => {
             tracing::warn!(claim, ban_node, "revoke: admin client not wired yet");
             anyhow::bail!("not implemented: revoke needs the admin endpoint")
@@ -283,4 +298,147 @@ fn entry_manager(
 async fn shutdown() {
     let _ = tokio::signal::ctrl_c().await;
     tracing::info!("shutting down");
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+
+    use super::*;
+
+    fn parse(argv: &[&str]) -> Result<Cmd, clap::Error> {
+        Cli::try_parse_from(argv).map(|c| c.cmd)
+    }
+
+    #[test]
+    fn the_command_tree_is_consistent() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn every_role_is_a_subcommand_of_the_one_binary() {
+        assert!(matches!(
+            parse(&["mediatore", "serve", "--config", "x.yaml"]),
+            Ok(Cmd::Serve { .. })
+        ));
+        let guest = parse(&[
+            "mediatore",
+            "guest",
+            "--mediatore-url",
+            "https://mediatore-sandbox.banlieue-system.svc",
+            "--dev-ek-hash",
+            "ec00000000000000000000000000000000000000000000000000000000000007",
+            "--dev-dmi-uuid",
+            "1d2c3b4a-5f6e-4d7c-8b9a-0f1e2d3c4b5a",
+            "--dev-skip-setup",
+            "--provider",
+            "libvirt",
+        ]);
+        assert!(
+            matches!(guest, Ok(Cmd::Guest(ref a)) if a.dev_skip_setup),
+            "{guest:?}"
+        );
+        let token = parse(&[
+            "mediatore",
+            "token",
+            "--audience",
+            "e2e",
+            "--mediatore-url",
+            "https://mediatore-sandbox.banlieue-system.svc",
+        ]);
+        assert!(
+            matches!(token, Ok(Cmd::Token(ref a)) if a.audience == "e2e"),
+            "{token:?}"
+        );
+        assert!(matches!(
+            parse(&["mediatore", "login", "--issuer", "https://dex.home.example"]),
+            Ok(Cmd::User(mediatore_client::cli::UserCmd::Login(_)))
+        ));
+        let create = parse(&[
+            "mediatore",
+            "sandbox",
+            "create",
+            "--mediatore",
+            "https://mediatore.sandbox.example",
+            "--pool",
+            "pool-a",
+            "--audience",
+            "api://trading-data",
+            "--image",
+            "registry.internal:5000/sandbox:latest",
+            "--arg",
+            "/bin/sh",
+        ]);
+        assert!(
+            matches!(
+                create,
+                Ok(Cmd::User(mediatore_client::cli::UserCmd::Sandbox(
+                    mediatore_client::cli::SandboxCmd::Create(ref a)
+                ))) if a.pool == "pool-a" && a.args == ["/bin/sh"]
+            ),
+            "{create:?}"
+        );
+        assert!(matches!(
+            parse(&[
+                "mediatore",
+                "sandbox",
+                "get",
+                "--mediatore",
+                "https://mediatore.sandbox.example",
+                "sandbox-3f9a1c2e"
+            ]),
+            Ok(Cmd::User(mediatore_client::cli::UserCmd::Sandbox(
+                mediatore_client::cli::SandboxCmd::Get { ref name, .. }
+            ))) if name == "sandbox-3f9a1c2e"
+        ));
+        assert!(matches!(
+            parse(&["mediatore", "session"]),
+            Ok(Cmd::User(mediatore_client::cli::UserCmd::Session(_)))
+        ));
+        assert!(matches!(
+            parse(&["mediatore", "revoke", "--claim", "sandbox-3f9a1c2e"]),
+            Ok(Cmd::Revoke { .. })
+        ));
+    }
+
+    /// The jail mounts the path the node entry selects (ADR-0014 decision 5), so the two
+    /// constants are one.
+    #[test]
+    fn the_guest_mounts_the_path_the_node_entry_pins() {
+        let guest = parse(&["mediatore", "guest", "--mediatore-url", "https://b"]);
+        let Ok(Cmd::Guest(args)) = guest else {
+            panic!("{guest:?}");
+        };
+        assert_eq!(
+            args.agent_binary.to_str(),
+            Some(mediatore_spire::GUEST_AGENT_PATH)
+        );
+        assert_eq!(
+            mediatore_guest::jail::JAIL_BINARY,
+            mediatore_spire::GUEST_AGENT_PATH
+        );
+    }
+
+    #[test]
+    fn the_old_binary_names_are_not_subcommands() {
+        for old in ["mediatore-guest", "sandbox-token", "mediatore-cli", "claim"] {
+            assert!(parse(&["mediatore", old]).is_err(), "{old} parsed");
+        }
+    }
+
+    /// The header path exists only in a `dev` build (ADR-0007 decision 5).
+    #[test]
+    fn the_dev_header_flag_follows_the_dev_feature() {
+        let argv = [
+            "mediatore",
+            "token",
+            "--audience",
+            "e2e",
+            "--mediatore-url",
+            "http://127.0.0.1:8443",
+            "--dev-spiffe-id",
+            "spiffe://sandbox.test/banlieue/claim/1d2c3b4a-5f6e-4d7c-8b9a-0f1e2d3c4b5a",
+        ];
+        assert_eq!(parse(&argv).is_ok(), cfg!(feature = "dev"));
+    }
 }

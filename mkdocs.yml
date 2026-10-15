@@ -159,5 +159,6 @@ nav:
       - "ADR-0011: The claim watcher": adr/0011-claim-watcher.md
       - "ADR-0012: The persistent store": adr/0012-persistent-store.md
       - "ADR-0013: The Dex path, the session delegated": adr/0013-dex-session-delegation.md
+      - "ADR-0014: One binary, the roles as subcommands": adr/0014-one-binary-roles-as-subcommands.md
   - Security:
       - Threat model: security/threat-model.md

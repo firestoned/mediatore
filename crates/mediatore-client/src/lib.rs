@@ -1,14 +1,16 @@
 // Copyright (c) 2026 Erick Bourgeois, mediatore
 // SPDX-License-Identifier: Apache-2.0
 
-//! mediatore-cli: log in at the issuer as mediatore's own public client and hand the
-//! session to mediatore with a claim (ADR-0013 decision 3).
+//! The user side of the one mediatore binary (ADR-0014): log in at the issuer as mediatore's
+//! own public client and hand the session to mediatore with a claim (ADR-0013 decision 3).
 //!
 //! `login` runs the authorization-code flow with PKCE (RFC 7636) and a loopback redirect
 //! (RFC 8252), then keeps the ID token and the refresh token in a session file. `claim`
 //! posts `/v1/claims` with the ID token as bearer and the refresh token delegated in the
 //! body, and forgets the refresh token: the issuer rotates it, so after mediatore's first
 //! refresh the copy here would be dead anyway. A second claim is a second login.
+
+pub mod cli;
 
 use std::path::{Path, PathBuf};
 
@@ -56,7 +58,7 @@ impl Session {
     /// Read the session at `path`.
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let text = std::fs::read_to_string(path)
-            .map_err(|e| anyhow::anyhow!("{}: {e} (run `mediatore-cli login`)", path.display()))?;
+            .map_err(|e| anyhow::anyhow!("{}: {e} (run `mediatore login`)", path.display()))?;
         Ok(serde_json::from_str(&text)?)
     }
 

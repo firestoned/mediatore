@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Build gate: license headers, signed commits, fmt, clippy, tests, cargo-audit,
-# cargo-deny, the server + guest binaries with CycloneDX SBOMs, and the server
+# cargo-deny, the one static binary with CycloneDX SBOMs, and the server
 # container image (SBOM'd, Cosign-signed and provenance-attested on push/release).
 #
 # Mirrors banlieue's build.yaml at mediatore's scale. Deliberately not ported yet:
@@ -180,10 +180,11 @@ jobs:
           command: check
 
   # ───────────────────────────────────────────────────────────────────────────
-  # Guest binaries — static musl, the artifacts banlieue-imagebuilder bakes in.
+  # The one static musl binary (ADR-0014): what banlieue-imagebuilder bakes into
+  # the VM image and what the server image carries.
   # ───────────────────────────────────────────────────────────────────────────
-  guest:
-    name: 🦀 Guest Binaries (musl)
+  dist:
+    name: 🦀 Static Binary (musl)
     runs-on: ubuntu-latest
     needs: [test]
     steps:
@@ -201,24 +202,23 @@ jobs:
       - name: Cache cargo dependencies
         uses: firestoned/github-actions/rust/cache-cargo@787be16a6bed7e6c2297683bb75bc9b5f1a54397 # v1.3.8
 
-      - name: Build guest binaries
-        run: make guest
+      - name: Build the binary
+        run: make dist
 
       - name: Generate CycloneDX SBOM
         run: make sbom
 
-      - name: Stage SBOMs next to the binaries
+      - name: Stage SBOMs next to the binary
         run: |
-          find . -name "*.cdx.json" -not -path './target/*' -exec mv {} target/x86_64-unknown-linux-musl/release/ \; || true
+          find . -name "*.cdx.json" -not -path './target/*' -not -path './dist/*' -exec mv {} dist/ \; || true
 
-      - name: Upload guest binaries
+      - name: Upload the binary
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: guest-binaries-linux-amd64
+          name: mediatore-linux-amd64-musl
           path: |
-            target/x86_64-unknown-linux-musl/release/mediatore-guest
-            target/x86_64-unknown-linux-musl/release/sandbox-token
-            target/x86_64-unknown-linux-musl/release/*.cdx.json
+            dist/mediatore
+            dist/*.cdx.json
           if-no-files-found: error
 
   # ───────────────────────────────────────────────────────────────────────────

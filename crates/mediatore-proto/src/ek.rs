@@ -6,7 +6,7 @@
 //!
 //! `bloomberg/spire-tpm-plugin` names an attested agent
 //! `spiffe://<td>/spire/agent/tpm/<hex sha256 of the EK public key in PKIX DER>`; the
-//! PKIX DER of a public key is the certificate's `SubjectPublicKeyInfo`. `mediatore-guest`
+//! PKIX DER of a public key is the certificate's `SubjectPublicKeyInfo`. `mediatore guest`
 //! computes the same value with `openssl pkey -pubin -outform der | sha256sum`, and
 //! banlieue publishes the certificate on `VirtualMachine.status.tpmEndorsementCertificates`
 //! (banlieue ADR-0045), so the broker can name a node's agent before it attests.
