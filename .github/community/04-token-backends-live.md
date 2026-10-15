@@ -32,6 +32,9 @@ the transit sealer are the next slices.
       change in the directory, and a deleted refresh token at Dex is the other refusal
 - [ ] Entra OBO: client_assertion signing (key via OpenBao transit or file for now),
       first exchange at claim creation, refresh within TTL, 15-minute re-issue cap
-- [ ] OpenBao transit `Sealer` (ADR-0012 decision 3): the work shape, where the broker
-      never holds the wrapping key; the local key file stays the homelab shape
+- [x] OpenBao transit `Sealer` (ADR-0015, 2026-10-15): the work shape, where the broker
+      never holds the wrapping key; a derived transit key with the binding UID as context,
+      Kubernetes auth with a projected token (audience `openbao`), a startup probe, an
+      outage as `503 sealer_unavailable`; every kind tier runs the broker on the OpenBao
+      `make kind-openbao` brings up; the local key file stays the homelab shape
 - [ ] Negative tests from runbook 8.7 that need real backends (revoked Entra session)

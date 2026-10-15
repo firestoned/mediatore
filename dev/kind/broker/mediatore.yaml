@@ -7,7 +7,9 @@
 # against: they exist so the AgentSandbox reconciler (ADR-0008) accepts a sandbox naming
 # them and refuses one that does not. The second issuer is the Dex `make kind-dex` runs
 # (ADR-0013): a session issuer over TLS the broker verifies against the CA that target
-# minted, with the sealing key and the STS signing key from the Secrets it created.
+# minted, with the STS signing key from the Secret it created. Refresh material is sealed
+# by the OpenBao `make kind-openbao` runs (ADR-0015): transit over TLS the broker verifies,
+# the broker logging in with its projected ServiceAccount token.
 trust_domain: sandbox.test
 listen:
   user: 0.0.0.0:8080
@@ -40,6 +42,11 @@ sandboxes:
 # for 0 s and the resync runs every 15 s so the sandbox tier sees the audit sweep.
 store:
   retention_secs: 0
-  sealing: { key_file: /etc/mediatore-sealing/key }
+  sealing:
+    transit:
+      url: https://mediatore-openbao.banlieue-system.svc:8200
+      ca_file: /etc/mediatore-openbao/ca.pem
+      key: mediatore
+      role: mediatore
 watcher:
   resync_secs: 15

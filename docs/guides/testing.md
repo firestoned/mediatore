@@ -143,6 +143,20 @@ entry id and the node in the store, with no second record and no second entry; a
 the deletion, the kind config's zero retention and 15 s resync let the tier see the
 released row archived.
 
+Every kind tier also runs the broker on the transit sealer
+([ADR-0015](../adr/0015-transit-sealer.md)). `make kind-openbao` (a dependency of
+`make kind-broker`) mints a certificate for `mediatore-openbao.banlieue-system.svc`,
+applies `dev/kind/openbao/openbao.yaml` (OpenBao 2.7.1, in-memory storage, TLS 1.3
+only) and runs `dev/kind/openbao-setup.sh`, which initialises and unseals it, enables
+transit with a derived key `mediatore`, configures the Kubernetes auth method against the
+cluster, writes a policy allowing encrypt and decrypt on that key alone, and a role for
+the broker's ServiceAccount with audience `openbao`. The broker overlay's config points
+`store.sealing.transit` at it with the CA the target put in a ConfigMap; the base
+Deployment's projected token is what the broker logs in with. The broker's startup
+probe (a seal and unseal under a random binding, and a refusal under another) is what
+every tier's `rollout status` waits on, and the Dex tier's sessions are sealed and
+reopened there on every issue.
+
 ### The Dex path against a real Dex
 
 `make kind-dex` (a dependency of `make kind-broker`, like the PostgreSQL) runs a Dex
@@ -150,7 +164,7 @@ released row archived.
 target mints for `mediatore-dex.banlieue-system.svc`, and a glauth LDAP directory
 behind it (`dev/kind/dex/glauth.yaml`, the users and groups in `dev/kind/dex/glauth.cfg`:
 `octocat` in group `sandbox-users`, the service account Dex binds as). It also mints
-the broker's STS signing key and sealing key into Secrets. The broker overlay's config
+the broker's STS signing key into a Secret. The broker overlay's config
 names that Dex as a session issuer with `subject_claim: preferred_username`,
 `required_group: sandbox-users` and `ca_file` pointing at the CA the target put in a
 ConfigMap, so the broker verifies the issuer exactly as it would one on a private PKI.

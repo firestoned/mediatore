@@ -6,7 +6,7 @@
 
 .PHONY: all help fmt fmt-check lint test deny audit check sbom dist dist-e2e image crds e2e live-admission-test \
         kind-install kind-create kind-delete kind-down kind-spire kind-deploy kind-up \
-        kind-images kind-postgres kind-dex kind-broker kind-banlieue-crds kind-e2e-entries kind-e2e-mtls kind-e2e-watcher kind-e2e-sandbox \
+        kind-images kind-postgres kind-dex kind-openbao kind-broker kind-banlieue-crds kind-e2e-entries kind-e2e-mtls kind-e2e-watcher kind-e2e-sandbox \
         kind-e2e-store kind-e2e-dex kind-e2e kind-e2e-ci kind-e2e-logs \
         calm-validate calm-diagrams docs docs-serve docs-clean clean
 
@@ -182,23 +182,33 @@ kind-postgres: kind-create ## PostgreSQL in kind with a certificate this target 
 	$(KIND_KUBECTL) -n banlieue-system rollout restart deploy/mediatore-postgres
 	$(KIND_KUBECTL) -n banlieue-system rollout status deploy/mediatore-postgres --timeout=300s
 
-kind-dex: kind-create ## Dex over TLS with a glauth directory behind it (ADR-0013), and the broker's STS signing and sealing keys, all minted by this target
+kind-dex: kind-create ## Dex over TLS with a glauth directory behind it (ADR-0013), and the broker's STS signing key, minted by this target
 	@$(KIND_KUBECTL) get ns banlieue-system >/dev/null 2>&1 || $(KIND_KUBECTL) create ns banlieue-system
 	cargo run -q -p mediatore-testkit --bin tls-fixture -- --out-dir $(KIND_DIR)/dex --dns mediatore-dex.banlieue-system.svc
 	$(KIND_KUBECTL) -n banlieue-system create secret generic mediatore-dex-tls --from-file=$(KIND_DIR)/dex/server.pem --from-file=$(KIND_DIR)/dex/server-key.pem --dry-run=client -o yaml | $(KIND_KUBECTL) apply -f -
 	$(KIND_KUBECTL) -n banlieue-system create configmap mediatore-dex-ca --from-file=$(KIND_DIR)/dex/ca.pem --dry-run=client -o yaml | $(KIND_KUBECTL) apply -f -
 	$(KIND_KUBECTL) -n banlieue-system create configmap mediatore-glauth-config --from-file=dev/kind/dex/glauth.cfg --dry-run=client -o yaml | $(KIND_KUBECTL) apply -f -
 	@[ -f $(KIND_DIR)/sts.pem ] || openssl ecparam -name prime256v1 -genkey -noout | openssl pkcs8 -topk8 -nocrypt -out $(KIND_DIR)/sts.pem
-	@[ -f $(KIND_DIR)/sealing.key ] || printf '%s' "$$(openssl rand -hex 32)" > $(KIND_DIR)/sealing.key
 	$(KIND_KUBECTL) -n banlieue-system create secret generic mediatore-sts --from-file=sts.pem=$(KIND_DIR)/sts.pem --dry-run=client -o yaml | $(KIND_KUBECTL) apply -f -
-	$(KIND_KUBECTL) -n banlieue-system create secret generic mediatore-sealing --from-file=key=$(KIND_DIR)/sealing.key --dry-run=client -o yaml | $(KIND_KUBECTL) apply -f -
 	$(KIND_KUBECTL) apply -f dev/kind/dex/glauth.yaml -f dev/kind/dex/dex.yaml
 	@# A new certificate needs a new pod.
 	$(KIND_KUBECTL) -n banlieue-system rollout restart deploy/mediatore-dex
 	$(KIND_KUBECTL) -n banlieue-system rollout status deploy/mediatore-glauth --timeout=300s
 	$(KIND_KUBECTL) -n banlieue-system rollout status deploy/mediatore-dex --timeout=300s
 
-kind-broker: kind-up kind-images kind-postgres kind-dex ## deploy/base in kind on the CSI driver's socket, the kind PostgreSQL and the kind Dex (dev/kind/broker overlay), rolled out
+kind-openbao: kind-create ## OpenBao over TLS (ADR-0015): minted certificate, initialised and unsealed, transit with a derived key, Kubernetes auth role for the broker
+	@$(KIND_KUBECTL) get ns banlieue-system >/dev/null 2>&1 || $(KIND_KUBECTL) create ns banlieue-system
+	cargo run -q -p mediatore-testkit --bin tls-fixture -- --out-dir $(KIND_DIR)/openbao --dns mediatore-openbao.banlieue-system.svc --dns localhost
+	$(KIND_KUBECTL) -n banlieue-system create secret generic mediatore-openbao-tls --from-file=$(KIND_DIR)/openbao/server.pem --from-file=$(KIND_DIR)/openbao/server-key.pem --dry-run=client -o yaml | $(KIND_KUBECTL) apply -f -
+	$(KIND_KUBECTL) -n banlieue-system create configmap mediatore-openbao-ca --from-file=$(KIND_DIR)/openbao/ca.pem --dry-run=client -o yaml | $(KIND_KUBECTL) apply -f -
+	$(KIND_KUBECTL) apply -f dev/kind/openbao/openbao.yaml
+	@# A new certificate needs a new pod; in-memory storage starts over, the setup redoes it.
+	$(KIND_KUBECTL) -n banlieue-system rollout restart deploy/mediatore-openbao
+	$(KIND_KUBECTL) -n banlieue-system rollout status deploy/mediatore-openbao --timeout=300s
+	@rm -f $(KIND_DIR)/openbao/init.json
+	./dev/kind/openbao-setup.sh $(KIND_KUBECONFIG) $(KIND_DIR)/openbao
+
+kind-broker: kind-up kind-images kind-postgres kind-dex kind-openbao ## deploy/base in kind on the CSI driver's socket, the kind PostgreSQL, Dex and OpenBao (dev/kind/broker overlay), rolled out
 	$(KIND_KUBECTL) apply -k dev/kind/broker
 	@# Same tag, new image: a restart is what makes the loaded image the running one.
 	$(KIND_KUBECTL) -n banlieue-system rollout restart deploy/mediatore
@@ -251,6 +261,7 @@ kind-e2e-logs: ## What a failing live suite needs: entries, policy, broker and c
 	-$(KIND_KUBECTL) -n banlieue-system logs deploy/mediatore --tail=200
 	-$(KIND_KUBECTL) -n banlieue-system logs deploy/mediatore-postgres --tail=50
 	-$(KIND_KUBECTL) -n banlieue-system logs deploy/mediatore-dex --tail=80
+	-$(KIND_KUBECTL) -n banlieue-system logs deploy/mediatore-openbao --tail=60
 	-$(KIND_KUBECTL) -n banlieue-system logs deploy/mediatore-glauth --tail=30
 	-$(KIND_KUBECTL) -n banlieue-system get refreshtokens.dex.coreos.com
 	-$(KIND_KUBECTL) -n mediatore-e2e-sandbox logs pod/cli-1 --tail=60

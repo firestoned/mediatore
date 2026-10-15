@@ -52,6 +52,7 @@ serde_json.workspace = true
 chrono.workspace = true
 sha2.workspace = true
 anyhow.workspace = true
+aws-lc-rs.workspace = true
 
 [lints]
 workspace = true

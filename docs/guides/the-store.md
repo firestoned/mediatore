@@ -75,7 +75,9 @@ sealed it, a fresh nonce, and the AES-256-GCM ciphertext with the claim's UID as
 associated data, so an envelope copied onto another claim's row does not open. The
 record type has no plaintext field. Revocation drops the envelope.
 
-The local sealer takes its key from a file:
+There are two sealers, and `store.sealing` names exactly one of them.
+
+The local sealer takes its key from a file (the homelab shape, one replica):
 
 ```yaml
 store:
@@ -86,10 +88,41 @@ store:
 The file is 32 raw bytes or 64 hex characters (`openssl rand -hex 32`), mounted from a
 Secret. The broker reads it at start, logs the key id (the first 16 hex characters of
 the key's SHA-256, never the key), and fails the start on a missing or malformed file.
+The wrapping key is in the broker's memory for as long as it runs.
+
+The transit sealer ([ADR-0015](../adr/0015-transit-sealer.md)) leaves the key in
+OpenBao (the work shape):
+
+```yaml
+store:
+  sealing:
+    transit:
+      url: https://openbao.home.example:8200
+      ca_file: /etc/mediatore-openbao/ca.pem   # the CA its certificate chains to
+      mount: transit                           # default
+      key: mediatore                           # a key created with derived=true
+      role: mediatore                          # the Kubernetes auth role
+      token_file: /var/run/secrets/openbao/token   # default: the projected token
+```
+
+Sealing is `transit/encrypt/<key>` and unsealing `transit/decrypt/<key>`, with the
+binding UID as the derivation `context`, so the envelope opens only for its claim exactly
+as the local sealer's associated data arranges. The envelope's `key_id` is
+`transit:<mount>/<key>`, its ciphertext the `vault:vN:...` string OpenBao returned, so a
+key rotated at OpenBao (`bao write -f transit/keys/mediatore/rotate`) keeps old
+envelopes readable until the administrator raises `min_decryption_version`; the broker
+re-seals every session at its next refresh anyway. The broker logs in at
+`auth/kubernetes/login` with the projected ServiceAccount token the base Deployment
+mounts (audience `openbao`), keeps the OpenBao token in memory until its lease nears
+its end, and exchanges it again at once on a 403. At start it seals and unseals a probe,
+so a wrong URL, CA, role, policy, mount or key, or a key created without `derived`,
+stops the process. The URL must be `https` outside `dev_mode`. OpenBao being away is
+`503 sealer_unavailable` on the request that needed it and revokes nothing. On the
+OpenBao side the broker's policy needs `update` on the two paths and nothing else; the
+kind fixture (`dev/kind/openbao-setup.sh`) is the reference for the role and the key.
+
 With no `sealing` section nothing can be persisted: a backend that needs to store
-refresh material fails that claim rather than store plaintext. The homelab shape keeps
-the wrapping key in the broker's memory; the work shape, an OpenBao transit sealer that
-never does, lands with roadmap 04, the first roadmap that has a refresh token to seal.
+refresh material fails that claim rather than store plaintext.
 
 A session issuer ([ADR-0013](../adr/0013-dex-session-delegation.md)) is where envelopes
 come from today: the refresh token `POST /v1/claims` receives is sealed with the
@@ -98,7 +131,7 @@ record) and parked in `sessions` until the reconciler creates the record and mov
 there; `claims.sandbox_uid` records which UID opens it. Every `POST /v1/token` opens the
 envelope, refreshes upstream, and re-seals the rotated token. A session no record ever
 took (a refused or deleted sandbox) is removed by the reconciler, and anything older than
-an hour is swept at resync. An issuer with a `session` block and no `sealing` key refuses
+an hour is swept at resync. An issuer with a `session` block and no `sealing` section refuses
 to start.
 
 ## Retention and the audit table
