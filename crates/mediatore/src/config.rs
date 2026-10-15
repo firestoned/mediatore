@@ -6,6 +6,7 @@
 use std::path::{Path, PathBuf};
 
 use mediatore_entra::{Backend, IssuerConfig};
+use mediatore_store::seal::TransitConfig;
 use serde::Deserialize;
 
 /// One downstream audience and which backend serves it.
@@ -157,12 +158,17 @@ impl Default for SandboxesSection {
     }
 }
 
-/// The wrapping key for refresh material (ADR-0012 decision 3).
+/// The wrapping key for refresh material (ADR-0012 decision 3): exactly one of the local
+/// key file (the homelab shape) or `OpenBao` transit (the work shape, ADR-0015).
 #[derive(Debug, Clone, Deserialize)]
 pub struct SealingSection {
     /// File holding the 32-byte key (raw, or 64 hex characters): a Secret volume. Read at
     /// startup; a missing or malformed key stops the process.
-    pub key_file: PathBuf,
+    #[serde(default)]
+    pub key_file: Option<PathBuf>,
+    /// `OpenBao` transit: the key stays there, the broker logs in as its `ServiceAccount`.
+    #[serde(default)]
+    pub transit: Option<TransitConfig>,
 }
 
 /// The claim store (ADR-0012). Outside `dev_mode` a URL is required; `MEDIATORE_STORE_URL`
@@ -328,9 +334,26 @@ impl Config {
             && cfg.store.sealing.is_none()
         {
             anyhow::bail!(
-                "issuer {} requires a delegated session, which is sealed before it is stored: set store.sealing.key_file (ADR-0013)",
+                "issuer {} requires a delegated session, which is sealed before it is stored: set store.sealing.key_file or store.sealing.transit (ADR-0013, ADR-0015)",
                 i.url
             );
+        }
+        if let Some(sealing) = &cfg.store.sealing {
+            match (&sealing.key_file, &sealing.transit) {
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("store.sealing takes key_file or transit, not both (ADR-0015)")
+                }
+                (None, None) => {
+                    anyhow::bail!("store.sealing needs key_file or transit (ADR-0015)")
+                }
+                (None, Some(t)) if !cfg.dev_mode && !t.url.starts_with("https://") => {
+                    anyhow::bail!(
+                        "store.sealing.transit.url must be https outside dev_mode (ADR-0015); got {}",
+                        t.url
+                    );
+                }
+                _ => {}
+            }
         }
         Ok(cfg)
     }
@@ -587,6 +610,30 @@ store: {{ url: \"sqlite:///var/lib/mediatore/store.db\" }}
         ))
         .unwrap_err();
         assert!(err.to_string().contains("rate_per_minute"), "{err}");
+    }
+
+    #[test]
+    fn the_sealing_section_is_one_of_a_key_file_or_transit_and_transit_is_https_outside_dev_mode() {
+        let transit = "store:\n  sealing:\n    transit: { url: https://openbao.home.example:8200, key: mediatore, role: mediatore }\n";
+        let cfg = Config::parse(&format!("{BASE}dev_mode: true\n{transit}")).unwrap();
+        let t = cfg.store.sealing.unwrap().transit.unwrap();
+        assert_eq!((t.mount.as_str(), t.key.as_str()), ("transit", "mediatore"));
+        for (yaml, want) in [
+            (
+                "store:\n  sealing:\n    key_file: /k\n    transit: { url: https://b, key: k, role: r }\n",
+                "not both",
+            ),
+            ("store:\n  sealing: {}\n", "needs key_file or transit"),
+        ] {
+            let err = Config::parse(&format!("{BASE}dev_mode: true\n{yaml}")).unwrap_err();
+            assert!(err.to_string().contains(want), "{err}");
+        }
+        // http reaches OpenBao only under dev_mode.
+        let plain = "store:\n  url: \"sqlite::memory:\"\n  sealing:\n    transit: { url: http://127.0.0.1:8200, key: k, role: r }\n";
+        assert!(Config::parse(&format!("{BASE}dev_mode: true\n{plain}")).is_ok());
+        let prod = "trust_domain: sandbox.test\nissuers: []\naudiences: []\nlisten: { user: 0.0.0.0:8080, sandbox: 0.0.0.0:8443 }\nspire:\n  workload_api_socket: unix:///run/spire/sockets/spire-agent.sock\n  entries:\n    class_name: spire-server-spire\nstore:\n  url: \"sqlite:///var/lib/mediatore/store.db\"\n  sealing:\n    transit: { url: http://openbao.home.example:8200, key: k, role: r }\n";
+        let err = Config::parse(prod).unwrap_err();
+        assert!(err.to_string().contains("must be https"), "{err}");
     }
 
     #[test]

@@ -38,7 +38,7 @@ use mediatore_proto::{
     TokenRequest, TokenResponse,
 };
 use mediatore_spire::{EntryManager, Naming};
-use mediatore_store::seal::Sealer;
+use mediatore_store::seal::{SealError, Sealer};
 use mediatore_store::{ClaimRecord, ClaimStore, NodeRecord, SessionRecord, StoreError};
 use mediatore_sts::{MintRequest, Sts};
 use mediatore_tls::PeerSpiffeId;
@@ -377,7 +377,7 @@ async fn create_claim(
             sealer
                 .seal(uid, token.0.as_bytes())
                 .await
-                .map_err(|e| ApiError::internal(e.to_string()))?,
+                .map_err(seal_error)?,
         ),
         _ => None,
     };
@@ -468,7 +468,10 @@ async fn create_sandbox(
         if let Err(d) = front.delete(&st.sandbox_namespace, name).await {
             tracing::warn!(sandbox = %name, error = %d, "sandbox withdrawal failed");
         }
-        return Err(ApiError::internal("session could not be stored"));
+        return Err(match e.downcast::<SealError>() {
+            Ok(seal) => seal_error(seal),
+            Err(_) => ApiError::internal("session could not be stored"),
+        });
     }
     Ok((StatusCode::CREATED, Json(response_of(&created))))
 }
@@ -729,8 +732,14 @@ async fn refresh_session(
         .unseal(rec.seal_binding(), envelope)
         .await
         .map_err(|e| {
-            tracing::warn!(claim_uid = %rec.uid, error = %e, "session envelope did not open");
-            ApiError::forbidden("delegated session unreadable")
+            // An outage at the sealer is an outage: the envelope stays, nothing is revoked.
+            if let SealError::Unavailable(_) = e {
+                tracing::warn!(claim_uid = %rec.uid, error = %e, "sealer unavailable");
+                seal_error(e)
+            } else {
+                tracing::warn!(claim_uid = %rec.uid, error = %e, "session envelope did not open");
+                ApiError::forbidden("delegated session unreadable")
+            }
         })?;
     let token = std::str::from_utf8(&plaintext)
         .map_err(|_| ApiError::forbidden("delegated session unreadable"))?;
@@ -758,7 +767,7 @@ async fn refresh_session(
     let envelope = sealer
         .seal(rec.seal_binding(), refreshed.refresh_token.as_bytes())
         .await
-        .map_err(|e| ApiError::internal(e.to_string()))?;
+        .map_err(seal_error)?;
     let mut updated = rec.clone();
     updated.refresh = Some(envelope);
     st.store
@@ -769,6 +778,19 @@ async fn refresh_session(
 }
 
 /// `403 session_revoked`: the delegated session is gone and so is the claim.
+/// A sealing failure as an API error: the sealer's backend being away is `503
+/// sealer_unavailable` (ADR-0015), anything else is the broker's own fault.
+fn seal_error(e: SealError) -> ApiError {
+    match e {
+        SealError::Unavailable(why) => ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "sealer_unavailable",
+            Some(format!("the sealer did not answer: {why}")),
+        ),
+        other => ApiError::internal(other.to_string()),
+    }
+}
+
 fn session_revoked() -> ApiError {
     ApiError::new(
         StatusCode::FORBIDDEN,

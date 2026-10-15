@@ -1,0 +1,113 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+#
+# OpenBao for the kind tiers (`make kind-openbao`, ADR-0015): one pod, in-memory storage,
+# TLS 1.3 only with the certificate the make target mints into Secret mediatore-openbao-tls
+# (tls-fixture, DNS name mediatore-openbao.banlieue-system.svc). dev/kind/openbao-setup.sh
+# initialises and unseals it, enables transit with a derived key and the Kubernetes auth
+# method with a role for the broker's ServiceAccount (audience openbao). Everything in it
+# is a fixture of a throwaway cluster: a restart of the pod loses it all.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: mediatore-openbao
+  namespace: banlieue-system
+---
+# The Kubernetes auth method verifies the broker's projected token with a TokenReview.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: mediatore-openbao-auth-delegator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+subjects:
+  - kind: ServiceAccount
+    name: mediatore-openbao
+    namespace: banlieue-system
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mediatore-openbao-config
+  namespace: banlieue-system
+data:
+  openbao.hcl: |
+    ui = false
+    disable_mlock = true
+    api_addr = "https://mediatore-openbao.banlieue-system.svc:8200"
+    listener "tcp" {
+      address = "0.0.0.0:8200"
+      tls_cert_file = "/tls/server.pem"
+      tls_key_file = "/tls/server-key.pem"
+      tls_min_version = "tls13"
+    }
+    storage "inmem" {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mediatore-openbao
+  namespace: banlieue-system
+spec:
+  selector: { app.kubernetes.io/name: mediatore-openbao }
+  ports:
+    - { name: https, port: 8200, targetPort: 8200 }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mediatore-openbao
+  namespace: banlieue-system
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector:
+    matchLabels: { app.kubernetes.io/name: mediatore-openbao }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: mediatore-openbao }
+    spec:
+      serviceAccountName: mediatore-openbao
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 100
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: openbao
+          # OpenBao 2.7.1, index digest (every architecture), pulled by kind's nodes.
+          image: quay.io/openbao/openbao:2.7.1@sha256:6d2b93856e3fcf7b18ad855a0b51eaba474dc8b79cf554379ea32034797d2acf
+          args: ["server", "-config=/config/openbao.hcl"]
+          env:
+            # For `bao` invoked by the setup script inside the pod, on the loopback.
+            - { name: BAO_ADDR, value: "https://127.0.0.1:8200" }
+            - { name: BAO_SKIP_VERIFY, value: "true" }
+          ports:
+            - { name: https, containerPort: 8200 }
+          readinessProbe:
+            # Ready even sealed or uninitialised: the setup script does those.
+            httpGet:
+              path: /v1/sys/health?standbyok=true&sealedcode=204&uninitcode=204
+              port: https
+              scheme: HTTPS
+            periodSeconds: 2
+          volumeMounts:
+            - { name: config, mountPath: /config, readOnly: true }
+            - { name: tls, mountPath: /tls, readOnly: true }
+            - { name: tmp, mountPath: /tmp }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+      volumes:
+        - name: config
+          configMap: { name: mediatore-openbao-config }
+        - name: tls
+          secret:
+            secretName: mediatore-openbao-tls
+            defaultMode: 0440
+        - name: tmp
+          emptyDir: {}

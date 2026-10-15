@@ -16,10 +16,12 @@ pub mod ek;
 pub mod pem;
 pub mod sandboxes;
 pub mod svid;
+pub mod transit;
 
 pub use pem::fixture_ca_pem;
 pub use sandboxes::MemorySandboxes;
 pub use svid::{MemoryMaterial, TestCa};
+pub use transit::FakeTransit;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

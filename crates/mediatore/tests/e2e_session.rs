@@ -20,10 +20,11 @@ use mediatore_proto::{
     ClaimRequest, ClaimResponse, ErrorBody, NodeRegistration, Secret, TokenResponse, Workload,
 };
 use mediatore_spire::{MemoryEntries, Naming};
-use mediatore_store::seal::LocalKeySealer;
+use mediatore_store::seal::{LocalKeySealer, Sealer, TransitConfig, TransitSealer};
 use mediatore_store::{ClaimStore, MemoryStore};
 use mediatore_sts::Sts;
 use mediatore_testkit::FakeIdp;
+use mediatore_testkit::FakeTransit;
 
 /// Throwaway P-256 key for the e2e STS. Test material only; never reuse.
 const STS_TEST_KEY: &str = "-----BEGIN PRIVATE KEY-----
@@ -50,6 +51,34 @@ struct Harness {
 
 impl Harness {
     async fn start(rate_per_minute: u32) -> Self {
+        Self::start_with(rate_per_minute, Arc::new(LocalKeySealer::new([3u8; 32]))).await
+    }
+
+    /// The broker over the transit sealer (ADR-0015), against a fake `OpenBao`.
+    async fn start_on_transit(rate_per_minute: u32) -> (Self, FakeTransit) {
+        let fake = FakeTransit::spawn("mediatore", "sa-jwt", "mediatore").await;
+        let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        let token_file = dir.join("token");
+        std::fs::write(&token_file, "sa-jwt").unwrap();
+        let sealer = TransitSealer::connect(&TransitConfig {
+            url: fake.url.clone(),
+            ca_file: None,
+            mount: "transit".into(),
+            key: "mediatore".into(),
+            role: "mediatore".into(),
+            token_file,
+        })
+        .await
+        .expect("the probe round-trips");
+        (
+            Self::start_with(rate_per_minute, Arc::new(sealer)).await,
+            fake,
+        )
+    }
+
+    async fn start_with(rate_per_minute: u32, sealer: Arc<dyn Sealer>) -> Self {
         let idp = FakeIdp::start().await;
         let sts = Sts::new(
             "https://mediatore.test",
@@ -81,7 +110,7 @@ impl Harness {
             audiences: vec![AUDIENCE.into()],
             sandboxes: None,
             sandbox_namespace: "sandboxes".into(),
-            sealer: Some(Arc::new(LocalKeySealer::new([3u8; 32]))),
+            sealer: Some(sealer),
             limiter: Limiter::new(rate_per_minute),
             dev_mode: true,
         });
@@ -327,4 +356,72 @@ async fn concurrent_issues_for_one_claim_refresh_one_at_a_time() {
     );
     let rec = h.store.get_claim(claim.uid.unwrap()).await.unwrap();
     assert!(rec.revoked_at.is_none());
+}
+
+#[tokio::test]
+async fn on_transit_the_envelope_is_openbao_ciphertext_and_every_issue_opens_and_reseals_it() {
+    let (h, fake) = Harness::start_on_transit(10).await;
+    let (claim, _) = h.bound_claim("octocat").await;
+    let rec = h.store.get_claim(claim.uid.unwrap()).await.unwrap();
+    let before = rec.refresh.clone().expect("sealed envelope in the record");
+    assert_eq!(before.key_id, "transit:transit/mediatore");
+    assert!(before.ciphertext.starts_with(b"vault:v1:"));
+    assert_eq!(before.nonce.len(), 0);
+    let (enc, dec) = (fake.encrypts(), fake.decrypts());
+    assert_eq!(h.token(&claim).await.status(), 200);
+    assert_eq!(
+        (fake.encrypts(), fake.decrypts()),
+        (enc + 1, dec + 1),
+        "one decrypt to refresh, one encrypt to re-seal the rotated token"
+    );
+    let after = h
+        .store
+        .get_claim(claim.uid.unwrap())
+        .await
+        .unwrap()
+        .refresh
+        .unwrap();
+    assert_ne!(after.ciphertext, before.ciphertext, "re-sealed");
+    assert_eq!(h.idp.refreshes(), 1);
+}
+
+#[tokio::test]
+async fn an_openbao_outage_is_503_and_revokes_nothing() {
+    let (h, fake) = Harness::start_on_transit(10).await;
+    let (claim, _) = h.bound_claim("octocat").await;
+    fake.set_down(true);
+    let resp = h.token(&claim).await;
+    assert_eq!(error_code(resp).await, (503, "sealer_unavailable".into()));
+    let rec = h.store.get_claim(claim.uid.unwrap()).await.unwrap();
+    assert!(rec.revoked_at.is_none(), "an outage is not a revocation");
+    assert!(rec.refresh.is_some(), "the envelope stays");
+    assert_eq!(h.entries.names().len(), 1, "the entry stays");
+    assert_eq!(h.idp.refreshes(), 0, "nothing reached the issuer");
+    fake.set_down(false);
+    assert_eq!(h.token(&claim).await.status(), 200);
+}
+
+#[tokio::test]
+async fn on_transit_a_claim_cannot_be_created_while_openbao_is_away() {
+    let (h, fake) = Harness::start_on_transit(10).await;
+    h.register_node().await;
+    let (id_token, refresh_token) = h.idp.session("octocat", "mediatore");
+    fake.set_down(true);
+    let resp = h.claim(&id_token, Some(&refresh_token)).await;
+    assert_eq!(error_code(resp).await, (503, "sealer_unavailable".into()));
+    assert_eq!(
+        h.store.list_claims().await.unwrap().len(),
+        0,
+        "no record on a plaintext"
+    );
+}
+
+#[tokio::test]
+async fn on_transit_a_token_revoked_at_openbao_is_exchanged_again_without_a_failed_issue() {
+    let (h, fake) = Harness::start_on_transit(10).await;
+    let (claim, _) = h.bound_claim("octocat").await;
+    let logins = fake.logins();
+    fake.revoke_tokens();
+    assert_eq!(h.token(&claim).await.status(), 200);
+    assert_eq!(fake.logins(), logins + 1);
 }

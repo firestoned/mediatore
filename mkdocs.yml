@@ -160,5 +160,6 @@ nav:
       - "ADR-0012: The persistent store": adr/0012-persistent-store.md
       - "ADR-0013: The Dex path, the session delegated": adr/0013-dex-session-delegation.md
       - "ADR-0014: One binary, the roles as subcommands": adr/0014-one-binary-roles-as-subcommands.md
+      - "ADR-0015: The transit sealer": adr/0015-transit-sealer.md
   - Security:
       - Threat model: security/threat-model.md

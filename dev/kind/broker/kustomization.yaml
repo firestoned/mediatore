@@ -67,14 +67,15 @@ patches:
                   - { name: pg-ca, mountPath: /etc/mediatore-pg, readOnly: true }
                   - { name: dex-ca, mountPath: /etc/mediatore-dex, readOnly: true }
                   - { name: sts, mountPath: /etc/mediatore-sts, readOnly: true }
-                  - { name: sealing, mountPath: /etc/mediatore-sealing, readOnly: true }
+                  - { name: openbao-ca, mountPath: /etc/mediatore-openbao, readOnly: true }
             volumes:
               - name: pg-ca
                 configMap: { name: mediatore-pg-ca }
-              # The Dex CA, the STS signing key and the sealing key: `make kind-dex`.
+              # The Dex CA and the STS signing key: `make kind-dex`. The OpenBao CA:
+              # `make kind-openbao`.
               - name: dex-ca
                 configMap: { name: mediatore-dex-ca }
               - name: sts
                 secret: { secretName: mediatore-sts }
-              - name: sealing
-                secret: { secretName: mediatore-sealing }
+              - name: openbao-ca
+                configMap: { name: mediatore-openbao-ca }

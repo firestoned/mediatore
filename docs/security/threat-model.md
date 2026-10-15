@@ -5,8 +5,16 @@ SPDX-License-Identifier: Apache-2.0
 # Threat Model
 
 > **Status:** Living document. Last full pass **2026-10-15**, against the
-> architecture defined by **ADR-0001 … ADR-0014** (ADR-0009 and ADR-0010 are
-> adopted platform ADRs with no code of their own). This pass covers ADR-0014,
+> architecture defined by **ADR-0001 … ADR-0015** (ADR-0009 and ADR-0010 are
+> adopted platform ADRs with no code of their own). This pass covers
+> ADR-0015, the transit sealer: the wrapping key for refresh material stays in
+> OpenBao's transit engine, the binding UID is the derivation context, the
+> broker logs in as its ServiceAccount with a projected token for that audience
+> and holds only a short-lived OpenBao token, a startup probe fails closed, an
+> outage is `503 sealer_unavailable` and revokes nothing; every kind tier runs
+> the broker on it. New boundary TB-10 (broker to OpenBao) with eight rows, a
+> new component, A-10 rewritten, the diagram and the boundary list, §7 one
+> item, **R-4 narrowed**. Earlier the same day, ADR-0014,
 > one binary with the roles as subcommands: `mediatore serve`, `guest`,
 > `token`, `login`, `sandbox` and `session` are one static musl artifact that
 > the server image, the VM image and the kind pods all carry; the guest
@@ -104,6 +112,7 @@ holds three things an attacker wants:
 | STS | `crates/mediatore-sts` | same pod | Holds the signing key handle |
 | Claim store | `crates/mediatore-store` (`SqlStore`, one query set) | PostgreSQL at work, SQLite for one replica; in-memory only under `dev_mode` | Sealed refresh envelopes, revocations, the node registry, audit rows; the request fields are a copy of the `AgentSandbox` spec. Migrated at startup; swept at resync |
 | Store database | the operator's PostgreSQL, or a SQLite file on the pod's volume (`dev/kind/postgres/` in kind) | management cluster or beside it | Holds every row; reached with the URL in Secret `mediatore-store` over TLS `verify-full` |
+| OpenBao (transit) | the operator's OpenBao (`dev/kind/openbao/` in kind), `crates/mediatore-store/src/seal.rs` (`TransitSealer`) on the broker's side | management cluster or beside it | Holds the derived sealing key and never releases it; encrypts and decrypts for a token it issued to the broker's ServiceAccount (ADR-0015) |
 | In-guest agent (`mediatore guest`) | `crates/mediatore-guest` (`guest.rs`), the same static binary as the broker (ADR-0014) | root on each pool member | `useradd`, mount, nsjail; bind-mounts the binary at the pinned path read-only into the jail |
 | Workload client (`mediatore token`) | `crates/mediatore-guest` (`token.rs`), the binary the guest mounted at `/usr/local/bin/mediatore` | inside the jail, as the `sb-` user | Holds one token in memory; nothing but the token on standard output |
 | Deployment | `deploy/base/*.yaml` | management cluster | SA, RBAC, `ClusterSPIFFEID`, the `AgentSandbox` CRD (`crds/`, generated), the entries and the sandbox-subject admission policies, the CSI inline volume for the agent socket, the `LoadBalancer` service for :8443, ingress for :8080, the store URL from Secret `mediatore-store` (operator-created) |
@@ -122,7 +131,7 @@ holds three things an attacker wants:
 | A-7 | Broker Kubernetes ServiceAccount | pod token | Create `AgentSandbox` resources and claims with arbitrary `spec.subject` (exempt from both subject policies); patch any sandbox's status; declare `/banlieue/{node,claim}/` entries, within what the entries admission policy allows |
 | A-8 | Broker SVID and private key (`spiffe://<td>/mediatore`) | process memory only, from the Workload API | Impersonate the broker to every guest; terminate the sandbox listener elsewhere |
 | A-9 | The `brokers` lists: ConfigMaps `mediatore-agentsandbox-subject-policy` and `banlieue-claim-subject-policy` | `banlieue-system` | List a principal and it may attribute a sandbox, and every token minted for it, to anyone; both ship empty |
-| A-10 | The sealing key (`store.sealing.key_file`) | a Secret volume, read into broker memory at start | With the rows, open every envelope in the store; a rotated key strands envelopes under the old id, which then fail to open (fail closed) |
+| A-10 | The sealing key: a derived transit key inside OpenBao (`store.sealing.transit`, the work shape), or the local key file (`store.sealing.key_file`, the homelab shape) | OpenBao, which never releases it; the broker holds a short-lived OpenBao token from its projected ServiceAccount token. Or: a Secret volume, read into broker memory at start | With the rows, open every envelope in the store. On transit, only while a valid OpenBao token is held and only through OpenBao, which audits every call and whose administrator can retire the role; the local key opens them all, offline. A key rotated at OpenBao keeps old versions readable until retired; a rotated local key strands envelopes under the old id (fail closed) |
 | A-11 | The store URL and its password (Secret `mediatore-store`) | the broker pod's environment, never logged | Read and alter every row: resurrect a revoked claim, rebind a node, register a clone's DMI under a known EK, delete audit rows |
 | A-12 | The CLI session file (`~/.config/mediatore/session.json`) | the user's machine, mode 0600 | The user's ID token until `exp` and, until it is delegated, a refresh token for mediatore's audience: a login, bounded by the issuer's session |
 
@@ -161,6 +170,8 @@ flowchart TB
   requester(["Declarative requester<br/>(GitOps, CI)"]) -- "(TB-2) AgentSandbox,<br/>subject policy" --> banlieue
   store[("Claim store<br/>(PostgreSQL / SQLite)")]
   mediatore -- "(TB-9) TLS verify-full,<br/>URL from a Secret" --> store
+  openbao["OpenBao (transit)"]
+  mediatore -- "(TB-10) TLS, projected SA token,<br/>seal / unseal" --> openbao
   mediatore -- "(TB-5) JWKS / refresh before issue / OBO" --> idp
   mediatore <-- "(TB-2) Kubernetes API: AgentSandbox,<br/>claims, watcher" --> banlieue
   mediatore -- "(TB-3) Kubernetes API: ClusterStaticEntry<br/>admission policy, RBAC" --> apiserver["Kubernetes API server"]
@@ -203,6 +214,8 @@ flowchart TB
   mount: the broker's own SVID)
 - **TB-9** mediatore ↔ store database (sqlx over TLS `verify-full` to PostgreSQL, or a
   SQLite file; the rows that outlive the process)
+- **TB-10** mediatore ↔ OpenBao transit (the sealing key that never leaves OpenBao; the
+  broker's ServiceAccount token for that audience, exchanged for an OpenBao token)
 
 ## 6. STRIDE, per boundary
 
@@ -341,6 +354,19 @@ the residue is in §8. No boundary carries the marker as of this pass.
 | A parked session read by another sandbox's record, or left behind | S/I | Keyed by the sandbox UID and sealed with it as associated data: the record that takes it is the one whose `sandbox_uid` opens it (`seal_binding`); `take_session` reads and deletes in one transaction on both engines (`a_session_is_taken_once_deleted_on_demand_and_swept_when_stale`); stale rows are swept at resync |
 | Database unreachable | D | `/healthz` pings the store (`crates/mediatore-api/src/lib.rs`), so the pod leaves the Service; a store that cannot be reached or migrated at start stops the process (`store()` in `crates/mediatore/src/main.rs`) |
 
+### TB-10: mediatore → OpenBao (transit)
+
+| Threat | S/T/R/I/D/E | Control |
+| --- | --- | --- |
+| The wrapping key read from the broker (memory dump, a copied Secret) | I | On transit there is nothing to read: the key is created and kept in OpenBao and the broker only ever sends plaintext in and gets ciphertext back (`TransitSealer`, `crates/mediatore-store/src/seal.rs`); no Secret holds it, no file on the pod either. What the broker has is an OpenBao token with a lease (`token_ttl=1h` in the kind role), in memory only |
+| OpenBao impersonated (a listener on the path) | S | TLS 1.3 only, verified against `store.sealing.transit.ca_file` alone (`https_client_config_with_ca`), the URL `https` outside `dev_mode` (`Config::parse`, unit `the_sealing_section_is_one_of_a_key_file_or_transit_and_transit_is_https_outside_dev_mode`) |
+| The broker's credential to OpenBao replayed elsewhere | S | The projected ServiceAccount token has audience `openbao` (`deploy/base/deployment.yaml`), which the API server does not accept and the kind role requires (`audience=openbao`, `dev/kind/openbao-setup.sh`); it is read from the file at every login, so the kubelet's rotation is honoured, and exchanged only at OpenBao's own login endpoint |
+| An envelope moved onto another claim opened through OpenBao | S | The binding UID is the derivation `context`; a derived key refuses the decrypt under any other (`an_envelope_opens_only_for_its_binding_and_names_the_transit_key`, `crates/mediatore/tests/transit_sealer.rs`). A key created without `derived` would drop the binding: the startup probe tries to open its envelope under another UID and refuses to start if that works (`TransitSealer::connect`; `the_probe_at_startup_refuses_a_bad_role_a_missing_key_and_an_underived_key`) |
+| A policy wider than encrypt and decrypt on the one key | E | The kind role's policy is the reference: `update` on `transit/encrypt/mediatore` and `transit/decrypt/mediatore`, nothing else (`dev/kind/openbao-setup.sh`); the broker never asks for a key read, a rotation or a rewrap |
+| OpenBao unavailable turned into a revocation | D | `SealError::Unavailable` is `503 sealer_unavailable` with the envelope kept and nothing released (`seal_error`, `refresh_session`, `crates/mediatore-api/src/lib.rs`; e2e `an_openbao_outage_is_503_and_revokes_nothing`); a claim cannot be created on a plaintext meanwhile (`on_transit_a_claim_cannot_be_created_while_openbao_is_away`) |
+| The OpenBao token revoked or expired mid-flight | D | A 403 is retried once after a fresh login, and a token inside a minute of its lease is exchanged before use (`a_revoked_token_is_exchanged_again_and_an_outage_is_unavailable`, `a_short_lease_is_renewed_before_it_ends`); no issue fails on it (e2e `on_transit_a_token_revoked_at_openbao_is_exchanged_again_without_a_failed_issue`) |
+| A key rotated at OpenBao stranding live sessions | D | Old versions decrypt until the administrator retires them, and every session is re-sealed under the current version at its next refresh (`a_rotation_at_openbao_keeps_old_envelopes_readable_until_retired`); the envelope's key id names the key, not the version |
+
 ## 7. Hardening that exists today
 
 - Fail closed everywhere: unimplemented paths return `501`, never a permissive
@@ -390,6 +416,11 @@ the residue is in §8. No boundary carries the marker as of this pass.
   start, ended rows swept into an audit table mediatore never deletes from,
   `/healthz` false when the store is unreachable (`crates/mediatore-store`,
   ADR-0012).
+- Transit sealer: the wrapping key inside OpenBao and never in the broker, the
+  binding as derivation context, a projected ServiceAccount token for OpenBao
+  alone, a startup probe that refuses an underived key, an outage that is a
+  `503` and not a revocation (`crates/mediatore-store/src/seal.rs`,
+  `deploy/base/deployment.yaml`, ADR-0015).
 - Dex path: the refresh token delegated in the request body only (never on the
   resource), sealed before it is stored, refreshed before every issue with the
   fresh groups minted, released on `invalid_grant` or a failed gate, kept on an
@@ -405,7 +436,7 @@ the residue is in §8. No boundary carries the marker as of this pass.
 | R-1 | *Deleted 2026-10-13.* The sandbox listener terminates SPIFFE mTLS (TB-6); the dev header survives only under `dev_mode`, which `Config::parse` confines to loopback | | |
 | R-2 | Entra On-Behalf-Of is unimplemented, so for an `entra-obo` audience nothing is minted at all (`501`), and an Entra-issued login has no refresh path: revocation at Entra does not reach a claim from an issuer without a `session`. The Dex half is closed by ADR-0013 (TB-5) | Fail-closed: no token is minted that the design would later revoke; a session issuer refreshes before every issue | The OBO path lands (next slice of roadmap 04) |
 | R-3 | A prompt-injected workload can exfiltrate its ≤ 15-min single-audience token | Bounded by TTL, audience allowlist and full attribution; the credential-injecting egress proxy is the designed phase 2 (runbook open decision #7) | The egress-proxy ADR is written |
-| R-4 | mediatore is a single trust point: a compromised broker mints for any active claim and, with the local sealer of ADR-0012, holds the key that opens every refresh envelope in the store | Inherent to the broker pattern; mitigations planned: HSM/transit-held keys (the transit sealer of roadmap 04 takes the wrapping key out of the process), two-person deploy, immutable audit sink | The production deployment ADR (key custody, audit); the transit sealer |
+| R-4 | mediatore is a single trust point: a compromised broker mints for any active claim and, while its OpenBao token lives, can have OpenBao open any envelope in the store (ADR-0015 took the key itself out of the process; a deployment on the local sealer of ADR-0012 still holds the key) | Inherent to the broker pattern; what remains is bounded by the OpenBao token's lease and audited by OpenBao, and the administrator can cut the role; mitigations planned: two-person deploy, immutable audit sink | The production deployment ADR (key custody, audit) |
 | R-5 | *Deleted 2026-10-14.* The sqlx store (ADR-0012, TB-9) keeps records, revocations and the node registry across a restart, proven on a SQLite file and on PostgreSQL in kind | | |
 | R-6 | vTPM EK attestation proves "this vTPM", not "this host"; hypervisor compromise breaks node identity | Same posture as banlieue ADR-0045; hypervisor is in the TCB | PCR / measured-boot selectors become available (runbook open decision #6) |
 | R-7 | Homelab collapse: one flat SPIRE trust domain on the management cluster, no root, no upstream authority: its signing key lives where sandboxes are administered. As deployed (2026-10-03): two servers sharing an external PostgreSQL datastore, each with a self-signed RSA-2048 CA whose key sits on a node-local volume in plaintext, audit log off (chart default) | Single-operator homelab; ADR-0005 records the enterprise topology (root on a dedicated identity cluster, HSM-backed) as the desired state | Any multi-team or production deployment; then split per ADR-0005 and delete this row. Before then: P-384 CA keys and the audit log on |
@@ -448,3 +479,4 @@ the residue is in §8. No boundary carries the marker as of this pass.
 | 2026-10-14 | Roadmap 04, first slice: the Dex path (ADR-0013) | 0001–0013 | TB-1 gains four rows (the redacted secret, delegation required or refused, the token never on the resource, a bad delegation), TB-5 five (refresh before issue and `invalid_grant`, the fresh token validated as a login, outage is not revocation, the endpoint from discovery, rotation re-sealed), TB-6 three (the per-claim limit, no session no mint, revocation durable) and TB-9 one (sessions taken once); every control cited by file and test. §2 a new component (the CLI) and the sandbox API row, A-2 produced and rebound to the sandbox UID, **A-12 new**, the diagram and the boundary list, §7 one item. **R-2 narrowed** to the Entra half; **R-11 new** (the CLI session file) |
 | 2026-10-15 | One binary, the roles as subcommands (ADR-0014) | 0001–0014 | No new boundary, asset or actor: a role's authority was never the file it ran from. §2 three rows reworded (the user tools, the guest, the workload client, all one artifact), the diagram relabelled. TB-4 gains the row for the shared binary path against the node entry (both selectors required, the `sb-` uid never matches), TB-7 the row for the whole binary inside the jail (read-only, no secret, no reachable authority) and its jail row cites the new mount and test; TB-6's impersonation row cites the one `SandboxClient` and the `dev` feature's new home with the test that pins it off. §7 one item; R-11 reworded |
 | 2026-10-15 | The Dex path's kind tier, `issuers[].ca_file` | 0001–0014 | No new component or boundary: Dex and glauth in kind are fixtures. TB-5 gains the private-PKI row (`ca_file`, read at startup, nothing else trusted for that issuer); the TB-5 refresh and group-gate rows and TB-1's delegation rows now cite the live run against a real Dex (`make kind-e2e-dex`: the real CLI from a pod, `lastUsed` advancing on Dex's refresh token before every issue, the claim released on a group change in the directory and on a deleted refresh token) |
+| 2026-10-15 | Roadmap 04, third slice: the transit sealer (ADR-0015) | 0001–0015 | New boundary TB-10 (broker to OpenBao): eight rows, every control cited by file and test (the fake OpenBao in the testkit, the transit e2e cases, the kind fixture). §2 a new component (OpenBao), A-10 rewritten around the key that never leaves OpenBao, the diagram and the boundary list, §7 one item. **R-4 narrowed**: the broker no longer holds the key, only a leased token to use it |

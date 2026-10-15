@@ -18,7 +18,7 @@ use mediatore_claims::sandbox::{KubeSandboxes, SandboxFrontDoor};
 use mediatore_claims::watch::{KubeClaimsApi, Watcher, WatcherConfig};
 use mediatore_entra::Validator;
 use mediatore_spire::{EntryManager, KubeEntryManager, MemoryEntries, Naming};
-use mediatore_store::seal::{LocalKeySealer, Sealer};
+use mediatore_store::seal::{LocalKeySealer, Sealer, TransitSealer};
 use mediatore_store::sql::{SqlStore, redacted};
 use mediatore_store::{ClaimStore, MemoryStore};
 use mediatore_sts::Sts;
@@ -101,7 +101,7 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
         tracing::warn!("dev_mode: peer identity from header, in-memory entries, no mTLS");
     }
     let store = store(&cfg).await?;
-    let sealer = sealer(&cfg)?;
+    let sealer = sealer(&cfg).await?;
     let sandboxes: Option<Arc<dyn SandboxFrontDoor>> = client
         .as_ref()
         .map(|c| Arc::new(KubeSandboxes::new(c.clone())) as Arc<dyn SandboxFrontDoor>);
@@ -257,14 +257,28 @@ fn validator(cfg: &Config) -> anyhow::Result<Validator> {
     Ok(v)
 }
 
-/// The refresh-material sealer (ADR-0012 decision 3), when `store.sealing` names a key.
-/// The key is read and checked now so a bad Secret fails the start, not the first claim.
-fn sealer(cfg: &Config) -> anyhow::Result<Option<Arc<dyn Sealer>>> {
+/// The refresh-material sealer (ADR-0012 decision 3): the local key file, or `OpenBao`
+/// transit (ADR-0015). Either is read and probed now, so a bad Secret, role, policy or
+/// key fails the start, not the first claim. `Config::parse` guarantees exactly one is set.
+async fn sealer(cfg: &Config) -> anyhow::Result<Option<Arc<dyn Sealer>>> {
     let Some(sealing) = &cfg.store.sealing else {
         tracing::info!("sealing: no key configured; refresh material cannot be persisted");
         return Ok(None);
     };
-    let sealer = LocalKeySealer::from_file(&sealing.key_file)?;
+    if let Some(transit) = &sealing.transit {
+        let sealer = TransitSealer::connect(transit).await?;
+        tracing::info!(
+            key_id = sealer.key_id(),
+            url = %transit.url,
+            role = %transit.role,
+            "sealing: OpenBao transit probed; the key stays there"
+        );
+        return Ok(Some(Arc::new(sealer)));
+    }
+    let Some(key_file) = &sealing.key_file else {
+        anyhow::bail!("store.sealing needs key_file or transit");
+    };
+    let sealer = LocalKeySealer::from_file(key_file)?;
     tracing::info!(key_id = sealer.key_id(), "sealing: local key loaded");
     Ok(Some(Arc::new(sealer)))
 }
@@ -311,8 +325,23 @@ fn entry_manager(
     ))
 }
 
+/// SIGINT or SIGTERM: the latter is what a rollout sends, and without it every restart
+/// waited for the kill.
 async fn shutdown() {
-    let _ = tokio::signal::ctrl_c().await;
+    let ctrl_c = tokio::signal::ctrl_c();
+    #[cfg(unix)]
+    {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("a SIGTERM handler");
+        tokio::select! {
+            _ = ctrl_c => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = ctrl_c.await;
+    }
     tracing::info!("shutting down");
 }
 

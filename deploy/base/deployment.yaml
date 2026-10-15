@@ -39,6 +39,7 @@ spec:
           volumeMounts:
             - { name: config, mountPath: /etc/mediatore, readOnly: true }
             - { name: spire-agent-socket, mountPath: /run/spire/sockets, readOnly: true }
+            - { name: openbao-token, mountPath: /var/run/secrets/openbao, readOnly: true }
           readinessProbe:
             httpGet: { path: /healthz, port: user }
           securityContext:
@@ -48,6 +49,16 @@ spec:
       volumes:
         - name: config
           configMap: { name: mediatore-config }
+        # A ServiceAccount token meant for OpenBao alone (ADR-0015): the transit sealer
+        # presents it at auth/kubernetes/login; the API server never accepts it. Unused,
+        # and harmless, on a deployment with the local sealer.
+        - name: openbao-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  audience: openbao
+                  expirationSeconds: 3600
+                  path: token
         # Inline ephemeral CSI volume: a read-only bind mount of the agent's socket
         # directory. Admissible under Pod Security Standard "restricted", unlike a
         # hostPath (ADR-0007).
