@@ -24,6 +24,10 @@ path = "src/bin/ek_fixture.rs"
 name = "tls-fixture"
 path = "src/bin/tls_fixture.rs"
 
+[[bin]]
+name = "dex-driver"
+path = "src/bin/dex_driver.rs"
+
 [dependencies]
 mediatore-proto.workspace = true
 mediatore-tls.workspace = true
@@ -40,6 +44,7 @@ rustls.workspace = true
 time.workspace = true
 clap.workspace = true
 tokio.workspace = true
+reqwest.workspace = true
 jsonwebtoken.workspace = true
 p256.workspace = true
 base64.workspace = true

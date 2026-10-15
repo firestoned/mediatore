@@ -13,9 +13,11 @@
 //! the Kubernetes API behind the user API's `AgentSandbox` front door.
 
 pub mod ek;
+pub mod pem;
 pub mod sandboxes;
 pub mod svid;
 
+pub use pem::fixture_ca_pem;
 pub use sandboxes::MemorySandboxes;
 pub use svid::{MemoryMaterial, TestCa};
 

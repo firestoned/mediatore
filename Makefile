@@ -4,10 +4,10 @@
 # All CI logic lives here (rules/github-workflows.md): workflows install tools
 # and call these targets, and every target runs identically locally.
 
-.PHONY: all help fmt fmt-check lint test deny audit check sbom dist image crds e2e live-admission-test \
+.PHONY: all help fmt fmt-check lint test deny audit check sbom dist dist-e2e image crds e2e live-admission-test \
         kind-install kind-create kind-delete kind-down kind-spire kind-deploy kind-up \
-        kind-images kind-postgres kind-broker kind-banlieue-crds kind-e2e-entries kind-e2e-mtls kind-e2e-watcher kind-e2e-sandbox \
-        kind-e2e-store kind-e2e kind-e2e-ci kind-e2e-logs \
+        kind-images kind-postgres kind-dex kind-broker kind-banlieue-crds kind-e2e-entries kind-e2e-mtls kind-e2e-watcher kind-e2e-sandbox \
+        kind-e2e-store kind-e2e-dex kind-e2e kind-e2e-ci kind-e2e-logs \
         calm-validate calm-diagrams docs docs-serve docs-clean clean
 
 # kind: a throwaway cluster with SPIRE for the live tests (docs/guides/testing.md).
@@ -34,6 +34,8 @@ SPIRE_CLASS_NAME    := spire-server-spire
 CONTAINER_CLI      ?= docker
 MUSL_TARGET        := x86_64-unknown-linux-musl
 KIND_IMAGE         := ghcr.io/firestoned/mediatore:kind
+# Test-only: the binary plus the testkit's dex-driver, for the Dex tier's user-side pod.
+KIND_E2E_IMAGE     := localhost/mediatore-e2e:kind
 
 # CALM (FINOS Common Architecture Language Model) configuration
 CALM_CLI_VERSION  ?= 1.37.0
@@ -84,6 +86,11 @@ dist: ## The one static musl binary into dist/ (ADR-0014): what the server image
 	cargo build --release --target $(MUSL_TARGET) -p mediatore
 	@mkdir -p dist
 	cp target/$(MUSL_TARGET)/release/mediatore dist/
+
+dist-e2e: ## The testkit's dex-driver (musl) into dist/, for the test-only e2e image
+	cargo build --release --target $(MUSL_TARGET) -p mediatore-testkit --bin dex-driver
+	@mkdir -p dist
+	cp target/$(MUSL_TARGET)/release/dex-driver dist/
 
 image: ## Build the server container image locally (the binary is compiled inside the image)
 	$(CONTAINER_CLI) build -t ghcr.io/firestoned/mediatore:dev .
@@ -158,9 +165,12 @@ kind-deploy: kind-create ## Apply the broker's CRD, ServiceAccount, RBAC and adm
 
 kind-up: kind-create kind-spire kind-deploy ## Cluster + SPIRE + the broker's identity, ready for the live tests
 
-kind-images: kind-create dist ## The server image (the shipped Dockerfile's runtime stage over dist/), loaded into the cluster; the node and workload pods run it too (ADR-0014)
+kind-images: kind-create dist dist-e2e ## The server image (the shipped Dockerfile's runtime stage over dist/) and the test-only e2e image, loaded into the cluster; the node and workload pods run the server image too (ADR-0014)
 	$(CONTAINER_CLI) build --build-arg BINARY_FROM=host -t $(KIND_IMAGE) .
+	$(CONTAINER_CLI) build -f dev/kind/Dockerfile.e2e -t $(KIND_E2E_IMAGE) .
+	@# One image per call: under the podman provider a multi-image load ends up with one manifest.
 	kind load docker-image --name $(KIND_CLUSTER_NAME) $(KIND_IMAGE)
+	kind load docker-image --name $(KIND_CLUSTER_NAME) $(KIND_E2E_IMAGE)
 
 kind-postgres: kind-create ## PostgreSQL in kind with a certificate this target mints (ADR-0012); the broker's store
 	@$(KIND_KUBECTL) get ns banlieue-system >/dev/null 2>&1 || $(KIND_KUBECTL) create ns banlieue-system
@@ -172,7 +182,23 @@ kind-postgres: kind-create ## PostgreSQL in kind with a certificate this target 
 	$(KIND_KUBECTL) -n banlieue-system rollout restart deploy/mediatore-postgres
 	$(KIND_KUBECTL) -n banlieue-system rollout status deploy/mediatore-postgres --timeout=300s
 
-kind-broker: kind-up kind-images kind-postgres ## deploy/base in kind on the CSI driver's socket and the kind PostgreSQL (dev/kind/broker overlay), rolled out
+kind-dex: kind-create ## Dex over TLS with a glauth directory behind it (ADR-0013), and the broker's STS signing and sealing keys, all minted by this target
+	@$(KIND_KUBECTL) get ns banlieue-system >/dev/null 2>&1 || $(KIND_KUBECTL) create ns banlieue-system
+	cargo run -q -p mediatore-testkit --bin tls-fixture -- --out-dir $(KIND_DIR)/dex --dns mediatore-dex.banlieue-system.svc
+	$(KIND_KUBECTL) -n banlieue-system create secret generic mediatore-dex-tls --from-file=$(KIND_DIR)/dex/server.pem --from-file=$(KIND_DIR)/dex/server-key.pem --dry-run=client -o yaml | $(KIND_KUBECTL) apply -f -
+	$(KIND_KUBECTL) -n banlieue-system create configmap mediatore-dex-ca --from-file=$(KIND_DIR)/dex/ca.pem --dry-run=client -o yaml | $(KIND_KUBECTL) apply -f -
+	$(KIND_KUBECTL) -n banlieue-system create configmap mediatore-glauth-config --from-file=dev/kind/dex/glauth.cfg --dry-run=client -o yaml | $(KIND_KUBECTL) apply -f -
+	@[ -f $(KIND_DIR)/sts.pem ] || openssl ecparam -name prime256v1 -genkey -noout | openssl pkcs8 -topk8 -nocrypt -out $(KIND_DIR)/sts.pem
+	@[ -f $(KIND_DIR)/sealing.key ] || printf '%s' "$$(openssl rand -hex 32)" > $(KIND_DIR)/sealing.key
+	$(KIND_KUBECTL) -n banlieue-system create secret generic mediatore-sts --from-file=sts.pem=$(KIND_DIR)/sts.pem --dry-run=client -o yaml | $(KIND_KUBECTL) apply -f -
+	$(KIND_KUBECTL) -n banlieue-system create secret generic mediatore-sealing --from-file=key=$(KIND_DIR)/sealing.key --dry-run=client -o yaml | $(KIND_KUBECTL) apply -f -
+	$(KIND_KUBECTL) apply -f dev/kind/dex/glauth.yaml -f dev/kind/dex/dex.yaml
+	@# A new certificate needs a new pod.
+	$(KIND_KUBECTL) -n banlieue-system rollout restart deploy/mediatore-dex
+	$(KIND_KUBECTL) -n banlieue-system rollout status deploy/mediatore-glauth --timeout=300s
+	$(KIND_KUBECTL) -n banlieue-system rollout status deploy/mediatore-dex --timeout=300s
+
+kind-broker: kind-up kind-images kind-postgres kind-dex ## deploy/base in kind on the CSI driver's socket, the kind PostgreSQL and the kind Dex (dev/kind/broker overlay), rolled out
 	$(KIND_KUBECTL) apply -k dev/kind/broker
 	@# Same tag, new image: a restart is what makes the loaded image the running one.
 	$(KIND_KUBECTL) -n banlieue-system rollout restart deploy/mediatore
@@ -207,7 +233,12 @@ kind-e2e-sandbox: kind-banlieue-crds kind-broker ## ADR-0008 live: the subject p
 kind-e2e-store: kind-broker ## ADR-0012 live: the broker on PostgreSQL over verify-full, the store conformance suite against that database
 	./dev/kind/store-e2e.sh $(KIND_KUBECONFIG) $(KIND_DIR)/pg/ca.pem
 
-kind-e2e: kind-e2e-entries kind-e2e-mtls kind-e2e-watcher kind-e2e-sandbox kind-e2e-store ## Every live suite against kind (grows with the roadmap)
+kind-e2e-dex: kind-banlieue-crds kind-broker ## ADR-0013 live: the real CLI logs in at a real Dex and delegates the session, every token issue refreshes it, a group removal and a revocation at Dex release the claim
+	$(KIND_KUBECTL) -n banlieue-system rollout restart deploy/mediatore
+	$(KIND_KUBECTL) -n banlieue-system rollout status deploy/mediatore --timeout=300s
+	./dev/kind/dex-e2e.sh $(KIND_KUBECONFIG) $(SPIRE_TRUST_DOMAIN) $(KIND_DIR)/ek.pem $(KIND_DIR)/ek.hash
+
+kind-e2e: kind-e2e-entries kind-e2e-mtls kind-e2e-watcher kind-e2e-sandbox kind-e2e-store kind-e2e-dex ## Every live suite against kind (grows with the roadmap)
 
 kind-e2e-ci: ## CI shape: the suites, cluster state on failure, cluster deleted after
 	@$(MAKE) kind-e2e || { $(MAKE) kind-e2e-logs; $(MAKE) kind-delete; exit 1; }
@@ -219,6 +250,10 @@ kind-e2e-logs: ## What a failing live suite needs: entries, policy, broker and c
 	-$(KIND_KUBECTL) -n banlieue-system get pods -o wide
 	-$(KIND_KUBECTL) -n banlieue-system logs deploy/mediatore --tail=200
 	-$(KIND_KUBECTL) -n banlieue-system logs deploy/mediatore-postgres --tail=50
+	-$(KIND_KUBECTL) -n banlieue-system logs deploy/mediatore-dex --tail=80
+	-$(KIND_KUBECTL) -n banlieue-system logs deploy/mediatore-glauth --tail=30
+	-$(KIND_KUBECTL) -n banlieue-system get refreshtokens.dex.coreos.com
+	-$(KIND_KUBECTL) -n mediatore-e2e-sandbox logs pod/cli-1 --tail=60
 	-$(KIND_KUBECTL) -n mediatore-e2e get pods -o wide
 	-$(KIND_KUBECTL) -n banlieue-system get lease mediatore-watcher -o yaml
 	-$(KIND_KUBECTL) -n mediatore-e2e-watcher get virtualmachines,virtualmachineclaims -o yaml

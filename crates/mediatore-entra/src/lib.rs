@@ -65,6 +65,12 @@ pub struct IssuerConfig {
     /// Set when claims from this issuer must delegate a refresh token (ADR-0013).
     #[serde(default)]
     pub session: Option<SessionConfig>,
+    /// A PEM file with the CA certificates that sign this issuer's TLS certificate, for an
+    /// issuer on a private PKI. When set, discovery, JWKS and token requests to this issuer
+    /// trust exactly those certificates and not the public roots. Read at startup
+    /// (`Validator::with_issuer_ca`); a missing or empty file stops the process.
+    #[serde(default)]
+    pub ca_file: Option<std::path::PathBuf>,
 }
 
 fn default_subject_claim() -> String {
@@ -150,6 +156,8 @@ pub struct Refreshed {
 pub struct Validator {
     issuers: Vec<IssuerConfig>,
     http: reqwest::Client,
+    /// Per-issuer clients over a private CA (`IssuerConfig::ca_file`), keyed by issuer URL.
+    pinned: HashMap<String, reqwest::Client>,
     jwks: Arc<RwLock<HashMap<String, CachedIssuer>>>,
 }
 
@@ -201,8 +209,27 @@ impl Validator {
                 .use_preconfigured_tls(mediatore_proto::tls::https_client_config())
                 .build()
                 .expect("reqwest client over the workspace TLS config"),
+            pinned: HashMap::new(),
             jwks: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Trust exactly the CA certificates in `pem` for the issuer at `url` (its
+    /// `ca_file`), instead of the public roots. Fails closed on a PEM with no certificate.
+    pub fn with_issuer_ca(mut self, url: &str, pem: &[u8]) -> Result<Self, IdpError> {
+        let cfg = mediatore_proto::tls::https_client_config_with_ca(pem)
+            .map_err(|e| IdpError::Upstream(format!("{url}: {e}")))?;
+        let client = reqwest::Client::builder()
+            .use_preconfigured_tls(cfg)
+            .build()
+            .map_err(|e| IdpError::Upstream(e.to_string()))?;
+        self.pinned.insert(url.to_owned(), client);
+        Ok(self)
+    }
+
+    /// The HTTP client for an issuer: the pinned one when it has a `ca_file`.
+    fn http_for(&self, issuer_url: &str) -> &reqwest::Client {
+        self.pinned.get(issuer_url).unwrap_or(&self.http)
     }
 
     /// Find the issuer config for a token without trusting anything in it yet.
@@ -245,7 +272,7 @@ impl Validator {
             issuer_url.trim_end_matches('/')
         );
         let discovery: serde_json::Value = self
-            .http
+            .http_for(issuer_url)
             .get(&discovery_url)
             .send()
             .await
@@ -265,7 +292,7 @@ impl Validator {
             .map(ToOwned::to_owned);
 
         let set: JwkSet = self
-            .http
+            .http_for(issuer_url)
             .get(jwks_uri)
             .send()
             .await
@@ -333,7 +360,7 @@ impl Validator {
             ("client_id", session.client_id.as_str()),
         ];
         let resp = self
-            .http
+            .http_for(&issuer.url)
             .post(&endpoint)
             .form(&form)
             .send()
@@ -510,6 +537,26 @@ impl Obo {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_pinned_issuer_ca_is_read_at_construction_and_an_empty_one_is_refused() {
+        let v = Validator::new(vec![]);
+        let err = v
+            .with_issuer_ca("https://dex.home.example", b"")
+            .unwrap_err();
+        assert!(err.to_string().contains("no certificate"), "{err}");
+        let v = Validator::new(vec![])
+            .with_issuer_ca(
+                "https://dex.home.example",
+                mediatore_testkit::fixture_ca_pem().as_bytes(),
+            )
+            .unwrap();
+        assert!(v.pinned.contains_key("https://dex.home.example"));
+        assert!(std::ptr::eq(
+            v.http_for("https://other.example"),
+            std::ptr::from_ref(&v.http)
+        ));
+    }
+
     use mediatore_testkit::FakeIdp;
 
     use super::*;
@@ -524,6 +571,7 @@ mod tests {
             session: Some(SessionConfig {
                 client_id: "mediatore".into(),
             }),
+            ca_file: None,
         }
     }
 

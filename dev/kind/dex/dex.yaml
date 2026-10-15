@@ -1,0 +1,162 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+#
+# Dex for the kind tiers (`make kind-dex`, ADR-0013): the real protocol the Dex path is
+# built against, over TLS with the certificate the make target mints into Secret
+# mediatore-dex-tls (tls-fixture, DNS name mediatore-dex.banlieue-system.svc), its state in
+# CRDs (storage: kubernetes), and the glauth directory beside it as its only connector.
+# mediatore is its one client, public (PKCE, loopback redirect). The broker verifies it
+# against the CA in ConfigMap mediatore-dex-ca, as it would a real issuer on a private PKI.
+# The bind password is a fixture for a throwaway cluster, not a secret.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: mediatore-dex
+  namespace: banlieue-system
+---
+# Dex keeps its state in custom resources of its own group and creates the CRDs itself.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: mediatore-dex
+rules:
+  - apiGroups: ["dex.coreos.com"]
+    resources: ["*"]
+    verbs: ["*"]
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources: ["customresourcedefinitions"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: mediatore-dex
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: mediatore-dex
+subjects:
+  - kind: ServiceAccount
+    name: mediatore-dex
+    namespace: banlieue-system
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mediatore-dex-config
+  namespace: banlieue-system
+data:
+  config.yaml: |
+    issuer: https://mediatore-dex.banlieue-system.svc:5556
+    storage:
+      type: kubernetes
+      config:
+        inCluster: true
+    web:
+      https: 0.0.0.0:5556
+      tlsCert: /tls/server.pem
+      tlsKey: /tls/server-key.pem
+    telemetry:
+      http: 0.0.0.0:5558
+    oauth2:
+      responseTypes: ["code"]
+      skipApprovalScreen: true
+    expiry:
+      idTokens: "1h"
+      refreshTokens:
+        validIfNotUsedFor: "24h"
+        absoluteLifetime: "48h"
+    enablePasswordDB: false
+    staticClients:
+      # mediatore's own public client (ADR-0013 decision 3): Dex accepts a loopback
+      # 127.0.0.1 redirect on any port for a public client, which is what the CLI binds.
+      - id: mediatore
+        name: mediatore
+        public: true
+    connectors:
+      - type: ldap
+        id: ldap
+        name: glauth
+        config:
+          host: mediatore-glauth.banlieue-system.svc:3893
+          insecureNoSSL: true
+          bindDN: cn=dex,ou=svcaccts,ou=users,dc=sandbox,dc=test
+          bindPW: dex-e2e
+          usernamePrompt: Login
+          userSearch:
+            baseDN: dc=sandbox,dc=test
+            filter: "(objectClass=posixAccount)"
+            username: uid
+            idAttr: uid
+            emailAttr: mail
+            nameAttr: cn
+            preferredUsernameAttr: uid
+          groupSearch:
+            # glauth serves its groups under ou=users as well; the objectClass tells them apart.
+            baseDN: dc=sandbox,dc=test
+            filter: "(objectClass=posixGroup)"
+            userMatchers:
+              - userAttr: uid
+                groupAttr: memberUid
+            nameAttr: cn
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mediatore-dex
+  namespace: banlieue-system
+spec:
+  selector: { app.kubernetes.io/name: mediatore-dex }
+  ports:
+    - { name: https, port: 5556, targetPort: 5556 }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mediatore-dex
+  namespace: banlieue-system
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector:
+    matchLabels: { app.kubernetes.io/name: mediatore-dex }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: mediatore-dex }
+    spec:
+      serviceAccountName: mediatore-dex
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        runAsGroup: 1001
+        fsGroup: 1001
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: dex
+          # dex v2.46.0, index digest (every architecture), pulled by kind's nodes.
+          image: docker.io/dexidp/dex:v2.46.0@sha256:933fcd3f523338c847b88ef84a7145fb2fcb7b9917f08418612afeaaa2001777
+          args: ["dex", "serve", "/etc/dex/config.yaml"]
+          ports:
+            - { name: https, containerPort: 5556 }
+            - { name: telemetry, containerPort: 5558 }
+          readinessProbe:
+            httpGet: { path: /healthz, port: telemetry }
+            periodSeconds: 2
+          volumeMounts:
+            - { name: config, mountPath: /etc/dex, readOnly: true }
+            - { name: tls, mountPath: /tls, readOnly: true }
+            # Dex expands its config into a temp file before it serves.
+            - { name: tmp, mountPath: /tmp }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: config
+          configMap: { name: mediatore-dex-config }
+        - name: tls
+          secret:
+            secretName: mediatore-dex-tls
+            defaultMode: 0440

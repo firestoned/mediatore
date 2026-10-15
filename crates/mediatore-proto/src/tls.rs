@@ -36,9 +36,68 @@ pub fn https_client_config() -> rustls::ClientConfig {
         .with_no_client_auth()
 }
 
+/// A TLS 1.3-only client config that trusts exactly the CA certificates in `pem` and
+/// nothing else: for an identity provider on a private PKI (`issuers[].ca_file`). The
+/// public roots are deliberately absent, so a certificate from any other authority is
+/// refused. Fails if `pem` holds no certificate.
+pub fn https_client_config_with_ca(pem: &[u8]) -> Result<rustls::ClientConfig, std::io::Error> {
+    use rustls::pki_types::CertificateDer;
+    use rustls::pki_types::pem::PemObject as _;
+
+    ensure_provider();
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in CertificateDer::pem_slice_iter(pem) {
+        let cert = cert.map_err(|e| std::io::Error::other(format!("ca_file: {e}")))?;
+        roots
+            .add(cert)
+            .map_err(|e| std::io::Error::other(format!("ca_file: {e}")))?;
+    }
+    if roots.is_empty() {
+        return Err(std::io::Error::other("ca_file holds no certificate"));
+    }
+    Ok(
+        rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A self-signed CA, PEM-armoured by hand (rcgen is built without `pem`).
+    fn ca_pem() -> Vec<u8> {
+        use base64::Engine as _;
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let key = rcgen::KeyPair::generate().unwrap();
+        let der = params.self_signed(&key).unwrap().der().to_vec();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(der);
+        let body: Vec<&str> = b64
+            .as_bytes()
+            .chunks(64)
+            .map(|c| std::str::from_utf8(c).unwrap())
+            .collect();
+        format!(
+            "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
+            body.join("\n")
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn a_private_ca_builds_a_config_and_an_empty_or_broken_file_does_not() {
+        assert!(https_client_config_with_ca(&ca_pem()).is_ok());
+        let err = https_client_config_with_ca(b"").unwrap_err();
+        assert!(err.to_string().contains("no certificate"), "{err}");
+        assert!(
+            https_client_config_with_ca(
+                b"-----BEGIN CERTIFICATE-----\nnope\n-----END CERTIFICATE-----\n"
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn installs_aws_lc_rs_once_and_tolerates_repeats() {

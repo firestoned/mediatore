@@ -24,9 +24,12 @@ the transit sealer are the next slices.
       `503 upstream_unavailable` and revokes nothing (runbook 5.6 rule 5)
 - [x] Per-claim rate limiting on `/v1/token`: a token bucket per claim UID,
       `token.rate_per_minute` (default 10), `429 rate_limited` before any upstream call
-- [ ] Dex in kind (`make kind-e2e-dex`): the same flow against a real Dex with a static
-      password connector, the CLI driven from inside the cluster; the runbook 8.7
-      negative case "Dex org removal" becomes a group change there
+- [x] Dex in kind (`make kind-e2e-dex`, 2026-10-15): a real Dex over TLS the broker
+      verifies with `issuers[].ca_file`, a glauth directory behind its LDAP connector, the
+      real CLI driven from a pod by the testkit's `dex-driver` (`mediatore login --ca-file`
+      with PKCE and the loopback redirect, then `mediatore sandbox create`); every issue
+      refreshes at Dex first; the runbook 8.7 negative case "Dex org removal" is a group
+      change in the directory, and a deleted refresh token at Dex is the other refusal
 - [ ] Entra OBO: client_assertion signing (key via OpenBao transit or file for now),
       first exchange at claim creation, refresh within TTL, 15-minute re-issue cap
 - [ ] OpenBao transit `Sealer` (ADR-0012 decision 3): the work shape, where the broker

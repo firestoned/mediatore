@@ -11,7 +11,7 @@ a real cluster address or a real credential in a tracked file.
 | Tier | Command | What it proves | Where it runs |
 | --- | --- | --- | --- |
 | Unit | `make check` | Every crate's own contract, over fakes that validate like production | everywhere, every commit |
-| Dev-mode loop | `make e2e` | The four shipped binaries agree on the wire contract as separate processes | everywhere, every PR |
+| Dev-mode loop | `make e2e` | The roles of the one binary agree on the wire contract as separate processes | everywhere, every PR |
 | Session e2e | `make check` (`crates/mediatore/tests/e2e_session.rs`) | The Dex path (ADR-0013) over real listeners against the fake issuer's real authorization-code and refresh grants: delegation, rotation, fresh groups, outage, revocation, the group gate at refresh, the per-claim limit; the CLI's PKCE login in `crates/mediatore-client` | everywhere, every commit |
 | Live against SPIRE in kind | `make kind-e2e` | Kubernetes, the SPIRE Controller Manager and the admission policy behave as the ADRs say, as the broker's own ServiceAccount; the broker image runs on the CSI driver's socket and agent-issued SVIDs meet on the sandbox listener | CI on every PR, any laptop with a container runtime |
 | Live against a real cluster | `make live-admission-test` | The same, against a deployment you operate | by hand, before a release or after changing the deployment |
@@ -117,6 +117,7 @@ Suites today:
 | `make kind-e2e-watcher` | 0011 | the watcher Lease, a member's certificate becoming a node entry, a claim without a record binding nothing, below |
 | `make kind-e2e-sandbox` | 0008, 0012 | the `AgentSandbox` CRD and its subject policy, a sandbox becoming an owned claim and a record, the claim bound end to end to a claim entry and the guest fetching the subject, a broker restart on the store with the sandbox staying `Ready`, deletion through the finalizer, the released row swept into the audit table, below |
 | `make kind-e2e-store` | 0012 | the broker on PostgreSQL over `verify-full`, the store conformance suite against that database, below |
+| `make kind-e2e-dex` | 0013 | the real CLI logging in at a real Dex from inside the cluster and delegating the session, a refresh at Dex before every issue, the claim released when the user leaves the gated group in the directory and when the refresh token is deleted at Dex, below |
 
 ### The store: PostgreSQL over TLS the client verifies
 
@@ -141,6 +142,39 @@ sandbox `Ready`, the broker is restarted and must come back finding the record, 
 entry id and the node in the store, with no second record and no second entry; after
 the deletion, the kind config's zero retention and 15 s resync let the tier see the
 released row archived.
+
+### The Dex path against a real Dex
+
+`make kind-dex` (a dependency of `make kind-broker`, like the PostgreSQL) runs a Dex
+(`dev/kind/dex/dex.yaml`, storage in its own CRDs) over TLS with a certificate the
+target mints for `mediatore-dex.banlieue-system.svc`, and a glauth LDAP directory
+behind it (`dev/kind/dex/glauth.yaml`, the users and groups in `dev/kind/dex/glauth.cfg`:
+`octocat` in group `sandbox-users`, the service account Dex binds as). It also mints
+the broker's STS signing key and sealing key into Secrets. The broker overlay's config
+names that Dex as a session issuer with `subject_claim: preferred_username`,
+`required_group: sandbox-users` and `ca_file` pointing at the CA the target put in a
+ConfigMap, so the broker verifies the issuer exactly as it would one on a private PKI.
+
+`make kind-e2e-dex` (`dev/kind/dex-e2e.sh`) runs the user's side from a pod: the
+test-only image (`dev/kind/Dockerfile.e2e`) holds the shipped binary and the testkit's
+`dex-driver`, which spawns the real `mediatore login --no-browser --ca-file ...`, plays
+the browser it would have opened (follows the authorization URL to Dex, posts the
+password into Dex's form, lets Dex redirect to the CLI's loopback listener) and then
+spawns the real `mediatore sandbox create`, so what runs against Dex is the CLI as
+shipped. Then:
+
+| Step | Expected |
+| --- | --- |
+| `cli-1` logs in and requests a sandbox | `logged in as octocat` in its log; the broker logs `session parked`; Dex holds exactly one refresh token |
+| the claim is patched Bound with the fixture node's certificate (as in the sandbox tier) and a `ClusterSPIFFEID` points at the claim UID | the sandbox turns `Ready`; the guest fetches `octocat`'s subject |
+| `token-1` runs `mediatore token` with the claim SVID | a token for `octocat`, `aud` `e2e-sts`, `claim_uid` the claim's; Dex's refresh token record shows `lastUsed` advanced: the issue refreshed first |
+| `octocat` is taken out of `sandbox-users` in the directory (the ConfigMap rewritten, glauth restarted) and `token-2` asks again | `403 session_revoked`; the broker logs `upstream session refused; claim released`; the claim entry is gone. Dex re-read the group at refresh (its LDAP connector queries on every refresh) |
+| the group restored, `cli-2` logs in again and requests a second sandbox; `token-3` issues | a token for the new claim |
+| every refresh token is deleted at Dex (`kubectl delete refreshtokens.dex.coreos.com`) and `token-4` asks again | `403 session_revoked`, the claim released: Dex answered `invalid_grant` |
+
+Dex, glauth and their passwords are fixtures of a throwaway cluster (`dev/kind/dex/`);
+nothing in them is a deployment shape, and the Dex tier's namespace, entries and
+directory change are undone when the script exits.
 
 ### Broker and client pods over SPIFFE mTLS
 

@@ -1,0 +1,57 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+#
+# glauth for the kind tiers (`make kind-dex`, ADR-0013): a one-binary LDAP directory with
+# the users and groups in ConfigMap mediatore-glauth-config (from dev/kind/dex/glauth.cfg,
+# created by the make target). Dex's LDAP connector reads it on every login and every
+# refresh, so a group change here is what the Dex tier uses as "the user was removed
+# upstream". Plain LDAP on the cluster network: a fixture, not a deployment shape.
+apiVersion: v1
+kind: Service
+metadata:
+  name: mediatore-glauth
+  namespace: banlieue-system
+spec:
+  selector: { app.kubernetes.io/name: mediatore-glauth }
+  ports:
+    - { name: ldap, port: 3893, targetPort: 3893 }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mediatore-glauth
+  namespace: banlieue-system
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector:
+    matchLabels: { app.kubernetes.io/name: mediatore-glauth }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: mediatore-glauth }
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: glauth
+          # glauth v2.5.4, index digest (every architecture), pulled by kind's nodes.
+          image: docker.io/glauth/glauth:v2.5.4@sha256:6d448805cf54fc2ca3bca2b87f89dffe571a354a69a667b5a910111be3cf430e
+          # The image's entrypoint is dumb-init; its default command is a start script.
+          args: ["/app/glauth", "-c", "/config/glauth.cfg"]
+          ports:
+            - { name: ldap, containerPort: 3893 }
+          readinessProbe:
+            tcpSocket: { port: ldap }
+            periodSeconds: 2
+          volumeMounts:
+            - { name: config, mountPath: /config, readOnly: true }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+      volumes:
+        - name: config
+          configMap: { name: mediatore-glauth-config }

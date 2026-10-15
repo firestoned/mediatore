@@ -75,6 +75,7 @@ impl Harness {
                 session: Some(SessionConfig {
                     client_id: "mediatore".into(),
                 }),
+                ca_file: None,
             }]),
             sts: Some(sts),
             audiences: vec![AUDIENCE.into()],

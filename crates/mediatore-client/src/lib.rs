@@ -109,6 +109,9 @@ pub struct LoginOptions {
     pub scopes: Vec<String>,
     /// A login hint for the issuer, if any.
     pub login_hint: Option<String>,
+    /// CA certificates (PEM) that sign the issuer's TLS certificate, for an issuer on a
+    /// private PKI; when set, exactly those are trusted and not the public roots.
+    pub ca_pem: Option<Vec<u8>>,
 }
 
 impl LoginOptions {
@@ -139,6 +142,13 @@ fn http() -> anyhow::Result<reqwest::Client> {
     mediatore_proto::tls::ensure_provider();
     Ok(reqwest::Client::builder()
         .use_preconfigured_tls(mediatore_proto::tls::https_client_config())
+        .build()?)
+}
+
+/// An HTTPS client trusting exactly the CA certificates in `pem`.
+fn http_with_ca(pem: &[u8]) -> anyhow::Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .use_preconfigured_tls(mediatore_proto::tls::https_client_config_with_ca(pem)?)
         .build()?)
 }
 
@@ -254,7 +264,10 @@ async fn accept_callback(listener: tokio::net::TcpListener) -> anyhow::Result<(S
 /// Log in: discovery, PKCE, the loopback listener, the browser (through `open_url`, which
 /// gets the authorization URL), the code exchange. Returns the session, unsaved.
 pub async fn login(opts: &LoginOptions, open_url: impl FnOnce(&str)) -> anyhow::Result<Session> {
-    let http = http()?;
+    let http = match &opts.ca_pem {
+        Some(pem) => http_with_ca(pem)?,
+        None => http()?,
+    };
     let discovery: Discovery = http
         .get(format!(
             "{}/.well-known/openid-configuration",
@@ -424,6 +437,7 @@ mod tests {
             client_id: "mediatore".into(),
             scopes: LoginOptions::default_scopes(),
             login_hint: Some("hexley".into()),
+            ca_pem: None,
         }
     }
 

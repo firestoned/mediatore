@@ -3,9 +3,11 @@
 #
 # The broker's config in kind. Identity and entries are the production paths (the
 # Workload API over the CSI mount, ClusterStaticEntry through the API server). The
-# issuer and audience are placeholders no token is ever validated against: they exist
-# so the AgentSandbox reconciler (ADR-0008) accepts a sandbox naming them and refuses
-# one that does not. The user API is not exercised in kind (no identity provider).
+# first issuer and the entra-obo audience are placeholders no token is ever validated
+# against: they exist so the AgentSandbox reconciler (ADR-0008) accepts a sandbox naming
+# them and refuses one that does not. The second issuer is the Dex `make kind-dex` runs
+# (ADR-0013): a session issuer over TLS the broker verifies against the CA that target
+# minted, with the sealing key and the STS signing key from the Secrets it created.
 trust_domain: sandbox.test
 listen:
   user: 0.0.0.0:8080
@@ -18,13 +20,26 @@ issuers:
   - url: https://issuer.example.com
     backend: sts
     client_id: mediatore
+  - url: https://mediatore-dex.banlieue-system.svc:5556
+    backend: sts
+    client_id: mediatore
+    subject_claim: preferred_username
+    required_group: sandbox-users
+    session: { client_id: mediatore }
+    ca_file: /etc/mediatore-dex/ca.pem
 audiences:
   - { name: e2e, via: entra-obo }
+  - { name: e2e-sts, via: sts, max_ttl: 900 }
+sts:
+  issuer: https://mediatore.sandbox.test
+  kid: kind
+  signing_key_file: /etc/mediatore-sts/sts.pem
 sandboxes:
   namespace: mediatore-e2e-sandbox
 # The store URL comes from the environment (Secret mediatore-store). Ended rows are kept
 # for 0 s and the resync runs every 15 s so the sandbox tier sees the audit sweep.
 store:
   retention_secs: 0
+  sealing: { key_file: /etc/mediatore-sealing/key }
 watcher:
   resync_secs: 15

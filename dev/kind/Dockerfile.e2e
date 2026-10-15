@@ -1,0 +1,9 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+
+# Test-only image for the Dex kind tier (`make kind-e2e-dex`): the shipped binary plus the
+# testkit's dex-driver, which plays the user's browser and drives `mediatore login` and
+# `mediatore sandbox create` from inside the cluster. Built from `dist/`; never published.
+FROM cgr.dev/chainguard/static:latest
+COPY dist/mediatore dist/dex-driver /usr/local/bin/
+USER 65532:65532
