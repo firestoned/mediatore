@@ -49,7 +49,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Check license headers
-        uses: firestoned/github-actions/security/license-check@787be16a6bed7e6c2297683bb75bc9b5f1a54397 # v1.3.8
+        uses: firestoned/github-actions/security/license-check@e034489c3a17ffaaaf7f8fb799156ce768d899d5 # v1.3.9
         with:
           copyright-holder: "Erick Bourgeois, mediatore"
           license-id: "Apache-2.0"
@@ -68,7 +68,7 @@ jobs:
 
       - name: Verify commits (PR)
         if: github.event_name == 'pull_request'
-        uses: firestoned/github-actions/security/verify-signed-commits@787be16a6bed7e6c2297683bb75bc9b5f1a54397 # v1.3.8
+        uses: firestoned/github-actions/security/verify-signed-commits@e034489c3a17ffaaaf7f8fb799156ce768d899d5 # v1.3.9
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           base-ref: origin/${{ github.base_ref }}
@@ -76,14 +76,14 @@ jobs:
 
       - name: Verify commits (push to main)
         if: github.event_name == 'push'
-        uses: firestoned/github-actions/security/verify-signed-commits@787be16a6bed7e6c2297683bb75bc9b5f1a54397 # v1.3.8
+        uses: firestoned/github-actions/security/verify-signed-commits@e034489c3a17ffaaaf7f8fb799156ce768d899d5 # v1.3.9
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           verify-mode: push
 
       - name: Verify commits (release)
         if: github.event_name == 'release'
-        uses: firestoned/github-actions/security/verify-signed-commits@787be16a6bed7e6c2297683bb75bc9b5f1a54397 # v1.3.8
+        uses: firestoned/github-actions/security/verify-signed-commits@e034489c3a17ffaaaf7f8fb799156ce768d899d5 # v1.3.9
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           verify-mode: release
@@ -121,7 +121,7 @@ jobs:
           components: clippy
 
       - name: Cache cargo dependencies
-        uses: firestoned/github-actions/rust/cache-cargo@787be16a6bed7e6c2297683bb75bc9b5f1a54397 # v1.3.8
+        uses: firestoned/github-actions/rust/cache-cargo@e034489c3a17ffaaaf7f8fb799156ce768d899d5 # v1.3.9
 
       - name: Run clippy
         run: make lint
@@ -141,7 +141,7 @@ jobs:
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable (moving ref — re-pin quarterly)
 
       - name: Cache cargo dependencies
-        uses: firestoned/github-actions/rust/cache-cargo@787be16a6bed7e6c2297683bb75bc9b5f1a54397 # v1.3.8
+        uses: firestoned/github-actions/rust/cache-cargo@e034489c3a17ffaaaf7f8fb799156ce768d899d5 # v1.3.9
 
       - name: Run tests
         run: make test
@@ -161,7 +161,7 @@ jobs:
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable (moving ref — re-pin quarterly)
 
       - name: Run security scan
-        uses: firestoned/github-actions/rust/security-scan@787be16a6bed7e6c2297683bb75bc9b5f1a54397 # v1.3.8
+        uses: firestoned/github-actions/rust/security-scan@e034489c3a17ffaaaf7f8fb799156ce768d899d5 # v1.3.9
         with:
           cargo-audit-version: "0.22.0"
 
@@ -200,7 +200,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
 
       - name: Cache cargo dependencies
-        uses: firestoned/github-actions/rust/cache-cargo@787be16a6bed7e6c2297683bb75bc9b5f1a54397 # v1.3.8
+        uses: firestoned/github-actions/rust/cache-cargo@e034489c3a17ffaaaf7f8fb799156ce768d899d5 # v1.3.9
 
       - name: Build the binary
         run: make dist
@@ -213,7 +213,7 @@ jobs:
           find . -name "*.cdx.json" -not -path './target/*' -not -path './dist/*' -exec mv {} dist/ \; || true
 
       - name: Upload the binary
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: mediatore-linux-amd64-musl
           path: |
@@ -241,7 +241,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Docker (login + buildx)
-        uses: firestoned/github-actions/docker/setup-docker@787be16a6bed7e6c2297683bb75bc9b5f1a54397 # v1.3.8
+        uses: firestoned/github-actions/docker/setup-docker@e034489c3a17ffaaaf7f8fb799156ce768d899d5 # v1.3.9
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -293,7 +293,7 @@ jobs:
 
       - name: Upload image SBOM artifact
         if: github.event_name != 'pull_request'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: docker-sbom
           path: docker-sbom.json
