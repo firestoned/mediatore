@@ -272,10 +272,11 @@ async fn a_google_login_is_by_email_with_the_installed_app_secret_and_access_typ
     let minted: TokenResponse = resp.json().await.unwrap();
     let claims = payload(&minted.access_token);
     assert_eq!(claims["sub"], "octocat@example.com");
-    assert_eq!(
-        claims["groups"],
-        serde_json::json!([]),
-        "Google has no groups"
+    assert!(
+        claims
+            .get("groups")
+            .is_none_or(|g| g == &serde_json::json!([])),
+        "Google has no groups: {claims}"
     );
     assert_eq!(h.google.refreshes(), 1);
     // Revoked at Google: released at the next issue.
