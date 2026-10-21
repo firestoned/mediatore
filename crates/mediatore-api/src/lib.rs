@@ -25,7 +25,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use banlieue_api::common::LocalObjectReference;
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use mediatore_claims::Reconciler;
 use mediatore_claims::sandbox::{
     AgentSandbox, AgentSandboxSpec, FrontDoorError, SandboxFrontDoor, SandboxSubject,
@@ -35,7 +35,7 @@ use mediatore_entra::{IdpError, Validated, Validator};
 use mediatore_proto::ek::is_ek_hash;
 use mediatore_proto::{
     ClaimPhase, ClaimRequest, ClaimResponse, ErrorBody, Me, NodeRegistered, NodeRegistration,
-    TokenRequest, TokenResponse,
+    Secret, TokenRequest, TokenResponse,
 };
 use mediatore_spire::{EntryManager, Naming};
 use mediatore_store::seal::{SealError, Sealer};
@@ -61,6 +61,9 @@ pub struct AppState {
     pub sts: Option<Sts>,
     /// Audiences we are allowed to serve, from config.
     pub audiences: Vec<String>,
+    /// The subset of `audiences` served by Entra On-Behalf-Of (ADR-0016): a token for one
+    /// is Entra's, minted from the claim's Entra session, never the STS's.
+    pub obo_audiences: Vec<String>,
     /// `AgentSandbox` resources through the Kubernetes API (ADR-0008); `None` under
     /// `dev_mode`, where the store and the dev binder stand in. Absent outside `dev_mode`,
     /// the claim endpoints fail closed with `501`.
@@ -331,30 +334,16 @@ async fn create_claim(
     headers: HeaderMap,
     Json(req): Json<ClaimRequest>,
 ) -> Result<(StatusCode, Json<ClaimResponse>), ApiError> {
+    let bearer_token = bearer(&headers)?.to_owned();
     let validated = caller(&st, &headers).await?;
     if let Some(bad) = req.audiences.iter().find(|a| !st.audiences.contains(a)) {
         return Err(ApiError::bad_request("unknown_audience", bad.clone()));
     }
-    // ADR-0013 decision 1: a session issuer requires the delegation, any other refuses it.
-    match (&validated.issuer.session, &req.refresh_token) {
-        (Some(_), None) => {
-            return Err(ApiError::bad_request(
-                "session_required",
-                "this issuer requires a refresh_token to be delegated with the claim",
-            ));
-        }
-        (None, Some(_)) => {
-            return Err(ApiError::bad_request(
-                "session_unexpected",
-                "this issuer takes no refresh_token",
-            ));
-        }
-        _ => {}
-    }
-    let sealer = match (&validated.issuer.session, st.sealer.as_ref()) {
-        (Some(_), None) => return Err(ApiError::not_implemented("sealing")),
-        (Some(_), Some(s)) => Some(s.clone()),
-        (None, _) => None,
+    let session = session_for(&st, &validated, &req, &bearer_token).await?;
+    let sealer = match (session.is_some(), st.sealer.as_ref()) {
+        (true, None) => return Err(ApiError::not_implemented("sealing")),
+        (true, Some(s)) => Some(s.clone()),
+        (false, _) => None,
     };
     if req.ttl_seconds == 0 {
         return Err(ApiError::bad_request(
@@ -367,12 +356,20 @@ async fn create_claim(
         &Uuid::new_v4().simple().to_string()[..CLAIM_NAME_SUFFIX_LEN]
     );
     if !st.dev_mode {
-        return create_sandbox(&st, &validated, &name, &req, sealer.as_deref()).await;
+        return create_sandbox(
+            &st,
+            &validated,
+            &name,
+            &req,
+            sealer.as_deref(),
+            session.as_ref(),
+        )
+        .await;
     }
 
     let uid = Uuid::new_v4();
     // The dev binder writes the record itself, so the envelope binds to the record's UID.
-    let refresh = match (sealer.as_deref(), &req.refresh_token) {
+    let refresh = match (sealer.as_deref(), &session) {
         (Some(sealer), Some(token)) => Some(
             sealer
                 .seal(uid, token.0.as_bytes())
@@ -428,6 +425,56 @@ async fn create_claim(
     ))
 }
 
+/// The session a claim is created with (ADR-0013 decision 1, ADR-0016 decision 1): a
+/// session issuer requires the caller's delegated refresh token and any other refuses
+/// one; an Entra issuer delegates nothing, the bearer is exchanged On-Behalf-Of for the
+/// first audience Entra serves, else for mediatore itself. An audience Entra serves needs
+/// an Entra login.
+async fn session_for(
+    st: &AppState,
+    validated: &Validated,
+    req: &ClaimRequest,
+    bearer_token: &str,
+) -> Result<Option<Secret>, ApiError> {
+    match (&validated.issuer.session, &req.refresh_token) {
+        (Some(_), None) => {
+            return Err(ApiError::bad_request(
+                "session_required",
+                "this issuer requires a refresh_token to be delegated with the claim",
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(ApiError::bad_request(
+                "session_unexpected",
+                "this issuer takes no refresh_token",
+            ));
+        }
+        _ => {}
+    }
+    if validated.issuer.entra.is_none() {
+        if let Some(bad) = req.audiences.iter().find(|a| st.obo_audiences.contains(a)) {
+            return Err(ApiError::bad_request(
+                "audience_needs_entra",
+                format!("audience {bad} is served On-Behalf-Of and needs an Entra login"),
+            ));
+        }
+        return Ok(req.refresh_token.clone());
+    }
+    let resource = req
+        .audiences
+        .iter()
+        .find(|a| st.obo_audiences.contains(a))
+        .cloned()
+        .unwrap_or_else(|| validated.issuer.client_id.clone());
+    let refresh = st
+        .validator
+        .exchange(&validated.issuer, bearer_token, &resource)
+        .await
+        .map_err(|e| exchange_error(validated, &resource, &e))?;
+    tracing::info!(subject = %validated.subject.id, %resource, "session obtained on behalf of the caller");
+    Ok(Some(refresh))
+}
+
 /// The production front door (ADR-0008 decision 4): the request becomes an `AgentSandbox`
 /// in the configured namespace, `spec.subject` from the validated token. mediatore's
 /// `ServiceAccount` is exempt from the subject admission check for exactly this, so the
@@ -438,6 +485,7 @@ async fn create_sandbox(
     name: &str,
     req: &ClaimRequest,
     sealer: Option<&dyn Sealer>,
+    session: Option<&Secret>,
 ) -> Result<(StatusCode, Json<ClaimResponse>), ApiError> {
     let Some(front) = st.sandboxes.as_ref() else {
         return Err(ApiError::not_implemented(
@@ -461,7 +509,7 @@ async fn create_sandbox(
     tracing::info!(subject = %validated.subject.id, pool = %req.pool_ref, sandbox = %name, namespace = %st.sandbox_namespace, "sandbox created");
     // ADR-0013 decision 2: the session is parked under the sandbox's UID, sealed with it,
     // before the caller hears back; a failure here undoes the resource.
-    if let (Some(sealer), Some(token)) = (sealer, &req.refresh_token)
+    if let (Some(sealer), Some(token)) = (sealer, session)
         && let Err(e) = park_session(st, sealer, &created, validated, token).await
     {
         tracing::warn!(sandbox = %name, error = %e, "session not parked; sandbox withdrawn");
@@ -482,7 +530,7 @@ async fn park_session(
     sealer: &dyn Sealer,
     created: &AgentSandbox,
     validated: &Validated,
-    token: &mediatore_proto::Secret,
+    token: &Secret,
 ) -> anyhow::Result<()> {
     let sandbox_uid = created
         .metadata
@@ -713,15 +761,32 @@ async fn me(
     }))
 }
 
-/// Refresh the delegated session behind `rec` and re-seal the rotated token into it.
-/// `invalid_grant` or a fresh token that fails the gate releases the claim (entry
-/// retracted, record revoked) and answers `403`; an issuer outage answers `503` and
-/// releases nothing. Returns the groups the fresh token carries.
+/// What the issuer answered a refresh with: the refresh token to keep, the validated
+/// identity when the fresh token is one mediatore can read, the token for an audience
+/// Entra serves.
+type RefreshOutcome = (String, Option<Validated>, Option<(Secret, DateTime<Utc>)>);
+
+/// What a refresh left for the issue: the groups to mint (empty when the fresh token was
+/// not one mediatore can read), and for an audience Entra serves, its token.
+struct Fresh {
+    groups: Vec<String>,
+    obo: Option<(Secret, DateTime<Utc>)>,
+}
+
+/// Refresh the session behind `rec` and re-seal the rotated token into it. On the Dex
+/// path the fresh ID token is validated like a login (ADR-0013 decision 4); on the Entra
+/// path the session is refreshed for `audience`'s resource when Entra serves it (`obo`),
+/// else for mediatore's own, whose token is validated like a login (ADR-0016 decision 2).
+/// A refusal upstream, a fresh token that fails the gate or names another subject
+/// releases the claim (entry retracted, record revoked) and answers `403`; an issuer
+/// outage answers `503` and releases nothing.
 async fn refresh_session(
     st: &AppState,
     rec: &ClaimRecord,
     issuer: &mediatore_entra::IssuerConfig,
-) -> Result<Vec<String>, ApiError> {
+    audience: &str,
+    obo: bool,
+) -> Result<Fresh, ApiError> {
     let Some(envelope) = rec.refresh.as_ref() else {
         return Err(ApiError::forbidden("no delegated session for this claim"));
     };
@@ -743,13 +808,27 @@ async fn refresh_session(
         })?;
     let token = std::str::from_utf8(&plaintext)
         .map_err(|_| ApiError::forbidden("delegated session unreadable"))?;
-    let refreshed = match st.validator.refresh(issuer, token).await {
-        Ok(r) if r.validated.subject.id == rec.subject.id => r,
-        Ok(_) => {
-            tracing::warn!(claim_uid = %rec.uid, "refreshed session names another subject; claim released");
-            release_quietly(st, rec.uid).await;
-            return Err(session_revoked());
-        }
+    let outcome: Result<RefreshOutcome, IdpError> = if issuer.entra.is_some() {
+        let resource = if obo {
+            audience
+        } else {
+            issuer.client_id.as_str()
+        };
+        st.validator
+            .refresh_entra(issuer, token, resource)
+            .await
+            .map(|r| {
+                let obo = obo.then_some((r.access_token, r.expires_at));
+                (r.refresh_token.0, r.validated, obo)
+            })
+    } else {
+        st.validator
+            .refresh(issuer, token)
+            .await
+            .map(|r| (r.refresh_token, Some(r.validated), None))
+    };
+    let (refresh_token, validated, obo) = match outcome {
+        Ok(out) => out,
         Err(IdpError::SessionRevoked(why) | IdpError::Forbidden(why)) => {
             tracing::warn!(claim_uid = %rec.uid, subject = %rec.subject.id, %why, "upstream session refused; claim released");
             release_quietly(st, rec.uid).await;
@@ -764,8 +843,15 @@ async fn refresh_session(
             ));
         }
     };
+    if let Some(v) = &validated
+        && v.subject.id != rec.subject.id
+    {
+        tracing::warn!(claim_uid = %rec.uid, "refreshed session names another subject; claim released");
+        release_quietly(st, rec.uid).await;
+        return Err(session_revoked());
+    }
     let envelope = sealer
-        .seal(rec.seal_binding(), refreshed.refresh_token.as_bytes())
+        .seal(rec.seal_binding(), refresh_token.as_bytes())
         .await
         .map_err(seal_error)?;
     let mut updated = rec.clone();
@@ -774,7 +860,36 @@ async fn refresh_session(
         .update_claim(updated)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
-    Ok(refreshed.validated.groups)
+    Ok(Fresh {
+        groups: validated.map(|v| v.groups).unwrap_or_default(),
+        obo,
+    })
+}
+
+/// A failed On-Behalf-Of exchange at claim creation (ADR-0016 decision 1): Entra's
+/// refusal is `403 session_refused` with its code, anything else is the broker's or
+/// Entra's problem and `503`.
+fn exchange_error(validated: &Validated, resource: &str, e: &IdpError) -> ApiError {
+    match e {
+        IdpError::SessionRevoked(code) => {
+            tracing::warn!(subject = %validated.subject.id, %resource, %code, "on-behalf-of exchange refused");
+            ApiError::new(
+                StatusCode::FORBIDDEN,
+                "session_refused",
+                Some(format!(
+                    "the identity provider refused the exchange: {code}"
+                )),
+            )
+        }
+        other => {
+            tracing::warn!(subject = %validated.subject.id, %resource, error = %other, "on-behalf-of exchange unavailable");
+            ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "upstream_unavailable",
+                Some("the identity provider did not answer the exchange".to_owned()),
+            )
+        }
+    }
 }
 
 /// `403 session_revoked`: the delegated session is gone and so is the claim.
@@ -836,15 +951,19 @@ async fn token(
             Some("too many token requests for this claim".to_owned()),
         ));
     }
-    let Some(sts) = st.sts.as_ref() else {
-        return Err(ApiError::not_implemented("entra-obo backend"));
-    };
-    // ADR-0013 decision 4: a session issuer's record is refreshed upstream first; the
-    // fresh token's groups are what the minted token carries. One refresh at a time per
-    // claim, over the record as it is once the lock is held: the previous one may have
-    // rotated the envelope, or released the claim.
-    let groups = match st.validator.issuer_named(&rec.subject.issuer) {
-        Some(issuer) if issuer.session.is_some() => {
+    // ADR-0013 decision 4, ADR-0016 decision 2: a session issuer's record is refreshed
+    // upstream first, for the audience's resource. One refresh at a time per claim, over
+    // the record as it is once the lock is held: the previous one may have rotated the
+    // envelope, or released the claim.
+    let obo = st.obo_audiences.iter().any(|a| a == &req.audience);
+    let issuer = st.validator.issuer_named(&rec.subject.issuer);
+    if obo && issuer.is_none_or(|i| i.entra.is_none()) {
+        return Err(ApiError::forbidden(
+            "audience is served On-Behalf-Of and this claim has no Entra session",
+        ));
+    }
+    let fresh = match issuer {
+        Some(issuer) if issuer.session.is_some() || issuer.entra.is_some() => {
             let lock = st.limiter.refresh_lock(claim_uid);
             let _held = lock.lock().await;
             let rec = st
@@ -855,9 +974,25 @@ async fn token(
             if !rec.is_live(Utc::now()) {
                 return Err(ApiError::forbidden("claim revoked or expired"));
             }
-            refresh_session(&st, &rec, issuer).await?
+            refresh_session(&st, &rec, issuer, &req.audience, obo).await?
         }
-        _ => vec![],
+        _ => Fresh {
+            groups: vec![],
+            obo: None,
+        },
+    };
+    if let Some((token, expires_at)) = fresh.obo {
+        tracing::info!(%claim_uid, audience = %req.audience, subject = %rec.subject.id, %expires_at, "token issued on behalf of the subject");
+        return Ok(Json(TokenResponse {
+            access_token: token.0,
+            token_type: "Bearer".into(),
+            expires_at,
+            audience: req.audience,
+            subject: rec.subject,
+        }));
+    }
+    let Some(sts) = st.sts.as_ref() else {
+        return Err(ApiError::not_implemented("sts backend not configured"));
     };
     let minted = sts
         .mint(&MintRequest {
@@ -865,7 +1000,7 @@ async fn token(
             actor_spiffe_id: &peer,
             claim_uid,
             audience: &req.audience,
-            groups,
+            groups: fresh.groups,
             ttl: Duration::minutes(15).min(sts.max_ttl()),
         })
         .map_err(|e| ApiError::internal(e.to_string()))?;

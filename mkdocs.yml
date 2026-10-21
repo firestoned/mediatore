@@ -139,7 +139,9 @@ nav:
   - Guides:
       - Running workloads on a claimed VM: guides/running-workloads.md
       - Requesting a sandbox: guides/requesting-a-sandbox.md
+      - Issuers: guides/issuers.md
       - The store: guides/the-store.md
+      - The Entra path: guides/the-entra-path.md
       - Enterprise SPIRE topology: guides/enterprise-spire-topology.md
       - Testing tiers: guides/testing.md
   - Architecture:
@@ -161,5 +163,7 @@ nav:
       - "ADR-0013: The Dex path, the session delegated": adr/0013-dex-session-delegation.md
       - "ADR-0014: One binary, the roles as subcommands": adr/0014-one-binary-roles-as-subcommands.md
       - "ADR-0015: The transit sealer": adr/0015-transit-sealer.md
+      - "ADR-0016: The Entra path": adr/0016-entra-on-behalf-of.md
+      - "ADR-0017: Issuer profiles": adr/0017-issuer-profiles.md
   - Security:
       - Threat model: security/threat-model.md

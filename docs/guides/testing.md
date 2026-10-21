@@ -12,7 +12,7 @@ a real cluster address or a real credential in a tracked file.
 | --- | --- | --- | --- |
 | Unit | `make check` | Every crate's own contract, over fakes that validate like production | everywhere, every commit |
 | Dev-mode loop | `make e2e` | The roles of the one binary agree on the wire contract as separate processes | everywhere, every PR |
-| Session e2e | `make check` (`crates/mediatore/tests/e2e_session.rs`) | The Dex path (ADR-0013) over real listeners against the fake issuer's real authorization-code and refresh grants: delegation, rotation, fresh groups, outage, revocation, the group gate at refresh, the per-claim limit; the CLI's PKCE login in `crates/mediatore-client` | everywhere, every commit |
+| Session e2e | `make check` (`crates/mediatore/tests/e2e_session.rs`) | The session path (ADR-0013) over real listeners against the fake issuer's real authorization-code and refresh grants: delegation, rotation, fresh groups, outage, revocation, the group gate at refresh, the per-claim limit; the CLI's PKCE login in `crates/mediatore-client` | everywhere, every commit |
 | Live against SPIRE in kind | `make kind-e2e` | Kubernetes, the SPIRE Controller Manager and the admission policy behave as the ADRs say, as the broker's own ServiceAccount; the broker image runs on the CSI driver's socket and agent-issued SVIDs meet on the sandbox listener | CI on every PR, any laptop with a container runtime |
 | Live against a real cluster | `make live-admission-test` | The same, against a deployment you operate | by hand, before a release or after changing the deployment |
 
@@ -189,6 +189,26 @@ shipped. Then:
 Dex, glauth and their passwords are fixtures of a throwaway cluster (`dev/kind/dex/`);
 nothing in them is a deployment shape, and the Dex tier's namespace, entries and
 directory change are undone when the script exits.
+
+### Issuer profiles: Google and Auth0 against the fake
+
+`crates/mediatore/tests/e2e_issuers.rs` runs the real CLI login code, the claim, the
+refresh and the group gate against the fake issuer playing Google (`email` subject, no
+groups, `access_type=offline`, the installed-app secret at the token endpoint) and
+Auth0 (`email` subject, groups under a namespaced claim), ADR-0017. The [issuers
+guide](issuers.md) is the operator's side; GitHub stays behind Dex and is the kind tier
+above.
+
+### The Entra path: by hand, against a tenant
+
+Entra does not run in kind. The Entra path (ADR-0016) is proven in `make check` against
+the fake issuer playing Entra (`crates/mediatore/tests/e2e_entra.rs`: the exchange at
+claim creation, the refresh per audience, the refusals, the outage, the three credential
+shapes, and `crates/mediatore-entra` for the assertion and the grants), and against a
+real tenant by `crates/mediatore/tests/live_entra.rs`, an ignored test that takes the
+issuer, client id, credential and a user's token from the environment and fails rather
+than skips without them. [The Entra path](the-entra-path.md) has the command. Roadmap 04
+closes when that run is green.
 
 ### Broker and client pods over SPIFFE mTLS
 

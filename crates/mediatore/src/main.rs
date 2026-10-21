@@ -16,7 +16,7 @@ use mediatore_claims::Reconciler;
 use mediatore_claims::lease::LeaseConfig;
 use mediatore_claims::sandbox::{KubeSandboxes, SandboxFrontDoor};
 use mediatore_claims::watch::{KubeClaimsApi, Watcher, WatcherConfig};
-use mediatore_entra::Validator;
+use mediatore_entra::{Backend, ClientAssertion, Validator};
 use mediatore_spire::{EntryManager, KubeEntryManager, MemoryEntries, Naming};
 use mediatore_store::seal::{LocalKeySealer, Sealer, TransitSealer};
 use mediatore_store::sql::{SqlStore, redacted};
@@ -124,9 +124,15 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
         store,
         spire,
         naming: naming.clone(),
-        validator: validator(&cfg)?,
+        validator: validator(&cfg).await?,
         sts,
         audiences: cfg.audiences.iter().map(|a| a.name.clone()).collect(),
+        obo_audiences: cfg
+            .audiences
+            .iter()
+            .filter(|a| a.via == Backend::EntraObo)
+            .map(|a| a.name.clone())
+            .collect(),
         sandboxes,
         sandbox_namespace: cfg.sandboxes.namespace.clone(),
         sealer,
@@ -243,7 +249,7 @@ async fn store(cfg: &Config) -> anyhow::Result<Arc<dyn ClaimStore>> {
 
 /// The upstream validator, with each issuer that names a `ca_file` pinned to that CA. The
 /// file is read now so a missing or empty one fails the start, not the first login.
-fn validator(cfg: &Config) -> anyhow::Result<Validator> {
+async fn validator(cfg: &Config) -> anyhow::Result<Validator> {
     let mut v = Validator::new(cfg.issuers.clone());
     for issuer in &cfg.issuers {
         if let Some(path) = &issuer.ca_file {
@@ -252,6 +258,36 @@ fn validator(cfg: &Config) -> anyhow::Result<Validator> {
             })?;
             v = v.with_issuer_ca(&issuer.url, &pem)?;
             tracing::info!(issuer = %issuer.url, ca_file = %path.display(), "issuer pinned to a private CA");
+        }
+        // ADR-0017: the secret an issuer's token endpoint wants from the public client
+        // (Google), read now.
+        if let Some(path) = issuer
+            .session
+            .as_ref()
+            .and_then(|s| s.client_secret_file.as_ref())
+        {
+            let secret = std::fs::read_to_string(path).map_err(|e| {
+                anyhow::anyhow!(
+                    "issuer {} client_secret_file {}: {e}",
+                    issuer.url,
+                    path.display()
+                )
+            })?;
+            v = v.with_session_secret(
+                &issuer.url,
+                mediatore_proto::Secret(secret.trim().to_owned()),
+            );
+            tracing::info!(issuer = %issuer.url, "session: the client secret is sent on refreshes");
+        }
+        // ADR-0016 decision 4: the credential is read and exercised now, so a key that is
+        // not the certificate's, a wrong transit role or key or an unreadable token file
+        // fails the start, not the first claim.
+        if let Some(entra) = &issuer.entra {
+            let assertion = ClientAssertion::build(entra)
+                .await
+                .map_err(|e| anyhow::anyhow!("issuer {}: {e}", issuer.url))?;
+            tracing::info!(issuer = %issuer.url, client_id = %issuer.client_id, credential = ?assertion, "entra: client assertion ready");
+            v = v.with_client_assertion(&issuer.url, assertion);
         }
     }
     Ok(v)

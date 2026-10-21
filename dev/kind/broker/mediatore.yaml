@@ -3,9 +3,10 @@
 #
 # The broker's config in kind. Identity and entries are the production paths (the
 # Workload API over the CSI mount, ClusterStaticEntry through the API server). The
-# first issuer and the entra-obo audience are placeholders no token is ever validated
-# against: they exist so the AgentSandbox reconciler (ADR-0008) accepts a sandbox naming
-# them and refuses one that does not. The second issuer is the Dex `make kind-dex` runs
+# first issuer is a placeholder no token is ever validated against, and the `e2e`
+# audience is what the tiers' workloads ask for: they exist so the AgentSandbox
+# reconciler (ADR-0008) accepts a sandbox naming them and refuses one that does not.
+# No Entra in kind (ADR-0016 decision 6): both audiences are the STS's. The second issuer is the Dex `make kind-dex` runs
 # (ADR-0013): a session issuer over TLS the broker verifies against the CA that target
 # minted, with the STS signing key from the Secret it created. Refresh material is sealed
 # by the OpenBao `make kind-openbao` runs (ADR-0015): transit over TLS the broker verifies,
@@ -30,7 +31,7 @@ issuers:
     session: { client_id: mediatore }
     ca_file: /etc/mediatore-dex/ca.pem
 audiences:
-  - { name: e2e, via: entra-obo }
+  - { name: e2e, via: sts }
   - { name: e2e-sts, via: sts, max_ttl: 900 }
 sts:
   issuer: https://mediatore.sandbox.test

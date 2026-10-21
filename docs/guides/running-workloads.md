@@ -193,9 +193,10 @@ tokens app-only as well (runbook §4.3: OBO is replaced by app-only tokens with
 scheduled data pulls — where the audit trail should say *the service did this*,
 not a person.
 
-> Not yet implemented: the `roles`-based authorization gate for app-only tokens rides
-> with roadmap 04 (the `required_group` gate already covers `roles` claims
-> structurally, but the app-only downstream issuance path is Entra-OBO-backend work).
+> The `required_group` gate reads `roles` as it reads `groups`, so an app role gates an
+> app-only login. What an app-only principal cannot do is the On-Behalf-Of exchange,
+> which Entra reserves for user principals (ADR-0016): a claim from one gets `sts`
+> tokens, and an `entra-obo` audience for it is refused at the exchange.
 
 ## What "the workload" is
 
@@ -234,14 +235,17 @@ Because nothing inbound reaches the VM, pick one of:
 
 ## Status and caveats
 
-- Implemented today: path A end to end on Dex-shaped issuers, with the session
+- Implemented today: path A end to end on any session issuer (Dex with GitHub, Google, Auth0; [issuers](issuers.md)), with the session
   delegated and refreshed before every issue (ADR-0013, `make check` runs it against
-  the fake issuer's real grants); the SVID legs over SPIFFE mTLS (roadmap 01); the
-  claim as a real `VirtualMachineClaim` behind an `AgentSandbox` (roadmaps 03 and 08);
-  the persistent store (roadmap 05).
-- Still to come: roadmap 04's Entra half (OBO for paths B and C at work, the transit
-  sealer); 02 gives VMs a real SPIRE server to attest to; 06 adds the OCI unpack and
-  the egress allowlist. See [`ROADMAPS.md`](https://github.com/firestoned/mediatore/blob/main/ROADMAPS.md).
+  the fake issuer's real grants); paths A and B on Entra, with the caller's token
+  exchanged On-Behalf-Of and every issue refreshed at Entra (ADR-0016, against the fake
+  issuer playing Entra; [the Entra path](the-entra-path.md) has the live run); the SVID
+  legs over SPIFFE mTLS (roadmap 01); the claim as a real `VirtualMachineClaim` behind
+  an `AgentSandbox` (roadmaps 03 and 08); the persistent store (roadmap 05); the
+  transit sealer (ADR-0015).
+- Still to come: roadmap 04's live run against a tenant; 02 gives VMs a real SPIRE
+  server to attest to; 06 adds the OCI unpack and the egress allowlist. See
+  [`ROADMAPS.md`](https://github.com/firestoned/mediatore/blob/main/ROADMAPS.md).
 - Threat model: the exfiltration window of the 15-minute in-workload token is
   accepted risk R-3; the dial-out pattern narrows what a leaked token can do
   (one audience), and roadmap 07 is the design that removes the window entirely.

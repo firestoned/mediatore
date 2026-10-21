@@ -8,19 +8,25 @@
 //!    signature via JWKS, expiry, and the per-issuer authorisation gate).
 //! 2. For an issuer with a `session`, refresh the delegated upstream session before every
 //!    issue and validate the ID token it returns the same way (ADR-0013).
-//! 3. For the `entra-obo` backend, exchange that token for downstream access tokens (the
-//!    request shape exists; the path is the next slice of roadmap 04).
+//! 3. For an Entra issuer (ADR-0016), exchange the caller's access token On-Behalf-Of at
+//!    claim creation for a refresh token, and before every issue refresh that session for
+//!    the audience's resource, authenticating as the broker with a client assertion
+//!    ([`assertion::ClientAssertion`]).
+
+pub mod assertion;
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
+
+pub use assertion::{ClientAssertion, EntraConfig};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::{DateTime, Utc};
 use jsonwebtoken::jwk::{AlgorithmParameters, EllipticCurve, Jwk, JwkSet};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation};
-use mediatore_proto::Subject;
+use mediatore_proto::{Secret, Subject};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
@@ -45,6 +51,11 @@ pub struct SessionConfig {
     /// The OAuth client the refresh token was issued to; `mediatore login` uses
     /// mediatore's own public client, so this is normally the issuer's `client_id`.
     pub client_id: String,
+    /// A file holding the client's secret, for an issuer whose token endpoint wants one
+    /// even from a public client (Google's installed-app clients, ADR-0017). Not a
+    /// credential anyone relies on; read at startup (`Validator::with_session_secret`).
+    #[serde(default)]
+    pub client_secret_file: Option<std::path::PathBuf>,
 }
 
 /// One trusted issuer, from config.
@@ -62,9 +73,19 @@ pub struct IssuerConfig {
     /// A group the token must carry (Dex `groups`, Entra `groups`/`roles`); none = no gate.
     #[serde(default)]
     pub required_group: Option<String>,
+    /// The claim that carries the groups, when it is not `groups` or `roles`: Auth0 puts
+    /// them under a namespaced claim such as `https://example.com/groups` (ADR-0017).
+    /// When set, only that claim is read.
+    #[serde(default)]
+    pub groups_claim: Option<String>,
     /// Set when claims from this issuer must delegate a refresh token (ADR-0013).
     #[serde(default)]
     pub session: Option<SessionConfig>,
+    /// Set for an Entra issuer (`backend: entra-obo`, ADR-0016): the broker's credential
+    /// for the On-Behalf-Of exchange and the refreshes. Exclusive with `session`: the
+    /// Entra session comes from the exchange, not from the caller.
+    #[serde(default)]
+    pub entra: Option<EntraConfig>,
     /// A PEM file with the CA certificates that sign this issuer's TLS certificate, for an
     /// issuer on a private PKI. When set, discovery, JWKS and token requests to this issuer
     /// trust exactly those certificates and not the public roots. Read at startup
@@ -92,10 +113,15 @@ pub enum IdpError {
     /// Upstream HTTP failure.
     #[error("upstream: {0}")]
     Upstream(String),
-    /// The issuer refused to refresh the session (`invalid_grant`): revoked upstream, or
-    /// the user is gone. A revocation, not an outage.
+    /// The issuer refused to refresh or exchange the session (`invalid_grant`, or Entra's
+    /// `interaction_required` and `consent_required`): revoked upstream, the user is gone,
+    /// or a policy now needs the user. A revocation, not an outage.
     #[error("session revoked upstream: {0}")]
     SessionRevoked(String),
+    /// The broker's own credential at the issuer is unusable: a key or certificate file,
+    /// the transit key, the federated token. The broker's fault, never the caller's.
+    #[error("client credential: {0}")]
+    Credential(String),
     /// Feature not wired yet.
     #[error("not implemented: {0}")]
     NotImplemented(&'static str),
@@ -151,6 +177,24 @@ pub struct Refreshed {
     pub refresh_token: String,
 }
 
+/// What an Entra refresh yields (ADR-0016 decision 2).
+#[derive(Debug)]
+pub struct EntraRefreshed {
+    /// The refresh token to keep: the rotated one, or the one just used.
+    pub refresh_token: Secret,
+    /// The access token for the resource asked for.
+    pub access_token: Secret,
+    /// When that access token expires, from Entra's `expires_in`.
+    pub expires_at: DateTime<Utc>,
+    /// Set when the resource was mediatore itself: the access token validated exactly
+    /// like a login (signature, issuer, audience, the group gate, the subject).
+    pub validated: Option<Validated>,
+}
+
+/// The errors Entra answers a refusal with. Everything else is an outage or the broker's
+/// own misconfiguration, and revokes nothing.
+const REFUSALS: &[&str] = &["invalid_grant", "interaction_required", "consent_required"];
+
 /// Validates upstream tokens against a configured set of issuers.
 #[derive(Clone)]
 pub struct Validator {
@@ -158,6 +202,10 @@ pub struct Validator {
     http: reqwest::Client,
     /// Per-issuer clients over a private CA (`IssuerConfig::ca_file`), keyed by issuer URL.
     pinned: HashMap<String, reqwest::Client>,
+    /// Per-issuer client assertions (`IssuerConfig::entra`), keyed by issuer URL.
+    assertions: HashMap<String, Arc<ClientAssertion>>,
+    /// Per-issuer client secrets for the refresh grant (`SessionConfig::client_secret_file`).
+    session_secrets: HashMap<String, Secret>,
     jwks: Arc<RwLock<HashMap<String, CachedIssuer>>>,
 }
 
@@ -210,8 +258,25 @@ impl Validator {
                 .build()
                 .expect("reqwest client over the workspace TLS config"),
             pinned: HashMap::new(),
+            assertions: HashMap::new(),
+            session_secrets: HashMap::new(),
             jwks: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Send `secret` as `client_secret` on every refresh at the issuer at `url`
+    /// (ADR-0017): what Google's token endpoint wants from an installed-app client.
+    #[must_use]
+    pub fn with_session_secret(mut self, url: &str, secret: Secret) -> Self {
+        self.session_secrets.insert(url.to_owned(), secret);
+        self
+    }
+
+    /// Authenticate as the broker at the issuer at `url` with `assertion` (ADR-0016).
+    #[must_use]
+    pub fn with_client_assertion(mut self, url: &str, assertion: ClientAssertion) -> Self {
+        self.assertions.insert(url.to_owned(), Arc::new(assertion));
+        self
     }
 
     /// Trust exactly the CA certificates in `pem` for the issuer at `url` (its
@@ -354,11 +419,14 @@ impl Validator {
             .as_ref()
             .ok_or(IdpError::NotImplemented("issuer takes no session"))?;
         let endpoint = self.token_endpoint_for(&issuer.url).await?;
-        let form = [
+        let mut form = vec![
             ("grant_type", "refresh_token"),
             ("refresh_token", refresh_token),
             ("client_id", session.client_id.as_str()),
         ];
+        if let Some(secret) = self.session_secrets.get(&issuer.url) {
+            form.push(("client_secret", secret.0.as_str()));
+        }
         let resp = self
             .http_for(&issuer.url)
             .post(&endpoint)
@@ -398,6 +466,149 @@ impl Validator {
         })
     }
 
+    /// The client assertion for an Entra issuer, signed now for its token endpoint.
+    async fn client_assertion(
+        &self,
+        issuer: &IssuerConfig,
+        endpoint: &str,
+    ) -> Result<String, IdpError> {
+        let assertion = self.assertions.get(&issuer.url).ok_or_else(|| {
+            IdpError::Credential(format!("issuer {} has no client assertion", issuer.url))
+        })?;
+        assertion.assert(&issuer.client_id, endpoint).await
+    }
+
+    /// One call to the token endpoint. A 4xx with one of Entra's refusal codes is
+    /// [`IdpError::SessionRevoked`]; anything else that is not a success is
+    /// [`IdpError::Upstream`].
+    async fn post_token(
+        &self,
+        issuer: &IssuerConfig,
+        endpoint: &str,
+        what: &str,
+        form: &[(&str, &str)],
+    ) -> Result<serde_json::Value, IdpError> {
+        let resp = self
+            .http_for(&issuer.url)
+            .post(endpoint)
+            .form(form)
+            .send()
+            .await
+            .map_err(|e| IdpError::Upstream(format!("{what}: {e}")))?;
+        let status = resp.status();
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| IdpError::Upstream(format!("{what}: {e}")))?;
+        if !status.is_success() {
+            let code = body
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned();
+            if status.is_client_error() && REFUSALS.contains(&code.as_str()) {
+                return Err(IdpError::SessionRevoked(code));
+            }
+            return Err(IdpError::Upstream(format!("{what}: {status} {code}")));
+        }
+        Ok(body)
+    }
+
+    /// The On-Behalf-Of exchange (ADR-0016 decision 1): the caller's access token for
+    /// mediatore becomes a refresh token issued to mediatore for that user, good for every
+    /// resource the user consented to. `resource` is the first audience the claim names
+    /// that Entra serves, or mediatore's own client id. Nothing else from the response is
+    /// kept.
+    pub async fn exchange(
+        &self,
+        issuer: &IssuerConfig,
+        access_token: &str,
+        resource: &str,
+    ) -> Result<Secret, IdpError> {
+        if issuer.entra.is_none() {
+            return Err(IdpError::NotImplemented("issuer is not Entra"));
+        }
+        let endpoint = self.token_endpoint_for(&issuer.url).await?;
+        let assertion = self.client_assertion(issuer, &endpoint).await?;
+        let scope = format!("offline_access {resource}/.default");
+        let form = [
+            ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
+            ("client_id", issuer.client_id.as_str()),
+            (
+                "client_assertion_type",
+                "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+            ),
+            ("client_assertion", assertion.as_str()),
+            ("assertion", access_token),
+            ("scope", scope.as_str()),
+            ("requested_token_use", "on_behalf_of"),
+        ];
+        let body = self
+            .post_token(issuer, &endpoint, "exchange", &form)
+            .await?;
+        body.get("refresh_token")
+            .and_then(|v| v.as_str())
+            .map(|t| Secret(t.to_owned()))
+            .ok_or_else(|| IdpError::Upstream("exchange: no refresh_token in the response".into()))
+    }
+
+    /// Refresh an Entra session for `resource` (ADR-0016 decision 2): the `refresh_token`
+    /// grant with the client assertion and `scope=offline_access <resource>/.default`
+    /// (`offline_access` so a rotated refresh token comes back, as MSAL asks on every
+    /// request). When the resource is mediatore itself the access token is validated like
+    /// a login and returned with its claims; for any other resource it is handed back
+    /// unread.
+    pub async fn refresh_entra(
+        &self,
+        issuer: &IssuerConfig,
+        refresh_token: &str,
+        resource: &str,
+    ) -> Result<EntraRefreshed, IdpError> {
+        if issuer.entra.is_none() {
+            return Err(IdpError::NotImplemented("issuer is not Entra"));
+        }
+        let endpoint = self.token_endpoint_for(&issuer.url).await?;
+        let assertion = self.client_assertion(issuer, &endpoint).await?;
+        let scope = format!("offline_access {resource}/.default");
+        let form = [
+            ("grant_type", "refresh_token"),
+            ("client_id", issuer.client_id.as_str()),
+            (
+                "client_assertion_type",
+                "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+            ),
+            ("client_assertion", assertion.as_str()),
+            ("refresh_token", refresh_token),
+            ("scope", scope.as_str()),
+        ];
+        let body = self.post_token(issuer, &endpoint, "refresh", &form).await?;
+        let access_token = body
+            .get("access_token")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| IdpError::Upstream("refresh: no access_token in the response".into()))?
+            .to_owned();
+        let expires_in = body
+            .get("expires_in")
+            .and_then(serde_json::Value::as_i64)
+            .ok_or_else(|| IdpError::Upstream("refresh: no expires_in in the response".into()))?;
+        let validated = if resource == issuer.client_id {
+            Some(self.validate_as(issuer, &access_token).await?)
+        } else {
+            None
+        };
+        let refresh_token = body
+            .get("refresh_token")
+            .and_then(|v| v.as_str())
+            .unwrap_or(refresh_token)
+            .to_owned();
+        Ok(EntraRefreshed {
+            refresh_token: Secret(refresh_token),
+            access_token: Secret(access_token),
+            expires_at: Utc::now() + chrono::Duration::seconds(expires_in),
+            validated,
+        })
+    }
+
     /// [`Self::validate`] against one known issuer.
     async fn validate_as(&self, issuer: &IssuerConfig, token: &str) -> Result<Validated, IdpError> {
         tracing::debug!(issuer = %issuer.url, backend = ?issuer.backend, "validating upstream token");
@@ -420,8 +631,13 @@ impl Validator {
             .ok_or_else(|| IdpError::Invalid(format!("missing claim {}", issuer.subject_claim)))?
             .to_owned();
 
-        let mut groups = string_array(&claims, "groups");
-        groups.extend(string_array(&claims, "roles"));
+        let groups = if let Some(claim) = &issuer.groups_claim {
+            string_array(&claims, claim)
+        } else {
+            let mut groups = string_array(&claims, "groups");
+            groups.extend(string_array(&claims, "roles"));
+            groups
+        };
         if let Some(required) = &issuer.required_group
             && !groups.iter().any(|g| g == required)
         {
@@ -450,88 +666,6 @@ impl Validator {
             groups,
             expires_at,
         })
-    }
-}
-
-/// Entra On-Behalf-Of exchange.
-#[derive(Debug, Clone)]
-pub struct Obo {
-    tenant_id: String,
-    client_id: String,
-    http: reqwest::Client,
-}
-
-/// Result of an OBO or refresh call.
-#[derive(Debug, Clone, Deserialize)]
-pub struct Exchanged {
-    /// Access token for the requested scope.
-    pub access_token: String,
-    /// Seconds until expiry.
-    pub expires_in: i64,
-    /// Refresh token, present when `offline_access` was granted. Store encrypted, never return.
-    #[serde(default)]
-    pub refresh_token: Option<String>,
-}
-
-impl Obo {
-    /// Construct for a tenant and our app id. The client assertion signer is injected per call.
-    ///
-    /// # Panics
-    /// If `reqwest` cannot build a client over the workspace TLS config, which would be a
-    /// broken build rather than a runtime condition.
-    #[must_use]
-    pub fn new(tenant_id: impl Into<String>, client_id: impl Into<String>) -> Self {
-        Self {
-            tenant_id: tenant_id.into(),
-            client_id: client_id.into(),
-            http: reqwest::Client::builder()
-                .use_preconfigured_tls(mediatore_proto::tls::https_client_config())
-                .build()
-                .expect("reqwest client over the workspace TLS config"),
-        }
-    }
-
-    /// Token endpoint for this tenant.
-    #[must_use]
-    pub fn token_endpoint(&self) -> String {
-        format!(
-            "https://login.microsoftonline.com/{}/oauth2/v2.0/token",
-            self.tenant_id
-        )
-    }
-
-    /// `grant_type=jwt-bearer` with `requested_token_use=on_behalf_of`.
-    pub async fn exchange(
-        &self,
-        user_assertion: &str,
-        client_assertion: &str,
-        scope: &str,
-    ) -> Result<Exchanged, IdpError> {
-        let form = [
-            ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
-            ("client_id", self.client_id.as_str()),
-            (
-                "client_assertion_type",
-                "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
-            ),
-            ("client_assertion", client_assertion),
-            ("assertion", user_assertion),
-            ("scope", scope),
-            ("requested_token_use", "on_behalf_of"),
-        ];
-        let resp = self
-            .http
-            .post(self.token_endpoint())
-            .form(&form)
-            .send()
-            .await
-            .map_err(|e| IdpError::Upstream(e.to_string()))?;
-        if !resp.status().is_success() {
-            return Err(IdpError::Upstream(format!("obo: {}", resp.status())));
-        }
-        resp.json::<Exchanged>()
-            .await
-            .map_err(|e| IdpError::Upstream(e.to_string()))
     }
 }
 
@@ -570,8 +704,11 @@ mod tests {
             required_group: Some("firestoned:sandbox-users".into()),
             session: Some(SessionConfig {
                 client_id: "mediatore".into(),
+                client_secret_file: None,
             }),
             ca_file: None,
+            entra: None,
+            groups_claim: None,
         }
     }
 
@@ -721,5 +858,154 @@ mod tests {
     async fn garbage_is_invalid() {
         let v = Validator::new(vec![]);
         assert!(v.validate("not-a-jwt").await.is_err());
+    }
+
+    /// An Entra-shaped issuer: `entra-obo`, the fixed certificate registered, `oid`.
+    const ENTRA_CLIENT: &str = "00001111-aaaa-2222-bbbb-3333cccc4444";
+
+    async fn entra(idp: &FakeIdp) -> (IssuerConfig, Validator) {
+        let dir = mediatore_testkit::tempdir();
+        let (key, cert) = mediatore_testkit::entra::write_client_credential(&dir);
+        idp.register_client_certificate(
+            ENTRA_CLIENT,
+            &mediatore_testkit::entra::client_credential().certificate_pem,
+        );
+        let cfg = EntraConfig {
+            certificate_file: Some(cert),
+            key_file: Some(key),
+            ..Default::default()
+        };
+        let issuer = IssuerConfig {
+            url: idp.issuer.clone(),
+            backend: Backend::EntraObo,
+            client_id: ENTRA_CLIENT.into(),
+            subject_claim: "oid".into(),
+            required_group: Some("firestoned:sandbox-users".into()),
+            session: None,
+            ca_file: None,
+            entra: Some(cfg.clone()),
+            groups_claim: None,
+        };
+        let assertion = ClientAssertion::build(&cfg).await.unwrap();
+        let v = Validator::new(vec![issuer.clone()]).with_client_assertion(&idp.issuer, assertion);
+        (issuer, v)
+    }
+
+    #[tokio::test]
+    async fn the_exchange_yields_a_session_good_for_mediatore_and_for_the_audience() {
+        let idp = FakeIdp::start().await;
+        let (issuer, v) = entra(&idp).await;
+        let bearer = idp.access_token("octocat", ENTRA_CLIENT);
+        let session = v
+            .exchange(&issuer, &bearer, "api://trading-data")
+            .await
+            .unwrap();
+        assert_eq!(idp.exchanges(), 1);
+        assert!(idp.is_live(&session.0));
+        assert!(
+            !format!("{session:?}").contains(&session.0),
+            "the refresh token has a redacting Debug"
+        );
+
+        // For mediatore itself: validated like a login, groups included.
+        let own = v
+            .refresh_entra(&issuer, &session.0, ENTRA_CLIENT)
+            .await
+            .unwrap();
+        let validated = own.validated.unwrap();
+        assert_eq!(validated.subject.id, "octocat");
+        assert_eq!(validated.groups, vec!["firestoned:sandbox-users"]);
+        assert_ne!(own.refresh_token.0, session.0, "rotated");
+        assert!(!idp.is_live(&session.0));
+        assert!(own.expires_at > Utc::now() + chrono::Duration::minutes(55));
+
+        // For the audience: Entra's token, unread.
+        let downstream = v
+            .refresh_entra(&issuer, &own.refresh_token.0, "api://trading-data")
+            .await
+            .unwrap();
+        assert!(downstream.validated.is_none());
+        assert!(downstream.access_token.0.starts_with("at-"));
+        assert_eq!(
+            idp.refresh_scopes(),
+            vec![
+                format!("offline_access {ENTRA_CLIENT}/.default"),
+                "offline_access api://trading-data/.default".to_owned()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn entra_refusals_are_revocations_and_everything_else_is_an_outage() {
+        let idp = FakeIdp::start().await;
+        let (issuer, v) = entra(&idp).await;
+        let bearer = idp.access_token("octocat", ENTRA_CLIENT);
+        let session = v
+            .exchange(&issuer, &bearer, "api://trading-data")
+            .await
+            .unwrap();
+        idp.set_interaction_required("octocat", true);
+        assert!(matches!(
+            v.refresh_entra(&issuer, &session.0, ENTRA_CLIENT).await,
+            Err(IdpError::SessionRevoked(ref c)) if c == "interaction_required"
+        ));
+        assert!(matches!(
+            v.exchange(&issuer, &bearer, "api://trading-data").await,
+            Err(IdpError::SessionRevoked(_))
+        ));
+        idp.set_interaction_required("octocat", false);
+        // The fake spends a refresh token on any grant, refused or not (Entra keeps it);
+        // a fresh session for what follows.
+        let (_, session) = idp.session("octocat", ENTRA_CLIENT);
+        idp.set_down(true);
+        assert!(matches!(
+            v.refresh_entra(&issuer, &session, ENTRA_CLIENT).await,
+            Err(IdpError::Upstream(_))
+        ));
+        idp.set_down(false);
+        // A fresh token that left the group fails the gate on the self refresh only.
+        idp.set_groups("octocat", &["firestoned:other"]);
+        assert!(
+            v.refresh_entra(&issuer, &session, "api://trading-data")
+                .await
+                .is_ok()
+        );
+        let (_, again) = idp.session("octocat", ENTRA_CLIENT);
+        assert!(matches!(
+            v.refresh_entra(&issuer, &again, ENTRA_CLIENT).await,
+            Err(IdpError::Forbidden(_))
+        ));
+        // The exchange needs an access token for mediatore: an ID token for another app
+        // does not validate at the login and would not exchange either.
+        let foreign = idp.token(serde_json::json!({ "aud": "another-app", "oid": "octocat" }));
+        assert!(matches!(
+            v.exchange(&issuer, &foreign, "api://trading-data").await,
+            Err(IdpError::SessionRevoked(ref c)) if c == "invalid_grant"
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_issuer_without_entra_cannot_exchange_and_one_without_an_assertion_is_a_credential_error()
+     {
+        let idp = FakeIdp::start().await;
+        let dex = issuer_config(&idp);
+        let v = Validator::new(vec![dex.clone()]);
+        assert!(matches!(
+            v.exchange(&dex, "t", "r").await,
+            Err(IdpError::NotImplemented(_))
+        ));
+        assert!(matches!(
+            v.refresh_entra(&dex, "t", "r").await,
+            Err(IdpError::NotImplemented(_))
+        ));
+        let mut entra = dex.clone();
+        entra.backend = Backend::EntraObo;
+        entra.session = None;
+        entra.entra = Some(EntraConfig::default());
+        let v = Validator::new(vec![entra.clone()]);
+        assert!(matches!(
+            v.exchange(&entra, "t", "r").await,
+            Err(IdpError::Credential(_))
+        ));
     }
 }

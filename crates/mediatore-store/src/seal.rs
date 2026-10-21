@@ -12,8 +12,7 @@
 //! holds a derived key, the binding UID is the derivation context, and the broker holds
 //! only a short-lived `OpenBao` token it obtained with its `ServiceAccount`.
 
-use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::path::Path;
 
 use async_trait::async_trait;
 use aws_lc_rs::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
@@ -177,77 +176,36 @@ impl Sealer for LocalKeySealer {
     }
 }
 
-/// `OpenBao` transit, as configuration (`store.sealing.transit`, ADR-0015).
-#[derive(Debug, Clone, Deserialize)]
-pub struct TransitConfig {
-    /// `https://openbao.example:8200`; `http` only under `dev_mode`.
-    pub url: String,
-    /// PEM file with the CA certificates `OpenBao`'s certificate chains to; when set,
-    /// nothing else is trusted for it.
-    #[serde(default)]
-    pub ca_file: Option<PathBuf>,
-    /// The transit engine's mount path (default `transit`).
-    #[serde(default = "default_mount")]
-    pub mount: String,
-    /// The derived transit key the envelopes are sealed under.
-    pub key: String,
-    /// The Kubernetes auth role the broker logs in as.
-    pub role: String,
-    /// The projected `ServiceAccount` token (audience `openbao`) presented at login
-    /// (default `/var/run/secrets/openbao/token`). Read at every login, since it rotates.
-    #[serde(default = "default_token_file")]
-    pub token_file: PathBuf,
-}
-
-fn default_mount() -> String {
-    "transit".to_owned()
-}
-fn default_token_file() -> PathBuf {
-    PathBuf::from("/var/run/secrets/openbao/token")
-}
-
-/// How long before its lease ends a token is exchanged again.
-const TOKEN_RENEW_MARGIN: Duration = Duration::from_secs(60);
-
-struct TransitToken {
-    value: String,
-    expires_at: Instant,
-}
+pub use mediatore_openbao::TransitConfig;
 
 /// Envelopes sealed by `OpenBao` transit under a derived key, the binding UID as context.
 pub struct TransitSealer {
-    http: reqwest::Client,
-    base: String,
-    mount: String,
+    client: mediatore_openbao::Client,
     key: String,
-    role: String,
-    token_file: PathBuf,
     key_id: String,
-    token: tokio::sync::Mutex<Option<TransitToken>>,
 }
 
 impl std::fmt::Debug for TransitSealer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TransitSealer")
-            .field("base", &self.base)
+            .field("client", &self.client)
+            .field("key", &self.key)
             .field("key_id", &self.key_id)
-            .finish_non_exhaustive()
+            .finish()
     }
 }
 
-/// An `OpenBao` error body: `{"errors": ["..."]}`.
-fn openbao_errors(body: &str) -> String {
-    serde_json::from_str::<serde_json::Value>(body)
-        .ok()
-        .and_then(|v| {
-            v.get("errors").and_then(|e| e.as_array()).map(|e| {
-                e.iter()
-                    .filter_map(|m| m.as_str())
-                    .collect::<Vec<_>>()
-                    .join("; ")
-            })
-        })
-        .unwrap_or_else(|| body.chars().take(200).collect())
+impl From<mediatore_openbao::Error> for SealError {
+    fn from(e: mediatore_openbao::Error) -> Self {
+        use mediatore_openbao::Error;
+        match e {
+            Error::Unavailable(why) => SealError::Unavailable(why),
+            Error::Denied(why) | Error::Config(why) => SealError::Key(why),
+            // A 400 is OpenBao refusing the operation: a bad context, a tampered or
+            // retired ciphertext, a missing key. Nothing to retry.
+            Error::Rejected(_) => SealError::Rejected,
+        }
+    }
 }
 
 impl TransitSealer {
@@ -255,30 +213,11 @@ impl TransitSealer {
     /// probe under a random binding, so a wrong URL, CA, role, policy, mount, key or a key
     /// created without derivation fails here, not at the first claim.
     pub async fn connect(cfg: &TransitConfig) -> Result<Self, SealError> {
-        mediatore_proto::tls::ensure_provider();
-        let tls = match &cfg.ca_file {
-            Some(path) => {
-                let pem = std::fs::read(path).map_err(|e| {
-                    SealError::Key(format!("transit ca_file {}: {e}", path.display()))
-                })?;
-                mediatore_proto::tls::https_client_config_with_ca(&pem)
-                    .map_err(|e| SealError::Key(format!("transit ca_file: {e}")))?
-            }
-            None => mediatore_proto::tls::https_client_config(),
-        };
-        let http = reqwest::Client::builder()
-            .use_preconfigured_tls(tls)
-            .build()
-            .map_err(|e| SealError::Key(format!("transit client: {e}")))?;
+        let client = mediatore_openbao::Client::connect(cfg).await?;
         let sealer = Self {
-            http,
-            base: cfg.url.trim_end_matches('/').to_owned(),
-            mount: cfg.mount.trim_matches('/').to_owned(),
+            key_id: format!("transit:{}/{}", client.mount(), cfg.key),
+            client,
             key: cfg.key.clone(),
-            role: cfg.role.clone(),
-            token_file: cfg.token_file.clone(),
-            key_id: format!("transit:{}/{}", cfg.mount.trim_matches('/'), cfg.key),
-            token: tokio::sync::Mutex::new(None),
         };
         let probe = Uuid::new_v4();
         let envelope = sealer.seal(probe, b"probe").await?;
@@ -294,115 +233,12 @@ impl TransitSealer {
         Ok(sealer)
     }
 
-    /// `POST auth/kubernetes/login` with the projected token, read now.
-    async fn login(&self) -> Result<TransitToken, SealError> {
-        let jwt = std::fs::read_to_string(&self.token_file).map_err(|e| {
-            SealError::Key(format!(
-                "transit token_file {}: {e}",
-                self.token_file.display()
-            ))
-        })?;
-        let resp = self
-            .http
-            .post(format!("{}/v1/auth/kubernetes/login", self.base))
-            .json(&serde_json::json!({ "role": self.role, "jwt": jwt.trim() }))
-            .send()
-            .await
-            .map_err(|e| SealError::Unavailable(format!("login: {e}")))?;
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        if status.is_server_error() {
-            return Err(SealError::Unavailable(format!(
-                "login: {status}: {}",
-                openbao_errors(&body)
-            )));
-        }
-        if !status.is_success() {
-            return Err(SealError::Key(format!(
-                "login refused: {status}: {}",
-                openbao_errors(&body)
-            )));
-        }
-        let v: serde_json::Value = serde_json::from_str(&body)
-            .map_err(|e| SealError::Unavailable(format!("login: {e}")))?;
-        let auth = v
-            .get("auth")
-            .ok_or_else(|| SealError::Key("login: no auth in reply".into()))?;
-        let value = auth
-            .get("client_token")
-            .and_then(|t| t.as_str())
-            .ok_or_else(|| SealError::Key("login: no client_token".into()))?
-            .to_owned();
-        let lease = auth
-            .get("lease_duration")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0);
-        Ok(TransitToken {
-            value,
-            expires_at: Instant::now() + Duration::from_secs(lease),
-        })
-    }
-
-    /// The cached token, exchanged again when it is about to expire or `force` is set.
-    async fn token(&self, force: bool) -> Result<String, SealError> {
-        let mut slot = self.token.lock().await;
-        let stale = slot.as_ref().is_none_or(|t| {
-            t.expires_at.saturating_duration_since(Instant::now()) < TOKEN_RENEW_MARGIN
-        });
-        if force || stale {
-            *slot = Some(self.login().await?);
-        }
-        Ok(slot.as_ref().map(|t| t.value.clone()).unwrap_or_default())
-    }
-
-    /// One transit call; a 403 is retried once after a fresh login, since the token may
-    /// have been revoked or expired early.
     async fn call(
         &self,
         op: &str,
         body: serde_json::Value,
     ) -> Result<serde_json::Value, SealError> {
-        let url = format!("{}/v1/{}/{op}/{}", self.base, self.mount, self.key);
-        let mut force = false;
-        for _ in 0..2 {
-            let token = self.token(force).await?;
-            let resp = self
-                .http
-                .post(&url)
-                .header("X-Vault-Token", token)
-                .json(&body)
-                .send()
-                .await
-                .map_err(|e| SealError::Unavailable(format!("{op}: {e}")))?;
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            if status == reqwest::StatusCode::FORBIDDEN && !force {
-                force = true;
-                continue;
-            }
-            if status.is_server_error() {
-                return Err(SealError::Unavailable(format!(
-                    "{op}: {status}: {}",
-                    openbao_errors(&text)
-                )));
-            }
-            if status == reqwest::StatusCode::FORBIDDEN {
-                return Err(SealError::Key(format!(
-                    "{op}: permission denied: {}",
-                    openbao_errors(&text)
-                )));
-            }
-            if !status.is_success() {
-                // A 400 is OpenBao refusing the operation: a bad context, a tampered or
-                // retired ciphertext, a missing key. Nothing to retry.
-                return Err(SealError::Rejected);
-            }
-            return serde_json::from_str(&text)
-                .map_err(|e| SealError::Unavailable(format!("{op}: {e}")));
-        }
-        Err(SealError::Key(format!(
-            "{op}: permission denied after a fresh login"
-        )))
+        Ok(self.client.call(op, &self.key, body).await?)
     }
 }
 
@@ -510,19 +346,6 @@ mod tests {
         let b = s.seal(uid, b"x").await.unwrap();
         assert_ne!(a.nonce, b.nonce);
         assert_ne!(a.ciphertext, b.ciphertext);
-    }
-
-    #[test]
-    fn the_transit_config_defaults_to_the_transit_mount_and_the_projected_token() {
-        let cfg: TransitConfig = serde_json::from_value(serde_json::json!({
-            "url": "https://openbao.home.example:8200",
-            "key": "mediatore",
-            "role": "mediatore"
-        }))
-        .unwrap();
-        assert_eq!(cfg.mount, "transit");
-        assert_eq!(cfg.token_file, Path::new("/var/run/secrets/openbao/token"));
-        assert!(cfg.ca_file.is_none());
     }
 
     #[test]

@@ -7,6 +7,7 @@
 //! Every type here is versioned together with [`API_VERSION`]. Breaking changes to any of
 //! them are a new API version, never a silent edit.
 
+pub mod cert;
 pub mod ek;
 pub mod tls;
 

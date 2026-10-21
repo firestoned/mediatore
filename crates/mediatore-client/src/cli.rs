@@ -75,9 +75,30 @@ pub struct LoginArgs {
     /// given, nothing else is trusted
     #[arg(long)]
     pub ca_file: Option<PathBuf>,
+    /// A scope to request (repeatable); the default set is `openid profile email groups
+    /// offline_access`, which Dex, Auth0 and Entra take. Google takes no `offline_access`
+    #[arg(long = "scope")]
+    pub scopes: Vec<String>,
+    /// An extra parameter on the authorization request, `key=value` (repeatable): Google
+    /// wants `access_type=offline` and `prompt=consent` for a refresh token, Auth0 may
+    /// want `audience=...`
+    #[arg(long = "auth-param", value_parser = parse_auth_param)]
+    pub auth_params: Vec<(String, String)>,
+    /// A file holding the client secret the issuer's token endpoint wants even from this
+    /// public client (Google's installed-app clients)
+    #[arg(long)]
+    pub client_secret_file: Option<PathBuf>,
     /// The session file.
     #[command(flatten)]
     pub session: SessionFile,
+}
+
+/// `key=value` for `--auth-param`.
+fn parse_auth_param(s: &str) -> Result<(String, String), String> {
+    match s.split_once('=') {
+        Some((k, v)) if !k.is_empty() => Ok((k.to_owned(), v.to_owned())),
+        _ => Err(format!("expected key=value, got {s:?}")),
+    }
 }
 
 /// The `sandbox` subcommands.
@@ -187,10 +208,25 @@ async fn login(args: LoginArgs) -> anyhow::Result<()> {
         }
         None => None,
     };
+    let client_secret = match &args.client_secret_file {
+        Some(p) => Some(
+            std::fs::read_to_string(p)
+                .map_err(|e| anyhow::anyhow!("--client-secret-file {}: {e}", p.display()))?
+                .trim()
+                .to_owned(),
+        ),
+        None => None,
+    };
     let opts = LoginOptions {
         issuer: args.issuer,
         client_id: args.client_id,
-        scopes: LoginOptions::default_scopes(),
+        scopes: if args.scopes.is_empty() {
+            LoginOptions::default_scopes()
+        } else {
+            args.scopes
+        },
+        extra_params: args.auth_params,
+        client_secret,
         login_hint: args.login_hint,
         ca_pem,
     };
