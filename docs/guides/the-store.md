@@ -134,6 +134,13 @@ took (a refused or deleted sandbox) is removed by the reconciler, and anything o
 an hour is swept at resync. An issuer with a `session` block and no `sealing` section refuses
 to start.
 
+An Entra issuer ([ADR-0016](../adr/0016-entra-on-behalf-of.md), [the Entra
+path](the-entra-path.md)) fills the same envelope from the other direction: nothing is
+delegated by the caller, the bearer is exchanged On-Behalf-Of at claim creation and the
+refresh token Entra issues to mediatore is what gets sealed. Every issue refreshes it for
+the audience's resource and re-seals what comes back. An issuer with an `entra` block
+needs a `sealing` section for the same reason.
+
 ## Retention and the audit table
 
 A claim row outlives its claim by `retention_secs` (default one hour). At every resync

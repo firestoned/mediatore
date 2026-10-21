@@ -10,8 +10,8 @@
     {
       "unique-id": "ecosystem-idp",
       "node-type": "ecosystem",
-      "name": "Identity Provider (Entra ID / Dex)",
-      "description": "Upstream OIDC issuer. At work: Entra ID, which also performs On-Behalf-Of exchange. In the homelab: Dex bridging GitHub, login only; mediatore's own STS stands in for delegation (ADR-0003)."
+      "name": "Identity Provider (Dex, Google, Auth0, Entra ID)",
+      "description": "Upstream OIDC issuer, any the configuration names (ADR-0017): Dex bridging GitHub or LDAP, Google, Auth0, all on the session path (a public PKCE client, the refresh grant before every issue, ADR-0013); Entra ID also performs the On-Behalf-Of exchange (ADR-0016): the caller's access token for mediatore is exchanged at claim creation for a refresh token issued to mediatore for that user, and every token issue is a refresh_token grant naming the audience's resource. mediatore's own STS stands in for delegation on issuers without one (ADR-0003)."
     },
     {
       "unique-id": "system-mediatore",
@@ -65,7 +65,7 @@
       "unique-id": "service-openbao",
       "node-type": "service",
       "name": "OpenBao (transit)",
-      "description": "Encryption as a service for the refresh envelopes (ADR-0015): the transit engine holds the derived sealing key, encrypts and decrypts on request with the binding UID as context, authorises every call by a token it issued to the broker's ServiceAccount (Kubernetes auth, audience openbao) and rotates the key in place. Reached over TLS the broker verifies against a configured CA. In kind: make kind-openbao."
+      "description": "Encryption as a service for the refresh envelopes (ADR-0015): the transit engine holds the derived sealing key, encrypts and decrypts on request with the binding UID as context, authorises every call by a token it issued to the broker's ServiceAccount (Kubernetes auth, audience openbao) and rotates the key in place. Since ADR-0016 the same engine may hold the RSA key that signs the broker's client assertion for Entra (transit sign, PSS), so the credential that lets mediatore act as itself at Entra never enters the process. Reached over TLS the broker verifies against a configured CA. In kind: make kind-openbao."
     },
     {
       "unique-id": "data-asset-sts-signing-key",
@@ -293,7 +293,7 @@
     },
     {
       "unique-id": "rel-mediatore-idp",
-      "description": "JWKS discovery and signature validation for incoming tokens; for a session issuer (ADR-0013, built), a refresh_token grant before every token issue, as mediatore's own public client: the fresh ID token is validated like a login (group gate included), the rotated refresh token re-sealed into the record, and invalid_grant releases the claim at once. Entra On-Behalf-Of exchange for the entra-obo backend (next slice of roadmap 04). The user's original token is discarded after validation.",
+      "description": "JWKS discovery and signature validation for incoming tokens; for a session issuer (ADR-0013, built), a refresh_token grant before every token issue, as mediatore's own public client: the fresh ID token is validated like a login (group gate included), the rotated refresh token re-sealed into the record, and invalid_grant releases the claim at once. For an Entra issuer (ADR-0016, built): the On-Behalf-Of exchange of the caller's access token at claim creation (offline_access, the first entra-obo audience or mediatore's own resource), mediatore authenticating with a PS256 client assertion signed by a key file, by OpenBao transit, or presented as a projected ServiceAccount token under workload identity federation; before every issue a refresh_token grant naming the audience's resource, a token for mediatore itself validated like a login for an sts audience, Entra's token handed to the workload as is for an entra-obo audience. The user's original token is discarded after validation.",
       "relationship-type": {
         "connects": {
           "source": {
@@ -540,7 +540,7 @@
     },
     {
       "unique-id": "rel-mediatore-openbao-transit",
-      "description": "Seal and unseal of refresh material (ADR-0015): encrypt when a session is parked at claim creation, decrypt and encrypt again on every token issue (the refresh of ADR-0013), under a derived transit key with the sandbox UID as context. The broker logs in with its projected ServiceAccount token (audience openbao) and keeps the OpenBao token in memory until its lease ends. TLS 1.3 verified against store.sealing.transit.ca_file; a probe seal at startup fails the process on a wrong role, policy or key.",
+      "description": "Seal and unseal of refresh material (ADR-0015): encrypt when a session is parked at claim creation, decrypt and encrypt again on every token issue (the refresh of ADR-0013), under a derived transit key with the sandbox UID as context. The broker logs in with its projected ServiceAccount token (audience openbao) and keeps the OpenBao token in memory until its lease ends. TLS 1.3 verified against store.sealing.transit.ca_file; a probe seal at startup fails the process on a wrong role, policy or key. With issuers[].entra.transit (ADR-0016) the broker also asks transit to sign its client assertion for Entra (PSS, SHA-256) with an RSA key that never leaves OpenBao.",
       "relationship-type": {
         "connects": {
           "source": {
@@ -684,7 +684,7 @@
     "repository": "https://github.com/firestoned/mediatore",
     "license": "Apache-2.0",
     "calm-schema-version": "1.2",
-    "phase": "dev-mode loop implemented and e2e-tested; Entra OBO is a fail-closed stub. Roadmap 01 (ADR-0006, ADR-0007) implemented and live-tested in kind: registration entries as ClusterStaticEntry through the Kubernetes API, broker identity from the Workload API over the SPIFFE CSI driver, SPIFFE mTLS terminated in-process (crates/mediatore-tls). Roadmap 03 (ADR-0011): the claim watcher, node resolution by EK, node entries from pool members, leader election by Lease. Roadmap 08 (ADR-0008): the AgentSandbox CRD, its reconciler on the same loop, the subject admission policy and the user API creating the resource; records now exist outside dev_mode. SPIRE topology models the ADR-0005 desired state: root on a dedicated identity cluster, downstream per environment; the homelab collapses to the downstream server alone. Roadmap 05 (ADR-0012): one sqlx store over SQLite or PostgreSQL, the sealed refresh envelope, rows swept into an audit table; every kind tier runs the broker on PostgreSQL over verify-full. Roadmap 04, first slice (ADR-0013): the Dex path, with the upstream session delegated at claim creation, sealed, refreshed before every issue and revoked on refusal; mediatore-cli; per-claim rate limiting. Entra OBO and the transit sealer are the roadmap's next slices. ADR-0014: one binary, the roles as subcommands (serve, guest, token, login, sandbox, session), one musl artifact for every host, the jail mounting it read-only; the node entry pins /usr/local/bin/mediatore. ADR-0015: the transit sealer; the kind tiers run the broker on an OpenBao (make kind-openbao) with Kubernetes auth and a derived key; the local sealer stays the homelab shape."
+    "phase": "dev-mode loop implemented and e2e-tested; Entra OBO is a fail-closed stub. Roadmap 01 (ADR-0006, ADR-0007) implemented and live-tested in kind: registration entries as ClusterStaticEntry through the Kubernetes API, broker identity from the Workload API over the SPIFFE CSI driver, SPIFFE mTLS terminated in-process (crates/mediatore-tls). Roadmap 03 (ADR-0011): the claim watcher, node resolution by EK, node entries from pool members, leader election by Lease. Roadmap 08 (ADR-0008): the AgentSandbox CRD, its reconciler on the same loop, the subject admission policy and the user API creating the resource; records now exist outside dev_mode. SPIRE topology models the ADR-0005 desired state: root on a dedicated identity cluster, downstream per environment; the homelab collapses to the downstream server alone. Roadmap 05 (ADR-0012): one sqlx store over SQLite or PostgreSQL, the sealed refresh envelope, rows swept into an audit table; every kind tier runs the broker on PostgreSQL over verify-full. Roadmap 04, first slice (ADR-0013): the Dex path, with the upstream session delegated at claim creation, sealed, refreshed before every issue and revoked on refusal; mediatore-cli; per-claim rate limiting. Entra OBO and the transit sealer are the roadmap's next slices. ADR-0014: one binary, the roles as subcommands (serve, guest, token, login, sandbox, session), one musl artifact for every host, the jail mounting it read-only; the node entry pins /usr/local/bin/mediatore. ADR-0015: the transit sealer; the kind tiers run the broker on an OpenBao (make kind-openbao) with Kubernetes auth and a derived key; the local sealer stays the homelab shape. ADR-0016: the Entra path, with the caller's token exchanged On-Behalf-Of at claim creation, the session refreshed per audience before every issue, and the broker's credential a signed assertion (key file, OpenBao transit or a federated ServiceAccount token); proven against the fake issuer, the live run against a tenant is by hand. ADR-0017: issuer profiles, the session path for any OIDC issuer (Google and Auth0 beside Dex), per-issuer login parameters and groups claim."
   },
   "adrs": [
     "docs/adr/0001-record-architecture-decisions.md",
@@ -701,6 +701,8 @@
     "docs/adr/0012-persistent-store.md",
     "docs/adr/0013-dex-session-delegation.md",
     "docs/adr/0014-one-binary-roles-as-subcommands.md",
-    "docs/adr/0015-transit-sealer.md"
+    "docs/adr/0015-transit-sealer.md",
+    "docs/adr/0016-entra-on-behalf-of.md",
+    "docs/adr/0017-issuer-profiles.md"
   ]
 }

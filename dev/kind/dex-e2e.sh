@@ -67,10 +67,18 @@ dump() {
 glauth_config() { # <otherGroups value>: the directory with octocat in that group set
   sed "s/otherGroups = \[5502\]/otherGroups = [$1]/" "$GLAUTH_CFG"
 }
+# glauth's Service has exactly one endpoint, ready and not terminating: the rollout is
+# over and the old pod is out of the endpoint list, so Dex's next LDAP dial is not
+# routed to a pod that is gone.
+glauth_settled() {
+  "${K[@]}" -n "$BROKER_NS" get endpointslices -l kubernetes.io/service-name=mediatore-glauth -o json 2>/dev/null \
+    | jq -e '[.items[].endpoints[]?] | length == 1 and all(.conditions.ready == true and (.conditions.terminating // false) == false)' >/dev/null
+}
 set_directory() { # <otherGroups value>
   glauth_config "$1" | "${K[@]}" -n "$BROKER_NS" create configmap mediatore-glauth-config --from-file=glauth.cfg=/dev/stdin --dry-run=client -o yaml | "${K[@]}" apply -f - >/dev/null
   "${K[@]}" -n "$BROKER_NS" rollout restart deploy/mediatore-glauth >/dev/null
   "${K[@]}" -n "$BROKER_NS" rollout status deploy/mediatore-glauth --timeout=120s >/dev/null
+  wait_for "$TIMEOUT" "glauth's endpoint settled after the restart" glauth_settled
 }
 
 cleanup() {

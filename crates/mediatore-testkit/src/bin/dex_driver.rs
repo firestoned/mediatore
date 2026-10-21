@@ -150,14 +150,29 @@ async fn browse(cli: &Cli, auth_url: &str) -> anyhow::Result<()> {
     let action = page_url.join(&action)?;
     eprintln!("browser: login form at {page_url}, posting to {action}");
 
-    let done = http
-        .post(action)
-        .form(&[
-            ("login", cli.login.as_str()),
-            ("password", cli.password.as_str()),
-        ])
-        .send()
-        .await?;
+    // Dex answers a connector failure (its directory restarting behind it) with a 500
+    // "Login error" page and keeps the authorization request, so a browser user would
+    // simply submit again; do the same, a few times, before calling it a failure.
+    let mut attempt = 0;
+    let done = loop {
+        attempt += 1;
+        let done = http
+            .post(action.clone())
+            .form(&[
+                ("login", cli.login.as_str()),
+                ("password", cli.password.as_str()),
+            ])
+            .send()
+            .await?;
+        if !done.status().is_server_error() || attempt >= 10 {
+            break done;
+        }
+        eprintln!(
+            "browser: Dex answered {} on attempt {attempt}; retrying in a second",
+            done.status()
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    };
     let final_url = done.url().clone();
     let status = done.status();
     let body = done.text().await.unwrap_or_default();

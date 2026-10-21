@@ -21,8 +21,8 @@ sqlx.workspace = true
 aws-lc-rs.workspace = true
 sha2.workspace = true
 hex.workspace = true
-# The transit sealer (ADR-0015): HTTPS to OpenBao on the workspace TLS config.
-reqwest.workspace = true
+# The transit sealer (ADR-0015): the OpenBao client, shared with the Entra signer.
+mediatore-openbao.workspace = true
 base64.workspace = true
 
 [lints]

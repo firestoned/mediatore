@@ -9,6 +9,7 @@ members = [
   "crates/mediatore-tls",
   "crates/mediatore-claims",
   "crates/mediatore-store",
+  "crates/mediatore-openbao",
   "crates/mediatore",
   "crates/mediatore-guest",
   "crates/mediatore-client",
@@ -35,6 +36,7 @@ mediatore-spire  = { path = "crates/mediatore-spire" }
 mediatore-tls    = { path = "crates/mediatore-tls" }
 mediatore-claims = { path = "crates/mediatore-claims" }
 mediatore-store  = { path = "crates/mediatore-store" }
+mediatore-openbao = { path = "crates/mediatore-openbao" }
 mediatore-guest  = { path = "crates/mediatore-guest" }
 mediatore-client = { path = "crates/mediatore-client" }
 mediatore-testkit = { path = "crates/mediatore-testkit" }

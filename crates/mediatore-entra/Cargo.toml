@@ -10,7 +10,9 @@ publish.workspace = true
 
 [dependencies]
 mediatore-proto.workspace = true
+mediatore-openbao.workspace = true
 jsonwebtoken.workspace = true
+uuid.workspace = true
 base64.workspace = true
 reqwest.workspace = true
 serde.workspace = true

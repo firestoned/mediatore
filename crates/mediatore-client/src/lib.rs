@@ -105,8 +105,16 @@ pub struct LoginOptions {
     pub issuer: String,
     /// The public client to log in as: mediatore's own.
     pub client_id: String,
-    /// Scopes to request; `offline_access` is what yields the refresh token.
+    /// Scopes to request; `offline_access` is what yields the refresh token at Dex, Auth0
+    /// and Entra. Google takes no such scope (see `extra_params`).
     pub scopes: Vec<String>,
+    /// Extra query parameters on the authorization request, per issuer (ADR-0017):
+    /// `access_type=offline` and `prompt=consent` for Google, `audience=...` for Auth0.
+    pub extra_params: Vec<(String, String)>,
+    /// A client secret the token endpoint wants even from this public client (Google's
+    /// installed-app clients). Not a credential anyone relies on; never stored in the
+    /// session file.
+    pub client_secret: Option<String>,
     /// A login hint for the issuer, if any.
     pub login_hint: Option<String>,
     /// CA certificates (PEM) that sign the issuer's TLS certificate, for an issuer on a
@@ -297,9 +305,14 @@ pub async fn login(opts: &LoginOptions, open_url: impl FnOnce(&str)) -> anyhow::
         encode(&state),
         encode(&challenge),
     );
-    if let Some(hint) = &opts.login_hint {
+    {
         use std::fmt::Write as _;
-        let _ = write!(url, "&login_hint={}", encode(hint));
+        if let Some(hint) = &opts.login_hint {
+            let _ = write!(url, "&login_hint={}", encode(hint));
+        }
+        for (k, v) in &opts.extra_params {
+            let _ = write!(url, "&{}={}", encode(k), encode(v));
+        }
     }
     let callback = tokio::spawn(accept_callback(listener));
     open_url(&url);
@@ -309,15 +322,19 @@ pub async fn login(opts: &LoginOptions, open_url: impl FnOnce(&str)) -> anyhow::
         "the callback's state does not match"
     );
 
+    let mut form = vec![
+        ("grant_type", "authorization_code"),
+        ("code", code.as_str()),
+        ("redirect_uri", redirect_uri.as_str()),
+        ("client_id", opts.client_id.as_str()),
+        ("code_verifier", verifier.as_str()),
+    ];
+    if let Some(secret) = &opts.client_secret {
+        form.push(("client_secret", secret.as_str()));
+    }
     let reply: TokenReply = http
         .post(&discovery.token_endpoint)
-        .form(&[
-            ("grant_type", "authorization_code"),
-            ("code", code.as_str()),
-            ("redirect_uri", redirect_uri.as_str()),
-            ("client_id", opts.client_id.as_str()),
-            ("code_verifier", verifier.as_str()),
-        ])
+        .form(&form)
         .send()
         .await?
         .error_for_status()?
@@ -436,6 +453,8 @@ mod tests {
             issuer: idp.issuer.clone(),
             client_id: "mediatore".into(),
             scopes: LoginOptions::default_scopes(),
+            extra_params: vec![],
+            client_secret: None,
             login_hint: Some("hexley".into()),
             ca_pem: None,
         }
@@ -460,6 +479,66 @@ mod tests {
         let claims = payload(&session.id_token).unwrap();
         assert_eq!(claims["aud"], "mediatore");
         assert!(idp.is_live(session.refresh_token.as_deref().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn the_extra_parameters_and_the_client_secret_reach_the_issuer() {
+        use mediatore_testkit::Profile;
+        // Google's shape: the refresh token needs access_type=offline, the token
+        // endpoint the installed-app secret, and offline_access is not a scope it knows.
+        let idp = FakeIdp::start_as(Profile::Google).await;
+        idp.set_client_secret("mediatore", "GOCSPX-not-a-secret");
+        let google =
+            |extra: Vec<(&str, &str)>, secret: Option<&str>, scopes: &[&str]| LoginOptions {
+                scopes: scopes.iter().map(|s| (*s).to_owned()).collect(),
+                extra_params: extra
+                    .into_iter()
+                    .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                    .collect(),
+                client_secret: secret.map(ToOwned::to_owned),
+                ..opts(&idp)
+            };
+        let session = login(
+            &google(
+                vec![("access_type", "offline"), ("prompt", "consent")],
+                Some("GOCSPX-not-a-secret"),
+                &["openid", "email"],
+            ),
+            browser,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            session.login, "hexley@example.com",
+            "email, Google has no username"
+        );
+        assert!(session.refresh_token.is_some());
+        let session = login(
+            &google(vec![], Some("GOCSPX-not-a-secret"), &["openid", "email"]),
+            browser,
+        )
+        .await
+        .unwrap();
+        assert!(session.refresh_token.is_none(), "no access_type=offline");
+        assert!(
+            login(&google(vec![], None, &["openid", "email"]), browser)
+                .await
+                .is_err(),
+            "the secret is required"
+        );
+        assert!(
+            login(
+                &google(
+                    vec![],
+                    Some("GOCSPX-not-a-secret"),
+                    &["openid", "offline_access"]
+                ),
+                browser
+            )
+            .await
+            .is_err(),
+            "offline_access is not a Google scope"
+        );
     }
 
     #[tokio::test]

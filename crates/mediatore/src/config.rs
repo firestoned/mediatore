@@ -298,6 +298,7 @@ impl Config {
         if cfg.audiences.iter().any(|a| a.via == Backend::Sts) && cfg.sts.is_none() {
             anyhow::bail!("an audience uses the sts backend but no `sts` section is configured");
         }
+        cfg.check_entra()?;
         if !cfg.dev_mode && cfg.spire.is_none() {
             anyhow::bail!("`spire` (workload_api_socket, entries) is required outside dev_mode");
         }
@@ -330,7 +331,10 @@ impl Config {
         if cfg.token.rate_per_minute == 0 {
             anyhow::bail!("token.rate_per_minute must be positive");
         }
-        if let Some(i) = cfg.issuers.iter().find(|i| i.session.is_some())
+        if let Some(i) = cfg
+            .issuers
+            .iter()
+            .find(|i| i.session.is_some() || i.entra.is_some())
             && cfg.store.sealing.is_none()
         {
             anyhow::bail!(
@@ -389,6 +393,57 @@ impl Config {
         if engine == Engine::Postgres && !url.contains("sslmode=verify-full") {
             anyhow::bail!(
                 "store.url: PostgreSQL is reached only over TLS the client verifies; the URL must carry sslmode=verify-full (ADR-0012)"
+            );
+        }
+        Ok(())
+    }
+}
+
+impl Config {
+    /// ADR-0016: an Entra issuer is `entra-obo` with an `entra` block and no `session`,
+    /// its credential is exactly one of the three shapes, transit is `https` outside
+    /// `dev_mode`, and an `entra-obo` audience has an Entra issuer to be minted from.
+    fn check_entra(&self) -> anyhow::Result<()> {
+        for issuer in &self.issuers {
+            match (issuer.backend, &issuer.entra) {
+                (Backend::EntraObo, None) => anyhow::bail!(
+                    "issuer {}: the entra-obo backend needs an `entra` section (ADR-0016)",
+                    issuer.url
+                ),
+                (Backend::Sts, Some(_)) => anyhow::bail!(
+                    "issuer {}: an `entra` section needs backend entra-obo",
+                    issuer.url
+                ),
+                _ => {}
+            }
+            let Some(entra) = &issuer.entra else {
+                continue;
+            };
+            if issuer.session.is_some() {
+                anyhow::bail!(
+                    "issuer {}: `entra` and `session` are exclusive: the Entra session comes from the exchange, not from the caller",
+                    issuer.url
+                );
+            }
+            entra
+                .validate()
+                .map_err(|e| anyhow::anyhow!("issuer {}: entra: {e}", issuer.url))?;
+            if let Some(t) = &entra.transit
+                && !self.dev_mode
+                && !t.url.starts_with("https://")
+            {
+                anyhow::bail!(
+                    "issuer {}: entra.transit.url must be https outside dev_mode; got {}",
+                    issuer.url,
+                    t.url
+                );
+            }
+        }
+        if self.audiences.iter().any(|a| a.via == Backend::EntraObo)
+            && !self.issuers.iter().any(|i| i.entra.is_some())
+        {
+            anyhow::bail!(
+                "an audience uses the entra-obo backend but no issuer has an `entra` section"
             );
         }
         Ok(())
@@ -647,5 +702,93 @@ store: {{ url: \"sqlite:///var/lib/mediatore/store.db\" }}
         ))
         .unwrap_err();
         assert!(err.to_string().contains("class_name"), "{err}");
+    }
+
+    #[test]
+    fn an_issuer_may_name_its_groups_claim_and_the_secret_its_token_endpoint_wants() {
+        let cfg = Config::parse(
+            "trust_domain: sandbox.test\naudiences: []\nlisten: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }\ndev_mode: true\nstore: { sealing: { key_file: /k } }\nissuers:\n  - url: https://accounts.google.com\n    backend: sts\n    client_id: 1234.apps.googleusercontent.com\n    subject_claim: email\n    session: { client_id: 1234.apps.googleusercontent.com, client_secret_file: /etc/mediatore-google/secret }\n  - url: https://tenant.us.auth0.com/\n    backend: sts\n    client_id: abc\n    subject_claim: email\n    required_group: sandbox-users\n    groups_claim: https://example.com/groups\n    session: { client_id: abc }\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.issuers[0]
+                .session
+                .as_ref()
+                .unwrap()
+                .client_secret_file
+                .as_deref(),
+            Some(Path::new("/etc/mediatore-google/secret"))
+        );
+        assert!(cfg.issuers[0].groups_claim.is_none());
+        assert_eq!(
+            cfg.issuers[1].groups_claim.as_deref(),
+            Some("https://example.com/groups")
+        );
+    }
+
+    #[test]
+    fn an_entra_issuer_has_a_credential_in_one_shape_and_no_session() {
+        let base = "trust_domain: sandbox.test\naudiences: []\nlisten: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }\ndev_mode: true\nstore: { sealing: { key_file: /etc/mediatore-sealing/key } }\n";
+        let entra = |body: &str| {
+            format!(
+                "issuers:\n  - url: https://login.microsoftonline.com/tenant/v2.0\n    backend: entra-obo\n    client_id: broker-app-id\n{body}"
+            )
+        };
+        let cfg = Config::parse(&format!(
+            "{base}{}",
+            entra("    entra: { certificate_file: /etc/mediatore-entra/cert.pem, key_file: /etc/mediatore-entra/key.pem }\n")
+        ))
+        .unwrap();
+        let e = cfg.issuers[0].entra.as_ref().unwrap();
+        assert_eq!(
+            e.key_file.as_deref(),
+            Some(Path::new("/etc/mediatore-entra/key.pem"))
+        );
+        assert_eq!(cfg.issuers[0].subject_claim, "oid");
+        for (yaml, want) in [
+            (entra(""), "needs an `entra` section"),
+            (
+                "issuers:\n  - url: https://dex.home.example\n    backend: sts\n    client_id: mediatore\n    entra: { token_file: /t }\n".to_owned(),
+                "needs backend entra-obo",
+            ),
+            (
+                entra("    session: { client_id: x }\n    entra: { token_file: /t }\n"),
+                "exclusive",
+            ),
+            (
+                entra("    entra: { key_file: /k }\n"),
+                "certificate_file is required",
+            ),
+            (
+                entra("    entra: { certificate_file: /c, key_file: /k, token_file: /t }\n"),
+                "exactly one",
+            ),
+        ] {
+            let err = Config::parse(&format!("{base}{yaml}")).unwrap_err();
+            assert!(err.to_string().contains(want), "{yaml}: {err}");
+        }
+        // The Entra session is sealed like a delegated one: a sealer is required.
+        let unsealed = "trust_domain: sandbox.test\naudiences: []\nlisten: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }\ndev_mode: true\n";
+        let err = Config::parse(&format!(
+            "{unsealed}{}",
+            entra("    entra: { token_file: /t }\n")
+        ))
+        .unwrap_err();
+        assert!(err.to_string().contains("store.sealing"), "{err}");
+        // An entra-obo audience needs an Entra issuer to be minted from.
+        let err = Config::parse(
+            "trust_domain: sandbox.test\nissuers: []\naudiences: [{ name: api://trading-data, via: entra-obo }]\nlisten: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }\ndev_mode: true\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("entra-obo backend"), "{err}");
+        // transit signs over https outside dev_mode, as the sealer does.
+        let prod = format!(
+            "trust_domain: sandbox.test\naudiences: []\nlisten: {{ user: 0.0.0.0:8080, sandbox: 0.0.0.0:8443 }}\nspire:\n  workload_api_socket: unix:///run/spire/sockets/spire-agent.sock\n  entries:\n    class_name: spire-server-spire\nstore:\n  url: \"sqlite:///var/lib/mediatore/store.db\"\n  sealing: {{ key_file: /k }}\n{}",
+            entra(
+                "    entra: { certificate_file: /c, transit: { url: http://openbao.home.example:8200, key: entra, role: mediatore } }\n"
+            )
+        );
+        let err = Config::parse(&prod).unwrap_err();
+        assert!(err.to_string().contains("must be https"), "{err}");
     }
 }
