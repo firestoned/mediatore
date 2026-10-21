@@ -1,0 +1,37 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+#
+# The broker's config for the homelab overlay. Placeholders throughout: your trust
+# domain, your issuer (docs/guides/issuers.md has Dex with GitHub, Google, Auth0 and
+# Entra), your audiences. The store URL comes from Secret mediatore-store (ADR-0012).
+trust_domain: sandbox.home.example
+listen:
+  user: 0.0.0.0:8080
+  sandbox: 0.0.0.0:8443
+spire:
+  workload_api_socket: unix:///run/spire/sockets/spire-agent.sock
+  entries:
+    # The SPIRE Controller Manager's class (the chart's release name plus `-spire`).
+    class_name: spire-server-spire
+issuers:
+  - url: https://dex.home.example
+    backend: sts
+    client_id: mediatore
+    subject_claim: preferred_username
+    required_group: firestoned:sandbox-users
+    session: { client_id: mediatore }
+audiences:
+  - { name: grafana.home.example, via: sts, max_ttl: 900 }
+sts:
+  issuer: https://mediatore.home.example
+  kid: homelab-1
+  signing_key_file: /etc/mediatore-sts/sts.pem
+sandboxes:
+  # Where `POST /v1/claims` creates AgentSandbox resources; the pool must live there.
+  namespace: sandboxes
+store:
+  # One replica only (kustomization.yaml): a file on the PVC. Secret mediatore-store
+  # overrides this with MEDIATORE_STORE_URL when present.
+  url: sqlite:///var/lib/mediatore/store.db?mode=rwc
+  sealing:
+    key_file: /etc/mediatore-sealing/key

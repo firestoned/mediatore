@@ -1,0 +1,139 @@
+<!-- Copyright (c) 2026 Erick Bourgeois, mediatore -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
+# Deploying on a homelab cluster
+
+The single-cluster shape of [ADR-0005](../adr/0005-spire-topology.md): one SPIRE server
+on the management cluster plays the downstream role, banlieue runs beside it, the
+broker runs as a Deployment from `deploy/base` with an overlay for what is yours. This
+page is that overlay, in order, for a k0s cluster that already has the SPIRE chart,
+banlieue and an issuer. The enterprise split (a root on its own identity cluster) is
+[a separate guide](enterprise-spire-topology.md); roadmap 02 tracks what is still
+missing for VMs to attest ([`ROADMAPS.md`](https://github.com/firestoned/mediatore/blob/main/ROADMAPS.md)).
+
+## What the cluster must already have
+
+| Piece | Where it comes from | How mediatore uses it |
+| --- | --- | --- |
+| SPIRE server, agents and the SPIFFE CSI driver | the `spiffe/spire` chart, `watchClassless: false`, class name `<release>-spire` | the broker's SVID over the CSI socket (ADR-0007); entries as `ClusterStaticEntry` (ADR-0006) |
+| SPIRE Controller Manager | the same chart | renders the entries the broker declares |
+| banlieue with `VirtualMachinePool` and `VirtualMachineClaim` | banlieue's release | the claims mediatore creates (ADR-0008, ADR-0011) |
+| banlieue's claim subject policy listing mediatore as a broker | ConfigMap `banlieue-claim-subject-policy`, `brokers:` line `system:serviceaccount:banlieue-system:mediatore`, `issuers:` listing yours | every claim mediatore creates names someone else's subject ([requesting a sandbox](requesting-a-sandbox.md)) |
+| An issuer with a public client for mediatore | Dex, Google, Auth0 or Entra ([issuers](issuers.md)) | `mediatore login` and the refresh before every issue |
+| An ingress for the user API, a LoadBalancer for the sandbox listener | the Tailscale operator's ingress class and MetalLB in the example | `:8080` to people, `:8443` to pool VMs |
+| A ReadWriteOnce storage class | `local-path` on k0s | the SQLite file of a one-replica broker, or nothing with PostgreSQL |
+
+None of those are this repository's to install. What follows is.
+
+## 1. Copy the example overlay and put your values in
+
+```sh
+cp -r deploy/overlays/homelab-example ~/.config/mediatore/core
+```
+
+Keep the copy outside the repository: it will carry your trust domain, your issuer's
+URL, your CIDRs. Edit:
+
+- `mediatore.yaml`: `trust_domain`, `issuers` (from the [issuers guide](issuers.md)),
+  `audiences`, `sts.issuer` (what downstream services will see as `iss`), and
+  `spire.entries.class_name` if the chart's release is not `spire-server`;
+- `networkpolicy.yaml`: the sandbox segment's CIDR for `:8443`, the control-plane
+  addresses for the API server, the node CIDR for the kubelet's probe, and the
+  issuer's namespace or addresses;
+- `ingress.yaml`: the ingress class and hostname, if not Tailscale's;
+- `kustomization.yaml`: the image tag, pinned to a digest or a `sha-<commit>` tag of
+  [the published image](https://github.com/firestoned/mediatore/pkgs/container/mediatore).
+
+`kubectl kustomize ~/.config/mediatore/core` renders the whole thing; read it once.
+
+## 2. Create the Secrets the overlay expects
+
+The overlay generates no secret. Three Secrets in `banlieue-system`, each a file the
+broker reads at startup:
+
+```sh
+# The STS signing key (ES256), whose public half becomes the broker's JWKS.
+openssl ecparam -name prime256v1 -genkey -noout | openssl pkcs8 -topk8 -nocrypt -out sts.pem
+kubectl -n banlieue-system create secret generic mediatore-sts --from-file=sts.pem
+
+# The sealing key for refresh material (ADR-0012 decision 3), the local sealer.
+openssl rand -hex 32 > sealing.key
+kubectl -n banlieue-system create secret generic mediatore-sealing --from-file=key=sealing.key
+
+# The store URL (ADR-0012). SQLite on the PVC for one replica, as the example
+# config says; or PostgreSQL over verify-full, in which case this overrides it.
+kubectl -n banlieue-system create secret generic mediatore-store \
+  --from-literal=url='sqlite:///var/lib/mediatore/store.db?mode=rwc'
+```
+
+Delete the local files afterwards. With the transit sealer ([the store](the-store.md))
+the sealing Secret is not needed; with Entra ([the Entra path](the-entra-path.md)) a
+fourth Secret holds the client credential.
+
+## 3. Apply, and read the start-up log
+
+```sh
+kubectl apply -k ~/.config/mediatore/core
+kubectl -n banlieue-system rollout status deploy/mediatore
+kubectl -n banlieue-system logs deploy/mediatore | head -40
+```
+
+The broker fails the start on anything it cannot use, and says which: a key file that
+does not parse, a store it cannot migrate, an issuer whose discovery document it cannot
+fetch, a class name the controller manager does not serve. What a healthy start logs,
+in order: the store migrated, the sealing key loaded, each issuer (and `issuer pinned
+to a private CA` when `ca_file` is set), `broker SVID` from the Workload API, the
+listeners, `claim watcher running` on the replica that holds the Lease.
+
+`/healthz` on the user API answers true only once the store is reachable; the Ingress
+routes to it.
+
+## 4. Prove the cluster side as the broker's ServiceAccount
+
+Before a single sandbox, run the live admission round trip from your machine, as the
+ServiceAccount the broker runs as (impersonated through your admin kubeconfig):
+
+```sh
+MEDIATORE_LIVE_KUBECONFIG=~/.kube/core.yaml \
+MEDIATORE_LIVE_TRUST_DOMAIN=sandbox.home.example \
+MEDIATORE_LIVE_CLASS_NAME=spire-server-spire \
+make live-admission-test
+```
+
+It declares the two entry shapes, waits for the controller manager to set them, proves
+that admission refuses what [ADR-0006](../adr/0006-registration-entries-as-clusterstaticentry.md)
+forbids and that RBAC refuses edits, and retracts everything. It fails rather than
+skips when a variable is missing. [Testing tiers](testing.md) has the rest of the
+suites.
+
+## 5. Log in and request a sandbox
+
+```sh
+mediatore login --issuer https://dex.home.example
+mediatore sandbox create --server https://mediatore.<tailnet> --pool pool-a \
+  --audience grafana.home.example --image registry.internal:5000/sandbox:latest
+```
+
+The sandbox turns `Bound` when banlieue hands it a member and `Ready` once the member
+has registered its node and the entry is set ([requesting a sandbox](requesting-a-sandbox.md)).
+Until pool VMs attest with a TPM (roadmap 02's second half: the server's TPM attestor
+and the guest image), a claim binds and nothing registers, so `ready` stays false and
+the claim fails after `watcher.resolve_timeout_secs`; the API, the issuer, the store,
+the entries and the policies are nonetheless live at that point, which is what this
+page gets you.
+
+## What the NetworkPolicy allows
+
+| Direction | Peer | Port | Why |
+| --- | --- | --- | --- |
+| ingress | the sandbox segment | 8443 | the guest and the jailed workload, over SPIFFE mTLS (TB-6) |
+| ingress | the ingress controller's namespace | 8080 | people and their tools, bearer over the ingress's TLS (TB-1) |
+| ingress | the node CIDR | 8080 | the kubelet's readiness probe, where the CNI does not exempt it |
+| egress | kube-dns | 53 | names |
+| egress | the control-plane addresses | 6443 | the API server: sandboxes, claims, entries, the Lease (TB-2, TB-3) |
+| egress | the issuer | 5556 or 443 | discovery, JWKS, the refresh before every issue (TB-5) |
+
+The Workload API is a socket on the node and needs no rule. Nothing else is open: the
+broker never reaches the internet unless the issuer or OpenBao is there, in which case
+their addresses go in. [ADR-0007](../adr/0007-broker-identity-and-spiffe-mtls.md)
+decision 7 is where this was decided.

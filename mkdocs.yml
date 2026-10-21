@@ -138,6 +138,7 @@ nav:
   - Home: index.md
   - Guides:
       - Running workloads on a claimed VM: guides/running-workloads.md
+      - Deploying on a homelab cluster: guides/deploying.md
       - Requesting a sandbox: guides/requesting-a-sandbox.md
       - Issuers: guides/issuers.md
       - The store: guides/the-store.md
