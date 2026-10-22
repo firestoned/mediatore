@@ -1,0 +1,15 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+#
+# The SQLite file's volume (one replica, ADR-0012 decision 2). Any ReadWriteOnce class
+# does; the local-path provisioner is what a k0s homelab usually has.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mediatore-data
+  labels: { app.kubernetes.io/name: mediatore }
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi

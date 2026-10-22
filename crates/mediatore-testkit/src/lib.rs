@@ -220,9 +220,17 @@ async fn authorize(State(st): State<Shared>, Query(q): Query<HashMap<String, Str
     let offline = q.get("access_type").map(String::as_str) == Some("offline");
     {
         let mut st = st.state.lock().unwrap();
-        // Google has no offline_access scope: the request is refused, not ignored.
+        // Google has no offline_access scope: the request is refused, not ignored, and
+        // as the OAuth error flow has it the browser is sent back to the client with
+        // the error, so a CLI waiting on its loopback listener hears about it.
         if st.profile == Profile::Google && scopes.contains(&"offline_access") {
-            return error(StatusCode::BAD_REQUEST, "invalid_scope");
+            let sep = if redirect_uri.contains('?') { '&' } else { '?' };
+            let state = q
+                .get("state")
+                .map(|s| format!("&state={s}"))
+                .unwrap_or_default();
+            return Redirect::to(&format!("{redirect_uri}{sep}error=invalid_scope{state}"))
+                .into_response();
         }
         st.user(&login);
         st.codes.insert(

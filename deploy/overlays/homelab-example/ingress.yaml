@@ -1,0 +1,21 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+#
+# The user API (bearer, :8080) on the tailnet through the Tailscale Kubernetes operator:
+# the operator terminates TLS with a tailnet certificate and the hostname becomes
+# `mediatore.<tailnet>`. Replace with your ingress class if it is not Tailscale; the
+# sandbox listener (:8443, SPIFFE mTLS) is the base's LoadBalancer Service and never
+# goes through an ingress, since the TLS it terminates is the identity.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: mediatore
+  labels: { app.kubernetes.io/name: mediatore }
+spec:
+  ingressClassName: tailscale
+  defaultBackend:
+    service:
+      name: mediatore
+      port: { name: user }
+  tls:
+    - hosts: [mediatore]

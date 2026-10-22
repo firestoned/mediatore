@@ -8,7 +8,7 @@
         kind-install kind-create kind-delete kind-down kind-spire kind-deploy kind-up \
         kind-images kind-postgres kind-dex kind-openbao kind-broker kind-banlieue-crds kind-e2e-entries kind-e2e-mtls kind-e2e-watcher kind-e2e-sandbox \
         kind-e2e-store kind-e2e-dex kind-e2e kind-e2e-ci kind-e2e-logs \
-        calm-validate calm-diagrams docs docs-serve docs-clean clean
+        calm-validate calm-diagrams docs docs-serve docs-clean clean manifests
 
 # kind: a throwaway cluster with SPIRE for the live tests (docs/guides/testing.md).
 KIND_VERSION       ?= 0.33.0
@@ -102,6 +102,12 @@ crds: ## Render mediatore's CRDs from their Rust types into deploy/base/crds/ (A
 
 e2e: ## Front-to-back dev-mode loop with the real binary (fake IdP; mediatore serve, guest and token as separate processes)
 	./dev/demo.sh
+
+manifests: ## Render deploy/base and the example overlay with kustomize, as a check that both still build
+	@command -v kubectl >/dev/null 2>&1 || { echo "Error: kubectl not found"; exit 1; }
+	kubectl kustomize deploy/base > /dev/null
+	kubectl kustomize deploy/overlays/homelab-example > /dev/null
+	@echo "✓ deploy/base and deploy/overlays/homelab-example render"
 
 live-admission-test: ## ClusterStaticEntry round trip as the mediatore ServiceAccount against a real cluster (MEDIATORE_LIVE_KUBECONFIG, MEDIATORE_LIVE_TRUST_DOMAIN, MEDIATORE_LIVE_CLASS_NAME; MEDIATORE_LIVE_IDENTITY=impersonate|self)
 	cargo test -p mediatore-spire --test live_kube -- --ignored

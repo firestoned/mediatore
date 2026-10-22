@@ -50,11 +50,11 @@ crates/
 ├── mediatore/          the one binary (ADR-0014): `serve`, `guest`, `token`, `login`, `sandbox`, `session`
 ├── mediatore-guest/    the VM side as a library: the guest role (root agent) and the token role (inside the jail)
 └── mediatore-client/   the user side as a library: PKCE login at the issuer, claims with the session delegated (ADR-0013)
-deploy/                 raw manifests (kustomize), Traefik IngressRoute
+deploy/                 raw manifests (kustomize): base, and an example homelab overlay with placeholders
 image/                  systemd units + cloud-config fragments baked into the VM image
 docs/adr/               architecture decision records
 docs/architecture/      FINOS CALM model + rendered Mermaid diagrams
-docs/guides/            operational guides (requesting a sandbox, issuers, the store, the Entra path, testing tiers, enterprise SPIRE topology)
+docs/guides/            operational guides (deploying, requesting a sandbox, issuers, the store, the Entra path, testing tiers, enterprise SPIRE topology)
 docs/security/          threat model (living document, stamped per ADR range)
 ```
 

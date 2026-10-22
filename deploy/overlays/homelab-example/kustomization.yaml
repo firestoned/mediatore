@@ -1,0 +1,63 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+#
+# An example overlay for a single-cluster homelab (roadmap 02, the ADR-0005 collapse):
+# deploy/base as shipped, one replica on a SQLite file (ADR-0012 decision 2), the local
+# sealer (ADR-0012 decision 3), the user API behind the Tailscale operator's ingress
+# class instead of Traefik, the sandbox listener as a MetalLB LoadBalancer, and the
+# NetworkPolicy of ADR-0007 decision 7. Every name and CIDR here is a placeholder: copy
+# this directory outside the repository, put your own values in, and keep it there.
+# docs/guides/deploying.md walks through it, including the Secrets this overlay expects
+# to exist (mediatore-store, mediatore-sts, mediatore-sealing) and never generates.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: banlieue-system
+resources:
+  - ../../base
+  - pvc.yaml
+  - ingress.yaml
+  - networkpolicy.yaml
+images:
+  # Pin what you deploy: a digest from `crane digest ghcr.io/firestoned/mediatore:latest`,
+  # or a sha-<commit> tag the build workflow pushes on every merge.
+  - name: ghcr.io/firestoned/mediatore
+    newTag: latest
+configMapGenerator:
+  - name: mediatore-config
+    files:
+      - mediatore.yaml
+generatorOptions:
+  disableNameSuffixHash: true
+patches:
+  # No Traefik here: the user API is an Ingress of the Tailscale class (ingress.yaml).
+  - patch: |-
+      apiVersion: traefik.io/v1alpha1
+      kind: IngressRoute
+      metadata:
+        name: mediatore
+      $patch: delete
+  # One replica on a SQLite file: two replicas would be two stores (the-store.md). The
+  # STS signing key and the sealing key come from Secrets the operator creates.
+  - patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: mediatore
+      spec:
+        replicas: 1
+        strategy: { type: Recreate }
+        template:
+          spec:
+            containers:
+              - name: mediatore
+                volumeMounts:
+                  - { name: data, mountPath: /var/lib/mediatore }
+                  - { name: sts, mountPath: /etc/mediatore-sts, readOnly: true }
+                  - { name: sealing, mountPath: /etc/mediatore-sealing, readOnly: true }
+            volumes:
+              - name: data
+                persistentVolumeClaim: { claimName: mediatore-data }
+              - name: sts
+                secret: { secretName: mediatore-sts, defaultMode: 0440 }
+              - name: sealing
+                secret: { secretName: mediatore-sealing, defaultMode: 0440 }
