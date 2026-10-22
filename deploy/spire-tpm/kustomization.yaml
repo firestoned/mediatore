@@ -1,0 +1,31 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+#
+# TPM node attestation on the SPIRE server (ADR-0018), as a kustomize component the
+# operator's SPIRE kustomization includes:
+#
+#   components:
+#     - ../mediatore/deploy/spire-tpm      # or a copy with the real CA certificates
+#
+# It adds, to the `spire-server` StatefulSet, an init container that copies the
+# attestor plugin out of its image (pinned by digest; the server verifies the binary
+# against the checksum in server.conf before loading it) into a shared volume, and
+# mounts a ConfigMap of EK trust anchors: one PEM per hypervisor host, the root of that
+# host's swtpm local CA, which signs the EK certificate libvirt creates for every vTPM.
+# server.conf gains the block in server.conf.fragment.hcl; that file is the operator's
+# to merge, since the server's configuration is one key of one ConfigMap.
+#
+# Nothing here depends on how the SPIRE manifests were produced: SPIRE's own
+# distribution rendered once (`helm template` of the hardened chart, checked in with
+# placeholders) or hand-written manifests, as long as the StatefulSet is `spire-server`
+# in namespace `spire-server` with its config at /run/spire/config/server.conf.
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+resources:
+  - ek-cas.yaml
+patches:
+  - path: statefulset-patch.yaml
+    target:
+      kind: StatefulSet
+      name: spire-server
+      namespace: spire-server

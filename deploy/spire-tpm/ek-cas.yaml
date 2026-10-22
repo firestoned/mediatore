@@ -1,0 +1,18 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+#
+# The EK trust bundle (ADR-0018 decision 2): one PEM per hypervisor host that runs pool
+# VMs, the root of its swtpm local CA (/var/lib/swtpm-localca/swtpm-localca-rootca-cert.pem).
+# A host missing here has VMs that never become agents. Placeholders: replace the key
+# names with your hosts and the bodies with their certificates.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spire-tpm-ek-cas
+  namespace: spire-server
+  labels: { app.kubernetes.io/name: spire-server, app.kubernetes.io/component: tpm-attestor }
+data:
+  hv-01.home.example.pem: |
+    -----BEGIN CERTIFICATE-----
+    MIIB...the host's swtpm-localca-rootca-cert.pem...
+    -----END CERTIFICATE-----

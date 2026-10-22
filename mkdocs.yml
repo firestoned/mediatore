@@ -139,6 +139,7 @@ nav:
   - Guides:
       - Running workloads on a claimed VM: guides/running-workloads.md
       - Deploying on a homelab cluster: guides/deploying.md
+      - Homelab walkthrough: guides/homelab-walkthrough.md
       - Requesting a sandbox: guides/requesting-a-sandbox.md
       - Issuers: guides/issuers.md
       - The store: guides/the-store.md
@@ -166,5 +167,6 @@ nav:
       - "ADR-0015: The transit sealer": adr/0015-transit-sealer.md
       - "ADR-0016: The Entra path": adr/0016-entra-on-behalf-of.md
       - "ADR-0017: Issuer profiles": adr/0017-issuer-profiles.md
+      - "ADR-0018: TPM attestation with the SPIFFE plugin": adr/0018-tpm-attestation-with-the-spiffe-plugin.md
   - Security:
       - Threat model: security/threat-model.md

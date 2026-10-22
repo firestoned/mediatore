@@ -38,16 +38,40 @@ installed beyond a `ServiceAccount` a live test left behind.
       ingress: the `AgentSandbox` created, the claim owned, `Pending` until a pool
       member attests (the second half)
 
-## Second half: VMs attest (needs slate for the images)
+## Second half: VMs attest ([ADR-0018](../../docs/adr/0018-tpm-attestation-via-the-chart.md))
 
-- [ ] Build the SPIRE server image with the bloomberg/spire-tpm-plugin server attestor;
-      record the plugin checksum; the chart values that add the `tpm` node attestor
-      beside `k8s_psat`
-- [ ] swtpm fleet EK CA generated; root into the `ek-ca` ConfigMap (`ek-ca.pem`)
-- [ ] Trust bundle exported for the VM image (Part 1.5)
+- [x] ~~Build the SPIRE server image with the bloomberg/spire-tpm-plugin server attestor~~
+      Withdrawn (2026-10-22): the Bloomberg repository is archived; its continuation
+      `spiffe/spire-tpm-plugin` ships static binaries as images, and SPIRE verifies an
+      external plugin's checksum at load, so an init container from the pinned image
+      replaces the image build. `deploy/spire-tpm` is the kustomize component (the
+      StatefulSet patch, the EK CA ConfigMap, the `server.conf` fragment), v1.11.3 by
+      digest and checksum; `make dist-tpm-plugin` extracts the binaries
+- [x] ~~swtpm fleet EK CA generated; root into the `ek-ca` ConfigMap~~ Replaced
+      (2026-10-22): libvirt already signs every vTPM's EK certificate with the host's
+      `swtpm-localca`; the EK trust bundle is one root per hypervisor host in ConfigMap
+      `spire-tpm-ek-cas` (ADR-0018 decision 2). The hash allowlist stays empty
+- [x] The agent's side as image fragments (2026-10-22): `image/spire/agent.conf` with
+      the `tpm` attestor (the same release, its checksum), the `unix` workload attestor
+      and the trust bundle path; `image/systemd/spire-agent.service` allowing the TPM
+      devices and nothing else
+- [ ] The cluster's SPIRE manifests rendered once from its distribution into a tracked
+      kustomization (the Helm release it was installed with retired), the component
+      included with the three hosts' CAs and the `server.conf` block, `kubectl apply -k`;
+      `tpm` listed among the server's node attestors
+- [ ] `make kind-spire` moved from a Helm release to `helm template` rendered into the
+      tier's manifests, so the component is exercised in kind the way it is on the
+      cluster
+- [ ] Trust bundle exported for the VM image (Part 1.5): `spire-server bundle show`
+      into `/opt/spire/conf/bundle.pem`
+- [ ] The VM image with the agent, the plugin from `dist/` and the fragments baked by
+      banlieue-imagebuilder (roadmap 06's image item; the mediatore side is `image/`)
 - [ ] Part 3 acceptance on libvirt: a fresh member appears in `agent list` as type
       `tpm` within 60 s, EK hash matches the local computation, reboot does not create
       a second agent
 - [ ] The broker Deployment on the CSI socket proven as `make kind-e2e-mtls` does in
       kind, against this cluster: a sandbox turning `Ready`, the guest fetching its
       subject, a token issued to the workload
+- [ ] A kind tier for the attestation path, if the kind node can carry a vTPM
+      (`swtpm chardev --vtpm-proxy` on the host, the device mounted into the node):
+      an agent pod attesting with the `tpm` plugin, the broker's node entry naming it
