@@ -38,7 +38,7 @@ installed beyond a `ServiceAccount` a live test left behind.
       ingress: the `AgentSandbox` created, the claim owned, `Pending` until a pool
       member attests (the second half)
 
-## Second half: VMs attest ([ADR-0018](../../docs/adr/0018-tpm-attestation-via-the-chart.md))
+## Second half: VMs attest ([ADR-0018](../../docs/adr/0018-tpm-attestation-with-the-spiffe-plugin.md))
 
 - [x] ~~Build the SPIRE server image with the bloomberg/spire-tpm-plugin server attestor~~
       Withdrawn (2026-10-22): the Bloomberg repository is archived; its continuation
@@ -59,9 +59,13 @@ installed beyond a `ServiceAccount` a live test left behind.
       kustomization (the Helm release it was installed with retired), the component
       included with the three hosts' CAs and the `server.conf` block, `kubectl apply -k`;
       `tpm` listed among the server's node attestors
-- [ ] `make kind-spire` moved from a Helm release to `helm template` rendered into the
-      tier's manifests, so the component is exercised in kind the way it is on the
-      cluster
+- [x] `make kind-spire` moved from a Helm release to rendered manifests (2026-10-22):
+      `dev/kind/spire` is SPIRE's distribution rendered once by `make kind-spire-render`
+      (`helm template`, no hooks, the only target that runs Helm), the `deploy/spire-tpm`
+      component included, the `server.conf` patch generated from the component's
+      fragment; `make kind-spire` applies it with kustomize, sets the webhook to fail
+      closed as the chart's hook did, and asserts that the server loaded the `tpm`
+      attestor. CI no longer needs Helm
 - [ ] Trust bundle exported for the VM image (Part 1.5): `spire-server bundle show`
       into `/opt/spire/conf/bundle.pem`
 - [ ] The VM image with the agent, the plugin from `dist/` and the fragments baked by

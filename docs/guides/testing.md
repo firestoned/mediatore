@@ -98,10 +98,13 @@ live tiers exist for.
 
 ## Live against SPIRE in kind: `make kind-e2e`
 
-`make kind-up` creates a one-node kind cluster (`dev/kind/cluster.yaml`), installs the
-same hardened charts and versions the homelab runs (`spire-crds` and `spire`,
-`dev/kind/spire-values.yaml`, release `spire` in namespace `spire-server` so the
-controller manager's class is `spire-server-spire`), applies the broker's
+`make kind-up` creates a one-node kind cluster (`dev/kind/cluster.yaml`), applies SPIRE
+from `dev/kind/spire` (SPIRE's distribution, the same hardened charts and versions the
+homelab runs, rendered once by `make kind-spire-render` into tracked manifests from
+`dev/kind/spire/values.yaml`, release name `spire` in namespace `spire-server` so the
+controller manager's class is `spire-server-spire`; no Helm release, kustomize only)
+together with the TPM node attestor component `deploy/spire-tpm` (ADR-0018), whose
+loading `make kind-spire` asserts from the server's log, applies the broker's
 ServiceAccount, RBAC and admission policy from `deploy/base`, and mints a one-hour
 token for that ServiceAccount into `.kind/mediatore-sa.yaml` (`dev/kind/sa-kubeconfig.sh`;
 the directory is git-ignored). `make kind-e2e` then runs every live suite with
@@ -301,17 +304,22 @@ volume delivers the Workload API under PSS `restricted`; SVIDs the `k8s` workloa
 attestor issued chain to the bundle the broker got from the same agent.
 
 What kind cannot do, and the real-cluster tier covers: TPM node attestation (the
+server loads the `tpm` attestor from the component, but no kind node has a TPM, so the
 parent agent `spiffe://<td>/spire/agent/tpm/<ek>` never exists in kind; the server
 accepts entries for a parent that has not attested, which is exactly the order a node
 entry is declared in), real VMs and jails, banlieue's claim controller binding a real
 member, and the broker's `LoadBalancer` exposure.
 
 Pins live at the top of the `Makefile`: kind, the node image by digest (same
-Kubernetes minor as the homelab), both chart versions, the placeholder trust domain
-`sandbox.test`. Dependabot does not see them; bump them when the homelab moves.
+Kubernetes minor as the homelab), the versions of SPIRE's distribution, the placeholder
+trust domain `sandbox.test`. Dependabot does not see them; bump them when the homelab
+moves, and after a SPIRE bump run `make kind-spire-render` and read the diff of
+`dev/kind/spire`: the rendered manifests are what the tier applies, never edited by
+hand, the `server.conf` patch generated from the component's fragment.
 
 Runtimes: kind needs Docker or rootless Podman (`KIND_EXPERIMENTAL_PROVIDER=podman`
-and `CONTAINER_CLI=podman` for the image builds), `kubectl` and `helm`; the images need
+and `CONTAINER_CLI=podman` for the image builds) and `kubectl` (`helm` and `jq` only
+for `make kind-spire-render`, which CI never runs); the images need
 the `x86_64-unknown-linux-musl` target and a musl C compiler (`musl-tools`) for
 `aws-lc-rs`. `make kind-install` fetches the pinned kind CLI, checksum verified, into
 `KIND_BIN_DIR` (default `/usr/local/bin`).

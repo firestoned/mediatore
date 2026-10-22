@@ -111,6 +111,9 @@ configured host CA never becomes an agent, let alone a node.
   **A-15 new** (the hypervisors' swtpm CA keys); R-6 reworded; the stamp.
 - Still outside this repository: the VM image build (banlieue-imagebuilder, roadmap 06),
   the SPIRE manifests the component patches (the operator's, rendered once), and the
-  acceptance on libvirt (roadmap 02). The kind tier still installs SPIRE with a Helm
-  release (`make kind-spire`); moving it to a rendered manifest set is roadmap 02's
-  follow-up, so that the component is exercised in kind the way it is on the cluster.
+  acceptance on libvirt (roadmap 02).
+- The kind tier exercises the component the way the cluster does: `dev/kind/spire` is
+  SPIRE's distribution rendered once (`make kind-spire-render`), the component included,
+  the `server.conf` patch generated from the fragment; `make kind-spire` applies it with
+  kustomize and asserts from the server's log that the `tpm` attestor loaded. No kind
+  node has a TPM, so no agent attests through it there.
