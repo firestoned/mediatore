@@ -7,7 +7,8 @@ The single-cluster shape of [ADR-0005](../adr/0005-spire-topology.md): one SPIRE
 on the management cluster plays the downstream role, banlieue runs beside it, the
 broker runs as a Deployment from `deploy/base` with an overlay for what is yours. This
 page is that overlay, in order, for a k0s cluster that already has the SPIRE chart,
-banlieue and an issuer. The enterprise split (a root on its own identity cluster) is
+banlieue and an issuer; [the walkthrough](homelab-walkthrough.md) is the whole stack
+from the empty cluster, with every command. The enterprise split (a root on its own identity cluster) is
 [a separate guide](enterprise-spire-topology.md); roadmap 02 tracks what is still
 missing for VMs to attest ([`ROADMAPS.md`](https://github.com/firestoned/mediatore/blob/main/ROADMAPS.md)).
 
@@ -121,6 +122,43 @@ and the guest image), a claim binds and nothing registers, so `ready` stays fals
 the claim fails after `watcher.resolve_timeout_secs`; the API, the issuer, the store,
 the entries and the policies are nonetheless live at that point, which is what this
 page gets you.
+
+## 6. Let the VMs attest
+
+Pool VMs become SPIRE agents with their vTPM ([ADR-0018](../adr/0018-tpm-attestation-with-the-spiffe-plugin.md)).
+On the server side it is a kustomize component, `deploy/spire-tpm`, that your SPIRE
+kustomization includes: an init container puts the attestor plugin (pinned by digest)
+into the server pod, a ConfigMap carries the EK trust anchors, and `server.conf` gains
+the attestor block with the binary's checksum.
+
+```sh
+# One PEM per hypervisor host: the root of its swtpm local CA, which signs every
+# vTPM's EK certificate libvirt creates. Repeat for each host that runs pool VMs.
+cp -r deploy/spire-tpm ~/.config/mediatore/spire-tpm
+for h in hv-01 hv-02; do
+  ssh $h sudo cat /var/lib/swtpm-localca/swtpm-localca-rootca-cert.pem > $h.pem
+done
+# Put them under data: of ~/.config/mediatore/spire-tpm/ek-cas.yaml (one key per host),
+# add the component to your SPIRE kustomization and the block of
+# server.conf.fragment.hcl to your rendered server.conf, then:
+kubectl apply -k ~/.config/mediatore/spire
+kubectl -n spire-server rollout status statefulset/spire-server
+kubectl -n spire-server exec spire-server-0 -c spire-server -- \
+  spire-server bundle show > bundle.pem        # the trust bundle for the VM image
+```
+
+If your SPIRE manifests are a Helm release today, render them once
+(`helm template spire spire --repo ... -f your-values.yaml > spire.yaml`), check them
+in with placeholders, and apply them with kustomize from then on; the component patches
+the standard `spire-server` StatefulSet whichever way the manifests were produced.
+
+The hash allowlist is not configured, because a VM's EK is created with the VM and the
+CA route is what admits new members. On the VM side, `image/spire/agent.conf` and
+`image/systemd/spire-agent.service` are the fragments the image carries, and `make
+dist-tpm-plugin` extracts the agent plugin binary (and the server's, for the record)
+from the same release into `dist/`, checksums verified, for banlieue-imagebuilder to
+bake beside `mediatore`. A VM whose EK certificate chains to no configured host CA
+never becomes an agent, and so never a node.
 
 ## What the NetworkPolicy allows
 

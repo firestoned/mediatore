@@ -8,7 +8,7 @@
         kind-install kind-create kind-delete kind-down kind-spire kind-deploy kind-up \
         kind-images kind-postgres kind-dex kind-openbao kind-broker kind-banlieue-crds kind-e2e-entries kind-e2e-mtls kind-e2e-watcher kind-e2e-sandbox \
         kind-e2e-store kind-e2e-dex kind-e2e kind-e2e-ci kind-e2e-logs \
-        calm-validate calm-diagrams docs docs-serve docs-clean clean manifests
+        calm-validate calm-diagrams docs docs-serve docs-clean clean manifests dist-tpm-plugin
 
 # kind: a throwaway cluster with SPIRE for the live tests (docs/guides/testing.md).
 KIND_VERSION       ?= 0.33.0
@@ -102,6 +102,25 @@ crds: ## Render mediatore's CRDs from their Rust types into deploy/base/crds/ (A
 
 e2e: ## Front-to-back dev-mode loop with the real binary (fake IdP; mediatore serve, guest and token as separate processes)
 	./dev/demo.sh
+
+# The TPM attestor plugin (ADR-0018): the release deploy/spire-tpm runs on the server and
+# the VM image runs on the agent, pinned by image digest and by the checksum of the static
+# binary inside. deploy/spire-tpm and image/spire/agent.conf carry the same checksums.
+TPM_PLUGIN_VERSION     := v1.11.3
+TPM_PLUGIN_SERVER_IMG  := ghcr.io/spiffe/spire-tpm-plugin-tpm-attestor-server:$(TPM_PLUGIN_VERSION)@sha256:2fec80b2db3171af5bb54312c4ad75187e430b635df6adc7ea4116a863ce0084
+TPM_PLUGIN_AGENT_IMG   := ghcr.io/spiffe/spire-tpm-plugin-tpm-attestor-agent:$(TPM_PLUGIN_VERSION)@sha256:4dba6dc77fcec06b66962b632b6453636d49d51a38946efb0bc6fed29e4b75b1
+TPM_PLUGIN_SERVER_SHA  := 5f32c3e8cc6c81fa1060a9155eea0a455935d199278406384567ffa125127d83
+TPM_PLUGIN_AGENT_SHA   := ffb7e266c7a10a7b1bdb349409d6c2ded8090715770287813055431cb692575c
+
+dist-tpm-plugin: ## Extract the pinned tpm attestor binaries (server and agent) from their images into dist/ and verify their checksums (ADR-0018)
+	@mkdir -p dist
+	@for pair in server:$(TPM_PLUGIN_SERVER_IMG):$(TPM_PLUGIN_SERVER_SHA) agent:$(TPM_PLUGIN_AGENT_IMG):$(TPM_PLUGIN_AGENT_SHA); do \
+	  role=$${pair%%:*}; rest=$${pair#*:}; img=$${rest%:*}; sha=$${rest##*:}; bin=tpm_attestor_$$role; \
+	  $(CONTAINER_CLI) pull -q "$$img" >/dev/null; id=$$($(CONTAINER_CLI) create "$$img"); \
+	  $(CONTAINER_CLI) cp "$$id:/app/$$bin" dist/$$bin; $(CONTAINER_CLI) rm "$$id" >/dev/null; \
+	  echo "$$sha  dist/$$bin" | sha256sum -c - >/dev/null || { echo "dist/$$bin: checksum mismatch"; exit 1; }; \
+	  echo "✓ dist/$$bin ($$sha)"; \
+	done
 
 manifests: ## Render deploy/base and the example overlay with kustomize, as a check that both still build
 	@command -v kubectl >/dev/null 2>&1 || { echo "Error: kubectl not found"; exit 1; }

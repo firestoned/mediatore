@@ -1,0 +1,35 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+#
+# The attestor plugin into the server pod (ADR-0018 decision 1): the static binary is
+# copied out of the plugin image, pinned by digest, into an emptyDir the server mounts;
+# the EK trust anchors are mounted read-only. spiffe/spire-tpm-plugin v1.11.3; the
+# binary's checksum (5f32c3e8…, Makefile TPM_PLUGIN_SERVER_SHA) is in server.conf and
+# verified by the server at start.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: spire-server
+  namespace: spire-server
+spec:
+  template:
+    spec:
+      initContainers:
+        - name: tpm-attestor-plugin
+          image: ghcr.io/spiffe/spire-tpm-plugin-tpm-attestor-server:v1.11.3@sha256:2fec80b2db3171af5bb54312c4ad75187e430b635df6adc7ea4116a863ce0084
+          command: ["/bin/sh", "-c", "cp /app/tpm_attestor_server /tpm/ && chmod 0555 /tpm/tpm_attestor_server"]
+          volumeMounts:
+            - { name: tpm-plugin, mountPath: /tpm }
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+      containers:
+        - name: spire-server
+          volumeMounts:
+            - { name: tpm-plugin, mountPath: /tpm, readOnly: true }
+            - { name: tpm-ek-cas, mountPath: /run/spire/tpm/cas, readOnly: true }
+      volumes:
+        - name: tpm-plugin
+          emptyDir: {}
+        - name: tpm-ek-cas
+          configMap: { name: spire-tpm-ek-cas }
