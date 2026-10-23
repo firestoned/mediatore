@@ -14,6 +14,7 @@ a real cluster address or a real credential in a tracked file.
 | Dev-mode loop | `make e2e` | The roles of the one binary agree on the wire contract as separate processes | everywhere, every PR |
 | Session e2e | `make check` (`crates/mediatore/tests/e2e_session.rs`) | The session path (ADR-0013) over real listeners against the fake issuer's real authorization-code and refresh grants: delegation, rotation, fresh groups, outage, revocation, the group gate at refresh, the per-claim limit; the CLI's PKCE login in `crates/mediatore-client` | everywhere, every commit |
 | Live against SPIRE in kind | `make kind-e2e` | Kubernetes, the SPIRE Controller Manager and the admission policy behave as the ADRs say, as the broker's own ServiceAccount; the broker image runs on the CSI driver's socket and agent-issued SVIDs meet on the sandbox listener | CI on every PR, any laptop with a container runtime |
+| TPM attestation in kind | `make kind-e2e-tpm` | A SPIRE agent on the image's own configuration attests with a vTPM through the pinned plugin on both sides, the EK trust bundle refuses what it should, the node entry lands under that agent | CI on every PR, a Linux host with `sudo` and swtpm |
 | Live against a real cluster | `make live-admission-test` | The same, against a deployment you operate | by hand, before a release or after changing the deployment |
 
 ## Unit: `make check`
@@ -121,6 +122,7 @@ Suites today:
 | `make kind-e2e-sandbox` | 0008, 0012 | the `AgentSandbox` CRD and its subject policy, a sandbox becoming an owned claim and a record, the claim bound end to end to a claim entry and the guest fetching the subject, a broker restart on the store with the sandbox staying `Ready`, deletion through the finalizer, the released row swept into the audit table, below |
 | `make kind-e2e-store` | 0012 | the broker on PostgreSQL over `verify-full`, the store conformance suite against that database, below |
 | `make kind-e2e-dex` | 0013 | the real CLI logging in at a real Dex from inside the cluster and delegating the session, a refresh at Dex before every issue, the claim released when the user leaves the gated group in the directory and when the refresh token is deleted at Dex, below |
+| `make kind-e2e-tpm` | 0018 | an agent attesting with a vTPM behind the kind node through the `tpm` plugin, on `image/spire/agent.conf`, refused under a CA that never signed its EK and listed under the EK's hash under the right one, the member's certificate becoming the node entry under that agent and the guest registering over the SVID it issues, a fresh pod re-attesting as the same agent; not part of `make kind-e2e` (it needs `sudo` and swtpm on the host), its own CI job, below |
 
 ### The store: PostgreSQL over TLS the client verifies
 
@@ -303,12 +305,49 @@ What this tier proves and the hermetic suite cannot: the `ClusterSPIFFEID` in
 volume delivers the Workload API under PSS `restricted`; SVIDs the `k8s` workload
 attestor issued chain to the bundle the broker got from the same agent.
 
-What kind cannot do, and the real-cluster tier covers: TPM node attestation (the
-server loads the `tpm` attestor from the component, but no kind node has a TPM, so the
-parent agent `spiffe://<td>/spire/agent/tpm/<ek>` never exists in kind; the server
+What kind cannot do, and the real-cluster tier covers: real VMs and jails, banlieue's
+claim controller binding a real member, the guest reading the EK from its own TPM
+(`tpm2-tools` are the VM image's, not the broker image's), and the broker's
+`LoadBalancer` exposure. TPM node attestation itself it can do, below. In every other
+tier the parent agent `spiffe://<td>/spire/agent/tpm/<ek>` never exists: the server
 accepts entries for a parent that has not attested, which is exactly the order a node
-entry is declared in), real VMs and jails, banlieue's claim controller binding a real
-member, and the broker's `LoadBalancer` exposure.
+entry is declared in.
+
+### TPM attestation with a vTPM behind the node
+
+`make kind-e2e-tpm` (`dev/kind/tpm-e2e.sh`) runs the attestation path a pool VM takes
+([ADR-0018](../adr/0018-tpm-attestation-with-the-spiffe-plugin.md)), with a vTPM in
+place of libvirt's. `make kind-vtpm` (`dev/kind/vtpm.sh`) starts swtpm behind the
+kernel's vtpm proxy (`tpm_vtpm_proxy`), which makes it a character device on the host,
+`/dev/tpmrmN`; the EK certificate is signed by a throwaway swtpm local CA the script
+creates under `.kind/vtpm`, the way `swtpm_setup` does on a hypervisor, never the host's
+own CA. `make kind-create` mounts that device into the node as `/dev/tpmrm0`, so the
+vTPM must be up before the cluster exists (`make kind-delete` first; the target refuses
+a node without the device). The server runs `deploy/spire-tpm` as in every tier. A
+Deployment then plays the pool member: an init container copies the agent plugin out of
+its pinned image, the SPIRE agent runs `image/spire/agent.conf` with its two placeholders
+replaced and the trust bundle `spire-server bundle show` exported (the command the
+deploying guide gives for the VM image), privileged for the device, and beside it the
+guest runs as root on the pinned binary path, over the agent's socket, in the pod's one
+PID namespace (the `unix` workload attestor reads its `/proc` entry, as on a VM):
+
+| Step | Expected |
+| --- | --- |
+| ConfigMap `spire-tpm-ek-cas` replaced with a CA that never signed this EK, the server restarted, the agent started | the agent is refused (`could not verify cert`); `spire-server agent list` has no `tpm` agent |
+| the ConfigMap replaced with the vTPM's local CA (its issuing certificate), the server restarted, the agent started again | `Node attestation was successful`; the server lists exactly one `tpm` agent, `spiffe://<td>/spire/agent/tpm/<hash>`, where the hash is what `vtpm.sh` computed from the EK certificate (sha256 of the DER `SubjectPublicKeyInfo`): the plugin's hash and mediatore's agree |
+| `VirtualMachine` `member-1` patched with both EK certificates, as a vTPM carries them | `ClusterStaticEntry` `mediatore-node-<hash>` with `parentID` the attested agent; the guest logs `SVID from the Workload API` for `spiffe://<td>/banlieue/node/<hash>` and `node registered`: the entry reached the agent that attested |
+| the Deployment restarted (a new pod, empty agent state: a VM that lost its disk) | the new agent re-attests as the same ID (the plugin answers `CanReattest`), the server still lists one `tpm` agent, the new guest registers again, no clone reported |
+
+What it found the first time it ran: the certificate that signs a vTPM's EK is the local
+CA's issuing certificate (`issuercert.pem`, `CN=swtpm-localca`), not the root
+(`swtpm-localca-rootca-cert.pem`), and the plugin verifies the EK against the files in
+`ca_path` as trust anchors with no intermediates, so a bundle holding the root alone
+refuses every VM. The deploying guide and `deploy/spire-tpm/ek-cas.yaml` collect
+`issuercert.pem`.
+
+The tier is not in `make kind-e2e`: it needs `sudo`, `swtpm`, `swtpm_setup` and the
+`tpm_vtpm_proxy` module on the host, which a laptop with Docker Desktop does not have.
+CI runs it as its own job (`make kind-e2e-ci KIND_E2E_SUITES=kind-e2e-tpm`).
 
 Pins live at the top of the `Makefile`: kind, the node image by digest (same
 Kubernetes minor as the homelab), the versions of SPIRE's distribution, the placeholder

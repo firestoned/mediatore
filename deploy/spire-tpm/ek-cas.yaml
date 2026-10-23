@@ -2,9 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # The EK trust bundle (ADR-0018 decision 2): one PEM per hypervisor host that runs pool
-# VMs, the root of its swtpm local CA (/var/lib/swtpm-localca/swtpm-localca-rootca-cert.pem).
-# A host missing here has VMs that never become agents. Placeholders: replace the key
-# names with your hosts and the bodies with their certificates.
+# VMs, the issuing certificate of its swtpm local CA
+# (/var/lib/swtpm-localca/issuercert.pem, CN=swtpm-localca), the one that signs every EK
+# certificate on that host. Not the root beside it: the attestor verifies an EK against
+# these files with no intermediates, and the root alone refuses every VM. A host missing
+# here has VMs that never become agents. Every file must parse, or every attestation
+# fails. Placeholders: replace the key names with your hosts and the bodies with their
+# certificates; the init container copies them at start, so a change takes a restart.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -14,5 +18,5 @@ metadata:
 data:
   hv-01.home.example.pem: |
     -----BEGIN CERTIFICATE-----
-    MIIB...the host's swtpm-localca-rootca-cert.pem...
+    MIIB...the host's /var/lib/swtpm-localca/issuercert.pem...
     -----END CERTIFICATE-----

@@ -9,13 +9,14 @@
 #
 #   "NodeAttestor": [{"tpm": {"plugin_cmd": "/tpm/tpm_attestor_server",
 #     "plugin_checksum": "5f32c3e8cc6c81fa1060a9155eea0a455935d199278406384567ffa125127d83",
-#     "plugin_data": {"ca_path": "/run/spire/tpm/cas"}}}]
+#     "plugin_data": {"ca_path": "/tpm/cas"}}}]
 plugins {
   NodeAttestor "tpm" {
     plugin_cmd = "/tpm/tpm_attestor_server"
     plugin_checksum = "5f32c3e8cc6c81fa1060a9155eea0a455935d199278406384567ffa125127d83"
     plugin_data {
-      ca_path = "/run/spire/tpm/cas"
+      # The copies the init container makes of the ConfigMap's files (statefulset-patch.yaml).
+      ca_path = "/tpm/cas"
     }
   }
 }

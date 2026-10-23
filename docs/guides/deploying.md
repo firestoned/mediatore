@@ -133,24 +133,32 @@ page gets you.
 Pool VMs become SPIRE agents with their vTPM ([ADR-0018](../adr/0018-tpm-attestation-with-the-spiffe-plugin.md)).
 On the server side it is a kustomize component, `deploy/spire-tpm`, that your SPIRE
 kustomization includes: an init container puts the attestor plugin (pinned by digest)
-into the server pod, a ConfigMap carries the EK trust anchors, and `server.conf` gains
-the attestor block with the binary's checksum.
+into the server pod together with the EK trust anchors it copies out of a ConfigMap,
+and `server.conf` gains the attestor block with the binary's checksum.
 
 ```sh
-# One PEM per hypervisor host: the root of its swtpm local CA, which signs every
-# vTPM's EK certificate libvirt creates. Repeat for each host that runs pool VMs.
+# One PEM per hypervisor host: the issuing certificate of its swtpm local CA, the one
+# that signs every vTPM's EK certificate libvirt creates (CN=swtpm-localca). Not the
+# root beside it: the attestor verifies an EK against these files with no intermediates,
+# so the root alone refuses every VM. Repeat for each host that runs pool VMs.
 cp -r deploy/spire-tpm ~/.config/mediatore/spire-tpm
 for h in hv-01 hv-02; do
-  ssh $h sudo cat /var/lib/swtpm-localca/swtpm-localca-rootca-cert.pem > $h.pem
+  ssh $h sudo cat /var/lib/swtpm-localca/issuercert.pem > $h.pem
 done
 # Put them under data: of ~/.config/mediatore/spire-tpm/ek-cas.yaml (one key per host),
 # add the component to your SPIRE kustomization and the block of
 # server.conf.fragment.hcl to your rendered server.conf, then:
 kubectl apply -k ~/.config/mediatore/spire
+kubectl -n spire-server rollout restart statefulset/spire-server   # the init container copies the certificates at start
 kubectl -n spire-server rollout status statefulset/spire-server
 kubectl -n spire-server exec spire-server-0 -c spire-server -- \
   spire-server bundle show > bundle.pem        # the trust bundle for the VM image
 ```
+
+A new hypervisor is a new key in the ConfigMap and the same restart. The whole path,
+from this component to an agent attesting with a vTPM, a refusal under a CA that did not
+sign the EK, and the node entry under the attested agent, runs in kind before it runs
+here: `make kind-e2e-tpm` ([testing tiers](testing.md)).
 
 If your SPIRE manifests are a Helm release today, render them once
 (`helm template spire spire --repo ... -f your-values.yaml > spire.yaml`), check them

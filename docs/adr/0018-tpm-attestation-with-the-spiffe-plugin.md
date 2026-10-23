@@ -43,8 +43,11 @@ A vTPM made by swtpm has one.
 **1. The attestor is `spiffe/spire-tpm-plugin`, pinned, as manifests.** The server side
 is a kustomize component, `deploy/spire-tpm`: an init container on the `spire-server`
 StatefulSet copies `tpm_attestor_server` out of the plugin image (pinned by digest) into
-an `emptyDir`, the server mounts it read-only, and `server.conf` gains the
-`NodeAttestor "tpm"` block with the binary's checksum (`server.conf.fragment.hcl`).
+an `emptyDir`, and the EK trust anchors beside it out of their ConfigMap (copied, not
+mounted: the plugin reads every entry of `ca_path` as a file, and a ConfigMap volume's
+`..data` link is a directory); the server mounts the volume read-only, and `server.conf`
+gains the `NodeAttestor "tpm"` block with the binary's checksum
+(`server.conf.fragment.hcl`). A new certificate is read at the next restart.
 The operator's SPIRE kustomization includes the component; how those SPIRE manifests
 were produced is not this ADR's concern (SPIRE's distribution rendered once with
 `helm template` and checked in with placeholders, or hand-written), as long as the
@@ -52,10 +55,14 @@ StatefulSet and its config path are the standard ones. No Helm release is involv
 and the roadmap's "build the SPIRE server image" item is withdrawn.
 
 **2. The EK trust bundle is the set of hypervisor swtpm CAs.** ConfigMap
-`spire-tpm-ek-cas`, mounted at the plugin's `ca_path`, holds one PEM per hypervisor
-host: the root of its `swtpm-localca` (`swtpm-localca-rootca-cert.pem`; the EK
-certificate chains through the host's issuer to it). Collecting them is the operator's
-step, documented; a new hypervisor is a new key in the ConfigMap. The hash allowlist
+`spire-tpm-ek-cas`, copied into the plugin's `ca_path`, holds one PEM per hypervisor
+host: the issuing certificate of its `swtpm-localca` (`issuercert.pem`,
+`CN=swtpm-localca`), the one that signs every EK certificate on that host. Not the root
+beside it: the plugin verifies an EK certificate against the files in `ca_path` as trust
+anchors with no intermediates, so the root alone refuses every VM (the first live run,
+the kind tier of 2026-10-24, found this; the ADR first said the root). Collecting them is
+the operator's step, documented; a new hypervisor is a new key in the ConfigMap and a
+restart of the server. The hash allowlist
 (`hash_path`) is not configured: a VM's EK is born with the VM (banlieue ADR-0045), so
 there is no hash to know in advance, and the CA route is what makes the fleet open to
 new members without touching the server. A fleet-wide swtpm CA shared by every host
@@ -115,5 +122,13 @@ configured host CA never becomes an agent, let alone a node.
 - The kind tier exercises the component the way the cluster does: `dev/kind/spire` is
   SPIRE's distribution rendered once (`make kind-spire-render`), the component included,
   the `server.conf` patch generated from the fragment; `make kind-spire` applies it with
-  kustomize and asserts from the server's log that the `tpm` attestor loaded. No kind
-  node has a TPM, so no agent attests through it there.
+  kustomize and asserts from the server's log that the `tpm` attestor loaded.
+- The attestation path itself runs in kind too (2026-10-24): `make kind-vtpm` puts a
+  swtpm behind the kernel's vtpm proxy on the host, with a throwaway swtpm local CA for
+  its EK, and the device goes into the node; `make kind-e2e-tpm` runs an agent on
+  `image/spire/agent.conf` with the agent plugin from its pinned image, refused under a
+  CA that never signed the EK and under the local CA's root alone, attested as
+  `spiffe://<td>/spire/agent/tpm/<hash>` under the issuing certificate with the hash
+  `mediatore_proto::ek` computes, the node entry under that agent reaching it, and a
+  replacement pod re-attesting as the same agent (the plugin answers `CanReattest`).
+  Its first run found the two corrections above (the issuing certificate, the copy).
