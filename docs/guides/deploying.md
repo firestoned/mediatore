@@ -104,7 +104,11 @@ make live-admission-test
 
 It declares the two entry shapes, waits for the controller manager to set them, proves
 that admission refuses what [ADR-0006](../adr/0006-registration-entries-as-clusterstaticentry.md)
-forbids and that RBAC refuses edits, and retracts everything. It fails rather than
+forbids and that RBAC refuses edits, and retracts everything. Give the API server a
+moment after step 3: a policy is stored before it is enforced, and
+`dev/kind/admission-settled.sh <sa kubeconfig> <trust domain>` is the dry-run probe
+the kind tier waits on (it needs a kubeconfig for the broker's ServiceAccount, which
+`dev/kind/sa-kubeconfig.sh` writes from an admin one). It fails rather than
 skips when a variable is missing. [Testing tiers](testing.md) has the rest of the
 suites.
 

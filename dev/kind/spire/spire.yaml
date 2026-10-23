@@ -744,7 +744,7 @@ spec:
           imagePullPolicy: "IfNotPresent"
           args: ["-config", "/opt/spire/conf/agent/agent.conf"]
           securityContext:
-            {}
+            allowPrivilegeEscalation: false
           env:
             - name: PATH
               value: "/opt/spire/bin:/bin"

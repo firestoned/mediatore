@@ -49,13 +49,12 @@ const TEST_KID: &str = "test-1";
 /// Groups a user has until a test says otherwise.
 pub const DEFAULT_GROUPS: &[&str] = &["firestoned:sandbox-users"];
 
-/// Fixed throwaway P-256 key for the fake issuer. Test material only; never reuse.
-const IDP_TEST_KEY: &str = "-----BEGIN PRIVATE KEY-----
-MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgrhNnnYdeXEjxagP5
-BxtNbemcWCB16Xj/4jAOKGjlneChRANCAATwTU0Is+XLXuVw1S7cYHSjxzVYamsp
-A+cAOHS5TsO7u6ChTcvHBecD+F7/j/ckAn5UHCjH9AYZ0qdljaXLdUMe
------END PRIVATE KEY-----
-";
+/// The fake issuer's signing key, generated once per process. Never embedded: a key in
+/// source is a key in every clone, and the secret scanners say so.
+fn idp_test_key() -> &'static str {
+    static KEY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    KEY.get_or_init(entra::fresh_p256_key_pem)
+}
 
 #[derive(Clone)]
 struct User {
@@ -180,7 +179,7 @@ type Refusal = (StatusCode, &'static str);
 
 /// The verifying half of the fixed test key.
 fn test_decoding_key() -> DecodingKey {
-    let secret = p256::SecretKey::from_pkcs8_pem(IDP_TEST_KEY).expect("test key");
+    let secret = p256::SecretKey::from_pkcs8_pem(idp_test_key()).expect("test key");
     let point = secret.public_key().to_sec1_point(false);
     DecodingKey::from_ec_components(
         &URL_SAFE_NO_PAD.encode(point.x().expect("x")),
@@ -577,7 +576,7 @@ impl FakeIdp {
     /// # Panics
     /// On any setup failure; this is test scaffolding.
     pub async fn start_on(addr: &str) -> Self {
-        let secret = p256::SecretKey::from_pkcs8_pem(IDP_TEST_KEY).expect("test key");
+        let secret = p256::SecretKey::from_pkcs8_pem(idp_test_key()).expect("test key");
 
         let point = secret.public_key().to_sec1_point(false);
         let jwk = serde_json::json!({
@@ -810,7 +809,7 @@ impl FakeIdp {
 /// On encoding failure; this is test scaffolding.
 #[must_use]
 pub fn mint(issuer: &str, mut claims: serde_json::Value) -> String {
-    let key = EncodingKey::from_ec_pem(IDP_TEST_KEY.as_bytes()).expect("test key");
+    let key = EncodingKey::from_ec_pem(idp_test_key().as_bytes()).expect("test key");
     let now = Utc::now();
     if let Some(obj) = claims.as_object_mut() {
         let defaults = [

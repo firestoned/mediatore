@@ -61,6 +61,7 @@ helm template spire spire --repo https://spiffe.github.io/helm-charts-hardened \
   -f spire-template-values.yaml > spire/spire.yaml
 cat > spire/kustomization.yaml <<'EOF'
 resources: [crds.yaml, spire.yaml]
+patches: [{ path: ../mediatore/dev/kind/spire/hardening-patch.yaml }]   # the CSI registrar's context
 components: [../mediatore/deploy/spire-tpm]     # step 8; leave out until then
 EOF
 kubectl apply -f spire/crds.yaml && kubectl wait --for=condition=established -f spire/crds.yaml
@@ -70,6 +71,10 @@ kubectl patch validatingwebhookconfiguration spire-server-spire-controller-manag
   --type=strategic -p '{"webhooks":[{"name":"vclusterfederatedtrustdomain.kb.io","failurePolicy":"Fail"},{"name":"vclusterspiffeid.kb.io","failurePolicy":"Fail"}]}'
 ```
 
+The hardening patch is the one gap the chart's recommended security contexts leave and
+no value reaches, the CSI node driver registrar's container; the CSI driver itself is
+privileged by necessity (bidirectional mount propagation), which the API server will
+not combine with `allowPrivilegeEscalation: false`.
 `--no-hooks --skip-tests` leaves out the chart's test pod and its hook Jobs. The one
 hook that mattered flipped the controller manager's webhook from `Ignore` to `Fail`
 after the first rollout (the webhook has to be lenient while the chart's own
@@ -118,6 +123,7 @@ spire-server:
   extraVolumeMounts:
     - { name: pg-root-ca, mountPath: /run/spire/pg-ca, readOnly: true }
 spire-agent:
+  securityContext: { allowPrivilegeEscalation: false }   # root with hostPID; nothing to gain
   kubeletAddress: { mode: hostip }
   workloadAttestors:
     k8s:
@@ -313,7 +319,7 @@ done
 # the kind tier does it (spire/spire.yaml stays as rendered):
 mediatore/dev/kind/spire/render-server-conf-patch.sh spire/spire.yaml \
   spire/tpm/server.conf.fragment.hcl > spire/server-conf-patch.yaml
-# components: [tpm] and patches: [{path: server-conf-patch.yaml}] in
+# components: [tpm] and server-conf-patch.yaml under patches: in
 # spire/kustomization.yaml, then:
 kubectl apply -k spire
 kubectl -n spire-server rollout status statefulset/spire-server

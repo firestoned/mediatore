@@ -36,5 +36,11 @@ spire-server:
   # sqlite on the kind default StorageClass
   persistence:
     size: 1Gi
+spire-agent:
+  # The chart's recommended contexts leave the agent container's empty. The agent runs
+  # as root with hostPID (the k8s workload attestor reads other pods' processes), so
+  # there is nothing to escalate to; saying so keeps the no-new-privileges bit set.
+  securityContext:
+    allowPrivilegeEscalation: false
 spiffe-oidc-discovery-provider:
   enabled: false
