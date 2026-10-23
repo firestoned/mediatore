@@ -8,24 +8,30 @@
         kind-install kind-create kind-delete kind-down kind-spire kind-deploy kind-up \
         kind-images kind-postgres kind-dex kind-openbao kind-broker kind-banlieue-crds kind-e2e-entries kind-e2e-mtls kind-e2e-watcher kind-e2e-sandbox \
         kind-e2e-store kind-e2e-dex kind-e2e kind-e2e-ci kind-e2e-logs \
-        calm-validate calm-diagrams docs docs-serve docs-clean clean manifests dist-tpm-plugin
+        kind-spire-render calm-validate calm-diagrams docs docs-serve docs-clean clean manifests dist-tpm-plugin
 
 # kind: a throwaway cluster with SPIRE for the live tests (docs/guides/testing.md).
 KIND_VERSION       ?= 0.33.0
 # Same Kubernetes minor as the measured homelab cluster (ADR-0005 appendix); digest-pinned.
 KIND_NODE_IMAGE    ?= kindest/node:v1.36.4@sha256:099e049362a1526b2db71494e1947aae99bd16290d7c895f2b7ea312e3cbfaed
+# The node image's Kubernetes version, what `kind-spire-render` tells the chart engine.
+KIND_K8S_VERSION   ?= 1.36.4
 KIND_CLUSTER_NAME  ?= mediatore
 KIND_BIN_DIR       ?= /usr/local/bin
 KIND_DIR           := .kind
 KIND_KUBECONFIG    := $(KIND_DIR)/kubeconfig
 KIND_SA_KUBECONFIG := $(KIND_DIR)/mediatore-sa.yaml
 KIND_KUBECTL       := kubectl --kubeconfig $(KIND_KUBECONFIG)
-KIND_HELM          := helm --kubeconfig $(KIND_KUBECONFIG)
-# The same hardened charts and versions as the homelab; release `spire` in namespace
-# `spire-server` gives the controller manager the className `spire-server-spire`.
+# SPIRE in kind comes from manifests rendered once (`make kind-spire-render`, the only
+# target that runs helm) from the same distribution and versions as the homelab, into
+# dev/kind/spire, applied with kustomize together with the TPM attestor component
+# (ADR-0018). Release name `spire` in namespace `spire-server` gives the controller
+# manager the className `spire-server-spire`. Bump a version here, re-render, read the
+# diff. SPIRE_TRUST_DOMAIN must agree with dev/kind/spire/values.yaml.
 SPIRE_CHART_REPO    ?= https://spiffe.github.io/helm-charts-hardened/
 SPIRE_CHART_VERSION ?= 0.30.2
 SPIRE_CRDS_VERSION  ?= 0.6.1
+SPIRE_KUSTOMIZATION := dev/kind/spire
 SPIRE_TRUST_DOMAIN  ?= sandbox.test
 SPIRE_NAMESPACE     := spire-server
 SPIRE_CLASS_NAME    := spire-server-spire
@@ -151,7 +157,6 @@ kind-install: ## Install the pinned kind CLI into $(KIND_BIN_DIR) if missing or 
 		rm -rf $$TMP; echo "✓ kind v$(KIND_VERSION) installed"; \
 	fi
 	@command -v kubectl >/dev/null 2>&1 || { echo "ERROR: kubectl not found on PATH"; exit 1; }
-	@command -v helm >/dev/null 2>&1 || { echo "ERROR: helm not found on PATH"; exit 1; }
 
 kind-create: kind-install ## Create the kind cluster (no-op if it exists) and write $(KIND_KUBECONFIG)
 	@mkdir -p $(KIND_DIR)
@@ -173,20 +178,40 @@ kind-delete: ## Delete the kind cluster and its kubeconfigs
 
 kind-down: kind-delete ## Alias for kind-delete
 
-kind-spire: kind-create ## Install SPIRE (server, controller manager, agent, CSI driver) from the hardened charts
+kind-spire-render: ## Render SPIRE's distribution (hardened charts, pinned versions) into $(SPIRE_KUSTOMIZATION); needs helm and jq; after a version bump, read the diff
+	@command -v helm >/dev/null 2>&1 || { echo "ERROR: helm not found on PATH"; exit 1; }
+	@command -v jq >/dev/null 2>&1 || { echo "ERROR: jq not found on PATH"; exit 1; }
+	helm template spire-crds spire-crds --repo $(SPIRE_CHART_REPO) --version $(SPIRE_CRDS_VERSION) \
+	  -n $(SPIRE_NAMESPACE) --kube-version $(KIND_K8S_VERSION) > $(SPIRE_KUSTOMIZATION)/crds.yaml
+	helm template spire spire --repo $(SPIRE_CHART_REPO) --version $(SPIRE_CHART_VERSION) \
+	  -n $(SPIRE_NAMESPACE) --kube-version $(KIND_K8S_VERSION) --no-hooks --skip-tests \
+	  -f $(SPIRE_KUSTOMIZATION)/values.yaml > $(SPIRE_KUSTOMIZATION)/spire.yaml
+	./$(SPIRE_KUSTOMIZATION)/render-server-conf-patch.sh $(SPIRE_KUSTOMIZATION)/spire.yaml deploy/spire-tpm/server.conf.fragment.hcl \
+	  > $(SPIRE_KUSTOMIZATION)/server-conf-patch.yaml
+	@kubectl kustomize $(SPIRE_KUSTOMIZATION) >/dev/null
+	@echo "✓ rendered spire-crds $(SPIRE_CRDS_VERSION) and spire $(SPIRE_CHART_VERSION) into $(SPIRE_KUSTOMIZATION)"
+
+kind-spire: kind-create ## Apply SPIRE (server, controller manager, agent, CSI driver) and the TPM attestor component from the rendered manifests
 	@$(KIND_KUBECTL) get ns $(SPIRE_NAMESPACE) >/dev/null 2>&1 || $(KIND_KUBECTL) create ns $(SPIRE_NAMESPACE)
 	@$(KIND_KUBECTL) get ns spire-system >/dev/null 2>&1 || $(KIND_KUBECTL) create ns spire-system
-	$(KIND_HELM) upgrade --install spire-crds spire-crds --repo $(SPIRE_CHART_REPO) --version $(SPIRE_CRDS_VERSION) -n $(SPIRE_NAMESPACE)
-	$(KIND_HELM) upgrade --install spire spire --repo $(SPIRE_CHART_REPO) --version $(SPIRE_CHART_VERSION) -n $(SPIRE_NAMESPACE) \
-	  -f dev/kind/spire-values.yaml --set global.spire.trustDomain=$(SPIRE_TRUST_DOMAIN) --wait --timeout 10m
-	@$(KIND_KUBECTL) -n $(SPIRE_NAMESPACE) rollout status statefulset/spire-server --timeout=300s
+	$(KIND_KUBECTL) apply -f $(SPIRE_KUSTOMIZATION)/crds.yaml
+	@$(KIND_KUBECTL) wait --for=condition=established --timeout=60s -f $(SPIRE_KUSTOMIZATION)/crds.yaml >/dev/null
+	$(KIND_KUBECTL) apply -k $(SPIRE_KUSTOMIZATION)
+	@$(KIND_KUBECTL) -n $(SPIRE_NAMESPACE) rollout status statefulset/spire-server --timeout=600s
 	@$(KIND_KUBECTL) -n spire-system rollout status daemonset/spire-agent --timeout=300s
-	@echo "✓ SPIRE $(SPIRE_CHART_VERSION) up; controller manager className $(SPIRE_CLASS_NAME)"
+	@# What the chart's post-install hook did: the webhook is applied lenient so the chart's own
+	@# ClusterSPIFFEIDs go in before the controller manager answers, then fails closed.
+	@$(KIND_KUBECTL) patch validatingwebhookconfiguration $(SPIRE_CLASS_NAME)-controller-manager-webhook --type=strategic \
+	  -p '{"webhooks":[{"name":"vclusterfederatedtrustdomain.kb.io","failurePolicy":"Fail"},{"name":"vclusterspiffeid.kb.io","failurePolicy":"Fail"}]}' >/dev/null
+	@$(KIND_KUBECTL) -n $(SPIRE_NAMESPACE) logs statefulset/spire-server -c spire-server | grep -Eq 'Plugin loaded.*plugin_name=tpm' \
+	  || { echo "ERROR: the tpm node attestor (deploy/spire-tpm) did not load"; $(KIND_KUBECTL) -n $(SPIRE_NAMESPACE) logs statefulset/spire-server -c spire-server --tail=60; exit 1; }
+	@echo "✓ SPIRE $(SPIRE_CHART_VERSION) up from $(SPIRE_KUSTOMIZATION); controller manager className $(SPIRE_CLASS_NAME); tpm node attestor loaded"
 
 kind-deploy: kind-create ## Apply the broker's CRD, ServiceAccount, RBAC and admission policies; mint its kubeconfig
 	@$(KIND_KUBECTL) get ns banlieue-system >/dev/null 2>&1 || $(KIND_KUBECTL) create ns banlieue-system
 	$(KIND_KUBECTL) apply -n banlieue-system -f deploy/base/crds -f deploy/base/serviceaccount.yaml -f deploy/base/rbac.yaml -f deploy/base/admission/clusterstaticentry-mediatore.yaml -f deploy/base/admission/agentsandbox-subject.yaml
 	@./dev/kind/sa-kubeconfig.sh $(KIND_KUBECONFIG) $(KIND_SA_KUBECONFIG)
+	@./dev/kind/admission-settled.sh $(KIND_SA_KUBECONFIG) $(SPIRE_TRUST_DOMAIN)
 
 kind-up: kind-create kind-spire kind-deploy ## Cluster + SPIRE + the broker's identity, ready for the live tests
 

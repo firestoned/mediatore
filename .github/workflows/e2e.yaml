@@ -11,7 +11,8 @@
 # bind, and the demo a human runs (`make e2e`) is the same thing CI runs.
 #
 # The second job runs the live tiers against a real SPIRE (server, controller
-# manager, agent, CSI driver from the hardened charts) in a kind cluster: the entries
+# manager, agent, CSI driver and the TPM attestor component, from the manifests
+# rendered once into dev/kind/spire) in a kind cluster: the entries
 # round trip as the broker's own ServiceAccount, then the broker image on the CSI
 # socket with agent-issued client SVIDs over SPIFFE mTLS, then the claim watcher
 # against banlieue's CRDs (lease, node-entry trigger), then the AgentSandbox CRD, its
@@ -78,8 +79,9 @@ jobs:
       - name: Cache cargo dependencies
         uses: firestoned/github-actions/rust/cache-cargo@e034489c3a17ffaaaf7f8fb799156ce768d899d5 # v1.3.9
 
-      # Docker, kubectl and helm ship on ubuntu-latest; `make kind-install` fetches the
-      # pinned kind CLI (checksum verified). The target tears the cluster down after,
+      # Docker and kubectl ship on ubuntu-latest (no Helm: SPIRE is applied from rendered
+      # manifests); `make kind-install` fetches the pinned kind CLI (checksum verified).
+      # The target tears the cluster down after,
       # and dumps entries, policy, broker and client pods and controller-manager logs
       # on failure.
       - name: Live suites as the broker ServiceAccount

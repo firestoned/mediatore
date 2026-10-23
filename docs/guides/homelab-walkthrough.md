@@ -55,15 +55,34 @@ kubectl create ns spire-server; kubectl create ns spire-system
 kubectl -n spire-server create configmap pg-root-ca --from-file=ca.crt=pg-ca.pem
 kubectl -n spire-server create secret generic spire-datastore --from-literal=password='...'
 helm template spire-crds spire-crds --repo https://spiffe.github.io/helm-charts-hardened \
-  --version 0.6.1 -n spire-server > spire/crds.yaml
+  --version 0.6.1 -n spire-server --kube-version 1.36.4 > spire/crds.yaml
 helm template spire spire --repo https://spiffe.github.io/helm-charts-hardened \
-  --version 0.30.2 -n spire-server -f spire-template-values.yaml > spire/spire.yaml
+  --version 0.30.2 -n spire-server --kube-version 1.36.4 --no-hooks --skip-tests \
+  -f spire-template-values.yaml > spire/spire.yaml
 cat > spire/kustomization.yaml <<'EOF'
 resources: [crds.yaml, spire.yaml]
+patches: [{ path: ../mediatore/dev/kind/spire/hardening-patch.yaml }]   # the CSI registrar's context
 components: [../mediatore/deploy/spire-tpm]     # step 8; leave out until then
 EOF
-kubectl apply --server-side -k spire
+kubectl apply -f spire/crds.yaml && kubectl wait --for=condition=established -f spire/crds.yaml
+kubectl apply -k spire
+kubectl -n spire-server rollout status statefulset/spire-server
+kubectl patch validatingwebhookconfiguration spire-server-spire-controller-manager-webhook \
+  --type=strategic -p '{"webhooks":[{"name":"vclusterfederatedtrustdomain.kb.io","failurePolicy":"Fail"},{"name":"vclusterspiffeid.kb.io","failurePolicy":"Fail"}]}'
 ```
+
+The hardening patch is the one gap the chart's recommended security contexts leave and
+no value reaches, the CSI node driver registrar's container; the CSI driver itself is
+privileged by necessity (bidirectional mount propagation), which the API server will
+not combine with `allowPrivilegeEscalation: false`.
+`--no-hooks --skip-tests` leaves out the chart's test pod and its hook Jobs. The one
+hook that mattered flipped the controller manager's webhook from `Ignore` to `Fail`
+after the first rollout (the webhook has to be lenient while the chart's own
+`ClusterSPIFFEID` objects go in, before the controller manager answers), which is the
+last command. The CRDs go first and are waited on, because `kubectl apply` discovers
+kinds once per run. `dev/kind/spire` in the mediatore repository is this same procedure
+for the kind tiers (`make kind-spire-render` renders, `make kind-spire` applies), so a
+SPIRE version bump is a re-render and a diff, there and here.
 
 `spire-template-values.yaml`, the render's input (the TPM attestor of step 8 is a kustomize
 component, not a value):
@@ -104,6 +123,7 @@ spire-server:
   extraVolumeMounts:
     - { name: pg-root-ca, mountPath: /run/spire/pg-ca, readOnly: true }
 spire-agent:
+  securityContext: { allowPrivilegeEscalation: false }   # root with hostPID; nothing to gain
   kubeletAddress: { mode: hostip }
   workloadAttestors:
     k8s:
@@ -127,7 +147,8 @@ kubectl -n spire-server exec spire-server-0 -c spire-server -- spire-server agen
 ## 3. The issuer: Dex over GitHub
 
 GitHub is OAuth2 only, so Dex authenticates against it and mints the ID tokens the API
-server, banlieue and mediatore validate ([issuers](issuers.md)). Dex runs from its chart
+server, banlieue and mediatore validate ([issuers](issuers.md)). Dex's distribution is
+a chart as well, rendered once the way SPIRE's was and applied with kustomize: Dex runs
 in namespace `dex`, storage in its own CRDs, exposed to the tailnet by a Tailscale
 Ingress (TLS terminated by the operator, hostname `dex.<tailnet>`). The GitHub OAuth
 App's callback is `https://dex.<tailnet>/callback`.
@@ -136,7 +157,10 @@ App's callback is `https://dex.<tailnet>/callback`.
 kubectl create ns dex
 kubectl -n dex create secret generic dex-github \
   --from-literal=GITHUB_CLIENT_ID=... --from-literal=GITHUB_CLIENT_SECRET=...
-helm upgrade --install dex dex --repo https://charts.dexidp.io --version 0.25.2 -n dex -f dex-values.yaml
+helm template dex dex --repo https://charts.dexidp.io --version 0.25.2 -n dex \
+  --kube-version 1.36.4 --skip-tests -f dex-values.yaml > dex/dex.yaml
+printf 'resources: [dex.yaml]\n' > dex/kustomization.yaml
+kubectl apply -k dex
 kubectl apply -f - <<'EOF'
 apiVersion: networking.k8s.io/v1
 kind: Ingress
@@ -148,8 +172,8 @@ spec:
 EOF
 ```
 
-`dex-values.yaml`, the parts that matter (the `mediatore` client is the one addition
-this stack needs; the `kubernetes` client is `kubelogin`'s):
+`dex-values.yaml`, the render's input, the parts that matter (the `mediatore` client is
+the one addition this stack needs; the `kubernetes` client is `kubelogin`'s):
 
 ```yaml
 replicaCount: 2
@@ -291,9 +315,13 @@ for h in hv-01 hv-02 hv-03; do
   ssh $h sudo cat /var/lib/swtpm-localca/swtpm-localca-rootca-cert.pem > $h.pem
 done
 # one key per host under data: of spire/tpm/ek-cas.yaml; the block of
-# spire/tpm/server.conf.fragment.hcl into the server.conf of spire/spire.yaml;
-# components: [tpm] in spire/kustomization.yaml, then:
-kubectl apply --server-side -k spire
+# spire/tpm/server.conf.fragment.hcl into server.conf as a patch, generated the way
+# the kind tier does it (spire/spire.yaml stays as rendered):
+mediatore/dev/kind/spire/render-server-conf-patch.sh spire/spire.yaml \
+  spire/tpm/server.conf.fragment.hcl > spire/server-conf-patch.yaml
+# components: [tpm] and server-conf-patch.yaml under patches: in
+# spire/kustomization.yaml, then:
+kubectl apply -k spire
 kubectl -n spire-server rollout status statefulset/spire-server
 kubectl -n spire-server exec spire-server-0 -c spire-server -- spire-server bundle show > bundle.pem
 ```

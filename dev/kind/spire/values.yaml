@@ -1,0 +1,46 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+#
+# SPIRE in kind, for `make kind-e2e`: the input of `make kind-spire-render`, which
+# renders SPIRE's distribution (the hardened charts, the versions the homelab runs,
+# ADR-0005 appendix) once into the manifests beside this file; `make kind-spire`
+# applies those with kustomize and never runs Helm. Shaped the way the homelab is
+# (release name `spire` in namespace `spire-server`, so the controller manager's
+# className is `spire-server-spire`), minus what a throwaway cluster has no use for: a
+# second replica, PostgreSQL, the OIDC discovery provider. The trust domain is the
+# RFC 2606 placeholder (the Makefile's SPIRE_TRUST_DOMAIN must agree); real values
+# never live in tracked files. The TPM attestor is not a value here: it is the
+# kustomize component deploy/spire-tpm, included by kustomization.yaml.
+global:
+  spire:
+    clusterName: kind
+    trustDomain: sandbox.test
+    # The chart refuses to render without a CA subject country; placeholders only.
+    caSubject:
+      country: XX
+      organization: mediatore test
+      commonName: sandbox.test
+    namespaces:
+      # Created by the Makefile, so the release namespace and the server namespace
+      # coincide exactly as they do in the homelab.
+      create: false
+      server:
+        name: spire-server
+      system:
+        name: spire-system
+    recommendations:
+      enabled: true
+spire-server:
+  controllerManager:
+    enabled: true
+  # sqlite on the kind default StorageClass
+  persistence:
+    size: 1Gi
+spire-agent:
+  # The chart's recommended contexts leave the agent container's empty. The agent runs
+  # as root with hostPID (the k8s workload attestor reads other pods' processes), so
+  # there is nothing to escalate to; saying so keeps the no-new-privileges bit set.
+  securityContext:
+    allowPrivilegeEscalation: false
+spiffe-oidc-discovery-provider:
+  enabled: false

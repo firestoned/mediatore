@@ -6,7 +6,7 @@
 The single-cluster shape of [ADR-0005](../adr/0005-spire-topology.md): one SPIRE server
 on the management cluster plays the downstream role, banlieue runs beside it, the
 broker runs as a Deployment from `deploy/base` with an overlay for what is yours. This
-page is that overlay, in order, for a k0s cluster that already has the SPIRE chart,
+page is that overlay, in order, for a k0s cluster that already has SPIRE,
 banlieue and an issuer; [the walkthrough](homelab-walkthrough.md) is the whole stack
 from the empty cluster, with every command. The enterprise split (a root on its own identity cluster) is
 [a separate guide](enterprise-spire-topology.md); roadmap 02 tracks what is still
@@ -16,8 +16,8 @@ missing for VMs to attest ([`ROADMAPS.md`](https://github.com/firestoned/mediato
 
 | Piece | Where it comes from | How mediatore uses it |
 | --- | --- | --- |
-| SPIRE server, agents and the SPIFFE CSI driver | the `spiffe/spire` chart, `watchClassless: false`, class name `<release>-spire` | the broker's SVID over the CSI socket (ADR-0007); entries as `ClusterStaticEntry` (ADR-0006) |
-| SPIRE Controller Manager | the same chart | renders the entries the broker declares |
+| SPIRE server, agents and the SPIFFE CSI driver | SPIRE's distribution rendered once into manifests ([the walkthrough](homelab-walkthrough.md), step 2), `watchClassless: false`, class name `<namespace>-<release name>` | the broker's SVID over the CSI socket (ADR-0007); entries as `ClusterStaticEntry` (ADR-0006) |
+| SPIRE Controller Manager | the same manifests | renders the entries the broker declares |
 | banlieue with `VirtualMachinePool` and `VirtualMachineClaim` | banlieue's release | the claims mediatore creates (ADR-0008, ADR-0011) |
 | banlieue's claim subject policy listing mediatore as a broker | ConfigMap `banlieue-claim-subject-policy`, `brokers:` line `system:serviceaccount:banlieue-system:mediatore`, `issuers:` listing yours | every claim mediatore creates names someone else's subject ([requesting a sandbox](requesting-a-sandbox.md)) |
 | An issuer with a public client for mediatore | Dex, Google, Auth0 or Entra ([issuers](issuers.md)) | `mediatore login` and the refresh before every issue |
@@ -37,7 +37,8 @@ URL, your CIDRs. Edit:
 
 - `mediatore.yaml`: `trust_domain`, `issuers` (from the [issuers guide](issuers.md)),
   `audiences`, `sts.issuer` (what downstream services will see as `iss`), and
-  `spire.entries.class_name` if the chart's release is not `spire-server`;
+  `spire.entries.class_name` if SPIRE was rendered with another namespace or release
+  name (the class is `<namespace>-<release name>`, `spire-server-spire` in the example);
 - `networkpolicy.yaml`: the sandbox segment's CIDR for `:8443`, the control-plane
   addresses for the API server, the node CIDR for the kubelet's probe, and the
   issuer's namespace or addresses;
@@ -103,7 +104,11 @@ make live-admission-test
 
 It declares the two entry shapes, waits for the controller manager to set them, proves
 that admission refuses what [ADR-0006](../adr/0006-registration-entries-as-clusterstaticentry.md)
-forbids and that RBAC refuses edits, and retracts everything. It fails rather than
+forbids and that RBAC refuses edits, and retracts everything. Give the API server a
+moment after step 3: a policy is stored before it is enforced, and
+`dev/kind/admission-settled.sh <sa kubeconfig> <trust domain>` is the dry-run probe
+the kind tier waits on (it needs a kubeconfig for the broker's ServiceAccount, which
+`dev/kind/sa-kubeconfig.sh` writes from an admin one). It fails rather than
 skips when a variable is missing. [Testing tiers](testing.md) has the rest of the
 suites.
 

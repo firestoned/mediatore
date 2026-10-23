@@ -1,0 +1,24 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+#
+# What the chart's recommended security contexts leave open and no value reaches: the
+# CSI node driver registrar runs with no context at all. It is a sidecar that writes
+# one socket into the kubelet's plugin registry (a root-owned host path, hence root)
+# and needs nothing else. The CSI driver container beside it stays privileged: it
+# mounts into other pods with bidirectional propagation, and the API server refuses
+# allowPrivilegeEscalation=false on a privileged container.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: spire-spiffe-csi-driver
+  namespace: spire-system
+spec:
+  template:
+    spec:
+      containers:
+        - name: node-driver-registrar
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+            readOnlyRootFilesystem: true
+            seccompProfile: { type: RuntimeDefault }
