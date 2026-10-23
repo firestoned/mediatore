@@ -38,7 +38,9 @@ cleanup() { kill "${PIDS[@]}" 2>/dev/null || true; }
 trap cleanup EXIT
 
 say "start fake-idp and mediatore"
-"$BIN/fake-idp" serve & PIDS+=($!)
+# The issuer's key is generated for this run and shared with the token command by file.
+IDP_KEY=dev/fake-idp.pem
+"$BIN/fake-idp" serve --key-file "$IDP_KEY" & PIDS+=($!)
 "$BIN/mediatore" serve --config dev/demo.yaml & PIDS+=($!)
 for url in "$IDP_URL/jwks" "$USER_URL/healthz" "$SANDBOX_URL/healthz"; do
   for _ in $(seq 1 50); do curl -fsS "$url" >/dev/null 2>&1 && break; sleep 0.2; done
@@ -56,7 +58,7 @@ NODE_SVID="spiffe://$TRUST_DOMAIN/banlieue/node/$EK_HASH"
   --provider libvirt & GUEST=$!; PIDS+=("$GUEST")
 
 say "login (fake IdP) and create the claim through the front door"
-TOKEN=$("$BIN/fake-idp" token --login octocat --group "$GROUP")
+TOKEN=$("$BIN/fake-idp" token --key-file "$IDP_KEY" --login octocat --group "$GROUP")
 CLAIM=$(curl -fsS "$USER_URL/v1/claims" -H "Authorization: Bearer $TOKEN" \
   -H 'content-type: application/json' \
   -d "{\"pool_ref\":\"pool-a\",\"ttl_seconds\":3600,\"audiences\":[\"$AUDIENCE\"],\"workload\":{\"image\":\"registry.internal:5000/sandbox:latest\",\"args\":[\"/bin/sh\"]}}")

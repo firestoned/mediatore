@@ -49,11 +49,30 @@ const TEST_KID: &str = "test-1";
 /// Groups a user has until a test says otherwise.
 pub const DEFAULT_GROUPS: &[&str] = &["firestoned:sandbox-users"];
 
-/// The fake issuer's signing key, generated once per process. Never embedded: a key in
-/// source is a key in every clone, and the secret scanners say so.
+/// The fake issuer's signing key: one per process, generated on first use unless
+/// [`use_idp_key`] installed one. Never embedded: a key in source is a key in every
+/// clone, and the secret scanners say so.
+static IDP_KEY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
 fn idp_test_key() -> &'static str {
-    static KEY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    KEY.get_or_init(entra::fresh_p256_key_pem)
+    IDP_KEY.get_or_init(entra::fresh_p256_key_pem)
+}
+
+/// The issuer key this process signs with, PKCS#8 PEM, for handing to another process
+/// (the `fake-idp` binary writes it to a file its `token` command reads).
+#[must_use]
+pub fn idp_key_pem() -> &'static str {
+    idp_test_key()
+}
+
+/// Sign with `pem` (a PKCS#8 P-256 key) instead of a fresh key, so a token minted here
+/// verifies against a fake issuer running elsewhere with the same key. Must come
+/// before the first issuer start or [`mint`] in this process.
+///
+/// # Errors
+/// When a key is already in use; `pem` is handed back.
+pub fn use_idp_key(pem: String) -> Result<(), String> {
+    IDP_KEY.set(pem)
 }
 
 #[derive(Clone)]
@@ -177,7 +196,7 @@ fn error(status: StatusCode, code: &str) -> Response {
 /// An OAuth error reply, before it is a `Response`: the status and the `error` code.
 type Refusal = (StatusCode, &'static str);
 
-/// The verifying half of the fixed test key.
+/// The verifying half of the process's issuer key.
 fn test_decoding_key() -> DecodingKey {
     let secret = p256::SecretKey::from_pkcs8_pem(idp_test_key()).expect("test key");
     let point = secret.public_key().to_sec1_point(false);
@@ -571,7 +590,7 @@ impl FakeIdp {
     }
 
     /// Bind `addr` and serve `/.well-known/openid-configuration`, `/jwks`, `/auth` and
-    /// `/token`, signing with the fixed test key.
+    /// `/token`, signing with the process's issuer key.
     ///
     /// # Panics
     /// On any setup failure; this is test scaffolding.
@@ -802,8 +821,9 @@ impl FakeIdp {
     }
 }
 
-/// Mint a token signed with the fixed test key for `issuer`, without a running server.
-/// Works because the key never changes; the `fake-idp` binary relies on this.
+/// Mint a token for `issuer` with the process's issuer key, without a running server.
+/// It verifies at a fake issuer in another process only when both share the key
+/// ([`use_idp_key`]); the `fake-idp` binary passes it through a file.
 ///
 /// # Panics
 /// On encoding failure; this is test scaffolding.
