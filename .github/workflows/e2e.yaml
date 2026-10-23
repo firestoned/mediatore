@@ -18,12 +18,11 @@
 # against banlieue's CRDs (lease, node-entry trigger), then the AgentSandbox CRD, its
 # subject policy and reconciler from request to Ready and back: `make kind-e2e-ci`.
 #
-# The third job is the TPM attestation path (ADR-0018) with a vTPM behind the kind node:
-# swtpm through the kernel's vtpm proxy on the runner, mounted into the node; an agent on
-# the image's agent.conf attesting through the pinned plugin, refused under the wrong EK
-# CA, listed under the EK's hash under the right one; the node entry under that agent.
-# It needs sudo and swtpm on the host, so it is its own job: `make kind-e2e-tpm`.
-# docs/guides/testing.md has the tiers and what each proves.
+# Not here: the TPM attestation path (ADR-0018, `make kind-e2e-tpm`) needs a vTPM
+# behind the kind node, which is swtpm through the kernel's tpm_vtpm_proxy module. The
+# Azure kernels of GitHub-hosted runners do not ship that module (checked against
+# linux-modules-extra-6.17.0-1022-azure on 2026-10-24), so that tier runs by hand on a
+# host whose kernel has it. docs/guides/testing.md has the tiers and what each proves.
 
 name: E2E
 
@@ -92,27 +91,3 @@ jobs:
       # on failure.
       - name: Live suites as the broker ServiceAccount
         run: make kind-e2e-ci
-
-  kind-tpm:
-    name: 🧪 TPM attestation against SPIRE in kind
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable (moving ref: re-pin quarterly)
-        with:
-          targets: x86_64-unknown-linux-musl
-
-      # swtpm and swtpm_setup for the vTPM (dev/kind/vtpm.sh); the runner's kernel has
-      # the tpm_vtpm_proxy module and sudo is passwordless.
-      - name: Install musl tools and swtpm
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools swtpm swtpm-tools
-
-      - name: Cache cargo dependencies
-        uses: firestoned/github-actions/rust/cache-cargo@e034489c3a17ffaaaf7f8fb799156ce768d899d5 # v1.3.9
-
-      - name: The attestation path with a vTPM behind the node
-        run: make kind-e2e-ci KIND_E2E_SUITES=kind-e2e-tpm

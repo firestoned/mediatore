@@ -84,6 +84,7 @@ installed beyond a `ServiceAccount` a live test left behind.
       `spiffe://<td>/spire/agent/tpm/<hash>` under the right one with the hash mediatore
       computes, the member's certificate becoming the node entry under that agent and the
       guest registering over the SVID it issues, a fresh pod re-attesting as the same
-      agent; its own CI job. What it found: the EK is signed by the local CA's issuing
+      agent; by hand on a host whose kernel has `tpm_vtpm_proxy` (GitHub's Azure runners
+      do not ship it). What it found: the EK is signed by the local CA's issuing
       certificate (`issuercert.pem`), not its root, and the plugin takes no intermediates,
       so the bundle must carry the issuing certificate; the docs and `ek-cas.yaml` fixed

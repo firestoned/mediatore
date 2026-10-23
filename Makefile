@@ -23,7 +23,7 @@ KIND_KUBECONFIG    := $(KIND_DIR)/kubeconfig
 KIND_SA_KUBECONFIG := $(KIND_DIR)/mediatore-sa.yaml
 # The vTPM behind the node (make kind-vtpm): swtpm's state, device path and EK material.
 KIND_VTPM_DIR      := $(KIND_DIR)/vtpm
-# What kind-e2e-ci runs; the TPM tier is its own job (it needs sudo and swtpm on the host).
+# What kind-e2e-ci runs; the TPM tier is run by hand where the host has the vtpm proxy module.
 KIND_E2E_SUITES    ?= kind-e2e
 KIND_KUBECTL       := kubectl --kubeconfig $(KIND_KUBECONFIG)
 # SPIRE in kind comes from manifests rendered once (`make kind-spire-render`, the only

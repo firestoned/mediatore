@@ -54,6 +54,10 @@ create_certs_tool_config = $D/swtpm-localca.conf
 create_certs_tool_options = $D/swtpm-localca.options
 active_pcr_banks = sha256
 EOF
+  sudo modprobe -n tpm_vtpm_proxy 2>/dev/null || {
+    echo "this kernel has no tpm_vtpm_proxy module; the TPM tier runs where it does (Debian's and Ubuntu's generic kernels have it, GitHub-hosted runners' Azure kernels do not)" >&2
+    exit 1
+  }
   sudo modprobe tpm_vtpm_proxy
   # swtpm_localca creates the local CA (a root and the issuing certificate it signs) on
   # its first use, as it does on a hypervisor; the EK certificates are written out beside

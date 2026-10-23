@@ -14,7 +14,7 @@ a real cluster address or a real credential in a tracked file.
 | Dev-mode loop | `make e2e` | The roles of the one binary agree on the wire contract as separate processes | everywhere, every PR |
 | Session e2e | `make check` (`crates/mediatore/tests/e2e_session.rs`) | The session path (ADR-0013) over real listeners against the fake issuer's real authorization-code and refresh grants: delegation, rotation, fresh groups, outage, revocation, the group gate at refresh, the per-claim limit; the CLI's PKCE login in `crates/mediatore-client` | everywhere, every commit |
 | Live against SPIRE in kind | `make kind-e2e` | Kubernetes, the SPIRE Controller Manager and the admission policy behave as the ADRs say, as the broker's own ServiceAccount; the broker image runs on the CSI driver's socket and agent-issued SVIDs meet on the sandbox listener | CI on every PR, any laptop with a container runtime |
-| TPM attestation in kind | `make kind-e2e-tpm` | A SPIRE agent on the image's own configuration attests with a vTPM through the pinned plugin on both sides, the EK trust bundle refuses what it should, the node entry lands under that agent | CI on every PR, a Linux host with `sudo` and swtpm |
+| TPM attestation in kind | `make kind-e2e-tpm` | A SPIRE agent on the image's own configuration attests with a vTPM through the pinned plugin on both sides, the EK trust bundle refuses what it should, the node entry lands under that agent | by hand, a Linux host with `sudo`, swtpm and the `tpm_vtpm_proxy` module (not GitHub's runners) |
 | Live against a real cluster | `make live-admission-test` | The same, against a deployment you operate | by hand, before a release or after changing the deployment |
 
 ## Unit: `make check`
@@ -122,7 +122,7 @@ Suites today:
 | `make kind-e2e-sandbox` | 0008, 0012 | the `AgentSandbox` CRD and its subject policy, a sandbox becoming an owned claim and a record, the claim bound end to end to a claim entry and the guest fetching the subject, a broker restart on the store with the sandbox staying `Ready`, deletion through the finalizer, the released row swept into the audit table, below |
 | `make kind-e2e-store` | 0012 | the broker on PostgreSQL over `verify-full`, the store conformance suite against that database, below |
 | `make kind-e2e-dex` | 0013 | the real CLI logging in at a real Dex from inside the cluster and delegating the session, a refresh at Dex before every issue, the claim released when the user leaves the gated group in the directory and when the refresh token is deleted at Dex, below |
-| `make kind-e2e-tpm` | 0018 | an agent attesting with a vTPM behind the kind node through the `tpm` plugin, on `image/spire/agent.conf`, refused under a CA that never signed its EK and listed under the EK's hash under the right one, the member's certificate becoming the node entry under that agent and the guest registering over the SVID it issues, a fresh pod re-attesting as the same agent; not part of `make kind-e2e` (it needs `sudo` and swtpm on the host), its own CI job, below |
+| `make kind-e2e-tpm` | 0018 | an agent attesting with a vTPM behind the kind node through the `tpm` plugin, on `image/spire/agent.conf`, refused under a CA that never signed its EK and listed under the EK's hash under the right one, the member's certificate becoming the node entry under that agent and the guest registering over the SVID it issues, a fresh pod re-attesting as the same agent; not part of `make kind-e2e` and not in CI (it needs `sudo`, swtpm and the kernel's vtpm proxy on the host), below |
 
 ### The store: PostgreSQL over TLS the client verifies
 
@@ -345,9 +345,13 @@ CA's issuing certificate (`issuercert.pem`, `CN=swtpm-localca`), not the root
 refuses every VM. The deploying guide and `deploy/spire-tpm/ek-cas.yaml` collect
 `issuercert.pem`.
 
-The tier is not in `make kind-e2e`: it needs `sudo`, `swtpm`, `swtpm_setup` and the
-`tpm_vtpm_proxy` module on the host, which a laptop with Docker Desktop does not have.
-CI runs it as its own job (`make kind-e2e-ci KIND_E2E_SUITES=kind-e2e-tpm`).
+The tier is not in `make kind-e2e` and not in CI: it needs `sudo`, `swtpm`,
+`swtpm_setup` and the `tpm_vtpm_proxy` module on the host. A laptop with Docker Desktop
+has none of that, and the Azure kernels of GitHub-hosted runners do not ship the module
+(not even in `linux-modules-extra`, checked 2026-10-24). Debian's and Ubuntu's generic
+kernels have it; the build host runs it by hand before a change to the attestation path
+merges (`make kind-e2e-ci KIND_E2E_SUITES=kind-e2e-tpm` is the CI shape, cluster deleted
+after). `make kind-vtpm` says so and stops when the module is missing.
 
 Pins live at the top of the `Makefile`: kind, the node image by digest (same
 Kubernetes minor as the homelab), the versions of SPIRE's distribution, the placeholder
