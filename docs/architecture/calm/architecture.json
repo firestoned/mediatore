@@ -137,7 +137,7 @@
       "unique-id": "system-sandbox-vm",
       "node-type": "system",
       "name": "Sandbox VM (pool member)",
-      "description": "A banlieue pool member with a fresh vTPM, attested at boot before any claim exists. Carries the SPIRE agent, the in-guest agent and, once bound, the jailed workload."
+      "description": "A banlieue pool member with a fresh vTPM, attested at boot before any claim exists. Carries the SPIRE agent, the in-guest agent and, once bound, the jailed workload. Its units start only on the installed disk, and its GuestReady is announced by the in-guest agent after registration (ADR-0019), not by a boot stage."
     },
     {
       "unique-id": "service-spire-agent",
@@ -149,7 +149,7 @@
       "unique-id": "service-guest-agent",
       "node-type": "service",
       "name": "mediatore guest",
-      "description": "Root daemon, the guest role of the one mediatore binary (ADR-0014): registers the node (EK hash + DMI UUID), polls GET /v1/me for a bound claim, creates the per-subject user (sb- + 12 hex, ADR-0004), builds /mnt/sandbox, bind-mounts the binary at the pinned path read-only into the jail and supervises the nsjail until the deadline, then tears down. crates/mediatore-guest."
+      "description": "Root daemon, the guest role of the one mediatore binary (ADR-0014): registers the node (EK hash + DMI UUID), then announces GuestReady to the hypervisor over the channel banlieue reads (the /run marker, guestinfo or vsock; ADR-0019), so the pool counts the member only once it is attested and registered; polls GET /v1/me for a bound claim, creates the per-subject user (sb- + 12 hex, ADR-0004), builds /mnt/sandbox, bind-mounts the binary at the pinned path read-only into the jail and supervises the nsjail until the deadline, then tears down. crates/mediatore-guest."
     },
     {
       "unique-id": "service-sandbox-workload",
@@ -482,6 +482,20 @@
       "protocol": "mTLS"
     },
     {
+      "unique-id": "rel-guest-agent-guestready",
+      "description": "After POST /v1/nodes is accepted, the installed-guest announcement banlieue ADR-0043 defines, on the channel its provider reads: /run/banlieue/phase (libvirt, through qemu-guest-agent), guestinfo.banlieue.phase (vSphere), phase=installed over vsock (Cloud Hypervisor). Liveness only; mediatore reads it nowhere (ADR-0019).",
+      "relationship-type": {
+        "connects": {
+          "source": {
+            "node": "service-guest-agent"
+          },
+          "destination": {
+            "node": "system-banlieue"
+          }
+        }
+      }
+    },
+    {
       "unique-id": "rel-workload-mediatore",
       "description": "POST /v1/token over the claim SVID: one audience per request, from the claim's allowlist, capped at 15 minutes, never a refresh token. Rate-limited per claim (token.rate_per_minute, 429 beyond it) ahead of any upstream call (ADR-0013).",
       "relationship-type": {
@@ -675,6 +689,11 @@
           "sequence-number": 5,
           "relationship-unique-id": "rel-guest-agent-mediatore",
           "description": "mediatore guest registers the node over mTLS with that SVID; the broker checks the SVID's EK hash equals the registered one and refuses a cloned EK with 409."
+        },
+        {
+          "sequence-number": 6,
+          "relationship-unique-id": "rel-guest-agent-guestready",
+          "description": "The guest announces GuestReady on the hypervisor's channel; only now does the pool count the member (ADR-0019)."
         }
       ]
     }
@@ -684,7 +703,7 @@
     "repository": "https://github.com/firestoned/mediatore",
     "license": "Apache-2.0",
     "calm-schema-version": "1.2",
-    "phase": "dev-mode loop implemented and e2e-tested; Entra OBO is a fail-closed stub. Roadmap 01 (ADR-0006, ADR-0007) implemented and live-tested in kind: registration entries as ClusterStaticEntry through the Kubernetes API, broker identity from the Workload API over the SPIFFE CSI driver, SPIFFE mTLS terminated in-process (crates/mediatore-tls). Roadmap 03 (ADR-0011): the claim watcher, node resolution by EK, node entries from pool members, leader election by Lease. Roadmap 08 (ADR-0008): the AgentSandbox CRD, its reconciler on the same loop, the subject admission policy and the user API creating the resource; records now exist outside dev_mode. SPIRE topology models the ADR-0005 desired state: root on a dedicated identity cluster, downstream per environment; the homelab collapses to the downstream server alone. Roadmap 05 (ADR-0012): one sqlx store over SQLite or PostgreSQL, the sealed refresh envelope, rows swept into an audit table; every kind tier runs the broker on PostgreSQL over verify-full. Roadmap 04, first slice (ADR-0013): the Dex path, with the upstream session delegated at claim creation, sealed, refreshed before every issue and revoked on refusal; mediatore-cli; per-claim rate limiting. Entra OBO and the transit sealer are the roadmap's next slices. ADR-0014: one binary, the roles as subcommands (serve, guest, token, login, sandbox, session), one musl artifact for every host, the jail mounting it read-only; the node entry pins /usr/local/bin/mediatore. ADR-0015: the transit sealer; the kind tiers run the broker on an OpenBao (make kind-openbao) with Kubernetes auth and a derived key; the local sealer stays the homelab shape. ADR-0016: the Entra path, with the caller's token exchanged On-Behalf-Of at claim creation, the session refreshed per audience before every issue, and the broker's credential a signed assertion (key file, OpenBao transit or a federated ServiceAccount token); proven against the fake issuer, the live run against a tenant is by hand. ADR-0017: issuer profiles, the session path for any OIDC issuer (Google and Auth0 beside Dex), per-issuer login parameters and groups claim. ADR-0018: TPM attestation with the SPIFFE community plugin as a kustomize component, the hypervisors' swtpm CAs as the EK bundle; the agent fragments for the VM image."
+    "phase": "dev-mode loop implemented and e2e-tested; Entra OBO is a fail-closed stub. Roadmap 01 (ADR-0006, ADR-0007) implemented and live-tested in kind: registration entries as ClusterStaticEntry through the Kubernetes API, broker identity from the Workload API over the SPIFFE CSI driver, SPIFFE mTLS terminated in-process (crates/mediatore-tls). Roadmap 03 (ADR-0011): the claim watcher, node resolution by EK, node entries from pool members, leader election by Lease. Roadmap 08 (ADR-0008): the AgentSandbox CRD, its reconciler on the same loop, the subject admission policy and the user API creating the resource; records now exist outside dev_mode. SPIRE topology models the ADR-0005 desired state: root on a dedicated identity cluster, downstream per environment; the homelab collapses to the downstream server alone. Roadmap 05 (ADR-0012): one sqlx store over SQLite or PostgreSQL, the sealed refresh envelope, rows swept into an audit table; every kind tier runs the broker on PostgreSQL over verify-full. Roadmap 04, first slice (ADR-0013): the Dex path, with the upstream session delegated at claim creation, sealed, refreshed before every issue and revoked on refusal; mediatore-cli; per-claim rate limiting. Entra OBO and the transit sealer are the roadmap's next slices. ADR-0014: one binary, the roles as subcommands (serve, guest, token, login, sandbox, session), one musl artifact for every host, the jail mounting it read-only; the node entry pins /usr/local/bin/mediatore. ADR-0015: the transit sealer; the kind tiers run the broker on an OpenBao (make kind-openbao) with Kubernetes auth and a derived key; the local sealer stays the homelab shape. ADR-0016: the Entra path, with the caller's token exchanged On-Behalf-Of at claim creation, the session refreshed per audience before every issue, and the broker's credential a signed assertion (key file, OpenBao transit or a federated ServiceAccount token); proven against the fake issuer, the live run against a tenant is by hand. ADR-0017: issuer profiles, the session path for any OIDC issuer (Google and Auth0 beside Dex), per-issuer login parameters and groups claim. ADR-0018: TPM attestation with the SPIFFE community plugin as a kustomize component, the hypervisors' swtpm CAs as the EK bundle; the agent fragments for the VM image. ADR-0019: GuestReady announced by the guest after attestation and registration, the VM units guarded on the installed disk."
   },
   "adrs": [
     "docs/adr/0001-record-architecture-decisions.md",
@@ -704,6 +723,7 @@
     "docs/adr/0015-transit-sealer.md",
     "docs/adr/0016-entra-on-behalf-of.md",
     "docs/adr/0017-issuer-profiles.md",
-    "docs/adr/0018-tpm-attestation-with-the-spiffe-plugin.md"
+    "docs/adr/0018-tpm-attestation-with-the-spiffe-plugin.md",
+    "docs/adr/0019-guestready-after-attestation-and-registration.md"
   ]
 }

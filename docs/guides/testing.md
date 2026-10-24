@@ -122,7 +122,7 @@ Suites today:
 | `make kind-e2e-sandbox` | 0008, 0012 | the `AgentSandbox` CRD and its subject policy, a sandbox becoming an owned claim and a record, the claim bound end to end to a claim entry and the guest fetching the subject, a broker restart on the store with the sandbox staying `Ready`, deletion through the finalizer, the released row swept into the audit table, below |
 | `make kind-e2e-store` | 0012 | the broker on PostgreSQL over `verify-full`, the store conformance suite against that database, below |
 | `make kind-e2e-dex` | 0013 | the real CLI logging in at a real Dex from inside the cluster and delegating the session, a refresh at Dex before every issue, the claim released when the user leaves the gated group in the directory and when the refresh token is deleted at Dex, below |
-| `make kind-e2e-tpm` | 0018 | an agent attesting with a vTPM behind the kind node through the `tpm` plugin, on `image/spire/agent.conf`, refused under a CA that never signed its EK and listed under the EK's hash under the right one, the member's certificate becoming the node entry under that agent and the guest registering over the SVID it issues, a fresh pod re-attesting as the same agent; not part of `make kind-e2e` and not in CI (it needs `sudo`, swtpm and the kernel's vtpm proxy on the host), below |
+| `make kind-e2e-tpm` | 0018 | an agent attesting with a vTPM behind the kind node through the `tpm` plugin, on `image/spire/agent.conf`, refused under a CA that never signed its EK and listed under the EK's hash under the right one, the member's certificate becoming the node entry under that agent, the guest registering over the SVID it issues and only then announcing `GuestReady` (ADR-0019), a fresh pod re-attesting as the same agent; not part of `make kind-e2e` and not in CI (it needs `sudo`, swtpm and the kernel's vtpm proxy on the host), below |
 
 ### The store: PostgreSQL over TLS the client verifies
 
@@ -323,7 +323,8 @@ kernel's vtpm proxy (`tpm_vtpm_proxy`), which makes it a character device on the
 creates under `.kind/vtpm`, the way `swtpm_setup` does on a hypervisor, never the host's
 own CA. `make kind-create` mounts that device into the node as `/dev/tpmrm0`, so the
 vTPM must be up before the cluster exists (`make kind-delete` first; the target refuses
-a node without the device). The server runs `deploy/spire-tpm` as in every tier. A
+a node without the device). A rerun starts from `make kind-delete` too: the server keeps
+the agent a previous run attested, and the first refusal step would find it listed. The server runs `deploy/spire-tpm` as in every tier. A
 Deployment then plays the pool member: an init container copies the agent plugin out of
 its pinned image, the SPIRE agent runs `image/spire/agent.conf` with its two placeholders
 replaced and the trust bundle `spire-server bundle show` exported (the command the
@@ -336,7 +337,8 @@ PID namespace (the `unix` workload attestor reads its `/proc` entry, as on a VM)
 | ConfigMap `spire-tpm-ek-cas` replaced with a CA that never signed this EK, the server restarted, the agent started | the agent is refused (`could not verify cert`); `spire-server agent list` has no `tpm` agent |
 | the ConfigMap replaced with the vTPM's local CA (its issuing certificate), the server restarted, the agent started again | `Node attestation was successful`; the server lists exactly one `tpm` agent, `spiffe://<td>/spire/agent/tpm/<hash>`, where the hash is what `vtpm.sh` computed from the EK certificate (sha256 of the DER `SubjectPublicKeyInfo`): the plugin's hash and mediatore's agree |
 | `VirtualMachine` `member-1` patched with both EK certificates, as a vTPM carries them | `ClusterStaticEntry` `mediatore-node-<hash>` with `parentID` the attested agent; the guest logs `SVID from the Workload API` for `spiffe://<td>/banlieue/node/<hash>` and `node registered`: the entry reached the agent that attested |
-| the Deployment restarted (a new pod, empty agent state: a VM that lost its disk) | the new agent re-attests as the same ID (the plugin answers `CanReattest`), the server still lists one `tpm` agent, the new guest registers again, no clone reported |
+| the same guest log, read for order (ADR-0019) | `GuestReady announced` with `file=announced` appears after `node registered`, never before: the pool hears a member only once it is attested and registered. In the pod the marker file is the one channel (a tmpfs at `/run/banlieue`, as a VM's `/run` is; without it the guest logs the write failing on the read-only root and stays out of the pool, which is decision 5 observed); the unit tests in `crates/mediatore-guest/src/ready.rs` pin the three payloads |
+| the Deployment restarted (a new pod, empty agent state: a VM that lost its disk) | the new agent re-attests as the same ID (the plugin answers `CanReattest`), the server still lists one `tpm` agent, the new guest registers again and announces again, no clone reported |
 
 What it found the first time it ran: the certificate that signs a vTPM's EK is the local
 CA's issuing certificate (`issuercert.pem`, `CN=swtpm-localca`), not the root

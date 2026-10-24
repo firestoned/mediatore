@@ -4,7 +4,8 @@
 //! `mediatore guest`: turns a bound banlieue claim into a jailed, identity-bearing workload.
 //!
 //! State machine (runbook Part 6.1):
-//! boot → node registered → subject fetched → user created → jail running → torn down.
+//! boot → node registered → `GuestReady` announced → subject fetched → user created →
+//! jail running → torn down.
 
 use std::path::PathBuf;
 
@@ -13,7 +14,7 @@ use reqwest::Method;
 use uuid::Uuid;
 
 use crate::client::SandboxClient;
-use crate::{identity, jail, supervise, user};
+use crate::{identity, jail, ready, supervise, user};
 
 /// Seconds between registration retries while mediatore is unreachable.
 const REGISTER_RETRY_SECS: u64 = 5;
@@ -46,6 +47,10 @@ pub struct GuestArgs {
     /// never the path this process happens to run from
     #[arg(long, default_value = mediatore_proto::AGENT_BINARY_PATH)]
     pub agent_binary: PathBuf,
+    /// Where the installed-guest marker goes once the node is registered (banlieue
+    /// ADR-0043, read by libvirt's provider through the guest agent; ADR-0019)
+    #[arg(long, default_value = ready::PHASE_FILE)]
+    pub phase_file: PathBuf,
     /// Dev only: send this SPIFFE ID as a header instead of doing mTLS
     #[cfg(feature = "dev")]
     #[arg(long, env = "MEDIATORE_DEV_SPIFFE_ID", hide = true)]
@@ -171,6 +176,12 @@ pub async fn run(args: GuestArgs) -> anyhow::Result<()> {
     let client = connect(&args).await?;
     let registered = register(&client, &reg).await?;
     tracing::info!(node_id = %registered.node_id, "node registered");
+    // Only now is this member ready for a claim (ADR-0019): attested (the SVID came from
+    // the agent) and known to mediatore as a node. Tell the pool, on whatever channel the
+    // hypervisor reads. Not fatal: a member that cannot say so is never handed out.
+    ready::announce(&ready::Channels::detect(args.phase_file.clone()))
+        .await
+        .log();
 
     // 3. Wait for a claim, then learn who the sandbox is for.
     let me = wait_for_subject(&client).await?;
