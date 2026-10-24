@@ -72,7 +72,7 @@ futures      = "0.3"
 serde          = { version = "1", features = ["derive"] }
 serde_json     = "1"
 # safe-Rust YAML; serde_yaml_ng pulled the unmaintained unsafe-libyaml (RUSTSEC-2024-0449)
-serde-saphyr   = "1.3"
+serde-saphyr   = "2.0"
 
 # identity + crypto
 # aws_lc_rs backend: jsonwebtoken 10+ requires exactly one crypto provider, and
