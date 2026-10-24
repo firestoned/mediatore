@@ -217,7 +217,9 @@ objects are mediatore's concern:
   broker and every issuer users come from, with the username prefix each gets at the
   API server;
 - a `VirtualMachinePool` with `readiness: GuestReady`, which is what a sandbox is
-  claimed from ([requesting a sandbox](requesting-a-sandbox.md)).
+  claimed from ([requesting a sandbox](requesting-a-sandbox.md)); on the sandbox image
+  the guest announces it after attesting and registering (ADR-0019), so the image
+  carries no phase stage of its own.
 
 ```sh
 kubectl -n banlieue-system get configmap banlieue-claim-subject-policy -o yaml

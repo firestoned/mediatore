@@ -3,6 +3,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Fragment merged into the pool image's Kairos config. Nothing here is claim-specific.
+# No banlieue phase stage (its examples/16-cloud-config-guest-phase.yaml): on a sandbox
+# member `mediatore guest` announces GuestReady itself, after the node is attested and
+# registered (ADR-0019), and the two units start only on the installed disk.
 stages:
   initramfs:
     - name: spire-user

@@ -15,6 +15,7 @@ pub mod client;
 pub mod guest;
 mod identity;
 pub mod jail;
+pub mod ready;
 mod supervise;
 pub mod token;
 mod user;

@@ -155,3 +155,15 @@ can register the node, and with `InfrastructureReady` a deferred-install image i
 out while the install is still running. The claim then binds, the sandbox turns `Bound`,
 and `ready` waits on a node registration that comes late or never, until the watcher's
 `resolve_timeout_secs` fails the claim.
+
+On a sandbox member the announcement is the guest's, not a boot stage's
+([ADR-0019](../adr/0019-guestready-after-attestation-and-registration.md)): `mediatore
+guest` writes it right after `POST /v1/nodes` is accepted, on the channel the hypervisor
+reads (the `/run/banlieue/phase` marker for libvirt, `guestinfo.banlieue.phase` for
+vSphere, a line over vsock for Cloud Hypervisor). So `GuestReady` on such a pool means
+booted from the installed disk, attested as a SPIRE agent and registered with mediatore,
+and the pool's `Warm` count is the number of members a claim can bind to now. A member
+refused as a clone, or one that cannot reach the broker, announces nothing and stays out
+of the pool. The signal is still liveness, not integrity (banlieue ADR-0043 decision 9):
+mediatore reads it nowhere, and a bind resolves through the published EK and the node the
+guest registered over its SVID.

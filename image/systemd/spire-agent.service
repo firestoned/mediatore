@@ -5,6 +5,12 @@
 Description=SPIRE agent (TPM node attestation)
 After=network-online.target
 Wants=network-online.target
+# Only the system booted from the installed disk (banlieue ADR-0043 decision 2, ADR-0019
+# decision 4): Kairos runs the same enabled units in the live installer and in recovery,
+# and an installer that attests with the member's vTPM is an agent nobody wanted. A
+# non-Kairos image drops these two lines or provides the sentinel.
+ConditionPathExists=|/run/cos/active_mode
+ConditionPathExists=|/run/cos/passive_mode
 
 [Service]
 User=spire

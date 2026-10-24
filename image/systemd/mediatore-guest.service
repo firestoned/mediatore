@@ -6,6 +6,12 @@ Description=mediatore in-guest agent (banlieue sandbox)
 After=spire-agent.service network-online.target
 Requires=spire-agent.service
 Wants=network-online.target
+# Only the system booted from the installed disk (banlieue ADR-0043 decision 2, ADR-0019
+# decision 4): Kairos runs the same enabled units in the live installer and in recovery,
+# and an installer that attests, registers and announces mid-install is handed out
+# mid-install. A non-Kairos image drops these two lines or provides the sentinel.
+ConditionPathExists=|/run/cos/active_mode
+ConditionPathExists=|/run/cos/passive_mode
 
 [Service]
 Type=simple

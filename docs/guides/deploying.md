@@ -126,7 +126,9 @@ Until pool VMs attest with a TPM (roadmap 02's second half: the server's TPM att
 and the guest image), a claim binds and nothing registers, so `ready` stays false and
 the claim fails after `watcher.resolve_timeout_secs`; the API, the issuer, the store,
 the entries and the policies are nonetheless live at that point, which is what this
-page gets you.
+page gets you. Once the image carries the guest, the pool's `GuestReady` is the guest's
+own announcement after it registered ([ADR-0019](../adr/0019-guestready-after-attestation-and-registration.md)),
+so a `GuestReady` pool binds only members that can take the claim.
 
 ## 6. Let the VMs attest
 
@@ -172,6 +174,15 @@ dist-tpm-plugin` extracts the agent plugin binary (and the server's, for the rec
 from the same release into `dist/`, checksums verified, for banlieue-imagebuilder to
 bake beside `mediatore`. A VM whose EK certificate chains to no configured host CA
 never becomes an agent, and so never a node.
+
+Both units (`image/systemd/spire-agent.service`, `mediatore-guest.service`) start only
+when Kairos's installed-disk sentinel exists (`/run/cos/active_mode` or
+`passive_mode`), so the live installer, which boots the same image with the same
+enabled units, never attests with the member's vTPM, registers or announces
+`GuestReady` mid-install ([ADR-0019](../adr/0019-guestready-after-attestation-and-registration.md)).
+The image carries no phase stage of banlieue's: the guest announces after it registered.
+On a non-Kairos image, drop the two `ConditionPathExists` lines or provide the sentinel,
+and take the installer case on yourself.
 
 ## What the NetworkPolicy allows
 

@@ -93,6 +93,7 @@ flowchart LR
     service-spire-agent-k8s -->|TLS| service-spire-server
     service-spire-agent -->|TLS| service-spire-server
     service-guest-agent -->|mTLS| service-mediatore-sandbox-api
+    service-guest-agent --> system-banlieue
     service-sandbox-workload -->|mTLS| service-mediatore-sandbox-api
     service-sandbox-workload -->|HTTPS| ecosystem-downstream-api
     actor-sandbox-user --> data-asset-claim-store

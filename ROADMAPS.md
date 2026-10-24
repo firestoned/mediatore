@@ -15,7 +15,7 @@ the same commit that changes a roadmap item's state.
 | 03 | Claim watcher against banlieue | 🔶 in progress | [03-claim-watcher.md](.github/community/03-claim-watcher.md) |
 | 04 | Token backends live (OBO + Dex/STS) | 🔶 in progress | [04-token-backends-live.md](.github/community/04-token-backends-live.md) |
 | 05 | Persistent store (sqlx, ADR-0012) | ✅ done | [05-persistent-store.md](.github/community/05-persistent-store.md) |
-| 06 | Guest completion + hardening | ⛔ not started | [06-guest-hardening.md](.github/community/06-guest-hardening.md) |
+| 06 | Guest completion + hardening | 🔶 in progress | [06-guest-hardening.md](.github/community/06-guest-hardening.md) |
 | 07 | Credential-injecting egress proxy | 📄 design reference | [07-egress-proxy.md](.github/community/07-egress-proxy.md) |
 | 08 | AgentSandbox CRD and reconciler (ADR-0008) | ✅ done | [08-agentsandbox-crd.md](.github/community/08-agentsandbox-crd.md) |
 

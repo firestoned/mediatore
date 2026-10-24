@@ -5,8 +5,16 @@ SPDX-License-Identifier: Apache-2.0
 # Threat Model
 
 > **Status:** Living document. Last full pass **2026-10-24**, against the
-> architecture defined by **ADR-0001 … ADR-0018** (ADR-0009 and ADR-0010 are
-> adopted platform ADRs with no code of their own). This pass follows the
+> architecture defined by **ADR-0001 … ADR-0019** (ADR-0009 and ADR-0010 are
+> adopted platform ADRs with no code of their own). This pass covers ADR-0019:
+> `GuestReady` announced by the guest after it is attested and registered,
+> not by a boot stage, on the channel the hypervisor reads. No new asset and no
+> broker code; the guest gains one outbound, unauthenticated, liveness-only
+> signal to banlieue (its provider's boundary, read nowhere here) and the VM
+> units an installed-disk guard. TB-2 gains two rows (a forged and a missing
+> announcement), TB-4 one (the live installer as an agent); §2, §4 and §9
+> reworded, the diagram one edge, §7 one item. Earlier the same day, the pass
+> followed the
 > first live run of the TPM attestation path, the kind tier with a vTPM
 > behind the node (`make kind-e2e-tpm`), which corrected two things the
 > previous pass took from the manuals: the EK certificate is signed by the
@@ -156,7 +164,7 @@ holds three things an attacker wants:
 | Claim store | `crates/mediatore-store` (`SqlStore`, one query set) | PostgreSQL at work, SQLite for one replica; in-memory only under `dev_mode` | Sealed refresh envelopes, revocations, the node registry, audit rows; the request fields are a copy of the `AgentSandbox` spec. Migrated at startup; swept at resync |
 | Store database | the operator's PostgreSQL, or a SQLite file on the pod's volume (`dev/kind/postgres/` in kind) | management cluster or beside it | Holds every row; reached with the URL in Secret `mediatore-store` over TLS `verify-full` |
 | OpenBao (transit) | the operator's OpenBao (`dev/kind/openbao/` in kind), `crates/mediatore-openbao` (the client), `crates/mediatore-store/src/seal.rs` (`TransitSealer`) and `crates/mediatore-entra/src/assertion.rs` (the transit signer) on the broker's side | management cluster or beside it | Holds the derived sealing key and, when configured so, the RSA key behind the broker's client assertion, and never releases either; encrypts, decrypts and signs for a token it issued to the broker's ServiceAccount (ADR-0015, ADR-0016) |
-| In-guest agent (`mediatore guest`) | `crates/mediatore-guest` (`guest.rs`), the same static binary as the broker (ADR-0014) | root on each pool member | `useradd`, mount, nsjail; bind-mounts the binary at the pinned path read-only into the jail |
+| In-guest agent (`mediatore guest`) | `crates/mediatore-guest` (`guest.rs`, `ready.rs`), the same static binary as the broker (ADR-0014) | root on each pool member | `useradd`, mount, nsjail; bind-mounts the binary at the pinned path read-only into the jail; writes the `GuestReady` announcement to the hypervisor's channel (the `/run` marker, `guestinfo`, vsock) once the node is registered, never before (ADR-0019) |
 | Workload client (`mediatore token`) | `crates/mediatore-guest` (`token.rs`), the binary the guest mounted at `/usr/local/bin/mediatore` | inside the jail, as the `sb-` user | Holds one token in memory; nothing but the token on standard output |
 | Deployment | `deploy/base/*.yaml`, with `deploy/overlays/homelab-example/` as the single-cluster shape (one replica on SQLite, the local sealer, the Tailscale ingress class, the `NetworkPolicy`) | management cluster | SA, RBAC, `ClusterSPIFFEID`, the `AgentSandbox` CRD (`crds/`, generated), the entries and the sandbox-subject admission policies, the CSI inline volume for the agent socket, the `LoadBalancer` service for :8443, ingress for :8080, the store URL from Secret `mediatore-store` (operator-created) |
 | SPIRE Controller Manager | hardened chart (not this repo) | `spire-server` pod | Renders `ClusterStaticEntry` into server entries over the server's private socket |
@@ -190,7 +198,7 @@ holds three things an attacker wants:
 | Declarative requester (GitOps, CI, an app-only service with `create` on `agentsandboxes`) | Authenticated by the API server, not trusted | May only request a sandbox for the subject it is, unless listed in A-9; never sees a token |
 | Jailed workload | Hostile by assumption | Prompt-injected agents run here; that is the design case |
 | In-guest agent | Trusted root on the VM | Bounded by the VM's own blast radius |
-| Pool VM (pre-claim) | Attested hardware identity, no subject | Holds a node SVID only |
+| Pool VM (pre-claim) | Attested hardware identity, no subject | Holds a node SVID only; counted by a `GuestReady` pool only once its guest announced, which it does after registering (ADR-0019) |
 | banlieue control plane | Trusted | Binds claims; never sees tokens |
 | SPIRE server | Trusted | Root of workload identity |
 | SPIRE Controller Manager | Trusted | Turns admitted `ClusterStaticEntry` resources into entries; the only thing that talks to the server's admin surface |
@@ -243,6 +251,7 @@ flowchart TB
 
   agent -- "(TB-4) TPM node attestation" --> spire
   guest -- "(TB-6) SPIFFE mTLS: node SVID" --> mediatore
+  guest -. "GuestReady after registration: /run marker,<br/>guestinfo or vsock (liveness, banlieue's boundary, ADR-0019)" .-> banlieue
   workload -- "(TB-6) SPIFFE mTLS: POST /v1/token, claim SVID" --> mediatore
   workload -- "(TB-7) issued token only" --> apis
 ```
@@ -264,6 +273,11 @@ flowchart TB
   SQLite file; the rows that outlive the process)
 - **TB-10** mediatore ↔ OpenBao transit (the sealing key that never leaves OpenBao; the
   broker's ServiceAccount token for that audience, exchanged for an OpenBao token)
+
+The guest's `GuestReady` announcement (ADR-0019) leaves the VM over the hypervisor's
+channel to banlieue's provider, which treats it as untrusted input (banlieue ADR-0043
+decision 9, its threat model). mediatore reads it nowhere, so it is no boundary of this
+document; what a forged or missing one can do here is in TB-2.
 
 ## 6. STRIDE, per boundary
 
@@ -311,6 +325,8 @@ the residue is in §8. No boundary carries the marker as of this pass.
 | A claim labelled as mediatore's by someone else | S | The label only selects what the watcher reads; a bind still needs a store record for that UID, which only the `AgentSandbox` reconciler writes and only for a claim it owns, and a registered node for the EK (`a_claim_without_a_record_binds_nothing`; live in kind, `make kind-e2e-watcher`, the claim without a record). Who may create claims at all is banlieue's claim-subject policy, above |
 | Two replicas bind or release the same claim | T/D | One leader by `Lease` `mediatore-watcher` (`crates/mediatore-claims/src/lease.rs`; namespaced Role `mediatore-watcher-lease`, `deploy/base/rbac.yaml`): a holder that fails to renew stops its controllers before another can acquire. Second line: `Reconciler::bind` is idempotent and `KubeEntryManager` tolerates 409 |
 | A deleted or expired claim keeps minting tokens | E | `Releasing`, `Failed` or a deletion timestamp releases (entry retracted, record revoked: `releasing_failed_and_deletion_retract_the_entry_and_cut_off`); at every resync the leader releases bound records whose claim is gone and sweeps orphan entries (`Watcher::resync`, `resync_releases_bound_records_whose_claim_is_gone_and_sweeps_orphans`) |
+| A member announces `GuestReady` without being attested or registered (a compromised or misbuilt guest, a boot stage left in the image), so its pool hands it to a claim | S | The announcement is liveness only and nothing in mediatore reads it: the bind resolves through the EK banlieue published and the node the guest registered over its node SVID (`Watcher::resolve`, `crates/mediatore-claims/src/watch.rs`, `a_bound_claim_with_a_registered_node_is_bound_by_its_ek`), and a member that never registers fails the claim at `resolve_timeout_secs` (`unresolved_is_retried_then_failed_after_the_timeout`). ADR-0019 only moves the honest signal later: `ready::announce` runs after `POST /v1/nodes` succeeded (`crates/mediatore-guest/src/guest.rs`), the kind TPM tier asserts that order in the guest's log (`dev/kind/tpm-e2e.sh`), and the sandbox image carries no phase stage (`image/cloud-config.yaml`) |
+| A member cannot announce (no writable `/run`, no channel its hypervisor reads), so it is never Ready | D | Logged per channel at warn and not fatal (`Announced::log`, `crates/mediatore-guest/src/ready.rs`; unit `an_unwritable_marker_is_a_failure_not_a_panic_and_nothing_else_announced_means_none`); the member stays out of a `GuestReady` pool, which reports why (banlieue ADR-0043 decision 10), and no claim is bound to it. A pool on `InfrastructureReady` is unaffected |
 | Broker SA used to delete claims at will | D | The watcher deletes only a claim it holds a record for and could not resolve within the timeout, logged with the UID and the reason (`Watcher::fail`); RBAC `delete` on `virtualmachineclaims` is what ADR-0008 needs anyway |
 
 ### TB-3: mediatore → Kubernetes API (`ClusterStaticEntry`) → controller manager → SPIRE server
@@ -339,6 +355,7 @@ the residue is in §8. No boundary carries the marker as of this pass.
 | An agent attests from outside the cluster | S | `k8s_psat` node attestation: a projected, audience-bound service-account token validated against the API server, bound to the cluster name. Observed: every agent's SPIFFE ID is bound to a node UID |
 | A jailed workload presents the agent's binary path to be issued the node SVID (the jail mounts the same file, ADR-0014) | S | The node entry carries two selectors and SPIRE requires both: `unix:uid:0` and `unix:path:/usr/local/bin/mediatore` (`ensure_node_entry`, `crates/mediatore-spire/src/kube.rs`, unit `node_entry_pins_root_and_the_agent_binary`); the jailed process runs as the `sb-` user, so the path alone matches nothing. The claim entry keeps `unix:user:<sb-user>` |
 | Another pod on the management cluster is issued the broker's SVID | S/E | `deploy/base/clusterspiffeid.yaml` selects namespace `banlieue-system`, pod label `app.kubernetes.io/name: mediatore`, ServiceAccount `mediatore` and container name `mediatore`, all attested by the agent through the verified kubelet; creating such a pod is RBAC-gated (cluster admin trusted, §9). See TB-8 |
+| The live installer, booted from the same image with the same enabled units and the member's vTPM, attests as the agent, registers and announces while it is still writing the disk | S | Both VM units start only when Kairos's installed-disk sentinel exists: `ConditionPathExists=|/run/cos/active_mode` and `|/run/cos/passive_mode` on `image/systemd/spire-agent.service` and `mediatore-guest.service` (ADR-0019 decision 4, banlieue ADR-0043 decision 2). A non-Kairos image that drops the lines takes the installer case on itself; the deploying guide says so |
 
 ### TB-5: mediatore → IdP
 
@@ -461,7 +478,9 @@ the residue is in §8. No boundary carries the marker as of this pass.
 - Sandbox listener and guests: TLS 1.3 only, client certificate required, no
   session resumption, X25519MLKEM768 as the only key exchange and
   AES-256-GCM-SHA384 as the only suite (`crates/mediatore-tls/src/provider.rs`);
-  one rustls provider (`aws-lc-rs`, `ring` banned in `deny.toml`).
+  one crypto provider for TLS, the refresh envelope and token signing alike
+  (`aws-lc-rs`, jsonwebtoken's `aws_lc_rs` backend in `Cargo.toml`, `ring` banned in
+  `deny.toml`, no advisory waived).
 - Every other TLS client mediatore builds offers X25519MLKEM768 first (rustls
   `prefer-post-quantum`, pinned by a unit test in `crates/mediatore-proto/src/tls.rs`);
   the identity-provider client is TLS 1.3 only over the Mozilla roots.
@@ -520,6 +539,10 @@ the residue is in §8. No boundary carries the marker as of this pass.
   by OpenBao transit or presented as a federated ServiceAccount token, exercised
   at start (`crates/mediatore-entra/src/assertion.rs`, `crates/mediatore-api`,
   `crates/mediatore-openbao`, ADR-0016).
+- `GuestReady` (ADR-0019): announced by the guest after `POST /v1/nodes` is
+  accepted, never by a boot stage, on every channel the guest has, with the
+  payloads banlieue's providers parse (`crates/mediatore-guest/src/ready.rs`);
+  the VM units gated on the installed-disk sentinel (`image/systemd/`).
 
 ## 8. Accepted risks
 
@@ -545,9 +568,11 @@ the residue is in §8. No boundary carries the marker as of this pass.
 - The SPIRE Controller Manager, agent and SPIFFE CSI driver come from the
   hardened chart and are part of the cluster's node TCB; mediatore adds no
   authority to them and takes none from them beyond its own SVID.
-- banlieue's own threat model covers the VM lifecycle, image supply chain and
-  hypervisor credentials; this document starts where a Ready, attested pool
-  member exists.
+- banlieue's own threat model covers the VM lifecycle, image supply chain,
+  hypervisor credentials and the guest-to-host channels its providers read; this
+  document starts where a pool member booted from its installed disk, and
+  ADR-0019 makes that member's `GuestReady` mean attested and registered as
+  well.
 - Denial of service beyond per-claim rate limiting (planned, `5.6` in the
   runbook) is out of scope pre-1.0.
 - The database role mediatore connects as is scoped by the operator: it needs
@@ -572,6 +597,7 @@ the residue is in §8. No boundary carries the marker as of this pass.
 | 2026-10-15 | One binary, the roles as subcommands (ADR-0014) | 0001–0014 | No new boundary, asset or actor: a role's authority was never the file it ran from. §2 three rows reworded (the user tools, the guest, the workload client, all one artifact), the diagram relabelled. TB-4 gains the row for the shared binary path against the node entry (both selectors required, the `sb-` uid never matches), TB-7 the row for the whole binary inside the jail (read-only, no secret, no reachable authority) and its jail row cites the new mount and test; TB-6's impersonation row cites the one `SandboxClient` and the `dev` feature's new home with the test that pins it off. §7 one item; R-11 reworded |
 | 2026-10-15 | The Dex path's kind tier, `issuers[].ca_file` | 0001–0014 | No new component or boundary: Dex and glauth in kind are fixtures. TB-5 gains the private-PKI row (`ca_file`, read at startup, nothing else trusted for that issuer); the TB-5 refresh and group-gate rows and TB-1's delegation rows now cite the live run against a real Dex (`make kind-e2e-dex`: the real CLI from a pod, `lastUsed` advancing on Dex's refresh token before every issue, the claim released on a group change in the directory and on a deleted refresh token) |
 | 2026-10-24 | The TPM attestation path live in kind (`make kind-e2e-tpm`, a vTPM behind the node) | 0001–0018 | No new component, asset, boundary or broker code. Two corrections from the first run: the EK trust bundle carries each host's swtpm local CA *issuing* certificate, not the root (the plugin verifies with no intermediates), and the component's init container copies the certificates beside the plugin instead of mounting the ConfigMap (the plugin reads `..data` as a file). TB-4's EK CA row rewritten with the tier as its live proof, A-15 reworded, §7 one item |
+| 2026-10-24 | `GuestReady` after attestation and registration (ADR-0019) | 0001–0019 | No new asset, boundary or broker code. The guest announces the installed-guest signal after `POST /v1/nodes` on the hypervisor's channel, an outbound liveness-only input to banlieue's provider; the VM units gated on the installed-disk sentinel. TB-2 gains two rows (a forged announcement, a missing one), TB-4 one (the live installer as an agent), every control cited by file, unit test or the kind TPM tier; §2 the guest row, §4 the pool VM row, the diagram one edge, §5 a note, §7 one item, §9 the banlieue bullet |
 | 2026-10-22 | Roadmap 02, second half: TPM attestation with the SPIFFE plugin as manifests (ADR-0018) | 0001–0018 | No broker code. TB-4: the stray row above the table moved into it, the EK CA row rewritten around the EK CA ConfigMap (one swtpm CA root per hypervisor), three rows new (the pinned plugin and its checksums on both sides, a stolen EK or CA key, the Proxmox hook off). §2 a new component (the TPM attestor), **A-15 new**, §7 one item, R-6 reworded around what the plugin does and does not prove |
 | 2026-10-21 | Roadmap 02, first half: the broker on a homelab cluster | 0001–0017 | No new component, asset, boundary or code: the `NetworkPolicy` ADR-0007 decision 7 deferred to roadmap 02 exists as a manifest in the example overlay. TB-1 gains one row (the user API only through the ingress), TB-6 one (the sandbox listener only from the segment, egress bounded); §2 the deployment row, §7 one item |
 | 2026-10-21 | Issuer profiles (ADR-0017) | 0001–0017 | No new boundary or actor. TB-1 gains one row (the gate on a configured claim, none at Google), TB-5 two (the installed-app secret, a login shape without a refresh token), every control cited by file and test against the Google and Auth0 profiles of the fake issuer. §2 the user tools row, §4 the IdP row, **A-14 new**, the diagram's IdP label, §7 one item; "the Dex path" is "the session path" throughout |

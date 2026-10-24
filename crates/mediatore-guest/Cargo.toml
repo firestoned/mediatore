@@ -23,6 +23,13 @@ thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
+# The vsock report to a Cloud Hypervisor host (ADR-0019 decision 2); vsock is a Linux socket family.
+[target.'cfg(target_os = "linux")'.dependencies]
+socket2.workspace = true
+
+[dev-dependencies]
+mediatore-testkit.workspace = true
+
 [features]
 # `--dev-spiffe-id`: a peer-identity header instead of mTLS, for the loopback dev loop only.
 # Off in release builds (ADR-0007 decision 5).

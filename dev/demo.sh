@@ -55,6 +55,7 @@ NODE_SVID="spiffe://$TRUST_DOMAIN/banlieue/node/$EK_HASH"
   --dev-ek-hash "$EK_HASH" \
   --dev-dmi-uuid "$(uuidgen | tr '[:upper:]' '[:lower:]')" \
   --dev-skip-setup \
+  --phase-file target/demo/phase \
   --provider libvirt & GUEST=$!; PIDS+=("$GUEST")
 
 say "login (fake IdP) and create the claim through the front door"

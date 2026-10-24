@@ -12,6 +12,7 @@
 # spiffe://<td>/spire/agent/tpm/<hash>, the hash mediatore computes from the EK
 # certificate. A pool member publishing that certificate gets its node entry under that
 # agent, and the guest beside the agent registers the node over the SVID the agent issues
+# and only then announces GuestReady (ADR-0019)
 # it. The pod is then replaced (fresh agent state, as a VM that lost its disk): the same
 # agent ID re-attests, the server lists one agent, the node registers again, no clone is
 # reported.
@@ -125,6 +126,9 @@ member() { # <role> <with guest: yes|no>
             capabilities: { drop: ["ALL"] }
           volumeMounts:
             - { name: sockets, mountPath: /run/spire/sockets, readOnly: true }
+            # The VM's tmpfs /run, where the GuestReady marker goes (ADR-0019); the
+            # container's root is read-only, a VM's /run is not.
+            - { name: phase, mountPath: /run/banlieue }
 YAML
 )
   fi
@@ -168,6 +172,7 @@ $guest
         - { name: data, emptyDir: {} }
         - { name: sockets, emptyDir: {} }
         - { name: tpm, hostPath: { path: /dev/tpmrm0, type: CharDevice } }
+        - { name: phase, emptyDir: { medium: Memory } }
 YAML
 }
 
@@ -243,7 +248,19 @@ wait_for "$TIMEOUT" "node entry for $EK_HASH with parent $AGENT_ID" node_entry
 registered() { guest_logs member | grep -qF "node registered"; }
 wait_for "$TIMEOUT" "'node registered' in the guest log" registered
 guest_logs member | grep -F "SVID from the Workload API" | grep -qF "spiffe://$TD/banlieue/node/$EK_HASH" || fail "the guest's SVID is not the node's"
-echo "entry declared with parent $AGENT_ID; the guest got spiffe://$TD/banlieue/node/$EK_HASH from the attested agent and registered"
+# ADR-0019: the pool hears GuestReady only after the registration, never before. In the
+# pod the marker file is the one channel (no rpctool, no /dev/vsock).
+announced() { guest_logs member | grep -qF "GuestReady announced"; }
+wait_for "$TIMEOUT" "'GuestReady announced' in the guest log" announced
+announced_after_registered() {
+  local reg ann
+  reg=$(guest_logs member | grep -nF "node registered" | tail -1 | cut -d: -f1)
+  ann=$(guest_logs member | grep -nF "GuestReady announced" | tail -1 | cut -d: -f1)
+  [ -n "$reg" ] && [ -n "$ann" ] && [ "$ann" -gt "$reg" ] || fail "GuestReady (line ${ann:-none}) was not announced after the registration (line ${reg:-none})"
+  guest_logs member | grep -F "GuestReady announced" | grep -qF "file=announced" || fail "the marker file was not written"
+}
+announced_after_registered
+echo "entry declared with parent $AGENT_ID; the guest got spiffe://$TD/banlieue/node/$EK_HASH from the attested agent, registered, then announced GuestReady"
 
 say "replaced: a fresh pod (new agent state) re-attests as the same agent; one agent, the node registered again"
 OLD_POD=$(member_pod member)
@@ -257,6 +274,8 @@ n=$(tpm_agents | wc -l | tr -d ' ')
 [ "$n" -eq 1 ] || fail "expected one tpm agent after the re-attestation, the server lists $n"
 wait_for "$TIMEOUT" "'node registered' in the new guest's log" registered
 guest_logs member | grep -qF "already registered" && fail "the re-registration was taken for a clone"
-echo "re-attested as $AGENT_ID (${OLD_POD} replaced by $(member_pod member)); one tpm agent; registered again"
+wait_for "$TIMEOUT" "'GuestReady announced' in the new guest's log" announced
+announced_after_registered
+echo "re-attested as $AGENT_ID (${OLD_POD} replaced by $(member_pod member)); one tpm agent; registered and announced again"
 
-say "PASS: ADR-0018 holds against a real SPIRE with a vTPM (the image's agent.conf, the pinned plugin on both sides, the EK CA fail-closed, the agent ID the hash of the EK, the node entry under it, re-attestation)"
+say "PASS: ADR-0018 holds against a real SPIRE with a vTPM (the image's agent.conf, the pinned plugin on both sides, the EK CA fail-closed, the agent ID the hash of the EK, the node entry under it, re-attestation), and ADR-0019's GuestReady follows the registration"

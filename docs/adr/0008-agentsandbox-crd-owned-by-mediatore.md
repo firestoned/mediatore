@@ -150,7 +150,9 @@ revocations still survive a restart.
   that only banlieue can violate.
 - The readiness caveat from ADR-0055 still applies: a sandbox is only as ready as the pool's
   readiness signal. Pools that serve sandboxes must use `GuestReady` (banlieue ADR-0043),
-  and mediatore's AgentSandbox user guide says so.
+  and mediatore's AgentSandbox user guide says so. [ADR-0019](0019-guestready-after-attestation-and-registration.md)
+  has the guest announce it after the node is registered, so the signal means what the
+  sandbox needs it to mean.
 - Built in roadmap 08 (2026-10-14), after roadmap 03; the threat-model pass
   (`docs/security/threat-model.md`) ran with it. The implementation notes below record the
   choices the decisions left open.
