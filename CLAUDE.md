@@ -15,7 +15,7 @@
 Full rules, adapted from banlieue, live in `.claude/rules/`:
 
 - `rules/architecture-driven-development.md` — the ADD cycle and when it applies.
-- `rules/testing.md` — TDD, the quality gate (`make check`), test placement.
+- `rules/testing.md`: TDD, the quality gate (`make check`), test placement, and the TPM attestation path proven on-prem (`make kind-e2e-tpm`) before any change to it merges.
 - `rules/threat-modeling.md` — full pass over `docs/security/threat-model.md` after every implemented ADR; the header stamp is the deliverable.
 - `rules/github-workflows.md` — Makefile-driven workflows, firestoned/github-actions composites, SHA pinning, `workflow_call`.
 - `rules/no-real-infrastructure.md` — public repo; placeholders only, sweep the diff before finishing.
