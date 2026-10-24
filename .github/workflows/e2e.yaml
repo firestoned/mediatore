@@ -17,7 +17,12 @@
 # socket with agent-issued client SVIDs over SPIFFE mTLS, then the claim watcher
 # against banlieue's CRDs (lease, node-entry trigger), then the AgentSandbox CRD, its
 # subject policy and reconciler from request to Ready and back: `make kind-e2e-ci`.
-# docs/guides/testing.md has the tiers and what each proves.
+#
+# Not here: the TPM attestation path (ADR-0018, `make kind-e2e-tpm`) needs a vTPM
+# behind the kind node, which is swtpm through the kernel's tpm_vtpm_proxy module. The
+# Azure kernels of GitHub-hosted runners do not ship that module (checked against
+# linux-modules-extra-6.17.0-1022-azure on 2026-10-24), so that tier runs by hand on a
+# host whose kernel has it. docs/guides/testing.md has the tiers and what each proves.
 
 name: E2E
 

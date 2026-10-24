@@ -306,13 +306,15 @@ is the expected state of a cluster at this step.
 [ADR-0018](../adr/0018-tpm-attestation-with-the-spiffe-plugin.md). The server side is the
 kustomize component `deploy/spire-tpm`, included by the SPIRE kustomization of step 2:
 an init container copies the `spiffe/spire-tpm-plugin` server binary (pinned by digest)
-into the server pod, a ConfigMap holds one swtpm local CA root per hypervisor host, and
-`server.conf` gains the attestor block with the binary's checksum:
+into the server pod with the EK trust anchors it copies out of a ConfigMap (one PEM per
+hypervisor host: the issuing certificate of its swtpm local CA, which signs every EK
+certificate on that host; the root alone verifies nothing, the attestor takes no
+intermediates), and `server.conf` gains the attestor block with the binary's checksum:
 
 ```sh
 cp -r deploy/spire-tpm spire/tpm
 for h in hv-01 hv-02 hv-03; do
-  ssh $h sudo cat /var/lib/swtpm-localca/swtpm-localca-rootca-cert.pem > $h.pem
+  ssh $h sudo cat /var/lib/swtpm-localca/issuercert.pem > $h.pem
 done
 # one key per host under data: of spire/tpm/ek-cas.yaml; the block of
 # spire/tpm/server.conf.fragment.hcl into server.conf as a patch, generated the way
@@ -322,6 +324,7 @@ mediatore/dev/kind/spire/render-server-conf-patch.sh spire/spire.yaml \
 # components: [tpm] and server-conf-patch.yaml under patches: in
 # spire/kustomization.yaml, then:
 kubectl apply -k spire
+kubectl -n spire-server rollout restart statefulset/spire-server   # the certificates are copied at start
 kubectl -n spire-server rollout status statefulset/spire-server
 kubectl -n spire-server exec spire-server-0 -c spire-server -- spire-server bundle show > bundle.pem
 ```

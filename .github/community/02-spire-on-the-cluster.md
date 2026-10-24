@@ -76,6 +76,15 @@ installed beyond a `ServiceAccount` a live test left behind.
 - [ ] The broker Deployment on the CSI socket proven as `make kind-e2e-mtls` does in
       kind, against this cluster: a sandbox turning `Ready`, the guest fetching its
       subject, a token issued to the workload
-- [ ] A kind tier for the attestation path, if the kind node can carry a vTPM
-      (`swtpm chardev --vtpm-proxy` on the host, the device mounted into the node):
-      an agent pod attesting with the `tpm` plugin, the broker's node entry naming it
+- [x] A kind tier for the attestation path (2026-10-23): the kind node carries a vTPM
+      (`make kind-vtpm`: swtpm behind the kernel's vtpm proxy on the host, a throwaway
+      swtpm local CA for its EK, the device mounted into the node at creation);
+      `make kind-e2e-tpm` runs a pod on `image/spire/agent.conf` with the pinned agent
+      plugin, refused under a CA that never signed its EK, attested as
+      `spiffe://<td>/spire/agent/tpm/<hash>` under the right one with the hash mediatore
+      computes, the member's certificate becoming the node entry under that agent and the
+      guest registering over the SVID it issues, a fresh pod re-attesting as the same
+      agent; by hand on a host whose kernel has `tpm_vtpm_proxy` (GitHub's Azure runners
+      do not ship it). What it found: the EK is signed by the local CA's issuing
+      certificate (`issuercert.pem`), not its root, and the plugin takes no intermediates,
+      so the bundle must carry the issuing certificate; the docs and `ek-cas.yaml` fixed

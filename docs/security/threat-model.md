@@ -4,10 +4,20 @@ SPDX-License-Identifier: Apache-2.0
 -->
 # Threat Model
 
-> **Status:** Living document. Last full pass **2026-10-22**, against the
+> **Status:** Living document. Last full pass **2026-10-24**, against the
 > architecture defined by **ADR-0001 … ADR-0018** (ADR-0009 and ADR-0010 are
-> adopted platform ADRs with no code of their own). This pass covers
-> ADR-0018, TPM node attestation with `spiffe/spire-tpm-plugin` as a
+> adopted platform ADRs with no code of their own). This pass follows the
+> first live run of the TPM attestation path, the kind tier with a vTPM
+> behind the node (`make kind-e2e-tpm`), which corrected two things the
+> previous pass took from the manuals: the EK certificate is signed by the
+> hypervisor's swtpm local CA *issuing* certificate, not its root, and the
+> plugin verifies against the files in `ca_path` with no intermediates, so the
+> issuing certificate is what the bundle carries; and the plugin reads a
+> ConfigMap volume's `..data` link as a file, so the component's init
+> container now copies the certificates beside the plugin. No new component,
+> asset, boundary or broker code; TB-4's EK CA row and A-15 reworded, §7 one
+> item, the tier cited as the live proof the previous pass called open. The
+> pass before, 2026-10-22, covered ADR-0018, TPM node attestation with `spiffe/spire-tpm-plugin` as a
 > kustomize component on the SPIRE server (the plugin from a digest-pinned
 > image, its checksum verified by the server) with one swtpm local CA root per
 > hypervisor host as the EK trust bundle, and the agent's configuration and
@@ -169,7 +179,7 @@ holds three things an attacker wants:
 | A-11 | The store URL and its password (Secret `mediatore-store`) | the broker pod's environment, never logged | Read and alter every row: resurrect a revoked claim, rebind a node, register a clone's DMI under a known EK, delete audit rows |
 | A-12 | The CLI session file (`~/.config/mediatore/session.json`) | the user's machine, mode 0600 | The user's ID token until `exp` and, until it is delegated, a refresh token for mediatore's audience: a login, bounded by the issuer's session |
 | A-14 | The client secret an issuer's token endpoint wants from mediatore's public client (Google's installed-app clients): `issuers[].session.client_secret_file` on the broker, `--client-secret-file` for the CLI | a Secret volume read at start; a file the user keeps, read for one login | Nothing on its own: Google documents it as not confidential, and the token endpoint still needs a code bound to a PKCE verifier or a refresh token issued to that user. It is a parameter the protocol wants, not a credential (ADR-0017) |
-| A-15 | The hypervisors' swtpm local CA keys (`/var/lib/swtpm-localca/swtpm-localca-rootca-privkey.pem`, `signkey.pem` on each host) | the hypervisor, owner `tss`, mode 0640, never copied anywhere; only the root certificate leaves the host, into ConfigMap `spire-tpm-ek-cas` | Sign an EK certificate for any key, so a VM the operator never created attests as a pool member of that host; the same reach as owning the hypervisor (R-6) |
+| A-15 | The hypervisors' swtpm local CA keys (`/var/lib/swtpm-localca/swtpm-localca-rootca-privkey.pem`, `signkey.pem` on each host) | the hypervisor, owner `tss`, mode 0640, never copied anywhere; only the issuing certificate (`issuercert.pem`, the public half of `signkey.pem`) leaves the host, into ConfigMap `spire-tpm-ek-cas` | Sign an EK certificate for any key, so a VM the operator never created attests as a pool member of that host; the same reach as owning the hypervisor (R-6) |
 | A-13 | The broker's credential at Entra (`issuers[].entra`): an RSA key in a Secret volume with its certificate registered on the app, or the same key inside OpenBao transit, or the pod's projected ServiceAccount token under a federated credential | a file read at start (`key_file`), OpenBao (`transit`, never released, `sign` only), or the kubelet's projection (`token_file`, read per request); never logged, never in the store | Authenticate as mediatore at Entra: with a user's token (A-3) exchange it for a session, with a session (A-2) refresh it for any consented downstream. Alone it mints nothing for anyone: Entra needs a user grant on every call. The signed assertion itself is good for five minutes at one token endpoint |
 
 ## 4. Actors
@@ -321,7 +331,7 @@ the residue is in §8. No boundary carries the marker as of this pass.
 | A VM without a vTPM, or one whose certificate banlieue never published, becomes a node | S | No certificate, no entry: `Watcher::reconcile_machine` declares `ensure_node_entry` only from a non-empty `status.tpmEndorsementCertificates` on a pool member (`a_member_with_a_certificate_gets_a_node_entry_and_one_without_gets_nothing`; kind tier `member-2`). The entries admission policy bounds the shape regardless |
 | Cloned TPM state (two VMs, one EK) | S | Second registration of an EK with a different DMI UUID refused 409: `crates/mediatore-store/src/lib.rs` (`put_node`), e2e-tested |
 | Impostor node claiming someone's EK | S | Peer must present the node SVID matching the EK it registers: `crates/mediatore-api/src/lib.rs` (`register_node`) |
-| EK certificate from an untrusted CA, or a VM whose EK no configured hypervisor signed | S | The server's `tpm` attestor accepts an EK only when its certificate chains to a CA in its `ca_path`, ConfigMap `spire-tpm-ek-cas`: one swtpm local CA root per hypervisor host (`deploy/spire-tpm/ek-cas.yaml`, ADR-0018 decision 2); no hash allowlist is configured, by design. A host not in the bundle has VMs that never become agents, so never nodes (TB-2's bind needs a registered node). Deployment control: the certificates are the operator's, applied with the component; live proof is roadmap 02's open acceptance |
+| EK certificate from an untrusted CA, or a VM whose EK no configured hypervisor signed | S | The server's `tpm` attestor accepts an EK only when its certificate is signed by a file in its `ca_path` (no intermediates): the swtpm local CA issuing certificate of each hypervisor host, from ConfigMap `spire-tpm-ek-cas` copied beside the plugin by the init container (`deploy/spire-tpm/ek-cas.yaml`, `statefulset-patch.yaml`, ADR-0018 decision 2); no hash allowlist is configured, by design. A host not in the bundle has VMs that never become agents, so never nodes (TB-2's bind needs a registered node). Live: `make kind-e2e-tpm` (`dev/kind/tpm-e2e.sh`) refuses a vTPM under a CA that never signed its EK and under the local CA's root alone, and attests it under the issuing certificate as `spiffe://<td>/spire/agent/tpm/<hash>`, the hash `mediatore_proto::ek` computes from the same certificate; the certificates on the cluster are the operator's, applied with the component |
 | The attestor plugin replaced or tampered with on the server or in the VM image | T | The server's plugin is copied by an init container from an image pinned by digest (`deploy/spire-tpm/statefulset-patch.yaml`) into a volume the server mounts read-only, and `server.conf` carries its `plugin_checksum`, which SPIRE verifies before loading it (`deploy/spire-tpm/server.conf.fragment.hcl`); the agent's binary comes from the same release through `make dist-tpm-plugin`, which refuses a checksum mismatch, and `image/spire/agent.conf` carries the same checksum for the agent to verify (`Makefile`, ADR-0018 decisions 1 and 3) |
 | A VM reads another VM's EK or a host's swtpm CA key and attests as it | S | The EK private key never leaves the vTPM (credential activation proves possession, `TPM.md` of the plugin); the hosts' CA keys are A-15, root-only on each hypervisor, and a compromise there is R-6's hypervisor compromise |
 | The Proxmox extension's host hook, which the plugin offers, trusted as a VM identity | S | Off: `pve { enabled = false }` in `image/spire/agent.conf`, no `pve` block on the server, so the EK alone identifies a VM (ADR-0018 decision 4, ADR-0004) |
@@ -487,10 +497,12 @@ the residue is in §8. No boundary carries the marker as of this pass.
   `crates/mediatore-client`, ADR-0013).
 - TPM attestation (ADR-0018): the server's attestor and the agent's plugin from
   one pinned release, checksums verified by SPIRE on both sides, the EK trust
-  bundle restricted to the hypervisors' own swtpm CAs, no hash allowlist, the
-  Proxmox hook off, the agent's unit allowing the TPM devices and nothing else
+  bundle restricted to the hypervisors' own swtpm CAs (their issuing
+  certificates, copied beside the plugin), no hash allowlist, the Proxmox hook
+  off, the agent's unit allowing the TPM devices and nothing else
   (`deploy/spire-tpm/`, `image/spire/agent.conf`,
-  `image/systemd/spire-agent.service`, `Makefile`).
+  `image/systemd/spire-agent.service`, `Makefile`); the path proven in kind
+  with a vTPM behind the node, refusals included (`make kind-e2e-tpm`).
 - Network policy (ADR-0007 decision 7): the broker pods take 8443 from the
   sandbox segment only and 8080 from the ingress controller only, and reach
   DNS, the API server and the issuer and nothing else
@@ -559,6 +571,7 @@ the residue is in §8. No boundary carries the marker as of this pass.
 | 2026-10-14 | Roadmap 04, first slice: the Dex path (ADR-0013) | 0001–0013 | TB-1 gains four rows (the redacted secret, delegation required or refused, the token never on the resource, a bad delegation), TB-5 five (refresh before issue and `invalid_grant`, the fresh token validated as a login, outage is not revocation, the endpoint from discovery, rotation re-sealed), TB-6 three (the per-claim limit, no session no mint, revocation durable) and TB-9 one (sessions taken once); every control cited by file and test. §2 a new component (the CLI) and the sandbox API row, A-2 produced and rebound to the sandbox UID, **A-12 new**, the diagram and the boundary list, §7 one item. **R-2 narrowed** to the Entra half; **R-11 new** (the CLI session file) |
 | 2026-10-15 | One binary, the roles as subcommands (ADR-0014) | 0001–0014 | No new boundary, asset or actor: a role's authority was never the file it ran from. §2 three rows reworded (the user tools, the guest, the workload client, all one artifact), the diagram relabelled. TB-4 gains the row for the shared binary path against the node entry (both selectors required, the `sb-` uid never matches), TB-7 the row for the whole binary inside the jail (read-only, no secret, no reachable authority) and its jail row cites the new mount and test; TB-6's impersonation row cites the one `SandboxClient` and the `dev` feature's new home with the test that pins it off. §7 one item; R-11 reworded |
 | 2026-10-15 | The Dex path's kind tier, `issuers[].ca_file` | 0001–0014 | No new component or boundary: Dex and glauth in kind are fixtures. TB-5 gains the private-PKI row (`ca_file`, read at startup, nothing else trusted for that issuer); the TB-5 refresh and group-gate rows and TB-1's delegation rows now cite the live run against a real Dex (`make kind-e2e-dex`: the real CLI from a pod, `lastUsed` advancing on Dex's refresh token before every issue, the claim released on a group change in the directory and on a deleted refresh token) |
+| 2026-10-24 | The TPM attestation path live in kind (`make kind-e2e-tpm`, a vTPM behind the node) | 0001–0018 | No new component, asset, boundary or broker code. Two corrections from the first run: the EK trust bundle carries each host's swtpm local CA *issuing* certificate, not the root (the plugin verifies with no intermediates), and the component's init container copies the certificates beside the plugin instead of mounting the ConfigMap (the plugin reads `..data` as a file). TB-4's EK CA row rewritten with the tier as its live proof, A-15 reworded, §7 one item |
 | 2026-10-22 | Roadmap 02, second half: TPM attestation with the SPIFFE plugin as manifests (ADR-0018) | 0001–0018 | No broker code. TB-4: the stray row above the table moved into it, the EK CA row rewritten around the EK CA ConfigMap (one swtpm CA root per hypervisor), three rows new (the pinned plugin and its checksums on both sides, a stolen EK or CA key, the Proxmox hook off). §2 a new component (the TPM attestor), **A-15 new**, §7 one item, R-6 reworded around what the plugin does and does not prove |
 | 2026-10-21 | Roadmap 02, first half: the broker on a homelab cluster | 0001–0017 | No new component, asset, boundary or code: the `NetworkPolicy` ADR-0007 decision 7 deferred to roadmap 02 exists as a manifest in the example overlay. TB-1 gains one row (the user API only through the ingress), TB-6 one (the sandbox listener only from the segment, egress bounded); §2 the deployment row, §7 one item |
 | 2026-10-21 | Issuer profiles (ADR-0017) | 0001–0017 | No new boundary or actor. TB-1 gains one row (the gate on a configured claim, none at Google), TB-5 two (the installed-app secret, a login shape without a refresh token), every control cited by file and test against the Google and Auth0 profiles of the fake issuer. §2 the user tools row, §4 the IdP row, **A-14 new**, the diagram's IdP label, §7 one item; "the Dex path" is "the session path" throughout |

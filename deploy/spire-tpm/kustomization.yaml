@@ -9,9 +9,10 @@
 #
 # It adds, to the `spire-server` StatefulSet, an init container that copies the
 # attestor plugin out of its image (pinned by digest; the server verifies the binary
-# against the checksum in server.conf before loading it) into a shared volume, and
-# mounts a ConfigMap of EK trust anchors: one PEM per hypervisor host, the root of that
-# host's swtpm local CA, which signs the EK certificate libvirt creates for every vTPM.
+# against the checksum in server.conf before loading it) into a shared volume, together
+# with the EK trust anchors from a ConfigMap: one PEM per hypervisor host, the issuing
+# certificate of that host's swtpm local CA, which signs the EK certificate libvirt
+# creates for every vTPM.
 # server.conf gains the block in server.conf.fragment.hcl; that file is the operator's
 # to merge, since the server's configuration is one key of one ConfigMap.
 #

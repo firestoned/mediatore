@@ -8,7 +8,7 @@
         kind-install kind-create kind-delete kind-down kind-spire kind-deploy kind-up \
         kind-images kind-postgres kind-dex kind-openbao kind-broker kind-banlieue-crds kind-e2e-entries kind-e2e-mtls kind-e2e-watcher kind-e2e-sandbox \
         kind-e2e-store kind-e2e-dex kind-e2e kind-e2e-ci kind-e2e-logs \
-        kind-spire-render calm-validate calm-diagrams docs docs-serve docs-clean clean manifests dist-tpm-plugin
+        kind-spire-render kind-vtpm kind-e2e-tpm calm-validate calm-diagrams docs docs-serve docs-clean clean manifests dist-tpm-plugin
 
 # kind: a throwaway cluster with SPIRE for the live tests (docs/guides/testing.md).
 KIND_VERSION       ?= 0.33.0
@@ -21,6 +21,10 @@ KIND_BIN_DIR       ?= /usr/local/bin
 KIND_DIR           := .kind
 KIND_KUBECONFIG    := $(KIND_DIR)/kubeconfig
 KIND_SA_KUBECONFIG := $(KIND_DIR)/mediatore-sa.yaml
+# The vTPM behind the node (make kind-vtpm): swtpm's state, device path and EK material.
+KIND_VTPM_DIR      := $(KIND_DIR)/vtpm
+# What kind-e2e-ci runs; the TPM tier is run by hand where the host has the vtpm proxy module.
+KIND_E2E_SUITES    ?= kind-e2e
 KIND_KUBECTL       := kubectl --kubeconfig $(KIND_KUBECONFIG)
 # SPIRE in kind comes from manifests rendered once (`make kind-spire-render`, the only
 # target that runs helm) from the same distribution and versions as the homelab, into
@@ -160,21 +164,35 @@ kind-install: ## Install the pinned kind CLI into $(KIND_BIN_DIR) if missing or 
 
 kind-create: kind-install ## Create the kind cluster (no-op if it exists) and write $(KIND_KUBECONFIG)
 	@mkdir -p $(KIND_DIR)
+	@cp dev/kind/cluster.yaml $(KIND_DIR)/cluster.yaml
+	@# With a vTPM up (make kind-vtpm), its device goes into the node as /dev/tpmrm0.
+	@if [ -r $(KIND_VTPM_DIR)/device ]; then \
+		printf '    extraMounts:\n      - hostPath: %s\n        containerPath: /dev/tpmrm0\n' "$$(cat $(KIND_VTPM_DIR)/device)" >> $(KIND_DIR)/cluster.yaml; \
+	fi
 	@if kind get clusters 2>/dev/null | grep -qx $(KIND_CLUSTER_NAME); then \
 		echo "✓ kind cluster '$(KIND_CLUSTER_NAME)' already exists"; \
 	else \
-		kind create cluster --name $(KIND_CLUSTER_NAME) --image $(KIND_NODE_IMAGE) --config dev/kind/cluster.yaml --wait 120s --kubeconfig $(KIND_KUBECONFIG); \
+		kind create cluster --name $(KIND_CLUSTER_NAME) --image $(KIND_NODE_IMAGE) --config $(KIND_DIR)/cluster.yaml --wait 120s --kubeconfig $(KIND_KUBECONFIG); \
 	fi
 	@kind get kubeconfig --name $(KIND_CLUSTER_NAME) > $(KIND_KUBECONFIG)
 	@$(KIND_KUBECTL) cluster-info
 
-kind-delete: ## Delete the kind cluster and its kubeconfigs
+kind-delete: ## Delete the kind cluster, the vTPM behind it if any, and its kubeconfigs
 	@if kind get clusters 2>/dev/null | grep -qx $(KIND_CLUSTER_NAME); then \
 		kind delete cluster --name $(KIND_CLUSTER_NAME); \
 	else \
 		echo "✓ no kind cluster named '$(KIND_CLUSTER_NAME)'"; \
 	fi
+	@./dev/kind/vtpm.sh down $(KIND_VTPM_DIR)
 	@rm -rf $(KIND_DIR)
+
+kind-vtpm: ## A swtpm behind the kernel's vtpm proxy as a device for the kind node (sudo, swtpm, swtpm_setup); before the cluster exists
+	@./dev/kind/vtpm.sh up $(KIND_VTPM_DIR)
+	@# The device goes in at creation: a node without it is recreated, not patched.
+	@if kind get clusters 2>/dev/null | grep -qx $(KIND_CLUSTER_NAME); then \
+		$(CONTAINER_CLI) exec $(KIND_CLUSTER_NAME)-control-plane test -c /dev/tpmrm0 2>/dev/null \
+		  || { echo "ERROR: kind cluster '$(KIND_CLUSTER_NAME)' has no /dev/tpmrm0; run make kind-delete first"; exit 1; }; \
+	fi
 
 kind-down: kind-delete ## Alias for kind-delete
 
@@ -298,10 +316,15 @@ kind-e2e-dex: kind-banlieue-crds kind-broker ## ADR-0013 live: the real CLI logs
 	$(KIND_KUBECTL) -n banlieue-system rollout status deploy/mediatore --timeout=300s
 	./dev/kind/dex-e2e.sh $(KIND_KUBECONFIG) $(SPIRE_TRUST_DOMAIN) $(KIND_DIR)/ek.pem $(KIND_DIR)/ek.hash
 
-kind-e2e: kind-e2e-entries kind-e2e-mtls kind-e2e-watcher kind-e2e-sandbox kind-e2e-store kind-e2e-dex ## Every live suite against kind (grows with the roadmap)
+kind-e2e-tpm: kind-vtpm kind-banlieue-crds kind-broker ## ADR-0018 live: an agent attesting with the vTPM behind the node on the image's agent.conf, the EK CA fail-closed, the node entry under that agent, re-attestation
+	$(KIND_KUBECTL) -n banlieue-system rollout restart deploy/mediatore
+	$(KIND_KUBECTL) -n banlieue-system rollout status deploy/mediatore --timeout=300s
+	TPM_PLUGIN_AGENT_IMG=$(TPM_PLUGIN_AGENT_IMG) ./dev/kind/tpm-e2e.sh $(KIND_KUBECONFIG) $(SPIRE_TRUST_DOMAIN) $(KIND_VTPM_DIR)
 
-kind-e2e-ci: ## CI shape: the suites, cluster state on failure, cluster deleted after
-	@$(MAKE) kind-e2e || { $(MAKE) kind-e2e-logs; $(MAKE) kind-delete; exit 1; }
+kind-e2e: kind-e2e-entries kind-e2e-mtls kind-e2e-watcher kind-e2e-sandbox kind-e2e-store kind-e2e-dex ## Every live suite against kind that needs nothing of the host (grows with the roadmap); kind-e2e-tpm needs a vTPM
+
+kind-e2e-ci: ## CI shape: $(KIND_E2E_SUITES), cluster state on failure, cluster deleted after
+	@$(MAKE) $(KIND_E2E_SUITES) || { $(MAKE) kind-e2e-logs; $(MAKE) kind-delete; exit 1; }
 	@$(MAKE) kind-delete
 
 kind-e2e-logs: ## What a failing live suite needs: entries, policy, broker and client pods, controller-manager and server logs
@@ -320,6 +343,10 @@ kind-e2e-logs: ## What a failing live suite needs: entries, policy, broker and c
 	-$(KIND_KUBECTL) -n mediatore-e2e-watcher get virtualmachines,virtualmachineclaims -o yaml
 	-$(KIND_KUBECTL) -n mediatore-e2e-sandbox get agentsandboxes,virtualmachineclaims,pods -o yaml
 	-$(KIND_KUBECTL) -n mediatore-e2e-sandbox logs pod/node --tail=50
+	-$(KIND_KUBECTL) -n mediatore-e2e-tpm get pods -o wide
+	-$(KIND_KUBECTL) -n mediatore-e2e-tpm logs deploy/member -c spire-agent --tail=80
+	-$(KIND_KUBECTL) -n mediatore-e2e-tpm logs deploy/member -c guest --tail=40
+	-$(KIND_KUBECTL) -n $(SPIRE_NAMESPACE) exec spire-server-0 -c spire-server -- spire-server agent list
 	-$(KIND_KUBECTL) get validatingadmissionpolicy mediatore-clusterstaticentry mediatore-agentsandbox-subject -o yaml
 	-$(KIND_KUBECTL) -n $(SPIRE_NAMESPACE) logs statefulset/spire-server -c spire-controller-manager --tail=200
 	-$(KIND_KUBECTL) -n $(SPIRE_NAMESPACE) logs statefulset/spire-server -c spire-server --tail=100
