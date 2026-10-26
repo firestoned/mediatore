@@ -94,6 +94,7 @@ flowchart LR
     service-spire-agent -->|TLS| service-spire-server
     service-guest-agent -->|mTLS| service-mediatore-sandbox-api
     service-guest-agent --> system-banlieue
+    service-guest-agent -->|HTTPS| ecosystem-oci-registry
     service-sandbox-workload -->|mTLS| service-mediatore-sandbox-api
     service-sandbox-workload -->|HTTPS| ecosystem-downstream-api
     actor-sandbox-user --> data-asset-claim-store

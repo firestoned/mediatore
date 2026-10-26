@@ -82,7 +82,8 @@ If you need interactivity, the workload dials **out** (see
    warm, already-attested pool member; mediatore declares the claim's SPIFFE entry as
    a `ClusterStaticEntry` and the SPIRE Controller Manager creates it (no entry ever
    exists any other way, ADR-0006); the in-guest agent fetches the subject over mTLS,
-   creates your `sb-` user, unpacks the image, and starts your command under nsjail.
+   creates your `sb-` user, mounts a fresh tmpfs, pulls your image into it as the
+   rootfs, loads the ruleset and starts your command under nsjail.
    No further input from you is needed or possible.
 
 ```mermaid
@@ -108,7 +109,7 @@ sequenceDiagram
     K-->>S: controller manager renders the entry; status.set observed
     G->>M: GET /v1/me (mTLS, node SVID)
     M-->>G: subject, expires_at, workload {image, args}, egress
-    G->>G: useradd sb-hash, nft ruleset keyed by its uid, unpack image, nsjail as sb-hash
+    G->>G: useradd sb-hash, tmpfs at /mnt/sandbox, pull image into rootfs (digests checked),<br/>nft ruleset keyed by its uid, nsjail as sb-hash
     G->>W: exec workload.args
     W->>M: POST /v1/token {audience} (mTLS, claim SVID)
     M-->>W: 15-min token, aud = one audience, acting for subject
@@ -200,15 +201,22 @@ not a person.
 
 ## What "the workload" is
 
-`workload.image` is an OCI reference the in-guest agent unpacks into
-`/mnt/sandbox/rootfs`; `workload.args` is the argv executed under nsjail as the
-per-subject user. The jail gives it:
+`workload.image` is an OCI reference the in-guest agent pulls itself and unpacks into
+`/mnt/sandbox/rootfs`, on a tmpfs mounted for that claim (`nosuid,nodev`, size-bounded;
+[ADR-0021](../adr/0021-sandbox-filesystem-tmpfs-and-rootfs-from-the-registry.md)): every layer is verified against its digest and the
+manifest digest is logged with the claim, so a reference pinned by digest
+(`name@sha256:…`) is what makes the record reproducible; a tag is whatever the registry
+says it is at bind time. The registry is reached anonymously over HTTPS (Docker Hub,
+`ghcr.io`, your own); one that wants a credential refuses the pull for now. `tar` and
+`tar+gzip` layers are accepted, zstd is not yet. `workload.args` is the argv executed
+under nsjail as the per-subject user. The jail gives it:
 
 | Inside the jail | Purpose |
 | --- | --- |
 | `/run/spire/agent.sock` (read-only) | The **only** credential surface: fetch the claim SVID |
 | `MEDIATORE_URL` env | Where to trade the SVID for tokens |
-| `/work` (writable), tmpfs `/tmp` + `$HOME` | Scratch space, wiped at teardown |
+| The rootfs (read-only) | Your image's filesystem as pulled: root-owned, setuid bits dropped, no device nodes ([ADR-0021](../adr/0021-sandbox-filesystem-tmpfs-and-rootfs-from-the-registry.md)) |
+| `/work` (writable), tmpfs `/tmp` + `$HOME` | Scratch space; `/work` is your `sb-` user's on the per-claim tmpfs, gone with the unmount at teardown |
 | `/usr/local/bin/mediatore` (read-only, the same file the guest runs from) | `mediatore token --audience api://trading-data` prints a 15-min bearer; the rootfs ships no client ([ADR-0014](../adr/0014-one-binary-roles-as-subcommands.md)) |
 | The VM's network, filtered by the sandbox uid | TCP to the broker and to the `egress` endpoints of the claim's audiences, DNS to the VM's resolvers; everything else the workload sends is logged (`mediatore-sandbox drop:`) and dropped ([ADR-0020](../adr/0020-jail-network-nftables-keyed-by-sandbox-uid.md)) |
 
@@ -247,7 +255,8 @@ Because nothing inbound reaches the VM, pick one of:
   an `AgentSandbox` (roadmaps 03 and 08); the persistent store (roadmap 05); the
   transit sealer (ADR-0015).
 - Still to come: roadmap 04's live run against a tenant; 02 gives VMs a real SPIRE
-  server to attest to; 06 adds the OCI unpack and the egress allowlist. See
+  server to attest to; 06's open items are root's own egress and the input chain with
+  the image, seccomp, pull credentials, the image bake and the live libvirt proof. See
   [`ROADMAPS.md`](https://github.com/firestoned/mediatore/blob/main/ROADMAPS.md).
 - Threat model: the exfiltration window of the 15-minute in-workload token is
   accepted risk R-3; the dial-out pattern narrows what a leaked token can do

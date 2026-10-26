@@ -5,7 +5,7 @@
 //!
 //! State machine (runbook Part 6.1):
 //! boot → node registered → `GuestReady` announced → subject fetched → user created →
-//! ruleset loaded → jail running → torn down.
+//! tmpfs mounted → image pulled → ruleset loaded → jail running → torn down.
 
 use std::path::{Path, PathBuf};
 
@@ -14,7 +14,7 @@ use reqwest::Method;
 use uuid::Uuid;
 
 use crate::client::SandboxClient;
-use crate::{identity, jail, net, ready, supervise, user};
+use crate::{identity, image, jail, net, ready, sandboxfs, supervise, user};
 
 /// Seconds between registration retries while mediatore is unreachable.
 const REGISTER_RETRY_SECS: u64 = 5;
@@ -40,9 +40,26 @@ pub struct GuestArgs {
     /// Hypervisor hint for audit
     #[arg(long, value_enum)]
     pub provider: Option<ProviderArg>,
-    /// Sandbox root
+    /// Sandbox root: a tmpfs mounted per claim (ADR-0021)
     #[arg(long, default_value = jail::SANDBOX_ROOT)]
     pub sandbox_root: PathBuf,
+    /// Size of that tmpfs, in the kernel's syntax: bytes with k, m or g, or a percentage of RAM
+    #[arg(
+        long,
+        env = "MEDIATORE_SANDBOX_SIZE",
+        default_value = sandboxfs::DEFAULT_SIZE,
+        value_parser = tmpfs_size
+    )]
+    pub sandbox_size: String,
+    /// A registry (host[:port]) reached over plain HTTP instead of HTTPS; repeatable, or
+    /// comma-separated in the environment
+    #[arg(
+        long = "plain-http-registry",
+        env = "MEDIATORE_PLAIN_HTTP_REGISTRIES",
+        value_name = "HOST[:PORT]",
+        value_delimiter = ','
+    )]
+    pub plain_http_registries: Vec<String>,
     /// The mediatore binary to mount read-only into the jail: the path the node entry pins,
     /// never the path this process happens to run from
     #[arg(long, default_value = mediatore_proto::AGENT_BINARY_PATH)]
@@ -64,6 +81,16 @@ pub struct GuestArgs {
     /// Dev only: stop after fetching the subject; no user, no jail
     #[arg(long, hide = true)]
     pub dev_skip_setup: bool,
+}
+
+fn tmpfs_size(s: &str) -> Result<String, String> {
+    if sandboxfs::size_is_valid(s) {
+        Ok(s.to_string())
+    } else {
+        Err(format!(
+            "{s:?} is not a tmpfs size (a number with k, m, g or %)"
+        ))
+    }
 }
 
 /// The hypervisor, as the command line names it.
@@ -199,21 +226,16 @@ pub async fn run(args: GuestArgs) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // 4. User, sandbox filesystem, jail.
+    // 4. What the claim asks for, checked before anything is built.
     anyhow::ensure!(
         !me.workload.args.is_empty(),
         "claim has no workload command to run"
     );
-    user::ensure(&me.subject).await?;
-    let uid = user::uid(&username).await?;
-    let (rootfs, work) = jail::JailSpec::default_paths(&args.sandbox_root);
-    anyhow::ensure!(
-        rootfs.is_dir(),
-        "workload rootfs {} does not exist; unpacking {} is not wired yet",
-        rootfs.display(),
-        me.workload.image
-    );
-    std::fs::create_dir_all(&work)?;
+    let reference: image::Reference = me
+        .workload
+        .image
+        .parse()
+        .map_err(|e| anyhow::anyhow!("claim workload image: {e}"))?;
     // The pinned path (ADR-0014 decision 5), not `current_exe`: what the node entry selects
     // is what the workload gets, and a guest started from elsewhere mounts nothing else.
     anyhow::ensure!(
@@ -221,41 +243,70 @@ pub async fn run(args: GuestArgs) -> anyhow::Result<()> {
         "agent binary {} is not a file; the jail needs the pinned binary",
         args.agent_binary.display()
     );
+    user::ensure(&me.subject).await?;
+    let uid = user::uid(&username).await?;
+    let gid = user::gid(&username).await?;
+
+    // 5. Build and run the sandbox, then tear down. Also tear down on an error: no
+    //    partial-trust mode.
+    let result = serve_claim(&args, &me, &username, &reference, uid, gid).await;
+    supervise::teardown(&args.sandbox_root, &username).await;
+    result
+}
+
+/// Tmpfs, rootfs, ruleset, jail (ADR-0021 decision 5), then supervise until the deadline.
+/// No jail without the ruleset (ADR-0020 decision 5), no ruleset without the rootfs.
+async fn serve_claim(
+    args: &GuestArgs,
+    me: &Me,
+    username: &str,
+    reference: &image::Reference,
+    uid: u32,
+    gid: u32,
+) -> anyhow::Result<()> {
+    let tmpfs = sandboxfs::Tmpfs {
+        root: args.sandbox_root.clone(),
+        size: args.sandbox_size.clone(),
+    };
+    tmpfs.mount().await?;
+    let layout = sandboxfs::prepare(&args.sandbox_root, uid, gid)?;
+    let pulled = image::Puller::new(&args.plain_http_registries)?
+        .pull(reference, &layout.rootfs, &layout.layers)
+        .await?;
+    tracing::info!(
+        claim_uid = %me.claim_uid,
+        image = %reference,
+        image_digest = %pulled.digest,
+        layers = pulled.layers,
+        bytes = pulled.bytes,
+        "workload image pulled"
+    );
     let spec = jail::JailSpec {
-        user: username.clone(),
-        rootfs,
-        work,
+        user: username.to_string(),
+        rootfs: layout.rootfs,
+        work: layout.work,
         workload_api_socket: args.workload_api_socket.clone(),
         mediatore_url: args.mediatore_url.clone(),
         agent_binary: args.agent_binary.clone(),
         argv: me.workload.args.clone(),
         rlimit_as_mib: jail::DEFAULT_RLIMIT_AS_MIB,
     };
-
-    // 5. The ruleset before the jail (ADR-0020 decision 5: no ruleset, no jail), then
-    //    supervise until the deadline, then tear down. Also tear down on an error: no
-    //    partial-trust mode.
-    let result = async {
-        let ruleset = net::Ruleset::resolve(
-            uid,
-            &args.mediatore_url,
-            &me.egress,
-            Path::new(net::RESOLV_CONF),
-        )
-        .await?;
-        let sha256 = net::load(&ruleset).await?;
-        tracing::info!(
-            claim_uid = %me.claim_uid,
-            user = %username,
-            uid,
-            destinations = ruleset.allow.len(),
-            resolvers = ruleset.dns.len(),
-            ruleset_sha256 = %sha256,
-            "sandbox ruleset loaded"
-        );
-        supervise::run(&spec, me.expires_at).await
-    }
-    .await;
-    supervise::teardown(&args.sandbox_root, &username).await;
-    result
+    let ruleset = net::Ruleset::resolve(
+        uid,
+        &args.mediatore_url,
+        &me.egress,
+        Path::new(net::RESOLV_CONF),
+    )
+    .await?;
+    let sha256 = net::load(&ruleset).await?;
+    tracing::info!(
+        claim_uid = %me.claim_uid,
+        user = username,
+        uid,
+        destinations = ruleset.allow.len(),
+        resolvers = ruleset.dns.len(),
+        ruleset_sha256 = %sha256,
+        "sandbox ruleset loaded"
+    );
+    supervise::run(&spec, me.expires_at).await
 }

@@ -15,6 +15,7 @@
 pub mod ek;
 pub mod entra;
 pub mod pem;
+pub mod registry;
 pub mod sandboxes;
 pub mod svid;
 pub mod transit;

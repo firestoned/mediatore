@@ -1,6 +1,6 @@
 [package]
 name = "mediatore-testkit"
-description = "Test-only helpers: a fake OIDC issuer, and a test CA minting SPIFFE SVIDs for the mTLS suite"
+description = "Test-only helpers: a fake OIDC issuer, a fake OCI registry, and a test CA minting SPIFFE SVIDs for the mTLS suite"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -51,6 +51,9 @@ base64.workspace = true
 serde_json.workspace = true
 chrono.workspace = true
 sha2.workspace = true
+hex.workspace = true
+tar.workspace = true
+flate2.workspace = true
 anyhow.workspace = true
 aws-lc-rs.workspace = true
 

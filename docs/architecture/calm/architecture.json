@@ -149,13 +149,13 @@
       "unique-id": "service-guest-agent",
       "node-type": "service",
       "name": "mediatore guest",
-      "description": "Root daemon, the guest role of the one mediatore binary (ADR-0014): registers the node (EK hash + DMI UUID), then announces GuestReady to the hypervisor over the channel banlieue reads (the /run marker, guestinfo or vsock; ADR-0019), so the pool counts the member only once it is attested and registered; polls GET /v1/me for a bound claim, creates the per-subject user (sb- + 12 hex, ADR-0004), loads the per-claim nftables ruleset keyed by that uid (the broker, the audiences' egress endpoints, DNS; no ruleset, no jail; ADR-0020), builds /mnt/sandbox, bind-mounts the binary at the pinned path read-only into the jail and supervises the nsjail until the deadline, then tears down. crates/mediatore-guest."
+      "description": "Root daemon, the guest role of the one mediatore binary (ADR-0014): registers the node (EK hash + DMI UUID), then announces GuestReady to the hypervisor over the channel banlieue reads (the /run marker, guestinfo or vsock; ADR-0019), so the pool counts the member only once it is attested and registered; polls GET /v1/me for a bound claim, creates the per-subject user (sb- + 12 hex, ADR-0004), mounts a size-bounded tmpfs at /mnt/sandbox (nosuid, nodev, mode 0700) and pulls the claim's workload image from its registry into it as the rootfs, manifest and layers verified against their digests, the manifest digest logged (ADR-0021), loads the per-claim nftables ruleset keyed by that uid (the broker, the audiences' egress endpoints, DNS; no ruleset, no jail; ADR-0020), bind-mounts the binary at the pinned path read-only into the jail and supervises the nsjail until the deadline, then tears down. crates/mediatore-guest."
     },
     {
       "unique-id": "service-sandbox-workload",
       "node-type": "service",
       "name": "Jailed Workload",
-      "description": "Runs under nsjail as the per-subject user with only the Workload API socket mounted in, in the VM's network namespace behind an nftables chain keyed by its uid that admits the broker, the egress endpoints of the claim's audiences and DNS to the VM's resolvers, and drops the rest (ADR-0020). Fetches its claim SVID and trades it at POST /v1/token for one short-lived, audience-scoped token at a time (mediatore token, the same binary mounted read-only into the jail; ADR-0014). No token ever rests on disk."
+      "description": "Runs under nsjail as the per-subject user in a read-only rootfs unpacked from the claim's image onto a per-claim tmpfs (ADR-0021), with only the Workload API socket and the binary mounted in and /work writable, in the VM's network namespace behind an nftables chain keyed by its uid that admits the broker, the egress endpoints of the claim's audiences and DNS to the VM's resolvers, and drops the rest (ADR-0020). Fetches its claim SVID and trades it at POST /v1/token for one short-lived, audience-scoped token at a time (mediatore token, the same binary mounted read-only into the jail; ADR-0014). No token ever rests on disk."
     },
     {
       "unique-id": "ecosystem-downstream-api",
@@ -164,10 +164,16 @@
       "description": "Services the sandbox may call on the user's behalf: Entra-protected APIs (OBO tokens) or JWKS-validating services (STS tokens with the act claim). Each validates audience and can audit 'broker on behalf of user'."
     },
     {
+      "unique-id": "ecosystem-oci-registry",
+      "node-type": "ecosystem",
+      "name": "Workload Image Registry",
+      "description": "The OCI registry the claim's workload.image names (ghcr.io, Docker Hub, a registry on the segment). The guest pulls from it anonymously over HTTPS with the distribution API, follows one bearer challenge, verifies every blob against its digest and logs the manifest digest that ran; a tag is the registry's word, a digest pin is the requester's (ADR-0021). Trusted for availability, not for content."
+    },
+    {
       "unique-id": "network-sandbox-segment",
       "node-type": "network",
       "name": "Sandbox Network Segment",
-      "description": "Pool members' network. Egress only: SPIRE server (TCP 8081), mediatore's sandbox listener (TCP 443) and the allowed downstream APIs. Nothing inbound to the VM; from inside the jail the sandbox uid reaches the broker, its audiences' egress endpoints and the resolvers, nothing else (ADR-0020), so the Kube API and the SPIRE server are unreachable from it."
+      "description": "Pool members' network. Egress only: SPIRE server (TCP 8081), mediatore's sandbox listener (TCP 443), the workload image registry (reached by the guest as root, ADR-0021) and the allowed downstream APIs. Nothing inbound to the VM; from inside the jail the sandbox uid reaches the broker, its audiences' egress endpoints and the resolvers, nothing else (ADR-0020), so the Kube API and the SPIRE server are unreachable from it."
     }
   ],
   "relationships": [
@@ -496,6 +502,21 @@
       }
     },
     {
+      "unique-id": "rel-guest-agent-registry",
+      "description": "The in-guest agent, as root and before the ruleset is loaded, pulls the claim's workload image: the manifest (an index resolved to linux/<arch>) and the layers, each verified against its digest, applied in order with whiteouts into the rootfs on the per-claim tmpfs; nothing escapes the rootfs, setuid bits are dropped, device nodes skipped (ADR-0021). HTTPS with WebPKI roots; plain HTTP only for a registry named on the command line.",
+      "relationship-type": {
+        "connects": {
+          "source": {
+            "node": "service-guest-agent"
+          },
+          "destination": {
+            "node": "ecosystem-oci-registry"
+          }
+        }
+      },
+      "protocol": "HTTPS"
+    },
+    {
       "unique-id": "rel-workload-mediatore",
       "description": "POST /v1/token over the claim SVID: one audience per request, from the claim's allowlist, capped at 15 minutes, never a refresh token. Rate-limited per claim (token.rate_per_minute, 429 beyond it) ahead of any upstream call (ADR-0013).",
       "relationship-type": {
@@ -619,15 +640,20 @@
         {
           "sequence-number": 7,
           "relationship-unique-id": "rel-guest-agent-mediatore",
-          "description": "The in-guest agent fetches the subject, the workload and the egress endpoints over its node SVID, creates the sb- user, loads the nftables ruleset keyed by that uid (ADR-0020) and starts the jail in the VM's network namespace."
+          "description": "The in-guest agent fetches the subject, the workload and the egress endpoints over its node SVID, creates the sb- user and mounts the per-claim sandbox tmpfs (ADR-0021)."
         },
         {
           "sequence-number": 8,
+          "relationship-unique-id": "rel-guest-agent-registry",
+          "description": "The guest pulls the workload image into the tmpfs as the rootfs, manifest and layers verified against their digests and the manifest digest logged (ADR-0021); then it loads the nftables ruleset keyed by the sb- uid (ADR-0020) and starts the jail in the VM's network namespace."
+        },
+        {
+          "sequence-number": 9,
           "relationship-unique-id": "rel-workload-mediatore",
           "description": "The workload presents its claim SVID over mTLS and trades it for a short-lived, audience-scoped token."
         },
         {
-          "sequence-number": 9,
+          "sequence-number": 10,
           "relationship-unique-id": "rel-workload-downstream",
           "description": "The workload calls the downstream API on the user's behalf."
         }
@@ -703,7 +729,7 @@
     "repository": "https://github.com/firestoned/mediatore",
     "license": "Apache-2.0",
     "calm-schema-version": "1.2",
-    "phase": "dev-mode loop implemented and e2e-tested; Entra OBO is a fail-closed stub. Roadmap 01 (ADR-0006, ADR-0007) implemented and live-tested in kind: registration entries as ClusterStaticEntry through the Kubernetes API, broker identity from the Workload API over the SPIFFE CSI driver, SPIFFE mTLS terminated in-process (crates/mediatore-tls). Roadmap 03 (ADR-0011): the claim watcher, node resolution by EK, node entries from pool members, leader election by Lease. Roadmap 08 (ADR-0008): the AgentSandbox CRD, its reconciler on the same loop, the subject admission policy and the user API creating the resource; records now exist outside dev_mode. SPIRE topology models the ADR-0005 desired state: root on a dedicated identity cluster, downstream per environment; the homelab collapses to the downstream server alone. Roadmap 05 (ADR-0012): one sqlx store over SQLite or PostgreSQL, the sealed refresh envelope, rows swept into an audit table; every kind tier runs the broker on PostgreSQL over verify-full. Roadmap 04, first slice (ADR-0013): the Dex path, with the upstream session delegated at claim creation, sealed, refreshed before every issue and revoked on refusal; mediatore-cli; per-claim rate limiting. Entra OBO and the transit sealer are the roadmap's next slices. ADR-0014: one binary, the roles as subcommands (serve, guest, token, login, sandbox, session), one musl artifact for every host, the jail mounting it read-only; the node entry pins /usr/local/bin/mediatore. ADR-0015: the transit sealer; the kind tiers run the broker on an OpenBao (make kind-openbao) with Kubernetes auth and a derived key; the local sealer stays the homelab shape. ADR-0016: the Entra path, with the caller's token exchanged On-Behalf-Of at claim creation, the session refreshed per audience before every issue, and the broker's credential a signed assertion (key file, OpenBao transit or a federated ServiceAccount token); proven against the fake issuer, the live run against a tenant is by hand. ADR-0017: issuer profiles, the session path for any OIDC issuer (Google and Auth0 beside Dex), per-issuer login parameters and groups claim. ADR-0018: TPM attestation with the SPIFFE community plugin as a kustomize component, the hypervisors' swtpm CAs as the EK bundle; the agent fragments for the VM image. ADR-0019: GuestReady announced by the guest after attestation and registration, the VM units guarded on the installed disk. ADR-0020: the jail in the VM's network namespace behind an nftables ruleset keyed by the sandbox uid, the destinations from the claim's audiences."
+    "phase": "dev-mode loop implemented and e2e-tested; Entra OBO is a fail-closed stub. Roadmap 01 (ADR-0006, ADR-0007) implemented and live-tested in kind: registration entries as ClusterStaticEntry through the Kubernetes API, broker identity from the Workload API over the SPIFFE CSI driver, SPIFFE mTLS terminated in-process (crates/mediatore-tls). Roadmap 03 (ADR-0011): the claim watcher, node resolution by EK, node entries from pool members, leader election by Lease. Roadmap 08 (ADR-0008): the AgentSandbox CRD, its reconciler on the same loop, the subject admission policy and the user API creating the resource; records now exist outside dev_mode. SPIRE topology models the ADR-0005 desired state: root on a dedicated identity cluster, downstream per environment; the homelab collapses to the downstream server alone. Roadmap 05 (ADR-0012): one sqlx store over SQLite or PostgreSQL, the sealed refresh envelope, rows swept into an audit table; every kind tier runs the broker on PostgreSQL over verify-full. Roadmap 04, first slice (ADR-0013): the Dex path, with the upstream session delegated at claim creation, sealed, refreshed before every issue and revoked on refusal; mediatore-cli; per-claim rate limiting. Entra OBO and the transit sealer are the roadmap's next slices. ADR-0014: one binary, the roles as subcommands (serve, guest, token, login, sandbox, session), one musl artifact for every host, the jail mounting it read-only; the node entry pins /usr/local/bin/mediatore. ADR-0015: the transit sealer; the kind tiers run the broker on an OpenBao (make kind-openbao) with Kubernetes auth and a derived key; the local sealer stays the homelab shape. ADR-0016: the Entra path, with the caller's token exchanged On-Behalf-Of at claim creation, the session refreshed per audience before every issue, and the broker's credential a signed assertion (key file, OpenBao transit or a federated ServiceAccount token); proven against the fake issuer, the live run against a tenant is by hand. ADR-0017: issuer profiles, the session path for any OIDC issuer (Google and Auth0 beside Dex), per-issuer login parameters and groups claim. ADR-0018: TPM attestation with the SPIFFE community plugin as a kustomize component, the hypervisors' swtpm CAs as the EK bundle; the agent fragments for the VM image. ADR-0019: GuestReady announced by the guest after attestation and registration, the VM units guarded on the installed disk. ADR-0020: the jail in the VM's network namespace behind an nftables ruleset keyed by the sandbox uid, the destinations from the claim's audiences. ADR-0021 implemented: the sandbox filesystem is a size-bounded tmpfs per claim (nosuid, nodev, 0700) and the guest pulls the workload rootfs from the registry itself, every blob digest-verified, the manifest digest logged per claim."
   },
   "adrs": [
     "docs/adr/0001-record-architecture-decisions.md",
@@ -725,6 +751,7 @@
     "docs/adr/0017-issuer-profiles.md",
     "docs/adr/0018-tpm-attestation-with-the-spiffe-plugin.md",
     "docs/adr/0019-guestready-after-attestation-and-registration.md",
-    "docs/adr/0020-jail-network-nftables-keyed-by-sandbox-uid.md"
+    "docs/adr/0020-jail-network-nftables-keyed-by-sandbox-uid.md",
+    "docs/adr/0021-sandbox-filesystem-tmpfs-and-rootfs-from-the-registry.md"
   ]
 }
