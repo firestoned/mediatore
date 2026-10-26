@@ -206,9 +206,12 @@ not a person.
 [ADR-0021](../adr/0021-sandbox-filesystem-tmpfs-and-rootfs-from-the-registry.md)): every layer is verified against its digest and the
 manifest digest is logged with the claim, so a reference pinned by digest
 (`name@sha256:…`) is what makes the record reproducible; a tag is whatever the registry
-says it is at bind time. The registry is reached anonymously over HTTPS (Docker Hub,
-`ghcr.io`, your own); one that wants a credential refuses the pull for now. `tar` and
-`tar+gzip` layers are accepted, zstd is not yet. `workload.args` is the argv executed
+says it is at bind time. The registry is reached over HTTPS (Docker Hub, `ghcr.io`,
+your own), anonymously unless the operator configured a credential for it
+(`registries[]` in the broker's config, [ADR-0022](../adr/0022-registry-pull-credentials-from-the-broker.md)): the
+guest gets that credential with the claim and uses it for the pull; nothing in the jail
+sees it. A reference the broker cannot parse is refused at `POST /v1/claims`
+(`invalid_workload_image`). `tar` and `tar+gzip` layers are accepted, zstd is not yet. `workload.args` is the argv executed
 under nsjail as the per-subject user. The jail gives it:
 
 | Inside the jail | Purpose |
@@ -256,7 +259,7 @@ Because nothing inbound reaches the VM, pick one of:
   transit sealer (ADR-0015).
 - Still to come: roadmap 04's live run against a tenant; 02 gives VMs a real SPIRE
   server to attest to; 06's open items are root's own egress and the input chain with
-  the image, seccomp, pull credentials, the image bake and the live libvirt proof. See
+  the image, seccomp, the image bake and the live libvirt proof. See
   [`ROADMAPS.md`](https://github.com/firestoned/mediatore/blob/main/ROADMAPS.md).
 - Threat model: the exfiltration window of the 15-minute in-workload token is
   accepted risk R-3; the dial-out pattern narrows what a leaked token can do

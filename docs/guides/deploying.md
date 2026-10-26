@@ -203,8 +203,34 @@ largest layer and `/work` on top of the workload: `MEDIATORE_SANDBOX_SIZE` in
 `/etc/mediatore-guest/env` bounds the tmpfs (`--sandbox-size`; `50%` of RAM, the kernel's
 default, when unset). A registry on the segment without TLS is named in
 `MEDIATORE_PLAIN_HTTP_REGISTRIES` (`--plain-http-registry`, `host:port`, comma-separated);
-pin images from it by digest, since nothing else vouches for the bytes. A registry that
-wants a credential refuses the pull: pull secrets are a roadmap 06 item.
+pin images from it by digest, since nothing else vouches for the bytes.
+
+A private registry gets its credential from the broker, not from the image
+([ADR-0022](../adr/0022-registry-pull-credentials-from-the-broker.md)): list it under `registries` in `mediatore.yaml`, with
+the login and a file holding the token, mounted from a Secret like the STS key, and the
+broker hands the guest that credential with the claim whose image names the registry.
+The token should be read-only and scoped to the pool's images; it is one credential for
+every member, which is what a pull secret is anywhere. A registry listed as plain HTTP
+never receives a credential.
+
+```yaml
+registries:
+  - { host: ghcr.io, username: octocat, password_file: /etc/mediatore-registry/ghcr }
+```
+
+```sh
+kubectl -n banlieue-system create secret generic mediatore-registry --from-file=ghcr=./ghcr-pull-token
+```
+
+and in the overlay's Deployment patch, beside the STS volume:
+
+```yaml
+volumeMounts:
+  - { name: registry, mountPath: /etc/mediatore-registry, readOnly: true }
+volumes:
+  - name: registry
+    secret: { secretName: mediatore-registry, defaultMode: 0440 }
+```
 
 ## What the NetworkPolicy allows
 

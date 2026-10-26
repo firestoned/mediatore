@@ -34,7 +34,7 @@ flowchart TD
     t4["4. banlieue binds a Ready, already-attested pool member and mirrors its EK certificate onto the claim."]
     t5["5. The watcher hashes the EK certificate's public key, resolves the node, and declares the claim's ClusterStaticEntry (admission policy checks the shape)."]
     t6["6. The controller manager renders the entry over the private socket and reports status.set; the watcher marks the claim live."]
-    t7["7. The in-guest agent fetches the subject, the workload and the egress endpoints over its node SVID, creates the sb- user and mounts the per-claim sandbox tmpfs (ADR-0021)."]
+    t7["7. The in-guest agent fetches the subject, the workload, the egress endpoints and the pull credential for the image's registry, if any (ADR-0022), over its node SVID, creates the sb- user and mounts the per-claim sandbox tmpfs (ADR-0021)."]
     t8["8. The guest pulls the workload image into the tmpfs as the rootfs, manifest and layers verified against their digests and the manifest digest logged (ADR-0021); then it loads the nftables ruleset keyed by the sb- uid (ADR-0020) and starts the jail in the VM's network namespace."]
     t9["9. The workload presents its claim SVID over mTLS and trades it for a short-lived, audience-scoped token."]
     t10["10. The workload calls the downstream API on the user's behalf."]

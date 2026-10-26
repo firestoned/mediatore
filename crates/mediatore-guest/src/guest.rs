@@ -219,6 +219,7 @@ pub async fn run(args: GuestArgs) -> anyhow::Result<()> {
         user = %username,
         expires_at = %me.expires_at,
         egress = me.egress.len(),
+        registry_credential = me.registry_credential.as_ref().map(|c| c.host.as_str()),
         "subject fetched"
     );
     if args.dev_skip_setup {
@@ -231,7 +232,7 @@ pub async fn run(args: GuestArgs) -> anyhow::Result<()> {
         !me.workload.args.is_empty(),
         "claim has no workload command to run"
     );
-    let reference: image::Reference = me
+    let reference: mediatore_proto::image::ImageReference = me
         .workload
         .image
         .parse()
@@ -260,7 +261,7 @@ async fn serve_claim(
     args: &GuestArgs,
     me: &Me,
     username: &str,
-    reference: &image::Reference,
+    reference: &mediatore_proto::image::ImageReference,
     uid: u32,
     gid: u32,
 ) -> anyhow::Result<()> {
@@ -271,7 +272,12 @@ async fn serve_claim(
     tmpfs.mount().await?;
     let layout = sandboxfs::prepare(&args.sandbox_root, uid, gid)?;
     let pulled = image::Puller::new(&args.plain_http_registries)?
-        .pull(reference, &layout.rootfs, &layout.layers)
+        .pull(
+            reference,
+            me.registry_credential.as_ref(),
+            &layout.rootfs,
+            &layout.layers,
+        )
         .await?;
     tracing::info!(
         claim_uid = %me.claim_uid,
