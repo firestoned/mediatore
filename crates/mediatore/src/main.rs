@@ -133,6 +133,11 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
             .filter(|a| a.via == Backend::EntraObo)
             .map(|a| a.name.clone())
             .collect(),
+        egress: cfg
+            .audiences
+            .iter()
+            .map(|a| (a.name.clone(), a.egress.clone()))
+            .collect(),
         sandboxes,
         sandbox_namespace: cfg.sandboxes.namespace.clone(),
         sealer,

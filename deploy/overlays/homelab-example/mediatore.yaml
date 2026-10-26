@@ -21,7 +21,9 @@ issuers:
     required_group: firestoned:sandbox-users
     session: { client_id: mediatore }
 audiences:
-  - { name: grafana.home.example, via: sts, max_ttl: 900 }
+  # egress: where the jail may reach this audience's API (host:port); without it the
+  # workload gets tokens it can spend nowhere (ADR-0020).
+  - { name: grafana.home.example, via: sts, max_ttl: 900, egress: ["grafana.home.example:443"] }
 sts:
   issuer: https://mediatore.home.example
   kid: homelab-1

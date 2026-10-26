@@ -64,7 +64,9 @@ impl JailSpec {
             "--tmpfsmount".into(),
             "/home/sandbox".into(),
             "--disable_proc".into(),
-            "--iface_no_lo=false".into(),
+            // The VM's network namespace, not a fresh one: the workload's sockets carry the
+            // sb- uid, which the guest's nftables ruleset keys on (ADR-0020 decision 1).
+            "--disable_clone_newnet".into(),
             "--rlimit_as".into(),
             self.rlimit_as_mib.to_string(),
             "--rlimit_nproc".into(),
@@ -112,6 +114,29 @@ mod tests {
         let sep = a.iter().position(|x| x == "--").unwrap();
         assert_eq!(&a[sep + 1..], &["/bin/sh", "-c", "id"]);
         assert!(a.iter().any(|x| x == "--disable_proc"));
+    }
+
+    #[test]
+    fn the_jail_keeps_the_vms_network_namespace() {
+        let s = JailSpec {
+            user: "sb-abc".into(),
+            rootfs: "/mnt/sandbox/rootfs".into(),
+            work: "/mnt/sandbox/work".into(),
+            workload_api_socket: "/run/spire/sockets/agent.sock".into(),
+            mediatore_url: "https://mediatore.test".into(),
+            agent_binary: "/usr/local/bin/mediatore".into(),
+            argv: vec!["/bin/sh".into()],
+            rlimit_as_mib: 8192,
+        };
+        let a = s.to_args();
+        assert!(
+            a.iter().any(|x| x == "--disable_clone_newnet"),
+            "ADR-0020: the sockets must be the sb- uid's in the VM's namespace"
+        );
+        assert!(
+            !a.iter().any(|x| x.starts_with("--iface_no_lo")),
+            "loopback setup belongs to a namespace the jail no longer has"
+        );
     }
 
     #[test]

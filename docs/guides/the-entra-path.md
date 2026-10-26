@@ -98,9 +98,13 @@ process, not the first claim. `key_file` and `transit` need `certificate_file`;
 
 ```yaml
 audiences:
-  - { name: api://trading-data, via: entra-obo }
-  - { name: grafana.home.example, via: sts, max_ttl: 900 }
+  - { name: api://trading-data, via: entra-obo, egress: ["api.trading.example:443"] }
+  - { name: grafana.home.example, via: sts, max_ttl: 900, egress: ["grafana.home.example:443"] }
 ```
+
+`egress` is where the workload reaches the audience's API from the jail ([ADR-0020](../adr/0020-jail-network-nftables-keyed-by-sandbox-uid.md)): the
+guest admits those `host:port` pairs for the sandbox uid and nothing else beyond the
+broker and DNS. Without it the jail reaches the broker only.
 
 An `entra-obo` audience is the downstream app's id URI (or client id); the token
 mediatore hands the workload is Entra's for `<name>/.default`, with the lifetime Entra

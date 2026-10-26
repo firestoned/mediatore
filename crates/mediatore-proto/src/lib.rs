@@ -97,6 +97,56 @@ pub struct Workload {
     pub args: Vec<String>,
 }
 
+/// A destination the jailed workload may reach: a host (a name or an address) and a TCP
+/// port. Declared per audience in the broker's config, returned by `GET /v1/me` for the
+/// claim's audiences, admitted by the guest's ruleset for the sandbox uid (ADR-0020).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct Endpoint {
+    /// Host name or IP address, without brackets.
+    pub host: String,
+    /// TCP port.
+    pub port: u16,
+}
+
+impl std::str::FromStr for Endpoint {
+    type Err = String;
+
+    /// `host:port`, with an IPv6 address in brackets (`[2001:db8::1]:443`).
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (host, port) = s
+            .rsplit_once(':')
+            .ok_or_else(|| format!("{s:?}: expected host:port"))?;
+        let host = host
+            .strip_prefix('[')
+            .and_then(|h| h.strip_suffix(']'))
+            .unwrap_or(host);
+        if host.is_empty() || (host.contains(':') && !s.starts_with('[')) {
+            return Err(format!(
+                "{s:?}: expected host:port, an IPv6 address in brackets"
+            ));
+        }
+        let port: u16 = port
+            .parse()
+            .ok()
+            .filter(|p| *p != 0)
+            .ok_or_else(|| format!("{s:?}: the port must be 1 to 65535"))?;
+        Ok(Self {
+            host: host.to_owned(),
+            port,
+        })
+    }
+}
+
+impl std::fmt::Display for Endpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.host.contains(':') {
+            write!(f, "[{}]:{}", self.host, self.port)
+        } else {
+            write!(f, "{}:{}", self.host, self.port)
+        }
+    }
+}
+
 /// A credential in a request body: serialises as the plain string, never prints.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -174,6 +224,11 @@ pub struct Me {
     pub expires_at: DateTime<Utc>,
     /// What to run.
     pub workload: Workload,
+    /// Where the workload may connect, beyond the broker: the `egress` of every audience
+    /// on the claim, sorted and deduplicated (ADR-0020). Empty with an old broker or an
+    /// audience that declares none; the jail then reaches the broker only.
+    #[serde(default)]
+    pub egress: Vec<Endpoint>,
 }
 
 /// `POST /v1/token` body, sent by the jailed workload over its claim SVID.
@@ -211,6 +266,45 @@ pub struct ErrorBody {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_endpoint_is_host_and_port_with_ipv6_in_brackets() {
+        let e: Endpoint = "grafana.home.example:443".parse().unwrap();
+        assert_eq!((e.host.as_str(), e.port), ("grafana.home.example", 443));
+        assert_eq!(e.to_string(), "grafana.home.example:443");
+        let e: Endpoint = "[2001:db8::1]:8443".parse().unwrap();
+        assert_eq!((e.host.as_str(), e.port), ("2001:db8::1", 8443));
+        assert_eq!(e.to_string(), "[2001:db8::1]:8443");
+        let e: Endpoint = "192.0.2.10:80".parse().unwrap();
+        assert_eq!((e.host.as_str(), e.port), ("192.0.2.10", 80));
+    }
+
+    #[test]
+    fn a_malformed_endpoint_is_refused() {
+        for bad in [
+            "grafana.home.example",
+            ":443",
+            "grafana.home.example:0",
+            "grafana.home.example:65536",
+            "grafana.home.example:https",
+            "2001:db8::1:443",
+            "[2001:db8::1]:",
+        ] {
+            assert!(bad.parse::<Endpoint>().is_err(), "{bad} parsed");
+        }
+    }
+
+    #[test]
+    fn me_without_egress_deserialises_as_an_empty_list() {
+        let me: Me = serde_json::from_value(serde_json::json!({
+            "claim_uid": "00000000-0000-0000-0000-000000000001",
+            "subject": { "issuer": "https://dex.home.example", "id": "octocat" },
+            "expires_at": "2026-01-01T00:00:00Z",
+            "workload": { "image": "registry.internal:5000/sandbox:latest" }
+        }))
+        .unwrap();
+        assert_eq!(me.egress, Vec::<Endpoint>::new());
+    }
 
     #[test]
     fn username_is_deterministic_and_valid() {

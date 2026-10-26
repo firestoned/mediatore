@@ -36,7 +36,9 @@ Keep the copy outside the repository: it will carry your trust domain, your issu
 URL, your CIDRs. Edit:
 
 - `mediatore.yaml`: `trust_domain`, `issuers` (from the [issuers guide](issuers.md)),
-  `audiences`, `sts.issuer` (what downstream services will see as `iss`), and
+  `audiences`, each with the `egress` the jail may reach for it (`host:port` pairs; an
+  audience without one yields tokens the workload can spend nowhere, [ADR-0020](../adr/0020-jail-network-nftables-keyed-by-sandbox-uid.md)),
+  `sts.issuer` (what downstream services will see as `iss`), and
   `spire.entries.class_name` if SPIRE was rendered with another namespace or release
   name (the class is `<namespace>-<release name>`, `spire-server-spire` in the example);
 - `networkpolicy.yaml`: the sandbox segment's CIDR for `:8443`, the control-plane
@@ -183,6 +185,14 @@ enabled units, never attests with the member's vTPM, registers or announces
 The image carries no phase stage of banlieue's: the guest announces after it registered.
 On a non-Kairos image, drop the two `ConditionPathExists` lines or provide the sentinel,
 and take the installer case on yourself.
+
+The image also carries `nftables`. When a claim binds, the guest loads a ruleset keyed
+by the sandbox user's uid before it starts the jail, and refuses to start the jail
+without it ([ADR-0020](../adr/0020-jail-network-nftables-keyed-by-sandbox-uid.md)): TCP to the broker and to the audiences' `egress`, DNS to the VM's
+resolvers, the rest logged under `mediatore-sandbox drop:` and dropped. The guest's log
+carries the ruleset's SHA-256 per claim, and `nft list table inet mediatore_sandbox` on
+the VM shows what is loaded. Root's own egress and the input chain are not in that
+table: those rules come with the image, once its system users are known (roadmap 06).
 
 ## What the NetworkPolicy allows
 

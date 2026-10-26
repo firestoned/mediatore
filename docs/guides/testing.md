@@ -215,6 +215,22 @@ issuer, client id, credential and a user's token from the environment and fails 
 than skips without them. [The Entra path](the-entra-path.md) has the command. Roadmap 04
 closes when that run is green.
 
+### The jail's ruleset: by hand, on the build host
+
+The guest's nftables ruleset ([ADR-0020](../adr/0020-jail-network-nftables-keyed-by-sandbox-uid.md))
+is rendered as text and pinned by unit tests in `crates/mediatore-guest/src/net.rs`.
+Whether the installed `nft` accepts that text is a different question, and `nft -c` asks
+the kernel even to check (it opens netlink, which wants `CAP_NET_ADMIN`), so that check
+is an ignored test that takes the command from the environment and fails rather than
+skips without it:
+
+```sh
+MEDIATORE_NFT='sudo /usr/sbin/nft' cargo test -p mediatore-guest net:: -- --include-ignored
+```
+
+Run it on the build host whenever `net.rs` changes. The kind tiers run the guest with
+`--dev-skip-setup` and load no ruleset; the live proof is a libvirt member (roadmap 06).
+
 ### Broker and client pods over SPIFFE mTLS
 
 `make kind-broker` builds the one musl binary on the host (`make dist`), packages it

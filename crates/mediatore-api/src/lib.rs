@@ -16,7 +16,7 @@
 //! `dev_mode` server, on a plain loopback listener, reads it from `x-mediatore-peer-spiffe-id`
 //! instead.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
@@ -34,8 +34,8 @@ use mediatore_claims::sandbox::{
 use mediatore_entra::{IdpError, Validated, Validator};
 use mediatore_proto::ek::is_ek_hash;
 use mediatore_proto::{
-    ClaimPhase, ClaimRequest, ClaimResponse, ErrorBody, Me, NodeRegistered, NodeRegistration,
-    Secret, TokenRequest, TokenResponse,
+    ClaimPhase, ClaimRequest, ClaimResponse, Endpoint, ErrorBody, Me, NodeRegistered,
+    NodeRegistration, Secret, TokenRequest, TokenResponse,
 };
 use mediatore_spire::{EntryManager, Naming};
 use mediatore_store::seal::{SealError, Sealer};
@@ -64,6 +64,9 @@ pub struct AppState {
     /// The subset of `audiences` served by Entra On-Behalf-Of (ADR-0016): a token for one
     /// is Entra's, minted from the claim's Entra session, never the STS's.
     pub obo_audiences: Vec<String>,
+    /// Per audience, where the workload reaches its API from the jail (`audiences[].egress`);
+    /// `GET /v1/me` returns the union over the claim's audiences (ADR-0020).
+    pub egress: BTreeMap<String, Vec<Endpoint>>,
     /// `AgentSandbox` resources through the Kubernetes API (ADR-0008); `None` under
     /// `dev_mode`, where the store and the dev binder stand in. Absent outside `dev_mode`,
     /// the claim endpoints fail closed with `501`.
@@ -753,11 +756,23 @@ async fn me(
     let expires_at = rec
         .expires_at
         .ok_or_else(|| ApiError::internal("bound claim has no deadline".to_owned()))?;
+    // The destinations are the claim's audiences' (ADR-0020 decision 2): an audience that
+    // declares none contributes none, and the jail reaches the broker only.
+    let mut egress: Vec<Endpoint> = rec
+        .audiences
+        .iter()
+        .filter_map(|a| st.egress.get(a))
+        .flatten()
+        .cloned()
+        .collect();
+    egress.sort();
+    egress.dedup();
     Ok(Json(Me {
         claim_uid: rec.uid,
         subject: rec.subject,
         expires_at,
         workload: rec.workload,
+        egress,
     }))
 }
 

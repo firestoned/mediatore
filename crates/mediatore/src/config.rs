@@ -6,6 +6,7 @@
 use std::path::{Path, PathBuf};
 
 use mediatore_entra::{Backend, IssuerConfig};
+use mediatore_proto::Endpoint;
 use mediatore_store::seal::TransitConfig;
 use serde::Deserialize;
 
@@ -19,10 +20,23 @@ pub struct AudienceConfig {
     /// Maximum token lifetime in seconds (default 900).
     #[serde(default = "default_max_ttl")]
     pub max_ttl: i64,
+    /// Where the workload reaches this audience's API from the jail: `host:port` pairs the
+    /// guest admits for the sandbox uid, returned by `GET /v1/me` (ADR-0020). Empty means
+    /// tokens with nowhere to spend them: the jail reaches the broker only.
+    #[serde(default, deserialize_with = "endpoints")]
+    pub egress: Vec<Endpoint>,
 }
 
 fn default_max_ttl() -> i64 {
     900
+}
+
+/// `host:port` strings into endpoints; one malformed entry fails the whole config.
+fn endpoints<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Endpoint>, D::Error> {
+    let raw: Vec<String> = Vec::deserialize(d)?;
+    raw.iter()
+        .map(|s| s.parse::<Endpoint>().map_err(serde::de::Error::custom))
+        .collect()
 }
 
 /// STS signing material.
@@ -466,6 +480,35 @@ issuers: []
 audiences: []
 listen: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }
 ";
+
+    #[test]
+    fn an_audience_declares_where_the_jail_reaches_it() {
+        let cfg = Config::parse(
+            "trust_domain: sandbox.test\nissuers: []\nlisten: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }\ndev_mode: true\nsts: { issuer: https://mediatore.test, kid: k, signing_key_file: /k }\naudiences:\n  - { name: grafana.home.example, via: sts, egress: [\"grafana.home.example:443\", \"[2001:db8::1]:8443\"] }\n  - { name: api://trading-data, via: sts }\n",
+        )
+        .unwrap();
+        let hosts: Vec<String> = cfg.audiences[0]
+            .egress
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(hosts, ["grafana.home.example:443", "[2001:db8::1]:8443"]);
+        assert_eq!(
+            cfg.audiences[1].egress,
+            Vec::<Endpoint>::new(),
+            "no egress declared: the jail reaches the broker only"
+        );
+    }
+
+    #[test]
+    fn a_malformed_egress_entry_fails_the_config() {
+        let err = Config::parse(
+            "trust_domain: sandbox.test\nissuers: []\nlisten: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }\ndev_mode: true\naudiences:\n  - { name: grafana.home.example, via: sts, egress: [\"grafana.home.example\"] }\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("host:port"), "{err}");
+    }
 
     #[test]
     fn dev_mode_needs_no_spire_section() {
