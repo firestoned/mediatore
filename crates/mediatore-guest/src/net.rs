@@ -470,11 +470,11 @@ table inet mediatore_sandbox {
             stdin.shutdown().await.unwrap();
             drop(stdin);
             let out = child.wait_with_output().await.unwrap();
+            // nft names the offending line; the text itself is pinned by the unit tests above.
             assert!(
                 out.status.success(),
-                "nft -c refused the ruleset:\n{}\n{}",
-                String::from_utf8_lossy(&out.stderr),
-                rs.render()
+                "nft -c refused the ruleset: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
             );
         }
     }
