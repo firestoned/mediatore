@@ -3,7 +3,7 @@
 
 //! nsjail configuration for the workload.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// Where the sandbox lives on the guest.
 pub const SANDBOX_ROOT: &str = "/mnt/sandbox";
@@ -85,12 +85,6 @@ impl JailSpec {
         ];
         a.extend(self.argv.iter().cloned());
         a
-    }
-
-    /// Default layout under [`SANDBOX_ROOT`].
-    #[must_use]
-    pub fn default_paths(root: &Path) -> (PathBuf, PathBuf) {
-        (root.join("rootfs"), root.join("work"))
     }
 }
 

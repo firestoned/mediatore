@@ -108,7 +108,7 @@ per-sandbox issuer allowlist is added only when a deployment needs one.
 This refines ADR-0055 decision 5, which only covered the first half. `mediatore-guest`, the
 jail and their dependencies are baked into the pool's `VMImage`, so a warm member has nothing
 to install at bind. What the jail runs is an OCI rootfs that `mediatore-guest` unpacks after
-the subject is known (roadmap 06). That is a pull on the bind path, and it is the workload's,
+the subject is known ([ADR-0021](0021-sandbox-filesystem-tmpfs-and-rootfs-from-the-registry.md)). That is a pull on the bind path, and it is the workload's,
 not the platform's.
 
 **9. One TTL, enforced by the claim.** Carried over from ADR-0055 decision 6.

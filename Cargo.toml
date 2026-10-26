@@ -85,6 +85,10 @@ p256         = "0.14"
 base64       = "0.23"
 sha2         = "0.11"
 hex          = "0.4"
+# The workload rootfs (ADR-0021): OCI layers are tar, gzip-compressed or not; flate2's Rust
+# back end (miniz_oxide), no C.
+tar          = "0.4"
+flate2       = "1"
 # SPIFFE: Workload API client (X509Source, in memory, rotated by the agent), SPIFFE ID and
 # SVID parsing. The TLS verifiers over that material are mediatore-tls (ADR-0007).
 spiffe       = { version = "0.18", default-features = false, features = ["x509-source"] }

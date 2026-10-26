@@ -5,10 +5,25 @@
 
 **Status: in progress.** Finish runbook Part 6 on a real VM.
 
-- [ ] Rootfs population: unpack the claim's OCI workload image (`umoci`/`skopeo`) into
-      `/mnt/sandbox/rootfs` (today the agent requires a pre-populated rootfs)
-- [ ] `/mnt/sandbox` as size-limited tmpfs or dedicated partition, `nosuid,nodev`,
-      mode 0700
+- [x] Rootfs population: unpack the claim's OCI workload image into
+      `/mnt/sandbox/rootfs`. Done 2026-10-26 as
+      [ADR-0021](../../docs/adr/0021-sandbox-filesystem-tmpfs-and-rootfs-from-the-registry.md): the guest
+      pulls the image itself (`crates/mediatore-guest/src/image.rs`), no `skopeo` or
+      `umoci` in the VM: the distribution API over HTTPS with the Mozilla roots,
+      anonymously, one bearer challenge followed; OCI and Docker manifests, an index
+      resolved to `linux/<arch>`; every blob verified against its digest, a digest-pinned
+      reference checked against the manifest, the manifest digest logged with the claim;
+      layers applied in order with whiteouts, an entry out of the rootfs (by `..` or
+      through a symlink) refuses the image, setuid bits dropped, device nodes skipped,
+      tar and tar+gzip only. Tested against a fake registry in `mediatore-testkit`
+      (`registry.rs`) and against a real one by an ignored test on the build host
+- [x] `/mnt/sandbox` as size-limited tmpfs, `nosuid,nodev`, mode 0700. Done 2026-10-26
+      as [ADR-0021](../../docs/adr/0021-sandbox-filesystem-tmpfs-and-rootfs-from-the-registry.md): a
+      fresh tmpfs mounted per claim before the pull (`--sandbox-size`, half the
+      member's RAM by default), `rootfs/` root's and `work/` the sandbox user's (mode
+      0700, which also fixes `/work` having been unwritable by the `sb-` user), one
+      `umount` at teardown (`crates/mediatore-guest/src/sandboxfs.rs`); the mount proven
+      for real by an ignored test on the build host
 - [x] Host nftables keyed by sandbox UID (`meta skuid`): broker + allowed downstream
       APIs only; Kube API and SPIRE server unreachable from the jail. Done 2026-10-24 as
       [ADR-0020](../../docs/adr/0020-jail-network-nftables-keyed-by-sandbox-uid.md):
@@ -22,8 +37,13 @@
       deleted at teardown; the SHA-256 logged per claim. Ruleset text pinned by unit
       tests, accepted by `nft -c` on the build host
 - [ ] The rest of ADR-0010's ruleset outline, with the image: root's egress (the broker
-      only) and the input chain, once the image's system users (DHCP, NTP, the SPIRE
-      agent) are known; the ruleset hash reported to the broker so a flush is detected
+      and the workload image registry the guest pulls from, ADR-0021 decision 5) and the
+      input chain, once the image's system users (DHCP, NTP, the SPIRE agent) are known;
+      the ruleset hash and the image digest reported to the broker so a flush is detected
+      and the record says which bytes ran
+- [ ] Pull credentials: a registry that wants one refuses the guest today (ADR-0021
+      decision 7). A per-claim pull secret returned by `GET /v1/me`, used once by the
+      guest and kept nowhere, is a token-shape change and gets its own ADR
 - [ ] Real seccomp policy for nsjail (the spec currently carries none)
 - [x] `GuestReady` (banlieue ADR-0043) emitted after the SPIRE healthcheck so Ready
       means attested (runbook 2.5). Done 2026-10-24 as

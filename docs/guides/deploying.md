@@ -194,6 +194,18 @@ carries the ruleset's SHA-256 per claim, and `nft list table inet mediatore_sand
 the VM shows what is loaded. Root's own egress and the input chain are not in that
 table: those rules come with the image, once its system users are known (roadmap 06).
 
+The guest pulls each claim's `workload.image` itself ([ADR-0021](../adr/0021-sandbox-filesystem-tmpfs-and-rootfs-from-the-registry.md)): over HTTPS with the
+Mozilla roots, anonymously, into a tmpfs it mounts at `/mnt/sandbox` for that claim
+(`nosuid,nodev`, mode 0700). Two things follow for the deployment. The segment's
+firewall must let members reach the registries the images live on, beside the broker
+and the audiences' endpoints; and the members need memory for the unpacked image, its
+largest layer and `/work` on top of the workload: `MEDIATORE_SANDBOX_SIZE` in
+`/etc/mediatore-guest/env` bounds the tmpfs (`--sandbox-size`; `50%` of RAM, the kernel's
+default, when unset). A registry on the segment without TLS is named in
+`MEDIATORE_PLAIN_HTTP_REGISTRIES` (`--plain-http-registry`, `host:port`, comma-separated);
+pin images from it by digest, since nothing else vouches for the bytes. A registry that
+wants a credential refuses the pull: pull secrets are a roadmap 06 item.
+
 ## What the NetworkPolicy allows
 
 | Direction | Peer | Port | Why |

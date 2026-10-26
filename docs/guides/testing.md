@@ -231,6 +231,24 @@ MEDIATORE_NFT='sudo /usr/sbin/nft' cargo test -p mediatore-guest net:: -- --incl
 Run it on the build host whenever `net.rs` changes. The kind tiers run the guest with
 `--dev-skip-setup` and load no ruleset; the live proof is a libvirt member (roadmap 06).
 
+### The sandbox filesystem and the pull: by hand, on the build host
+
+The tmpfs the guest mounts per claim and the image pull
+([ADR-0021](../adr/0021-sandbox-filesystem-tmpfs-and-rootfs-from-the-registry.md)) are unit-tested
+as far as a test can go without root or the network: the mount arguments and the layout
+are pinned, and the pull runs against a fake registry in `mediatore-testkit`
+(`crates/mediatore-testkit/src/registry.rs`), layers built in the test, hostile ones
+included. Two ignored tests go the rest of the way and fail rather than skip without
+their variable: the tmpfs mounted for real and its options read back from the kernel,
+and an image pulled from a real registry:
+
+```sh
+MEDIATORE_SUDO=sudo cargo test -p mediatore-guest sandboxfs:: -- --include-ignored
+MEDIATORE_PULL_IMAGE=docker.io/library/busybox:1.37 cargo test -p mediatore-guest image:: -- --include-ignored
+```
+
+Run them on the build host whenever `sandboxfs.rs` or `image.rs` changes.
+
 ### Broker and client pods over SPIFFE mTLS
 
 `make kind-broker` builds the one musl binary on the host (`make dist`), packages it

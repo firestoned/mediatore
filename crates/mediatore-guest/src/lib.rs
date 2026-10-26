@@ -14,9 +14,11 @@
 pub mod client;
 pub mod guest;
 mod identity;
+pub mod image;
 pub mod jail;
 pub mod net;
 pub mod ready;
+pub mod sandboxfs;
 mod supervise;
 pub mod token;
 mod user;
