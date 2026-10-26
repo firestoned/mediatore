@@ -5,16 +5,16 @@
 //!
 //! State machine (runbook Part 6.1):
 //! boot → node registered → `GuestReady` announced → subject fetched → user created →
-//! jail running → torn down.
+//! ruleset loaded → jail running → torn down.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use mediatore_proto::{Me, NodeRegistered, NodeRegistration, Provider};
 use reqwest::Method;
 use uuid::Uuid;
 
 use crate::client::SandboxClient;
-use crate::{identity, jail, ready, supervise, user};
+use crate::{identity, jail, net, ready, supervise, user};
 
 /// Seconds between registration retries while mediatore is unreachable.
 const REGISTER_RETRY_SECS: u64 = 5;
@@ -191,6 +191,7 @@ pub async fn run(args: GuestArgs) -> anyhow::Result<()> {
         subject = %me.subject.id,
         user = %username,
         expires_at = %me.expires_at,
+        egress = me.egress.len(),
         "subject fetched"
     );
     if args.dev_skip_setup {
@@ -204,6 +205,7 @@ pub async fn run(args: GuestArgs) -> anyhow::Result<()> {
         "claim has no workload command to run"
     );
     user::ensure(&me.subject).await?;
+    let uid = user::uid(&username).await?;
     let (rootfs, work) = jail::JailSpec::default_paths(&args.sandbox_root);
     anyhow::ensure!(
         rootfs.is_dir(),
@@ -230,9 +232,30 @@ pub async fn run(args: GuestArgs) -> anyhow::Result<()> {
         rlimit_as_mib: jail::DEFAULT_RLIMIT_AS_MIB,
     };
 
-    // 5. Supervise until the deadline, then tear down. Also tear down on a supervision
-    //    error: no partial-trust mode.
-    let result = supervise::run(&spec, me.expires_at).await;
+    // 5. The ruleset before the jail (ADR-0020 decision 5: no ruleset, no jail), then
+    //    supervise until the deadline, then tear down. Also tear down on an error: no
+    //    partial-trust mode.
+    let result = async {
+        let ruleset = net::Ruleset::resolve(
+            uid,
+            &args.mediatore_url,
+            &me.egress,
+            Path::new(net::RESOLV_CONF),
+        )
+        .await?;
+        let sha256 = net::load(&ruleset).await?;
+        tracing::info!(
+            claim_uid = %me.claim_uid,
+            user = %username,
+            uid,
+            destinations = ruleset.allow.len(),
+            resolvers = ruleset.dns.len(),
+            ruleset_sha256 = %sha256,
+            "sandbox ruleset loaded"
+        );
+        supervise::run(&spec, me.expires_at).await
+    }
+    .await;
     supervise::teardown(&args.sandbox_root, &username).await;
     result
 }

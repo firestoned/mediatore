@@ -39,6 +39,22 @@ pub async fn ensure(subject: &Subject) -> anyhow::Result<String> {
     Ok(name)
 }
 
+/// The uid of `name`, what the ruleset keys on (ADR-0020).
+///
+/// # Errors
+/// No such user, or `id` unavailable.
+pub async fn uid(name: &str) -> anyhow::Result<u32> {
+    let out = tokio::process::Command::new("id")
+        .args(["-u", name])
+        .output()
+        .await?;
+    anyhow::ensure!(out.status.success(), "id -u {name} failed: {}", out.status);
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.trim()
+        .parse()
+        .map_err(|e| anyhow::anyhow!("id -u {name} printed {:?}: {e}", text.trim()))
+}
+
 /// Remove the sandbox user and its group. Idempotent.
 pub async fn remove(name: &str) -> anyhow::Result<()> {
     let status = tokio::process::Command::new("userdel")

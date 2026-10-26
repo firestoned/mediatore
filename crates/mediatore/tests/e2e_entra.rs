@@ -168,6 +168,7 @@ impl Harness {
             sts: Some(sts),
             audiences: vec![OBO_AUDIENCE.into(), STS_AUDIENCE.into()],
             obo_audiences: vec![OBO_AUDIENCE.into()],
+            egress: std::collections::BTreeMap::new(),
             sandboxes: None,
             sandbox_namespace: "sandboxes".into(),
             sealer: Some(Arc::new(LocalKeySealer::new([7u8; 32]))),
@@ -429,14 +430,14 @@ async fn a_refused_exchange_creates_no_claim_and_an_outage_at_creation_is_503() 
     h.idp.set_interaction_required("octocat", true);
     let resp = h.claim(&bearer, &[OBO_AUDIENCE], None).await;
     assert_eq!(error_code(resp).await, (403, "session_refused".into()));
-    assert!(h.store.list_claims().await.unwrap().is_empty());
+    assert_eq!(h.store.list_claims().await.unwrap().len(), 0);
     h.idp.set_interaction_required("octocat", false);
 
     h.idp.set_down(true);
     // The login itself still validates (the JWKS is cached), the exchange does not.
     let resp = h.claim(&bearer, &[OBO_AUDIENCE], None).await;
     assert_eq!(error_code(resp).await, (503, "upstream_unavailable".into()));
-    assert!(h.store.list_claims().await.unwrap().is_empty());
+    assert_eq!(h.store.list_claims().await.unwrap().len(), 0);
     h.idp.set_down(false);
 
     // A token for another app, or an expired one, is not exchanged: the login refuses it.

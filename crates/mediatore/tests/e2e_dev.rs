@@ -85,6 +85,15 @@ impl Harness {
             sts: Some(sts),
             audiences: vec![AUDIENCE.into()],
             obo_audiences: vec![],
+            egress: [(
+                AUDIENCE.to_owned(),
+                vec![
+                    "api.home.example:443".parse().unwrap(),
+                    "192.0.2.10:8443".parse().unwrap(),
+                ],
+            )]
+            .into_iter()
+            .collect(),
             sandboxes: None,
             sandbox_namespace: "sandboxes".into(),
             sealer: None,
@@ -237,6 +246,12 @@ async fn full_loop_from_login_to_cutoff() {
     assert_eq!(me.claim_uid, uid);
     assert_eq!(me.subject.id, "octocat");
     assert_eq!(me.workload.image, "registry.internal:5000/sandbox:latest");
+    // The jail admits the claim's audiences' egress for the sandbox uid, sorted (ADR-0020).
+    let want: Vec<mediatore_proto::Endpoint> = ["192.0.2.10:8443", "api.home.example:443"]
+        .iter()
+        .map(|e| e.parse().unwrap())
+        .collect();
+    assert_eq!(me.egress, want);
     let sandbox_user = me.subject.sandbox_username();
     assert!(sandbox_user.starts_with("sb-"));
 

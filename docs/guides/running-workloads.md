@@ -107,8 +107,8 @@ sequenceDiagram
     M->>K: declare ClusterStaticEntry spiffe://td/banlieue/claim/(uid),<br/>parent = VM node, selector unix:user:sb-hash
     K-->>S: controller manager renders the entry; status.set observed
     G->>M: GET /v1/me (mTLS, node SVID)
-    M-->>G: subject, expires_at, workload {image, args}
-    G->>G: useradd sb-hash, unpack image, nsjail as sb-hash
+    M-->>G: subject, expires_at, workload {image, args}, egress
+    G->>G: useradd sb-hash, nft ruleset keyed by its uid, unpack image, nsjail as sb-hash
     G->>W: exec workload.args
     W->>M: POST /v1/token {audience} (mTLS, claim SVID)
     M-->>W: 15-min token, aud = one audience, acting for subject
@@ -210,9 +210,12 @@ per-subject user. The jail gives it:
 | `MEDIATORE_URL` env | Where to trade the SVID for tokens |
 | `/work` (writable), tmpfs `/tmp` + `$HOME` | Scratch space, wiped at teardown |
 | `/usr/local/bin/mediatore` (read-only, the same file the guest runs from) | `mediatore token --audience api://trading-data` prints a 15-min bearer; the rootfs ships no client ([ADR-0014](../adr/0014-one-binary-roles-as-subcommands.md)) |
+| The VM's network, filtered by the sandbox uid | TCP to the broker and to the `egress` endpoints of the claim's audiences, DNS to the VM's resolvers; everything else the workload sends is logged (`mediatore-sandbox drop:`) and dropped ([ADR-0020](../adr/0020-jail-network-nftables-keyed-by-sandbox-uid.md)) |
 
-No token files, no baked-in secrets, no network beyond the broker and the claim's
-audiences. For tools that read a bearer from the environment:
+No token files, no baked-in secrets, and no network beyond the broker and the endpoints
+the claim's audiences declare (`audiences[].egress` in the broker's config, [ADR-0020](../adr/0020-jail-network-nftables-keyed-by-sandbox-uid.md)): an
+audience with none gives tokens with nowhere to spend them, which is the default until
+the operator says where. For tools that read a bearer from the environment:
 `TOKEN=$(mediatore token --audience ...) exec your-tool`; logs go to standard error, the token alone to standard output.
 
 ## Interaction patterns

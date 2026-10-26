@@ -43,7 +43,11 @@ only control: a guest-root attacker can remove them.
    root sits outside the guest (host bridge rules, or distributed firewall /
    VLAN and upstream firewall on vSphere) and at the gateway.
 5. The jailed process gets an empty network namespace and reaches the world
-   only through a socket to mediatore-guest.
+   only through a socket to mediatore-guest. *Amended 2026-10-24 by
+   [ADR-0020](0020-jail-network-nftables-keyed-by-sandbox-uid.md): the jail keeps
+   the VM's network namespace and the sandbox uid is bounded by the ruleset
+   below; the relay socket is the credential-injecting proxy of roadmap 07,
+   not this layer.*
 
 ## Guest ruleset outline
 
@@ -60,6 +64,11 @@ atomically before the agent starts:
 - Link-local and management ranges blocked.
 - The ruleset hash is reported to mediatore so a flush or change is
   detected.
+
+As implemented in mediatore (ADR-0020): the jailed uid's chain (the broker,
+the audiences' declared endpoints, DNS to the VM's resolvers) is loaded per
+claim by `mediatore guest` before the jail starts. The root rules, the input
+policy, the gateway resolver and the hash report are still to come.
 
 ## Consequences
 

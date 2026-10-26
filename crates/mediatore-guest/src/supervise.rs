@@ -9,7 +9,7 @@ use std::path::Path;
 use chrono::{DateTime, Utc};
 
 use crate::jail::JailSpec;
-use crate::user;
+use crate::{net, user};
 
 /// Seconds to wait before restarting a crashed workload.
 const RESTART_DELAY_SECS: u64 = 2;
@@ -47,9 +47,10 @@ pub async fn run(spec: &JailSpec, expires_at: DateTime<Utc>) -> anyhow::Result<(
     }
 }
 
-/// Best-effort teardown: wipe the sandbox filesystem and remove the user.
+/// Best-effort teardown: drop the ruleset, wipe the sandbox filesystem and remove the user.
 /// Failures are logged, never fatal; the VM is about to be destroyed anyway.
 pub async fn teardown(sandbox_root: &Path, username: &str) {
+    net::unload().await;
     let (rootfs, work) = JailSpec::default_paths(sandbox_root);
     for dir in [work, rootfs] {
         if let Err(e) = tokio::fs::remove_dir_all(&dir).await

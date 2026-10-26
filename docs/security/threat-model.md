@@ -5,8 +5,20 @@ SPDX-License-Identifier: Apache-2.0
 # Threat Model
 
 > **Status:** Living document. Last full pass **2026-10-24**, against the
-> architecture defined by **ADR-0001 … ADR-0019** (ADR-0009 and ADR-0010 are
-> adopted platform ADRs with no code of their own). This pass covers ADR-0019:
+> architecture defined by **ADR-0001 … ADR-0020** (ADR-0009 and ADR-0010 are
+> adopted platform ADRs; ADR-0020 is mediatore's share of ADR-0010's in-guest
+> layer). This pass covers ADR-0020: the jail keeps the VM's network namespace,
+> and before it starts the guest loads an nftables ruleset keyed by the sandbox
+> uid that admits the broker, the `egress` endpoints the claim's audiences
+> declare and DNS to the VM's resolvers, and drops the rest; `GET /v1/me`
+> carries the endpoints. Until now the jail had an empty namespace, which the
+> previous passes described as a control and under which the workload's
+> `mediatore token` could not have reached the broker at all. No new asset; the
+> broker gains one field, the guest one module. TB-7 gains four rows (anything
+> beyond the bound, guest root flushing the table, DNS as a channel, a
+> listening socket), TB-6 one (a forged or stale `egress`), §8 two risks (R-12,
+> R-13), the diagram one label; §2, §7 and §9 reworded. The pass before, the
+> same day, covered ADR-0019:
 > `GuestReady` announced by the guest after it is attested and registered,
 > not by a boot stage, on the channel the hypervisor reads. No new asset and no
 > broker code; the guest gains one outbound, unauthenticated, liveness-only
@@ -164,8 +176,8 @@ holds three things an attacker wants:
 | Claim store | `crates/mediatore-store` (`SqlStore`, one query set) | PostgreSQL at work, SQLite for one replica; in-memory only under `dev_mode` | Sealed refresh envelopes, revocations, the node registry, audit rows; the request fields are a copy of the `AgentSandbox` spec. Migrated at startup; swept at resync |
 | Store database | the operator's PostgreSQL, or a SQLite file on the pod's volume (`dev/kind/postgres/` in kind) | management cluster or beside it | Holds every row; reached with the URL in Secret `mediatore-store` over TLS `verify-full` |
 | OpenBao (transit) | the operator's OpenBao (`dev/kind/openbao/` in kind), `crates/mediatore-openbao` (the client), `crates/mediatore-store/src/seal.rs` (`TransitSealer`) and `crates/mediatore-entra/src/assertion.rs` (the transit signer) on the broker's side | management cluster or beside it | Holds the derived sealing key and, when configured so, the RSA key behind the broker's client assertion, and never releases either; encrypts, decrypts and signs for a token it issued to the broker's ServiceAccount (ADR-0015, ADR-0016) |
-| In-guest agent (`mediatore guest`) | `crates/mediatore-guest` (`guest.rs`, `ready.rs`), the same static binary as the broker (ADR-0014) | root on each pool member | `useradd`, mount, nsjail; bind-mounts the binary at the pinned path read-only into the jail; writes the `GuestReady` announcement to the hypervisor's channel (the `/run` marker, `guestinfo`, vsock) once the node is registered, never before (ADR-0019) |
-| Workload client (`mediatore token`) | `crates/mediatore-guest` (`token.rs`), the binary the guest mounted at `/usr/local/bin/mediatore` | inside the jail, as the `sb-` user | Holds one token in memory; nothing but the token on standard output |
+| In-guest agent (`mediatore guest`) | `crates/mediatore-guest` (`guest.rs`, `ready.rs`, `net.rs`), the same static binary as the broker (ADR-0014) | root on each pool member | `useradd`, the per-claim nftables ruleset keyed by the sandbox uid, loaded with `nft` before the jail and deleted after it (ADR-0020), mount, nsjail; bind-mounts the binary at the pinned path read-only into the jail; writes the `GuestReady` announcement to the hypervisor's channel (the `/run` marker, `guestinfo`, vsock) once the node is registered, never before (ADR-0019) |
+| Workload client (`mediatore token`) | `crates/mediatore-guest` (`token.rs`), the binary the guest mounted at `/usr/local/bin/mediatore` | inside the jail, as the `sb-` user, in the VM's network namespace behind that uid's ruleset (ADR-0020) | Holds one token in memory; nothing but the token on standard output |
 | Deployment | `deploy/base/*.yaml`, with `deploy/overlays/homelab-example/` as the single-cluster shape (one replica on SQLite, the local sealer, the Tailscale ingress class, the `NetworkPolicy`) | management cluster | SA, RBAC, `ClusterSPIFFEID`, the `AgentSandbox` CRD (`crds/`, generated), the entries and the sandbox-subject admission policies, the CSI inline volume for the agent socket, the `LoadBalancer` service for :8443, ingress for :8080, the store URL from Secret `mediatore-store` (operator-created) |
 | SPIRE Controller Manager | hardened chart (not this repo) | `spire-server` pod | Renders `ClusterStaticEntry` into server entries over the server's private socket |
 | SPIRE TPM node attestor | `deploy/spire-tpm` (a kustomize component: the init container from the digest-pinned `spiffe/spire-tpm-plugin` image, the EK CA ConfigMap, the `server.conf` block with the checksum); the agent plugin in the VM image from `make dist-tpm-plugin` with `image/spire/agent.conf` | `spire-server` pod (the init container copies the binary); each pool VM | Verifies a VM's EK certificate against the hypervisor CAs and activates a credential on its vTPM; assigns `spiffe://<td>/spire/agent/tpm/<ek-hash>` (ADR-0018) |
@@ -253,7 +265,7 @@ flowchart TB
   guest -- "(TB-6) SPIFFE mTLS: node SVID" --> mediatore
   guest -. "GuestReady after registration: /run marker,<br/>guestinfo or vsock (liveness, banlieue's boundary, ADR-0019)" .-> banlieue
   workload -- "(TB-6) SPIFFE mTLS: POST /v1/token, claim SVID" --> mediatore
-  workload -- "(TB-7) issued token only" --> apis
+  workload -- "(TB-7) issued token only, to the endpoints<br/>the audiences declare (nft keyed by the sb- uid, ADR-0020)" --> apis
 ```
 
 - **TB-1** user ↔ mediatore user API (bearer token over HTTPS)
@@ -398,6 +410,7 @@ the residue is in §8. No boundary carries the marker as of this pass.
 | A session issuer's record minted without a session (an envelope that never arrived) | E | `refresh_session` refuses a record of a session issuer that has no envelope (`403`), and one whose envelope does not open under the configured key; nothing is minted on the record alone |
 | Issuance after release / expiry | E | `ClaimRecord::is_live` gate + revocation drops the refresh envelope: `crates/mediatore-store/src/lib.rs`, on every engine (`revoke_is_idempotent_and_drops_the_refresh_envelope`, conformance), e2e-tested (cut-off in `full_loop_from_login_to_cutoff`); the revocation is durable (TB-9) |
 | Refresh token reaching the VM | I | `TokenResponse` has no refresh field by construction: `crates/mediatore-proto/src/lib.rs` |
+| A forged or stale `egress` list steering the jail (a broker that lies, an old broker that sends none) | T | The list arrives over the same mTLS session as the subject (`GET /v1/me`, `me` in `crates/mediatore-api/src/lib.rs`): the union of the configured `audiences[].egress` for the claim's audiences only, sorted (e2e `full_loop_from_login_to_cutoff` asserts it); an absent field is an empty list (`Me::egress`, `#[serde(default)]`, unit `me_without_egress_deserialises_as_an_empty_list`) and the jail then reaches the broker only. The broker already decides what the sandbox is (§8 R-4); this adds nothing it could not do through `workload` |
 
 ### TB-7: jail → downstream
 
@@ -407,6 +420,10 @@ the residue is in §8. No boundary carries the marker as of this pass.
 | Acting without attribution | R | STS tokens carry `act` (claim SVID) + `claim_uid` + `upstream_iss`: `crates/mediatore-sts/src/lib.rs`; OBO tokens carry `azp` (Entra) |
 | Escaping the jail to steal the node identity | E | nsjail: chroot, no proc, rlimits, tmpfs home, only the Workload API socket and the mediatore binary mounted, both read-only: `crates/mediatore-guest/src/jail.rs` (`JailSpec::to_args`, unit `the_agent_binary_is_mounted_read_only_and_nothing_else_is_writable_but_work`). The mounted file is the pinned path `AGENT_BINARY_PATH` that the node entry selects, never `current_exe()` (`crates/mediatore-guest/src/guest.rs`; unit `the_guest_mounts_the_path_the_node_entry_pins`, `crates/mediatore/src/main.rs`); root processes are outside the jail |
 | The whole binary inside the jail: every role (`serve`, `guest`, `login`) is a command the workload can run (ADR-0014 decision 4) | E | The file is static, read-only, not setuid and holds no secret; a role's authority is what it can reach, not which subcommand ran: `serve` has no broker SVID (TB-8) and no config, `guest` has no TPM and is not root, `login` has no session file; the agent socket in the jail yields the claim SVID only (TB-4 row above, `unix:user:<sb-user>`). The same holds for any binary the workload brings in its rootfs |
+| The workload reaching anything but the broker and its audiences' endpoints (the Kube API, the SPIRE server, the LAN, another member) | E/I | The jail keeps the VM's network namespace (`--disable_clone_newnet`, `JailSpec::to_args`, unit `the_jail_keeps_the_vms_network_namespace`) so its sockets carry the `sb-` uid, and before `nsjail` is spawned the guest loads `table inet mediatore_sandbox`: one output rule sends that uid's packets to a chain that accepts established traffic, TCP to the resolved broker and `egress` addresses and DNS to the VM's resolvers, then logs and drops (`crates/mediatore-guest/src/net.rs`, `Ruleset::render`; units `the_ruleset_admits_the_uid_to_the_broker_the_egress_and_dns_and_drops_the_rest`, `only_the_uids_packets_enter_the_chain_and_the_chain_ends_in_a_drop`; the text accepted by a real `nft -c`, ignored test `nft_accepts_the_rendered_ruleset`, run on the build host). No ruleset, no jail: a failing `nft` is an error before the spawn and the guest tears down (`guest.rs`, `net::load`). Names are resolved once by the guest; an unresolvable destination is omitted (unit `address_literals_need_no_dns_and_a_name_that_does_not_resolve_is_omitted`), an unresolvable broker fatal (`a_broker_that_does_not_resolve_is_an_error_not_a_ruleset`) |
+| Guest root flushes or edits the table | T | Not this layer's to hold: ADR-0010 decision 4, the enforcement that holds against guest root is the segment's and the hypervisor's (banlieue's providers). The guest logs the ruleset's SHA-256 per claim (`Ruleset::sha256`) so a later `nft list table` can be compared; reporting it to the broker is roadmap 06's follow-up |
+| DNS as a covert channel: the sandbox uid may query the VM's resolvers for any name | I | Bounded to port 53 at the resolvers `/etc/resolv.conf` names (`net::resolvers`, unit `resolvers_come_from_nameserver_lines_only`), to what the resolver logs, and to the claim's deadline; §8 R-12 |
+| The workload opens a listening socket in the VM's namespace | S/E | Nothing reaches it: no inbound to the segment is ADR-0010 decision 1, enforced outside the guest; the in-guest input chain and root's own egress are the image's item (roadmap 06); §8 R-13 |
 
 ### TB-8: broker pod → SPIRE agent (Workload API over the CSI mount)
 
@@ -543,6 +560,11 @@ the residue is in §8. No boundary carries the marker as of this pass.
   accepted, never by a boot stage, on every channel the guest has, with the
   payloads banlieue's providers parse (`crates/mediatore-guest/src/ready.rs`);
   the VM units gated on the installed-disk sentinel (`image/systemd/`).
+- The jail's network (ADR-0020): the VM's namespace, the sandbox uid's packets
+  bounded to the broker, the audiences' `egress` and DNS by a per-claim
+  nftables table loaded before the jail and deleted after it
+  (`crates/mediatore-guest/src/net.rs`); `audiences[].egress` empty by
+  default, so an undeclared audience gives tokens with nowhere to spend them.
 
 ## 8. Accepted risks
 
@@ -558,12 +580,18 @@ the residue is in §8. No boundary carries the marker as of this pass.
 | R-11 | The CLI session file holds a login (the ID token until `exp`, the refresh token until it is delegated) on the user's machine; a copy taken before `mediatore sandbox create` runs can request a sandbox as that user, within the group gate, until the issuer's session ends | Mode 0600, the refresh token spent and dropped at the first claim, the ID token bounded by the issuer's lifetime (24 h on the homelab Dex until shortened, TB-5); the same exposure as any OIDC CLI's token cache | A keyring-backed store for the session, or the ID token lifetime shortened at the issuer |
 | R-10 | SQLite behind two replicas is two stores, and mediatore cannot tell: it does not know the Deployment's replica count. The API on one pod would not see what the watcher wrote on the other | ADR-0012 decision 2 documents SQLite as single-replica only; `deploy/base` keeps two replicas and reads a PostgreSQL URL from the Secret, so the shipped manifests cannot be misconfigured this way without editing both | A Lease-derived guard (the watcher knows the holder count) or the replica count reaching the config |
 | R-8 | Signatures are classical: the STS tokens (ES256) and the SVIDs they bind to (ECDSA or RSA, issued by SPIRE) could be forged by a cryptographically relevant quantum computer. Key exchange is no longer part of this risk: since 2026-10-13 the sandbox leg accepts X25519MLKEM768 only, and every other TLS client mediatore builds offers it first (rustls `prefer-post-quantum`; `ring` banned). What is not ours keeps a classical fallback: the identity provider and the Kubernetes API server choose the group from that offer | Post-quantum signatures are not supported by SPIRE or JOSE implementations yet; the exposure is forgery in the future, not disclosure of recorded traffic. The verifiers already accept ML-DSA SVIDs, so this repo needs no change when SPIRE issues them | ML-DSA support in SPIRE (SVIDs) and in JOSE (STS tokens) |
+| R-12 | DNS is a covert channel out of the jail: the sandbox uid may query the VM's resolvers for any name, and a name is data (ADR-0020). What leaves this way is bounded by what the workload holds, which is its own single-audience token at most (R-3) and whatever it computed | The workload needs names to reach its audiences' endpoints, and the guest cannot tell a legitimate query from an exfiltrating one; the resolver's log attributes the queries to the VM and the window is the claim's TTL | The egress proxy of roadmap 07 answers names itself, or the image pins the resolver to one that filters |
+| R-13 | The in-guest table bounds the sandbox uid only: root's own egress and the input chain of ADR-0010's outline are not loaded, so a workload may open a listening socket in the VM's namespace, and a compromised guest-root process is not bounded by anything in the guest (ADR-0020 decisions 3 and 7) | "No inbound" is enforced by the segment and the hypervisor (ADR-0010 decisions 1 and 4), which hold against guest root as nothing in the guest can; the root rules need the image's system users (DHCP, NTP, the SPIRE agent), which the image item of roadmap 06 defines | The image bakes the full ruleset; then narrow this row to guest root alone |
 
 ## 9. Assumptions and out of scope
 
 - Single-tenant management cluster; a cluster admin is trusted (they can read
   the broker's SA token regardless — and, in the homelab collapse of ADR-0005,
   the SPIRE signing key too; see §8 R-7).
+- The VM image carries `nftables`, and its `/etc/resolv.conf` names the
+  resolvers the operator intends the workload to use (ADR-0020); the segment
+  and the hypervisor enforce "no inbound" and bound guest root (ADR-0010
+  decisions 1 and 4), which this repo cannot test.
 - The IdP is authoritative for authentication and group membership.
 - The SPIRE Controller Manager, agent and SPIFFE CSI driver come from the
   hardened chart and are part of the cluster's node TCB; mediatore adds no
@@ -597,6 +625,7 @@ the residue is in §8. No boundary carries the marker as of this pass.
 | 2026-10-15 | One binary, the roles as subcommands (ADR-0014) | 0001–0014 | No new boundary, asset or actor: a role's authority was never the file it ran from. §2 three rows reworded (the user tools, the guest, the workload client, all one artifact), the diagram relabelled. TB-4 gains the row for the shared binary path against the node entry (both selectors required, the `sb-` uid never matches), TB-7 the row for the whole binary inside the jail (read-only, no secret, no reachable authority) and its jail row cites the new mount and test; TB-6's impersonation row cites the one `SandboxClient` and the `dev` feature's new home with the test that pins it off. §7 one item; R-11 reworded |
 | 2026-10-15 | The Dex path's kind tier, `issuers[].ca_file` | 0001–0014 | No new component or boundary: Dex and glauth in kind are fixtures. TB-5 gains the private-PKI row (`ca_file`, read at startup, nothing else trusted for that issuer); the TB-5 refresh and group-gate rows and TB-1's delegation rows now cite the live run against a real Dex (`make kind-e2e-dex`: the real CLI from a pod, `lastUsed` advancing on Dex's refresh token before every issue, the claim released on a group change in the directory and on a deleted refresh token) |
 | 2026-10-24 | The TPM attestation path live in kind (`make kind-e2e-tpm`, a vTPM behind the node) | 0001–0018 | No new component, asset, boundary or broker code. Two corrections from the first run: the EK trust bundle carries each host's swtpm local CA *issuing* certificate, not the root (the plugin verifies with no intermediates), and the component's init container copies the certificates beside the plugin instead of mounting the ConfigMap (the plugin reads `..data` as a file). TB-4's EK CA row rewritten with the tier as its live proof, A-15 reworded, §7 one item |
+| 2026-10-24 | The jail's network (ADR-0020) | 0001–0020 | No new asset. The jail had an empty network namespace, which earlier passes cited as a control and under which `mediatore token` could not have reached the broker; it now keeps the VM's namespace behind a per-claim nftables table keyed by the sandbox uid (the broker, the audiences' `egress`, DNS; drop the rest), loaded before the jail, deleted after it, no ruleset no jail. TB-7 gains four rows, TB-6 one, every control cited by file and test (the text accepted by a real `nft -c` on the build host); §8 R-12 (DNS as a channel) and R-13 (the in-guest input chain and root's egress with the image); §2, §7 and §9 reworded, the diagram one label |
 | 2026-10-24 | `GuestReady` after attestation and registration (ADR-0019) | 0001–0019 | No new asset, boundary or broker code. The guest announces the installed-guest signal after `POST /v1/nodes` on the hypervisor's channel, an outbound liveness-only input to banlieue's provider; the VM units gated on the installed-disk sentinel. TB-2 gains two rows (a forged announcement, a missing one), TB-4 one (the live installer as an agent), every control cited by file, unit test or the kind TPM tier; §2 the guest row, §4 the pool VM row, the diagram one edge, §5 a note, §7 one item, §9 the banlieue bullet |
 | 2026-10-22 | Roadmap 02, second half: TPM attestation with the SPIFFE plugin as manifests (ADR-0018) | 0001–0018 | No broker code. TB-4: the stray row above the table moved into it, the EK CA row rewritten around the EK CA ConfigMap (one swtpm CA root per hypervisor), three rows new (the pinned plugin and its checksums on both sides, a stolen EK or CA key, the Proxmox hook off). §2 a new component (the TPM attestor), **A-15 new**, §7 one item, R-6 reworded around what the plugin does and does not prove |
 | 2026-10-21 | Roadmap 02, first half: the broker on a homelab cluster | 0001–0017 | No new component, asset, boundary or code: the `NetworkPolicy` ADR-0007 decision 7 deferred to roadmap 02 exists as a manifest in the example overlay. TB-1 gains one row (the user API only through the ingress), TB-6 one (the sandbox listener only from the segment, egress bounded); §2 the deployment row, §7 one item |

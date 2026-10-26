@@ -52,6 +52,7 @@ impl Harness {
             sts: None,
             audiences: vec![AUDIENCE.into()],
             obo_audiences: vec![],
+            egress: std::collections::BTreeMap::new(),
             sandboxes: front_door.then(|| sandboxes.clone() as _),
             sandbox_namespace: NAMESPACE.into(),
             sealer: None,
