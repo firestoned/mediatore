@@ -65,9 +65,18 @@
       never attests, registers or announces; the kind TPM tier asserts the order in the
       guest's log, at first boot and after the pod is replaced. The image carries no phase
       stage of banlieue's
-- [ ] Image baking via banlieue-imagebuilder: agent binaries, `nftables` (ADR-0020),
-      trust bundle, units,
-      `COS_PERSISTENT` for the agent key (runbook Part 2); banlieue's EK-certificate layer
-      (its `examples/20`) in, its phase layer (`examples/16`) out (ADR-0019)
+- [x] Image baking. Done 2026-10-27 as
+      [ADR-0023](../../docs/adr/0023-sandbox-vm-image-kairos-derivative.md): a Kairos
+      Debian 13 derivative built from `image/Dockerfile` (the binary, the SPIRE agent and
+      the plugin pinned by digest in the immutable rootfs, `tpm2-tools`,
+      `qemu-guest-agent`, `nftables`, listeners removed, the `spire` user, units enabled),
+      checked by `image/check.sh` in CI and on the build host, published as
+      `ghcr.io/firestoned/mediatore-guest` signed and attested; the pinned path moved to
+      `/usr/bin/mediatore` (Kairos mounts the persistent partition over `/usr/local`);
+      `/var/lib/spire` bound from the sealed partition for the agent's key; the trust
+      bundle and `agent.conf` from the deployment's cloud-config layer
+      (`image/cloud-config-deployment.example.yaml`); banlieue's EK-certificate layer in,
+      its phase layer out; the `VMImage` and `VMClass` for libvirt in the homelab overlay
+      (`deferred` until a Kairos 4.4 Debian base allows first-boot sealing)
 - [ ] Live proof on a libvirt member: reboot mid-claim re-attests with the same EK and
       recreates the jail (runbook 8.7 last row)

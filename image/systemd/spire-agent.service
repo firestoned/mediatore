@@ -15,7 +15,7 @@ ConditionPathExists=|/run/cos/passive_mode
 [Service]
 User=spire
 SupplementaryGroups=tss
-ExecStart=/opt/spire/bin/spire-agent run -config /opt/spire/conf/agent.conf
+ExecStart=/usr/bin/spire-agent run -config /etc/spire/agent.conf
 # The vTPM, for the tpm attestor plugin (ADR-0018): the resource manager device first,
 # the raw device as go-attestation's fallback; nothing else under /dev.
 DeviceAllow=/dev/tpmrm0 rw

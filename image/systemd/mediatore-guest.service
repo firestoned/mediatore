@@ -16,8 +16,8 @@ ConditionPathExists=|/run/cos/passive_mode
 [Service]
 Type=simple
 User=root
-ExecStartPre=/opt/spire/bin/spire-agent healthcheck -socketPath /run/spire/sockets/agent.sock
-ExecStart=/usr/local/bin/mediatore guest
+ExecStartPre=/usr/bin/spire-agent healthcheck -socketPath /run/spire/sockets/agent.sock
+ExecStart=/usr/bin/mediatore guest
 EnvironmentFile=-/etc/mediatore-guest/env
 Restart=on-failure
 RestartSec=5

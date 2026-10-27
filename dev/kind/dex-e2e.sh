@@ -117,7 +117,7 @@ spec:
       image: localhost/mediatore-e2e:kind
       imagePullPolicy: Never
       command:
-        - /usr/local/bin/dex-driver
+        - /usr/bin/dex-driver
         - --issuer=$ISSUER
         - --ca-file=/etc/mediatore-dex/ca.pem
         - --login=$LOGIN
@@ -165,7 +165,7 @@ spec:
     - name: token
       image: ghcr.io/firestoned/mediatore:kind
       imagePullPolicy: Never
-      command: ["/usr/local/bin/mediatore", "token", "--audience", "$AUDIENCE"]
+      command: ["/usr/bin/mediatore", "token", "--audience", "$AUDIENCE"]
       env:
         - { name: MEDIATORE_URL, value: "$SANDBOX_API" }
         - { name: SPIFFE_ENDPOINT_SOCKET, value: "unix:///run/spire/sockets/spire-agent.sock" }
@@ -267,7 +267,7 @@ spec:
       image: ghcr.io/firestoned/mediatore:kind
       imagePullPolicy: Never
       command:
-        - /usr/local/bin/mediatore
+        - /usr/bin/mediatore
         - guest
         - --dev-ek-hash
         - "$EK_HASH"

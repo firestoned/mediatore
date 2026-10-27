@@ -151,7 +151,7 @@ spec:
       image: ghcr.io/firestoned/mediatore:kind
       imagePullPolicy: Never
       command:
-        - /usr/local/bin/mediatore
+        - /usr/bin/mediatore
         - guest
         - --dev-ek-hash
         - "$EK_HASH"

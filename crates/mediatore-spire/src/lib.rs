@@ -5,7 +5,7 @@
 //!
 //! mediatore creates exactly two kinds of registration entry:
 //! * a node bootstrap entry `spiffe://<td>/banlieue/node/<ek-hash>` for the in-guest agent
-//!   (selectors `unix:uid:0` + `unix:path:/usr/local/bin/mediatore`, ADR-0014), and
+//!   (selectors `unix:uid:0` + `unix:path:/usr/bin/mediatore`, ADR-0014), and
 //! * a claim entry `spiffe://<td>/banlieue/claim/<uid>` for the jailed workload
 //!   (selector `unix:user:<sandbox user>`).
 //!

@@ -134,6 +134,33 @@ so a `GuestReady` pool binds only members that can take the claim.
 
 ## 6. Let the VMs attest
 
+This step is about the VM image: the pool member's disk, which every member boots from.
+It carries the SPIRE agent, the TPM plugin, the one `mediatore` binary, `nftables`,
+`tpm2-tools` and `qemu-guest-agent`, and nothing of any workload. What a sandbox runs is
+the *workload image*, an ordinary OCI container image the requester names on each claim
+and the guest pulls at bind ([what "the workload" is](running-workloads.md#what-the-workload-is)).
+One VM image serves every workload image.
+
+The VM image is built from this repository ([ADR-0023](../adr/0023-sandbox-vm-image-kairos-derivative.md)): `image/Dockerfile` is a
+Kairos Debian 13 derivative with the guest software in the immutable rootfs (`/usr/bin`,
+never `/usr/local`, which Kairos mounts the persistent partition over), every listener the
+base shipped removed, the `spire` user created and both units enabled. The Build workflow
+publishes it as `ghcr.io/firestoned/mediatore-guest`, signed and attested like the server
+image, on every push and release; `make guest-image` builds it locally and
+`make guest-image-check` proves what it carries. The image holds no trust bundle, no trust
+domain and no key: the deployment's cloud-config layer writes the agent's configuration at
+every boot, and the agent's key is generated on each member's first boot onto the sealed
+persistent partition (banlieue ADR-0108). `deploy/overlays/homelab-example/vmimage.yaml`
+is the `VMImage` (a libvirt `Url` source pinned by digest, three cloud-config layers:
+`image/cloud-config.yaml`, banlieue's EK-certificate layer, your copy of
+`image/cloud-config-deployment.example.yaml`) and the `VMClass` with a vTPM; it runs
+`installMode: deferred` until a Kairos 4.4 Debian base exists for first-boot sealing.
+
+```sh
+make dist && make guest-image BINARY_FROM=host && make guest-image-check   # or pull a release by digest
+gh attestation verify oci://ghcr.io/firestoned/mediatore-guest@sha256:<digest> --repo firestoned/mediatore
+```
+
 Pool VMs become SPIRE agents with their vTPM ([ADR-0018](../adr/0018-tpm-attestation-with-the-spiffe-plugin.md)).
 On the server side it is a kustomize component, `deploy/spire-tpm`, that your SPIRE
 kustomization includes: an init container puts the attestor plugin (pinned by digest)
@@ -170,12 +197,13 @@ in with placeholders, and apply them with kustomize from then on; the component 
 the standard `spire-server` StatefulSet whichever way the manifests were produced.
 
 The hash allowlist is not configured, because a VM's EK is created with the VM and the
-CA route is what admits new members. On the VM side, `image/spire/agent.conf` and
-`image/systemd/spire-agent.service` are the fragments the image carries, and `make
-dist-tpm-plugin` extracts the agent plugin binary (and the server's, for the record)
-from the same release into `dist/`, checksums verified, for banlieue-imagebuilder to
-bake beside `mediatore`. A VM whose EK certificate chains to no configured host CA
-never becomes an agent, and so never a node.
+CA route is what admits new members. On the VM side, the image carries the agent and the
+plugin (the same release the server runs, pinned by digest in `image/Dockerfile`, the
+plugin's checksum verified in the build against `image/spire/agent.conf`), and your
+deployment layer writes `/etc/spire/agent.conf` and the bundle at every boot
+([ADR-0023](../adr/0023-sandbox-vm-image-kairos-derivative.md)). `make dist-tpm-plugin` still extracts both plugin binaries into
+`dist/`, for the record. A VM whose EK certificate chains to no configured host CA never
+becomes an agent, and so never a node.
 
 Both units (`image/systemd/spire-agent.service`, `mediatore-guest.service`) start only
 when Kairos's installed-disk sentinel exists (`/run/cos/active_mode` or
@@ -186,13 +214,13 @@ The image carries no phase stage of banlieue's: the guest announces after it reg
 On a non-Kairos image, drop the two `ConditionPathExists` lines or provide the sentinel,
 and take the installer case on yourself.
 
-The image also carries `nftables`. When a claim binds, the guest loads a ruleset keyed
+When a claim binds, the guest loads a ruleset keyed
 by the sandbox user's uid before it starts the jail, and refuses to start the jail
 without it ([ADR-0020](../adr/0020-jail-network-nftables-keyed-by-sandbox-uid.md)): TCP to the broker and to the audiences' `egress`, DNS to the VM's
 resolvers, the rest logged under `mediatore-sandbox drop:` and dropped. The guest's log
 carries the ruleset's SHA-256 per claim, and `nft list table inet mediatore_sandbox` on
 the VM shows what is loaded. Root's own egress and the input chain are not in that
-table: those rules come with the image, once its system users are known (roadmap 06).
+table: those rules come once the image's system users are settled (roadmap 06).
 
 The guest pulls each claim's `workload.image` itself ([ADR-0021](../adr/0021-sandbox-filesystem-tmpfs-and-rootfs-from-the-registry.md)): over HTTPS with the
 Mozilla roots, anonymously, into a tmpfs it mounts at `/mnt/sandbox` for that claim

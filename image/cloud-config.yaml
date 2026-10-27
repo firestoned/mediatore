@@ -2,19 +2,24 @@
 # Copyright (c) 2026 Erick Bourgeois, mediatore
 # SPDX-License-Identifier: Apache-2.0
 
-# Fragment merged into the pool image's Kairos config. Nothing here is claim-specific.
-# No banlieue phase stage (its examples/16-cloud-config-guest-phase.yaml): on a sandbox
-# member `mediatore guest` announces GuestReady itself, after the node is attested and
-# registered (ADR-0019), and the two units start only on the installed disk.
+# The base layer of the sandbox VM image's cloud-config (ADR-0023): nothing here is
+# claim-specific or deployment-specific. The binaries, the units, the spire user and the
+# packages are in the image itself (image/Dockerfile); this layer is what Kairos has to be
+# told at install and at every boot. The deployment's own layer
+# (image/cloud-config-deployment.example.yaml) adds the install block, the SPIRE agent's
+# configuration and the trust bundle. No banlieue phase stage (its examples/17): on a
+# sandbox member `mediatore guest` announces GuestReady itself, after the node is attested
+# and registered (ADR-0019), and the two units start only on the installed disk.
+install:
+  # The agent's key and state live on the sealed persistent partition, never in the image
+  # (banlieue ADR-0108 decision 3): /var/lib is ephemeral on Kairos unless bound.
+  bind_mounts:
+    - /var/lib/spire
 stages:
-  initramfs:
-    - name: spire-user
-      users:
-        spire: { system: true, homedir: /var/lib/spire, shell: /sbin/nologin }
   boot:
     - name: spire-dirs
       commands:
         - install -d -o spire -g spire -m 0700 /var/lib/spire/agent
         - install -d -o spire -g spire -m 0755 /run/spire/sockets
       systemctl:
-        enable: [spire-agent, mediatore-guest]
+        enable: [spire-agent, mediatore-guest, qemu-guest-agent]
