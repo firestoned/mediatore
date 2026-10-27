@@ -95,7 +95,8 @@ rely on: a container runtime in the VM (none is baked, and none should be, the j
    registry that wants a credential refuses the pull. A per-claim pull secret delivered
    by the broker is a roadmap 06 follow-up; the shape it needs (the broker returns it on
    `GET /v1/me`, the guest uses it once and keeps nothing) is a token-shape change and
-   gets its own ADR.
+   gets its own ADR. *Done as
+   [ADR-0022](0022-registry-pull-credentials-from-the-broker.md).*
 
 ## Consequences
 

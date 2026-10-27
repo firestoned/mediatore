@@ -41,9 +41,18 @@
       input chain, once the image's system users (DHCP, NTP, the SPIRE agent) are known;
       the ruleset hash and the image digest reported to the broker so a flush is detected
       and the record says which bytes ran
-- [ ] Pull credentials: a registry that wants one refuses the guest today (ADR-0021
-      decision 7). A per-claim pull secret returned by `GET /v1/me`, used once by the
-      guest and kept nowhere, is a token-shape change and gets its own ADR
+- [x] Pull credentials. Done 2026-10-27 as
+      [ADR-0022](../../docs/adr/0022-registry-pull-credentials-from-the-broker.md):
+      `registries[]` in the broker's config (host, username, a token file read at
+      start, mounted from a Secret like the STS key); `GET /v1/me` carries the
+      credential for the registry the claim's image names and no other
+      (`Me::registry_credential`, the password a `Secret` that prints redacted); the
+      guest presents it at the registry's token endpoint as HTTP Basic, or on the
+      content when the registry challenges with `Basic`, for one pull, never over plain
+      HTTP, and keeps nothing; the reference grammar moved to `mediatore-proto`
+      (`ImageReference`) and `POST /v1/claims` refuses a `workload.image` it cannot
+      parse. The fake registry demands the credential at `/token` or challenges with
+      `Basic` in the tests
 - [ ] Real seccomp policy for nsjail (the spec currently carries none)
 - [x] `GuestReady` (banlieue ADR-0043) emitted after the SPIRE healthcheck so Ready
       means attested (runbook 2.5). Done 2026-10-24 as

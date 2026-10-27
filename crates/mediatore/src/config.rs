@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 use mediatore_entra::{Backend, IssuerConfig};
 use mediatore_proto::Endpoint;
+use mediatore_proto::image::canonical_registry;
 use mediatore_store::seal::TransitConfig;
 use serde::Deserialize;
 
@@ -37,6 +38,19 @@ fn endpoints<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Endpoint>, D:
     raw.iter()
         .map(|s| s.parse::<Endpoint>().map_err(serde::de::Error::custom))
         .collect()
+}
+
+/// A registry the pool's images live in and the operator's credential for pulling from it
+/// (ADR-0022): handed by `GET /v1/me` to the guest whose claim names that registry.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RegistryConfig {
+    /// The registry as a reference names it (`ghcr.io`, `registry.internal:5000`,
+    /// `docker.io`).
+    pub host: String,
+    /// The login.
+    pub username: String,
+    /// File holding the password or token, read at start.
+    pub password_file: PathBuf,
 }
 
 /// STS signing material.
@@ -263,6 +277,9 @@ pub struct Config {
     /// STS material; required when any audience uses `sts`.
     #[serde(default)]
     pub sts: Option<StsConfig>,
+    /// Pull credentials, one per registry (ADR-0022). Empty means every pull is anonymous.
+    #[serde(default)]
+    pub registries: Vec<RegistryConfig>,
     /// Listeners.
     #[serde(default = "default_listen")]
     pub listen: ListenConfig,
@@ -291,6 +308,29 @@ fn default_listen() -> ListenConfig {
 }
 
 impl Config {
+    /// One credential per registry host, Docker Hub's two names being one host.
+    fn check_registries(&self) -> anyhow::Result<()> {
+        let mut seen = std::collections::BTreeSet::new();
+        for r in &self.registries {
+            let host = r.host.trim();
+            if host.is_empty() || host.contains('/') || host != r.host {
+                anyhow::bail!(
+                    "registries[].host must be a registry host (host[:port]), got {:?}",
+                    r.host
+                );
+            }
+            if r.username.trim().is_empty() {
+                anyhow::bail!("registries[{host}].username must not be empty");
+            }
+            if !seen.insert(canonical_registry(host)) {
+                anyhow::bail!(
+                    "registries: {host} is listed twice (docker.io and registry-1.docker.io are one host)"
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Load and sanity-check. `MEDIATORE_STORE_URL` in the environment overrides `store.url`.
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let text = std::fs::read_to_string(path)?;
@@ -312,6 +352,7 @@ impl Config {
         if cfg.audiences.iter().any(|a| a.via == Backend::Sts) && cfg.sts.is_none() {
             anyhow::bail!("an audience uses the sts backend but no `sts` section is configured");
         }
+        cfg.check_registries()?;
         cfg.check_entra()?;
         if !cfg.dev_mode && cfg.spire.is_none() {
             anyhow::bail!("`spire` (workload_api_socket, entries) is required outside dev_mode");
@@ -833,5 +874,36 @@ store: {{ url: \"sqlite:///var/lib/mediatore/store.db\" }}
         );
         let err = Config::parse(&prod).unwrap_err();
         assert!(err.to_string().contains("must be https"), "{err}");
+    }
+
+    #[test]
+    fn a_registry_credential_is_named_per_host_and_hosts_are_unique() {
+        let base = "trust_domain: sandbox.test\nissuers: []\nlisten: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }\ndev_mode: true\naudiences: []\n";
+        let cfg = Config::parse(&format!(
+            "{base}registries:\n  - {{ host: ghcr.io, username: octocat, password_file: /run/secrets/ghcr }}\n  - {{ host: docker.io, username: octocat, password_file: /run/secrets/hub }}\n"
+        ))
+        .unwrap();
+        assert_eq!(cfg.registries.len(), 2);
+        assert_eq!(cfg.registries[1].host, "docker.io");
+        for (bad, why) in [
+            (
+                "registries:\n  - { host: docker.io, username: a, password_file: /x }\n  - { host: registry-1.docker.io, username: b, password_file: /y }\n",
+                "listed twice",
+            ),
+            (
+                "registries:\n  - { host: ghcr.io, username: \"\", password_file: /x }\n",
+                "username must not be empty",
+            ),
+            (
+                "registries:\n  - { host: ghcr.io/firestoned, username: a, password_file: /x }\n",
+                "must be a registry host",
+            ),
+        ] {
+            let err = Config::parse(&format!("{base}{bad}"))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(why), "{err}");
+        }
+        assert!(Config::parse(base).unwrap().registries.is_empty());
     }
 }

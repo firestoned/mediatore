@@ -410,8 +410,16 @@ struct Inner {
     blobs: Mutex<HashMap<String, Vec<u8>>>,
     tampered: Mutex<Vec<String>>,
     require_token: AtomicBool,
+    /// The login `/token` demands, as HTTP Basic, before it hands out the bearer token.
+    credential: Mutex<Option<(String, String)>>,
+    /// Demand that login on the content itself, with a `Basic` challenge and no token
+    /// endpoint: the shape of a plain private registry.
+    basic_only: AtomicBool,
     token_requests: AtomicUsize,
     blob_requests: AtomicUsize,
+    /// Content requests that carried `Authorization: Basic`.
+    basic_on_content: AtomicUsize,
+    requests: AtomicUsize,
     host: Mutex<String>,
 }
 
@@ -519,6 +527,39 @@ impl FakeRegistry {
         self.inner.require_token.store(on, Ordering::SeqCst);
     }
 
+    /// Require this login at `/token` (ADR-0022): an anonymous token request is refused,
+    /// one with the right HTTP Basic credential gets the bearer token. Implies
+    /// `require_token`.
+    ///
+    /// # Panics
+    /// When the registry's state lock is poisoned.
+    pub fn require_credential(&self, username: &str, password: &str) {
+        self.require_token(true);
+        *self.inner.credential.lock().unwrap() = Some((username.into(), password.into()));
+    }
+
+    /// Challenge content requests with `Basic` and accept this login on them; no token
+    /// endpoint is involved.
+    ///
+    /// # Panics
+    /// When the registry's state lock is poisoned.
+    pub fn basic_only(&self, username: &str, password: &str) {
+        self.inner.basic_only.store(true, Ordering::SeqCst);
+        *self.inner.credential.lock().unwrap() = Some((username.into(), password.into()));
+    }
+
+    /// How many manifest or blob requests carried `Authorization: Basic`.
+    #[must_use]
+    pub fn basic_on_content(&self) -> usize {
+        self.inner.basic_on_content.load(Ordering::SeqCst)
+    }
+
+    /// How many requests of any kind arrived.
+    #[must_use]
+    pub fn requests(&self) -> usize {
+        self.inner.requests.load(Ordering::SeqCst)
+    }
+
     /// Serve the blob at `digest` with its first byte flipped.
     ///
     /// # Panics
@@ -540,11 +581,30 @@ impl FakeRegistry {
     }
 }
 
+/// `Authorization: Basic` decoded and compared to the configured login.
+fn basic_matches(inner: &Inner, headers: &HeaderMap) -> bool {
+    use base64::Engine as _;
+    let Some((user, pass)) = inner.credential.lock().unwrap().clone() else {
+        return false;
+    };
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Basic "))
+        .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())
+        .and_then(|raw| String::from_utf8(raw).ok())
+        .is_some_and(|v| v == format!("{user}:{pass}"))
+}
+
 fn unauthorized(inner: &Inner, name: &str) -> Response {
     let host = inner.host.lock().unwrap().clone();
-    let challenge = format!(
-        "Bearer realm=\"http://{host}/token\",service=\"fake-registry\",scope=\"repository:{name}:pull\""
-    );
+    let challenge = if inner.basic_only.load(Ordering::SeqCst) {
+        "Basic realm=\"fake-registry\"".to_string()
+    } else {
+        format!(
+            "Bearer realm=\"http://{host}/token\",service=\"fake-registry\",scope=\"repository:{name}:pull\""
+        )
+    };
     (
         StatusCode::UNAUTHORIZED,
         [(header::WWW_AUTHENTICATE, challenge)],
@@ -554,6 +614,17 @@ fn unauthorized(inner: &Inner, name: &str) -> Response {
 }
 
 fn authorized(inner: &Inner, headers: &HeaderMap) -> bool {
+    inner.requests.fetch_add(1, Ordering::SeqCst);
+    if headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("Basic "))
+    {
+        inner.basic_on_content.fetch_add(1, Ordering::SeqCst);
+    }
+    if inner.basic_only.load(Ordering::SeqCst) {
+        return basic_matches(inner, headers);
+    }
     if !inner.require_token.load(Ordering::SeqCst) {
         return true;
     }
@@ -573,8 +644,18 @@ async fn base(State(inner): State<Arc<Inner>>, headers: HeaderMap) -> Response {
 async fn token(
     State(inner): State<Arc<Inner>>,
     Query(q): Query<HashMap<String, String>>,
+    headers: HeaderMap,
 ) -> Response {
+    inner.requests.fetch_add(1, Ordering::SeqCst);
     inner.token_requests.fetch_add(1, Ordering::SeqCst);
+    if inner.credential.lock().unwrap().is_some() && !basic_matches(&inner, &headers) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            [(header::WWW_AUTHENTICATE, "Basic realm=\"fake-registry\"")],
+            "{\"errors\":[{\"code\":\"UNAUTHORIZED\"}]}",
+        )
+            .into_response();
+    }
     assert!(
         q.contains_key("service") && q.contains_key("scope"),
         "a token request carries the challenge's service and scope"

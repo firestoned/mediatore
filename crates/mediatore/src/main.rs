@@ -120,6 +120,8 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
         None => None,
     };
 
+    let registries = registries(&cfg)?;
+
     let state = Arc::new(AppState {
         store,
         spire,
@@ -138,6 +140,7 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
             .iter()
             .map(|a| (a.name.clone(), a.egress.clone()))
             .collect(),
+        registries,
         sandboxes,
         sandbox_namespace: cfg.sandboxes.namespace.clone(),
         sealer,
@@ -384,6 +387,42 @@ async fn shutdown() {
         let _ = ctrl_c.await;
     }
     tracing::info!("shutting down");
+}
+
+/// The pull credentials (ADR-0022): each password file read once, at start, like the STS
+/// key; keyed by the registry host as the API reaches it. The host and login are logged,
+/// the password never.
+fn registries(
+    cfg: &Config,
+) -> anyhow::Result<std::collections::BTreeMap<String, mediatore_proto::RegistryCredential>> {
+    let mut out = std::collections::BTreeMap::new();
+    for r in &cfg.registries {
+        let password = std::fs::read_to_string(&r.password_file).map_err(|e| {
+            anyhow::anyhow!(
+                "registries[{}].password_file {}: {e}",
+                r.host,
+                r.password_file.display()
+            )
+        })?;
+        let password = password.trim();
+        anyhow::ensure!(
+            !password.is_empty(),
+            "registries[{}].password_file {} is empty",
+            r.host,
+            r.password_file.display()
+        );
+        let host = mediatore_proto::image::canonical_registry(&r.host);
+        tracing::info!(registry = %host, username = %r.username, "registry credential loaded");
+        out.insert(
+            host.clone(),
+            mediatore_proto::RegistryCredential {
+                host,
+                username: r.username.clone(),
+                password: mediatore_proto::Secret(password.to_string()),
+            },
+        );
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

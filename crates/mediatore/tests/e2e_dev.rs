@@ -94,6 +94,16 @@ impl Harness {
             )]
             .into_iter()
             .collect(),
+            registries: [(
+                "registry.internal:5000".to_owned(),
+                mediatore_proto::RegistryCredential {
+                    host: "registry.internal:5000".into(),
+                    username: "pool".into(),
+                    password: mediatore_proto::Secret("pull-token".into()),
+                },
+            )]
+            .into_iter()
+            .collect(),
             sandboxes: None,
             sandbox_namespace: "sandboxes".into(),
             sealer: None,
@@ -158,6 +168,25 @@ impl Harness {
             .await
             .expect("node body")
             .node_id
+    }
+
+    async fn create_claim_with_image(&self, token: &str, image: &str) -> reqwest::Response {
+        self.http
+            .post(format!("{}/v1/claims", self.user_url))
+            .bearer_auth(token)
+            .json(&ClaimRequest {
+                pool_ref: "pool-a".into(),
+                ttl_seconds: 3600,
+                audiences: vec![AUDIENCE.into()],
+                workload: Workload {
+                    image: image.into(),
+                    args: vec![],
+                },
+                refresh_token: None,
+            })
+            .send()
+            .await
+            .expect("create claim")
     }
 
     async fn create_claim(&self, token: &str) -> (reqwest::StatusCode, ClaimResponse) {
@@ -252,6 +281,7 @@ async fn full_loop_from_login_to_cutoff() {
         .map(|e| e.parse().unwrap())
         .collect();
     assert_eq!(me.egress, want);
+    assert_registry_credential(me.registry_credential.as_ref());
     let sandbox_user = me.subject.sandbox_username();
     assert!(sandbox_user.starts_with("sb-"));
 
@@ -325,6 +355,53 @@ async fn wrong_audience_is_a_400_not_403() {
     let uid = claim.uid.expect("uid");
     let resp = h.token_for(&claim_svid(&uid), "api://something-else").await;
     assert_eq!(resp.status(), 400);
+}
+
+/// The operator's credential for the registry the image names travels with the subject,
+/// over the same session, and prints redacted (ADR-0022).
+fn assert_registry_credential(cred: Option<&mediatore_proto::RegistryCredential>) {
+    let cred = cred.expect("the fixture configures registry.internal:5000");
+    assert_eq!(cred.host, "registry.internal:5000");
+    assert_eq!(cred.username, "pool");
+    assert_eq!(cred.password.0, "pull-token");
+    assert!(!format!("{cred:?}").contains("pull-token"), "{cred:?}");
+}
+
+#[tokio::test]
+async fn a_malformed_workload_image_is_refused_at_creation() {
+    let h = Harness::start().await;
+    h.register_node().await;
+    let resp = h
+        .create_claim_with_image(&h.login("octocat"), "Not An Image")
+        .await;
+    assert_eq!(resp.status(), 400);
+    let body: mediatore_proto::ErrorBody = resp.json().await.expect("error body");
+    assert_eq!(body.error, "invalid_workload_image");
+}
+
+#[tokio::test]
+async fn a_registry_without_a_configured_credential_gets_none() {
+    let h = Harness::start().await;
+    h.register_node().await;
+    let resp = h
+        .create_claim_with_image(&h.login("octocat"), "ghcr.io/octocat/agent:1")
+        .await;
+    assert_eq!(resp.status(), 201);
+    let me: Me = h
+        .http
+        .get(format!("{}/v1/me", h.sandbox_url))
+        .header(PEER_HEADER, node_svid())
+        .send()
+        .await
+        .expect("me")
+        .json()
+        .await
+        .expect("me body");
+    assert_eq!(me.workload.image, "ghcr.io/octocat/agent:1");
+    assert_eq!(
+        me.registry_credential, None,
+        "no credential for ghcr.io is configured"
+    );
 }
 
 #[tokio::test]

@@ -24,6 +24,10 @@ audiences:
   # egress: where the jail may reach this audience's API (host:port); without it the
   # workload gets tokens it can spend nowhere (ADR-0020).
   - { name: grafana.home.example, via: sts, max_ttl: 900, egress: ["grafana.home.example:443"] }
+# Private registries (ADR-0022): the login and a token file from a Secret mounted like the
+# STS key; the guest gets the credential for the registry its claim's image names.
+# registries:
+#   - { host: registry.internal:5000, username: pool, password_file: /etc/mediatore-registry/token }
 sts:
   issuer: https://mediatore.home.example
   kid: homelab-1

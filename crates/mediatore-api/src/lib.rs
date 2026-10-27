@@ -33,9 +33,10 @@ use mediatore_claims::sandbox::{
 };
 use mediatore_entra::{IdpError, Validated, Validator};
 use mediatore_proto::ek::is_ek_hash;
+use mediatore_proto::image::ImageReference;
 use mediatore_proto::{
     ClaimPhase, ClaimRequest, ClaimResponse, Endpoint, ErrorBody, Me, NodeRegistered,
-    NodeRegistration, Secret, TokenRequest, TokenResponse,
+    NodeRegistration, RegistryCredential, Secret, TokenRequest, TokenResponse,
 };
 use mediatore_spire::{EntryManager, Naming};
 use mediatore_store::seal::{SealError, Sealer};
@@ -67,6 +68,10 @@ pub struct AppState {
     /// Per audience, where the workload reaches its API from the jail (`audiences[].egress`);
     /// `GET /v1/me` returns the union over the claim's audiences (ADR-0020).
     pub egress: BTreeMap<String, Vec<Endpoint>>,
+    /// Per registry host (as the API reaches it), the operator's pull credential
+    /// (`registries[]`); `GET /v1/me` hands the guest the one its claim's image names
+    /// (ADR-0022).
+    pub registries: BTreeMap<String, RegistryCredential>,
     /// `AgentSandbox` resources through the Kubernetes API (ADR-0008); `None` under
     /// `dev_mode`, where the store and the dev binder stand in. Absent outside `dev_mode`,
     /// the claim endpoints fail closed with `501`.
@@ -342,6 +347,11 @@ async fn create_claim(
     if let Some(bad) = req.audiences.iter().find(|a| !st.audiences.contains(a)) {
         return Err(ApiError::bad_request("unknown_audience", bad.clone()));
     }
+    // The guest would refuse it at bind (ADR-0021); say so now (ADR-0022 decision 4).
+    req.workload
+        .image
+        .parse::<ImageReference>()
+        .map_err(|e| ApiError::bad_request("invalid_workload_image", e))?;
     let session = session_for(&st, &validated, &req, &bearer_token).await?;
     let sealer = match (session.is_some(), st.sealer.as_ref()) {
         (true, None) => return Err(ApiError::not_implemented("sealing")),
@@ -767,12 +777,23 @@ async fn me(
         .collect();
     egress.sort();
     egress.dedup();
+    // The credential for the registry the image names, and no other (ADR-0022 decision 2).
+    let registry_credential = rec
+        .workload
+        .image
+        .parse::<ImageReference>()
+        .ok()
+        .and_then(|r| st.registries.get(&r.registry).cloned());
+    if let Some(c) = &registry_credential {
+        tracing::debug!(claim_uid = %rec.uid, registry = %c.host, "registry credential attached");
+    }
     Ok(Json(Me {
         claim_uid: rec.uid,
         subject: rec.subject,
         expires_at,
         workload: rec.workload,
         egress,
+        registry_credential,
     }))
 }
 

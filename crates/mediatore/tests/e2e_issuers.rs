@@ -100,6 +100,7 @@ impl Harness {
             audiences: vec![AUDIENCE.into()],
             obo_audiences: vec![],
             egress: std::collections::BTreeMap::new(),
+            registries: std::collections::BTreeMap::new(),
             sandboxes: None,
             sandbox_namespace: "sandboxes".into(),
             sealer: Some(Arc::new(LocalKeySealer::new([5u8; 32]))),

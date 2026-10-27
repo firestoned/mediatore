@@ -10,20 +10,14 @@
 //! outside the rootfs refuses the image.
 
 use std::collections::BTreeSet;
-use std::fmt;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
+use mediatore_proto::image::{ImageReference, is_sha256_digest as is_digest};
+use mediatore_proto::{RegistryCredential, Secret};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
-
-/// Docker Hub, as a reference names it.
-const DOCKER_IO: &str = "docker.io";
-/// Docker Hub, as the API reaches it.
-const DOCKER_REGISTRY: &str = "registry-1.docker.io";
-/// The tag a reference without one means.
-const DEFAULT_TAG: &str = "latest";
 
 const OCI_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
 const OCI_INDEX: &str = "application/vnd.oci.image.index.v1+json";
@@ -32,123 +26,6 @@ const DOCKER_MANIFEST_LIST: &str = "application/vnd.docker.distribution.manifest
 
 /// What `Accept` says on a manifest request: both families, image and index.
 const ACCEPT: &str = "application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json";
-
-/// An image reference: `[registry/]repository[:tag][@sha256:digest]`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Reference {
-    /// The registry host the API is reached at (`registry-1.docker.io` for Docker Hub).
-    pub registry: String,
-    /// Repository path (`library/busybox`).
-    pub repository: String,
-    /// Tag, when named.
-    pub tag: Option<String>,
-    /// Digest, when pinned; what the manifest must hash to.
-    pub digest: Option<String>,
-}
-
-impl Reference {
-    /// What the manifest is asked for by: the digest when pinned, else the tag, else `latest`.
-    #[must_use]
-    pub fn manifest_reference(&self) -> &str {
-        self.digest
-            .as_deref()
-            .or(self.tag.as_deref())
-            .unwrap_or(DEFAULT_TAG)
-    }
-}
-
-fn is_digest(s: &str) -> bool {
-    s.strip_prefix("sha256:")
-        .is_some_and(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
-}
-
-fn is_repository(s: &str) -> bool {
-    !s.is_empty()
-        && !s.starts_with('/')
-        && !s.ends_with('/')
-        && s.split('/').all(|c| {
-            !c.is_empty()
-                && c.bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-".contains(&b))
-        })
-}
-
-fn is_tag(s: &str) -> bool {
-    !s.is_empty()
-        && s.len() <= 128
-        && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
-}
-
-impl std::str::FromStr for Reference {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let (rest, digest) = match s.split_once('@') {
-            Some((r, d)) => {
-                if !is_digest(d) {
-                    return Err(format!(
-                        "image reference {s:?}: digest must be sha256:<64 hex>"
-                    ));
-                }
-                (r, Some(d.to_string()))
-            }
-            None => (s, None),
-        };
-        // A colon after the last slash is the tag separator; before it, a registry port.
-        let (name, tag) = match rest.rsplit_once(':') {
-            Some((n, t)) if !t.contains('/') => {
-                if !is_tag(t) {
-                    return Err(format!("image reference {s:?}: tag {t:?} is not a tag"));
-                }
-                (n, Some(t.to_string()))
-            }
-            _ => (rest, None),
-        };
-        let (registry, repository) = match name.split_once('/') {
-            Some((first, path))
-                if first.contains('.') || first.contains(':') || first == "localhost" =>
-            {
-                (first.to_string(), path.to_string())
-            }
-            _ => (DOCKER_IO.to_string(), name.to_string()),
-        };
-        let (registry, repository) = if registry == DOCKER_IO {
-            let repository = if repository.contains('/') {
-                repository
-            } else {
-                format!("library/{repository}")
-            };
-            (DOCKER_REGISTRY.to_string(), repository)
-        } else {
-            (registry, repository)
-        };
-        if !is_repository(&repository) {
-            return Err(format!(
-                "image reference {s:?}: {repository:?} is not a repository path"
-            ));
-        }
-        Ok(Self {
-            registry,
-            repository,
-            tag,
-            digest,
-        })
-    }
-}
-
-impl fmt::Display for Reference {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}/{}", self.registry, self.repository)?;
-        if let Some(t) = &self.tag {
-            write!(f, ":{t}")?;
-        }
-        if let Some(d) = &self.digest {
-            write!(f, "@{d}")?;
-        }
-        Ok(())
-    }
-}
 
 /// The platform the guest selects from an index: `linux` and this machine's architecture
 /// in the registry's spelling.
@@ -247,12 +124,18 @@ pub struct Puller {
     http: reqwest::Client,
     plain_http: BTreeSet<String>,
     platform: Platform,
+    /// Never set outside tests: the fake registry speaks plain HTTP.
+    plain_http_credentials: bool,
 }
 
-/// One pull's bearer token, obtained from the registry's challenge, kept for the pull only.
+/// One pull's credentials: the operator's, when the claim carries one (ADR-0022), and the
+/// bearer token the registry's challenge yields. Kept for the pull only.
 #[derive(Default)]
 struct Session {
     token: Option<String>,
+    basic: Option<(String, Secret)>,
+    /// The registry challenged with `Basic`: send the credential on the requests themselves.
+    send_basic: bool,
 }
 
 impl Puller {
@@ -269,6 +152,7 @@ impl Puller {
             http,
             plain_http: plain_http.iter().cloned().collect(),
             platform: Platform::this(),
+            plain_http_credentials: false,
         })
     }
 
@@ -279,7 +163,15 @@ impl Puller {
         self
     }
 
-    fn base(&self, reference: &Reference) -> String {
+    /// Let a credential cross plain HTTP, because the fake registry has no TLS. Tests
+    /// only; the refusal itself has its own test.
+    #[cfg(test)]
+    fn credentials_over_plain_http_for_tests(mut self) -> Self {
+        self.plain_http_credentials = true;
+        self
+    }
+
+    fn base(&self, reference: &ImageReference) -> String {
         let scheme = if self.plain_http.contains(&reference.registry) {
             "http"
         } else {
@@ -291,7 +183,9 @@ impl Puller {
         )
     }
 
-    /// GET `url`, answering one bearer challenge.
+    /// GET `url`, answering one challenge: a bearer one with a token from its realm (the
+    /// credential presented there, when there is one), a `Basic` one with the credential
+    /// itself.
     async fn get(
         &self,
         session: &mut Session,
@@ -305,23 +199,43 @@ impl Puller {
             }
             if let Some(t) = &session.token {
                 req = req.bearer_auth(t);
+            } else if session.send_basic
+                && let Some((user, password)) = &session.basic
+            {
+                req = req.basic_auth(user, Some(&password.0));
             }
             let resp = req.send().await?;
             if resp.status() != reqwest::StatusCode::UNAUTHORIZED || attempt == 1 {
                 return Ok(resp);
             }
-            let challenge = resp
+            let header = resp
                 .headers()
                 .get(reqwest::header::WWW_AUTHENTICATE)
                 .and_then(|v| v.to_str().ok())
-                .and_then(parse_bearer_challenge)
-                .ok_or_else(|| anyhow::anyhow!("{url}: 401 without a bearer challenge"))?;
-            session.token = Some(self.token(&challenge).await?);
+                .map(str::to_owned)
+                .ok_or_else(|| anyhow::anyhow!("{url}: 401 without a challenge"))?;
+            match parse_challenge(&header) {
+                Some(Challenge::Bearer(c)) => {
+                    session.token = Some(self.token(&c, session.basic.as_ref()).await?);
+                }
+                Some(Challenge::Basic) => {
+                    anyhow::ensure!(
+                        session.basic.is_some(),
+                        "{url}: the registry wants a credential and the claim carries none"
+                    );
+                    session.send_basic = true;
+                }
+                None => anyhow::bail!("{url}: 401 with an unsupported challenge"),
+            }
         }
         unreachable!("two attempts, each returns");
     }
 
-    async fn token(&self, c: &Challenge) -> anyhow::Result<String> {
+    async fn token(
+        &self,
+        c: &BearerChallenge,
+        basic: Option<&(String, Secret)>,
+    ) -> anyhow::Result<String> {
         #[derive(Deserialize)]
         struct TokenResponse {
             #[serde(default)]
@@ -336,12 +250,21 @@ impl Puller {
         if let Some(s) = &c.scope {
             query.push(("scope", s.as_str()));
         }
-        let resp = self.http.get(&c.realm).query(&query).send().await?;
+        let mut req = self.http.get(&c.realm).query(&query);
+        if let Some((user, password)) = basic {
+            req = req.basic_auth(user, Some(&password.0));
+        }
+        let resp = req.send().await?;
         anyhow::ensure!(
             resp.status().is_success(),
-            "token endpoint {} refused: {}",
+            "token endpoint {} refused: {}{}",
             c.realm,
-            resp.status()
+            resp.status(),
+            if basic.is_some() {
+                " (the configured credential was presented)"
+            } else {
+                " (no credential configured for this registry)"
+            }
         );
         let t: TokenResponse = resp.json().await?;
         t.token
@@ -352,7 +275,7 @@ impl Puller {
     async fn manifest(
         &self,
         session: &mut Session,
-        reference: &Reference,
+        reference: &ImageReference,
         by: &str,
     ) -> anyhow::Result<(String, Manifest)> {
         let url = format!("{}/manifests/{by}", self.base(reference));
@@ -389,14 +312,29 @@ impl Puller {
     }
 
     /// Pull `reference` into `rootfs`, staging each layer under `scratch` while it is
-    /// hashed. `rootfs` and `scratch` exist and are empty.
+    /// hashed. `rootfs` and `scratch` exist and are empty. `credential`, when the claim
+    /// carries one, is for this registry and goes over HTTPS only (ADR-0022 decision 3).
     pub async fn pull(
         &self,
-        reference: &Reference,
+        reference: &ImageReference,
+        credential: Option<&RegistryCredential>,
         rootfs: &Path,
         scratch: &Path,
     ) -> anyhow::Result<Pulled> {
         let mut session = Session::default();
+        if let Some(c) = credential {
+            anyhow::ensure!(
+                c.host == reference.registry,
+                "{reference}: the credential is for {}, not this registry",
+                c.host
+            );
+            anyhow::ensure!(
+                self.plain_http_credentials || !self.plain_http.contains(&reference.registry),
+                "{reference}: a credential never crosses plain HTTP, and {} is listed as plain",
+                reference.registry
+            );
+            session.basic = Some((c.username.clone(), c.password.clone()));
+        }
         let by = reference.manifest_reference();
         let (mut digest, mut manifest) = self.manifest(&mut session, reference, by).await?;
         if matches!(
@@ -483,7 +421,7 @@ impl Puller {
     async fn fetch_blob(
         &self,
         session: &mut Session,
-        reference: &Reference,
+        reference: &ImageReference,
         d: &Descriptor,
         dest: &Path,
     ) -> anyhow::Result<u64> {
@@ -535,15 +473,30 @@ impl Puller {
     }
 }
 
-/// A parsed `WWW-Authenticate: Bearer realm="…",service="…",scope="…"`.
+/// A parsed `WWW-Authenticate`: the bearer form with its realm, or `Basic`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Challenge {
+enum Challenge {
+    Bearer(BearerChallenge),
+    Basic,
+}
+
+/// `Bearer realm="…",service="…",scope="…"`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BearerChallenge {
     realm: String,
     service: Option<String>,
     scope: Option<String>,
 }
 
-fn parse_bearer_challenge(header: &str) -> Option<Challenge> {
+fn parse_challenge(header: &str) -> Option<Challenge> {
+    let header = header.trim();
+    if header == "Basic" || header.starts_with("Basic ") {
+        return Some(Challenge::Basic);
+    }
+    parse_bearer_challenge(header).map(Challenge::Bearer)
+}
+
+fn parse_bearer_challenge(header: &str) -> Option<BearerChallenge> {
     let rest = header.trim().strip_prefix("Bearer ")?;
     let mut realm = None;
     let mut service = None;
@@ -558,7 +511,7 @@ fn parse_bearer_challenge(header: &str) -> Option<Challenge> {
             _ => {}
         }
     }
-    Some(Challenge {
+    Some(BearerChallenge {
         realm: realm?,
         service,
         scope,
@@ -681,58 +634,21 @@ mod tests {
 
     use super::*;
 
-    fn r(s: &str) -> Reference {
+    fn r(s: &str) -> ImageReference {
         s.parse().unwrap()
     }
 
-    #[test]
-    fn a_bare_name_is_docker_hub_library_latest() {
-        let got = r("busybox");
-        assert_eq!(got.registry, "registry-1.docker.io");
-        assert_eq!(got.repository, "library/busybox");
-        assert_eq!(got.tag, None);
-        assert_eq!(got.manifest_reference(), "latest");
-        assert_eq!(r("docker.io/busybox:1.37").repository, "library/busybox");
-        assert_eq!(r("octocat/tool:1").repository, "octocat/tool");
-        assert_eq!(r("octocat/tool:1").registry, "registry-1.docker.io");
+    /// A password minted per test: nothing a scanner can mistake for a secret in the
+    /// source, and nothing two tests share.
+    fn fresh_password() -> String {
+        uuid::Uuid::new_v4().to_string()
     }
 
-    #[test]
-    fn a_registry_with_a_port_a_tag_and_a_digest_parse_apart() {
-        let d = "sha256:".to_string() + &"a".repeat(64);
-        let got = r(&format!("registry.internal:5000/team/tool:v2@{d}"));
-        assert_eq!(got.registry, "registry.internal:5000");
-        assert_eq!(got.repository, "team/tool");
-        assert_eq!(got.tag.as_deref(), Some("v2"));
-        assert_eq!(got.digest.as_deref(), Some(d.as_str()));
-        assert_eq!(
-            got.manifest_reference(),
-            d,
-            "a pinned reference is asked for by digest"
-        );
-        assert_eq!(
-            got.to_string(),
-            format!("registry.internal:5000/team/tool:v2@{d}")
-        );
-        let plain = r("localhost:5000/tool");
-        assert_eq!(plain.registry, "localhost:5000");
-        assert_eq!(plain.repository, "tool");
-        assert_eq!(plain.tag, None);
-        assert_eq!(r("ghcr.io/firestoned/mediatore").registry, "ghcr.io");
-    }
-
-    #[test]
-    fn a_malformed_reference_is_refused() {
-        for bad in [
-            "",
-            "Busybox",
-            "ghcr.io/",
-            "ghcr.io/x@sha256:short",
-            "ghcr.io/x@md5:abc",
-            "ghcr.io/x:tag with space",
-            "ghcr.io//x",
-        ] {
-            assert!(bad.parse::<Reference>().is_err(), "{bad:?} parsed");
+    fn credential(reg: &FakeRegistry, user: &str, pass: &str) -> RegistryCredential {
+        RegistryCredential {
+            host: reg.host(),
+            username: user.into(),
+            password: Secret(pass.into()),
         }
     }
 
@@ -746,6 +662,8 @@ mod tests {
         assert_eq!(c.service.as_deref(), Some("ghcr.io"));
         assert_eq!(c.scope.as_deref(), Some("repository:a/b:pull"));
         assert_eq!(parse_bearer_challenge("Basic realm=\"x\""), None);
+        assert_eq!(parse_challenge("Basic realm=\"x\""), Some(Challenge::Basic));
+        assert_eq!(parse_challenge("Digest realm=\"x\""), None);
         assert_eq!(
             parse_bearer_challenge("Bearer service=\"x\""),
             None,
@@ -791,7 +709,7 @@ mod tests {
         Puller::new(&[reg.host()]).unwrap()
     }
 
-    fn reference(reg: &FakeRegistry, rest: &str) -> Reference {
+    fn reference(reg: &FakeRegistry, rest: &str) -> ImageReference {
         r(&format!("{}/{rest}", reg.host()))
     }
 
@@ -832,7 +750,12 @@ mod tests {
         let want = reg.push("team/tool", "v1", &img);
         let s = scratch();
         let got = puller(&reg)
-            .pull(&reference(&reg, "team/tool:v1"), &s.rootfs, &s.scratch)
+            .pull(
+                &reference(&reg, "team/tool:v1"),
+                None,
+                &s.rootfs,
+                &s.scratch,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -894,7 +817,12 @@ mod tests {
         reg.push("team/tool", "v1", &img);
         let s = scratch();
         puller(&reg)
-            .pull(&reference(&reg, "team/tool:v1"), &s.rootfs, &s.scratch)
+            .pull(
+                &reference(&reg, "team/tool:v1"),
+                None,
+                &s.rootfs,
+                &s.scratch,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -917,7 +845,12 @@ mod tests {
         reg.push("team/tool", "v1", &img);
         let s = scratch();
         let err = puller(&reg)
-            .pull(&reference(&reg, "team/tool:v1"), &s.rootfs, &s.scratch)
+            .pull(
+                &reference(&reg, "team/tool:v1"),
+                None,
+                &s.rootfs,
+                &s.scratch,
+            )
             .await
             .unwrap_err()
             .to_string();
@@ -940,7 +873,12 @@ mod tests {
         reg.push("team/tool", "v1", &img);
         let s = scratch();
         let err = puller(&reg)
-            .pull(&reference(&reg, "team/tool:v1"), &s.rootfs, &s.scratch)
+            .pull(
+                &reference(&reg, "team/tool:v1"),
+                None,
+                &s.rootfs,
+                &s.scratch,
+            )
             .await
             .unwrap_err()
             .to_string();
@@ -967,7 +905,12 @@ mod tests {
         reg.push("team/tool", "v1", &img);
         let s = scratch();
         puller(&reg)
-            .pull(&reference(&reg, "team/tool:v1"), &s.rootfs, &s.scratch)
+            .pull(
+                &reference(&reg, "team/tool:v1"),
+                None,
+                &s.rootfs,
+                &s.scratch,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -997,7 +940,12 @@ mod tests {
         reg.push("team/tool", "v1", &img);
         let s = scratch();
         puller(&reg)
-            .pull(&reference(&reg, "team/tool:v1"), &s.rootfs, &s.scratch)
+            .pull(
+                &reference(&reg, "team/tool:v1"),
+                None,
+                &s.rootfs,
+                &s.scratch,
+            )
             .await
             .unwrap();
         assert_eq!(mode(&s.rootfs.join("suid")), 0o755);
@@ -1020,7 +968,12 @@ mod tests {
         reg.tamper(&img.layers[1].digest());
         let s = scratch();
         let err = puller(&reg)
-            .pull(&reference(&reg, "team/tool:v1"), &s.rootfs, &s.scratch)
+            .pull(
+                &reference(&reg, "team/tool:v1"),
+                None,
+                &s.rootfs,
+                &s.scratch,
+            )
             .await
             .unwrap_err()
             .to_string();
@@ -1045,6 +998,7 @@ mod tests {
         let err = puller(&reg)
             .pull(
                 &reference(&reg, &format!("team/tool@{other}")),
+                None,
                 &s.rootfs,
                 &s.scratch,
             )
@@ -1060,6 +1014,7 @@ mod tests {
         let ok = puller(&reg)
             .pull(
                 &reference(&reg, &format!("team/tool:v1@{d}")),
+                None,
                 &s.rootfs,
                 &s.scratch,
             )
@@ -1085,7 +1040,12 @@ mod tests {
         reg.push_index("team/tool", "foreign", &[&elsewhere]);
         let s = scratch();
         let got = puller(&reg)
-            .pull(&reference(&reg, "team/tool:multi"), &s.rootfs, &s.scratch)
+            .pull(
+                &reference(&reg, "team/tool:multi"),
+                None,
+                &s.rootfs,
+                &s.scratch,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -1098,7 +1058,12 @@ mod tests {
             "here"
         );
         let err = puller(&reg)
-            .pull(&reference(&reg, "team/tool:foreign"), &s.rootfs, &s.scratch)
+            .pull(
+                &reference(&reg, "team/tool:foreign"),
+                None,
+                &s.rootfs,
+                &s.scratch,
+            )
             .await
             .unwrap_err()
             .to_string();
@@ -1108,7 +1073,12 @@ mod tests {
                 os: "linux".into(),
                 architecture: "s390x".into(),
             })
-            .pull(&reference(&reg, "team/tool:foreign"), &s.rootfs, &s.scratch)
+            .pull(
+                &reference(&reg, "team/tool:foreign"),
+                None,
+                &s.rootfs,
+                &s.scratch,
+            )
             .await
             .unwrap();
         assert_eq!(got.digest, elsewhere.manifest.digest());
@@ -1127,7 +1097,12 @@ mod tests {
         reg.push("team/tool", "v1", &img);
         let s = scratch();
         let err = puller(&reg)
-            .pull(&reference(&reg, "team/tool:v1"), &s.rootfs, &s.scratch)
+            .pull(
+                &reference(&reg, "team/tool:v1"),
+                None,
+                &s.rootfs,
+                &s.scratch,
+            )
             .await
             .unwrap_err()
             .to_string();
@@ -1150,7 +1125,12 @@ mod tests {
         reg.push("team/tool", "v1", &img);
         let s = scratch();
         puller(&reg)
-            .pull(&reference(&reg, "team/tool:v1"), &s.rootfs, &s.scratch)
+            .pull(
+                &reference(&reg, "team/tool:v1"),
+                None,
+                &s.rootfs,
+                &s.scratch,
+            )
             .await
             .unwrap();
         assert_eq!(reg.token_requests(), 1);
@@ -1167,7 +1147,12 @@ mod tests {
         let s = scratch();
         let err = Puller::new(&[])
             .unwrap()
-            .pull(&reference(&reg, "team/tool:v1"), &s.rootfs, &s.scratch)
+            .pull(
+                &reference(&reg, "team/tool:v1"),
+                None,
+                &s.rootfs,
+                &s.scratch,
+            )
             .await
             .unwrap_err();
         let chain = format!("{err:#}");
@@ -1175,6 +1160,163 @@ mod tests {
             !chain.contains("http://"),
             "the plain listener must not have been spoken to in the clear: {chain}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_credential_is_presented_at_the_token_endpoint_and_nowhere_else() {
+        let reg = FakeRegistry::start().await;
+        let password = fresh_password();
+        reg.require_credential("octocat", &password);
+        let img = Image::new()
+            .layer(Layer::new().file("a", 0o644, b"a"), Compression::None)
+            .build();
+        reg.push("team/tool", "v1", &img);
+        let s = scratch();
+        let err = puller(&reg)
+            .pull(
+                &reference(&reg, "team/tool:v1"),
+                None,
+                &s.rootfs,
+                &s.scratch,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no credential configured"), "{err}");
+        let cred = credential(&reg, "octocat", &password);
+        puller(&reg)
+            .credentials_over_plain_http_for_tests()
+            .pull(
+                &reference(&reg, "team/tool:v1"),
+                Some(&cred),
+                &s.rootfs,
+                &s.scratch,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            reg.token_requests(),
+            2,
+            "one refused anonymous, one with the credential"
+        );
+        assert_eq!(
+            reg.basic_on_content(),
+            0,
+            "the credential goes to the realm, not the blobs"
+        );
+        assert_eq!(std::fs::read_to_string(s.rootfs.join("a")).unwrap(), "a");
+    }
+
+    #[tokio::test]
+    async fn a_wrong_credential_is_refused_by_the_registry_not_retried() {
+        let reg = FakeRegistry::start().await;
+        let password = fresh_password();
+        reg.require_credential("octocat", &password);
+        let img = Image::new()
+            .layer(Layer::new().file("a", 0o644, b"a"), Compression::None)
+            .build();
+        reg.push("team/tool", "v1", &img);
+        let s = scratch();
+        let wrong = fresh_password();
+        let cred = credential(&reg, "octocat", &wrong);
+        let err = puller(&reg)
+            .credentials_over_plain_http_for_tests()
+            .pull(
+                &reference(&reg, "team/tool:v1"),
+                Some(&cred),
+                &s.rootfs,
+                &s.scratch,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("credential was presented"), "{err}");
+        assert!(
+            !err.contains("wrong"),
+            "the password is not in the error: {err}"
+        );
+        assert_eq!(reg.token_requests(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_basic_challenge_gets_the_credential_directly() {
+        let reg = FakeRegistry::start().await;
+        let password = fresh_password();
+        reg.basic_only("octocat", &password);
+        let img = Image::new()
+            .layer(Layer::new().file("a", 0o644, b"a"), Compression::None)
+            .layer(Layer::new().file("b", 0o644, b"b"), Compression::Gzip)
+            .build();
+        reg.push("team/tool", "v1", &img);
+        let s = scratch();
+        let err = puller(&reg)
+            .pull(
+                &reference(&reg, "team/tool:v1"),
+                None,
+                &s.rootfs,
+                &s.scratch,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("carries none"), "{err}");
+        let cred = credential(&reg, "octocat", &password);
+        puller(&reg)
+            .credentials_over_plain_http_for_tests()
+            .pull(
+                &reference(&reg, "team/tool:v1"),
+                Some(&cred),
+                &s.rootfs,
+                &s.scratch,
+            )
+            .await
+            .unwrap();
+        assert_eq!(reg.token_requests(), 0);
+        assert_eq!(std::fs::read_to_string(s.rootfs.join("b")).unwrap(), "b");
+    }
+
+    #[tokio::test]
+    async fn a_credential_never_crosses_plain_http_and_never_goes_to_another_host() {
+        let reg = FakeRegistry::start().await;
+        let password = fresh_password();
+        let img = Image::new()
+            .layer(Layer::new().file("a", 0o644, b"a"), Compression::None)
+            .build();
+        reg.push("team/tool", "v1", &img);
+        let s = scratch();
+        let cred = credential(&reg, "octocat", &password);
+        // The registry is listed as plain HTTP: the credential is refused before a request.
+        let err = puller(&reg)
+            .pull(
+                &reference(&reg, "team/tool:v1"),
+                Some(&cred),
+                &s.rootfs,
+                &s.scratch,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("never crosses plain HTTP"), "{err}");
+        assert_eq!(reg.requests(), 0, "nothing was asked");
+        // A credential for another host is a broker bug, refused the same way.
+        let other = RegistryCredential {
+            host: "ghcr.io".into(),
+            username: "octocat".into(),
+            password: Secret(password.clone()),
+        };
+        let err = Puller::new(&[])
+            .unwrap()
+            .pull(
+                &reference(&reg, "team/tool:v1"),
+                Some(&other),
+                &s.rootfs,
+                &s.scratch,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("is for ghcr.io"), "{err}");
+        assert_eq!(reg.requests(), 0);
     }
 
     /// Pulls a real image from a real registry. Set `MEDIATORE_PULL_IMAGE` to a reference
@@ -1188,7 +1330,7 @@ mod tests {
         let s = scratch();
         let got = Puller::new(&[])
             .unwrap()
-            .pull(&r(&image), &s.rootfs, &s.scratch)
+            .pull(&r(&image), None, &s.rootfs, &s.scratch)
             .await
             .unwrap();
         assert!(is_digest(&got.digest));

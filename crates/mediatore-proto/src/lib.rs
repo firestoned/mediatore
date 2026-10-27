@@ -9,6 +9,7 @@
 
 pub mod cert;
 pub mod ek;
+pub mod image;
 pub mod tls;
 
 use chrono::{DateTime, Utc};
@@ -229,6 +230,23 @@ pub struct Me {
     /// audience that declares none; the jail then reaches the broker only.
     #[serde(default)]
     pub egress: Vec<Endpoint>,
+    /// The operator's credential for the registry `workload.image` names, when one is
+    /// configured (ADR-0022); absent, the pull is anonymous. Used by the guest for one
+    /// pull, kept nowhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry_credential: Option<RegistryCredential>,
+}
+
+/// The operator's pull credential for one registry, handed to the guest for the registry
+/// its claim's image names (ADR-0022). The password prints as `[redacted]`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegistryCredential {
+    /// The registry host as the API reaches it (`registry-1.docker.io` for Docker Hub).
+    pub host: String,
+    /// The login at that registry.
+    pub username: String,
+    /// The password or token.
+    pub password: Secret,
 }
 
 /// `POST /v1/token` body, sent by the jailed workload over its claim SVID.
