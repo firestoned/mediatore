@@ -249,6 +249,21 @@ MEDIATORE_PULL_IMAGE=docker.io/library/busybox:1.37 cargo test -p mediatore-gues
 
 Run them on the build host whenever `sandboxfs.rs` or `image.rs` changes.
 
+### The VM image: built and checked, not booted
+
+The sandbox VM image ([ADR-0023](../adr/0023-sandbox-vm-image-kairos-derivative.md)) is a
+Kairos derivative that CI builds on every pull request and checks with `image/check.sh`:
+the binaries at the paths the units and `agent.conf` name, the plugin's checksum, the
+packages, the `spire` user, both units enabled, no `sshd` and no other listener, no
+private key. The same on the build host:
+
+```sh
+make dist && make guest-image BINARY_FROM=host CONTAINER_CLI=podman && make guest-image-check CONTAINER_CLI=podman
+```
+
+Nothing boots it: the install, the sealed partition, the EK export and a claim on a real
+member are roadmap 06's live item.
+
 ### Broker and client pods over SPIFFE mTLS
 
 `make kind-broker` builds the one musl binary on the host (`make dist`), packages it

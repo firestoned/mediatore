@@ -201,6 +201,23 @@ not a person.
 
 ## What "the workload" is
 
+Two images are involved, and they are not the same thing:
+
+| | The VM image | The workload image |
+| --- | --- | --- |
+| What | The pool member's disk: Kairos, the SPIRE agent and its TPM plugin, the one `mediatore` binary, `nsjail`, `nftables` | An ordinary OCI container image: the runtime, the agent framework, the tools, your code |
+| Who chooses it | The operator, once, when the pool is baked ([deploying](deploying.md) step 6) | The requester, per claim: `workload.image` on the claim or the `AgentSandbox` |
+| Who runs in it | `mediatore guest`, as root, outside the jail | Your `workload.args`, as the `sb-` user, inside the jail |
+| How it gets there | Built from `image/Dockerfile`, a Kairos derivative published as `ghcr.io/firestoned/mediatore-guest` ([ADR-0023](../adr/0023-sandbox-vm-image-kairos-derivative.md)); every member boots it | Pulled by the guest at bind into the per-claim tmpfs, as a rootfs for `nsjail`; no container runtime is involved |
+
+So "the workload" is your agent packaged as a container image, and the VM is what
+mediatore runs it on. One VM image serves every workload image; the pull credential of
+[ADR-0022](../adr/0022-registry-pull-credentials-from-the-broker.md) is the operator's
+because the registry it opens is where the organisation publishes its sanctioned agent
+images, not anything of the user's. The `mediatore token` the workload calls is not in
+your image either: the guest bind-mounts the one binary into the jail
+([ADR-0014](../adr/0014-one-binary-roles-as-subcommands.md)).
+
 `workload.image` is an OCI reference the in-guest agent pulls itself and unpacks into
 `/mnt/sandbox/rootfs`, on a tmpfs mounted for that claim (`nosuid,nodev`, size-bounded;
 [ADR-0021](../adr/0021-sandbox-filesystem-tmpfs-and-rootfs-from-the-registry.md)): every layer is verified against its digest and the
@@ -220,7 +237,7 @@ under nsjail as the per-subject user. The jail gives it:
 | `MEDIATORE_URL` env | Where to trade the SVID for tokens |
 | The rootfs (read-only) | Your image's filesystem as pulled: root-owned, setuid bits dropped, no device nodes ([ADR-0021](../adr/0021-sandbox-filesystem-tmpfs-and-rootfs-from-the-registry.md)) |
 | `/work` (writable), tmpfs `/tmp` + `$HOME` | Scratch space; `/work` is your `sb-` user's on the per-claim tmpfs, gone with the unmount at teardown |
-| `/usr/local/bin/mediatore` (read-only, the same file the guest runs from) | `mediatore token --audience api://trading-data` prints a 15-min bearer; the rootfs ships no client ([ADR-0014](../adr/0014-one-binary-roles-as-subcommands.md)) |
+| `/usr/bin/mediatore` (read-only, the same file the guest runs from) | `mediatore token --audience api://trading-data` prints a 15-min bearer; the rootfs ships no client ([ADR-0014](../adr/0014-one-binary-roles-as-subcommands.md)) |
 | The VM's network, filtered by the sandbox uid | TCP to the broker and to the `egress` endpoints of the claim's audiences, DNS to the VM's resolvers; everything else the workload sends is logged (`mediatore-sandbox drop:`) and dropped ([ADR-0020](../adr/0020-jail-network-nftables-keyed-by-sandbox-uid.md)) |
 
 No token files, no baked-in secrets, and no network beyond the broker and the endpoints

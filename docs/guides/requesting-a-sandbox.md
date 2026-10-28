@@ -27,6 +27,12 @@ curl -sS https://mediatore.sandbox.example/v1/claims \
 # {"name":"sandbox-3f9a1c2e","phase":"Pending","ready":false,"addresses":[]}
 ```
 
+`workload.image` is your agent as an ordinary OCI container image, the runtime and your
+code, not the VM: the guest on the pool member pulls it at bind and runs `workload.args`
+inside it under `nsjail` as your sandbox user ([what "the workload"
+is](running-workloads.md#what-the-workload-is)). Pin it by digest when the record has to
+say exactly which bytes ran.
+
 For an issuer configured with a `session` (Dex in the homelab,
 [ADR-0013](../adr/0013-dex-session-delegation.md)) the body also carries the caller's
 `refresh_token`, which mediatore seals and keeps in its store, never on the resource, and

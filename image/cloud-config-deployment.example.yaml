@@ -1,0 +1,86 @@
+#cloud-config
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+
+# The deployment's layer of the sandbox VM image's cloud-config (ADR-0023 decision 3): the
+# install block and what the image deliberately does not carry, the SPIRE agent's
+# configuration and the trust bundle. Copy it outside the repository, replace the
+# placeholders, and store it as the third cloud-config Secret the overlay's vmimage.yaml
+# names. Public material only: the bundle is the same for every member by design
+# (banlieue ADR-0108 decision 2); the agent's key is generated on each member's first
+# boot onto the sealed persistent partition and never appears here.
+install:
+  auto: true
+  device: auto
+  # Deferred mode (banlieue ADR-0040): each member runs this install at its own first boot,
+  # with its own vTPM attached, and seals the persistent partition to it.
+  reboot: true
+  poweroff: false
+  encrypted_partitions:
+    - COS_PERSISTENT
+# Console break-glass only: the image has no sshd (ADR-0010). A hashed password, or
+# `install.nousers: true` for a member nobody can log in to.
+users:
+  - name: kairos-admin
+    groups: ["admin"]
+    passwd: "$6$replace-me$with-a-hash-from-mkpasswd"
+stages:
+  initramfs:
+    # /etc is an ephemeral overlay on Kairos: written at every boot, from this layer.
+    - name: spire-agent-config
+      files:
+        - path: /etc/spire/bundle.pem
+          permissions: 0644
+          owner: 0
+          group: 0
+          # `spire-server bundle show` on your SPIRE server (deploying guide, step 6).
+          content: |
+            -----BEGIN CERTIFICATE-----
+            ...your trust bundle...
+            -----END CERTIFICATE-----
+        - path: /etc/spire/agent.conf
+          permissions: 0644
+          owner: 0
+          group: 0
+          # image/spire/agent.conf with the two placeholders replaced: the trust domain
+          # and the server's address. The plugin path and checksum stay as they are.
+          content: |
+            agent {
+              trust_domain = "sandbox.home.example"
+              server_address = "spire-server.sandbox.home.example"
+              server_port = "8081"
+              trust_bundle_path = "/etc/spire/bundle.pem"
+              socket_path = "/run/spire/sockets/agent.sock"
+              data_dir = "/var/lib/spire/agent"
+              log_level = "INFO"
+            }
+            plugins {
+              NodeAttestor "tpm" {
+                plugin_cmd = "/usr/lib/spire/tpm_attestor_agent"
+                plugin_checksum = "ffb7e266c7a10a7b1bdb349409d6c2ded8090715770287813055431cb692575c"
+                plugin_data {
+                  pve { enabled = false }
+                }
+              }
+              KeyManager "disk" {
+                plugin_data {
+                  directory = "/var/lib/spire/agent"
+                }
+              }
+              WorkloadAttestor "unix" {
+                plugin_data {
+                  discover_workload_path = true
+                }
+              }
+            }
+    - name: mediatore-guest-env
+      files:
+        - path: /etc/mediatore-guest/env
+          permissions: 0644
+          owner: 0
+          group: 0
+          # image/env.example: the broker's sandbox listener, as the members reach it.
+          content: |
+            MEDIATORE_URL=https://mediatore.sandbox.home.example:8443
+            SPIFFE_ENDPOINT_SOCKET=/run/spire/sockets/agent.sock
+            RUST_LOG=info

@@ -108,7 +108,7 @@ member() { # <role> <with guest: yes|no>
           image: ghcr.io/firestoned/mediatore:kind
           imagePullPolicy: Never
           command:
-            - /usr/local/bin/mediatore
+            - /usr/bin/mediatore
             - guest
             - --dev-ek-hash
             - "$EK_HASH"
@@ -156,12 +156,12 @@ spec:
       containers:
         - name: spire-agent
           image: $AGENT_IMAGE
-          args: ["-config", "/opt/spire/conf/agent.conf"]
+          args: ["-config", "/etc/spire/agent.conf"]
           # /dev/tpmrm0; the VM's unit allows the two TPM devices instead (image/systemd).
           securityContext: { privileged: true }
           volumeMounts:
-            - { name: conf, mountPath: /opt/spire/conf, readOnly: true }
-            - { name: plugin, mountPath: /opt/spire/bin/tpm_attestor_agent, subPath: tpm_attestor_agent, readOnly: true }
+            - { name: conf, mountPath: /etc/spire, readOnly: true }
+            - { name: plugin, mountPath: /usr/lib/spire/tpm_attestor_agent, subPath: tpm_attestor_agent, readOnly: true }
             - { name: data, mountPath: /var/lib/spire/agent }
             - { name: sockets, mountPath: /run/spire/sockets }
             - { name: tpm, mountPath: /dev/tpmrm0 }

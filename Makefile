@@ -4,7 +4,7 @@
 # All CI logic lives here (rules/github-workflows.md): workflows install tools
 # and call these targets, and every target runs identically locally.
 
-.PHONY: all help fmt fmt-check lint test deny audit check sbom dist dist-e2e image crds e2e live-admission-test \
+.PHONY: all help fmt fmt-check lint test deny audit check sbom dist dist-e2e image guest-image guest-image-check crds e2e live-admission-test \
         kind-install kind-create kind-delete kind-down kind-spire kind-deploy kind-up \
         kind-images kind-postgres kind-dex kind-openbao kind-broker kind-banlieue-crds kind-e2e-entries kind-e2e-mtls kind-e2e-watcher kind-e2e-sandbox \
         kind-e2e-store kind-e2e-dex kind-e2e kind-e2e-ci kind-e2e-logs \
@@ -104,6 +104,17 @@ dist-e2e: ## The testkit's dex-driver (musl) into dist/, for the test-only e2e i
 
 image: ## Build the server container image locally (the binary is compiled inside the image)
 	$(CONTAINER_CLI) build -t ghcr.io/firestoned/mediatore:dev .
+
+# The sandbox VM image (ADR-0023): a Kairos derivative with the guest software in the
+# immutable rootfs. The base, the SPIRE agent and the plugin are pinned by digest in
+# image/Dockerfile; BINARY_FROM=host reuses dist/mediatore (make dist) as the kind tier does.
+GUEST_IMAGE ?= ghcr.io/firestoned/mediatore-guest:dev
+BINARY_FROM ?= container
+guest-image: ## Build the sandbox VM image, a Kairos derivative (ADR-0023); BINARY_FROM=host copies dist/mediatore
+	$(CONTAINER_CLI) build -f image/Dockerfile --build-arg BINARY_FROM=$(BINARY_FROM) -t $(GUEST_IMAGE) .
+
+guest-image-check: ## Check the built VM image carries what ADR-0023 says, and no listener
+	CONTAINER_CLI=$(CONTAINER_CLI) ./image/check.sh $(GUEST_IMAGE)
 
 crds: ## Render mediatore's CRDs from their Rust types into deploy/base/crds/ (ADR-0008; never hand-edited, a unit test fails on a stale file)
 	cargo run -q -p mediatore-claims --bin crdgen -- --out-dir deploy/base/crds

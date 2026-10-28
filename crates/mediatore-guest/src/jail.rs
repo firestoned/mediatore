@@ -100,7 +100,7 @@ mod tests {
             work: "/mnt/sandbox/work".into(),
             workload_api_socket: "/run/spire/sockets/agent.sock".into(),
             mediatore_url: "https://mediatore.test".into(),
-            agent_binary: "/usr/local/bin/mediatore".into(),
+            agent_binary: "/usr/bin/mediatore".into(),
             argv: vec!["/bin/sh".into(), "-c".into(), "id".into()],
             rlimit_as_mib: 8192,
         };
@@ -118,7 +118,7 @@ mod tests {
             work: "/mnt/sandbox/work".into(),
             workload_api_socket: "/run/spire/sockets/agent.sock".into(),
             mediatore_url: "https://mediatore.test".into(),
-            agent_binary: "/usr/local/bin/mediatore".into(),
+            agent_binary: "/usr/bin/mediatore".into(),
             argv: vec!["/bin/sh".into()],
             rlimit_as_mib: 8192,
         };
@@ -155,7 +155,7 @@ mod tests {
             ro,
             [
                 "/run/spire/sockets/agent.sock:/run/spire/agent.sock",
-                "/opt/mediatore/bin/mediatore:/usr/local/bin/mediatore",
+                "/opt/mediatore/bin/mediatore:/usr/bin/mediatore",
             ]
         );
         let rw: Vec<&str> = a

@@ -23,7 +23,7 @@ COPY dist/mediatore /mediatore
 FROM build-${BINARY_FROM} AS build
 
 FROM cgr.dev/chainguard/static:latest
-COPY --from=build /mediatore /usr/local/bin/mediatore
+COPY --from=build /mediatore /usr/bin/mediatore
 USER 65532:65532
-ENTRYPOINT ["/usr/local/bin/mediatore"]
+ENTRYPOINT ["/usr/bin/mediatore"]
 CMD ["serve", "--config", "/etc/mediatore/mediatore.yaml"]

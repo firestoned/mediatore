@@ -20,7 +20,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 )]
 struct Cli {
     /// The mediatore binary to drive
-    #[arg(long, default_value = "/usr/local/bin/mediatore")]
+    #[arg(long, default_value = "/usr/bin/mediatore")]
     bin: PathBuf,
     /// The issuer URL, as the broker's config names it
     #[arg(long)]

@@ -71,6 +71,11 @@ setuid and holds no secret, so the mount adds no authority inside the jail: `med
 serve` in there has no broker SVID, `mediatore guest` has no TPM and no root, and the
 Workload API socket yields the claim SVID only.
 
+   *Amended by [ADR-0023](0023-sandbox-vm-image-kairos-derivative.md): the pinned path is
+   `/usr/bin/mediatore`. On Kairos `/usr/local` is the persistent partition's mount point,
+   so a binary baked there is hidden on an installed member; the immutable rootfs is where a
+   pinned path belongs.*
+
 **5. The node entry pins the new path, and the uid is what tells the roles apart.** The
 node entry's selectors become `unix:uid:0` and `unix:path:/usr/local/bin/mediatore`
 (`GUEST_AGENT_PATH`), amending ADR-0006's table. Because the jailed workload can now

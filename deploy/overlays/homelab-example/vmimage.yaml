@@ -1,0 +1,68 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+#
+# The sandbox pool's VM image and class for a libvirt host (ADR-0023). Not part of the
+# kustomization: banlieue's resources live in the namespace banlieue serves, and the three
+# cloud-config layers are Secrets you create in banlieue's imagebuild namespace first:
+#
+#   kubectl -n banlieue-imagebuild create secret generic mediatore-guest-base \
+#     --from-file=cloud-config.yaml=image/cloud-config.yaml
+#   kubectl -n banlieue-imagebuild create secret generic banlieue-guest-ek-certificate \
+#     --from-file=cloud-config.yaml=<banlieue>/examples/21-cloud-config-guest-ek-certificate.yaml
+#   kubectl -n banlieue-imagebuild create secret generic mediatore-guest-deployment \
+#     --from-file=cloud-config.yaml=<your copy of image/cloud-config-deployment.example.yaml>
+#
+# Pin the image by the digest of a release of ghcr.io/firestoned/mediatore-guest (the
+# Build workflow signs and attests it; `gh attestation verify oci://<image> --repo
+# firestoned/mediatore`). banlieue's phase layer (its examples/17) is deliberately absent:
+# the guest announces GuestReady itself once attested and registered (ADR-0019).
+---
+apiVersion: banlieue.io/v1alpha1
+kind: VMImage
+metadata:
+  name: mediatore-guest
+spec:
+  osFamily: linux
+  osDistribution: debian
+  osVersion: "13"
+  architecture: amd64
+  guestAgent: cloud-init
+  sources:
+    - providerClass: libvirt
+      kind: Url
+      ref: unused-for-url-sources # required by the schema; ignored for kind: Url
+      importFrom: ghcr.io/firestoned/mediatore-guest@sha256:0000000000000000000000000000000000000000000000000000000000000000 # placeholder: a release digest
+  cloudConfigs:
+    - secretRef: { name: mediatore-guest-base, key: cloud-config.yaml }
+    - secretRef: { name: banlieue-guest-ek-certificate, key: cloud-config.yaml }
+    - secretRef: { name: mediatore-guest-deployment, key: cloud-config.yaml }
+  template:
+    # Each member installs itself at first boot with its own vTPM present (banlieue
+    # ADR-0040). Immediate plus firstBootSealing (banlieue ADR-0088) replaces this once a
+    # Kairos 4.4 Debian base is published; the image itself does not change.
+    installMode: deferred
+---
+apiVersion: banlieue.io/v1alpha1
+kind: VMClass
+metadata:
+  name: sandbox-standard
+spec:
+  hardware:
+    cpus: 2
+    # The sandbox tmpfs is RAM (ADR-0021): the workload image unpacked, its largest layer
+    # and /work, on top of the workload itself. Size for the images the pool runs.
+    memoryMiB: 4096
+    disks:
+      - name: os
+        sizeGiB: 20
+        storageClass: standard
+        provisioning: thin
+  network:
+    interfaces:
+      - name: eth0
+        networkClass: sandbox-segment
+        ipam: {}
+  firmware: efi # a vTPM needs EFI
+  features:
+    - vtpm
+  tpmEnabled: true
