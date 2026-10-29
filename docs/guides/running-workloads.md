@@ -217,6 +217,9 @@ because the registry it opens is where the organisation publishes its sanctioned
 images, not anything of the user's. The `mediatore token` the workload calls is not in
 your image either: the guest bind-mounts the one binary into the jail
 ([ADR-0014](../adr/0014-one-binary-roles-as-subcommands.md)).
+[The research agent, front to back](research-agent-walkthrough.md) follows one workload
+image from the team that publishes it to the report it pushes, with the policy notaio
+certifies for it.
 
 `workload.image` is an OCI reference the in-guest agent pulls itself and unpacks into
 `/mnt/sandbox/rootfs`, on a tmpfs mounted for that claim (`nosuid,nodev`, size-bounded;

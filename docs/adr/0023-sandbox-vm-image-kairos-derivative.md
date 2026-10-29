@@ -50,7 +50,11 @@ runs `Deferred` installs, which banlieue's libvirt guide calls the simpler path 
 1. **The image is a Kairos derivative built from `image/Dockerfile`.** `FROM` the Kairos
    Debian 13 `core` base, pinned by digest; the packages the guest needs installed with
    `apt-get` (`tpm2-tools` for the EK export, `qemu-guest-agent` for the libvirt
-   channels, `nftables`, which the base already has); every listening service the base
+   channels, `nftables`, which the base already has); `nsjail`, the jail itself
+   ([ADR-0020](0020-jail-network-nftables-keyed-by-sandbox-uid.md)), which no Debian archive
+   carries, built from source at a pinned commit in a build stage and installed at
+   `/usr/bin/nsjail` with the two libraries it links (*amended 2026-10-28: the first build
+   omitted it, and `image/check.sh` now proves it*); every listening service the base
    ships removed or masked (`openssh-server`, `snmpd`, `lldpd`, `fail2ban`, `rpcbind`:
    no inbound, [ADR-0010](0010-no-inbound-to-sandboxes.md) decision 2); the `spire` system
    user created, in group `tss`; the two units installed and enabled. The build takes the

@@ -331,15 +331,18 @@ kubectl -n spire-server rollout status statefulset/spire-server
 kubectl -n spire-server exec spire-server-0 -c spire-server -- spire-server bundle show > bundle.pem
 ```
 
-The VM side is the image: the SPIRE agent, the agent plugin binary from the same
-release, the fragments in `image/` and the bundle just exported.
+The VM side is the image of [ADR-0023](../adr/0023-sandbox-vm-image-kairos-derivative.md):
+the SPIRE agent, the plugin and the one binary in the immutable rootfs, built from
+`image/Dockerfile` and published as `ghcr.io/firestoned/mediatore-guest`; the bundle just
+exported and the agent's configuration go into your copy of
+`image/cloud-config-deployment.example.yaml`, the third cloud-config layer of the `VMImage`
+in `deploy/overlays/homelab-example/vmimage.yaml` ([deploying](deploying.md), step 6).
 
 ```sh
-make dist-tpm-plugin CONTAINER_CLI=podman    # dist/tpm_attestor_agent, checksum verified
-ls image/spire/agent.conf image/systemd/spire-agent.service image/systemd/mediatore-guest.service
+make dist && make guest-image BINARY_FROM=host CONTAINER_CLI=podman && make guest-image-check CONTAINER_CLI=podman
 ```
 
-banlieue-imagebuilder bakes them (roadmap 06). Acceptance, once a pool member boots from
+Acceptance, once a pool member boots from
 that image: it appears in `spire-server agent list` as type `tpm` within a minute, its
 hash equals `sha256` of the DER `SubjectPublicKeyInfo` of the certificate banlieue
 published on the `VirtualMachine`, a reboot keeps the same agent, and a sandbox claimed

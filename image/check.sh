@@ -29,6 +29,8 @@ check "the SPIRE agent in the rootfs" \
 check "the TPM attestor plugin at the path agent.conf names, with the checksum it pins" \
   "echo '$PLUGIN_SHA  /usr/lib/spire/tpm_attestor_agent' | sha256sum -c - >/dev/null"
 check "nftables, for the jail's ruleset (ADR-0020)" 'nft --version >/dev/null'
+check "nsjail, the jail itself, linked against what the image has" \
+  'test -x /usr/bin/nsjail && ! ldd /usr/bin/nsjail | grep -q "not found" && /usr/bin/nsjail --help 2>&1 | grep -q -- "--chroot"'
 check "mount and umount, for the sandbox tmpfs (ADR-0021)" 'command -v mount && command -v umount'
 check "tpm2-tools, for the EK certificate export (banlieue examples/21)" 'command -v tpm2_nvread'
 check "qemu-guest-agent, the libvirt channel for GuestReady (ADR-0019)" 'command -v qemu-ga'
