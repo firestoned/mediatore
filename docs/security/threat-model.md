@@ -4,10 +4,15 @@ SPDX-License-Identifier: Apache-2.0
 -->
 # Threat Model
 
-> **Status:** Living document. Last full pass **2026-10-27**, against the
+> **Status:** Living document. Last full pass **2026-10-28**, against the
 > architecture defined by **ADR-0001 … ADR-0023** (ADR-0009 and ADR-0010 are
 > adopted platform ADRs; ADR-0020 is mediatore's share of ADR-0010's in-guest
-> layer). This pass covers ADR-0023: the sandbox VM image is a Kairos Debian
+> layer). This pass covers the 2026-10-28 amendment of ADR-0023: `nsjail`, the
+> jail every TB-4 row relies on, is built from a pinned source commit into the
+> image and proven present by `image/check.sh`; the first build had omitted it,
+> so no member could have started a workload. No boundary, asset or actor
+> changes; the TB-4 supply-chain row names the pin. The pass before, on
+> 2026-10-27, covered ADR-0023: the sandbox VM image is a Kairos Debian
 > derivative built from this repository and published signed and attested, with
 > the one binary, the SPIRE agent and the TPM attestor plugin in the immutable
 > rootfs, every listener the base shipped removed, the agent's configuration
@@ -410,7 +415,7 @@ the residue is in §8. No boundary carries the marker as of this pass.
 | A jailed workload presents the agent's binary path to be issued the node SVID (the jail mounts the same file, ADR-0014) | S | The node entry carries two selectors and SPIRE requires both: `unix:uid:0` and `unix:path:/usr/bin/mediatore` (`ensure_node_entry`, `crates/mediatore-spire/src/kube.rs`, unit `node_entry_pins_root_and_the_agent_binary`); the jailed process runs as the `sb-` user, so the path alone matches nothing. The claim entry keeps `unix:user:<sb-user>` |
 | Another pod on the management cluster is issued the broker's SVID | S/E | `deploy/base/clusterspiffeid.yaml` selects namespace `banlieue-system`, pod label `app.kubernetes.io/name: mediatore`, ServiceAccount `mediatore` and container name `mediatore`, all attested by the agent through the verified kubelet; creating such a pod is RBAC-gated (cluster admin trusted, §9). See TB-8 |
 | The pinned binary replaced or shadowed on the member, so the node entry's `unix:path` selects another file | S/E | The path is in the immutable rootfs: `/usr/bin/mediatore` (`AGENT_BINARY_PATH`, `crates/mediatore-proto/src/lib.rs`; the node entry in `ensure_node_entry`, `crates/mediatore-spire/src/kube.rs`, unit `node_entry_pins_root_and_the_agent_binary`), copied there by `image/Dockerfile`; `image/check.sh` fails the build on any binary under `/usr/local`, the persistent partition's mount point, where the previous path would have been hidden (ADR-0023 decision 2). Guest root replacing the rootfs is the VM's own blast radius (§4) |
-| A tampered or substituted VM image (the supply chain of A-17) | T | Built only by this repository's Build workflow from `image/Dockerfile`, with the base, the SPIRE agent and the plugin pinned by digest and the plugin's checksum verified in the build against `image/spire/agent.conf`; pushed keyless-signed by digest with an SBOM and build provenance (`.github/workflows/build.yaml`, `guest-image` and `attest` jobs); the `VMImage` names a digest (`deploy/overlays/homelab-example/vmimage.yaml`) and the deploying guide says to verify the attestation. What a signed image proves is which bytes, not that they are right: `image/check.sh` runs on every pull request |
+| A tampered or substituted VM image (the supply chain of A-17) | T | Built only by this repository's Build workflow from `image/Dockerfile`, with the base, the SPIRE agent and the plugin pinned by digest, `nsjail` built from a pinned source commit (`NSJAIL_COMMIT`) and the plugin's checksum verified in the build against `image/spire/agent.conf`; pushed keyless-signed by digest with an SBOM and build provenance (`.github/workflows/build.yaml`, `guest-image` and `attest` jobs); the `VMImage` names a digest (`deploy/overlays/homelab-example/vmimage.yaml`) and the deploying guide says to verify the attestation. What a signed image proves is which bytes, not that they are right: `image/check.sh` runs on every pull request |
 | A listener in the image (`sshd`, `snmpd`, a guest tools daemon) reachable from the segment | S/E | `openssh-server`, `snmpd`, `lldpd`, `fail2ban`, `rpcbind` purged and `ssh` masked in `image/Dockerfile`; `image/check.sh` fails the build on any of them. `qemu-guest-agent` listens on the host's virtio channel, not the network (ADR-0019 decision 2). The segment and the hypervisor still enforce no inbound (ADR-0010 decision 1) |
 | The live installer, booted from the same image with the same enabled units and the member's vTPM, attests as the agent, registers and announces while it is still writing the disk | S | Both VM units start only when Kairos's installed-disk sentinel exists: `ConditionPathExists=|/run/cos/active_mode` and `|/run/cos/passive_mode` on `image/systemd/spire-agent.service` and `mediatore-guest.service` (ADR-0019 decision 4, banlieue ADR-0043 decision 2). A non-Kairos image that drops the lines takes the installer case on itself; the deploying guide says so |
 

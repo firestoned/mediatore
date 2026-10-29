@@ -140,6 +140,7 @@ nav:
       - Running workloads on a claimed VM: guides/running-workloads.md
       - Deploying on a homelab cluster: guides/deploying.md
       - Homelab walkthrough: guides/homelab-walkthrough.md
+      - The research agent, front to back: guides/research-agent-walkthrough.md
       - Requesting a sandbox: guides/requesting-a-sandbox.md
       - Issuers: guides/issuers.md
       - The store: guides/the-store.md
@@ -168,5 +169,10 @@ nav:
       - "ADR-0016: The Entra path": adr/0016-entra-on-behalf-of.md
       - "ADR-0017: Issuer profiles": adr/0017-issuer-profiles.md
       - "ADR-0018: TPM attestation with the SPIFFE plugin": adr/0018-tpm-attestation-with-the-spiffe-plugin.md
+      - "ADR-0019: GuestReady after attestation and registration": adr/0019-guestready-after-attestation-and-registration.md
+      - "ADR-0020: The jail's network, nftables keyed by the sandbox uid": adr/0020-jail-network-nftables-keyed-by-sandbox-uid.md
+      - "ADR-0021: The sandbox filesystem, a tmpfs and the rootfs from the registry": adr/0021-sandbox-filesystem-tmpfs-and-rootfs-from-the-registry.md
+      - "ADR-0022: Registry pull credentials from the broker": adr/0022-registry-pull-credentials-from-the-broker.md
+      - "ADR-0023: The sandbox VM image, a Kairos derivative": adr/0023-sandbox-vm-image-kairos-derivative.md
   - Security:
       - Threat model: security/threat-model.md

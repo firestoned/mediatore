@@ -68,7 +68,8 @@
 - [x] Image baking. Done 2026-10-27 as
       [ADR-0023](../../docs/adr/0023-sandbox-vm-image-kairos-derivative.md): a Kairos
       Debian 13 derivative built from `image/Dockerfile` (the binary, the SPIRE agent and
-      the plugin pinned by digest in the immutable rootfs, `tpm2-tools`,
+      the plugin pinned by digest in the immutable rootfs, `nsjail` built from a pinned
+      source commit (added 2026-10-28: the first build omitted it), `tpm2-tools`,
       `qemu-guest-agent`, `nftables`, listeners removed, the `spire` user, units enabled),
       checked by `image/check.sh` in CI and on the build host, published as
       `ghcr.io/firestoned/mediatore-guest` signed and attested; the pinned path moved to

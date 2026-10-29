@@ -54,7 +54,7 @@ deploy/                 raw manifests (kustomize): base, and an example homelab 
 image/                  systemd units + cloud-config fragments baked into the VM image
 docs/adr/               architecture decision records
 docs/architecture/      FINOS CALM model + rendered Mermaid diagrams
-docs/guides/            operational guides (the homelab walkthrough, deploying, requesting a sandbox, issuers, the store, the Entra path, testing tiers, enterprise SPIRE topology)
+docs/guides/            operational guides (the homelab walkthrough, the research agent front to back, deploying, requesting a sandbox, issuers, the store, the Entra path, testing tiers, enterprise SPIRE topology)
 docs/security/          threat model (living document, stamped per ADR range)
 ```
 

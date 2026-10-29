@@ -135,8 +135,8 @@ so a `GuestReady` pool binds only members that can take the claim.
 ## 6. Let the VMs attest
 
 This step is about the VM image: the pool member's disk, which every member boots from.
-It carries the SPIRE agent, the TPM plugin, the one `mediatore` binary, `nftables`,
-`tpm2-tools` and `qemu-guest-agent`, and nothing of any workload. What a sandbox runs is
+It carries the SPIRE agent, the TPM plugin, the one `mediatore` binary, `nsjail`,
+`nftables`, `tpm2-tools` and `qemu-guest-agent`, and nothing of any workload. What a sandbox runs is
 the *workload image*, an ordinary OCI container image the requester names on each claim
 and the guest pulls at bind ([what "the workload" is](running-workloads.md#what-the-workload-is)).
 One VM image serves every workload image.

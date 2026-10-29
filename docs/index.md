@@ -29,6 +29,9 @@ the component that finishes the story.
 
 - [Running workloads on a claimed VM](guides/running-workloads.md): the user, OBO-agent and
   app-only paths, end to end.
+- [The research agent, front to back](guides/research-agent-walkthrough.md): one agent
+  image from publication to the report it pushes, under a policy notaio certifies, with
+  what enforces each line of it today.
 - [Requesting a sandbox](guides/requesting-a-sandbox.md): the `AgentSandbox` resource,
   through the API or declaratively, who may name which subject, and what its status says.
 - [The store](guides/the-store.md): SQLite or PostgreSQL by URL, what survives a restart,
