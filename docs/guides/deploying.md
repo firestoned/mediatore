@@ -12,6 +12,22 @@ from the empty cluster, with every command. The enterprise split (a root on its 
 [a separate guide](enterprise-spire-topology.md); roadmap 02 tracks what is still
 missing for VMs to attest ([`ROADMAPS.md`](https://github.com/firestoned/mediatore/blob/main/ROADMAPS.md)).
 
+Every release attaches what the install needs beside the two images: the static binary
+(`mediatore-<version>-linux-amd64`, the CLI and every role), `mediatore-<version>.yaml`
+(this `deploy/base` with the server image pinned by digest), the `VMImage` of step 6 pinned to
+the guest image's digest with the two cloud-config layers it names, the SBOMs and
+`checksums.sha256`, each file attested by the Build workflow. An overlay can name the
+manifest instead of a checkout, and every asset verifies offline:
+
+```sh
+gh release download v0.1.0 --repo firestoned/mediatore --pattern 'mediatore-0.1.0*' --pattern checksums.sha256
+shasum -a 256 -c checksums.sha256
+gh attestation verify mediatore-0.1.0.yaml --repo firestoned/mediatore
+# kustomization.yaml of your overlay:
+#   resources:
+#     - https://github.com/firestoned/mediatore/releases/download/v0.1.0/mediatore-0.1.0.yaml
+```
+
 ## What the cluster must already have
 
 | Piece | Where it comes from | How mediatore uses it |
