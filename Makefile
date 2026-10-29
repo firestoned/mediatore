@@ -4,7 +4,7 @@
 # All CI logic lives here (rules/github-workflows.md): workflows install tools
 # and call these targets, and every target runs identically locally.
 
-.PHONY: all help fmt fmt-check lint test deny audit check sbom dist dist-e2e image guest-image guest-image-check crds e2e live-admission-test \
+.PHONY: all help fmt fmt-check lint test deny audit check sbom dist dist-e2e image guest-image guest-image-check crds e2e live-admission-test release-assets release-assets-test \
         kind-install kind-create kind-delete kind-down kind-spire kind-deploy kind-up \
         kind-images kind-postgres kind-dex kind-openbao kind-broker kind-banlieue-crds kind-e2e-entries kind-e2e-mtls kind-e2e-watcher kind-e2e-sandbox \
         kind-e2e-store kind-e2e-dex kind-e2e kind-e2e-ci kind-e2e-logs \
@@ -148,6 +148,48 @@ manifests: ## Render deploy/base and the example overlay with kustomize, as a ch
 	kubectl kustomize deploy/base > /dev/null
 	kubectl kustomize deploy/overlays/homelab-example > /dev/null
 	@echo "✓ deploy/base and deploy/overlays/homelab-example render"
+
+# ----- Release assets: what the release page carries beside the two images --------------
+#
+# The images are the install's blobs (the server image for the Deployment, the guest image
+# banlieue-imagebuilder turns into the pool's disk, ADR-0023). A release also attaches the
+# static binary (the CLI, the same file every role runs from), the install manifest with the
+# server image pinned by digest, the VMImage pinned to the guest digest, the two cloud-config
+# layers it names, the SBOMs, and checksums; the workflow attests every file.
+RELEASE_DIR    ?= release
+RELEASE_IMAGE  := ghcr.io/firestoned/mediatore
+RELEASE_GUEST  := ghcr.io/firestoned/mediatore-guest
+RELEASE_BINARY ?= dist/mediatore
+
+release-assets: ## Gather RELEASE_DIR for VERSION: the binary (+ SBOMs staged in dist/), mediatore-VERSION.yaml pinned to IMAGE_DIGEST, the VMImage pinned to GUEST_DIGEST, the cloud-config layers, checksums
+	@test -n "$(VERSION)" || { echo "set VERSION, e.g. 0.1.0"; exit 1; }
+	@echo "$(IMAGE_DIGEST)" | grep -Eq '^sha256:[0-9a-f]{64}$$' || { echo "set IMAGE_DIGEST to sha256:<64 hex>, got '$(IMAGE_DIGEST)'"; exit 1; }
+	@echo "$(GUEST_DIGEST)" | grep -Eq '^sha256:[0-9a-f]{64}$$' || { echo "set GUEST_DIGEST to sha256:<64 hex>, got '$(GUEST_DIGEST)'"; exit 1; }
+	@test -x "$(RELEASE_BINARY)" || { echo "$(RELEASE_BINARY) missing or not executable: make dist first"; exit 1; }
+	@command -v kubectl >/dev/null 2>&1 || { echo "Error: kubectl not found"; exit 1; }
+	@mkdir -p "$(RELEASE_DIR)"
+	@cp "$(RELEASE_BINARY)" "$(RELEASE_DIR)/mediatore-$(VERSION)-linux-amd64"
+	@if [ -f dist/mediatore.cdx.json ]; then cp dist/mediatore.cdx.json "$(RELEASE_DIR)/mediatore-$(VERSION)-linux-amd64.cdx.json"; fi
+	@if [ -f dist/docker-sbom.json ]; then cp dist/docker-sbom.json "$(RELEASE_DIR)/mediatore-$(VERSION)-image.sbom.spdx.json"; fi
+	@if [ -f dist/guest-image-sbom.json ]; then cp dist/guest-image-sbom.json "$(RELEASE_DIR)/mediatore-guest-$(VERSION)-image.sbom.spdx.json"; fi
+	@{ printf '# mediatore %s: the CRD, the broker Deployment, RBAC, the admission policies, the services, the image pinned by digest.\n' "$(VERSION)"; \
+	   printf '# Rendered from deploy/base. What is yours is an overlay (deploy/overlays/homelab-example): mediatore.yaml, the Secrets, the ingress.\n'; \
+	   kubectl kustomize deploy/base; } \
+	  | sed -E 's#(image: )$(RELEASE_IMAGE):[^[:space:]]+#\1$(RELEASE_IMAGE)@$(IMAGE_DIGEST)#' > "$(RELEASE_DIR)/mediatore-$(VERSION).yaml"
+	@sed -E 's#$(RELEASE_GUEST)@sha256:[0-9a-f]{64}#$(RELEASE_GUEST)@$(GUEST_DIGEST)#' deploy/overlays/homelab-example/vmimage.yaml > "$(RELEASE_DIR)/mediatore-guest-$(VERSION)-vmimage.yaml"
+	@cp image/cloud-config.yaml "$(RELEASE_DIR)/mediatore-guest-$(VERSION)-cloud-config-base.yaml"
+	@cp image/cloud-config-deployment.example.yaml "$(RELEASE_DIR)/mediatore-guest-$(VERSION)-cloud-config-deployment.example.yaml"
+	@cd "$(RELEASE_DIR)" && rm -f checksums.sha256 && shasum -a 256 ./* > checksums.sha256
+	@echo "✓ $(RELEASE_DIR): $$(ls "$(RELEASE_DIR)" | wc -l | tr -d ' ') files; $(RELEASE_IMAGE)@$(IMAGE_DIGEST); $(RELEASE_GUEST)@$(GUEST_DIGEST)"
+
+release-assets-test: ## Prove release-assets pins both images by digest, keeps every kind the install needs, and checksums every file
+	@tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
+	  printf '#!/bin/sh\n' > "$$tmp/mediatore" && chmod +x "$$tmp/mediatore"; \
+	  d1=sha256:$$(printf 'release-assets-test-image' | shasum -a 256 | cut -d' ' -f1); \
+	  d2=sha256:$$(printf 'release-assets-test-guest' | shasum -a 256 | cut -d' ' -f1); \
+	  $(MAKE) --no-print-directory -s release-assets VERSION=0.0.0-test IMAGE_DIGEST=$$d1 GUEST_DIGEST=$$d2 RELEASE_DIR="$$tmp/release" RELEASE_BINARY="$$tmp/mediatore" >/dev/null && \
+	  python3 scripts/check_release_assets.py "$$tmp/release" 0.0.0-test "$(RELEASE_IMAGE)@$$d1" "$(RELEASE_GUEST)@$$d2" && \
+	  echo "release-assets-test: ok"
 
 live-admission-test: ## ClusterStaticEntry round trip as the mediatore ServiceAccount against a real cluster (MEDIATORE_LIVE_KUBECONFIG, MEDIATORE_LIVE_TRUST_DOMAIN, MEDIATORE_LIVE_CLASS_NAME; MEDIATORE_LIVE_IDENTITY=impersonate|self)
 	cargo test -p mediatore-spire --test live_kube -- --ignored

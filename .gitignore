@@ -11,3 +11,6 @@
 # MkDocs site build and docs venv (make docs / docs-serve)
 /site
 /.venv
+
+# make release-assets output
+/release/
