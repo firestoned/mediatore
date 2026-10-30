@@ -53,7 +53,19 @@
       (`ImageReference`) and `POST /v1/claims` refuses a `workload.image` it cannot
       parse. The fake registry demands the credential at `/token` or challenges with
       `Basic` in the tests
-- [ ] Real seccomp policy for nsjail (the spec currently carries none)
+- [x] Kernel confinement inside the jail, beyond what the mounts and file modes give. Done
+      2026-10-30 as [ADR-0024](../../docs/adr/0024-landlock-inside-the-jail.md): `nsjail`
+      execs the one binary's `jail-exec` role, which applies Landlock to its own process
+      through the `nono` library before the workload's argv runs
+      (`crates/mediatore-guest/src/confine.rs`): the rootfs readable and executable,
+      `/work`, `/tmp` and the home writable whatever the image says, TCP connect only to
+      the ports of the ruleset's destinations, no bind, signals and abstract sockets
+      scoped; a kernel that cannot enforce it or a claim with no port is refused with exit
+      125 and the supervisor ends the claim instead of restarting. The plan is pinned by
+      unit tests, the enforcement proven by an ignored test on the build host. The item
+      had been "a real seccomp policy for nsjail": a syscall allowlist per arbitrary image
+      is not writable and says nothing about paths or ports; a seccomp layer on top is a
+      later item only if a threat needs it
 - [x] `GuestReady` (banlieue ADR-0043) emitted after the SPIRE healthcheck so Ready
       means attested (runbook 2.5). Done 2026-10-24 as
       [ADR-0019](../../docs/adr/0019-guestready-after-attestation-and-registration.md):

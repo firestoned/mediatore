@@ -174,5 +174,6 @@ nav:
       - "ADR-0021: The sandbox filesystem, a tmpfs and the rootfs from the registry": adr/0021-sandbox-filesystem-tmpfs-and-rootfs-from-the-registry.md
       - "ADR-0022: Registry pull credentials from the broker": adr/0022-registry-pull-credentials-from-the-broker.md
       - "ADR-0023: The sandbox VM image, a Kairos derivative": adr/0023-sandbox-vm-image-kairos-derivative.md
+      - "ADR-0024: Landlock inside the jail": adr/0024-landlock-inside-the-jail.md
   - Security:
       - Threat model: security/threat-model.md

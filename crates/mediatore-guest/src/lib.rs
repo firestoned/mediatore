@@ -5,6 +5,8 @@
 //! bound banlieue claim into a jailed, identity-bearing workload, and the `token` role,
 //! which the workload runs inside that jail to trade its claim SVID for an audience-scoped
 //! token. Both reach the broker through the same [`client::SandboxClient`].
+//! The `jail-exec` role sits between the two: what `nsjail` execs as the sandbox user, it
+//! applies Landlock to itself and execs the workload (ADR-0024).
 //!
 //! Transport: SPIFFE mTLS with the SVID from the Workload API, verifying the broker as
 //! exactly `spiffe://<td>/mediatore` (ADR-0007 decision 5). With the `dev` cargo feature
@@ -12,6 +14,7 @@
 //! instead; release builds have no such path.
 
 pub mod client;
+pub mod confine;
 pub mod guest;
 mod identity;
 pub mod image;

@@ -18,3 +18,13 @@ to learn from. Design questions to answer in the ADR when this activates:
 - TLS: MITM-with-installed-CA vs CONNECT-only header injection for known APIs
 - What R-3 becomes afterwards (exfiltration window shrinks to the proxy's per-request
   scope)
+
+**Reference design (2026-10-30).** nono's supervisor and `nono-proxy`
+([always-further/nono](https://github.com/always-further/nono)) are this roadmap built for
+a laptop: the child reaches only a loopback proxy, holds a phantom token, and the proxy swaps
+it for the real credential per route with method and path rules; its NEP-0007 moves the
+decisions and the credentials to the host over vsock, which is mediatore's shape already.
+[ADR-0024](../../docs/adr/0024-landlock-inside-the-jail.md) put the nono library inside the
+jail for Landlock; the proxy of this roadmap is written on this workspace's TLS stack
+(`nono-proxy` pulls `ring`), with nono's route and endpoint-rule shape as the policy format
+so a claim, or a notaio bundle under M3, renders both layers once.

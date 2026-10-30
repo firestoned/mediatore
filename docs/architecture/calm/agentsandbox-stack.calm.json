@@ -287,30 +287,45 @@
     {
       "unique-id": "agentsandbox-nono",
       "node-type": "service",
-      "name": "nono (proposed spike)",
-      "description": "Proposed, not built: Landlock confinement around the jailed agent, a per-tool broker, and phantom credentials injected at egress.",
+      "name": "nono (library in the jail; proxy proposed)",
+      "description": "Partly built: the nono library applies Landlock around the jailed agent from inside the guest's own binary (ADR-0024). The per-tool broker and phantom credentials injected at egress remain proposed (roadmap 07); nono-proxy itself is not used.",
       "metadata": {
-        "status": "proposed",
+        "status": "in-progress",
         "diagram-style": "dashed orange: proposed, not built yet"
       }
     },
     {
       "unique-id": "agentsandbox-jailed-agent",
       "node-type": "service",
-      "name": "Jailed agent (nsjail)",
-      "description": "Runs agent-generated code as a per-subject Linux user in an empty network namespace. Reaches the world only through a local socket to mediatore-guest.",
+      "name": "Jailed agent (nsjail + Landlock)",
+      "description": "Runs agent-generated code as a per-subject Linux user: nsjail for the rootfs, the user, the mounts and the rlimits; the VM's network namespace behind an nftables chain keyed by the sandbox uid (ADR-0020); Landlock applied by the process itself before the agent runs, so writes stay in /work, /tmp and the home and TCP reaches only the ports of the broker and the audiences' endpoints, with no bind (ADR-0024).",
       "controls": {
-        "empty-network-namespace": {
-          "description": "The jailed process has an empty network namespace; its only channel out is a local socket to mediatore-guest.",
+        "uid-keyed-egress": {
+          "description": "The sandbox uid's packets reach the broker, the audiences' egress endpoints and DNS to the VM's resolvers; the rest is logged and dropped.",
           "requirements": [
             {
-              "requirement-url": "https://github.com/firestoned/mediatore/blob/main/docs/adr/0010-no-inbound-to-sandboxes.md",
+              "requirement-url": "https://github.com/firestoned/mediatore/blob/main/docs/adr/0020-jail-network-nftables-keyed-by-sandbox-uid.md",
               "config": {
                 "framework": "mediatore ADR",
                 "controls": [
-                  "ADR-0010 Decision 5 (Proposed)"
+                  "ADR-0020 Decisions 1 to 3 (Accepted, implemented)"
                 ],
-                "evidence": "docs/adr/0010-no-inbound-to-sandboxes.md"
+                "evidence": "crates/mediatore-guest/src/net.rs"
+              }
+            }
+          ]
+        },
+        "landlock-inside-the-jail": {
+          "description": "The workload's own process is confined by Landlock before its first instruction: paths and TCP ports as data from the claim, irreversible, inherited by every child; a refusal ends the claim.",
+          "requirements": [
+            {
+              "requirement-url": "https://github.com/firestoned/mediatore/blob/main/docs/adr/0024-landlock-inside-the-jail.md",
+              "config": {
+                "framework": "mediatore ADR",
+                "controls": [
+                  "ADR-0024 Decisions 1 to 4 (Accepted, implemented)"
+                ],
+                "evidence": "crates/mediatore-guest/src/confine.rs"
               }
             }
           ]

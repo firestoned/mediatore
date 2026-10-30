@@ -30,6 +30,8 @@ tracing-subscriber.workspace = true
 # The vsock report to a Cloud Hypervisor host (ADR-0019 decision 2); vsock is a Linux socket family.
 [target.'cfg(target_os = "linux")'.dependencies]
 socket2.workspace = true
+# Landlock for the jail's inner layer, applied by `jail-exec` (ADR-0024); Linux's LSM.
+nono.workspace = true
 
 [dev-dependencies]
 mediatore-testkit.workspace = true

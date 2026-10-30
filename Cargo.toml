@@ -62,6 +62,11 @@ webpki-roots = "1"
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs", "logging"] }
 hyper        = { version = "1", features = ["server", "http1", "http2"] }
 hyper-util   = { version = "0.1", features = ["server-auto", "server-graceful", "service", "tokio"] }
+# The jail's inner layer (ADR-0024): Landlock applied by `mediatore jail-exec` through nono's
+# library crate, pinned exactly (it decides what the workload may touch; bump by hand). The
+# keyring feature is off: no secret store in the guest. nono-proxy and nono-cli are not used
+# (they pull ring).
+nono         = { version = "=0.81.0", default-features = false }
 arc-swap     = "1"
 # AF_VSOCK for the guest's GuestReady report on Cloud Hypervisor (ADR-0019); `all` carries the vsock API
 socket2      = { version = "0.6", features = ["all"] }

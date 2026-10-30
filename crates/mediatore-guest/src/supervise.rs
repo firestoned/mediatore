@@ -8,11 +8,32 @@ use std::path::Path;
 
 use chrono::{DateTime, Utc};
 
+use crate::confine::EXIT_CONFINEMENT_REFUSED;
 use crate::jail::JailSpec;
 use crate::{net, sandboxfs, user};
 
 /// Seconds to wait before restarting a crashed workload.
 const RESTART_DELAY_SECS: u64 = 2;
+
+/// What the supervisor does after the jail exits before the deadline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Next {
+    /// The workload exited or crashed: start it again.
+    Restart,
+    /// `jail-exec` refused to confine the workload (ADR-0024 decision 4): the claim is
+    /// over, nothing may run unconfined.
+    Stop,
+}
+
+/// The decision for an exit status: only the confinement refusal stops the claim.
+#[must_use]
+pub fn after_exit(status: std::process::ExitStatus) -> Next {
+    if status.code() == Some(EXIT_CONFINEMENT_REFUSED) {
+        Next::Stop
+    } else {
+        Next::Restart
+    }
+}
 
 /// Run `nsjail` with the spec's arguments until `expires_at`, restarting on exit.
 ///
@@ -34,8 +55,16 @@ pub async fn run(spec: &JailSpec, expires_at: DateTime<Utc>) -> anyhow::Result<(
         tokio::select! {
             status = child.wait() => {
                 let status = status?;
-                tracing::warn!(%status, "workload exited before the deadline; restarting");
-                tokio::time::sleep(std::time::Duration::from_secs(RESTART_DELAY_SECS)).await;
+                match after_exit(status) {
+                    Next::Stop => {
+                        tracing::error!(%status, "the jail refused to confine the workload; not restarting");
+                        anyhow::bail!("confinement refused (exit {EXIT_CONFINEMENT_REFUSED}): the workload did not run");
+                    }
+                    Next::Restart => {
+                        tracing::warn!(%status, "workload exited before the deadline; restarting");
+                        tokio::time::sleep(std::time::Duration::from_secs(RESTART_DELAY_SECS)).await;
+                    }
+                }
             }
             () = tokio::time::sleep(remaining) => {
                 tracing::info!("claim deadline reached; stopping the jail");
@@ -71,4 +100,24 @@ pub async fn teardown(sandbox_root: &Path, username: &str) {
         tracing::warn!(user = username, error = %e, "could not remove sandbox user");
     }
     tracing::info!(user = username, "teardown complete");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt as _;
+    use std::process::ExitStatus;
+
+    #[test]
+    fn only_the_confinement_refusal_stops_the_claim() {
+        assert_eq!(
+            after_exit(ExitStatus::from_raw(EXIT_CONFINEMENT_REFUSED << 8)),
+            Next::Stop
+        );
+        assert_eq!(after_exit(ExitStatus::from_raw(0)), Next::Restart);
+        assert_eq!(after_exit(ExitStatus::from_raw(1 << 8)), Next::Restart);
+        assert_eq!(after_exit(ExitStatus::from_raw(127 << 8)), Next::Restart);
+        // Killed by a signal: no code at all, restarted.
+        assert_eq!(after_exit(ExitStatus::from_raw(9)), Next::Restart);
+    }
 }
