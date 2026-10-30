@@ -17,8 +17,11 @@ Every release attaches what the install needs beside the two images: the binary 
 (`mediatore-<version>-darwin-arm64`, the CLI: `login`, `sandbox`, `session`), `mediatore-<version>.yaml`
 (this `deploy/base` with the server image pinned by digest), the `VMImage` of step 6 pinned to
 the guest image's digest with the two cloud-config layers it names, the SBOMs and
-`checksums.sha256`, each file attested by the Build workflow. An overlay can name the
-manifest instead of a checkout, and every asset verifies offline:
+`checksums.sha256`, each file attested by the Build workflow. Every binary and both images
+report the release's version (`mediatore --version` prints `mediatore <version>`): the
+workspace version is set from the tag before each build, and the release job refuses a
+binary that says otherwise. An overlay can name the manifest instead of a checkout, and
+every asset verifies offline:
 
 ```sh
 gh release download v0.1.0 --repo firestoned/mediatore --pattern 'mediatore-0.1.0*' --pattern checksums.sha256

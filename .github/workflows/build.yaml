@@ -191,6 +191,13 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # The binary reports the release's version; fails if Cargo.toml then disagrees.
+      - name: Set the workspace version (release)
+        if: github.event_name == 'release'
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: make set-version VERSION="${TAG#v}"
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable (moving ref — re-pin quarterly)
         with:
@@ -207,6 +214,9 @@ jobs:
 
       - name: Release assets, dry run (the release-only logic, proven on every event)
         run: make release-assets-test
+
+      - name: Release version stamp works (the release-only step, proven on every event)
+        run: make set-version-test
 
       - name: Generate CycloneDX SBOM
         run: make sbom
@@ -236,6 +246,13 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The binary reports the release's version; fails if Cargo.toml then disagrees.
+      - name: Set the workspace version (release)
+        if: github.event_name == 'release'
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: make set-version VERSION="${TAG#v}"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable (moving ref: re-pin quarterly)
@@ -271,6 +288,13 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The binary reports the release's version; fails if Cargo.toml then disagrees.
+      - name: Set the workspace version (release)
+        if: github.event_name == 'release'
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: make set-version VERSION="${TAG#v}"
 
       - name: Set up Docker (login + buildx)
         uses: firestoned/github-actions/docker/setup-docker@f52366c4f57f0110012035ac1bcd0bee4075b3e9 # v1.4.0
@@ -348,6 +372,13 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The binary reports the release's version; fails if Cargo.toml then disagrees.
+      - name: Set the workspace version (release)
+        if: github.event_name == 'release'
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: make set-version VERSION="${TAG#v}"
 
       - name: Set up Docker (login + buildx)
         uses: firestoned/github-actions/docker/setup-docker@f52366c4f57f0110012035ac1bcd0bee4075b3e9 # v1.4.0
