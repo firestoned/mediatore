@@ -4,7 +4,7 @@
 # All CI logic lives here (rules/github-workflows.md): workflows install tools
 # and call these targets, and every target runs identically locally.
 
-.PHONY: all help fmt fmt-check lint test deny audit check sbom dist dist-e2e image guest-image guest-image-check crds e2e live-admission-test release-assets release-assets-test dist-darwin \
+.PHONY: all help fmt fmt-check lint test deny audit check sbom dist dist-e2e image guest-image guest-image-check crds e2e live-admission-test release-assets release-assets-test dist-darwin set-version set-version-test \
         kind-install kind-create kind-delete kind-down kind-spire kind-deploy kind-up \
         kind-images kind-postgres kind-dex kind-openbao kind-broker kind-banlieue-crds kind-e2e-entries kind-e2e-mtls kind-e2e-watcher kind-e2e-sandbox \
         kind-e2e-store kind-e2e-dex kind-e2e kind-e2e-ci kind-e2e-logs \
@@ -175,6 +175,8 @@ release-assets: ## Gather RELEASE_DIR for VERSION: the linux and darwin binaries
 	@test -x "$(RELEASE_BINARY)" || { echo "$(RELEASE_BINARY) missing or not executable: make dist first"; exit 1; }
 	@test -x "$(RELEASE_BINARY_DARWIN)" || { echo "$(RELEASE_BINARY_DARWIN) missing or not executable: make dist-darwin on a Mac, or stage the artifact"; exit 1; }
 	@command -v kubectl >/dev/null 2>&1 || { echo "Error: kubectl not found"; exit 1; }
+	@got=$$("$(RELEASE_BINARY)" --version 2>/dev/null); test "$$got" = "mediatore $(VERSION)" || \
+	  { echo "$(RELEASE_BINARY) reports '$$got', the release is $(VERSION): run make set-version VERSION=$(VERSION) before building"; exit 1; }
 	@mkdir -p "$(RELEASE_DIR)"
 	@cp "$(RELEASE_BINARY)" "$(RELEASE_DIR)/mediatore-$(VERSION)-linux-amd64"
 	@cp "$(RELEASE_BINARY_DARWIN)" "$(RELEASE_DIR)/mediatore-$(VERSION)-darwin-arm64"
@@ -193,12 +195,38 @@ release-assets: ## Gather RELEASE_DIR for VERSION: the linux and darwin binaries
 
 release-assets-test: ## Prove release-assets pins both images by digest, keeps every kind the install needs, and checksums every file
 	@tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
-	  printf '#!/bin/sh\n' > "$$tmp/mediatore" && chmod +x "$$tmp/mediatore"; cp "$$tmp/mediatore" "$$tmp/mediatore-darwin"; \
+	  printf '#!/bin/sh\necho "mediatore 0.0.0-test"\n' > "$$tmp/mediatore" && chmod +x "$$tmp/mediatore"; cp "$$tmp/mediatore" "$$tmp/mediatore-darwin"; \
 	  d1=sha256:$$(printf 'release-assets-test-image' | shasum -a 256 | cut -d' ' -f1); \
 	  d2=sha256:$$(printf 'release-assets-test-guest' | shasum -a 256 | cut -d' ' -f1); \
 	  $(MAKE) --no-print-directory -s release-assets VERSION=0.0.0-test IMAGE_DIGEST=$$d1 GUEST_DIGEST=$$d2 RELEASE_DIR="$$tmp/release" RELEASE_BINARY="$$tmp/mediatore" RELEASE_BINARY_DARWIN="$$tmp/mediatore-darwin" >/dev/null && \
 	  python3 scripts/check_release_assets.py "$$tmp/release" 0.0.0-test "$(RELEASE_IMAGE)@$$d1" "$(RELEASE_GUEST)@$$d2" && \
 	  echo "release-assets-test: ok"
+
+# The binary reports the release's version (`mediatore --version`, clap's `version` reads
+# CARGO_PKG_VERSION). The workspace version is set from the tag in every job that compiles
+# the binary (the musl and darwin builds, both images), so the tag, the four binaries and
+# the SBOMs agree; release-assets refuses a binary that reports anything else.
+VERSION_FILE ?= Cargo.toml
+
+set-version: ## Set [workspace.package] version in VERSION_FILE to VERSION; fails if the file does not then say so
+	@test -n "$(VERSION)" || { echo "set VERSION, e.g. make set-version VERSION=1.2.3"; exit 1; }
+	@perl -i -pe 's/^version = ".*"/version = "$(VERSION)"/ if /^\[workspace\.package\]/ ... /^\[/' $(VERSION_FILE)
+	@got=$$(awk -F'"' '/^\[workspace\.package\]/ { p = 1; next } /^\[/ { p = 0 } p && /^version *=/ { print $$2; exit }' $(VERSION_FILE)); \
+	  if [ "$$got" != "$(VERSION)" ]; then echo "$(VERSION_FILE): workspace version is '$$got', expected '$(VERSION)'"; exit 1; fi; \
+	  echo "$(VERSION_FILE): workspace version $(VERSION)"
+
+set-version-test: ## Prove set-version changes the workspace version, and only it, and the workspace still resolves
+	@tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
+	  cp Cargo.toml "$$tmp/Cargo.toml"; \
+	  $(MAKE) --no-print-directory -s set-version VERSION=0.0.0-set-version-test VERSION_FILE="$$tmp/Cargo.toml" >/dev/null && \
+	  changed=$$(diff Cargo.toml "$$tmp/Cargo.toml" | grep -c '^>'); \
+	  if [ "$$changed" != "1" ]; then echo "set-version changed $$changed lines, expected exactly 1"; exit 1; fi; \
+	  grep -q '^version = "0.0.0-set-version-test"' "$$tmp/Cargo.toml" || { echo "set-version did not set the version"; exit 1; }; \
+	  cp -R Cargo.toml Cargo.lock crates "$$tmp/" && \
+	  $(MAKE) --no-print-directory -s set-version VERSION=9.8.7 VERSION_FILE="$$tmp/Cargo.toml" >/dev/null && \
+	  ( cd "$$tmp" && cargo metadata --format-version 1 >/dev/null 2>"$$tmp/metadata.err" ) || \
+	    { cat "$$tmp/metadata.err"; echo "the workspace does not resolve at a new version: does an internal dependency pin one?"; exit 1; }; \
+	  echo "set-version-test: ok"
 
 live-admission-test: ## ClusterStaticEntry round trip as the mediatore ServiceAccount against a real cluster (MEDIATORE_LIVE_KUBECONFIG, MEDIATORE_LIVE_TRUST_DOMAIN, MEDIATORE_LIVE_CLASS_NAME; MEDIATORE_LIVE_IDENTITY=impersonate|self)
 	cargo test -p mediatore-spire --test live_kube -- --ignored
