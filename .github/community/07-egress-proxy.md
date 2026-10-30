@@ -3,21 +3,56 @@
 
 # 07: Credential-injecting egress proxy
 
-**Status: design reference** (runbook open decision #7; threat-model R-3's revisit
-condition). Phase 2 of the delegation model: instead of handing the workload a
-15-minute token it could exfiltrate, the sandbox's egress goes through a proxy that
-injects the credential on the way out — the workload never sees a token at all.
+**Status: in progress.** Phase 2 of the delegation model: instead of handing the workload
+a 15-minute token it could exfiltrate, the sandbox's egress goes through a proxy that
+injects the credential on the way out, and the workload never sees a token at all.
+Threat model R-3 was accepted until the ADR for this was written; it is rewritten now.
 
-Not scheduled until roadmap 04 is live and the token-in-workload model has real usage
-to learn from. Design questions to answer in the ADR when this activates:
-
-- Where the proxy runs (in-guest beside the agent vs on the host vs central) and what
-  identity it holds
-- How the audience is chosen per request (SNI/host allowlist vs explicit CONNECT)
-- What replaces `mediatore token` for tools that want raw tokens (nothing, ideally)
-- TLS: MITM-with-installed-CA vs CONNECT-only header injection for known APIs
-- What R-3 becomes afterwards (exfiltration window shrinks to the proxy's per-request
-  scope)
+- [x] The ADR. Done 2026-10-30 as
+      [ADR-0025](../../docs/adr/0025-phantom-token-egress-proxy.md), answering the
+      questions this roadmap carried: the proxy runs in the guest, as the sandbox user,
+      outside the jail, and holds the claim SVID (the identity the workload used to
+      hold); the audience is chosen per request by the host the request names, since
+      every `egress` endpoint is one audience's; nothing replaces `mediatore token` in
+      the jail (it stays a role, with no socket and no route inside); no TLS is
+      intercepted (a reverse proxy on loopback, nono's shape for credential injection);
+      R-3 becomes "the workload drives requests through the proxy within the rules
+      while the claim lives"
+- [x] The proxy. Done 2026-10-30: `mediatore egress-proxy`
+      (`crates/mediatore-guest/src/egress.rs`), started per claim by the guest as the
+      `sb-` user before the jail, on `127.0.0.1:3128`; `http://127.0.0.1:3128/<host>[:<port>]/<path>`
+      forwards to `https://<host>:<port>/<path>` over TLS 1.3 to the Mozilla roots,
+      HTTP/1.1 both legs, bodies streamed; the phantom in `MEDIATORE_TOKEN` swapped for
+      a token for the host's audience, fetched at `POST /v1/token` over the claim SVID and
+      cached until 30 s before its expiry; a bare request forwarded bare, a foreign bearer
+      `401`, a host outside the routes `404`; a proxy that exits ends the claim
+- [x] The policy format: nono's `endpoint_rules`. Done 2026-10-30: `audiences[].rules`
+      (`{ method, path }`, `*` one segment, `**` any) in the broker's config, carried to
+      the guest as `routes` on `GET /v1/me` (one per audience and endpoint); a request
+      outside the rules is `403` before anything is forwarded; the broker refuses an
+      endpoint declared by two audiences
+- [x] The jail's reach. Done 2026-10-30: no Workload API socket in the jail, no
+      `MEDIATORE_URL`; Landlock admits the proxy's port alone (ADR-0024 decision 2
+      amended), the uid-keyed table admits loopback to the proxy and drops packets to that
+      port from any other uid (ADR-0020 decision 3 amended); the phantom reaches the jail
+      through `nsjail`'s environment, never its argument list
+- [x] Proven in `make check`: `crates/mediatore/tests/e2e_egress.rs` against a TLS
+      upstream from the test kit (`TlsUpstream`), the dev-mode broker and the fake issuer
+- [ ] A private certificate authority per audience, for an upstream on a private PKI:
+      the broker's `issuers[].ca_file` shape, carried on the route, so the homelab's own
+      services are reachable through the proxy
+- [ ] An audience served directly, without the proxy, declared per audience for a
+      protocol that is not HTTP; never a default. Until then such an audience is
+      unreachable from the jail
+- [ ] Per-request approval: the proxy asks before forwarding a request a rule marks
+      as needing one (nono's approval backends; mediatore's would ask the broker, which
+      asks the requester). The instrument that narrows R-3 further
+- [ ] The proxy answers names for the jail, or the image pins a filtering resolver,
+      so the sandbox uid needs no DNS of its own (R-12)
+- [ ] Upstream connection reuse (one connection per request today) and HTTP/2 to the
+      upstream, if a workload needs them
+- [ ] notaio M3: the bundle renders the routes and the rules, so the jail's two layers
+      and the proxy come from one signed policy
 
 **Reference design (2026-10-30).** nono's supervisor and `nono-proxy`
 ([always-further/nono](https://github.com/always-further/nono)) are this roadmap built for

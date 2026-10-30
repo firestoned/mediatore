@@ -60,7 +60,7 @@ reqwest      = { version = "0.12", default-features = false, features = ["json",
 rustls       = { version = "0.23", default-features = false, features = ["aws-lc-rs", "logging", "prefer-post-quantum", "std"] }
 webpki-roots = "1"
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs", "logging"] }
-hyper        = { version = "1", features = ["server", "http1", "http2"] }
+hyper        = { version = "1", features = ["server", "client", "http1", "http2"] }
 hyper-util   = { version = "0.1", features = ["server-auto", "server-graceful", "service", "tokio"] }
 # The jail's inner layer (ADR-0024): Landlock applied by `mediatore jail-exec` through nono's
 # library crate, pinned exactly (it decides what the workload may touch; bump by hand). The
@@ -122,10 +122,12 @@ tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 clap               = { version = "4", features = ["derive", "env"] }
 
-# test-only (mock API server for the kube entry manager; test CA for SVIDs)
-tower-test     = "0.4"
+# http types and body utilities: the egress proxy (ADR-0025) and the test servers
 http           = "1"
 http-body-util = "0.1"
+
+# test-only (mock API server for the kube entry manager; test CA for SVIDs)
+tower-test     = "0.4"
 rcgen          = { version = "0.14", default-features = false, features = ["aws_lc_rs"] }
 time           = "0.3"
 

@@ -91,5 +91,10 @@
       (`image/cloud-config-deployment.example.yaml`); banlieue's EK-certificate layer in,
       its phase layer out; the `VMImage` and `VMClass` for libvirt in the homelab overlay
       (`deferred` until a Kairos 4.4 Debian base allows first-boot sealing)
+- [ ] `kernel.yama.ptrace_scope = 1` in the image's sysctl: Debian 13 ships 0, and since
+      [ADR-0025](../../docs/adr/0025-phantom-token-egress-proxy.md) the egress proxy
+      holds the claim's tokens as the same uid as the workload. The PID namespace and the
+      absent `/proc` are what keep the workload from naming the proxy's process; the
+      scope is a second line, cheap, and belongs with the image's other sysctls
 - [ ] Live proof on a libvirt member: reboot mid-claim re-attests with the same EK and
       recreates the jail (runbook 8.7 last row)

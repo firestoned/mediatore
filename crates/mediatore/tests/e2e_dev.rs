@@ -94,6 +94,21 @@ impl Harness {
             )]
             .into_iter()
             .collect(),
+            rules: [(
+                AUDIENCE.to_owned(),
+                vec![
+                    mediatore_proto::EndpointRule {
+                        method: "GET".into(),
+                        path: "/api/**".into(),
+                    },
+                    mediatore_proto::EndpointRule {
+                        method: "POST".into(),
+                        path: "/api/things/*/notes".into(),
+                    },
+                ],
+            )]
+            .into_iter()
+            .collect(),
             registries: [(
                 "registry.internal:5000".to_owned(),
                 mediatore_proto::RegistryCredential {

@@ -249,6 +249,23 @@ cargo test -p mediatore --test jail_exec_live -- --include-ignored
 Run it on the build host whenever `confine.rs` or `jail.rs` changes. The kind tiers run the
 guest with `--dev-skip-setup` and start no jail.
 
+### The egress proxy: in `make check`
+
+The proxy of [ADR-0025](../adr/0025-phantom-token-egress-proxy.md) is proven front to
+back in `make check`, with no socket and no jail: `crates/mediatore/tests/e2e_egress.rs`
+runs the fake issuer, the dev-mode broker, a TLS upstream from the test kit
+(`mediatore_testkit::TlsUpstream`, a fresh CA per test) that records what reaches it, and
+the real `Proxy` in between, with a token source that is a client of the dev header path
+(the Workload API is the one thing faked). It drives the proxy as the jailed workload
+would: plain HTTP on loopback, the host as the first path segment, the phantom in
+`Authorization`. The upstream receives an STS token it verifies against the broker's JWKS
+in place of the phantom; a second request reuses it (one fetch for two calls); a request
+with no header is forwarded bare; a foreign bearer is `401`, a request outside the
+audience's rules `403`, a host outside the routes `404`, none of them reaching the
+upstream; a released claim gets `502`, not a bare forward. The policy itself (`judge`, the
+route lookup, the rule glob) is unit-tested in `crates/mediatore-guest/src/egress.rs` and
+`crates/mediatore-proto/src/lib.rs`, and the ruleset's two new lines in `net.rs`.
+
 ### The sandbox filesystem and the pull: by hand, on the build host
 
 The tmpfs the guest mounts per claim and the image pull

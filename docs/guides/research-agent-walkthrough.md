@@ -39,9 +39,11 @@ the VM, and nothing of the sandbox machinery ([what "the workload"
 is](running-workloads.md#what-the-workload-is)). Three things make an image fit this
 platform, and all three are absences.
 
-- **No credential in it.** The agent gets a token at run time from the one binary the guest
-  mounts into the jail at `/usr/bin/mediatore`, so the image ships no client, no token file
-  and nothing at that path.
+- **No credential in it.** The agent never holds one: the jail's environment carries a
+  phantom token and the address of the egress proxy on the VM's loopback, and the proxy
+  swaps the phantom for the real token on the way out
+  ([ADR-0025](../adr/0025-phantom-token-egress-proxy.md)). The image ships no client, no
+  token file and nothing at `/usr/bin/mediatore`, where the guest mounts the one binary.
 - **No listener.** Nothing inbound ever reaches a sandbox ([ADR-0010](../adr/0010-no-inbound-to-sandboxes.md)). The agent
   takes its question from its arguments and delivers its answer by writing to the audience.
 - **No reliance on `/proc`, devices or setuid.** The jail mounts none of them; the rootfs is
@@ -58,30 +60,27 @@ RUN chmod 0755 /usr/local/bin/research-agent
 # No ENTRYPOINT: the claim's workload.args is the argv, in full.
 ```
 
-The agent's loop is short. It mints a token for the one audience it has, reads what it
-needs from the git host over HTTPS with that token, writes its findings, and mints again
-before the push: a token lives 15 minutes and the broker refreshes `octocat`'s session
+The agent's loop is short. It reads what it needs from the git host through the egress
+proxy, writes its findings, and pushes. It holds no token: every request carries the
+phantom from `MEDIATORE_TOKEN`, and the proxy, a process of the same sandbox user outside
+the jail, replaces it with a token for `internal-git` that it fetches over the claim's SVID
+and keeps to itself. A token lives 15 minutes and the broker refreshes `octocat`'s session
 before every one it mints, so a login revoked at Dex ends the agent at its next request
-([ADR-0013](../adr/0013-dex-session-delegation.md)).
+([ADR-0013](../adr/0013-dex-session-delegation.md), [ADR-0025](../adr/0025-phantom-token-egress-proxy.md)).
 
 ```python
 #!/usr/bin/env python3
-# research_agent.py, the shape of it: one audience, a token per call, the answer pushed.
-import subprocess, sys, datetime
+# research_agent.py, the shape of it: one audience, the phantom on every call, the answer pushed.
+import os, subprocess, sys, datetime
 
 QUESTION = sys.argv[1]
-GIT = "https://git.home.example"
-
-def token() -> str:
-    # The only credential surface in the jail: the claim's SVID, traded for a 15-minute
-    # bearer scoped to this audience. Logs go to stderr, the token alone to stdout.
-    return subprocess.check_output(
-        ["/usr/bin/mediatore", "token", "--audience", "internal-git"], text=True
-    ).strip()
+# The jail's only way out: http://127.0.0.1:3128/<host>/<path> goes to https://<host>/<path>.
+GIT = f"{os.environ['MEDIATORE_EGRESS_PROXY']}/git.home.example"
+PHANTOM = os.environ["MEDIATORE_TOKEN"]   # useless anywhere but at that proxy
 
 def git(*args: str) -> str:
     return subprocess.check_output(
-        ["git", "-c", f"http.extraheader=Authorization: Bearer {token()}", *args],
+        ["git", "-c", f"http.extraheader=Authorization: Bearer {PHANTOM}", *args],
         text=True, cwd="/work",
     )
 
@@ -93,7 +92,7 @@ open("/work/services/REPORT.md", "w").write(findings)
 git("-C", "services", "add", "REPORT.md")
 git("-C", "services", "-c", "user.name=research-agent",
     "-c", "user.email=research-agent@home.example", "commit", "-m", f"research: {QUESTION}")
-git("-C", "services", "push", "origin", branch)        # a fresh token for the push
+git("-C", "services", "push", "origin", branch)        # the proxy refreshes the token itself
 ```
 
 Build for the pool's architecture, push, and record the digest. The digest is what the
@@ -268,28 +267,40 @@ diagram):
    declared as a `ClusterStaticEntry` with the member as parent and the sandbox user as
    selector ([ADR-0006](../adr/0006-registration-entries-as-clusterstaticentry.md)).
 2. The guest on that member fetches the claim over mTLS with its node SVID: the subject,
-   the deadline, `workload`, the `egress` of the claim's audiences, and the GHCR credential
-   for this pull.
+   the deadline, `workload`, the `egress` of the claim's audiences and the proxy's routes
+   for them (the audience, the endpoint, its rules), and the GHCR credential for this pull.
 3. It creates `sb-…` for `octocat`, mounts a fresh tmpfs at `/mnt/sandbox`, pulls the image
    into it (every blob checked against its digest, the manifest digest logged), loads the
-   nftables ruleset keyed by the sandbox uid (the broker and `git.home.example:443`, DNS to
-   the member's resolvers, nothing else), and starts the argv under `nsjail` as that user;
-   inside, the binary applies Landlock to its own process before the argv runs, so writes
-   stay in `/work`, `/tmp` and the home and TCP reaches port 443 and the broker's port only
-   ([ADR-0024](../adr/0024-landlock-inside-the-jail.md)).
+   nftables ruleset keyed by the sandbox uid (the broker and `git.home.example:443` for the
+   proxy's sockets, the proxy's loopback port for the jail's, DNS to the member's
+   resolvers, nothing else), starts `mediatore egress-proxy` as that user with the routes
+   and a fresh phantom token, and starts the argv under `nsjail` as that user with the
+   phantom in its environment; inside, the binary applies Landlock to its own process
+   before the argv runs, so writes stay in `/work`, `/tmp` and the home and TCP reaches
+   the proxy's port only ([ADR-0024](../adr/0024-landlock-inside-the-jail.md),
+   [ADR-0025](../adr/0025-phantom-token-egress-proxy.md)).
 
    ```
    INFO mediatore_guest::guest: node registered node_id=…
    INFO mediatore_guest::guest: workload image pulled claim_uid=… image=ghcr.io/octocat/research-agent@sha256:9f86… image_digest=sha256:9f86… layers=6 bytes=58213441
-   INFO mediatore_guest::guest: sandbox ruleset loaded claim_uid=… user=sb-… uid=… destinations=2 resolvers=1 ruleset_sha256=…
+   INFO mediatore_guest::guest: sandbox ruleset loaded claim_uid=… user=sb-… uid=… destinations=3 resolvers=1 proxy_port=3128 ruleset_sha256=…
+   INFO mediatore_guest::guest: egress proxy ready claim_uid=… pid=… user=sb-… listen=127.0.0.1:3128 routes=1
    INFO mediatore_guest::supervise: jail started pid=… user=sb-…
    ```
 
-4. In the jail the agent runs `mediatore token --audience internal-git`: the token role
-   fetches the claim SVID from the Workload API socket (the only credential surface in
-   the jail), the broker refreshes `octocat`'s session at Dex and mints a 15-minute
-   `sts` token for `internal-git`, acting for `octocat`. The clone and the push each carry
-   a fresh one.
+4. The agent calls `http://127.0.0.1:3128/git.home.example/platform/services.git` with the
+   phantom in `Authorization`. The proxy finds the route (`internal-git`), checks the
+   method and path against the audience's rules, and, holding no token yet, fetches one:
+   its claim SVID from the Workload API socket (the proxy's, not the jail's), the broker
+   refreshes `octocat`'s session at Dex and mints a 15-minute `sts` token for
+   `internal-git`, acting for `octocat`. The request goes to `git.home.example` over TLS
+   with that token in place of the phantom; the push, minutes later, reuses it, and a
+   token near its expiry is replaced before the next request.
+
+   ```
+   INFO mediatore_guest::egress: token fetched for the proxy audience=internal-git expires_at=…
+   INFO mediatore_guest::egress: forwarded audience=internal-git host=git.home.example:443 method=GET path=/platform/services.git/info/refs?service=git-upload-pack status=200 OK credential=true
+   ```
 5. The report lands on `research/2026-10-28` at `git.home.example`. The agent exits; the
    guest restarts it until the deadline, since a workload that exits early is restarted
    (the agent is idempotent: a branch that exists is a no-op).
@@ -315,7 +326,7 @@ banlieue destroys the member. Nothing of the run survives on it.
 | `audiences[].name` | `audiences[]` in the broker's config; a claim naming one not there is refused before any VM exists | the same, with the policy's set as the ceiling and the version stamped into the token |
 | `audiences[].access: Write`, `scopes` | not expressed: a token carries `aud`, `sub` and `act`; what it may do is the git host's authorization of `octocat` | the bundle's access and scopes, carried in the token |
 | `ttlSeconds: 900` | the audience's `max_ttl` and the broker's 15-minute cap | the bundle's value |
-| `egress: []` and the audience's host | the audience's `egress` in the broker's config, rendered by the guest into nftables keyed by the sandbox uid | rendered from the bundle, with the direct hosts the policy allows |
+| `egress: []` and the audience's host | the audience's `egress` in the broker's config, rendered by the guest into nftables keyed by the sandbox uid and into the egress proxy's routes; the audience's `rules` bound the methods and paths the proxy forwards ([ADR-0025](../adr/0025-phantom-token-egress-proxy.md)) | rendered from the bundle, with the direct hosts the policy allows and the endpoint rules it names |
 | the image (K8.1) | `workload.image` on the claim, pulled by the guest, verified by digest | the step's meaning, from the register |
 | `lease.maxDurationSeconds` | the claim's `ttl_seconds`, the member destroyed at the deadline | the bundle's value as the ceiling |
 | the `ExposureCeiling` | notaio: no ceiling, no bundle | unchanged |

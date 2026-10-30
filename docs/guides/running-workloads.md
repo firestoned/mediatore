@@ -23,8 +23,9 @@ RBAC on the cluster can create the same resource directly, see
 **Nothing inbound ever reaches the VM.** There is no SSH, no exec API, no reverse
 channel from mediatore. The workload is declared *at claim time* (`workload.image` +
 `workload.args`), started by the in-guest agent, and speaks to the world only through
-its allowed egress: mediatore's sandbox listener and the claim's downstream audiences.
-If you need interactivity, the workload dials **out** (see
+its allowed egress: the claim's downstream audiences, reached through the egress proxy
+on the VM's loopback ([ADR-0025](../adr/0025-phantom-token-egress-proxy.md)). If you
+need interactivity, the workload dials **out** (see
 [Interaction patterns](#interaction-patterns)).
 
 ## Path A: a user, directly
@@ -83,7 +84,8 @@ If you need interactivity, the workload dials **out** (see
    a `ClusterStaticEntry` and the SPIRE Controller Manager creates it (no entry ever
    exists any other way, ADR-0006); the in-guest agent fetches the subject over mTLS,
    creates your `sb-` user, mounts a fresh tmpfs, pulls your image into it as the
-   rootfs, loads the ruleset and starts your command under nsjail.
+   rootfs, loads the ruleset, starts the egress proxy as that user and starts your
+   command under nsjail with a phantom token in its environment.
    No further input from you is needed or possible.
 
 ```mermaid
@@ -95,6 +97,7 @@ sequenceDiagram
     participant K as Kubernetes API<br/>(banlieue)
     participant S as SPIRE server
     participant G as in-guest agent<br/>(on the bound VM)
+    participant P as egress proxy<br/>(sb- user, outside the jail)
     participant W as workload (jailed)
     participant D as downstream API
 
@@ -108,12 +111,16 @@ sequenceDiagram
     M->>K: declare ClusterStaticEntry spiffe://td/banlieue/claim/(uid),<br/>parent = VM node, selector unix:user:sb-hash
     K-->>S: controller manager renders the entry; status.set observed
     G->>M: GET /v1/me (mTLS, node SVID)
-    M-->>G: subject, expires_at, workload {image, args}, egress
-    G->>G: useradd sb-hash, tmpfs at /mnt/sandbox, pull image into rootfs (digests checked),<br/>nft ruleset keyed by its uid, nsjail as sb-hash
-    G->>W: exec workload.args
-    W->>M: POST /v1/token {audience} (mTLS, claim SVID)
-    M-->>W: 15-min token, aud = one audience, acting for subject
-    W->>D: call with token (audit shows broker on behalf of subject)
+    M-->>G: subject, expires_at, workload {image, args}, egress, routes
+    G->>G: useradd sb-hash, tmpfs at /mnt/sandbox, pull image into rootfs (digests checked),<br/>nft ruleset keyed by its uid, phantom token
+    G->>P: start mediatore egress-proxy as sb-hash (routes, phantom)
+    G->>W: nsjail as sb-hash: exec workload.args, MEDIATORE_TOKEN = phantom
+    W->>P: http://127.0.0.1:3128/host/path, Authorization: Bearer phantom
+    P->>M: POST /v1/token {audience} (mTLS, claim SVID)
+    M-->>P: 15-min token, aud = one audience, acting for subject
+    P->>D: the request with the real token (audit shows broker on behalf of subject)
+    D-->>P: response
+    P-->>W: response
     Note over M,W: TTL expires or DELETE /v1/claims:<br/>entry deleted, tokens refused, jail torn down, VM destroyed
 ```
 
@@ -214,9 +221,10 @@ So "the workload" is your agent packaged as a container image, and the VM is wha
 mediatore runs it on. One VM image serves every workload image; the pull credential of
 [ADR-0022](../adr/0022-registry-pull-credentials-from-the-broker.md) is the operator's
 because the registry it opens is where the organisation publishes its sanctioned agent
-images, not anything of the user's. The `mediatore token` the workload calls is not in
-your image either: the guest bind-mounts the one binary into the jail
-([ADR-0014](../adr/0014-one-binary-roles-as-subcommands.md)).
+images, not anything of the user's. Nothing of mediatore's is in your image either: the
+guest bind-mounts the one binary into the jail for the confinement step
+([ADR-0014](../adr/0014-one-binary-roles-as-subcommands.md), [ADR-0024](../adr/0024-landlock-inside-the-jail.md)),
+and the credential never enters the jail at all ([ADR-0025](../adr/0025-phantom-token-egress-proxy.md)).
 [The research agent, front to back](research-agent-walkthrough.md) follows one workload
 image from the team that publishes it to the report it pushes, with the policy notaio
 certifies for it.
@@ -236,19 +244,24 @@ under nsjail as the per-subject user. The jail gives it:
 
 | Inside the jail | Purpose |
 | --- | --- |
-| `/run/spire/agent.sock` (read-only) | The **only** credential surface: fetch the claim SVID |
-| `MEDIATORE_URL` env | Where to trade the SVID for tokens |
+| `MEDIATORE_EGRESS_PROXY` env (`http://127.0.0.1:3128`) | The **only** way out: a reverse proxy on the VM's loopback, run by the guest as your `sb-` user outside the jail. Call `$MEDIATORE_EGRESS_PROXY/<host>[:<port>]/<path>` and the proxy forwards to `https://<host>:<port>/<path>`, for the `egress` endpoints of the claim's audiences and no other host ([ADR-0025](../adr/0025-phantom-token-egress-proxy.md)) |
+| `MEDIATORE_TOKEN` env | A **phantom** token: send it as `Authorization: Bearer $MEDIATORE_TOKEN` and the proxy replaces it with a real token for the host's audience on the way out. The real token lives in the proxy and never enters the jail. Any other `Authorization` value is refused (`401`); no header at all is forwarded bare |
+| The audience's rules | The operator may bound an audience to methods and paths (`audiences[].rules`, nono's `endpoint_rules` shape: `{ method, path }`, `*` one segment, `**` any). A request outside them is refused (`403`) before anything is forwarded; no rules means every method and path |
 | The rootfs (read-only) | Your image's filesystem as pulled: root-owned, setuid bits dropped, no device nodes ([ADR-0021](../adr/0021-sandbox-filesystem-tmpfs-and-rootfs-from-the-registry.md)) |
 | `/work` (writable), tmpfs `/tmp` + `$HOME` | Scratch space; `/work` is your `sb-` user's on the per-claim tmpfs, gone with the unmount at teardown |
-| `/usr/bin/mediatore` (read-only, the same file the guest runs from) | `mediatore token --audience api://trading-data` prints a 15-min bearer; the rootfs ships no client ([ADR-0014](../adr/0014-one-binary-roles-as-subcommands.md)) |
-| The VM's network, filtered by the sandbox uid | TCP to the broker and to the `egress` endpoints of the claim's audiences, DNS to the VM's resolvers; everything else the workload sends is logged (`mediatore-sandbox drop:`) and dropped ([ADR-0020](../adr/0020-jail-network-nftables-keyed-by-sandbox-uid.md)) |
-| Landlock, applied before your argv runs | What `nsjail` execs is `mediatore jail-exec`, which confines its own process and then execs your command: writes only to `/work`, `/tmp` and `$HOME` whatever your image's file modes say, TCP `connect()` only to the ports of the broker and the `egress` endpoints, no `bind()`, signals and abstract sockets scoped to the jail; inherited by every process you start. A write elsewhere fails with `EACCES`, a listener fails at `bind()` ([ADR-0024](../adr/0024-landlock-inside-the-jail.md)) |
+| `/usr/bin/mediatore` (read-only, the same file the guest runs from) | What `nsjail` execs before your argv, for the confinement below; the rootfs ships nothing of mediatore's ([ADR-0014](../adr/0014-one-binary-roles-as-subcommands.md)). `mediatore token` is still in it, with no socket and no route to the broker: inside the jail it does nothing |
+| The VM's network, filtered by the sandbox uid | TCP to the proxy on loopback, and for the proxy's own sockets (the same uid) the broker, the `egress` endpoints and DNS to the VM's resolvers; everything else the uid sends is logged (`mediatore-sandbox drop:`) and dropped, and a packet to the proxy's port from any other uid is dropped ([ADR-0020](../adr/0020-jail-network-nftables-keyed-by-sandbox-uid.md), [ADR-0025](../adr/0025-phantom-token-egress-proxy.md)) |
+| Landlock, applied before your argv runs | What `nsjail` execs is `mediatore jail-exec`, which confines its own process and then execs your command: writes only to `/work`, `/tmp` and `$HOME` whatever your image's file modes say, TCP `connect()` only to the proxy's port, no `bind()`, signals and abstract sockets scoped to the jail; inherited by every process you start. A write elsewhere fails with `EACCES`, a listener fails at `bind()`, a direct connection to anything fails too ([ADR-0024](../adr/0024-landlock-inside-the-jail.md)) |
 
-No token files, no baked-in secrets, and no network beyond the broker and the endpoints
-the claim's audiences declare (`audiences[].egress` in the broker's config, [ADR-0020](../adr/0020-jail-network-nftables-keyed-by-sandbox-uid.md)): an
-audience with none gives tokens with nowhere to spend them, which is the default until
-the operator says where. For tools that read a bearer from the environment:
-`TOKEN=$(mediatore token --audience ...) exec your-tool`; logs go to standard error, the token alone to standard output.
+No socket, no token files, no baked-in secrets, and no network beyond the proxy and,
+through it, the endpoints the claim's audiences declare (`audiences[].egress` in the
+broker's config, [ADR-0020](../adr/0020-jail-network-nftables-keyed-by-sandbox-uid.md)):
+an audience with none gives nowhere to go, which is the default until the operator says
+where. Tools that take a base URL and a bearer from the environment work unchanged:
+`OPENAI_BASE_URL=$MEDIATORE_EGRESS_PROXY/api.openai.com/v1 OPENAI_API_KEY=$MEDIATORE_TOKEN`;
+`git clone -c http.extraheader="Authorization: Bearer $MEDIATORE_TOKEN" $MEDIATORE_EGRESS_PROXY/git.home.example/platform/services.git`.
+Nothing in the jail mints, refreshes or caches a token: the proxy does, over the claim's
+SVID, as `mediatore token` used to from inside.
 
 ## Interaction patterns
 
@@ -260,10 +273,12 @@ Because nothing inbound reaches the VM, pick one of:
 2. **Dial-out interactive.** For a conversational agent, run the agent *as* the
    workload and have it connect outward to your orchestrator or relay (WebSocket,
    queue). Register the orchestrator's endpoint as a **downstream audience**: the
-   workload then both *reaches* it (egress allowlist) and *authenticates* to it
-   (audience-scoped token carrying the subject + the RFC 8693 `act` claim naming the
-   sandbox). Your orchestrator can verify it is talking to the sandbox for claim X
-   acting for user Y — not just anyone holding a URL.
+   workload then both *reaches* it (through the egress proxy) and *authenticates* to it
+   (the proxy injects the audience-scoped token carrying the subject + the RFC 8693
+   `act` claim naming the sandbox). Your orchestrator can verify it is talking to the
+   sandbox for claim X acting for user Y, not just anyone holding a URL. The proxy
+   speaks HTTP/1.1; a WebSocket upgrade is not relayed, so a dial-out relay is a plain
+   HTTPS API or a long poll.
 3. **Poll-the-broker.** The caller polls `GET /v1/claims/{name}` for phase and
    deadline; that endpoint mirrors state but never carries workload output. Output
    always travels via pattern 1 or 2.
@@ -282,6 +297,8 @@ Because nothing inbound reaches the VM, pick one of:
   server to attest to; 06's open items are root's own egress and the input chain with
   the image, seccomp, the image bake and the live libvirt proof. See
   [`ROADMAPS.md`](https://github.com/firestoned/mediatore/blob/main/ROADMAPS.md).
-- Threat model: the exfiltration window of the 15-minute in-workload token is
-  accepted risk R-3; the dial-out pattern narrows what a leaked token can do
-  (one audience), and roadmap 07 is the design that removes the window entirely.
+- Threat model: the workload holds no token since the egress proxy
+  ([ADR-0025](../adr/0025-phantom-token-egress-proxy.md), roadmap 07): what a
+  prompt-injected workload can do is drive requests through the proxy, within the
+  audience's rules, while the claim lives (R-3, rewritten). The dial-out pattern narrows
+  that to one audience.

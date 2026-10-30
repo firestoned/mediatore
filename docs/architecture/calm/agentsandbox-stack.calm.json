@@ -287,19 +287,33 @@
     {
       "unique-id": "agentsandbox-nono",
       "node-type": "service",
-      "name": "nono (library in the jail; proxy proposed)",
-      "description": "Partly built: the nono library applies Landlock around the jailed agent from inside the guest's own binary (ADR-0024). The per-tool broker and phantom credentials injected at egress remain proposed (roadmap 07); nono-proxy itself is not used.",
+      "name": "nono (library in the jail; its proxy shape rebuilt in mediatore)",
+      "description": "Built in two parts: the nono library applies Landlock around the jailed agent from inside the guest's own binary (ADR-0024), and the phantom-token egress proxy with nono's endpoint-rule shape is mediatore's own egress-proxy role on this workspace's TLS stack (ADR-0025); nono-proxy itself is not used, it pulls ring. Roadmap 07.",
       "metadata": {
-        "status": "in-progress",
-        "diagram-style": "dashed orange: proposed, not built yet"
+        "status": "implemented"
       }
     },
     {
       "unique-id": "agentsandbox-jailed-agent",
       "node-type": "service",
       "name": "Jailed agent (nsjail + Landlock)",
-      "description": "Runs agent-generated code as a per-subject Linux user: nsjail for the rootfs, the user, the mounts and the rlimits; the VM's network namespace behind an nftables chain keyed by the sandbox uid (ADR-0020); Landlock applied by the process itself before the agent runs, so writes stay in /work, /tmp and the home and TCP reaches only the ports of the broker and the audiences' endpoints, with no bind (ADR-0024).",
+      "description": "Runs agent-generated code as a per-subject Linux user: nsjail for the rootfs, the user, the mounts and the rlimits; the VM's network namespace behind an nftables chain keyed by the sandbox uid (ADR-0020); Landlock applied by the process itself before the agent runs, so writes stay in /work, /tmp and the home and TCP reaches only the egress proxy's loopback port, with no bind (ADR-0024, ADR-0025). Holds a phantom token and no credential: the real token lives in the egress proxy, a process of the same user outside the jail (ADR-0025).",
       "controls": {
+        "phantom-token-egress": {
+          "description": "The jailed agent never holds a downstream token: it calls a reverse proxy on loopback with a phantom, the proxy swaps in the audience's token (fetched over the claim SVID, held in the proxy only) and enforces the audience's method and path rules; the Workload API socket is not in the jail.",
+          "requirements": [
+            {
+              "requirement-url": "https://github.com/firestoned/mediatore/blob/main/docs/adr/0025-phantom-token-egress-proxy.md",
+              "config": {
+                "framework": "mediatore ADR",
+                "controls": [
+                  "ADR-0025 Decisions 1 to 5 (Accepted, implemented)"
+                ],
+                "evidence": "crates/mediatore-guest/src/egress.rs"
+              }
+            }
+          ]
+        },
         "uid-keyed-egress": {
           "description": "The sandbox uid's packets reach the broker, the audiences' egress endpoints and DNS to the VM's resolvers; the rest is logged and dropped.",
           "requirements": [

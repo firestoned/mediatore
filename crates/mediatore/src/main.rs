@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! mediatore: identity broker for banlieue sandbox VMs. One binary, every role a subcommand
-//! (ADR-0014): `serve` is the broker, `guest` and `token` are the VM side, `login`,
-//! `sandbox` and `session` are the user's tools, `revoke` the admin stub.
+//! (ADR-0014): `serve` is the broker, `guest`, `egress-proxy`, `jail-exec` and `token` are
+//! the VM side, `login`, `sandbox` and `session` are the user's tools, `revoke` the admin stub.
 
 mod config;
 
@@ -52,6 +52,8 @@ enum Cmd {
     Token(mediatore_guest::token::TokenArgs),
     /// Inside the jail, before the workload: apply Landlock to this process, then exec the argv (ADR-0024).
     JailExec(mediatore_guest::confine::JailExecArgs),
+    /// Beside the jail, as the sandbox user: the reverse proxy that swaps the jail's phantom token for the audience's real one (ADR-0025).
+    EgressProxy(mediatore_guest::egress::EgressArgs),
     /// The user's tools: `login`, `sandbox create|get|delete`, `session`.
     #[command(flatten)]
     User(mediatore_client::cli::UserCmd),
@@ -84,6 +86,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Serve { config } => serve(&config).await,
         Cmd::Guest(args) => mediatore_guest::guest::run(args).await,
         Cmd::Token(args) => mediatore_guest::token::run(args).await,
+        Cmd::EgressProxy(args) => mediatore_guest::egress::run(args).await,
         Cmd::JailExec(args) => {
             // Returns only when the workload did not run; on success this process is the workload.
             let err = mediatore_guest::confine::run(&args);
@@ -147,6 +150,11 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
             .audiences
             .iter()
             .map(|a| (a.name.clone(), a.egress.clone()))
+            .collect(),
+        rules: cfg
+            .audiences
+            .iter()
+            .map(|a| (a.name.clone(), a.rules.clone()))
             .collect(),
         registries,
         sandboxes,
@@ -564,6 +572,48 @@ mod tests {
         );
         // ADR-0024 decision 4 at the parser: the argv is required.
         assert!(parse(&["mediatore", "jail-exec", "--connect-port", "443"]).is_err());
+    }
+
+    #[test]
+    fn egress_proxy_is_a_subcommand_with_its_files_and_a_loopback_default() {
+        let proxy = parse(&[
+            "mediatore",
+            "egress-proxy",
+            "--mediatore-url",
+            "https://mediatore.test:8443",
+            "--routes",
+            "/mnt/sandbox/egress/routes.json",
+            "--phantom-file",
+            "/mnt/sandbox/egress/phantom",
+        ]);
+        let Ok(Cmd::EgressProxy(args)) = proxy else {
+            panic!("{proxy:?}");
+        };
+        assert_eq!(args.listen.to_string(), "127.0.0.1:3128");
+        assert_eq!(
+            args.workload_api_socket, "/run/spire/sockets/agent.sock",
+            "the host's socket path: the proxy runs outside the jail"
+        );
+        assert_eq!(
+            args.routes.to_str(),
+            Some("/mnt/sandbox/egress/routes.json")
+        );
+        // The guest's command line for it is what the parser accepts.
+        let files = mediatore_guest::egress::EgressFiles {
+            routes: "/r".into(),
+            phantom: "/p".into(),
+        };
+        let mut line = vec!["mediatore".to_owned()];
+        line.extend(mediatore_guest::egress::command_args(
+            "127.0.0.1:3128".parse().unwrap(),
+            "https://b",
+            "/run/spire/sockets/agent.sock",
+            &files,
+        ));
+        let line: Vec<&str> = line.iter().map(String::as_str).collect();
+        assert!(matches!(parse(&line), Ok(Cmd::EgressProxy(_))), "{line:?}");
+        // The routes and the phantom are required.
+        assert!(parse(&["mediatore", "egress-proxy", "--mediatore-url", "https://b"]).is_err());
     }
 
     #[test]

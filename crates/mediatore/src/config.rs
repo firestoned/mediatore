@@ -6,8 +6,8 @@
 use std::path::{Path, PathBuf};
 
 use mediatore_entra::{Backend, IssuerConfig};
-use mediatore_proto::Endpoint;
 use mediatore_proto::image::canonical_registry;
+use mediatore_proto::{Endpoint, EndpointRule};
 use mediatore_store::seal::TransitConfig;
 use serde::Deserialize;
 
@@ -26,6 +26,12 @@ pub struct AudienceConfig {
     /// tokens with nowhere to spend them: the jail reaches the broker only.
     #[serde(default, deserialize_with = "endpoints")]
     pub egress: Vec<Endpoint>,
+    /// What the workload may ask of this audience through the egress proxy (ADR-0025
+    /// decision 4): `{ method, path }` rules in nono's `endpoint_rules` shape, `method` an
+    /// HTTP method or `*`, `path` a glob (`*` one segment, `**` zero or more). Empty admits
+    /// every method and path; once any rule exists, a request outside them is refused.
+    #[serde(default)]
+    pub rules: Vec<EndpointRule>,
 }
 
 fn default_max_ttl() -> i64 {
@@ -308,6 +314,39 @@ fn default_listen() -> ListenConfig {
 }
 
 impl Config {
+    /// The egress proxy chooses the token by the endpoint a request names (ADR-0025
+    /// decision 4), so an endpoint may belong to one audience only; and a rule must be
+    /// a method or `*` with an absolute path.
+    fn check_routes(&self) -> anyhow::Result<()> {
+        let mut owner: std::collections::BTreeMap<&Endpoint, &str> =
+            std::collections::BTreeMap::new();
+        for a in &self.audiences {
+            for e in &a.egress {
+                if let Some(other) = owner.insert(e, &a.name)
+                    && other != a.name
+                {
+                    anyhow::bail!(
+                        "egress endpoint {e} is declared by audiences {other:?} and {:?}: the egress proxy must choose one token per endpoint (ADR-0025)",
+                        a.name
+                    );
+                }
+            }
+            for r in &a.rules {
+                let method_ok = r.method == "*"
+                    || (!r.method.is_empty() && r.method.chars().all(|c| c.is_ascii_alphabetic()));
+                if !method_ok || !r.path.starts_with('/') {
+                    anyhow::bail!(
+                        "audience {:?}: rule {{ method: {:?}, path: {:?} }} needs an HTTP method or `*` and an absolute path glob",
+                        a.name,
+                        r.method,
+                        r.path
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// One credential per registry host, Docker Hub's two names being one host.
     fn check_registries(&self) -> anyhow::Result<()> {
         let mut seen = std::collections::BTreeSet::new();
@@ -353,6 +392,7 @@ impl Config {
             anyhow::bail!("an audience uses the sts backend but no `sts` section is configured");
         }
         cfg.check_registries()?;
+        cfg.check_routes()?;
         cfg.check_entra()?;
         if !cfg.dev_mode && cfg.spire.is_none() {
             anyhow::bail!("`spire` (workload_api_socket, entries) is required outside dev_mode");
@@ -549,6 +589,56 @@ listen: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }
         .unwrap_err()
         .to_string();
         assert!(err.contains("host:port"), "{err}");
+    }
+
+    #[test]
+    fn rules_are_parsed_per_audience_and_default_to_none() {
+        let cfg = Config::parse(
+            "trust_domain: sandbox.test\nissuers: []\nlisten: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }\ndev_mode: true\nsts: { issuer: https://mediatore.test, kid: k, signing_key_file: /k }\naudiences:\n  - name: internal-git\n    via: sts\n    egress: [\"git.home.example:443\"]\n    rules:\n      - { method: GET, path: \"/platform/**\" }\n      - { method: \"*\", path: \"/platform/*/git-receive-pack\" }\n  - { name: grafana.home.example, via: sts, egress: [\"grafana.home.example:443\"] }\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.audiences[0].rules.len(), 2);
+        assert_eq!(cfg.audiences[0].rules[0].method, "GET");
+        assert_eq!(cfg.audiences[0].rules[1].method, "*");
+        assert_eq!(
+            cfg.audiences[1].rules,
+            Vec::<EndpointRule>::new(),
+            "no rules: every method and path at that audience's endpoints"
+        );
+    }
+
+    #[test]
+    fn a_rule_without_a_method_or_an_absolute_path_fails_the_config() {
+        for bad in [
+            "{ method: \"\", path: \"/x\" }",
+            "{ method: GET, path: \"x\" }",
+            "{ method: \"G ET\", path: \"/x\" }",
+        ] {
+            let err = Config::parse(&format!(
+                "trust_domain: sandbox.test\nissuers: []\nlisten: {{ user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }}\ndev_mode: true\nsts: {{ issuer: https://mediatore.test, kid: k, signing_key_file: /k }}\naudiences:\n  - {{ name: a, via: sts, egress: [\"a.home.example:443\"], rules: [{bad}] }}\n"
+            ))
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("absolute path glob"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn an_endpoint_declared_by_two_audiences_fails_the_config() {
+        let err = Config::parse(
+            "trust_domain: sandbox.test\nissuers: []\nlisten: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }\ndev_mode: true\nsts: { issuer: https://mediatore.test, kid: k, signing_key_file: /k }\naudiences:\n  - { name: a, via: sts, egress: [\"api.home.example:443\"] }\n  - { name: b, via: sts, egress: [\"api.home.example:443\", \"b.home.example:443\"] }\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("api.home.example:443") && err.contains("ADR-0025"),
+            "{err}"
+        );
+        // The same audience listing an endpoint twice is not a conflict.
+        Config::parse(
+            "trust_domain: sandbox.test\nissuers: []\nlisten: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }\ndev_mode: true\nsts: { issuer: https://mediatore.test, kid: k, signing_key_file: /k }\naudiences:\n  - { name: a, via: sts, egress: [\"api.home.example:443\", \"api.home.example:443\"] }\n",
+        )
+        .unwrap();
     }
 
     #[test]

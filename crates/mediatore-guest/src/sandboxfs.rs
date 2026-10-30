@@ -162,6 +162,9 @@ pub struct Layout {
     pub work: PathBuf,
     /// Where layers are staged while they are hashed, root's, mode 0700.
     pub layers: PathBuf,
+    /// The egress proxy's files (the routes, the phantom; ADR-0025), the sandbox user's,
+    /// mode 0700, outside the jail's mounts.
+    pub egress: PathBuf,
 }
 
 /// Create the layout under `root` for the sandbox user `uid`:`gid`.
@@ -170,16 +173,19 @@ pub fn prepare(root: &Path, uid: u32, gid: u32) -> anyhow::Result<Layout> {
         rootfs: root.join("rootfs"),
         work: root.join("work"),
         layers: root.join("layers"),
+        egress: root.join("egress"),
     };
     for (dir, mode) in [
         (&layout.rootfs, 0o755),
         (&layout.work, 0o700),
         (&layout.layers, 0o700),
+        (&layout.egress, 0o700),
     ] {
         std::fs::create_dir_all(dir)?;
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode))?;
     }
     std::os::unix::fs::chown(&layout.work, Some(uid), Some(gid))?;
+    std::os::unix::fs::chown(&layout.egress, Some(uid), Some(gid))?;
     Ok(layout)
 }
 
@@ -236,12 +242,20 @@ mod tests {
         assert_eq!(l.rootfs, root.join("rootfs"));
         assert_eq!(l.work, root.join("work"));
         assert_eq!(l.layers, root.join("layers"));
+        assert_eq!(l.egress, root.join("egress"));
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
         assert_eq!(mode(&l.rootfs), 0o755);
         assert_eq!(mode(&l.work), 0o700);
         assert_eq!(mode(&l.layers), 0o700);
+        assert_eq!(mode(&l.egress), 0o700);
         let work = std::fs::metadata(&l.work).unwrap();
         assert_eq!((work.uid(), work.gid()), (uid, gid));
+        let egress = std::fs::metadata(&l.egress).unwrap();
+        assert_eq!(
+            (egress.uid(), egress.gid()),
+            (uid, gid),
+            "the proxy runs as the sandbox user and reads its files there (ADR-0025)"
+        );
         // Idempotent: a second call keeps the tree.
         std::fs::write(l.work.join("kept"), b"x").unwrap();
         prepare(&root, uid, gid).unwrap();

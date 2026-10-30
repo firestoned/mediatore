@@ -46,6 +46,7 @@ flowchart LR
     service-spire-agent["SPIRE Agent (in guest)"]
     service-guest-agent["mediatore guest"]
     service-sandbox-workload["Jailed Workload"]
+    service-egress-proxy["mediatore egress-proxy"]
     network-sandbox-segment["Sandbox Network Segment"]
     subgraph sg_system-mediatore [System Mediatore]
         service-mediatore-user-api
@@ -59,6 +60,7 @@ flowchart LR
     subgraph sg_system-sandbox-vm [System Sandbox Vm]
         service-spire-agent
         service-guest-agent
+        service-egress-proxy
         service-sandbox-workload
     end
     subgraph sg_network-sandbox-segment [Network Sandbox Segment]
@@ -95,8 +97,9 @@ flowchart LR
     service-guest-agent -->|mTLS| service-mediatore-sandbox-api
     service-guest-agent --> system-banlieue
     service-guest-agent -->|HTTPS| ecosystem-oci-registry
-    service-sandbox-workload -->|mTLS| service-mediatore-sandbox-api
-    service-sandbox-workload -->|HTTPS| ecosystem-downstream-api
+    service-sandbox-workload -->|HTTP| service-egress-proxy
+    service-egress-proxy -->|mTLS| service-mediatore-sandbox-api
+    service-egress-proxy -->|HTTPS| ecosystem-downstream-api
     actor-sandbox-user --> data-asset-claim-store
     system-mediatore -->|TLS| database-store
     system-mediatore -->|TLS| service-openbao
