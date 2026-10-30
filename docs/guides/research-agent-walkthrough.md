@@ -273,7 +273,10 @@ diagram):
 3. It creates `sb-…` for `octocat`, mounts a fresh tmpfs at `/mnt/sandbox`, pulls the image
    into it (every blob checked against its digest, the manifest digest logged), loads the
    nftables ruleset keyed by the sandbox uid (the broker and `git.home.example:443`, DNS to
-   the member's resolvers, nothing else), and starts the argv under `nsjail` as that user.
+   the member's resolvers, nothing else), and starts the argv under `nsjail` as that user;
+   inside, the binary applies Landlock to its own process before the argv runs, so writes
+   stay in `/work`, `/tmp` and the home and TCP reaches port 443 and the broker's port only
+   ([ADR-0024](../adr/0024-landlock-inside-the-jail.md)).
 
    ```
    INFO mediatore_guest::guest: node registered node_id=…

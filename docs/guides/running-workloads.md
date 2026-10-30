@@ -242,6 +242,7 @@ under nsjail as the per-subject user. The jail gives it:
 | `/work` (writable), tmpfs `/tmp` + `$HOME` | Scratch space; `/work` is your `sb-` user's on the per-claim tmpfs, gone with the unmount at teardown |
 | `/usr/bin/mediatore` (read-only, the same file the guest runs from) | `mediatore token --audience api://trading-data` prints a 15-min bearer; the rootfs ships no client ([ADR-0014](../adr/0014-one-binary-roles-as-subcommands.md)) |
 | The VM's network, filtered by the sandbox uid | TCP to the broker and to the `egress` endpoints of the claim's audiences, DNS to the VM's resolvers; everything else the workload sends is logged (`mediatore-sandbox drop:`) and dropped ([ADR-0020](../adr/0020-jail-network-nftables-keyed-by-sandbox-uid.md)) |
+| Landlock, applied before your argv runs | What `nsjail` execs is `mediatore jail-exec`, which confines its own process and then execs your command: writes only to `/work`, `/tmp` and `$HOME` whatever your image's file modes say, TCP `connect()` only to the ports of the broker and the `egress` endpoints, no `bind()`, signals and abstract sockets scoped to the jail; inherited by every process you start. A write elsewhere fails with `EACCES`, a listener fails at `bind()` ([ADR-0024](../adr/0024-landlock-inside-the-jail.md)) |
 
 No token files, no baked-in secrets, and no network beyond the broker and the endpoints
 the claim's audiences declare (`audiences[].egress` in the broker's config, [ADR-0020](../adr/0020-jail-network-nftables-keyed-by-sandbox-uid.md)): an

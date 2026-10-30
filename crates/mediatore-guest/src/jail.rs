@@ -1,7 +1,8 @@
 // Copyright (c) 2026 Erick Bourgeois, mediatore
 // SPDX-License-Identifier: Apache-2.0
 
-//! nsjail configuration for the workload.
+//! nsjail configuration for the workload: the outer jail (ADR-0020, ADR-0021). What it execs
+//! is the binary's `jail-exec` role, the inner layer (ADR-0024), then the workload.
 
 use std::path::PathBuf;
 
@@ -13,6 +14,10 @@ pub const DEFAULT_RLIMIT_AS_MIB: u64 = 8192;
 
 /// Where the mediatore binary appears inside the jail: the same path as on the host.
 pub const JAIL_BINARY: &str = mediatore_proto::AGENT_BINARY_PATH;
+
+/// What the workload may write inside the jail, and nothing else (ADR-0024 decision 2):
+/// its work dir, a tmpfs `/tmp` and a tmpfs home.
+pub const WRITABLE_IN_JAIL: [&str; 3] = ["/work", "/tmp", "/home/sandbox"];
 
 /// Inputs to the jail.
 #[derive(Debug, Clone)]
@@ -35,6 +40,19 @@ pub struct JailSpec {
     pub argv: Vec<String>,
     /// Address-space limit in MiB.
     pub rlimit_as_mib: u64,
+    /// TCP ports the workload may connect to: those of the broker and the claim's `egress`,
+    /// the same destinations the ruleset resolved (ADR-0024 decision 2).
+    pub connect_ports: Vec<u16>,
+}
+
+/// The connect ports of a ruleset's destinations, sorted and deduplicated: what `jail-exec`
+/// is told, so the two layers cannot disagree.
+#[must_use]
+pub fn connect_ports<'a>(allow: impl IntoIterator<Item = &'a (std::net::IpAddr, u16)>) -> Vec<u16> {
+    let mut ports: Vec<u16> = allow.into_iter().map(|(_, port)| *port).collect();
+    ports.sort_unstable();
+    ports.dedup();
+    ports
 }
 
 impl JailSpec {
@@ -82,7 +100,19 @@ impl JailSpec {
             "--env".into(),
             format!("MEDIATORE_URL={}", self.mediatore_url),
             "--".into(),
+            // The inner layer (ADR-0024): the binary confines itself, then execs the argv.
+            JAIL_BINARY.into(),
+            "jail-exec".into(),
         ];
+        for dir in WRITABLE_IN_JAIL {
+            a.push("--writable".into());
+            a.push(dir.into());
+        }
+        for port in &self.connect_ports {
+            a.push("--connect-port".into());
+            a.push(port.to_string());
+        }
+        a.push("--".into());
         a.extend(self.argv.iter().cloned());
         a
     }
@@ -103,11 +133,62 @@ mod tests {
             agent_binary: "/usr/bin/mediatore".into(),
             argv: vec!["/bin/sh".into(), "-c".into(), "id".into()],
             rlimit_as_mib: 8192,
+            connect_ports: vec![443],
         };
         let a = s.to_args();
-        let sep = a.iter().position(|x| x == "--").unwrap();
+        let sep = a.iter().rposition(|x| x == "--").unwrap();
         assert_eq!(&a[sep + 1..], &["/bin/sh", "-c", "id"]);
         assert!(a.iter().any(|x| x == "--disable_proc"));
+    }
+
+    #[test]
+    fn nsjail_execs_jail_exec_with_the_writable_dirs_and_the_claims_ports_then_the_argv() {
+        let s = JailSpec {
+            user: "sb-abc".into(),
+            rootfs: "/mnt/sandbox/rootfs".into(),
+            work: "/mnt/sandbox/work".into(),
+            workload_api_socket: "/run/spire/sockets/agent.sock".into(),
+            mediatore_url: "https://mediatore.test".into(),
+            agent_binary: "/usr/bin/mediatore".into(),
+            argv: vec!["/bin/sh".into(), "-c".into(), "id".into()],
+            rlimit_as_mib: 8192,
+            connect_ports: vec![443, 8443],
+        };
+        let a = s.to_args();
+        let first = a.iter().position(|x| x == "--").unwrap();
+        assert_eq!(
+            &a[first + 1..],
+            &[
+                "/usr/bin/mediatore",
+                "jail-exec",
+                "--writable",
+                "/work",
+                "--writable",
+                "/tmp",
+                "--writable",
+                "/home/sandbox",
+                "--connect-port",
+                "443",
+                "--connect-port",
+                "8443",
+                "--",
+                "/bin/sh",
+                "-c",
+                "id"
+            ],
+            "ADR-0024 decision 1: the binary at the pinned path confines itself, then execs"
+        );
+    }
+
+    #[test]
+    fn the_connect_ports_are_the_rulesets_sorted_and_deduplicated() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let allow = [
+            (IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)), 8443),
+            (IpAddr::V4(Ipv4Addr::new(192, 0, 2, 20)), 443),
+            (IpAddr::V4(Ipv4Addr::new(192, 0, 2, 21)), 443),
+        ];
+        assert_eq!(connect_ports(allow.iter()), [443, 8443]);
     }
 
     #[test]
@@ -121,6 +202,7 @@ mod tests {
             agent_binary: "/usr/bin/mediatore".into(),
             argv: vec!["/bin/sh".into()],
             rlimit_as_mib: 8192,
+            connect_ports: vec![443],
         };
         let a = s.to_args();
         assert!(
@@ -144,6 +226,7 @@ mod tests {
             agent_binary: "/opt/mediatore/bin/mediatore".into(),
             argv: vec!["/bin/sh".into()],
             rlimit_as_mib: 8192,
+            connect_ports: vec![443],
         };
         let a = s.to_args();
         let ro: Vec<&str> = a

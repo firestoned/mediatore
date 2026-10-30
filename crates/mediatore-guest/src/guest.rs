@@ -287,6 +287,14 @@ async fn serve_claim(
         bytes = pulled.bytes,
         "workload image pulled"
     );
+    let ruleset = net::Ruleset::resolve(
+        uid,
+        &args.mediatore_url,
+        &me.egress,
+        Path::new(net::RESOLV_CONF),
+    )
+    .await?;
+    // The inner layer gets the same destinations' ports (ADR-0024 decision 2).
     let spec = jail::JailSpec {
         user: username.to_string(),
         rootfs: layout.rootfs,
@@ -296,14 +304,8 @@ async fn serve_claim(
         agent_binary: args.agent_binary.clone(),
         argv: me.workload.args.clone(),
         rlimit_as_mib: jail::DEFAULT_RLIMIT_AS_MIB,
+        connect_ports: jail::connect_ports(ruleset.allow.iter()),
     };
-    let ruleset = net::Ruleset::resolve(
-        uid,
-        &args.mediatore_url,
-        &me.egress,
-        Path::new(net::RESOLV_CONF),
-    )
-    .await?;
     let sha256 = net::load(&ruleset).await?;
     tracing::info!(
         claim_uid = %me.claim_uid,

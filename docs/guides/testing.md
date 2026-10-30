@@ -231,6 +231,24 @@ MEDIATORE_NFT='sudo /usr/sbin/nft' cargo test -p mediatore-guest net:: -- --incl
 Run it on the build host whenever `net.rs` changes. The kind tiers run the guest with
 `--dev-skip-setup` and load no ruleset; the live proof is a libvirt member (roadmap 06).
 
+### The jail's confinement: by hand, on the build host
+
+What the workload may touch under Landlock ([ADR-0024](../adr/0024-landlock-inside-the-jail.md))
+is a plan pinned by unit tests in `crates/mediatore-guest/src/confine.rs` and `jail.rs` on
+every platform. Whether the kernel enforces it is the question an ignored test answers by
+running the real `mediatore jail-exec` around a probe: a write inside a granted directory
+succeeds and one outside fails, a TCP connect to a granted port succeeds and to another
+fails, a bind fails, and a run with no port is refused with exit 125. It needs Linux with
+Landlock (6.7 or later for the ports; Debian 13 is 6.12) and `python3`, and it fails
+rather than skips anywhere else:
+
+```sh
+cargo test -p mediatore --test jail_exec_live -- --include-ignored
+```
+
+Run it on the build host whenever `confine.rs` or `jail.rs` changes. The kind tiers run the
+guest with `--dev-skip-setup` and start no jail.
+
 ### The sandbox filesystem and the pull: by hand, on the build host
 
 The tmpfs the guest mounts per claim and the image pull

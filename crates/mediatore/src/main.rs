@@ -50,6 +50,8 @@ enum Cmd {
     Guest(mediatore_guest::guest::GuestArgs),
     /// Inside the jail: trade the claim SVID for one audience-scoped token.
     Token(mediatore_guest::token::TokenArgs),
+    /// Inside the jail, before the workload: apply Landlock to this process, then exec the argv (ADR-0024).
+    JailExec(mediatore_guest::confine::JailExecArgs),
     /// The user's tools: `login`, `sandbox create|get|delete`, `session`.
     #[command(flatten)]
     User(mediatore_client::cli::UserCmd),
@@ -82,6 +84,12 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Serve { config } => serve(&config).await,
         Cmd::Guest(args) => mediatore_guest::guest::run(args).await,
         Cmd::Token(args) => mediatore_guest::token::run(args).await,
+        Cmd::JailExec(args) => {
+            // Returns only when the workload did not run; on success this process is the workload.
+            let err = mediatore_guest::confine::run(&args);
+            tracing::error!(error = %err, "jail-exec: the workload did not run");
+            std::process::exit(err.exit_code());
+        }
         Cmd::User(cmd) => mediatore_client::cli::run(cmd).await,
         Cmd::Revoke { claim, ban_node } => {
             tracing::warn!(claim, ban_node, "revoke: admin client not wired yet");
@@ -528,6 +536,36 @@ mod tests {
 
     /// The jail mounts the path the node entry selects (ADR-0014 decision 5), so the two
     /// constants are one.
+    #[test]
+    fn jail_exec_is_a_subcommand_with_its_writable_dirs_ports_and_argv() {
+        let jail_exec = parse(&[
+            "mediatore",
+            "jail-exec",
+            "--writable",
+            "/work",
+            "--writable",
+            "/tmp",
+            "--connect-port",
+            "443",
+            "--",
+            "/bin/sh",
+            "-c",
+            "id",
+        ]);
+        assert!(
+            matches!(
+                jail_exec,
+                Ok(Cmd::JailExec(ref a))
+                    if a.connect_ports == [443]
+                        && a.writable.len() == 2
+                        && a.argv == ["/bin/sh", "-c", "id"]
+            ),
+            "{jail_exec:?}"
+        );
+        // ADR-0024 decision 4 at the parser: the argv is required.
+        assert!(parse(&["mediatore", "jail-exec", "--connect-port", "443"]).is_err());
+    }
+
     #[test]
     fn the_guest_mounts_the_path_the_node_entry_pins() {
         let guest = parse(&["mediatore", "guest", "--mediatore-url", "https://b"]);
