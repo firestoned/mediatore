@@ -12,6 +12,16 @@ publish.workspace = true
 mediatore-proto.workspace = true
 mediatore-tls.workspace = true
 reqwest.workspace = true
+# The egress proxy (ADR-0025): HTTP/1.1 on both legs, the upstream over rustls to the Mozilla roots.
+hyper.workspace = true
+hyper-util.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+tokio-rustls.workspace = true
+rustls.workspace = true
+# The phantom token (ADR-0025 decision 3): 256 bits from the provider the TLS stack runs on.
+aws-lc-rs.workspace = true
+async-trait.workspace = true
 tokio.workspace = true
 clap.workspace = true
 serde.workspace = true

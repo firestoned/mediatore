@@ -35,8 +35,8 @@ use mediatore_entra::{IdpError, Validated, Validator};
 use mediatore_proto::ek::is_ek_hash;
 use mediatore_proto::image::ImageReference;
 use mediatore_proto::{
-    ClaimPhase, ClaimRequest, ClaimResponse, Endpoint, ErrorBody, Me, NodeRegistered,
-    NodeRegistration, RegistryCredential, Secret, TokenRequest, TokenResponse,
+    ClaimPhase, ClaimRequest, ClaimResponse, Endpoint, EndpointRule, ErrorBody, Me, NodeRegistered,
+    NodeRegistration, RegistryCredential, Route, Secret, TokenRequest, TokenResponse,
 };
 use mediatore_spire::{EntryManager, Naming};
 use mediatore_store::seal::{SealError, Sealer};
@@ -68,6 +68,9 @@ pub struct AppState {
     /// Per audience, where the workload reaches its API from the jail (`audiences[].egress`);
     /// `GET /v1/me` returns the union over the claim's audiences (ADR-0020).
     pub egress: BTreeMap<String, Vec<Endpoint>>,
+    /// Per audience, the egress proxy's rules (`audiences[].rules`, ADR-0025); `GET /v1/me`
+    /// returns one route per audience and endpoint of the claim, carrying them.
+    pub rules: BTreeMap<String, Vec<EndpointRule>>,
     /// Per registry host (as the API reaches it), the operator's pull credential
     /// (`registries[]`); `GET /v1/me` hands the guest the one its claim's image names
     /// (ADR-0022).
@@ -777,6 +780,25 @@ async fn me(
         .collect();
     egress.sort();
     egress.dedup();
+    // The proxy's routes (ADR-0025 decision 4): the same destinations, each with its
+    // audience and that audience's rules; the config guarantees one audience per endpoint.
+    let mut routes: Vec<Route> = rec
+        .audiences
+        .iter()
+        .flat_map(|a| {
+            st.egress.get(a).into_iter().flatten().map(|e| Route {
+                audience: a.clone(),
+                endpoint: e.clone(),
+                rules: st.rules.get(a).cloned().unwrap_or_default(),
+            })
+        })
+        .collect();
+    routes.sort_by(|a, b| {
+        a.endpoint
+            .cmp(&b.endpoint)
+            .then(a.audience.cmp(&b.audience))
+    });
+    routes.dedup();
     // The credential for the registry the image names, and no other (ADR-0022 decision 2).
     let registry_credential = rec
         .workload
@@ -793,6 +815,7 @@ async fn me(
         expires_at,
         workload: rec.workload,
         egress,
+        routes,
         registry_credential,
     }))
 }

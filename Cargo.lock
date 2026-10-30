@@ -2177,6 +2177,7 @@ name = "mediatore"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "banlieue-api",
  "base64 0.23.1",
@@ -2298,15 +2299,22 @@ name = "mediatore-guest"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "aws-lc-rs",
  "chrono",
  "clap",
  "flate2",
  "hex",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "mediatore-proto",
  "mediatore-testkit",
  "mediatore-tls",
  "nono",
  "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "sha2 0.11.1",
@@ -2314,6 +2322,7 @@ dependencies = [
  "tar",
  "thiserror",
  "tokio",
+ "tokio-rustls",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -2420,6 +2429,8 @@ dependencies = [
  "flate2",
  "futures",
  "hex",
+ "hyper",
+ "hyper-util",
  "jsonwebtoken",
  "k8s-openapi",
  "kube",
@@ -2435,6 +2446,7 @@ dependencies = [
  "tar",
  "time",
  "tokio",
+ "tokio-rustls",
  "uuid",
 ]
 

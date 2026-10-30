@@ -22,8 +22,17 @@ issuers:
     session: { client_id: mediatore }
 audiences:
   # egress: where the jail may reach this audience's API (host:port); without it the
-  # workload gets tokens it can spend nowhere (ADR-0020).
-  - { name: grafana.home.example, via: sts, max_ttl: 900, egress: ["grafana.home.example:443"] }
+  # workload gets tokens it can spend nowhere (ADR-0020). An endpoint belongs to one
+  # audience. rules (optional): what the egress proxy forwards for it, nono's
+  # endpoint_rules shape, `*` one path segment, `**` any; none means every method and
+  # path (ADR-0025).
+  - name: grafana.home.example
+    via: sts
+    max_ttl: 900
+    egress: ["grafana.home.example:443"]
+    rules:
+      - { method: GET, path: "/api/**" }
+      - { method: POST, path: "/api/ds/query" }
 # Private registries (ADR-0022): the login and a token file from a Secret mounted like the
 # STS key; the guest gets the credential for the registry its claim's image names.
 # registries:

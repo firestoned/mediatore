@@ -169,6 +169,7 @@ impl Harness {
             audiences: vec![OBO_AUDIENCE.into(), STS_AUDIENCE.into()],
             obo_audiences: vec![OBO_AUDIENCE.into()],
             egress: std::collections::BTreeMap::new(),
+            rules: std::collections::BTreeMap::new(),
             registries: std::collections::BTreeMap::new(),
             sandboxes: None,
             sandbox_namespace: "sandboxes".into(),

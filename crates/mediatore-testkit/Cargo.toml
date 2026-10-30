@@ -39,6 +39,10 @@ kube.workspace = true
 k8s-openapi.workspace = true
 axum.workspace = true
 futures.workspace = true
+# The TLS upstream the egress proxy is tested against (ADR-0025).
+hyper.workspace = true
+hyper-util.workspace = true
+tokio-rustls.workspace = true
 rcgen.workspace = true
 rustls.workspace = true
 time.workspace = true

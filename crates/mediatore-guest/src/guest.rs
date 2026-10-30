@@ -5,7 +5,7 @@
 //!
 //! State machine (runbook Part 6.1):
 //! boot → node registered → `GuestReady` announced → subject fetched → user created →
-//! tmpfs mounted → image pulled → ruleset loaded → jail running → torn down.
+//! tmpfs mounted → image pulled → ruleset loaded → egress proxy up → jail running → torn down.
 
 use std::path::{Path, PathBuf};
 
@@ -14,12 +14,14 @@ use reqwest::Method;
 use uuid::Uuid;
 
 use crate::client::SandboxClient;
-use crate::{identity, image, jail, net, ready, sandboxfs, supervise, user};
+use crate::{egress, identity, image, jail, net, ready, sandboxfs, supervise, user};
 
 /// Seconds between registration retries while mediatore is unreachable.
 const REGISTER_RETRY_SECS: u64 = 5;
 /// Seconds between `GET /v1/me` polls while no claim is bound.
 const ME_POLL_SECS: u64 = 5;
+/// How long the egress proxy gets to report ready before the claim fails.
+const PROXY_READY_SECS: u64 = 30;
 
 /// Arguments of the `guest` role.
 #[derive(Debug, clap::Args)]
@@ -60,10 +62,17 @@ pub struct GuestArgs {
         value_delimiter = ','
     )]
     pub plain_http_registries: Vec<String>,
-    /// The mediatore binary to mount read-only into the jail: the path the node entry pins,
-    /// never the path this process happens to run from
+    /// The mediatore binary to mount read-only into the jail and to start the egress proxy
+    /// from: the path the node entry pins, never the path this process happens to run from
     #[arg(long, default_value = mediatore_proto::AGENT_BINARY_PATH)]
     pub agent_binary: PathBuf,
+    /// The egress proxy's loopback port (ADR-0025): the one TCP port the jail may connect to
+    #[arg(
+        long,
+        env = "MEDIATORE_EGRESS_PROXY_PORT",
+        default_value_t = egress::DEFAULT_PORT
+    )]
+    pub egress_proxy_port: u16,
     /// Where the installed-guest marker goes once the node is registered (banlieue
     /// ADR-0043, read by libvirt's provider through the guest agent; ADR-0019)
     #[arg(long, default_value = ready::PHASE_FILE)]
@@ -219,6 +228,7 @@ pub async fn run(args: GuestArgs) -> anyhow::Result<()> {
         user = %username,
         expires_at = %me.expires_at,
         egress = me.egress.len(),
+        routes = me.routes.len(),
         registry_credential = me.registry_credential.as_ref().map(|c| c.host.as_str()),
         "subject fetched"
     );
@@ -255,8 +265,10 @@ pub async fn run(args: GuestArgs) -> anyhow::Result<()> {
     result
 }
 
-/// Tmpfs, rootfs, ruleset, jail (ADR-0021 decision 5), then supervise until the deadline.
-/// No jail without the ruleset (ADR-0020 decision 5), no ruleset without the rootfs.
+/// Tmpfs, rootfs, ruleset, egress proxy, jail (ADR-0021 decision 5, ADR-0025), then
+/// supervise until the deadline. No jail without the ruleset (ADR-0020 decision 5) or
+/// without the proxy (ADR-0025 decision 1), no ruleset without the rootfs.
+#[allow(clippy::too_many_lines)] // one straight line of steps, each logged; splitting it would hide the order
 async fn serve_claim(
     args: &GuestArgs,
     me: &Me,
@@ -292,19 +304,34 @@ async fn serve_claim(
         &args.mediatore_url,
         &me.egress,
         Path::new(net::RESOLV_CONF),
+        args.egress_proxy_port,
     )
     .await?;
-    // The inner layer gets the same destinations' ports (ADR-0024 decision 2).
+    // The proxy's inputs (ADR-0025): the routes the broker returned and a fresh phantom,
+    // in files of the sandbox user's outside the jail; the phantom also goes to the jail
+    // through nsjail's environment.
+    let phantom = egress::Phantom::generate()?;
+    let routes = egress::Routes::new(me.routes.clone())?;
+    if routes.is_empty() {
+        tracing::warn!(claim_uid = %me.claim_uid, "the claim has no routes: the jail reaches nowhere");
+    }
+    let files = egress::write_files(&layout.egress, &me.routes, &phantom, uid, gid)?;
+    let listen = std::net::SocketAddr::from(([127, 0, 0, 1], args.egress_proxy_port));
+    let proxy_args = egress::command_args(
+        listen,
+        &args.mediatore_url,
+        &args.workload_api_socket.to_string_lossy(),
+        &files,
+    );
     let spec = jail::JailSpec {
         user: username.to_string(),
         rootfs: layout.rootfs,
         work: layout.work,
-        workload_api_socket: args.workload_api_socket.clone(),
-        mediatore_url: args.mediatore_url.clone(),
         agent_binary: args.agent_binary.clone(),
         argv: me.workload.args.clone(),
         rlimit_as_mib: jail::DEFAULT_RLIMIT_AS_MIB,
-        connect_ports: jail::connect_ports(ruleset.allow.iter()),
+        proxy_port: args.egress_proxy_port,
+        phantom,
     };
     let sha256 = net::load(&ruleset).await?;
     tracing::info!(
@@ -313,8 +340,33 @@ async fn serve_claim(
         uid,
         destinations = ruleset.allow.len(),
         resolvers = ruleset.dns.len(),
+        proxy_port = ruleset.proxy_port,
         ruleset_sha256 = %sha256,
         "sandbox ruleset loaded"
     );
-    supervise::run(&spec, me.expires_at).await
+    // The proxy before the jail: the workload's only route out must exist when its first
+    // instruction runs (ADR-0025 decision 1).
+    let mut proxy = egress::spawn(
+        &args.agent_binary,
+        &proxy_args,
+        uid,
+        gid,
+        std::time::Duration::from_secs(PROXY_READY_SECS),
+    )
+    .await?;
+    tracing::info!(
+        claim_uid = %me.claim_uid,
+        pid = proxy.id(),
+        user = username,
+        %listen,
+        routes = routes.len(),
+        "egress proxy ready"
+    );
+    let result = supervise::run(&spec, me.expires_at, &mut proxy).await;
+    // The proxy ends with the claim, whichever way it ended.
+    if let Err(e) = proxy.start_kill() {
+        tracing::debug!(error = %e, "egress proxy already gone");
+    }
+    let _ = proxy.wait().await;
+    result
 }

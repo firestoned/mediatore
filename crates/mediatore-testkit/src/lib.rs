@@ -14,6 +14,7 @@
 
 pub mod ek;
 pub mod entra;
+pub mod https;
 pub mod pem;
 pub mod registry;
 pub mod sandboxes;
@@ -21,6 +22,7 @@ pub mod svid;
 pub mod transit;
 
 pub use entra::tempdir;
+pub use https::TlsUpstream;
 pub use pem::fixture_ca_pem;
 pub use sandboxes::MemorySandboxes;
 pub use svid::{MemoryMaterial, TestCa};

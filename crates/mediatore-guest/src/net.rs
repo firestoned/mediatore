@@ -3,9 +3,11 @@
 
 //! The jail's network bound (ADR-0020): one nftables table per claim whose output hook
 //! sends the sandbox uid's packets to a chain that admits the broker, the resolved egress
-//! endpoints of the claim's audiences and DNS to the VM's resolvers, then logs and drops.
-//! Every other uid is untouched. Rendered as text so the exact ruleset is pinned by tests
-//! and hashed in the log; loaded in one `nft -f` transaction before the jail starts.
+//! endpoints of the claim's audiences, the egress proxy on loopback (ADR-0025) and DNS to
+//! the VM's resolvers, then logs and drops. Every other uid is untouched, except that a
+//! packet to the proxy's loopback port from any other uid is dropped (ADR-0025 decision 5).
+//! Rendered as text so the exact ruleset is pinned by tests and hashed in the log; loaded in
+//! one `nft -f` transaction before the jail starts.
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
@@ -32,23 +34,31 @@ const LOG_PREFIX: &str = "mediatore-sandbox drop: ";
 pub struct Ruleset {
     /// The sandbox user's uid, what `meta skuid` matches.
     pub uid: u32,
-    /// TCP destinations: the broker and the claim's egress, as addresses.
+    /// TCP destinations: the broker, the claim's egress and the proxy on loopback, as
+    /// addresses.
     pub allow: BTreeSet<(IpAddr, u16)>,
     /// Resolvers DNS may go to, UDP and TCP 53.
     pub dns: BTreeSet<IpAddr>,
+    /// The egress proxy's loopback port: admitted for the sandbox uid, refused to every
+    /// other uid (ADR-0025 decision 5).
+    pub proxy_port: u16,
 }
 
 impl Ruleset {
-    /// The broker and `egress` resolved for `uid`, the resolvers read from `resolv_conf`.
+    /// The broker and `egress` resolved for `uid`, the proxy at `127.0.0.1:proxy_port`, the
+    /// resolvers read from `resolv_conf`.
     ///
     /// # Errors
     /// A broker URL without a host or port, or a broker that resolves to nothing: nothing
-    /// would work. An egress endpoint that does not resolve is omitted with a warning.
+    /// would work. A broker or egress endpoint on the proxy's port: the workload's one
+    /// allowed port must name one destination (ADR-0025 decision 5). An egress endpoint
+    /// that does not resolve is omitted with a warning.
     pub async fn resolve(
         uid: u32,
         mediatore_url: &str,
         egress: &[Endpoint],
         resolv_conf: &Path,
+        proxy_port: u16,
     ) -> anyhow::Result<Self> {
         let broker = broker_endpoint(mediatore_url)?;
         let mut allow = BTreeSet::new();
@@ -71,10 +81,17 @@ impl Ruleset {
                 }
             }
         }
+        if let Some((ip, _)) = allow.iter().find(|(_, p)| *p == proxy_port) {
+            anyhow::bail!(
+                "{ip}:{proxy_port} is a destination of this claim and {proxy_port} is the egress proxy's port: the workload's one allowed port would name two destinations (ADR-0025); choose another --egress-proxy-port"
+            );
+        }
+        allow.insert((IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), proxy_port));
         Ok(Self {
             uid,
             allow,
             dns: resolvers(resolv_conf),
+            proxy_port,
         })
     }
 
@@ -83,10 +100,11 @@ impl Ruleset {
     #[must_use]
     pub fn render(&self) -> String {
         let uid = self.uid;
+        let proxy = self.proxy_port;
         let mut out = String::new();
         let _ = writeln!(
             out,
-            "# mediatore guest (ADR-0020): uid {uid} reaches the broker, the claim's egress and DNS; nothing else"
+            "# mediatore guest (ADR-0020, ADR-0025): uid {uid} reaches the broker, the claim's egress, the egress proxy and DNS; nothing else, and nobody else reaches the proxy"
         );
         let _ = writeln!(out, "table inet {TABLE}");
         let _ = writeln!(out, "delete table inet {TABLE}");
@@ -113,6 +131,10 @@ impl Ruleset {
         let _ = writeln!(
             out,
             "    type filter hook output priority filter; policy accept;"
+        );
+        let _ = writeln!(
+            out,
+            "    oifname \"lo\" tcp dport {proxy} meta skuid != {uid} drop"
         );
         let _ = writeln!(out, "    meta skuid {uid} jump sandbox");
         let _ = writeln!(out, "  }}");
@@ -267,13 +289,14 @@ mod tests {
             ]
             .into_iter()
             .collect(),
+            proxy_port: 3128,
         }
     }
 
     #[test]
     fn the_ruleset_admits_the_uid_to_the_broker_the_egress_and_dns_and_drops_the_rest() {
         let expected = "\
-# mediatore guest (ADR-0020): uid 1234 reaches the broker, the claim's egress and DNS; nothing else
+# mediatore guest (ADR-0020, ADR-0025): uid 1234 reaches the broker, the claim's egress, the egress proxy and DNS; nothing else, and nobody else reaches the proxy
 table inet mediatore_sandbox
 delete table inet mediatore_sandbox
 table inet mediatore_sandbox {
@@ -283,6 +306,7 @@ table inet mediatore_sandbox {
   set dns6 { type ipv6_addr; elements = { 2001:db8::53 } }
   chain output {
     type filter hook output priority filter; policy accept;
+    oifname \"lo\" tcp dport 3128 meta skuid != 1234 drop
     meta skuid 1234 jump sandbox
   }
   chain sandbox {
@@ -314,9 +338,10 @@ table inet mediatore_sandbox {
             output,
             [
                 "type filter hook output priority filter; policy accept;",
+                "oifname \"lo\" tcp dport 3128 meta skuid != 1234 drop",
                 "meta skuid 1234 jump sandbox"
             ],
-            "one rule in the base chain, keyed by the uid; everyone else keeps the policy"
+            "two rules in the base chain: nobody but the uid reaches the proxy's port (ADR-0025), and the uid's packets are judged; everyone else keeps the policy"
         );
         let last = text
             .lines()
@@ -334,6 +359,7 @@ table inet mediatore_sandbox {
                 .into_iter()
                 .collect(),
             dns: BTreeSet::new(),
+            proxy_port: 3128,
         };
         let text = rs.render();
         assert!(text.contains(
@@ -406,21 +432,53 @@ table inet mediatore_sandbox {
             "https://192.0.2.10:8443",
             &[ep("198.51.100.7:443"), ep("no-such-host.invalid:443")],
             &resolv,
+            3128,
         )
         .await
         .unwrap();
         let want: BTreeSet<(IpAddr, u16)> = [
             ("192.0.2.10".parse().unwrap(), 8443),
             ("198.51.100.7".parse().unwrap(), 443),
+            ("127.0.0.1".parse().unwrap(), 3128),
         ]
         .into_iter()
         .collect();
         assert_eq!(
             rs.allow, want,
-            "the broker always, the literal, not the unresolvable name"
+            "the broker always, the literal, the proxy on loopback, not the unresolvable name"
         );
         assert_eq!(rs.uid, 4242);
+        assert_eq!(rs.proxy_port, 3128);
         assert_eq!(rs.dns.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_destination_on_the_proxys_port_is_refused() {
+        let err = Ruleset::resolve(
+            1,
+            "https://192.0.2.10:8443",
+            &[ep("198.51.100.7:3128")],
+            Path::new("/nonexistent"),
+            3128,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("198.51.100.7:3128") && err.contains("ADR-0025"),
+            "{err}"
+        );
+        let err = Ruleset::resolve(
+            1,
+            "https://192.0.2.10:3128",
+            &[],
+            Path::new("/nonexistent"),
+            3128,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("egress proxy's port"), "{err}");
     }
 
     #[tokio::test]
@@ -430,6 +488,7 @@ table inet mediatore_sandbox {
             "https://no-such-host.invalid",
             &[],
             Path::new("/nonexistent"),
+            3128,
         )
         .await
         .unwrap_err()
@@ -455,6 +514,7 @@ table inet mediatore_sandbox {
                 .into_iter()
                 .collect(),
             dns: BTreeSet::new(),
+            proxy_port: 3128,
         };
         for rs in [full(), empty] {
             let mut child = tokio::process::Command::new(program)

@@ -57,7 +57,10 @@ URL, your CIDRs. Edit:
 
 - `mediatore.yaml`: `trust_domain`, `issuers` (from the [issuers guide](issuers.md)),
   `audiences`, each with the `egress` the jail may reach for it (`host:port` pairs; an
-  audience without one yields tokens the workload can spend nowhere, [ADR-0020](../adr/0020-jail-network-nftables-keyed-by-sandbox-uid.md)),
+  audience without one yields tokens the workload can spend nowhere, [ADR-0020](../adr/0020-jail-network-nftables-keyed-by-sandbox-uid.md);
+  an endpoint belongs to one audience only) and, optionally, the `rules` the egress proxy
+  enforces for it (`{ method, path }` globs, [ADR-0025](../adr/0025-phantom-token-egress-proxy.md);
+  none means every method and path),
   `sts.issuer` (what downstream services will see as `iss`), and
   `spire.entries.class_name` if SPIRE was rendered with another namespace or release
   name (the class is `<namespace>-<release name>`, `spire-server-spire` in the example);
@@ -236,11 +239,23 @@ and take the installer case on yourself.
 
 When a claim binds, the guest loads a ruleset keyed
 by the sandbox user's uid before it starts the jail, and refuses to start the jail
-without it ([ADR-0020](../adr/0020-jail-network-nftables-keyed-by-sandbox-uid.md)): TCP to the broker and to the audiences' `egress`, DNS to the VM's
-resolvers, the rest logged under `mediatore-sandbox drop:` and dropped. The guest's log
-carries the ruleset's SHA-256 per claim, and `nft list table inet mediatore_sandbox` on
-the VM shows what is loaded. Root's own egress and the input chain are not in that
-table: those rules come once the image's system users are settled (roadmap 06).
+without it ([ADR-0020](../adr/0020-jail-network-nftables-keyed-by-sandbox-uid.md)): TCP to the broker, to the audiences' `egress` and to the
+egress proxy on loopback, DNS to the VM's resolvers, the rest logged under
+`mediatore-sandbox drop:` and dropped; a packet to the proxy's port from any other uid is
+dropped too. The guest's log carries the ruleset's SHA-256 per claim, and
+`nft list table inet mediatore_sandbox` on the VM shows what is loaded. Root's own egress
+and the input chain are not in that table: those rules come once the image's system users
+are settled (roadmap 06).
+
+The guest then starts `mediatore egress-proxy` as the sandbox user, outside the jail, on
+`127.0.0.1:3128` (`--egress-proxy-port`, or `MEDIATORE_EGRESS_PROXY_PORT`, on the guest's
+unit; a claim whose broker or `egress` uses that port is refused), and only then the jail
+([ADR-0025](../adr/0025-phantom-token-egress-proxy.md)). The jail has no Workload API
+socket and no route to the broker: it reaches the proxy, the proxy reaches the broker (for
+tokens, over the claim's SVID) and the audiences' endpoints over TLS 1.3 to the Mozilla
+roots. An audience on a private PKI is not reachable through the proxy yet (roadmap 07).
+The proxy's log names the audience, the host, the method, the path and the status of
+every request it forwards or refuses, never a token.
 
 The guest pulls each claim's `workload.image` itself ([ADR-0021](../adr/0021-sandbox-filesystem-tmpfs-and-rootfs-from-the-registry.md)): over HTTPS with the
 Mozilla roots, anonymously, into a tmpfs it mounts at `/mnt/sandbox` for that claim

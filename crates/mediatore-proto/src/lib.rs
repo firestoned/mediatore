@@ -148,6 +148,69 @@ impl std::fmt::Display for Endpoint {
     }
 }
 
+/// One rule of what a workload may ask of an audience through the egress proxy (ADR-0025
+/// decision 4), in nono's `endpoint_rules` shape: an HTTP method or `*`, and a path glob
+/// where `*` matches one segment and `**` zero or more.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct EndpointRule {
+    /// `GET`, `POST`, ... or `*` for any method. Compared case-insensitively.
+    pub method: String,
+    /// The path glob, matched against the request path without the query.
+    pub path: String,
+}
+
+impl EndpointRule {
+    /// Whether `method` and `path` (no query) are admitted by this rule.
+    #[must_use]
+    pub fn matches(&self, method: &str, path: &str) -> bool {
+        (self.method == "*" || self.method.eq_ignore_ascii_case(method))
+            && glob_matches(&segments(&self.path), &segments(path))
+    }
+}
+
+/// A path split into its non-empty segments: `/a//b/` is `["a", "b"]`.
+fn segments(path: &str) -> Vec<&str> {
+    path.split('/').filter(|s| !s.is_empty()).collect()
+}
+
+/// Segment-wise glob: `*` matches exactly one segment, `**` zero or more, anything else
+/// matches itself.
+fn glob_matches(pattern: &[&str], path: &[&str]) -> bool {
+    match pattern.split_first() {
+        None => path.is_empty(),
+        Some((&"**", rest)) => (0..=path.len()).any(|skip| glob_matches(rest, &path[skip..])),
+        Some((&"*", rest)) => path
+            .split_first()
+            .is_some_and(|(_, tail)| glob_matches(rest, tail)),
+        Some((lit, rest)) => path
+            .split_first()
+            .is_some_and(|(head, tail)| head == lit && glob_matches(rest, tail)),
+    }
+}
+
+/// One route of the egress proxy (ADR-0025): an audience, one of its `egress` endpoints,
+/// and the audience's rules. `GET /v1/me` carries one per audience and endpoint of the
+/// claim; the proxy chooses the audience, and so the token, by the endpoint a request names.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Route {
+    /// The audience whose token the proxy injects on this route.
+    pub audience: String,
+    /// The upstream, reached over HTTPS.
+    pub endpoint: Endpoint,
+    /// The audience's rules; empty admits every method and path.
+    #[serde(default)]
+    pub rules: Vec<EndpointRule>,
+}
+
+impl Route {
+    /// Whether a request for `method` and `path` is admitted: always when the audience
+    /// declares no rules, else by at least one of them (ADR-0025 decision 4).
+    #[must_use]
+    pub fn admits(&self, method: &str, path: &str) -> bool {
+        self.rules.is_empty() || self.rules.iter().any(|r| r.matches(method, path))
+    }
+}
+
 /// A credential in a request body: serialises as the plain string, never prints.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -230,6 +293,12 @@ pub struct Me {
     /// audience that declares none; the jail then reaches the broker only.
     #[serde(default)]
     pub egress: Vec<Endpoint>,
+    /// The egress proxy's routes (ADR-0025): one per audience and `egress` endpoint of the
+    /// claim, with the audience's rules, sorted by endpoint. The same destinations as
+    /// `egress`, which stays for the ruleset. Empty with an old broker: the proxy then
+    /// routes nothing and the jail reaches nowhere.
+    #[serde(default)]
+    pub routes: Vec<Route>,
     /// The operator's credential for the registry `workload.image` names, when one is
     /// configured (ADR-0022); absent, the pull is anonymous. Used by the guest for one
     /// pull, kept nowhere.
@@ -322,6 +391,74 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(me.egress, Vec::<Endpoint>::new());
+        assert_eq!(me.routes, Vec::<Route>::new(), "an old broker: no routes");
+    }
+
+    #[test]
+    fn a_rule_matches_its_method_and_a_segment_glob() {
+        let rule = |m: &str, p: &str| EndpointRule {
+            method: m.into(),
+            path: p.into(),
+        };
+        // Exact path, exact method, case-insensitive on the method.
+        assert!(rule("GET", "/v1/chat/completions").matches("get", "/v1/chat/completions"));
+        assert!(!rule("GET", "/v1/chat/completions").matches("POST", "/v1/chat/completions"));
+        assert!(!rule("GET", "/v1/chat/completions").matches("GET", "/v1/chat"));
+        assert!(!rule("GET", "/v1/chat/completions").matches("GET", "/v1/chat/completions/x"));
+        // `*` is one segment.
+        assert!(rule("*", "/repos/*/issues").matches("DELETE", "/repos/octo/issues"));
+        assert!(!rule("*", "/repos/*/issues").matches("GET", "/repos/issues"));
+        assert!(!rule("*", "/repos/*/issues").matches("GET", "/repos/a/b/issues"));
+        // `**` is zero or more.
+        assert!(rule("GET", "/api/**").matches("GET", "/api"));
+        assert!(rule("GET", "/api/**").matches("GET", "/api/v4/projects/7"));
+        assert!(!rule("GET", "/api/**").matches("GET", "/apix"));
+        assert!(
+            rule("POST", "/api/v4/projects/*/merge_requests/*/notes")
+                .matches("POST", "/api/v4/projects/7/merge_requests/12/notes")
+        );
+        assert!(rule("GET", "/**/notes").matches("GET", "/a/b/c/notes"));
+        // Empty segments and trailing slashes do not count.
+        assert!(rule("GET", "/a/b").matches("GET", "/a//b/"));
+    }
+
+    #[test]
+    fn a_route_without_rules_admits_everything_and_one_with_rules_only_what_they_say() {
+        let open = Route {
+            audience: "internal-git".into(),
+            endpoint: "git.home.example:443".parse().unwrap(),
+            rules: vec![],
+        };
+        assert!(open.admits("DELETE", "/anything/at/all"));
+        let narrow = Route {
+            rules: vec![
+                EndpointRule {
+                    method: "GET".into(),
+                    path: "/platform/**".into(),
+                },
+                EndpointRule {
+                    method: "POST".into(),
+                    path: "/platform/*/git-receive-pack".into(),
+                },
+            ],
+            ..open
+        };
+        assert!(narrow.admits("GET", "/platform/services.git/info/refs"));
+        assert!(narrow.admits("POST", "/platform/services.git/git-receive-pack"));
+        assert!(!narrow.admits("POST", "/platform/services.git/info/refs"));
+        assert!(!narrow.admits("GET", "/other/services.git/info/refs"));
+    }
+
+    #[test]
+    fn routes_roundtrip_with_rules_defaulting_to_none() {
+        let r: Route = serde_json::from_value(serde_json::json!({
+            "audience": "internal-git",
+            "endpoint": { "host": "git.home.example", "port": 443 }
+        }))
+        .unwrap();
+        assert_eq!(r.rules, Vec::<EndpointRule>::new());
+        let json = serde_json::to_value(&r).unwrap();
+        assert_eq!(json["rules"], serde_json::json!([]));
     }
 
     #[test]
