@@ -40,6 +40,7 @@ def fail(msg: str) -> None:
 def main() -> None:
     release, version, server, guest = Path(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
     binary = release / f"mediatore-{version}-linux-amd64"
+    darwin = release / f"mediatore-{version}-darwin-arm64"
     manifest = release / f"mediatore-{version}.yaml"
     vmimage = release / f"mediatore-guest-{version}-vmimage.yaml"
     layers = [
@@ -47,7 +48,7 @@ def main() -> None:
         release / f"mediatore-guest-{version}-cloud-config-deployment.example.yaml",
     ]
     checksums = release / "checksums.sha256"
-    for p in [binary, manifest, vmimage, *layers, checksums]:
+    for p in [binary, darwin, manifest, vmimage, *layers, checksums]:
         if not p.is_file():
             fail(f"missing {p.name}")
 
@@ -71,8 +72,8 @@ def main() -> None:
         fail("a tag reference to the server image survived")
 
     vm = vmimage.read_text(encoding="utf-8")
-    if vm.count(guest) != 1 or "@sha256:" + "0" * 64 in vm:
-        fail(f"expected the VMImage pinned to {guest} once, with no placeholder digest left")
+    if vm.count(guest) != 1 or "@sha256:" + "0" * 64 in vm or "placeholder: a release digest" in vm:
+        fail(f"expected the VMImage pinned to {guest} once, with no placeholder digest or its comment left")
     for layer in layers:
         if not layer.read_text(encoding="utf-8").startswith("#cloud-config"):
             fail(f"{layer.name} is not a cloud-config document")

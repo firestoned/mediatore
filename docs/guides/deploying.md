@@ -12,8 +12,9 @@ from the empty cluster, with every command. The enterprise split (a root on its 
 [a separate guide](enterprise-spire-topology.md); roadmap 02 tracks what is still
 missing for VMs to attest ([`ROADMAPS.md`](https://github.com/firestoned/mediatore/blob/main/ROADMAPS.md)).
 
-Every release attaches what the install needs beside the two images: the static binary
-(`mediatore-<version>-linux-amd64`, the CLI and every role), `mediatore-<version>.yaml`
+Every release attaches what the install needs beside the two images: the binary for Linux
+(`mediatore-<version>-linux-amd64`, static, every role) and for a Mac
+(`mediatore-<version>-darwin-arm64`, the CLI: `login`, `sandbox`, `session`), `mediatore-<version>.yaml`
 (this `deploy/base` with the server image pinned by digest), the `VMImage` of step 6 pinned to
 the guest image's digest with the two cloud-config layers it names, the SBOMs and
 `checksums.sha256`, each file attested by the Build workflow. An overlay can name the
