@@ -3,7 +3,8 @@
 
 # ADR-0025: The egress proxy, a phantom token in the jail and the real one in a process the workload cannot read
 
-**Status:** Accepted · **Date:** 2026-10-30
+**Status:** Accepted · **Date:** 2026-10-30 · **Amended:** 2026-10-30 (decision 7, the
+audience's own CA)
 
 Roadmap 07, the credential-injecting egress proxy: phase 2 of the delegation model that
 [ADR-0003](0003-token-backends.md) recorded as a trade-off and that threat model R-3
@@ -112,12 +113,24 @@ audience, and the audience chooses the token.
    and an operator or a test runs it outside a jail); inside the jail it has no socket and
    no route, and nothing replaces it. The binary stays mounted for `jail-exec`.
 
-6. **Not decided here.** A private certificate authority per audience for an upstream
-   on a private PKI (the broker's `issuers[].ca_file` shape, carried in `routes`); an
-   audience served directly, without the proxy, for a protocol that is not HTTP; a `direct`
-   bypass per claim; approval of individual requests; the proxy answering DNS for the
-   jail (R-12 is unchanged, the uid still needs the resolvers for the proxy's own
-   lookups). Each is a roadmap 07 item with its own trigger, not a default.
+6. **Not decided here.** An audience served directly, without the proxy, for a protocol
+   that is not HTTP; a `direct` bypass per claim; approval of individual requests; the
+   proxy answering DNS for the jail (R-12 is unchanged, the uid still needs the resolvers
+   for the proxy's own lookups). Each is a roadmap 07 item with its own trigger, not a
+   default. *The private certificate authority per audience, listed here when this ADR
+   was accepted, became decision 7 the same day: the homelab's endpoints are on a private
+   PKI, so without it the proxy reached nothing there.*
+
+7. **The audience's own CA, on the route.** (Amendment, 2026-10-30.) `audiences[].ca_file`
+   names a PEM of CA certificates, the shape `issuers[].ca_file` already has for an
+   identity provider on a private PKI. The broker reads it at start and refuses to start on
+   a file that holds no certificate; `GET /v1/me` carries the PEM on every route of that
+   audience (`Route::ca_pem`, public material, over the same mutual-TLS session as the
+   rest); the proxy builds, for that audience, a client configuration that trusts exactly
+   that CA and nothing else, and uses the Mozilla roots for routes that carry none. A route
+   whose PEM does not parse refuses the proxy, and so the claim, at start: never the
+   default roots in its place. The CA is per audience, not per endpoint, since an audience
+   is one API behind one authority.
 
 ## Consequences
 
@@ -132,11 +145,13 @@ audience, and the audience chooses the token.
   (`routes` on `GET /v1/me`), `crates/mediatore-proto` (`Route`, `EndpointRule`,
   `Me::routes`; `Me::egress` stays, so an older guest keeps its ruleset).
 - The proxy is proven end to end in `crates/mediatore/tests/e2e_egress.rs`: the fake
-  issuer, the dev-mode broker, a TLS upstream from `mediatore-testkit` that records what
-  reached it, and the proxy in between; the phantom swapped for an STS token the
+  issuer, the dev-mode broker, a TLS upstream from `mediatore-testkit` on its own CA that
+  records what reached it, and the proxy in between through its production constructor;
+  the audience's CA travels on the route and the phantom is swapped for an STS token the
   upstream verifies against the broker's JWKS, a request with no header forwarded bare, a
   foreign bearer refused, a request outside the rules refused, an unknown host refused,
-  the token fetched once for two requests. The image is unchanged; the kind tiers start
+  the token fetched once for two requests, and the same upstream refused (`502`, nothing
+  reaching it) when the route carries no CA. The image is unchanged; the kind tiers start
   no jail and no proxy.
 - What the workload sees: no socket, no `mediatore token`, a base URL and a phantom.
   Tools that take a base URL and a bearer from the environment work unchanged; `git`

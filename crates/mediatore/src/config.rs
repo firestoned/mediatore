@@ -32,6 +32,11 @@ pub struct AudienceConfig {
     /// every method and path; once any rule exists, a request outside them is refused.
     #[serde(default)]
     pub rules: Vec<EndpointRule>,
+    /// A PEM file of CA certificates the egress proxy trusts for this audience's endpoints
+    /// instead of the Mozilla roots (ADR-0025 amended): an upstream on a private PKI. Read
+    /// at start, refused if it holds no certificate, carried to the guest on the route.
+    #[serde(default)]
+    pub ca_file: Option<PathBuf>,
 }
 
 fn default_max_ttl() -> i64 {
@@ -605,6 +610,19 @@ listen: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }
             Vec::<EndpointRule>::new(),
             "no rules: every method and path at that audience's endpoints"
         );
+    }
+
+    #[test]
+    fn an_audience_may_name_the_ca_file_of_its_private_pki() {
+        let cfg = Config::parse(
+            "trust_domain: sandbox.test\nissuers: []\nlisten: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }\ndev_mode: true\nsts: { issuer: https://mediatore.test, kid: k, signing_key_file: /k }\naudiences:\n  - { name: internal-git, via: sts, egress: [\"git.home.example:443\"], ca_file: /etc/mediatore-cas/home.pem }\n  - { name: public, via: sts, egress: [\"api.example.com:443\"] }\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.audiences[0].ca_file.as_deref(),
+            Some(std::path::Path::new("/etc/mediatore-cas/home.pem"))
+        );
+        assert_eq!(cfg.audiences[1].ca_file, None, "no file: the Mozilla roots");
     }
 
     #[test]

@@ -8,8 +8,9 @@
 //!
 //! What stays faked: the peer identity is a header (`dev_mode`) and the proxy's token
 //! source is a client of that header path, since no Workload API exists here. Everything
-//! else (the routes from `GET /v1/me`, the rules, the swap, the upstream TLS, the token
-//! minted by the STS and verified against the broker's JWKS) is the production code path.
+//! else (the routes from `GET /v1/me`, the rules, the swap, the upstream TLS through the
+//! production constructor with the audience's own CA on the route, the token minted by the
+//! STS and verified against the broker's JWKS) is the production code path.
 
 use std::future::IntoFuture;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -179,6 +180,11 @@ impl Harness {
             )]
             .into_iter()
             .collect(),
+            // The upstream is on a private PKI, as the homelab's are: its CA is the
+            // audience's `ca_file`, carried to the proxy on the route (ADR-0025 amended).
+            cas: [(AUDIENCE.to_owned(), upstream.ca_pem())]
+                .into_iter()
+                .collect(),
             registries: std::collections::BTreeMap::new(),
             sandboxes: None,
             sandbox_namespace: "sandboxes".into(),
@@ -272,11 +278,12 @@ impl Harness {
             .expect("me body")
     }
 
-    /// The proxy as the guest would run it, from the routes `GET /v1/me` returned, on an
-    /// ephemeral loopback port; returns its base URL, the phantom and the token counter.
+    /// The proxy as the guest would run it, through the production constructor (the
+    /// Mozilla roots for routes without a CA), from `routes`, on an ephemeral loopback
+    /// port; returns its base URL, the phantom and the token counter.
     async fn start_proxy(
         &self,
-        me: &Me,
+        routes: Vec<mediatore_proto::Route>,
         claim_uid: &uuid::Uuid,
     ) -> (String, Phantom, Arc<DevTokens>) {
         let tokens = Arc::new(DevTokens {
@@ -286,12 +293,14 @@ impl Harness {
             calls: AtomicUsize::new(0),
         });
         let phantom = Phantom::generate().expect("phantom");
-        let proxy = Arc::new(Proxy::new(
-            Routes::new(me.routes.clone()).expect("routes"),
-            phantom.clone(),
-            tokens.clone(),
-            self.upstream.client_config(),
-        ));
+        let proxy = Arc::new(
+            Proxy::with_webpki_roots(
+                Routes::new(routes).expect("routes"),
+                phantom.clone(),
+                tokens.clone(),
+            )
+            .expect("a proxy from the claim's routes"),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind proxy");
@@ -343,7 +352,12 @@ async fn the_phantom_is_swapped_for_a_real_token_the_workload_never_sees() {
         "the ruleset's destinations are the routes' endpoints"
     );
 
-    let (proxy, phantom, tokens) = h.start_proxy(&me, &uid).await;
+    assert_eq!(
+        me.routes[0].ca_pem.as_deref(),
+        Some(h.upstream.ca_pem().as_str()),
+        "the audience's CA travels on the route (ADR-0025 amended)"
+    );
+    let (proxy, phantom, tokens) = h.start_proxy(me.routes.clone(), &uid).await;
     let host = h.upstream.endpoint().to_string();
 
     // The workload: a GET within the rules, the phantom in Authorization.
@@ -433,7 +447,7 @@ async fn refusals_never_reach_the_upstream() {
     h.register_node().await;
     let claim = h.claim().await;
     let me = h.me().await;
-    let (proxy, phantom, tokens) = h.start_proxy(&me, &claim.uid.expect("uid")).await;
+    let (proxy, phantom, tokens) = h.start_proxy(me.routes, &claim.uid.expect("uid")).await;
     let host = h.upstream.endpoint().to_string();
     let error_of = |body: String| -> String {
         serde_json::from_str::<serde_json::Value>(&body).expect("json")["error"]
@@ -494,7 +508,7 @@ async fn a_released_claim_gets_no_token_and_the_request_fails_closed() {
     h.register_node().await;
     let claim = h.claim().await;
     let me = h.me().await;
-    let (proxy, phantom, _tokens) = h.start_proxy(&me, &claim.uid.expect("uid")).await;
+    let (proxy, phantom, _tokens) = h.start_proxy(me.routes, &claim.uid.expect("uid")).await;
     let host = h.upstream.endpoint().to_string();
 
     let del = h
@@ -517,4 +531,38 @@ async fn a_released_claim_gets_no_token_and_the_request_fails_closed() {
         .expect("after release");
     assert_eq!(resp.status(), 502);
     assert_eq!(h.seen().len(), 0);
+}
+
+#[tokio::test]
+async fn without_the_audiences_ca_a_private_upstream_is_refused_not_trusted() {
+    let h = Harness::start().await;
+    h.register_node().await;
+    let claim = h.claim().await;
+    let me = h.me().await;
+    // The same routes with the CA stripped: what an audience without `ca_file` gets, the
+    // Mozilla roots, which did not sign this upstream.
+    let routes: Vec<mediatore_proto::Route> = me
+        .routes
+        .into_iter()
+        .map(|r| mediatore_proto::Route { ca_pem: None, ..r })
+        .collect();
+    let (proxy, phantom, tokens) = h.start_proxy(routes, &claim.uid.expect("uid")).await;
+    let host = h.upstream.endpoint().to_string();
+
+    let resp = h
+        .http
+        .get(format!("{proxy}/{host}/api/things"))
+        .bearer_auth(phantom.expose())
+        .send()
+        .await
+        .expect("through the proxy");
+    assert_eq!(resp.status(), 502);
+    let body: serde_json::Value = resp.json().await.expect("json");
+    assert_eq!(body["error"], "upstream_unreachable");
+    assert_eq!(h.seen().len(), 0, "the handshake failed before any request");
+    assert_eq!(
+        tokens.calls.load(Ordering::SeqCst),
+        1,
+        "the token was fetched (the request was admitted) and went nowhere"
+    );
 }

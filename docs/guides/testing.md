@@ -258,11 +258,15 @@ runs the fake issuer, the dev-mode broker, a TLS upstream from the test kit
 the real `Proxy` in between, with a token source that is a client of the dev header path
 (the Workload API is the one thing faked). It drives the proxy as the jailed workload
 would: plain HTTP on loopback, the host as the first path segment, the phantom in
-`Authorization`. The upstream receives an STS token it verifies against the broker's JWKS
-in place of the phantom; a second request reuses it (one fetch for two calls); a request
-with no header is forwarded bare; a foreign bearer is `401`, a request outside the
-audience's rules `403`, a host outside the routes `404`, none of them reaching the
-upstream; a released claim gets `502`, not a bare forward. The policy itself (`judge`, the
+`Authorization`. The upstream is on the test kit's own CA, which the audience names as its
+`ca_file` and the route carries, so the proxy runs through its production constructor and
+the private-PKI path is the one proven. The upstream receives an STS token it verifies
+against the broker's JWKS in place of the phantom; a second request reuses it (one fetch
+for two calls); a request with no header is forwarded bare; a foreign bearer is `401`, a
+request outside the audience's rules `403`, a host outside the routes `404`, none of them
+reaching the upstream; a released claim gets `502`, not a bare forward; and the same
+upstream with the CA stripped from the route is `502` with nothing reaching it, since the
+Mozilla roots did not sign it. The policy itself (`judge`, the
 route lookup, the rule glob) is unit-tested in `crates/mediatore-guest/src/egress.rs` and
 `crates/mediatore-proto/src/lib.rs`, and the ruleset's two new lines in `net.rs`.
 

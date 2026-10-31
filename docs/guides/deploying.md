@@ -58,9 +58,11 @@ URL, your CIDRs. Edit:
 - `mediatore.yaml`: `trust_domain`, `issuers` (from the [issuers guide](issuers.md)),
   `audiences`, each with the `egress` the jail may reach for it (`host:port` pairs; an
   audience without one yields tokens the workload can spend nowhere, [ADR-0020](../adr/0020-jail-network-nftables-keyed-by-sandbox-uid.md);
-  an endpoint belongs to one audience only) and, optionally, the `rules` the egress proxy
+  an endpoint belongs to one audience only), optionally the `rules` the egress proxy
   enforces for it (`{ method, path }` globs, [ADR-0025](../adr/0025-phantom-token-egress-proxy.md);
-  none means every method and path),
+  none means every method and path) and, for an audience on a private PKI, the `ca_file`
+  the proxy trusts for its endpoints instead of the Mozilla roots (a PEM from a Secret
+  volume, read at start; the homelab overlay mounts one),
   `sts.issuer` (what downstream services will see as `iss`), and
   `spire.entries.class_name` if SPIRE was rendered with another namespace or release
   name (the class is `<namespace>-<release name>`, `spire-server-spire` in the example);
@@ -253,9 +255,9 @@ unit; a claim whose broker or `egress` uses that port is refused), and only then
 ([ADR-0025](../adr/0025-phantom-token-egress-proxy.md)). The jail has no Workload API
 socket and no route to the broker: it reaches the proxy, the proxy reaches the broker (for
 tokens, over the claim's SVID) and the audiences' endpoints over TLS 1.3 to the Mozilla
-roots. An audience on a private PKI is not reachable through the proxy yet (roadmap 07).
-The proxy's log names the audience, the host, the method, the path and the status of
-every request it forwards or refuses, never a token.
+roots, or to the CA named by the audience's `ca_file`, which travels to the guest on the
+route. The proxy's log names the audience, the host, the method, the path and the status
+of every request it forwards or refuses, never a token.
 
 The guest pulls each claim's `workload.image` itself ([ADR-0021](../adr/0021-sandbox-filesystem-tmpfs-and-rootfs-from-the-registry.md)): over HTTPS with the
 Mozilla roots, anonymously, into a tmpfs it mounts at `/mnt/sandbox` for that claim

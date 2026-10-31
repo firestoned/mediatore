@@ -9,8 +9,9 @@
 //! of the claim's audiences and its `egress` endpoint, from `GET /v1/me`), checks the method
 //! and path against that audience's rules, swaps the phantom for a token for that audience
 //! (fetched over the claim SVID at `POST /v1/token`, cached until shortly before its expiry)
-//! and forwards over TLS 1.3 to the Mozilla roots. The token is in this process's memory and
-//! nowhere else; the workload holds a phantom that is useless anywhere but here.
+//! and forwards over TLS 1.3 to the Mozilla roots, or to the CA the route carries for an
+//! upstream on a private PKI (`audiences[].ca_file`). The token is in this process's memory
+//! and nowhere else; the workload holds a phantom that is useless anywhere but here.
 //!
 //! Refusals: `404` for a host outside the routes, `403` for a request outside the audience's
 //! rules, `401` for an `Authorization` that is not the phantom (the workload has no credential
@@ -333,49 +334,89 @@ impl TokenCache {
 }
 
 /// The proxy: the claim's routes, its phantom, where tokens come from and how the upstream
-/// is trusted.
+/// is trusted, per route.
 pub struct Proxy {
     routes: Routes,
     phantom: Phantom,
     tokens: Arc<dyn TokenSource>,
     cache: TokenCache,
+    /// The trust for a route without a CA of its own.
     tls: Arc<rustls::ClientConfig>,
+    /// Per audience, the trust for routes that carry a CA (`Route::ca_pem`): exactly that
+    /// CA, never the default roots as well.
+    tls_by_audience: HashMap<String, Arc<rustls::ClientConfig>>,
 }
 
 type Body = BoxBody<Bytes, hyper::Error>;
 
+/// `tls` with HTTP/1.1 as the one application protocol.
+fn http1_only(mut tls: rustls::ClientConfig) -> Arc<rustls::ClientConfig> {
+    tls.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Arc::new(tls)
+}
+
 impl Proxy {
-    /// A proxy over `tls` for the upstream leg: the Mozilla roots in production
-    /// ([`Self::with_webpki_roots`]), a test CA in tests.
+    /// A proxy over `tls` for the routes that carry no CA (the Mozilla roots in production,
+    /// [`Self::with_webpki_roots`]); a route with a `ca_pem` gets a config trusting that CA
+    /// alone, built here.
+    ///
+    /// # Errors
+    /// A `ca_pem` that holds no certificate: the claim must not start with a route whose
+    /// trust cannot be built (fail closed, never the default roots in its place).
     pub fn new(
         routes: Routes,
         phantom: Phantom,
         tokens: Arc<dyn TokenSource>,
-        mut tls: rustls::ClientConfig,
-    ) -> Self {
-        tls.alpn_protocols = vec![b"http/1.1".to_vec()];
-        Self {
+        tls: rustls::ClientConfig,
+    ) -> anyhow::Result<Self> {
+        let mut tls_by_audience = HashMap::new();
+        for r in routes.by_endpoint.values() {
+            if let Some(pem) = &r.ca_pem
+                && !tls_by_audience.contains_key(&r.audience)
+            {
+                let cfg = mediatore_proto::tls::https_client_config_with_ca(pem.as_bytes())
+                    .map_err(|e| {
+                        anyhow::anyhow!("route {} (audience {}): {e}", r.endpoint, r.audience)
+                    })?;
+                tls_by_audience.insert(r.audience.clone(), http1_only(cfg));
+            }
+        }
+        Ok(Self {
             routes,
             phantom,
             tokens,
             cache: TokenCache::default(),
-            tls: Arc::new(tls),
-        }
+            tls: http1_only(tls),
+            tls_by_audience,
+        })
     }
 
-    /// The production trust: TLS 1.3 to the Mozilla roots, like the broker's identity
-    /// provider client.
+    /// The production trust for routes without a CA: TLS 1.3 to the Mozilla roots, like
+    /// the broker's identity provider client.
+    ///
+    /// # Errors
+    /// As [`Self::new`].
     pub fn with_webpki_roots(
         routes: Routes,
         phantom: Phantom,
         tokens: Arc<dyn TokenSource>,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         Self::new(
             routes,
             phantom,
             tokens,
             mediatore_proto::tls::https_client_config(),
         )
+    }
+
+    /// The trust for `route`: its audience's CA when it carries one, the default otherwise.
+    fn tls_for(&self, route: &Route) -> Arc<rustls::ClientConfig> {
+        route
+            .ca_pem
+            .as_ref()
+            .and_then(|_| self.tls_by_audience.get(&route.audience))
+            .unwrap_or(&self.tls)
+            .clone()
     }
 
     /// Serve connections from `listener` forever (until the task is dropped).
@@ -438,7 +479,7 @@ impl Proxy {
             None
         };
         let upstream = rewrite(req, &forward, bearer.as_deref());
-        match connect_and_send(&route.endpoint, self.tls.clone(), upstream).await {
+        match connect_and_send(&route.endpoint, self.tls_for(&route), upstream).await {
             Ok(resp) => {
                 tracing::info!(
                     audience = %route.audience,
@@ -673,7 +714,7 @@ pub async fn run(args: EgressArgs) -> anyhow::Result<()> {
         routes,
         phantom,
         Arc::new(BrokerTokens { client }),
-    ));
+    )?);
     tracing::info!(%addr, routes = proxy.routes.len(), "egress proxy listening");
     // The one line on standard output: the guest starts the jail when it reads it.
     println!("{READY_LINE} {addr}");
@@ -696,7 +737,71 @@ mod tests {
                     path: (*p).into(),
                 })
                 .collect(),
+            ca_pem: None,
         }
+    }
+
+    struct NoTokens;
+
+    #[async_trait::async_trait]
+    impl TokenSource for NoTokens {
+        async fn token(&self, _: &str) -> anyhow::Result<TokenResponse> {
+            anyhow::bail!("no tokens in this test")
+        }
+    }
+
+    #[test]
+    fn a_route_with_a_ca_is_trusted_through_that_ca_alone_and_a_bad_one_refuses_the_proxy() {
+        let private = Route {
+            ca_pem: Some(mediatore_testkit::fixture_ca_pem()),
+            ..route("internal-git", "git.home.example:443", &[])
+        };
+        let public = route("public", "api.example.com:443", &[]);
+        let proxy = Proxy::with_webpki_roots(
+            Routes::new(vec![private.clone(), public.clone()]).unwrap(),
+            phantom(),
+            Arc::new(NoTokens),
+        )
+        .unwrap();
+        let for_private = proxy.tls_for(&private);
+        let for_public = proxy.tls_for(&public);
+        assert!(
+            Arc::ptr_eq(&for_public, &proxy.tls),
+            "no ca_pem: the default roots"
+        );
+        assert!(
+            !Arc::ptr_eq(&for_private, &proxy.tls),
+            "a ca_pem: a config of its own, never the default roots as well"
+        );
+        assert_eq!(for_private.alpn_protocols, vec![b"http/1.1".to_vec()]);
+        assert_eq!(for_public.alpn_protocols, vec![b"http/1.1".to_vec()]);
+
+        let broken = Route {
+            ca_pem: Some("-----BEGIN CERTIFICATE-----\nnope\n-----END CERTIFICATE-----\n".into()),
+            ..route("internal-git", "git.home.example:443", &[])
+        };
+        let err = Proxy::with_webpki_roots(
+            Routes::new(vec![broken]).unwrap(),
+            phantom(),
+            Arc::new(NoTokens),
+        )
+        .err()
+        .expect("a CA that is not a certificate refuses the proxy")
+        .to_string();
+        assert!(err.contains("git.home.example:443"), "{err}");
+        let empty = Route {
+            ca_pem: Some(String::new()),
+            ..route("internal-git", "git.home.example:443", &[])
+        };
+        assert!(
+            Proxy::with_webpki_roots(
+                Routes::new(vec![empty]).unwrap(),
+                phantom(),
+                Arc::new(NoTokens)
+            )
+            .is_err(),
+            "an empty ca_pem is not the Mozilla roots; it is a refusal"
+        );
     }
 
     fn routes() -> Routes {
