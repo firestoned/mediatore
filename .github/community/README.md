@@ -19,6 +19,7 @@ board is [`ROADMAPS.md`](../../ROADMAPS.md) at the repo root.
 | 06 | [06-guest-hardening.md](06-guest-hardening.md) | Rootfs unpack, network policy, seccomp, live-VM proof |
 | 07 | [07-egress-proxy.md](07-egress-proxy.md) | Phase 2: tokens the workload never sees |
 | 08 | [08-agentsandbox-crd.md](08-agentsandbox-crd.md) | `AgentSandbox` as mediatore's CRD; the declarative way to ask for a sandbox |
+| 09 | [09-notaio-bundles-in-shadow.md](09-notaio-bundles-in-shadow.md) | notaio's signed policy bundles, verified and compared with each sandbox, enforcing nothing yet |
 
 Dependency shape: 01 unblocks 02 (the agents need something to present SVIDs
-to) and 03–05 build on both; 06 needs 02; 07 is design-only until 04 exists; 08 builds on 03 and narrows 05.
+to) and 03–05 build on both; 06 needs 02; 07 is design-only until 04 exists; 08 builds on 03 and narrows 05; 09 builds on 05 and 08.

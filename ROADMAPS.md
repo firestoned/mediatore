@@ -18,6 +18,7 @@ the same commit that changes a roadmap item's state.
 | 06 | Guest completion + hardening | 🔶 in progress | [06-guest-hardening.md](.github/community/06-guest-hardening.md) |
 | 07 | Credential-injecting egress proxy | 🔶 in progress | [07-egress-proxy.md](.github/community/07-egress-proxy.md) |
 | 08 | AgentSandbox CRD and reconciler (ADR-0008) | ✅ done | [08-agentsandbox-crd.md](.github/community/08-agentsandbox-crd.md) |
+| 09 | notaio bundles, verified in shadow (ADR-0026) | ⛔ not started | [09-notaio-bundles-in-shadow.md](.github/community/09-notaio-bundles-in-shadow.md) |
 
 Statuses: ✅ done · 🔶 in progress · ⛔ not started · 📄 reference doc.
 ADRs are separate and live in [`docs/adr/`](docs/adr/).
