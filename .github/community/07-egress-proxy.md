@@ -38,9 +38,13 @@ Threat model R-3 was accepted until the ADR for this was written; it is rewritte
       through `nsjail`'s environment, never its argument list
 - [x] Proven in `make check`: `crates/mediatore/tests/e2e_egress.rs` against a TLS
       upstream from the test kit (`TlsUpstream`), the dev-mode broker and the fake issuer
-- [ ] A private certificate authority per audience, for an upstream on a private PKI:
-      the broker's `issuers[].ca_file` shape, carried on the route, so the homelab's own
-      services are reachable through the proxy
+- [x] A private certificate authority per audience, for an upstream on a private PKI.
+      Done 2026-10-30 as ADR-0025 decision 7 (amendment): `audiences[].ca_file`, the
+      `issuers[].ca_file` shape, read at start and refused if empty, carried on the route
+      as `Route::ca_pem`, the proxy trusting exactly that CA for that audience and the
+      Mozilla roots for the rest; a PEM that does not parse refuses the proxy and the
+      claim. Proven in `e2e_egress.rs` through the production constructor against the
+      test kit's CA, and refused with the CA stripped
 - [ ] An audience served directly, without the proxy, declared per audience for a
       protocol that is not HTTP; never a default. Until then such an audience is
       unreachable from the jail

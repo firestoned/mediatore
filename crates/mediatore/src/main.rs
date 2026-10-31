@@ -156,6 +156,7 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
             .iter()
             .map(|a| (a.name.clone(), a.rules.clone()))
             .collect(),
+        cas: audience_cas(&cfg)?,
         registries,
         sandboxes,
         sandbox_namespace: cfg.sandboxes.namespace.clone(),
@@ -269,6 +270,33 @@ async fn store(cfg: &Config) -> anyhow::Result<Arc<dyn ClaimStore>> {
         "store: migrated and connected"
     );
     Ok(Arc::new(store))
+}
+
+/// The CA bundles the egress proxy trusts per audience (`audiences[].ca_file`, ADR-0025
+/// amended): each file read at start and refused unless it builds a client config, so a
+/// missing or empty file stops the broker rather than a claim.
+fn audience_cas(cfg: &Config) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
+    let mut out = std::collections::BTreeMap::new();
+    for a in &cfg.audiences {
+        if let Some(path) = &a.ca_file {
+            let pem = std::fs::read(path).map_err(|e| {
+                anyhow::anyhow!("audience {} ca_file {}: {e}", a.name, path.display())
+            })?;
+            mediatore_proto::tls::https_client_config_with_ca(&pem).map_err(|e| {
+                anyhow::anyhow!("audience {} ca_file {}: {e}", a.name, path.display())
+            })?;
+            let pem = String::from_utf8(pem).map_err(|e| {
+                anyhow::anyhow!(
+                    "audience {} ca_file {}: not UTF-8 PEM: {e}",
+                    a.name,
+                    path.display()
+                )
+            })?;
+            tracing::info!(audience = %a.name, ca_file = %path.display(), "audience pinned to a private CA for the egress proxy");
+            out.insert(a.name.clone(), pem);
+        }
+    }
+    Ok(out)
 }
 
 /// The upstream validator, with each issuer that names a `ca_file` pinned to that CA. The
@@ -640,6 +668,33 @@ mod tests {
     }
 
     /// The header path exists only in a `dev` build (ADR-0007 decision 5).
+    #[test]
+    fn an_audiences_ca_file_is_read_at_start_and_an_empty_or_missing_one_stops_the_broker() {
+        let dir = mediatore_testkit::tempdir();
+        let good = dir.join("home.pem");
+        std::fs::write(&good, mediatore_testkit::fixture_ca_pem()).unwrap();
+        let empty = dir.join("empty.pem");
+        std::fs::write(&empty, "").unwrap();
+        let base = |ca: &str| {
+            format!(
+                "trust_domain: sandbox.test\nissuers: []\nlisten: {{ user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }}\ndev_mode: true\nsts: {{ issuer: https://mediatore.test, kid: k, signing_key_file: /k }}\naudiences:\n  - {{ name: internal-git, via: sts, egress: [\"git.home.example:443\"], ca_file: {ca} }}\n  - {{ name: public, via: sts, egress: [\"api.example.com:443\"] }}\n"
+            )
+        };
+        let cfg = Config::parse(&base(good.to_str().unwrap())).unwrap();
+        let cas = audience_cas(&cfg).unwrap();
+        assert_eq!(cas.len(), 1, "only the audience that named a file");
+        assert!(cas["internal-git"].starts_with("-----BEGIN CERTIFICATE-----"));
+        let err = audience_cas(&Config::parse(&base(empty.to_str().unwrap())).unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no certificate"), "{err}");
+        let err =
+            audience_cas(&Config::parse(&base(dir.join("absent.pem").to_str().unwrap())).unwrap())
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("absent.pem"), "{err}");
+    }
+
     #[test]
     fn the_dev_header_flag_follows_the_dev_feature() {
         let argv = [

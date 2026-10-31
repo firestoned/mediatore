@@ -200,6 +200,11 @@ pub struct Route {
     /// The audience's rules; empty admits every method and path.
     #[serde(default)]
     pub rules: Vec<EndpointRule>,
+    /// The CA certificates, PEM, the proxy trusts for this route instead of the Mozilla
+    /// roots (`audiences[].ca_file`, ADR-0025 amended): an upstream on a private PKI.
+    /// Public material. Absent, the Mozilla roots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_pem: Option<String>,
 }
 
 impl Route {
@@ -428,6 +433,7 @@ mod tests {
             audience: "internal-git".into(),
             endpoint: "git.home.example:443".parse().unwrap(),
             rules: vec![],
+            ca_pem: None,
         };
         assert!(open.admits("DELETE", "/anything/at/all"));
         let narrow = Route {
@@ -457,8 +463,21 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(r.rules, Vec::<EndpointRule>::new());
+        assert_eq!(r.ca_pem, None, "no ca_pem: the Mozilla roots");
         let json = serde_json::to_value(&r).unwrap();
         assert_eq!(json["rules"], serde_json::json!([]));
+        assert!(json.get("ca_pem").is_none(), "absent, not null: {json}");
+        let with_ca = Route {
+            ca_pem: Some("-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----\n".into()),
+            ..r
+        };
+        let json = serde_json::to_value(&with_ca).unwrap();
+        assert!(
+            json["ca_pem"]
+                .as_str()
+                .unwrap()
+                .starts_with("-----BEGIN CERTIFICATE-----")
+        );
     }
 
     #[test]

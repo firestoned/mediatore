@@ -23,6 +23,7 @@ pub struct TlsUpstream {
     /// Where it listens.
     pub addr: SocketAddr,
     roots: Arc<RootCertStore>,
+    ca_pem: String,
     server: tokio::task::JoinHandle<()>,
 }
 
@@ -53,6 +54,7 @@ impl TlsUpstream {
         let ca_cert = ca.self_signed(&ca_key).expect("ca cert");
         let mut roots = RootCertStore::empty();
         roots.add(ca_cert.der().clone()).expect("root");
+        let ca_pem = crate::pem::armour("CERTIFICATE", ca_cert.der());
         let issuer = Issuer::new(ca, ca_key);
 
         let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("leaf key");
@@ -102,8 +104,15 @@ impl TlsUpstream {
         Self {
             addr,
             roots: Arc::new(roots),
+            ca_pem,
             server,
         }
+    }
+
+    /// This server's CA as PEM: what an operator puts in `audiences[].ca_file`.
+    #[must_use]
+    pub fn ca_pem(&self) -> String {
+        self.ca_pem.clone()
     }
 
     /// A TLS 1.3 client configuration trusting this server's CA and nothing else.

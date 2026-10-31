@@ -71,6 +71,10 @@ pub struct AppState {
     /// Per audience, the egress proxy's rules (`audiences[].rules`, ADR-0025); `GET /v1/me`
     /// returns one route per audience and endpoint of the claim, carrying them.
     pub rules: BTreeMap<String, Vec<EndpointRule>>,
+    /// Per audience, the PEM of the CA the egress proxy trusts for its endpoints
+    /// (`audiences[].ca_file`, ADR-0025 amended); absent, the Mozilla roots. Public material,
+    /// validated at start, carried on the route.
+    pub cas: BTreeMap<String, String>,
     /// Per registry host (as the API reaches it), the operator's pull credential
     /// (`registries[]`); `GET /v1/me` hands the guest the one its claim's image names
     /// (ADR-0022).
@@ -790,6 +794,7 @@ async fn me(
                 audience: a.clone(),
                 endpoint: e.clone(),
                 rules: st.rules.get(a).cloned().unwrap_or_default(),
+                ca_pem: st.cas.get(a).cloned(),
             })
         })
         .collect();

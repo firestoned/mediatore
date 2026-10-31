@@ -25,7 +25,9 @@ audiences:
   # workload gets tokens it can spend nowhere (ADR-0020). An endpoint belongs to one
   # audience. rules (optional): what the egress proxy forwards for it, nono's
   # endpoint_rules shape, `*` one path segment, `**` any; none means every method and
-  # path (ADR-0025).
+  # path (ADR-0025). ca_file (optional): the CA the proxy trusts for this audience's
+  # endpoints instead of the Mozilla roots, for a service on your private PKI; a PEM from
+  # a Secret mounted like the STS key.
   - name: grafana.home.example
     via: sts
     max_ttl: 900
@@ -33,6 +35,7 @@ audiences:
     rules:
       - { method: GET, path: "/api/**" }
       - { method: POST, path: "/api/ds/query" }
+    # ca_file: /etc/mediatore-cas/home.pem
 # Private registries (ADR-0022): the login and a token file from a Secret mounted like the
 # STS key; the guest gets the credential for the registry its claim's image names.
 # registries:
