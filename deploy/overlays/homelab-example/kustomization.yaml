@@ -48,6 +48,10 @@ patches:
         strategy: { type: Recreate }
         template:
           spec:
+            # The container runs as uid 65532 (deploy/base); the two Secrets below are
+            # mounted 0440, readable through the group alone, so the pod's fsGroup must be
+            # that uid or the broker refuses its keys at start ("Permission denied").
+            securityContext: { fsGroup: 65532 }
             containers:
               - name: mediatore
                 volumeMounts:

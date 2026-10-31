@@ -41,7 +41,7 @@ gh attestation verify mediatore-0.1.0.yaml --repo firestoned/mediatore
 | banlieue with `VirtualMachinePool` and `VirtualMachineClaim` | banlieue's release | the claims mediatore creates (ADR-0008, ADR-0011) |
 | banlieue's claim subject policy listing mediatore as a broker | ConfigMap `banlieue-claim-subject-policy`, `brokers:` line `system:serviceaccount:banlieue-system:mediatore`, `issuers:` listing yours | every claim mediatore creates names someone else's subject ([requesting a sandbox](requesting-a-sandbox.md)) |
 | An issuer with a public client for mediatore | Dex, Google, Auth0 or Entra ([issuers](issuers.md)) | `mediatore login` and the refresh before every issue |
-| An ingress for the user API, a LoadBalancer for the sandbox listener | the Tailscale operator's ingress class and MetalLB in the example | `:8080` to people, `:8443` to pool VMs |
+| An ingress for the user API, a LoadBalancer for the sandbox listener | the Tailscale operator's ingress class and MetalLB in the example | `:8080` to people; `:443` on the LoadBalancer (the pod's 8443) to pool VMs, so `MEDIATORE_URL` in the members' env file names the address alone |
 | A ReadWriteOnce storage class | `local-path` on k0s | the SQLite file of a one-replica broker, or nothing with PostgreSQL |
 
 None of those are this repository's to install. What follows is.
@@ -181,6 +181,20 @@ is the `VMImage` (a libvirt `Url` source pinned by digest, three cloud-config la
 `image/cloud-config-deployment.example.yaml`) and the `VMClass` with a vTPM; it runs
 `installMode: deferred` until a Kairos 4.4 Debian base exists for first-boot sealing.
 
+A `Url` source needs banlieue-imagebuilder and the kairos-operator on the cluster; without
+them the `VMImage` stays `BuildPending` on every provider. The other route, the one the
+live proof took: merge the three layers yourself (maps deep-merged, lists concatenated, in
+that order, with the `#cloud-config` header), build the installer ISO on a host with
+AuroraBoot (`build-iso --cloud-config merged.yaml --override-name <name> docker://ghcr.io/firestoned/mediatore-guest@sha256:<digest>`),
+put it in the libvirt pool the `VMClass`'s storage class maps to (`virsh pool-refresh`),
+and declare `sources: [{providerClass: libvirt, kind: BackingFile, ref: <name>.iso}]` with
+`installMode: deferred`: the member installs from the CD-ROM, which is ejected when the
+guest reports its phase. Two things to know for either route. The bundle in the deployment
+layer admits a member's first boot for as long as the server's CA lives (`ca_ttl`; 24 h in
+a default Helm render means refreshing the layer daily, a week or more means an image that
+keeps), and `/etc/mediatore-guest/env` takes whole-line comments only, since systemd's
+`EnvironmentFile` keeps an inline comment as part of the value.
+
 ```sh
 make dist && make guest-image BINARY_FROM=host && make guest-image-check   # or pull a release by digest
 gh attestation verify oci://ghcr.io/firestoned/mediatore-guest@sha256:<digest> --repo firestoned/mediatore
@@ -261,7 +275,7 @@ of every request it forwards or refuses, never a token.
 
 The guest pulls each claim's `workload.image` itself ([ADR-0021](../adr/0021-sandbox-filesystem-tmpfs-and-rootfs-from-the-registry.md)): over HTTPS with the
 Mozilla roots, anonymously, into a tmpfs it mounts at `/mnt/sandbox` for that claim
-(`nosuid,nodev`, mode 0700). Two things follow for the deployment. The segment's
+(`nosuid,nodev`, mode 0711). Two things follow for the deployment. The segment's
 firewall must let members reach the registries the images live on, beside the broker
 and the audiences' endpoints; and the members need memory for the unpacked image, its
 largest layer and `/work` on top of the workload: `MEDIATORE_SANDBOX_SIZE` in

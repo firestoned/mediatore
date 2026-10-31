@@ -55,14 +55,15 @@ need interactivity, the workload dials **out** (see
    next token ([ADR-0013](../adr/0013-dex-session-delegation.md)). The CLI forgets the
    refresh token once delegated (Dex rotates it); a second claim is a second login.
 
-2. Claim, naming the workload:
+2. Claim, naming the workload (an argument that starts with a dash goes in the `--arg=-p`
+   form, or the CLI reads it as a flag of its own):
 
    ```bash
    # Dex: the CLI posts the claim with the session delegated
    mediatore sandbox create --mediatore https://mediatore.sandbox.example \
      --pool pool-a --ttl 3600 --audience api://trading-data \
      --image registry.internal:5000/sandbox/claude:latest \
-     --arg /usr/bin/claude --arg -p --arg "reconcile the ledgers"
+     --arg /usr/bin/claude --arg=-p --arg "reconcile the ledgers"
 
    # Entra, or any issuer without a session: the same call by hand
    curl -sS https://mediatore.sandbox.example/v1/claims \

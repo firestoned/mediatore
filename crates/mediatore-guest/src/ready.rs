@@ -45,15 +45,26 @@ pub struct Channels {
 
 impl Channels {
     /// The channels as this guest has them: the marker at `phase_file`, the tool if it is
-    /// on `PATH`, the device at its fixed path.
+    /// on `PATH` and the firmware says `VMware` (the tool exits 255 anywhere else, which is
+    /// not a failed announcement), the device at its fixed path.
     #[must_use]
     pub fn detect(phase_file: PathBuf) -> Self {
+        let vendor = std::fs::read_to_string(DMI_SYS_VENDOR).unwrap_or_default();
         Self {
             phase_file,
-            rpctool: find_in_path(RPCTOOL),
+            rpctool: is_vmware(&vendor).then(|| find_in_path(RPCTOOL)).flatten(),
             vsock_device: PathBuf::from(VSOCK_DEVICE),
         }
     }
+}
+
+/// Where the kernel exposes the firmware's system vendor.
+pub const DMI_SYS_VENDOR: &str = "/sys/class/dmi/id/sys_vendor";
+
+/// Whether the firmware vendor is `VMware`: the one platform `vmware-rpctool` works on.
+#[must_use]
+pub fn is_vmware(sys_vendor: &str) -> bool {
+    sys_vendor.trim().to_ascii_lowercase().starts_with("vmware")
 }
 
 /// How one channel went.
@@ -333,6 +344,21 @@ mod tests {
         assert_eq!(ch.vsock_device, PathBuf::from(VSOCK_DEVICE));
         if let Some(p) = &ch.rpctool {
             assert!(p.ends_with(RPCTOOL) && p.is_absolute());
+        }
+    }
+
+    #[test]
+    fn the_rpctool_channel_is_vmwares_alone() {
+        assert!(is_vmware("VMware, Inc.\n"));
+        assert!(is_vmware("VMware7,1"));
+        for other in [
+            "QEMU",
+            "Red Hat",
+            "Cloud Hypervisor",
+            "",
+            "Microsoft Corporation",
+        ] {
+            assert!(!is_vmware(other), "{other:?}");
         }
     }
 

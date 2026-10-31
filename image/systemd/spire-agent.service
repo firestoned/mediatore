@@ -26,6 +26,18 @@ RestartSec=5
 NoNewPrivileges=yes
 ProtectSystem=strict
 ReadWritePaths=/var/lib/spire /run/spire
+# /run/spire exists before the first start (the sockets dir inside it is the base layer's),
+# and survives a restart: the guest's healthcheck and the proxy hold the socket path.
+RuntimeDirectory=spire
+RuntimeDirectoryPreserve=yes
+# The TPM attestor plugin is a go-plugin child that opens a temp file at start; under
+# ProtectSystem=strict the system /tmp is read-only, a private one is not.
+PrivateTmp=yes
+# The unix workload attestor resolves a caller's binary through /proc/<pid>/exe
+# (discover_workload_path, image/spire/agent.conf). The callers are the root guest and
+# the sandbox user's proxy, neither this user: the capability, as an ambient one, is what
+# lets an unprivileged agent read them. Found on the first live member (roadmap 06).
+AmbientCapabilities=CAP_SYS_PTRACE
 
 [Install]
 WantedBy=multi-user.target

@@ -40,6 +40,18 @@ come from, when the ruleset is loaded, and what happens when it cannot be.
    credentials so the workload never holds a token is roadmap 07, a different design with
    its own ADR.
 
+   *Amended 2026-10-31, from the live proof.* No user namespace either
+   (`--disable_clone_newuser`). nsjail's default is one, and inside it the jail's uid is
+   mapped to the invoker's, root: `uid_map` `101 0 1`, so every socket the workload opens
+   carries global uid 0, outside the chain this decision keys on, and the loopback rule
+   that admits the sandbox uid alone to the proxy cuts the workload off from its one route.
+   The unix workload attestor's `unix:user` selector and the proxy's uid gate key on the
+   same global uid. Without the namespace nsjail sets the uid directly, `uid_map`
+   `0 0 4294967295` and `id` the sandbox user's. The namespace also fails on a systemd
+   host, where the read-only remount of nsjail's mount tree under `/run/user`
+   (`nosuid,nodev` locked by the parent mount) is refused inside it. The kind tier ran the
+   guest in a pod and saw neither.
+
 2. **The destinations are the claim's audiences' endpoints, declared in the broker's
    config.** `audiences[].egress` lists `host:port` pairs per audience;
    `GET /v1/me` returns the union over the claim's audiences as `egress`, so the guest
