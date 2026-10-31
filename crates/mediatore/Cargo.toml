@@ -54,6 +54,7 @@ mediatore-testkit.workspace = true
 reqwest.workspace = true
 jsonwebtoken.workspace = true
 uuid.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true

@@ -3,6 +3,8 @@
 
 //! The HTTP client both VM-side roles use against the sandbox listener.
 
+use std::time::Duration;
+
 use mediatore_tls::{MaterialSource, SpiffeId, WorkloadApiSource};
 use reqwest::Method;
 use serde::Serialize;
@@ -10,6 +12,15 @@ use serde::Serialize;
 /// Header carrying the peer SPIFFE ID against a `dev_mode` server.
 #[cfg(feature = "dev")]
 const DEV_PEER_HEADER: &str = "x-mediatore-peer-spiffe-id";
+
+/// How long a VM-side role waits for its first SVID before it fails closed. Not short: a
+/// process started the moment its claim binds waits for the claim entry to reach the agent
+/// through the controller manager, the server and the agent's own sync (ADR-0006), which
+/// kind shows taking tens of seconds; the Workload API answers only once the entry is
+/// there. Bounded all the same, so an agent that is absent or silent is an error that
+/// names the cause, not a hang. The guest's readiness wait for the egress proxy outlasts
+/// this (`PROXY_READY_SECS`, `guest.rs`), so that error is what the claim ends with.
+pub const WORKLOAD_API_WAIT: Duration = Duration::from_secs(90);
 
 /// HTTP client for the sandbox listener, with this process's identity as the client.
 pub struct SandboxClient {
@@ -30,11 +41,11 @@ enum Transport {
 }
 
 impl SandboxClient {
-    /// Obtain the transport identity from the Workload API at `workload_api_socket`.
-    /// Fails closed: no Workload API, no client.
+    /// Obtain the transport identity from the Workload API at `workload_api_socket`,
+    /// within [`WORKLOAD_API_WAIT`]. Fails closed: no Workload API, no client.
     pub async fn connect(mediatore_url: &str, workload_api_socket: &str) -> anyhow::Result<Self> {
         let endpoint = mediatore_tls::endpoint(workload_api_socket);
-        let source = WorkloadApiSource::connect(&endpoint)
+        let source = WorkloadApiSource::connect(&endpoint, WORKLOAD_API_WAIT)
             .await
             .map_err(|e| anyhow::anyhow!("Workload API at {endpoint}: {e}"))?;
         let own = source.current()?;

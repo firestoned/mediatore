@@ -54,8 +54,9 @@ sys.exit(0)
 
     pub fn run() {
         let bin = env!("CARGO_BIN_EXE_mediatore");
-        let root =
-            std::env::temp_dir().join(format!("mediatore-jail-exec-{}", uuid::Uuid::new_v4()));
+        // A private directory of this test's own, a random name, gone on drop.
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path();
         let allowed = root.join("allowed");
         let denied = root.join("denied");
         std::fs::create_dir_all(&allowed).unwrap();
@@ -84,7 +85,6 @@ sys.exit(0)
             .status()
             .expect("spawn mediatore jail-exec");
         let code = status.code();
-        let _ = std::fs::remove_dir_all(&root);
         assert_eq!(
             code,
             Some(0),

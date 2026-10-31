@@ -45,6 +45,8 @@ check "no sshd, and ssh masked (ADR-0010: nothing inbound)" \
   '! command -v sshd && for u in ssh.service ssh.socket; do test "$(readlink /etc/systemd/system/$u)" = /dev/null || exit 1; done'
 check "no other listener the base shipped (snmpd, lldpd, rpcbind)" \
   '! command -v snmpd && ! command -v lldpd && ! command -v rpcbind'
+check "Yama's ptrace scope raised in the image's sysctl (ADR-0025, roadmap 06)" \
+  'grep -qx "kernel.yama.ptrace_scope = 1" /etc/sysctl.d/99-mediatore.conf'
 check "no private key material (banlieue ADR-0108 decision 2)" \
   '! grep -rl "PRIVATE KEY" /etc /usr/share/mediatore /var/lib 2>/dev/null | grep -q .'
 

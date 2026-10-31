@@ -4,6 +4,7 @@
 //! Where SVIDs and bundles come from.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::future::BoxFuture;
 use rustls::RootCertStore;
@@ -71,12 +72,19 @@ pub struct WorkloadApiSource {
 
 impl WorkloadApiSource {
     /// Connect to the agent at `endpoint` (`unix:///run/spire/sockets/spire-agent.sock`) and
-    /// wait for the first SVID.
-    pub async fn connect(endpoint: &str) -> Result<Self, TlsError> {
-        let source = X509Source::builder()
-            .endpoint(endpoint)
-            .build()
+    /// wait for the first SVID, at most `wait`. The `spiffe` crate retries a socket that is
+    /// absent and waits on one that never answers, both without end; a role that cannot
+    /// get its identity has to fail closed, not hang, so the wait is bounded here.
+    pub async fn connect(endpoint: &str, wait: Duration) -> Result<Self, TlsError> {
+        let build = X509Source::builder().endpoint(endpoint).build();
+        let source = tokio::time::timeout(wait, build)
             .await
+            .map_err(|_elapsed| {
+                TlsError::WorkloadApi(format!(
+                    "no SVID from {endpoint} within {}s",
+                    wait.as_secs_f32()
+                ))
+            })?
             .map_err(|e| TlsError::WorkloadApi(e.to_string()))?;
         Ok(Self { source })
     }
@@ -130,5 +138,64 @@ impl MaterialSource for WorkloadApiSource {
                 .map(|_generation| ())
                 .map_err(|e| TlsError::WorkloadApi(e.to_string()))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::WorkloadApiSource;
+    use crate::TlsError;
+
+    /// A private directory of this test's own (mode 0700, a random name, gone on drop) and
+    /// the socket path inside it: never a predictable name in the shared temp directory.
+    fn socket_dir() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("a private directory");
+        let path = dir.path().join("agent.sock");
+        (dir, path)
+    }
+
+    #[tokio::test]
+    async fn a_workload_api_that_never_answers_fails_the_connect_within_the_wait() {
+        let (_dir, path) = socket_dir();
+        // Bound, never accepted: a connect succeeds and the first SVID never comes.
+        let _listener = tokio::net::UnixListener::bind(&path).expect("bind");
+        let started = Instant::now();
+        let err = WorkloadApiSource::connect(
+            &crate::endpoint(&path.to_string_lossy()),
+            Duration::from_millis(300),
+        )
+        .await
+        .err()
+        .expect("no SVID, no source");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(
+            matches!(&err, TlsError::WorkloadApi(m) if m.contains("within")),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_workload_api_socket_that_does_not_exist_fails_the_connect_within_the_wait() {
+        let (_dir, path) = socket_dir();
+        let started = Instant::now();
+        let err = WorkloadApiSource::connect(
+            &crate::endpoint(&path.to_string_lossy()),
+            Duration::from_millis(300),
+        )
+        .await
+        .err()
+        .expect("no socket, no source");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(matches!(err, TlsError::WorkloadApi(_)), "{err}");
     }
 }

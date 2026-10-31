@@ -129,6 +129,9 @@ http-body-util = "0.1"
 # test-only (mock API server for the kube entry manager; test CA for SVIDs)
 tower-test     = "0.4"
 rcgen          = { version = "0.14", default-features = false, features = ["aws_lc_rs"] }
+# A uniquely named private directory for a test's socket or tree, removed on drop: never a
+# predictable path under the shared temp directory.
+tempfile       = "3"
 time           = "0.3"
 
 [workspace.lints.rust]
