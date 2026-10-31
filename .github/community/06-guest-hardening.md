@@ -104,5 +104,21 @@
       raised to 120 s to outlast it): a role whose agent socket is absent or silent fails
       closed with the cause instead of hanging, which the egress proxy did behind the
       guest's readiness wait
-- [ ] Live proof on a libvirt member: reboot mid-claim re-attests with the same EK and
-      recreates the jail (runbook 8.7 last row)
+- [x] Live proof on a libvirt member: reboot mid-claim re-attests with the same EK and
+      recreates the jail (runbook 8.7 last row). Done 2026-10-31 against v0.2.0-rc.3 on
+      the homelab cluster (banlieue v0.4.8, SPIRE 1.15.3 with the `tpm` NodeAttestor, Dex):
+      a Kairos member installed from an AuroraBoot ISO with the three layers embedded
+      (a `BackingFile` VMImage, `installMode: deferred`, a vTPM class) attested as
+      `spiffe://sandbox.home.example/spire/agent/tpm/6ed87b22…`, registered, went
+      GuestReady; a claim ran the public curl image under nsjail and Landlock, and the
+      four ADR-0025 cases came back 200 with the real token at the audience (a private
+      CA), 401 `unknown_credential`, 403 `outside_rules`, 404 `no_route`; after
+      `systemctl reboot` mid-claim the same agent ID loaded from the sealed partition, the
+      guest re-registered, re-fetched the claim, recreated the proxy and the jail, and the
+      workload's heartbeats through the proxy resumed within 40 s. The proof needed a
+      deployment layer carrying stopgaps for defects the kind tier (the guest in a pod)
+      cannot see: the image has no `/mnt`, the sandbox tmpfs is unreadable by the sandbox
+      user, nsjail's user namespace maps the jail to global root and fails its remount on a
+      systemd host, `/etc/spire` is created without the execute bit, and the agent unit
+      lacks a writable `/tmp` and `CAP_SYS_PTRACE`. Those are the next change, with a tier
+      that runs the guest under the image's own units on a VM.
