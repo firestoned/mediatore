@@ -169,7 +169,7 @@ One VM image serves every workload image.
 The VM image is built from this repository ([ADR-0023](../adr/0023-sandbox-vm-image-kairos-derivative.md)): `image/Dockerfile` is a
 Kairos Debian 13 derivative with the guest software in the immutable rootfs (`/usr/bin`,
 never `/usr/local`, which Kairos mounts the persistent partition over), every listener the
-base shipped removed, the `spire` user created and both units enabled. The Build workflow
+base shipped removed, the `spire` user created, both units enabled and Yama's `ptrace_scope` raised to 1 (`image/sysctl/`). The Build workflow
 publishes it as `ghcr.io/firestoned/mediatore-guest`, signed and attested like the server
 image, on every push and release; `make guest-image` builds it locally and
 `make guest-image-check` proves what it carries. The image holds no trust bundle, no trust

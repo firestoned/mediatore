@@ -20,8 +20,10 @@ use crate::{egress, identity, image, jail, net, ready, sandboxfs, supervise, use
 const REGISTER_RETRY_SECS: u64 = 5;
 /// Seconds between `GET /v1/me` polls while no claim is bound.
 const ME_POLL_SECS: u64 = 5;
-/// How long the egress proxy gets to report ready before the claim fails.
-const PROXY_READY_SECS: u64 = 30;
+/// How long the egress proxy gets to report ready before the claim fails. Longer than the
+/// proxy's own wait for the claim SVID (`client::WORKLOAD_API_WAIT`), so that a claim
+/// whose entry never reaches the agent ends with the proxy's error, which names it.
+const PROXY_READY_SECS: u64 = 120;
 
 /// Arguments of the `guest` role.
 #[derive(Debug, clap::Args)]
@@ -369,4 +371,15 @@ async fn serve_claim(
     }
     let _ = proxy.wait().await;
     result
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn the_proxys_readiness_wait_outlasts_its_wait_for_the_claim_svid() {
+        assert!(
+            super::PROXY_READY_SECS > crate::client::WORKLOAD_API_WAIT.as_secs(),
+            "a proxy still waiting for its SVID would be killed before it could say why"
+        );
+    }
 }

@@ -231,6 +231,11 @@ async fn claim_watcher(
     }
 }
 
+/// How long the broker waits for its own SVID at start. Longer than a VM-side role's: the
+/// agent beside it in the pod may still be attesting; and bounded, so a pod with no
+/// Workload API restarts with the cause in its log instead of hanging as Running.
+const BROKER_WORKLOAD_API_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// The broker's own SVID from the Workload API, and the sandbox listener's rotating TLS
 /// config over it (ADR-0007 decisions 1 and 2). Fails closed: no socket, no SVID, or an
 /// SVID that is not `spiffe://<td>/mediatore` (a wrong `ClusterSPIFFEID`) and the process
@@ -239,7 +244,9 @@ async fn broker_identity(
     workload_api_socket: &str,
     naming: &Naming,
 ) -> anyhow::Result<Arc<mediatore_tls::TlsConfigs>> {
-    let source = mediatore_tls::WorkloadApiSource::connect(workload_api_socket).await?;
+    let source =
+        mediatore_tls::WorkloadApiSource::connect(workload_api_socket, BROKER_WORKLOAD_API_WAIT)
+            .await?;
     let own = source.current()?;
     anyhow::ensure!(
         own.spiffe_id.to_string() == naming.broker_id(),
