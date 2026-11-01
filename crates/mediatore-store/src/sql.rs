@@ -15,14 +15,17 @@ use std::borrow::Cow;
 use std::str::FromStr;
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use sqlx::any::{AnyConnectOptions, AnyPoolOptions, AnyRow};
 use sqlx::migrate::{Migration, MigrationType, Migrator};
 use sqlx::{AnyPool, ConnectOptions, Row, SqlSafeStr};
 use uuid::Uuid;
 
 use crate::seal::Sealed;
-use crate::{ClaimAudit, ClaimRecord, ClaimStore, NodeRecord, SessionRecord, StoreError};
+use crate::{
+    ClaimAudit, ClaimRecord, ClaimStore, NodeRecord, PolicyFloor, SessionRecord, StoreError,
+    same_policy,
+};
 
 /// Which engine a URL names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,7 +49,7 @@ impl Engine {
     }
 
     fn migrator(self) -> Migrator {
-        let steps: [(i64, &'static str, &'static str); 2] = match self {
+        let steps: [(i64, &'static str, &'static str); 3] = match self {
             Self::Sqlite => [
                 (
                     1,
@@ -57,6 +60,11 @@ impl Engine {
                     2,
                     "sessions",
                     include_str!("../migrations/sqlite/0002_sessions.sql"),
+                ),
+                (
+                    3,
+                    "policy_floors",
+                    include_str!("../migrations/sqlite/0003_policy_floors.sql"),
                 ),
             ],
             Self::Postgres => [
@@ -69,6 +77,11 @@ impl Engine {
                     2,
                     "sessions",
                     include_str!("../migrations/postgres/0002_sessions.sql"),
+                ),
+                (
+                    3,
+                    "policy_floors",
+                    include_str!("../migrations/postgres/0003_policy_floors.sql"),
                 ),
             ],
         };
@@ -154,6 +167,21 @@ fn unjson<T: serde::de::DeserializeOwned>(s: &str) -> Result<T, StoreError> {
 
 fn uuid(s: &str) -> Result<Uuid, StoreError> {
     Uuid::parse_str(s).map_err(backend)
+}
+
+/// A floor's `issuedAt`, exact (the `policy_floors` migration says why).
+fn nanos_text(t: DateTime<Utc>) -> String {
+    t.to_rfc3339_opts(SecondsFormat::Nanos, true)
+}
+
+fn from_nanos_text(s: &str) -> Result<DateTime<Utc>, StoreError> {
+    DateTime::parse_from_rfc3339(s)
+        .map(|t| t.with_timezone(&Utc))
+        .map_err(backend)
+}
+
+fn floor_version(v: u64) -> Result<i64, StoreError> {
+    i64::try_from(v).map_err(backend)
 }
 
 fn is_unique_violation(e: &sqlx::Error) -> bool {
@@ -638,6 +666,87 @@ impl ClaimStore for SqlStore {
         usize::try_from(done.rows_affected()).map_err(backend)
     }
 
+    async fn get_policy_floor(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> Result<Option<PolicyFloor>, StoreError> {
+        let row = sqlx::query(
+            "SELECT uid, version, issued_at FROM policy_floors WHERE namespace = $1 AND name = $2",
+        )
+        .bind(namespace)
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(backend)?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let version: i64 = row.try_get("version").map_err(backend)?;
+        let issued_at: String = row.try_get("issued_at").map_err(backend)?;
+        Ok(Some(PolicyFloor {
+            namespace: namespace.to_string(),
+            name: name.to_string(),
+            uid: row.try_get("uid").map_err(backend)?,
+            version: u64::try_from(version).map_err(backend)?,
+            issued_at: from_nanos_text(&issued_at)?,
+        }))
+    }
+
+    async fn advance_policy_floor(
+        &self,
+        held: Option<&PolicyFloor>,
+        next: PolicyFloor,
+    ) -> Result<(), StoreError> {
+        same_policy(held, &next)?;
+        let moved = || {
+            StoreError::Conflict(format!(
+                "the floor of {}/{} moved",
+                next.namespace, next.name
+            ))
+        };
+        let Some(held) = held else {
+            let result = sqlx::query(
+                "INSERT INTO policy_floors (namespace, name, uid, version, issued_at) \
+                 VALUES ($1, $2, $3, $4, $5)",
+            )
+            .bind(&next.namespace)
+            .bind(&next.name)
+            .bind(&next.uid)
+            .bind(floor_version(next.version)?)
+            .bind(nanos_text(next.issued_at))
+            .execute(&self.pool)
+            .await;
+            return match result {
+                Ok(_) => Ok(()),
+                Err(e) if is_unique_violation(&e) => Err(moved()),
+                Err(e) => Err(backend(e)),
+            };
+        };
+        // Compare and set: the row changes only if it is still exactly what the caller decided
+        // from.
+        let done = sqlx::query(
+            "UPDATE policy_floors SET uid = $1, version = $2, issued_at = $3 \
+             WHERE namespace = $4 AND name = $5 AND uid = $6 AND version = $7 AND issued_at = $8",
+        )
+        .bind(&next.uid)
+        .bind(floor_version(next.version)?)
+        .bind(nanos_text(next.issued_at))
+        .bind(&next.namespace)
+        .bind(&next.name)
+        .bind(&held.uid)
+        .bind(floor_version(held.version)?)
+        .bind(nanos_text(held.issued_at))
+        .execute(&self.pool)
+        .await
+        .map_err(backend)?;
+        if done.rows_affected() == 1 {
+            Ok(())
+        } else {
+            Err(moved())
+        }
+    }
+
     async fn ping(&self) -> Result<(), StoreError> {
         sqlx::query("SELECT 1")
             .execute(&self.pool)
@@ -673,7 +782,13 @@ mod tests {
             );
             let store = SqlStore::connect(&url, 4).await.unwrap();
             // Each case assumes an empty store, as the in-memory runs get one.
-            for t in ["claim_audit", "claims", "nodes", "sessions"] {
+            for t in [
+                "claim_audit",
+                "claims",
+                "nodes",
+                "sessions",
+                "policy_floors",
+            ] {
                 sqlx::query(sqlx::AssertSqlSafe(format!("DELETE FROM {t}")))
                     .execute(&store.pool)
                     .await
@@ -707,6 +822,9 @@ mod tests {
             ban_marks_the_node_and_needs_an_existing_row,
             a_sweep_moves_ended_claims_into_the_audit_table,
             a_session_is_taken_once_deleted_on_demand_and_swept_when_stale,
+            a_policy_floor_round_trips_to_the_nanosecond,
+            a_policy_floor_moves_only_from_what_is_held,
+            a_floor_written_under_another_policy_is_refused,
             ping_answers,
         );
     }
