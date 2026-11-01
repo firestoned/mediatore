@@ -289,6 +289,24 @@ mod tests {
         p
     }
 
+    /// `announce`, past the one failure the test process itself causes: another test forking
+    /// while `fake_tool` still has the script open for writing leaves that child holding the
+    /// descriptor until its exec, and running the script in that window is `ETXTBSY`. The
+    /// window is a few microseconds; a tool that exists on a real guest is never being written.
+    #[cfg(unix)]
+    async fn announce_once_the_tool_is_free(ch: &Channels) -> Announced {
+        for _ in 0..50 {
+            let out = announce(ch).await;
+            match &out.rpctool {
+                Outcome::Failed(e) if e.contains("Text file busy") => {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                _ => return out,
+            }
+        }
+        panic!("the fake tool stayed busy");
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn rpctool_gets_the_one_info_set_argument_vspheres_provider_reads() {
@@ -298,7 +316,7 @@ mod tests {
             &d,
             "printf '%s\\n' \"$@\" > \"$(dirname \"$0\")/args\"",
         ));
-        let out = announce(&ch).await;
+        let out = announce_once_the_tool_is_free(&ch).await;
         assert_eq!(out.rpctool, Outcome::Announced);
         assert_eq!(
             std::fs::read_to_string(d.join("args")).unwrap(),
@@ -313,7 +331,7 @@ mod tests {
         let d = scratch();
         let mut ch = channels(&d);
         ch.rpctool = Some(fake_tool(&d, "echo 'no VMware backdoor' >&2; exit 1"));
-        let out = announce(&ch).await;
+        let out = announce_once_the_tool_is_free(&ch).await;
         assert!(matches!(out.rpctool, Outcome::Failed(ref e) if e.contains("no VMware backdoor")));
         assert_eq!(out.file, Outcome::Announced);
         assert!(out.any());
