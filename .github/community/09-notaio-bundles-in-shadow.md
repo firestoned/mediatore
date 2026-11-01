@@ -71,7 +71,9 @@ are the questions it answers, with the recommendation this roadmap is built on.
 ## Work
 
 - [ ] ADR-0026 accepted, answering the decisions above, with the CALM model updated for the new
-      flow (bundle ConfigMaps to the broker) and its trust anchor (the configured keys)
+      flow (bundle ConfigMaps to the broker) and its trust anchor (the configured keys). Proposed
+      2026-10-31 as [ADR-0026](../../docs/adr/0026-notaio-bundles-verified-in-shadow.md), with
+      the finding codes `P001` to `P011`
 - [ ] notaio: the floor decision as a pure function, in a patch release (if decision 4 keeps the
       recommendation); mediatore pins that tag
 - [ ] The dependency and `deny.toml`; the crate's conformance vectors run in mediatore's own tests
@@ -96,9 +98,9 @@ are the questions it answers, with the recommendation this roadmap is built on.
       refused that is not refused today
 - [ ] User guide: naming a policy on a sandbox, the trusted keys, reading the findings; the
       research agent walkthrough's section 5 updated
-- [ ] Threat model pass: the bundle as a new input to TB-1, the configured keys as a trust
-      anchor, the floor as the T5.4 control (notaio's threat model), the shadow mode's residual
-      risk (the configuration still rules)
+- [ ] Threat model pass: the bundle as a new input across TB-2 (read from the Kubernetes API), the
+      configured keys as a trust anchor, the floor as the T5.4 control (notaio's threat model), the
+      shadow mode's residual risk (the configuration still rules)
 
 ## Out of scope
 

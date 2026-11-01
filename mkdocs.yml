@@ -176,5 +176,6 @@ nav:
       - "ADR-0023: The sandbox VM image, a Kairos derivative": adr/0023-sandbox-vm-image-kairos-derivative.md
       - "ADR-0024: Landlock inside the jail": adr/0024-landlock-inside-the-jail.md
       - "ADR-0025: The egress proxy, a phantom token in the jail": adr/0025-phantom-token-egress-proxy.md
+      - "ADR-0026: notaio's policy bundles, verified in shadow": adr/0026-notaio-bundles-verified-in-shadow.md
   - Security:
       - Threat model: security/threat-model.md

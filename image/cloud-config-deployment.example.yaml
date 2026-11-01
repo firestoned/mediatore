@@ -79,8 +79,10 @@ stages:
           permissions: 0644
           owner: 0
           group: 0
-          # image/env.example: the broker's sandbox listener, as the members reach it.
+          # image/env.example: the broker's sandbox listener, as the members reach it (the
+          # LoadBalancer's port, 443 in deploy/base). Whole-line comments only: systemd's
+          # EnvironmentFile keeps an inline comment as part of the value.
           content: |
-            MEDIATORE_URL=https://mediatore.sandbox.home.example:8443
+            MEDIATORE_URL=https://mediatore.sandbox.home.example
             SPIFFE_ENDPOINT_SOCKET=/run/spire/sockets/agent.sock
             RUST_LOG=info

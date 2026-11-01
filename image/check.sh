@@ -32,6 +32,8 @@ check "nftables, for the jail's ruleset (ADR-0020)" 'nft --version >/dev/null'
 check "nsjail, the jail itself, linked against what the image has" \
   'test -x /usr/bin/nsjail && ! ldd /usr/bin/nsjail | grep -q "not found" && /usr/bin/nsjail --help 2>&1 | grep -q -- "--chroot"'
 check "mount and umount, for the sandbox tmpfs (ADR-0021)" 'command -v mount && command -v umount'
+check "the sandbox root and the agent's configuration directory, 0755, in the immutable root" \
+  'test "$(stat -c %a /mnt/sandbox)" = 755 && test "$(stat -c %a /etc/spire)" = 755'
 check "tpm2-tools, for the EK certificate export (banlieue examples/21)" 'command -v tpm2_nvread'
 check "qemu-guest-agent, the libvirt channel for GuestReady (ADR-0019)" 'command -v qemu-ga'
 check "the spire user, in the TPM device group" 'id -nG spire | tr " " "\n" | grep -qx tss'
@@ -41,6 +43,8 @@ check "both units enabled" \
   'test -L /etc/systemd/system/multi-user.target.wants/spire-agent.service && test -L /etc/systemd/system/multi-user.target.wants/mediatore-guest.service'
 check "the units point at the paths the image has" \
   'grep -q "^ExecStart=/usr/bin/spire-agent run -config /etc/spire/agent.conf" /etc/systemd/system/spire-agent.service && grep -q "^ExecStart=/usr/bin/mediatore guest" /etc/systemd/system/mediatore-guest.service'
+check "the agent unit: a private /tmp for the attestor plugin, CAP_SYS_PTRACE for the unix attestor, its runtime directory" \
+  'grep -q "^PrivateTmp=yes" /etc/systemd/system/spire-agent.service && grep -q "^AmbientCapabilities=CAP_SYS_PTRACE" /etc/systemd/system/spire-agent.service && grep -q "^RuntimeDirectory=spire" /etc/systemd/system/spire-agent.service'
 check "no sshd, and ssh masked (ADR-0010: nothing inbound)" \
   '! command -v sshd && for u in ssh.service ssh.socket; do test "$(readlink /etc/systemd/system/$u)" = /dev/null || exit 1; done'
 check "no other listener the base shipped (snmpd, lldpd, rpcbind)" \

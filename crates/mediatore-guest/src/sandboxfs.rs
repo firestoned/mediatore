@@ -2,9 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The sandbox filesystem: a fresh tmpfs per claim at the sandbox root, `nosuid,nodev`,
-//! mode 0700, size-bounded, with the rootfs root's and `work/` the sandbox user's
-//! (ADR-0021 decision 1). One `umount` at teardown takes the whole tree with it.
+//! mode 0711 (root's, traversable, listable by nobody else), size-bounded, with the rootfs
+//! root's and `work/` and `egress/` the sandbox user's (ADR-0021 decision 1, ADR-0025).
+//! One `umount` at teardown takes the whole tree with it.
 
+use anyhow::Context as _;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
@@ -48,7 +50,7 @@ impl Tmpfs {
             "-t".into(),
             "tmpfs".into(),
             "-o".into(),
-            format!("size={},nosuid,nodev,mode=0700", self.size),
+            format!("size={},nosuid,nodev,mode=0711", self.size),
             "tmpfs".into(),
             self.root.display().to_string(),
         ]
@@ -62,7 +64,9 @@ impl Tmpfs {
             "sandbox size {:?} is not a size",
             self.size
         );
-        tokio::fs::create_dir_all(&self.root).await?;
+        tokio::fs::create_dir_all(&self.root)
+            .await
+            .with_context(|| format!("creating the sandbox root {}", self.root.display()))?;
         if is_mounted(&self.root)? {
             tracing::warn!(root = %self.root.display(), "sandbox root still mounted; unmounting");
             unmount(&self.root).await;
@@ -196,7 +200,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_tmpfs_is_mounted_nosuid_nodev_private_to_root_and_size_bounded() {
+    fn the_tmpfs_is_mounted_nosuid_nodev_traverse_only_and_size_bounded() {
         let t = Tmpfs {
             root: "/mnt/sandbox".into(),
             size: "4g".into(),
@@ -207,10 +211,12 @@ mod tests {
                 "-t",
                 "tmpfs",
                 "-o",
-                "size=4g,nosuid,nodev,mode=0700",
+                "size=4g,nosuid,nodev,mode=0711",
                 "tmpfs",
                 "/mnt/sandbox"
-            ]
+            ],
+            "ADR-0021 decision 1 (amended): root's, traversable by the sandbox user on its way \
+             to the egress files the proxy reads, listable by nobody else"
         );
     }
 
@@ -303,7 +309,7 @@ mod tests {
             .expect("the mount is listed");
         let opts = line.split_whitespace().nth(3).unwrap();
         assert!(is_mounted(&root).unwrap());
-        for want in ["nosuid", "nodev", "size=16384k", "mode=700"] {
+        for want in ["nosuid", "nodev", "size=16384k", "mode=711"] {
             assert!(opts.split(',').any(|o| o == want), "{want} in {opts}");
         }
         let out = tokio::process::Command::new(&sudo)

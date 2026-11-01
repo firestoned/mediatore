@@ -118,6 +118,9 @@ spire-server:
       options: [{ sslmode: verify-full }]
       rootCAPath: /run/spire/pg-ca/ca.crt
       externalSecret: { enabled: true, name: spire-datastore, key: password }
+  # Helm replaces a list wholesale: a second values file that adds a volume (the TPM
+  # attestor component's, deploying step 6) must repeat this one or the server loses its
+  # PostgreSQL CA at the next upgrade and the pod crashloops on its old revision.
   extraVolumes:
     - { name: pg-root-ca, configMap: { name: pg-root-ca } }
   extraVolumeMounts:

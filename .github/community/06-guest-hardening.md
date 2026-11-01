@@ -120,5 +120,15 @@
       cannot see: the image has no `/mnt`, the sandbox tmpfs is unreadable by the sandbox
       user, nsjail's user namespace maps the jail to global root and fails its remount on a
       systemd host, `/etc/spire` is created without the execute bit, and the agent unit
-      lacks a writable `/tmp` and `CAP_SYS_PTRACE`. Those are the next change, with a tier
-      that runs the guest under the image's own units on a VM.
+      lacks a writable `/tmp` and `CAP_SYS_PTRACE`. Fixed in the change after the proof
+      (`image/Dockerfile` carries `/mnt/sandbox` and `/etc/spire`; the agent unit gains
+      `PrivateTmp`, `AmbientCapabilities=CAP_SYS_PTRACE` and its runtime directory; the
+      tmpfs is 0711, ADR-0021 amended; the jail runs without a user namespace, ADR-0020
+      amended; `image/check.sh` proves the directories and the unit lines), to be proven
+      again on a member before v0.2.0 is cut.
+- [ ] A tier that runs the guest under the image's own units on a Kairos VM, on the
+      build host: the kind tiers run the guest in a pod with `--dev-skip-setup`, which is
+      how six of the defects above reached a release candidate. The shape: the ISO built
+      by AuroraBoot from the image under test with the three layers, booted by libvirt
+      with a vTPM against the kind cluster's SPIRE, one claim through the real sandbox
+      listener, the four egress cases and the reboot, then the member destroyed.

@@ -81,6 +81,12 @@ impl JailSpec {
             // The VM's network namespace, not a fresh one: the workload's sockets carry the
             // sb- uid, which the guest's nftables ruleset keys on (ADR-0020 decision 1).
             "--disable_clone_newnet".into(),
+            // And no user namespace: nsjail's default maps the jail's uid to the invoker's,
+            // so the workload would be global root, outside everything keyed on the sb-
+            // uid (the ruleset, the unix attestor, the proxy's gate); and its read-only
+            // remount of the mount tree fails inside a user namespace under a systemd
+            // /run. The jail's uid is the global one (ADR-0020 decision 1, amended).
+            "--disable_clone_newuser".into(),
             "--rlimit_as".into(),
             self.rlimit_as_mib.to_string(),
             "--rlimit_nproc".into(),
@@ -206,6 +212,17 @@ mod tests {
             [("MEDIATORE_TOKEN".to_owned(), s.phantom.expose().to_owned())]
         );
         assert_eq!(s.proxy_url(), "http://127.0.0.1:3128");
+    }
+
+    #[test]
+    fn the_jail_has_no_user_namespace_so_its_uid_is_the_global_sandbox_uid() {
+        let a = spec().to_args();
+        assert!(
+            a.iter().any(|x| x == "--disable_clone_newuser"),
+            "ADR-0020 decision 1 (amended): nsjail's user namespace maps the jail's uid to the \
+             invoker's, root, and the ruleset, the attestor and the proxy's gate key on the \
+             global uid: {a:?}"
+        );
     }
 
     #[test]

@@ -65,6 +65,13 @@ RUN apt-get update \
 RUN useradd --system --user-group --home-dir /var/lib/spire --no-create-home --shell /usr/sbin/nologin spire \
     && usermod -aG tss spire
 
+# Two directories the immutable root must already have, since nothing can create them at
+# boot: the sandbox root the guest mounts its per-claim tmpfs on (ADR-0021; the base has
+# no /mnt), and the agent's configuration directory, which the deployment layer's files
+# would otherwise create with a file's mode, no execute bit, so user spire could not read
+# agent.conf under it (found on the first live member, roadmap 06).
+RUN install -d -m 0755 /mnt/sandbox /etc/spire
+
 COPY --from=build /mediatore /usr/bin/mediatore
 COPY --from=spire-agent /opt/spire/bin/spire-agent /usr/bin/spire-agent
 COPY --from=tpm-plugin /app/tpm_attestor_agent /usr/lib/spire/tpm_attestor_agent

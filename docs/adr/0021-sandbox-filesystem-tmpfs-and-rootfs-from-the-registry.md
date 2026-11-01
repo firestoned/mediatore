@@ -35,12 +35,18 @@ rely on: a container runtime in the VM (none is baked, and none should be, the j
 ## Decision
 
 1. **`/mnt/sandbox` is a fresh tmpfs per claim.** Before the rootfs is populated the guest
-   mounts `tmpfs` at the sandbox root with `nosuid,nodev,mode=0700` and a size bound
+   mounts `tmpfs` at the sandbox root with `nosuid,nodev,mode=0711` and a size bound
    (`--sandbox-size`, the kernel's `size=` syntax, `50%` of the member's RAM by default,
-   the tmpfs default). Root owns the mount point and nothing else traverses it: the jail
-   enters the rootfs through `nsjail`'s own mount namespace, where the mount point's mode
-   is irrelevant. Inside it `rootfs/` is root's, mode 0755, and `work/` belongs to the
-   sandbox user, mode 0700, so `/work` is writable by exactly the uid the jail runs as.
+   the tmpfs default). Root owns the mount point; nothing else lists it, and only a
+   process that knows a path under it traverses it. The jail enters the rootfs through
+   `nsjail`'s own mount namespace, where the mount point's mode is irrelevant. Inside it
+   `rootfs/` is root's, mode 0755, and `work/` belongs to the sandbox user, mode 0700, so
+   `/work` is writable by exactly the uid the jail runs as. *Amended 2026-10-31:* the mode
+   was 0700 until the live proof, where the egress proxy of ADR-0025, the sandbox user's
+   process outside the jail, could not reach its routes and phantom files in `egress/`
+   under that root; the execute bits for group and other are what it needs, and the
+   mount point itself is in the image (`install -d /mnt/sandbox`, `image/Dockerfile`),
+   since the immutable root cannot grow it at claim time.
    Anything left mounted there from an earlier attempt is unmounted first. The whole
    tree disappears with one `umount` at teardown; a wipe that fails is logged.
 
