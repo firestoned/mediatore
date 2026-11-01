@@ -23,7 +23,7 @@ use async_trait::async_trait;
 use banlieue_api::banlieue::{
     ClaimPhase as BanlieuePhase, LABEL_POOL, VirtualMachine, VirtualMachineClaim,
 };
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 use kube::api::{DeleteParams, ListParams, Patch, PatchParams, PostParams};
 use kube::runtime::controller::{Action, Controller};
 use kube::runtime::watcher;
@@ -32,10 +32,12 @@ use mediatore_proto::ClaimPhase;
 use mediatore_proto::ek::ek_hash_from_pems;
 use mediatore_spire::SpireError;
 use mediatore_store::StoreError;
+use tokio::sync::broadcast;
 use uuid::Uuid;
 
-use crate::policy::BundleCache;
+use crate::policy::{BundleCache, PolicyKey};
 use crate::sandbox::{AgentSandbox, AgentSandboxStatus, FINALIZER};
+use crate::shadow::Audience;
 use crate::{Action as Intent, Reconciler, next_action};
 
 /// Label mediatore puts on every object it creates; the watcher looks at nothing else.
@@ -53,8 +55,9 @@ pub struct WatcherConfig {
     /// Between retries while unresolved, and between polls of a sandbox whose claim is
     /// `Bound` but whose entry is not set yet.
     pub requeue: Duration,
-    /// Audiences mediatore serves; a sandbox may request a subset.
-    pub audiences: Vec<String>,
+    /// Audiences mediatore serves, as configured; a sandbox may request a subset, and the
+    /// shadow comparison (ADR-0026 decision 7) reads what each would allow.
+    pub audiences: Vec<Audience>,
     /// Issuers mediatore trusts; a sandbox's subject must come from one.
     pub issuers: Vec<String>,
     /// How long a claim row outlives its claim before the resync sweeps it into the audit
@@ -258,9 +261,9 @@ pub struct Watcher {
     pub(crate) reconciler: Reconciler,
     pub(crate) claims: Arc<dyn ClaimsApi>,
     pub(crate) cfg: WatcherConfig,
-    /// notaio's verified bundles (ADR-0026), filled by the reflector on every replica; empty
-    /// with no `policy` section, which reads as "no sandbox's policy has a bundle".
-    pub(crate) bundles: Arc<BundleCache>,
+    /// notaio's verified bundles (ADR-0026), filled by the reflector on every replica;
+    /// `None` with no `policy` section, and then no sandbox is compared.
+    pub(crate) bundles: Option<Arc<BundleCache>>,
     first_unresolved: Mutex<HashMap<Uuid, Instant>>,
     declared: Mutex<HashSet<String>>,
 }
@@ -272,17 +275,18 @@ impl Watcher {
             reconciler,
             claims,
             cfg,
-            bundles: Arc::new(BundleCache::default()),
+            bundles: None,
             first_unresolved: Mutex::new(HashMap::new()),
             declared: Mutex::new(HashSet::new()),
         }
     }
 
-    /// With the reflector's cache, so a record created for a sandbox naming a policy carries
-    /// the bundle it was admitted under (ADR-0026 decision 6).
+    /// With the reflector's cache: a record created for a sandbox naming a policy carries
+    /// the bundle it was admitted under (ADR-0026 decision 6), and every sandbox is compared
+    /// with its policy's bundle (decision 7).
     #[must_use]
     pub fn with_bundles(mut self, bundles: Arc<BundleCache>) -> Self {
-        self.bundles = bundles;
+        self.bundles = Some(bundles);
         self
     }
 
@@ -502,6 +506,29 @@ pub fn phase_of(claim: &VirtualMachineClaim) -> ClaimPhase {
     }
 }
 
+/// One tick per policy whose bundle changed (admitted at a new version, dropped), from
+/// the reflector's cache. Each tick reconciles every sandbox: kube's per-object trigger is
+/// behind an unstable feature, the sandboxes are few, and a pass over one that names
+/// another policy patches nothing. A subscriber that lagged ticks once for what it missed.
+fn bundle_changes(changes: broadcast::Receiver<PolicyKey>) -> impl Stream<Item = ()> {
+    futures::stream::unfold(changes, |mut changes| async move {
+        match changes.recv().await {
+            Ok((namespace, policy)) => {
+                tracing::debug!(%namespace, %policy, "bundle changed; sandboxes compared again");
+                Some(((), changes))
+            }
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                tracing::warn!(
+                    missed = n,
+                    "bundle changes missed; sandboxes compared again"
+                );
+                Some(((), changes))
+            }
+            Err(broadcast::error::RecvError::Closed) => None,
+        }
+    })
+}
+
 /// The three controllers (claims, pool members, sandboxes) and the resync ticker, until
 /// the first one ends (they do not end on their own). Run this on the Lease holder only.
 pub async fn run(client: Client, watcher: Arc<Watcher>) -> anyhow::Result<()> {
@@ -515,7 +542,15 @@ pub async fn run(client: Client, watcher: Arc<Watcher>) -> anyhow::Result<()> {
     .owns(
         Api::<VirtualMachineClaim>::all(client.clone()),
         watcher::Config::default().labels(MANAGED_BY_SELECTOR),
-    )
+    );
+    // A change to a policy's bundle reconciles every sandbox naming that policy (ADR-0026
+    // decision 7), after the reflector on this replica admitted it, so the comparison never
+    // runs against a cache that has not caught up.
+    let sandboxes = match watcher.bundles.as_ref() {
+        Some(bundles) => sandboxes.reconcile_all_on(bundle_changes(bundles.subscribe())),
+        None => sandboxes,
+    };
+    let sandboxes = sandboxes
     .run(
         |sb, w: Arc<Watcher>| async move { w.reconcile_sandbox(&sb).await },
         move |sb, err, _| {

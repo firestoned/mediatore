@@ -21,7 +21,7 @@ use async_trait::async_trait;
 use banlieue_api::banlieue::{ClaimSubject, VirtualMachineClaim, VirtualMachineClaimSpec};
 use banlieue_api::common::LocalObjectReference;
 use chrono::{DateTime, Utc};
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 use kube::api::{DeleteParams, ObjectMeta, PostParams};
 use kube::runtime::controller::Action;
 use kube::{Api, Client, CustomResource, CustomResourceExt, Resource, ResourceExt};
@@ -33,6 +33,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::shadow;
 use crate::watch::{WatchError, Watcher, claim_uid_of, phase_of};
 
 /// The finalizer that holds an `AgentSandbox` until its claim is gone (decision 10).
@@ -180,7 +181,16 @@ pub struct AgentSandboxStatus {
     /// The generation this status was computed from.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_generation: Option<i64>,
+    /// `PolicyConformant` (ADR-0026 decision 7): `True` when the broker's configuration
+    /// allows this sandbox nothing its policy's bundle does not, `False` with the gaps'
+    /// codes in the message, `Unknown` while the bundles of this namespace have not been
+    /// read yet. Absent without a `policy` section.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conditions: Vec<Condition>,
 }
+
+/// The condition type the shadow comparison writes.
+pub const POLICY_CONFORMANT: &str = "PolicyConformant";
 
 impl From<&SandboxSubject> for Subject {
     fn from(s: &SandboxSubject) -> Self {
@@ -376,6 +386,7 @@ pub fn mirror_status(
         ready: phase == SandboxPhase::Bound && entry_set,
         reason: None,
         observed_generation: sb.metadata.generation,
+        conditions: Vec::new(),
     }
 }
 
@@ -390,7 +401,7 @@ impl Watcher {
         if let Some(a) = spec
             .audiences
             .iter()
-            .find(|a| !self.cfg.audiences.contains(a))
+            .find(|a| !self.cfg.audiences.iter().any(|c| &c.name == *a))
         {
             return Some(format!("audience {a} is not configured"));
         }
@@ -499,7 +510,8 @@ impl Watcher {
             return Ok(Action::await_change());
         };
         let record = self.record_of(sb, uid).await?;
-        let status = mirror_status(sb, &claim, &record);
+        let mut status = mirror_status(sb, &claim, &record);
+        status.conditions = self.conditions(sb, &current.conditions);
         // The entry is set (on Bound) or retracted (on Releasing / Failed) by the claim
         // watcher and recorded in the store, which raises no event here: poll until the
         // status agrees with the record, or until the watcher fails the claim.
@@ -521,11 +533,80 @@ impl Watcher {
     /// again: the record says what was current then.
     fn bundle_of(&self, sb: &AgentSandbox) -> Option<Arc<BundlePayload>> {
         let policy = sb.spec.policy_ref.as_ref()?;
-        self.bundles.get(
+        self.bundles.as_ref()?.get(
             &sb.namespace().unwrap_or_default(),
             &policy.name,
             Utc::now(),
         )
+    }
+
+    /// The sandbox's conditions after this pass: `previous` with `PolicyConformant` replaced
+    /// by the comparison's verdict (ADR-0026 decision 7), or untouched without a `policy`
+    /// section. `lastTransitionTime` holds while the status does. Each gap is logged when
+    /// the verdict's message changes: a new bundle, a new gap, a gap closed.
+    fn conditions(&self, sb: &AgentSandbox, previous: &[Condition]) -> Vec<Condition> {
+        let Some(bundles) = self.bundles.as_ref() else {
+            return previous.to_vec();
+        };
+        let name = sb.name_any();
+        let namespace = sb.namespace().unwrap_or_default();
+        let policy = sb
+            .spec
+            .policy_ref
+            .as_ref()
+            .map_or("none", |p| p.name.as_str());
+        let held = previous.iter().find(|c| c.type_ == POLICY_CONFORMANT);
+        let (status, reason, message) = if bundles.synced(&namespace) {
+            let bundle = self.bundle_of(sb);
+            let version = bundle.as_ref().map(|b| b.meta.version);
+            let findings = shadow::compare(&sb.spec, &self.cfg.audiences, bundle.as_deref());
+            if findings.is_empty() {
+                (
+                    "True",
+                    "Conformant",
+                    format!(
+                        "the broker allows nothing bundle v{} of {policy} does not",
+                        version.unwrap_or_default()
+                    ),
+                )
+            } else {
+                let message = findings
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                if held.map(|c| c.message.as_str()) != Some(message.as_str()) {
+                    for f in &findings {
+                        tracing::warn!(sandbox = %name, %namespace, policy, bundle_version = ?version, code = %f.code, "policy gap: {}", f.detail);
+                    }
+                }
+                ("False", "Gaps", message)
+            }
+        } else {
+            (
+                "Unknown",
+                "BundlesNotRead",
+                format!("no bundle has been read from {namespace} yet"),
+            )
+        };
+        let last_transition_time = held.filter(|c| c.status == status).map_or_else(
+            || Time(k8s_openapi::jiff::Timestamp::now()),
+            |c| c.last_transition_time.clone(),
+        );
+        let mut out: Vec<Condition> = previous
+            .iter()
+            .filter(|c| c.type_ != POLICY_CONFORMANT)
+            .cloned()
+            .collect();
+        out.push(Condition {
+            type_: POLICY_CONFORMANT.into(),
+            status: status.into(),
+            reason: reason.into(),
+            message,
+            observed_generation: sb.metadata.generation,
+            last_transition_time,
+        });
+        out
     }
 
     /// The record for the sandbox's claim, created on first sight. ADR-0013 decision 2:
@@ -715,6 +796,7 @@ mod tests {
     use crate::Reconciler;
     use crate::fakes::{FakeClaims, Rig, node, rig, rig_with};
     use crate::policy::{BundleCache, BundleReflector, Outcome};
+    use crate::shadow::Audience;
     use crate::watch::WatcherConfig;
 
     const ISSUER: &str = "https://issuer.example.com";
@@ -723,10 +805,37 @@ mod tests {
     fn cfg() -> WatcherConfig {
         WatcherConfig {
             requeue: Duration::from_millis(5),
-            audiences: vec!["api.example".into()],
+            audiences: vec![Audience::named("api.example")],
             issuers: vec![ISSUER.into()],
             ..WatcherConfig::default()
         }
+    }
+
+    /// The broker configured for `internal-git` exactly as the conformance bundle allows
+    /// it, beside the test's own `api.example`.
+    fn cfg_with_git() -> WatcherConfig {
+        WatcherConfig {
+            audiences: vec![
+                Audience::named("api.example"),
+                Audience {
+                    name: "internal-git".into(),
+                    max_ttl: 300,
+                    egress: vec!["git.foo.io:443".parse().unwrap()],
+                    rules: vec![mediatore_proto::EndpointRule {
+                        method: "GET".into(),
+                        path: "/repos/**".into(),
+                    }],
+                },
+            ],
+            ..cfg()
+        }
+    }
+
+    fn conformant(sb: &AgentSandbox) -> &Condition {
+        sb.status
+            .as_ref()
+            .and_then(|s| s.conditions.iter().find(|c| c.type_ == POLICY_CONFORMANT))
+            .expect("a PolicyConformant condition")
     }
 
     fn sandbox(finalized: bool, deleting: bool) -> AgentSandbox {
@@ -1349,9 +1458,42 @@ mod tests {
         );
     }
 
-    /// A reflector over the testkit's freshly signed bundle, admitted at the real clock, and
-    /// the sandbox in that policy's namespace naming it.
-    async fn admitted_bundle(version: u64) -> (Arc<BundleCache>, BundlePayload, AgentSandbox) {
+    /// A reflector over the testkit's freshly signed bundle, admitted at the real clock
+    /// with the namespace's first list completed, and the sandbox in that policy's
+    /// namespace naming it, asking for the bundle's audience.
+    struct Admitted {
+        reflector: BundleReflector,
+        payload: BundlePayload,
+        sb: AgentSandbox,
+    }
+
+    impl Admitted {
+        fn cache(&self) -> Arc<BundleCache> {
+            self.reflector.cache()
+        }
+
+        /// A later version of the bundle with `edit` applied to its content, admitted.
+        async fn admit(&self, version: u64, edit: impl FnOnce(&mut BundlePayload)) {
+            let mut next = self.payload.clone();
+            edit(&mut next);
+            let fresh = mediatore_testkit::policy::signed_bundle(Utc::now(), version, next.content);
+            let policy = &fresh.payload.content.policy;
+            let cm = mediatore_testkit::policy::bundle_configmap(
+                &policy.namespace,
+                &format!("{}-bundle", policy.name),
+                &fresh.envelope,
+            );
+            assert_eq!(
+                self.reflector.applied(&cm).await,
+                Outcome::Admitted {
+                    policy: format!("{}/{}", policy.namespace, policy.name),
+                    version,
+                }
+            );
+        }
+    }
+
+    async fn admitted_bundle(version: u64) -> Admitted {
         let mediatore_testkit::policy::FreshBundle {
             keys,
             envelope,
@@ -1375,19 +1517,29 @@ mod tests {
                 version,
             }
         );
+        reflector.resynced(
+            &policy.namespace,
+            &std::collections::HashSet::from([cm.name_any()]),
+        );
         let mut sb = sandbox(true, false);
         sb.metadata.namespace = Some(policy.namespace.clone());
         sb.spec.policy_ref = Some(LocalObjectReference {
             name: policy.name.clone(),
         });
-        (reflector.cache(), payload, sb)
+        sb.spec.audiences = vec!["internal-git".into()];
+        Admitted {
+            reflector,
+            payload,
+            sb,
+        }
     }
 
     #[tokio::test]
     async fn a_sandbox_naming_a_policy_records_the_bundle_it_was_admitted_under() {
-        let (cache, payload, sb) = admitted_bundle(5).await;
+        let a = admitted_bundle(5).await;
+        let (payload, sb) = (&a.payload, a.sb.clone());
         let namespace = sb.namespace().unwrap();
-        let r = rig_with(cfg(), cache);
+        let r = rig_with(cfg_with_git(), Some(a.cache()));
         r.claims.put_sandbox(sb.clone());
         assert_eq!(
             r.watcher.reconcile_sandbox(&sb).await.unwrap(),
@@ -1444,9 +1596,10 @@ mod tests {
     async fn a_bundle_admitted_after_the_record_exists_does_not_rewrite_it() {
         // The record says what was current when the claim was created (decision 6); a
         // later bundle is the comparison's business, not the record's.
-        let (cache, _payload, sb) = admitted_bundle(5).await;
+        let a = admitted_bundle(5).await;
+        let sb = a.sb.clone();
         let namespace = sb.namespace().unwrap();
-        let r = rig_with(cfg(), Arc::new(BundleCache::default()));
+        let r = rig_with(cfg_with_git(), Some(Arc::new(BundleCache::default())));
         r.claims.put_sandbox(sb.clone());
         r.watcher.reconcile_sandbox(&sb).await.unwrap();
         let uid = claim_uid_of(&r.claims.claim(&namespace, "sb-1").unwrap()).unwrap();
@@ -1462,9 +1615,9 @@ mod tests {
                     },
                 },
                 r.claims.clone(),
-                cfg(),
+                cfg_with_git(),
             )
-            .with_bundles(cache),
+            .with_bundles(a.reflector.cache()),
             store: r.store.clone(),
             entries: r.entries.clone(),
             claims: r.claims.clone(),
@@ -1475,6 +1628,179 @@ mod tests {
         assert!(
             rec.policy_uid.is_none() && rec.bundle_version.is_none(),
             "created once, never rewritten"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_conformant_sandbox_reports_policy_conformant_true() {
+        let a = admitted_bundle(1).await;
+        let r = rig_with(cfg_with_git(), Some(a.cache()));
+        r.claims.put_sandbox(a.sb.clone());
+        r.watcher.reconcile_sandbox(&a.sb).await.unwrap();
+        let sb = r.claims.sandbox("conformance", "sb-1").unwrap();
+        let c = conformant(&sb);
+        assert_eq!(
+            (c.status.as_str(), c.reason.as_str()),
+            ("True", "Conformant")
+        );
+        assert!(
+            c.message.contains("v1") && c.message.contains("agent"),
+            "{}",
+            c.message
+        );
+        assert_eq!(c.observed_generation, Some(1));
+        assert_eq!(sb.status.as_ref().unwrap().phase, SandboxPhase::Pending);
+        // Held across a pass with nothing new: no patch, the same transition time.
+        let before = r.claims.patches();
+        r.watcher.reconcile_sandbox(&sb).await.unwrap();
+        assert_eq!(r.claims.patches(), before);
+    }
+
+    #[tokio::test]
+    async fn a_gap_reports_false_with_its_codes_and_refuses_nothing() {
+        let a = admitted_bundle(1).await;
+        // The broker mints 900 s tokens for internal-git (the bundle says 300) and the
+        // sandbox also asks for an audience the bundle does not list.
+        let mut sb = a.sb.clone();
+        sb.spec.audiences.push("api.example".into());
+        let r = rig_with(
+            WatcherConfig {
+                audiences: vec![
+                    Audience::named("api.example"),
+                    Audience::named("internal-git"),
+                ],
+                ..cfg()
+            },
+            Some(a.cache()),
+        );
+        r.claims.put_sandbox(sb.clone());
+        r.watcher.reconcile_sandbox(&sb).await.unwrap();
+        let held = r.claims.sandbox("conformance", "sb-1").unwrap();
+        let c = conformant(&held);
+        assert_eq!((c.status.as_str(), c.reason.as_str()), ("False", "Gaps"));
+        assert!(c.message.contains("P002 max_ttl 900"), "{}", c.message);
+        assert!(
+            c.message.contains("P001 audience api.example"),
+            "{}",
+            c.message
+        );
+        // Admitted exactly as today (decision 8).
+        assert_eq!(held.status.as_ref().unwrap().phase, SandboxPhase::Pending);
+        assert!(held.status.as_ref().unwrap().reason.is_none());
+        assert!(r.claims.claim("conformance", "sb-1").is_some());
+        assert_eq!(r.store.list_claims().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn no_policy_ref_and_no_bundle_report_their_codes() {
+        let a = admitted_bundle(1).await;
+        for (edit, code) in [
+            (
+                Box::new(|sb: &mut AgentSandbox| sb.spec.policy_ref = None)
+                    as Box<dyn Fn(&mut AgentSandbox)>,
+                "P010",
+            ),
+            (
+                Box::new(|sb: &mut AgentSandbox| {
+                    sb.spec.policy_ref = Some(LocalObjectReference {
+                        name: "unsigned".into(),
+                    });
+                }),
+                "P011",
+            ),
+        ] {
+            let mut sb = a.sb.clone();
+            edit(&mut sb);
+            let r = rig_with(cfg_with_git(), Some(a.cache()));
+            r.claims.put_sandbox(sb.clone());
+            r.watcher.reconcile_sandbox(&sb).await.unwrap();
+            let held = r.claims.sandbox("conformance", "sb-1").unwrap();
+            let c = conformant(&held);
+            assert_eq!(c.status, "False", "{code}");
+            assert!(c.message.starts_with(code), "{code}: {}", c.message);
+            assert_eq!(held.status.as_ref().unwrap().phase, SandboxPhase::Pending);
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_until_the_namespace_was_listed_and_absent_without_a_policy_section() {
+        let a = admitted_bundle(1).await;
+        let r = rig_with(cfg_with_git(), Some(Arc::new(BundleCache::default())));
+        r.claims.put_sandbox(a.sb.clone());
+        r.watcher.reconcile_sandbox(&a.sb).await.unwrap();
+        let held = r.claims.sandbox("conformance", "sb-1").unwrap();
+        let c = conformant(&held);
+        assert_eq!(
+            (c.status.as_str(), c.reason.as_str()),
+            ("Unknown", "BundlesNotRead")
+        );
+
+        let r = rig(cfg_with_git());
+        r.claims.put_sandbox(a.sb.clone());
+        r.watcher.reconcile_sandbox(&a.sb).await.unwrap();
+        let held = r.claims.sandbox("conformance", "sb-1").unwrap();
+        assert_eq!(
+            held.status.as_ref().unwrap().conditions.len(),
+            0,
+            "no policy section, no condition"
+        );
+        assert_eq!(held.status.as_ref().unwrap().phase, SandboxPhase::Pending);
+    }
+
+    #[tokio::test]
+    async fn a_new_bundle_changes_the_verdict_and_the_transition_time_moves_only_with_the_status() {
+        let a = admitted_bundle(1).await;
+        let r = rig_with(cfg_with_git(), Some(a.cache()));
+        r.claims.put_sandbox(a.sb.clone());
+        r.watcher.reconcile_sandbox(&a.sb).await.unwrap();
+        let first = conformant(&r.claims.sandbox("conformance", "sb-1").unwrap()).clone();
+        assert_eq!(first.status, "True");
+
+        // v2 shortens the lease below the sandbox's ttlSeconds: a gap appears, and the
+        // cache announces the policy so the controller compares its sandboxes again.
+        let mut changes = a.cache().subscribe();
+        a.admit(2, |b| b.content.lease.max_duration_seconds = 60)
+            .await;
+        assert_eq!(
+            changes.try_recv().unwrap(),
+            ("conformance".to_owned(), "agent".to_owned())
+        );
+        let sb = r.claims.sandbox("conformance", "sb-1").unwrap();
+        r.watcher.reconcile_sandbox(&sb).await.unwrap();
+        let second = conformant(&r.claims.sandbox("conformance", "sb-1").unwrap()).clone();
+        assert_eq!(second.status, "False");
+        assert!(
+            second.message.contains("P005 ttlSeconds 600"),
+            "{}",
+            second.message
+        );
+        assert!(second.last_transition_time >= first.last_transition_time);
+
+        // v3 adds another gap: False still, so the transition time holds; the message moves.
+        a.admit(3, |b| {
+            b.content.lease.max_duration_seconds = 60;
+            b.content.audiences[0].ttl_seconds = Some(10);
+        })
+        .await;
+        let sb = r.claims.sandbox("conformance", "sb-1").unwrap();
+        r.watcher.reconcile_sandbox(&sb).await.unwrap();
+        let third = conformant(&r.claims.sandbox("conformance", "sb-1").unwrap()).clone();
+        assert_eq!(third.status, "False");
+        assert_eq!(third.last_transition_time, second.last_transition_time);
+        assert!(third.message.contains("P002") && third.message.contains("P005"));
+
+        // v4 is conformant again.
+        a.admit(4, |_| {}).await;
+        let sb = r.claims.sandbox("conformance", "sb-1").unwrap();
+        r.watcher.reconcile_sandbox(&sb).await.unwrap();
+        let fourth = conformant(&r.claims.sandbox("conformance", "sb-1").unwrap()).clone();
+        assert_eq!(fourth.status, "True");
+        assert!(fourth.message.contains("v4"), "{}", fourth.message);
+        // The record still says what was current at admission.
+        let uid = claim_uid_of(&r.claims.claim("conformance", "sb-1").unwrap()).unwrap();
+        assert_eq!(
+            r.store.get_claim(uid).await.unwrap().bundle_version,
+            Some(1)
         );
     }
 

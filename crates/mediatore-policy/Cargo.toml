@@ -10,6 +10,7 @@ publish.workspace = true
 
 [dependencies]
 sandboxpolicy-bundle.workspace = true
+sandboxpolicy-types.workspace = true
 mediatore-store.workspace = true
 base64.workspace = true
 chrono.workspace = true

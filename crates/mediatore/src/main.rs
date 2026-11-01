@@ -16,6 +16,7 @@ use mediatore_claims::Reconciler;
 use mediatore_claims::lease::LeaseConfig;
 use mediatore_claims::policy::{BundleCache, BundleReflector};
 use mediatore_claims::sandbox::{KubeSandboxes, SandboxFrontDoor};
+use mediatore_claims::shadow::Audience;
 use mediatore_claims::watch::{KubeClaimsApi, Watcher, WatcherConfig};
 use mediatore_entra::{Backend, ClientAssertion, Validator};
 use mediatore_spire::{EntryManager, KubeEntryManager, MemoryEntries, Naming};
@@ -183,9 +184,7 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
         // creates a record (ADR-0026 decision 6). Empty, and never filled, without a
         // `policy` section.
         let reflector = bundle_reflector(&cfg, &state)?;
-        let bundles = reflector
-            .as_ref()
-            .map_or_else(|| Arc::new(BundleCache::default()), |r| r.cache());
+        let bundles = reflector.as_ref().map(|r| r.cache());
         let policy_client = client.clone();
         let p = async {
             policy_reflector(policy_client, reflector)
@@ -248,28 +247,38 @@ async fn claim_watcher(
     cfg: &Config,
     client: kube::Client,
     state: &Arc<AppState>,
-    bundles: Arc<BundleCache>,
+    bundles: Option<Arc<BundleCache>>,
 ) -> anyhow::Result<()> {
     let reconciler = Reconciler {
         store: state.store.clone(),
         spire: state.spire.clone(),
         naming: state.naming.clone(),
     };
-    let watcher = Arc::new(
-        Watcher::new(
-            reconciler,
-            Arc::new(KubeClaimsApi::new(client.clone())),
-            WatcherConfig {
-                resync: std::time::Duration::from_secs(cfg.watcher.resync_secs),
-                resolve_timeout: std::time::Duration::from_secs(cfg.watcher.resolve_timeout_secs),
-                audiences: cfg.audiences.iter().map(|a| a.name.clone()).collect(),
-                issuers: cfg.issuers.iter().map(|i| i.url.clone()).collect(),
-                retention: std::time::Duration::from_secs(cfg.store.retention_secs),
-                ..WatcherConfig::default()
-            },
-        )
-        .with_bundles(bundles),
+    let mut watcher = Watcher::new(
+        reconciler,
+        Arc::new(KubeClaimsApi::new(client.clone())),
+        WatcherConfig {
+            resync: std::time::Duration::from_secs(cfg.watcher.resync_secs),
+            resolve_timeout: std::time::Duration::from_secs(cfg.watcher.resolve_timeout_secs),
+            audiences: cfg
+                .audiences
+                .iter()
+                .map(|a| Audience {
+                    name: a.name.clone(),
+                    max_ttl: a.max_ttl,
+                    egress: a.egress.clone(),
+                    rules: a.rules.clone(),
+                })
+                .collect(),
+            issuers: cfg.issuers.iter().map(|i| i.url.clone()).collect(),
+            retention: std::time::Duration::from_secs(cfg.store.retention_secs),
+            ..WatcherConfig::default()
+        },
     );
+    if let Some(bundles) = bundles {
+        watcher = watcher.with_bundles(bundles);
+    }
+    let watcher = Arc::new(watcher);
     let lease = LeaseConfig {
         namespace: client.default_namespace().to_owned(),
         name: "mediatore-watcher".into(),

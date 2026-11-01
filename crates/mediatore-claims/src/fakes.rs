@@ -219,12 +219,13 @@ pub(crate) struct Rig {
     pub(crate) claims: Arc<FakeClaims>,
 }
 
+/// A rig with no `policy` section: no bundle is read, no sandbox compared.
 pub(crate) fn rig(cfg: WatcherConfig) -> Rig {
-    rig_with(cfg, Arc::new(BundleCache::default()))
+    rig_with(cfg, None)
 }
 
 /// A rig whose watcher reads `bundles`, the cache a reflector fills.
-pub(crate) fn rig_with(cfg: WatcherConfig, bundles: Arc<BundleCache>) -> Rig {
+pub(crate) fn rig_with(cfg: WatcherConfig, bundles: Option<Arc<BundleCache>>) -> Rig {
     let store = Arc::new(MemoryStore::default());
     let entries = Arc::new(MemoryEntries::default());
     let claims = Arc::new(FakeClaims::default());
@@ -235,7 +236,10 @@ pub(crate) fn rig_with(cfg: WatcherConfig, bundles: Arc<BundleCache>) -> Rig {
             trust_domain: "sandbox.test".into(),
         },
     };
-    let watcher = Watcher::new(reconciler, claims.clone(), cfg).with_bundles(bundles);
+    let mut watcher = Watcher::new(reconciler, claims.clone(), cfg);
+    if let Some(bundles) = bundles {
+        watcher = watcher.with_bundles(bundles);
+    }
     Rig {
         watcher,
         store,
