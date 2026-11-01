@@ -245,6 +245,11 @@ pub struct ClaimRequest {
     /// `session`, refused for any other. Sealed before it is stored; never returned.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refresh_token: Option<Secret>,
+    /// The notaio `SandboxPolicy` the sandbox is under, by name in the sandbox namespace
+    /// (ADR-0026 decision 6): `spec.policyRef` on the `AgentSandbox`. Optional while the
+    /// bundle is read in shadow; naming one grants and refuses nothing yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_ref: Option<String>,
 }
 
 /// Claim lifecycle as mirrored from banlieue.
@@ -519,6 +524,7 @@ mod tests {
                 args: vec![],
             },
             refresh_token: None,
+            policy_ref: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let back: ClaimRequest = serde_json::from_str(&json).unwrap();

@@ -213,6 +213,7 @@ impl Harness {
                         args: vec![],
                     },
                     refresh_token: None,
+                    policy_ref: None,
                 },
             )
             .await

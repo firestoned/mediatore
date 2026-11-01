@@ -15,6 +15,7 @@
 //! binary and checked by a unit test; it is never edited by hand (decision 1).
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use banlieue_api::banlieue::{ClaimSubject, VirtualMachineClaim, VirtualMachineClaimSpec};
@@ -24,6 +25,7 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use kube::api::{DeleteParams, ObjectMeta, PostParams};
 use kube::runtime::controller::Action;
 use kube::{Api, Client, CustomResource, CustomResourceExt, Resource, ResourceExt};
+use mediatore_policy::BundlePayload;
 use mediatore_proto::{ClaimPhase, Subject, Workload};
 use mediatore_spire::{MANAGED_BY, MANAGED_BY_LABEL};
 use mediatore_store::{ClaimRecord, StoreError};
@@ -108,6 +110,12 @@ pub struct AgentSandboxSpec {
     pub audiences: Vec<String>,
     /// What to run.
     pub workload: SandboxWorkload,
+    /// The notaio `SandboxPolicy` this sandbox is under, in this namespace (ADR-0026
+    /// decision 6). Optional while the bundle is read in shadow: a sandbox without one is
+    /// reported, never refused, and naming one grants nothing yet. The claim record keeps
+    /// the policy's uid and the bundle version current when the claim was created.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_ref: Option<LocalObjectReference>,
 }
 
 /// The claim's phase, mirrored (decision 11). Never derived independently.
@@ -292,9 +300,15 @@ pub fn sandbox_uid_of(sb: &AgentSandbox) -> Option<Uuid> {
 }
 
 /// The store record for a sandbox whose claim has UID `claim_uid` (decision 12): the
-/// request fields the sandbox API answers from, nothing bound yet.
+/// request fields the sandbox API answers from, nothing bound yet; and, when the sandbox
+/// names a policy with a verified `bundle`, the policy's uid and that bundle's version
+/// (ADR-0026 decision 6), for the audit and for the comparison.
 #[must_use]
-pub fn record_for(sb: &AgentSandbox, claim_uid: Uuid) -> ClaimRecord {
+pub fn record_for(
+    sb: &AgentSandbox,
+    claim_uid: Uuid,
+    bundle: Option<&BundlePayload>,
+) -> ClaimRecord {
     ClaimRecord {
         uid: claim_uid,
         name: sb.name_any(),
@@ -309,6 +323,8 @@ pub fn record_for(sb: &AgentSandbox, claim_uid: Uuid) -> ClaimRecord {
         expires_at: None,
         revoked_at: None,
         sandbox_uid: sandbox_uid_of(sb),
+        policy_uid: bundle.map(|b| b.content.policy.uid.clone()),
+        bundle_version: bundle.map(|b| b.meta.version),
     }
 }
 
@@ -500,6 +516,18 @@ impl Watcher {
         }
     }
 
+    /// The verified bundle of the policy `sb` names, if it names one and the cache holds one
+    /// that is valid now (ADR-0026 decision 6). Read when the record is created and never
+    /// again: the record says what was current then.
+    fn bundle_of(&self, sb: &AgentSandbox) -> Option<Arc<BundlePayload>> {
+        let policy = sb.spec.policy_ref.as_ref()?;
+        self.bundles.get(
+            &sb.namespace().unwrap_or_default(),
+            &policy.name,
+            Utc::now(),
+        )
+    }
+
     /// The record for the sandbox's claim, created on first sight. ADR-0013 decision 2:
     /// the delegated session the API parked under the sandbox's UID becomes the record's
     /// envelope, taken once.
@@ -507,7 +535,8 @@ impl Watcher {
         match self.reconciler.store.get_claim(uid).await {
             Ok(r) => Ok(r),
             Err(StoreError::NotFound(_)) => {
-                let mut r = record_for(sb, uid);
+                let bundle = self.bundle_of(sb);
+                let mut r = record_for(sb, uid, bundle.as_deref());
                 if let Some(sandbox_uid) = r.sandbox_uid
                     && let Some(session) = self.reconciler.store.take_session(sandbox_uid).await?
                 {
@@ -515,7 +544,15 @@ impl Watcher {
                 }
                 let delegated = r.refresh.is_some();
                 self.reconciler.store.put_claim(r.clone()).await?;
-                tracing::info!(sandbox = %sb.name_any(), namespace = %sb.namespace().unwrap_or_default(), claim_uid = %uid, delegated, "record created");
+                tracing::info!(
+                    sandbox = %sb.name_any(),
+                    namespace = %sb.namespace().unwrap_or_default(),
+                    claim_uid = %uid,
+                    delegated,
+                    policy = sb.spec.policy_ref.as_ref().map_or("none", |p| p.name.as_str()),
+                    bundle_version = ?r.bundle_version,
+                    "record created"
+                );
                 Ok(r)
             }
             Err(e) => Err(e.into()),
@@ -675,7 +712,9 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::fakes::{FakeClaims, Rig, node, rig};
+    use crate::Reconciler;
+    use crate::fakes::{FakeClaims, Rig, node, rig, rig_with};
+    use crate::policy::{BundleCache, BundleReflector, Outcome};
     use crate::watch::WatcherConfig;
 
     const ISSUER: &str = "https://issuer.example.com";
@@ -708,6 +747,7 @@ mod tests {
                     image: "ghcr.io/example/workload:1".into(),
                     args: vec!["sh".into()],
                 },
+                policy_ref: None,
             },
         );
         sb.metadata.namespace = Some("sandboxes".into());
@@ -842,6 +882,14 @@ mod tests {
         for f in ["subject", "poolRef", "ttlSeconds", "workload"] {
             assert!(required.contains(&f), "{f} required");
         }
+        assert!(
+            !required.contains(&"policyRef"),
+            "policyRef is optional in shadow (ADR-0026 decision 6)"
+        );
+        assert!(
+            spec["properties"]["policyRef"]["properties"]["name"].is_object(),
+            "policyRef names a SandboxPolicy"
+        );
         assert_eq!(spec["properties"]["ttlSeconds"]["minimum"], 1.0);
         assert_eq!(
             spec["properties"]["subject"]["properties"]["id"]["minLength"],
@@ -940,6 +988,10 @@ mod tests {
         assert_eq!(rec.workload.image, "ghcr.io/example/workload:1");
         assert_eq!(rec.ttl_seconds, 600);
         assert!(rec.entry_id.is_none());
+        assert!(
+            rec.policy_uid.is_none() && rec.bundle_version.is_none(),
+            "no policyRef, no policy on the record"
+        );
         let status = sb.status.clone().unwrap();
         assert_eq!(status.phase, SandboxPhase::Pending);
         assert_eq!(status.claim_uid.as_deref(), Some(uid.to_string().as_str()));
@@ -1294,6 +1346,135 @@ mod tests {
         assert_eq!(
             r.watcher.reconcile_sandbox(&bare).await.unwrap(),
             Action::await_change()
+        );
+    }
+
+    /// A reflector over the testkit's freshly signed bundle, admitted at the real clock, and
+    /// the sandbox in that policy's namespace naming it.
+    async fn admitted_bundle(version: u64) -> (Arc<BundleCache>, BundlePayload, AgentSandbox) {
+        let mediatore_testkit::policy::FreshBundle {
+            keys,
+            envelope,
+            payload,
+        } = mediatore_testkit::policy::fresh_bundle(Utc::now(), version);
+        let policy = payload.content.policy.clone();
+        let reflector = BundleReflector::new(
+            Arc::new(mediatore_store::MemoryStore::default()),
+            keys,
+            vec![policy.namespace.clone()],
+        );
+        let cm = mediatore_testkit::policy::bundle_configmap(
+            &policy.namespace,
+            &format!("{}-bundle", policy.name),
+            &envelope,
+        );
+        assert_eq!(
+            reflector.applied(&cm).await,
+            Outcome::Admitted {
+                policy: format!("{}/{}", policy.namespace, policy.name),
+                version,
+            }
+        );
+        let mut sb = sandbox(true, false);
+        sb.metadata.namespace = Some(policy.namespace.clone());
+        sb.spec.policy_ref = Some(LocalObjectReference {
+            name: policy.name.clone(),
+        });
+        (reflector.cache(), payload, sb)
+    }
+
+    #[tokio::test]
+    async fn a_sandbox_naming_a_policy_records_the_bundle_it_was_admitted_under() {
+        let (cache, payload, sb) = admitted_bundle(5).await;
+        let namespace = sb.namespace().unwrap();
+        let r = rig_with(cfg(), cache);
+        r.claims.put_sandbox(sb.clone());
+        assert_eq!(
+            r.watcher.reconcile_sandbox(&sb).await.unwrap(),
+            Action::await_change()
+        );
+        let claim = r.claims.claim(&namespace, "sb-1").expect("claim created");
+        let rec = r
+            .store
+            .get_claim(claim_uid_of(&claim).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            rec.policy_uid.as_deref(),
+            Some(payload.content.policy.uid.as_str())
+        );
+        assert_eq!(rec.bundle_version, Some(5));
+        // Admitted as any other sandbox: naming a policy grants and refuses nothing.
+        let st = r
+            .claims
+            .sandbox(&namespace, "sb-1")
+            .unwrap()
+            .status
+            .unwrap();
+        assert_eq!(st.phase, SandboxPhase::Pending);
+        assert!(st.reason.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_sandbox_whose_policy_has_no_verified_bundle_is_admitted_with_nothing_recorded() {
+        // The policy named has no bundle in the cache: no policy at all, or none that
+        // verified (ADR-0026 decision 8: nothing new fails closed).
+        let r = rig(cfg());
+        let mut sb = sandbox(true, false);
+        sb.spec.policy_ref = Some(LocalObjectReference {
+            name: "unsigned".into(),
+        });
+        r.claims.put_sandbox(sb.clone());
+        r.watcher.reconcile_sandbox(&sb).await.unwrap();
+        let uid = claim_uid_of(&r.claims.claim("sandboxes", "sb-1").unwrap()).unwrap();
+        let rec = r.store.get_claim(uid).await.unwrap();
+        assert!(rec.policy_uid.is_none() && rec.bundle_version.is_none());
+        assert_eq!(
+            r.claims
+                .sandbox("sandboxes", "sb-1")
+                .unwrap()
+                .status
+                .unwrap()
+                .phase,
+            SandboxPhase::Pending
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bundle_admitted_after_the_record_exists_does_not_rewrite_it() {
+        // The record says what was current when the claim was created (decision 6); a
+        // later bundle is the comparison's business, not the record's.
+        let (cache, _payload, sb) = admitted_bundle(5).await;
+        let namespace = sb.namespace().unwrap();
+        let r = rig_with(cfg(), Arc::new(BundleCache::default()));
+        r.claims.put_sandbox(sb.clone());
+        r.watcher.reconcile_sandbox(&sb).await.unwrap();
+        let uid = claim_uid_of(&r.claims.claim(&namespace, "sb-1").unwrap()).unwrap();
+        assert!(r.store.get_claim(uid).await.unwrap().policy_uid.is_none());
+        // The bundle arrives; the same sandbox is reconciled again.
+        let later = Rig {
+            watcher: Watcher::new(
+                Reconciler {
+                    store: r.store.clone(),
+                    spire: r.entries.clone(),
+                    naming: mediatore_spire::Naming {
+                        trust_domain: "sandbox.test".into(),
+                    },
+                },
+                r.claims.clone(),
+                cfg(),
+            )
+            .with_bundles(cache),
+            store: r.store.clone(),
+            entries: r.entries.clone(),
+            claims: r.claims.clone(),
+        };
+        let sb = later.claims.sandbox(&namespace, "sb-1").unwrap();
+        later.watcher.reconcile_sandbox(&sb).await.unwrap();
+        let rec = later.store.get_claim(uid).await.unwrap();
+        assert!(
+            rec.policy_uid.is_none() && rec.bundle_version.is_none(),
+            "created once, never rewritten"
         );
     }
 

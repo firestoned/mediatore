@@ -108,8 +108,14 @@ are the questions it answers, with the recommendation this roadmap is built on.
       replay below the floor refused and a re-delivery admitted, a deletion and a relist
       dropping the policy with the floor kept, the sweep); `deploy/policy-bundles` the Role
       and its binding, the deploying guide's step 1
-- [ ] `spec.policyRef` on `AgentSandbox` (`make crds`), immutable under the existing admission
-      policy; the record's policy uid and bundle version
+- [x] `spec.policyRef` on `AgentSandbox` (`make crds`), immutable under the existing admission
+      policy; the record's policy uid and bundle version. Done 2026-11-01: an optional
+      `{ name }` on the spec, `policy_ref` on `POST /v1/claims` and `--policy` on the CLI;
+      `claims.policy_uid` and `claims.bundle_version` (migration 4, both engines, the
+      conformance suite's round trip and update); the reconciler reads the reflector's cache
+      once, when it creates the record, and a sandbox whose policy has no verified bundle is
+      admitted with nothing recorded (three reconcile tests over a bundle the testkit signs
+      at the real clock, `mediatore_testkit::policy`)
 - [ ] The comparison, with its finding codes, on every reconcile of a sandbox and whenever its
       policy's bundle changes; the `PolicyConformant` condition
 - [ ] Live test, `make kind-e2e-policy`: notaio installed from its release manifest in kind,

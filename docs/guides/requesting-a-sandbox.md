@@ -23,7 +23,8 @@ curl -sS https://mediatore.sandbox.example/v1/claims \
   -d '{ "pool_ref": "agents", "ttl_seconds": 3600,
         "audiences": ["api://trading-data"],
         "workload": { "image": "registry.internal:5000/sandbox/claude:latest",
-                      "args": ["/usr/bin/claude", "-p", "reconcile the ledgers"] } }'
+                      "args": ["/usr/bin/claude", "-p", "reconcile the ledgers"] },
+        "policy_ref": "agents" }'
 # {"name":"sandbox-3f9a1c2e","phase":"Pending","ready":false,"addresses":[]}
 ```
 
@@ -67,6 +68,7 @@ spec:
   workload:
     image: registry.internal:5000/sandbox/claude:latest
     args: ["/usr/bin/claude", "-p", "reconcile the ledgers"]
+  policyRef: { name: agents }
 ```
 
 ```
@@ -74,6 +76,19 @@ $ kubectl -n agents get agentsandboxes
 NAME                  SUBJECT   POOL     PHASE   READY   AGE
 ledgers-2026-10-14    octocat   agents   Bound   true    41s
 ```
+
+### Naming a policy
+
+`spec.policyRef` (`policy_ref` on `POST /v1/claims`, `--policy` on `mediatore sandbox
+create`) names the notaio `SandboxPolicy` the sandbox is under, in the sandbox's own
+namespace ([ADR-0026](../adr/0026-notaio-bundles-verified-in-shadow.md) decision 6). It is
+optional, and in this release it grants and refuses nothing: the broker's configuration is
+still the policy, and the bundle notaio signs for the named policy is read in shadow. What
+naming one does is put on the claim record the policy's uid and the version of the verified
+bundle current when the claim was created, for the audit and for the comparison that
+reports where the configuration and the bundle disagree. A sandbox naming a policy with no
+verified bundle (no such policy, or none the broker trusts) is admitted exactly like one
+naming none, with nothing recorded. Like the rest of the spec, the field is immutable.
 
 ### Who may name which subject
 

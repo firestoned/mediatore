@@ -130,7 +130,10 @@ A session issuer ([ADR-0013](../adr/0013-dex-session-delegation.md)) is where en
 come from today: the refresh token `POST /v1/claims` receives is sealed with the
 `AgentSandbox` UID (the associated data, so the envelope opens only for that sandbox's
 record) and parked in `sessions` until the reconciler creates the record and moves it
-there; `claims.sandbox_uid` records which UID opens it. Every `POST /v1/token` opens the
+there; `claims.sandbox_uid` records which UID opens it. (Two columns beside it,
+`policy_uid` and `bundle_version`, hold the notaio policy a sandbox named and the verified
+bundle current when its claim was created, [ADR-0026](../adr/0026-notaio-bundles-verified-in-shadow.md)
+decision 6; both empty for a sandbox naming none.) Every `POST /v1/token` opens the
 envelope, refreshes upstream, and re-seals the rotated token. A session no record ever
 took (a refused or deleted sandbox) is removed by the reconciler, and anything older than
 an hour is swept at resync. An issuer with a `session` block and no `sealing` section refuses

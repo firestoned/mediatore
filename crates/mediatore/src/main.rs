@@ -14,7 +14,7 @@ use clap::{Parser, Subcommand};
 use mediatore_api::{AppState, Limiter};
 use mediatore_claims::Reconciler;
 use mediatore_claims::lease::LeaseConfig;
-use mediatore_claims::policy::BundleReflector;
+use mediatore_claims::policy::{BundleCache, BundleReflector};
 use mediatore_claims::sandbox::{KubeSandboxes, SandboxFrontDoor};
 use mediatore_claims::watch::{KubeClaimsApi, Watcher, WatcherConfig};
 use mediatore_entra::{Backend, ClientAssertion, Validator};
@@ -179,14 +179,21 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
     ) {
         let configs = broker_identity(&spire.workload_api_socket, &naming).await?;
         let s = mediatore_tls::serve(sandbox, configs, sandbox_router, shutdown());
+        // One cache: the reflector fills it on this replica, the watcher reads it when it
+        // creates a record (ADR-0026 decision 6). Empty, and never filled, without a
+        // `policy` section.
+        let reflector = bundle_reflector(&cfg, &state)?;
+        let bundles = reflector
+            .as_ref()
+            .map_or_else(|| Arc::new(BundleCache::default()), |r| r.cache());
         let policy_client = client.clone();
         let p = async {
-            policy_reflector(&cfg, policy_client, &state)
+            policy_reflector(policy_client, reflector)
                 .await
                 .map_err(std::io::Error::other)
         };
         let w = async {
-            claim_watcher(&cfg, client, &state)
+            claim_watcher(&cfg, client, &state, bundles)
                 .await
                 .map_err(std::io::Error::other)
         };
@@ -201,53 +208,68 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// notaio's bundle reflector (ADR-0026 decision 3) on every replica, outside the Lease:
-/// each replica needs the cache it will compare with (decision 4). Until shutdown; nothing
-/// to do without a `policy` section. A watch that ends is an error, so the pod restarts
-/// with the cause in its log instead of comparing against a cache going stale.
-async fn policy_reflector(
+/// notaio's bundle reflector (ADR-0026 decision 3) over the configured keys and namespaces;
+/// `None` without a `policy` section.
+fn bundle_reflector(
     cfg: &Config,
-    client: kube::Client,
     state: &Arc<AppState>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<Arc<BundleReflector>>> {
     let Some(policy) = cfg.policy.as_ref() else {
-        return Ok(());
+        return Ok(None);
     };
     let keys = mediatore_policy::trusted_keys(&policy.trusted_keys)?;
-    let reflector = Arc::new(BundleReflector::new(
+    Ok(Some(Arc::new(BundleReflector::new(
         state.store.clone(),
         keys,
         policy.namespaces.clone(),
-    ));
+    ))))
+}
+
+/// The reflector on every replica, outside the Lease: each replica needs the cache it will
+/// compare with (decision 4). Until shutdown; nothing to do without a reflector. A watch
+/// that ends is an error, so the pod restarts with the cause in its log instead of
+/// comparing against a cache going stale.
+async fn policy_reflector(
+    client: kube::Client,
+    reflector: Option<Arc<BundleReflector>>,
+) -> anyhow::Result<()> {
+    let Some(reflector) = reflector else {
+        return Ok(());
+    };
     tokio::select! {
         r = mediatore_claims::policy::run(client, reflector) => r,
         () = shutdown() => Ok(()),
     }
 }
 
-/// The claim watcher on the replica holding the Lease (ADR-0011), until shutdown.
+/// The claim watcher on the replica holding the Lease (ADR-0011), until shutdown, reading
+/// the reflector's `bundles` when it creates a record.
 async fn claim_watcher(
     cfg: &Config,
     client: kube::Client,
     state: &Arc<AppState>,
+    bundles: Arc<BundleCache>,
 ) -> anyhow::Result<()> {
     let reconciler = Reconciler {
         store: state.store.clone(),
         spire: state.spire.clone(),
         naming: state.naming.clone(),
     };
-    let watcher = Arc::new(Watcher::new(
-        reconciler,
-        Arc::new(KubeClaimsApi::new(client.clone())),
-        WatcherConfig {
-            resync: std::time::Duration::from_secs(cfg.watcher.resync_secs),
-            resolve_timeout: std::time::Duration::from_secs(cfg.watcher.resolve_timeout_secs),
-            audiences: cfg.audiences.iter().map(|a| a.name.clone()).collect(),
-            issuers: cfg.issuers.iter().map(|i| i.url.clone()).collect(),
-            retention: std::time::Duration::from_secs(cfg.store.retention_secs),
-            ..WatcherConfig::default()
-        },
-    ));
+    let watcher = Arc::new(
+        Watcher::new(
+            reconciler,
+            Arc::new(KubeClaimsApi::new(client.clone())),
+            WatcherConfig {
+                resync: std::time::Duration::from_secs(cfg.watcher.resync_secs),
+                resolve_timeout: std::time::Duration::from_secs(cfg.watcher.resolve_timeout_secs),
+                audiences: cfg.audiences.iter().map(|a| a.name.clone()).collect(),
+                issuers: cfg.issuers.iter().map(|i| i.url.clone()).collect(),
+                retention: std::time::Duration::from_secs(cfg.store.retention_secs),
+                ..WatcherConfig::default()
+            },
+        )
+        .with_bundles(bundles),
+    );
     let lease = LeaseConfig {
         namespace: client.default_namespace().to_owned(),
         name: "mediatore-watcher".into(),

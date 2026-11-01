@@ -74,6 +74,14 @@ pub struct ClaimRecord {
     /// `refresh`. `None` for a record the dev binder wrote, which seals with its own UID.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_uid: Option<Uuid>,
+    /// The notaio policy the sandbox named (ADR-0026 decision 6): the `SandboxPolicy`'s `uid`,
+    /// its incarnation, as the verified bundle in the cache spelled it when the claim was
+    /// created. `None` for a sandbox naming no policy, or one with no verified bundle then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_uid: Option<String>,
+    /// The version of that bundle. Set with `policy_uid`, never alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_version: Option<u64>,
 }
 
 impl ClaimRecord {

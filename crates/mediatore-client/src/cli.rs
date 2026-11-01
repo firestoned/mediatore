@@ -145,6 +145,9 @@ pub struct CreateArgs {
     /// Workload argv (repeatable, in order)
     #[arg(long = "arg")]
     pub args: Vec<String>,
+    /// The notaio policy the sandbox is under, by name (optional; read in shadow)
+    #[arg(long)]
+    pub policy: Option<String>,
     /// Print the response as JSON
     #[arg(long)]
     pub json: bool,
@@ -264,6 +267,7 @@ async fn create(args: CreateArgs) -> anyhow::Result<()> {
             args: args.args,
         },
         refresh_token: None,
+        policy_ref: args.policy,
     };
     let (claim, spent) = Api::new(&args.target.mediatore)?
         .claim(&session, &request)

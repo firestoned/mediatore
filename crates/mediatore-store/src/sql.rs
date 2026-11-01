@@ -49,7 +49,7 @@ impl Engine {
     }
 
     fn migrator(self) -> Migrator {
-        let steps: [(i64, &'static str, &'static str); 3] = match self {
+        let steps: [(i64, &'static str, &'static str); 4] = match self {
             Self::Sqlite => [
                 (
                     1,
@@ -65,6 +65,11 @@ impl Engine {
                     3,
                     "policy_floors",
                     include_str!("../migrations/sqlite/0003_policy_floors.sql"),
+                ),
+                (
+                    4,
+                    "policy_ref",
+                    include_str!("../migrations/sqlite/0004_policy_ref.sql"),
                 ),
             ],
             Self::Postgres => [
@@ -82,6 +87,11 @@ impl Engine {
                     3,
                     "policy_floors",
                     include_str!("../migrations/postgres/0003_policy_floors.sql"),
+                ),
+                (
+                    4,
+                    "policy_ref",
+                    include_str!("../migrations/postgres/0004_policy_ref.sql"),
                 ),
             ],
         };
@@ -190,7 +200,7 @@ fn is_unique_violation(e: &sqlx::Error) -> bool {
 
 const CLAIM_COLUMNS: &str = "uid, name, subject, entry_id, node_id, audiences, workload, ttl_seconds, \
      refresh_key_id, refresh_nonce, refresh_ciphertext, created_at, expires_at, revoked_at, \
-     sandbox_uid";
+     sandbox_uid, policy_uid, bundle_version";
 
 /// The three columns of a [`Sealed`] envelope, or three `NULL`s.
 fn sealed_columns(s: Option<&Sealed>) -> (Option<String>, Option<Vec<u8>>, Option<Vec<u8>>) {
@@ -259,6 +269,13 @@ fn claim_of(row: &AnyRow) -> Result<ClaimRecord, StoreError> {
             .as_deref()
             .map(uuid)
             .transpose()?,
+        policy_uid: row.try_get("policy_uid").map_err(backend)?,
+        bundle_version: row
+            .try_get::<Option<i64>, _>("bundle_version")
+            .map_err(backend)?
+            .map(u64::try_from)
+            .transpose()
+            .map_err(backend)?,
     })
 }
 
@@ -326,7 +343,7 @@ impl ClaimStore for SqlStore {
     async fn put_claim(&self, rec: ClaimRecord) -> Result<(), StoreError> {
         let (key_id, nonce, ciphertext) = sealed_columns(rec.refresh.as_ref());
         let sql = format!(
-            "INSERT INTO claims ({CLAIM_COLUMNS}) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)"
+            "INSERT INTO claims ({CLAIM_COLUMNS}) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)"
         );
         let result = sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(rec.uid.to_string())
@@ -344,6 +361,8 @@ impl ClaimStore for SqlStore {
             .bind(rec.expires_at.map(micros))
             .bind(rec.revoked_at.map(micros))
             .bind(rec.sandbox_uid.map(|u| u.to_string()))
+            .bind(&rec.policy_uid)
+            .bind(rec.bundle_version.map(floor_version).transpose()?)
             .execute(&self.pool)
             .await;
         match result {
@@ -383,7 +402,7 @@ impl ClaimStore for SqlStore {
             "UPDATE claims SET name = $1, subject = $2, entry_id = $3, node_id = $4, audiences = $5, \
              workload = $6, ttl_seconds = $7, refresh_key_id = $8, refresh_nonce = $9, \
              refresh_ciphertext = $10, created_at = $11, expires_at = $12, revoked_at = $13, \
-             sandbox_uid = $14 WHERE uid = $15",
+             sandbox_uid = $14, policy_uid = $15, bundle_version = $16 WHERE uid = $17",
         )
         .bind(&rec.name)
         .bind(json(&rec.subject)?)
@@ -399,6 +418,8 @@ impl ClaimStore for SqlStore {
         .bind(rec.expires_at.map(micros))
         .bind(rec.revoked_at.map(micros))
         .bind(rec.sandbox_uid.map(|u| u.to_string()))
+        .bind(&rec.policy_uid)
+        .bind(rec.bundle_version.map(floor_version).transpose()?)
         .bind(rec.uid.to_string())
         .execute(&self.pool)
         .await
