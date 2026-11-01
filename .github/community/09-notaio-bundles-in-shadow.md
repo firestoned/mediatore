@@ -73,8 +73,12 @@ are the questions it answers, with the recommendation this roadmap is built on.
 - [x] ADR-0026 accepted, answering the decisions above. Done 2026-11-01 as
       [ADR-0026](../../docs/adr/0026-notaio-bundles-verified-in-shadow.md), with the finding codes
       `P001` to `P011`
-- [ ] The CALM model updated for the new flow (bundle ConfigMaps to the broker) and its trust
-      anchor (the configured keys)
+- [x] The CALM model updated for the new flow (bundle ConfigMaps to the broker) and its trust
+      anchor (the configured keys). Done 2026-11-01: notaio as a system on the management
+      cluster with its bundles as a data asset, the configured keys as a data asset of the
+      broker, the reflector relationship with its Role, the store relationship carrying the
+      floor, the flow `flow-policy-shadow` (write, verify, floor, compare, mint unchanged);
+      `make calm-validate` and the diagrams re-rendered
 - [x] notaio: the floor decision as a pure function, in a patch release; mediatore pins that tag.
       Done 2026-11-01: `next_floor` in notaio v0.3.3, verified like every release
 - [x] The dependency and `deny.toml`; the crate's conformance vectors run in mediatore's own tests,

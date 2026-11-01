@@ -35,7 +35,7 @@
       "unique-id": "service-mediatore-watcher",
       "node-type": "service",
       "name": "Claim Watcher and AgentSandbox Reconciler",
-      "description": "Reconciles AgentSandbox (ADR-0008, built): creates and owns one VirtualMachineClaim per sandbox, named after it, at most once; writes the store record keyed by the claim's UID; mirrors the claim's status plus whether the entry is set (Ready only when Bound and set); refuses, before any claim exists, a sandbox naming an audience or issuer outside mediatore's configuration; holds a finalizer that releases the record, deletes the claim and lets the object go only once the claim is gone. Watches VirtualMachineClaim (managed-by label) and VirtualMachine (pool members): on Bound resolves the node by the EK hash the claim mirrors (never by name, address or UUID), binds through the Reconciler, fails an unresolved bind after a bounded wait by deleting the claim, releases on Releasing / Failed / deletion and at resync; declares a node entry when a member publishes its vTPM endorsement certificate; one replica leads by Lease (ADR-0011, built). Never holds a SPIRE admin identity (ADR-0006). crates/mediatore-claims."
+      "description": "Reconciles AgentSandbox (ADR-0008, built): creates and owns one VirtualMachineClaim per sandbox, named after it, at most once; writes the store record keyed by the claim's UID; mirrors the claim's status plus whether the entry is set (Ready only when Bound and set); refuses, before any claim exists, a sandbox naming an audience or issuer outside mediatore's configuration; holds a finalizer that releases the record, deletes the claim and lets the object go only once the claim is gone. Watches VirtualMachineClaim (managed-by label) and VirtualMachine (pool members): on Bound resolves the node by the EK hash the claim mirrors (never by name, address or UUID), binds through the Reconciler, fails an unresolved bind after a bounded wait by deleting the claim, releases on Releasing / Failed / deletion and at resync; declares a node entry when a member publishes its vTPM endorsement certificate; one replica leads by Lease (ADR-0011, built). Under ADR-0026 (in progress) the same loop reflects notaio's bundle ConfigMaps in the configured namespaces, verifies each against the configured keys, moves the policy's version floor in the store by a compare and set, caches the verified payload, and on each reconcile of a sandbox, and whenever its policy's bundle changes, reports every way the broker would allow more than the bundle (codes P001 to P011) as a log line and the PolicyConformant condition; it admits, binds and mints exactly as before. Never holds a SPIRE admin identity (ADR-0006). crates/mediatore-claims."
     },
     {
       "unique-id": "service-mediatore-sts",
@@ -47,7 +47,7 @@
       "unique-id": "data-asset-agentsandbox-cr",
       "node-type": "data-asset",
       "name": "AgentSandbox resources",
-      "description": "Namespaced CRD mediatore.io/v1alpha1, served and reconciled by mediatore (ADR-0008, built: roadmap 08; schema generated from the Rust type into deploy/base/crds). The request for one sandbox: subject, poolRef, ttlSeconds, audiences, workload. Created by the user API on POST /v1/claims or declaratively by anything with RBAC on agentsandboxes; spec.subject is pinned to the caller by the mediatore-agentsandbox-subject admission policy unless the caller is mediatore's ServiceAccount or a listed broker, and the whole spec is immutable afterwards. Never carries a credential. Owns exactly one VirtualMachineClaim; a finalizer holds it until the claim and its ClusterStaticEntry are gone. Status mirrors the claim plus whether the entry is set."
+      "description": "Namespaced CRD mediatore.io/v1alpha1, served and reconciled by mediatore (ADR-0008, built: roadmap 08; schema generated from the Rust type into deploy/base/crds). The request for one sandbox: subject, poolRef, ttlSeconds, audiences, workload. Created by the user API on POST /v1/claims or declaratively by anything with RBAC on agentsandboxes; spec.subject is pinned to the caller by the mediatore-agentsandbox-subject admission policy unless the caller is mediatore's ServiceAccount or a listed broker, and the whole spec is immutable afterwards. Never carries a credential. Owns exactly one VirtualMachineClaim; a finalizer holds it until the claim and its ClusterStaticEntry are gone. Status mirrors the claim plus whether the entry is set. ADR-0026 (in progress) adds spec.policyRef, the name of a SandboxPolicy in the sandbox's namespace, optional and immutable with the rest of the spec; naming a policy grants nothing in shadow."
     },
     {
       "unique-id": "data-asset-claim-store",
@@ -90,6 +90,24 @@
       "node-type": "system",
       "name": "banlieue Control Plane",
       "description": "Schedules pool members and binds VirtualMachineClaims to Ready VMs. mediatore consumes its CRDs (banlieue-api types) and never bypasses it; the Kubernetes API is the only interface between the two (banlieue non-negotiable #1, mediatore ADR-0002)."
+    },
+    {
+      "unique-id": "system-notaio",
+      "node-type": "system",
+      "name": "notaio Policy Control Plane",
+      "description": "Reviews SandboxPolicy resources and compiles each into a signed bundle: a DSSE envelope over the effective policy (per audience its access, scopes, ttlSeconds, endpoints and rules in the broker's own rule shape; direct egress; the lease's maxDurationSeconds; the policy's namespace, name and uid; a version that only goes up; a notAfter), signed by a key in OpenBao transit that notaio alone can use, published in the policy's namespace as the ConfigMap <policy>-bundle (key bundle.dsse.json, label app.kubernetes.io/managed-by=notaio). mediatore reads what it publishes through the Kubernetes API and nothing else; the signing key never leaves notaio's transit (ADR-0026)."
+    },
+    {
+      "unique-id": "data-asset-policy-bundles",
+      "node-type": "data-asset",
+      "name": "SandboxPolicy bundles (ConfigMaps)",
+      "description": "notaio's signed bundles, one ConfigMap per policy in each namespace listed in policy.namespaces. State notaio owns and the broker only reads: the broker's RBAC there is a Role granting get, list and watch on ConfigMaps and nothing else. A bundle is used only once it verifies against the configured keys at the current time and passes notaio's floor rule; one that fails is logged with its reason and changes nothing, an expired one leaves the cache. In this phase a bundle is compared with the broker's configuration and never enforced (ADR-0026, roadmap 09, in progress)."
+    },
+    {
+      "unique-id": "data-asset-policy-trusted-keys",
+      "node-type": "data-asset",
+      "name": "Policy trust anchor (configured keys)",
+      "description": "policy.trusted_keys in the broker's configuration: the Ed25519 public keys, by notaio's key id, that a bundle must be signed with. Configuration, never cluster state, so whoever can write objects in the cluster cannot choose the policy; two versions listed cover a rotation. A key that does not decode to 32 bytes or a duplicate id refuses the start; a missing policy section turns the whole of ADR-0026 off (built: crates/mediatore/src/config.rs)."
     },
     {
       "unique-id": "service-spire-server",
@@ -149,7 +167,7 @@
       "unique-id": "service-guest-agent",
       "node-type": "service",
       "name": "mediatore guest",
-      "description": "Root daemon, the guest role of the one mediatore binary (ADR-0014): registers the node (EK hash + DMI UUID), then announces GuestReady to the hypervisor over the channel banlieue reads (the /run marker, guestinfo or vsock; ADR-0019), so the pool counts the member only once it is attested and registered; polls GET /v1/me for a bound claim, creates the per-subject user (sb- + 12 hex, ADR-0004), mounts a size-bounded tmpfs at /mnt/sandbox (nosuid, nodev, mode 0700) and pulls the claim's workload image from its registry into it as the rootfs (with the operator's credential for that registry when the broker handed one over, used for the pull and kept nowhere; ADR-0022), manifest and layers verified against their digests, the manifest digest logged (ADR-0021), loads the per-claim nftables ruleset keyed by that uid (the broker, the audiences' egress endpoints, DNS; no ruleset, no jail; ADR-0020), bind-mounts the binary at the pinned path read-only into the jail and supervises the nsjail until the deadline, then tears down; what nsjail execs is the binary's jail-exec role, which applies Landlock to itself (the rootfs readable, /work, /tmp and the home writable, TCP connect to the egress proxy's port only, no bind) before the workload's argv runs, and a refusal (exit 125) ends the claim instead of restarting (ADR-0024). Since ADR-0025 it also generates the claim's phantom token, writes the routes GET /v1/me returned to a file of the sandbox user's, starts mediatore egress-proxy as that user outside the jail before the jail, and ends the claim if the proxy exits. crates/mediatore-guest."
+      "description": "Root daemon, the guest role of the one mediatore binary (ADR-0014): registers the node (EK hash + DMI UUID), then announces GuestReady to the hypervisor over the channel banlieue reads (the /run marker, guestinfo or vsock; ADR-0019), so the pool counts the member only once it is attested and registered; polls GET /v1/me for a bound claim, creates the per-subject user (sb- + 12 hex, ADR-0004), mounts a size-bounded tmpfs at /mnt/sandbox (nosuid, nodev, mode 0711 so the egress proxy reaches its files; ADR-0021 amended) and pulls the claim's workload image from its registry into it as the rootfs (with the operator's credential for that registry when the broker handed one over, used for the pull and kept nowhere; ADR-0022), manifest and layers verified against their digests, the manifest digest logged (ADR-0021), loads the per-claim nftables ruleset keyed by that uid (the broker, the audiences' egress endpoints, DNS; no ruleset, no jail; ADR-0020), bind-mounts the binary at the pinned path read-only into the jail and supervises the nsjail until the deadline, then tears down; what nsjail execs is the binary's jail-exec role, which applies Landlock to itself (the rootfs readable, /work, /tmp and the home writable, TCP connect to the egress proxy's port only, no bind) before the workload's argv runs, and a refusal (exit 125) ends the claim instead of restarting (ADR-0024). Since ADR-0025 it also generates the claim's phantom token, writes the routes GET /v1/me returned to a file of the sandbox user's, starts mediatore egress-proxy as that user outside the jail before the jail, and ends the claim if the proxy exits. crates/mediatore-guest."
     },
     {
       "unique-id": "service-sandbox-workload",
@@ -185,7 +203,7 @@
   "relationships": [
     {
       "unique-id": "rel-mediatore-composition",
-      "description": "The mediatore system is one binary composed of the two API surfaces, the claim watcher and the STS; the claim store and the STS signing key are the state it guards.",
+      "description": "The mediatore system is one binary composed of the two API surfaces, the claim watcher and the STS; the claim store and the STS signing key are the state it guards, with the configured policy keys the trust anchor for notaio's bundles (ADR-0026).",
       "relationship-type": {
         "composed-of": {
           "container": "system-mediatore",
@@ -196,7 +214,8 @@
             "service-mediatore-sts",
             "data-asset-claim-store",
             "data-asset-sts-signing-key",
-            "data-asset-agentsandbox-cr"
+            "data-asset-agentsandbox-cr",
+            "data-asset-policy-trusted-keys"
           ]
         }
       }
@@ -238,6 +257,7 @@
             "system-mediatore",
             "service-kubernetes-api",
             "system-banlieue",
+            "system-notaio",
             "service-spire-server",
             "service-spire-controller-manager",
             "service-spire-agent-k8s",
@@ -405,6 +425,48 @@
         }
       },
       "protocol": "HTTPS"
+    },
+    {
+      "unique-id": "rel-notaio-kube-api",
+      "description": "notaio writes each policy's bundle ConfigMap in the policy's namespace and keeps it current: a new version on every change, re-signed on a key rotation (ADR-0026). mediatore never calls notaio; the ConfigMap is the whole interface.",
+      "relationship-type": {
+        "connects": {
+          "source": {
+            "node": "system-notaio"
+          },
+          "destination": {
+            "node": "service-kubernetes-api"
+          }
+        }
+      },
+      "protocol": "HTTPS"
+    },
+    {
+      "unique-id": "rel-watcher-policy-bundles",
+      "description": "The bundle reflector (ADR-0026 decision 3, in progress): a watch on ConfigMaps labelled app.kubernetes.io/managed-by=notaio in each namespace of policy.namespaces, with a Role per namespace granting get, list and watch on ConfigMaps and nothing else. A ConfigMap without bundle.dsse.json, or whose envelope does not parse, is logged and ignored. The condition the comparison writes goes through rel-watcher-agentsandboxes, on agentsandboxes/status.",
+      "relationship-type": {
+        "connects": {
+          "source": {
+            "node": "service-mediatore-watcher"
+          },
+          "destination": {
+            "node": "service-kubernetes-api"
+          }
+        }
+      },
+      "protocol": "HTTPS"
+    },
+    {
+      "unique-id": "rel-notaio-composition",
+      "description": "The bundles are notaio's state; mediatore holds a verified copy in memory and the floor in its store.",
+      "relationship-type": {
+        "composed-of": {
+          "container": "system-notaio",
+          "nodes": [
+            "data-asset-policy-bundles"
+          ]
+        }
+      }
     },
     {
       "unique-id": "rel-controller-manager-kube-api",
@@ -582,7 +644,7 @@
     },
     {
       "unique-id": "rel-mediatore-store-db",
-      "description": "Every store read and write from both API surfaces and the reconcilers: the record on create, the entry id and deadline on bind, revocation on release, the node registry on registration, the sweep into the audit table at resync (ADR-0012). TLS verify-full to PostgreSQL; a file for SQLite.",
+      "description": "Every store read and write from both API surfaces and the reconcilers: the record on create, the entry id and deadline on bind, revocation on release, the node registry on registration, the sweep into the audit table at resync; the version floor of each notaio policy read and moved by a compare and set, so two replicas cannot move a floor down (ADR-0012, amended by ADR-0026). TLS verify-full to PostgreSQL; a file for SQLite.",
       "relationship-type": {
         "connects": {
           "source": {
@@ -749,6 +811,38 @@
           "description": "The guest announces GuestReady on the hypervisor's channel; only now does the pool count the member (ADR-0019)."
         }
       ]
+    },
+    {
+      "unique-id": "flow-policy-shadow",
+      "name": "A policy bundle, verified and compared in shadow",
+      "description": "How notaio's reviewed policy reaches the broker and what the broker does with it in this phase: observe and report, never admit, refuse or mint differently (ADR-0026).",
+      "transitions": [
+        {
+          "sequence-number": 1,
+          "relationship-unique-id": "rel-notaio-kube-api",
+          "description": "notaio compiles the SandboxPolicy, signs the bundle with its transit key and writes <policy>-bundle in the policy's namespace."
+        },
+        {
+          "sequence-number": 2,
+          "relationship-unique-id": "rel-watcher-policy-bundles",
+          "description": "The broker's reflector sees the ConfigMap and verifies the envelope against policy.trusted_keys at the current time; a bundle that fails is logged with its reason and goes no further."
+        },
+        {
+          "sequence-number": 3,
+          "relationship-unique-id": "rel-mediatore-store-db",
+          "description": "notaio's floor rule decides from the held floor (the same uid never goes down; a new uid only if issued after the held one); the store writes the next floor only if the held one is still what was read, and a replica that lost the race reads and decides again."
+        },
+        {
+          "sequence-number": 4,
+          "relationship-unique-id": "rel-watcher-agentsandboxes",
+          "description": "Only after the write succeeds does the verified payload enter the cache; each sandbox naming the policy is reconciled, every gap between the broker's configuration and the bundle is logged with its code, and PolicyConformant is set True, False with the codes, or Unknown while no bundle has been read."
+        },
+        {
+          "sequence-number": 5,
+          "relationship-unique-id": "rel-egress-proxy-mediatore",
+          "description": "Tokens are minted exactly as before: the comparison changes no admission, no claim and no mint. The enforcing ADR is the one that makes a gap a refusal."
+        }
+      ]
     }
   ],
   "metadata": {
@@ -756,7 +850,7 @@
     "repository": "https://github.com/firestoned/mediatore",
     "license": "Apache-2.0",
     "calm-schema-version": "1.2",
-    "phase": "dev-mode loop implemented and e2e-tested; Entra OBO is a fail-closed stub. Roadmap 01 (ADR-0006, ADR-0007) implemented and live-tested in kind: registration entries as ClusterStaticEntry through the Kubernetes API, broker identity from the Workload API over the SPIFFE CSI driver, SPIFFE mTLS terminated in-process (crates/mediatore-tls). Roadmap 03 (ADR-0011): the claim watcher, node resolution by EK, node entries from pool members, leader election by Lease. Roadmap 08 (ADR-0008): the AgentSandbox CRD, its reconciler on the same loop, the subject admission policy and the user API creating the resource; records now exist outside dev_mode. SPIRE topology models the ADR-0005 desired state: root on a dedicated identity cluster, downstream per environment; the homelab collapses to the downstream server alone. Roadmap 05 (ADR-0012): one sqlx store over SQLite or PostgreSQL, the sealed refresh envelope, rows swept into an audit table; every kind tier runs the broker on PostgreSQL over verify-full. Roadmap 04, first slice (ADR-0013): the Dex path, with the upstream session delegated at claim creation, sealed, refreshed before every issue and revoked on refusal; mediatore-cli; per-claim rate limiting. Entra OBO and the transit sealer are the roadmap's next slices. ADR-0014: one binary, the roles as subcommands (serve, guest, token, login, sandbox, session), one musl artifact for every host, the jail mounting it read-only; the node entry pins /usr/local/bin/mediatore. ADR-0015: the transit sealer; the kind tiers run the broker on an OpenBao (make kind-openbao) with Kubernetes auth and a derived key; the local sealer stays the homelab shape. ADR-0016: the Entra path, with the caller's token exchanged On-Behalf-Of at claim creation, the session refreshed per audience before every issue, and the broker's credential a signed assertion (key file, OpenBao transit or a federated ServiceAccount token); proven against the fake issuer, the live run against a tenant is by hand. ADR-0017: issuer profiles, the session path for any OIDC issuer (Google and Auth0 beside Dex), per-issuer login parameters and groups claim. ADR-0018: TPM attestation with the SPIFFE community plugin as a kustomize component, the hypervisors' swtpm CAs as the EK bundle; the agent fragments for the VM image. ADR-0019: GuestReady announced by the guest after attestation and registration, the VM units guarded on the installed disk. ADR-0020: the jail in the VM's network namespace behind an nftables ruleset keyed by the sandbox uid, the destinations from the claim's audiences. ADR-0021 implemented: the sandbox filesystem is a size-bounded tmpfs per claim (nosuid, nodev, 0700) and the guest pulls the workload rootfs from the registry itself, every blob digest-verified, the manifest digest logged per claim. ADR-0022 implemented: registry pull credentials are the operator's, in the broker's config, handed per claim over GET /v1/me for the registry the image names and used by the guest for one pull. ADR-0023 implemented: the sandbox VM image is a Kairos derivative built from image/Dockerfile and published signed by this repository; the pinned binary path is /usr/bin/mediatore. ADR-0024 implemented: Landlock inside the jail, applied by the binary's jail-exec role through the nono library before the workload runs; what the workload may write and which TCP ports it may connect to hold in the kernel of its own process, no bind, a refusal ends the claim. ADR-0025 implemented: the egress proxy, a second process of the one binary started per claim by the guest as the sandbox user outside the jail; a reverse proxy on loopback that swaps the jail's phantom token for the audience's real one, fetched over the claim SVID and held only there, under nono's endpoint-rule shape (audiences[].rules, carried as routes on GET /v1/me); the jail loses the Workload API socket and the broker route and reaches the proxy's port alone."
+    "phase": "dev-mode loop implemented and e2e-tested; Entra OBO is a fail-closed stub. Roadmap 01 (ADR-0006, ADR-0007) implemented and live-tested in kind: registration entries as ClusterStaticEntry through the Kubernetes API, broker identity from the Workload API over the SPIFFE CSI driver, SPIFFE mTLS terminated in-process (crates/mediatore-tls). Roadmap 03 (ADR-0011): the claim watcher, node resolution by EK, node entries from pool members, leader election by Lease. Roadmap 08 (ADR-0008): the AgentSandbox CRD, its reconciler on the same loop, the subject admission policy and the user API creating the resource; records now exist outside dev_mode. SPIRE topology models the ADR-0005 desired state: root on a dedicated identity cluster, downstream per environment; the homelab collapses to the downstream server alone. Roadmap 05 (ADR-0012): one sqlx store over SQLite or PostgreSQL, the sealed refresh envelope, rows swept into an audit table; every kind tier runs the broker on PostgreSQL over verify-full. Roadmap 04, first slice (ADR-0013): the Dex path, with the upstream session delegated at claim creation, sealed, refreshed before every issue and revoked on refusal; mediatore-cli; per-claim rate limiting. Entra OBO and the transit sealer are the roadmap's next slices. ADR-0014: one binary, the roles as subcommands (serve, guest, token, login, sandbox, session), one musl artifact for every host, the jail mounting it read-only; the node entry pins /usr/local/bin/mediatore. ADR-0015: the transit sealer; the kind tiers run the broker on an OpenBao (make kind-openbao) with Kubernetes auth and a derived key; the local sealer stays the homelab shape. ADR-0016: the Entra path, with the caller's token exchanged On-Behalf-Of at claim creation, the session refreshed per audience before every issue, and the broker's credential a signed assertion (key file, OpenBao transit or a federated ServiceAccount token); proven against the fake issuer, the live run against a tenant is by hand. ADR-0017: issuer profiles, the session path for any OIDC issuer (Google and Auth0 beside Dex), per-issuer login parameters and groups claim. ADR-0018: TPM attestation with the SPIFFE community plugin as a kustomize component, the hypervisors' swtpm CAs as the EK bundle; the agent fragments for the VM image. ADR-0019: GuestReady announced by the guest after attestation and registration, the VM units guarded on the installed disk. ADR-0020: the jail in the VM's network namespace behind an nftables ruleset keyed by the sandbox uid, the destinations from the claim's audiences. ADR-0021 implemented: the sandbox filesystem is a size-bounded tmpfs per claim (nosuid, nodev, 0711 since the amendment of 2026-10-31) and the guest pulls the workload rootfs from the registry itself, every blob digest-verified, the manifest digest logged per claim. ADR-0022 implemented: registry pull credentials are the operator's, in the broker's config, handed per claim over GET /v1/me for the registry the image names and used by the guest for one pull. ADR-0023 implemented: the sandbox VM image is a Kairos derivative built from image/Dockerfile and published signed by this repository; the pinned binary path is /usr/bin/mediatore. ADR-0024 implemented: Landlock inside the jail, applied by the binary's jail-exec role through the nono library before the workload runs; what the workload may write and which TCP ports it may connect to hold in the kernel of its own process, no bind, a refusal ends the claim. ADR-0025 implemented: the egress proxy, a second process of the one binary started per claim by the guest as the sandbox user outside the jail; a reverse proxy on loopback that swaps the jail's phantom token for the audience's real one, fetched over the claim SVID and held only there, under nono's endpoint-rule shape (audiences[].rules, carried as routes on GET /v1/me); the jail loses the Workload API socket and the broker route and reaches the proxy's port alone. ADR-0026 accepted (roadmap 09, in progress): notaio's signed policy bundles read from labelled ConfigMaps in the configured namespaces, verified against keys that are configuration, the per-policy version floor moved in the store by a compare and set, and every gap between the broker's configuration and the bundle reported in shadow by code and as the PolicyConformant condition; built so far the policy section of the configuration, the policy_floors table and the mediatore-policy crate over notaio's verifier at the pinned tag."
   },
   "adrs": [
     "docs/adr/0001-record-architecture-decisions.md",
@@ -783,6 +877,7 @@
     "docs/adr/0022-registry-pull-credentials-from-the-broker.md",
     "docs/adr/0023-sandbox-vm-image-kairos-derivative.md",
     "docs/adr/0024-landlock-inside-the-jail.md",
-    "docs/adr/0025-phantom-token-egress-proxy.md"
+    "docs/adr/0025-phantom-token-egress-proxy.md",
+    "docs/adr/0026-notaio-bundles-verified-in-shadow.md"
   ]
 }
