@@ -413,6 +413,8 @@ async fn create_claim(
             expires_at: None,
             revoked_at: None,
             sandbox_uid: None,
+            policy_uid: None,
+            bundle_version: None,
         })
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
@@ -522,6 +524,10 @@ async fn create_sandbox(
             ttl_seconds: req.ttl_seconds,
             audiences: req.audiences.clone(),
             workload: SandboxWorkload::from(&req.workload),
+            policy_ref: req
+                .policy_ref
+                .clone()
+                .map(|name| LocalObjectReference { name }),
         },
     );
     sandbox.metadata.namespace = Some(st.sandbox_namespace.clone());

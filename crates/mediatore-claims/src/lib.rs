@@ -186,6 +186,8 @@ mod tests {
             expires_at: None,
             revoked_at: None,
             sandbox_uid: None,
+            policy_uid: None,
+            bundle_version: None,
         }
     }
 

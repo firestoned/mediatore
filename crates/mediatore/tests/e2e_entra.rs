@@ -235,6 +235,7 @@ impl Harness {
                     args: vec![],
                 },
                 refresh_token: refresh_token.map(|t| Secret(t.to_owned())),
+                policy_ref: None,
             })
             .send()
             .await

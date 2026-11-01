@@ -199,6 +199,7 @@ impl Harness {
                     args: vec![],
                 },
                 refresh_token: None,
+                policy_ref: None,
             })
             .send()
             .await
@@ -219,6 +220,7 @@ impl Harness {
                     args: vec![],
                 },
                 refresh_token: None,
+                policy_ref: None,
             })
             .send()
             .await
@@ -450,6 +452,7 @@ async fn a_token_for_another_audience_client_is_unauthorized() {
             audiences: vec![],
             workload: Workload::default(),
             refresh_token: None,
+            policy_ref: None,
         })
         .send()
         .await
@@ -475,6 +478,7 @@ async fn a_login_outside_the_required_group_is_forbidden() {
             audiences: vec![],
             workload: Workload::default(),
             refresh_token: None,
+            policy_ref: None,
         })
         .send()
         .await
@@ -644,6 +648,7 @@ async fn an_issuer_without_a_session_refuses_a_delegated_refresh_token() {
                 args: vec![],
             },
             refresh_token: Some(mediatore_proto::Secret("rt-unwanted".into())),
+            policy_ref: None,
         })
         .send()
         .await

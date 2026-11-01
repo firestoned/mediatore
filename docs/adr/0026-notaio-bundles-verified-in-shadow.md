@@ -163,6 +163,15 @@ What roadmap 09 fixed within the decisions above, so a reader of the code finds 
   through `mediatore-policy::admit` and nothing else, so a re-delivery at the same floor is
   admitted again without a write, and a replay below it is refused before it reaches the
   cache. The RBAC is `deploy/policy-bundles`, one copy per namespace.
+- **The record reads the cache once** (decision 6). `spec.policyRef` is a `{ name }` like
+  `poolRef`, optional, rendered into the CRD by `make crds`; the admission policy's
+  `object.spec == oldObject.spec` already freezes it. When the reconciler creates the claim
+  record it looks the named policy up in the reflector's cache, on the replica holding the
+  Lease, and writes `policy_uid` and `bundle_version` (migration 4, both engines) from the
+  verified bundle valid at that moment, or nothing when there is none. The record is never
+  rewritten by a later bundle: it says what was current when the claim was created, and a
+  later bundle is the comparison's business. `POST /v1/claims` carries the name as
+  `policy_ref`, the CLI as `--policy`.
 
 ## Consequences
 

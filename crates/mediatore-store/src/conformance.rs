@@ -85,6 +85,8 @@ pub(crate) fn claim(uid: Uuid) -> ClaimRecord {
         expires_at: None,
         revoked_at: None,
         sandbox_uid: None,
+        policy_uid: None,
+        bundle_version: None,
     }
 }
 
@@ -113,6 +115,8 @@ pub(crate) async fn a_claim_round_trips_every_field(s: &dyn ClaimStore) {
     rec.sandbox_uid = Some(sandbox_uid);
     rec.refresh = Some(sealer().seal(sandbox_uid, b"refresh-token").await.unwrap());
     rec.expires_at = Some(at(3600));
+    rec.policy_uid = Some("3f1b8d2a-0c4e-4b7a-9d6f-2e5c1a7b9f03".into());
+    rec.bundle_version = Some(u64::from(u32::MAX) + 1);
     s.put_claim(rec.clone()).await.unwrap();
 
     for got in [
@@ -133,6 +137,8 @@ pub(crate) async fn a_claim_round_trips_every_field(s: &dyn ClaimStore) {
         assert_eq!(got.revoked_at, None);
         assert_eq!(got.sandbox_uid, Some(sandbox_uid));
         assert_eq!(got.seal_binding(), sandbox_uid);
+        assert_eq!(got.policy_uid, rec.policy_uid);
+        assert_eq!(got.bundle_version, rec.bundle_version);
         let env = got.refresh.as_ref().expect("envelope survives");
         assert_eq!(env, rec.refresh.as_ref().unwrap());
         assert_eq!(
@@ -171,12 +177,16 @@ pub(crate) async fn update_replaces_and_needs_an_existing_row(s: &dyn ClaimStore
     rec.node_id = Some("node".into());
     rec.expires_at = Some(at(10));
     rec.audiences = vec!["only".into()];
+    rec.policy_uid = Some("policy-uid".into());
+    rec.bundle_version = Some(7);
     s.update_claim(rec).await.unwrap();
     let got = s.get_claim(uid).await.unwrap();
     assert_eq!(got.entry_id.as_deref(), Some("entry"));
     assert_eq!(got.node_id.as_deref(), Some("node"));
     assert_eq!(got.expires_at, Some(at(10)));
     assert_eq!(got.audiences, vec!["only".to_owned()]);
+    assert_eq!(got.policy_uid.as_deref(), Some("policy-uid"));
+    assert_eq!(got.bundle_version, Some(7));
 
     let err = s.update_claim(claim(Uuid::new_v4())).await.unwrap_err();
     assert!(matches!(err, StoreError::NotFound(_)), "{err}");

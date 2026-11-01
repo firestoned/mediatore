@@ -21,6 +21,7 @@ use mediatore_store::{MemoryStore, NodeRecord};
 use uuid::Uuid;
 
 use crate::Reconciler;
+use crate::policy::BundleCache;
 use crate::sandbox::{AgentSandbox, AgentSandboxStatus, FINALIZER};
 use crate::watch::{ClaimsApi, WatchError, Watcher, WatcherConfig, claim_uid_of};
 
@@ -219,6 +220,11 @@ pub(crate) struct Rig {
 }
 
 pub(crate) fn rig(cfg: WatcherConfig) -> Rig {
+    rig_with(cfg, Arc::new(BundleCache::default()))
+}
+
+/// A rig whose watcher reads `bundles`, the cache a reflector fills.
+pub(crate) fn rig_with(cfg: WatcherConfig, bundles: Arc<BundleCache>) -> Rig {
     let store = Arc::new(MemoryStore::default());
     let entries = Arc::new(MemoryEntries::default());
     let claims = Arc::new(FakeClaims::default());
@@ -229,7 +235,7 @@ pub(crate) fn rig(cfg: WatcherConfig) -> Rig {
             trust_domain: "sandbox.test".into(),
         },
     };
-    let watcher = Watcher::new(reconciler, claims.clone(), cfg);
+    let watcher = Watcher::new(reconciler, claims.clone(), cfg).with_bundles(bundles);
     Rig {
         watcher,
         store,

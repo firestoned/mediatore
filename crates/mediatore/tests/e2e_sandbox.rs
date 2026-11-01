@@ -97,6 +97,7 @@ impl Harness {
                     args: vec!["sh".into()],
                 },
                 refresh_token: None,
+                policy_ref: Some("agent".into()),
             })
             .send()
             .await
@@ -142,6 +143,11 @@ async fn post_creates_an_agentsandbox_with_the_callers_subject() {
         "registry.internal:5000/sandbox:latest"
     );
     assert_eq!(sb.spec.workload.args, vec!["sh".to_owned()]);
+    assert_eq!(
+        sb.spec.policy_ref.as_ref().map(|p| p.name.as_str()),
+        Some("agent"),
+        "policy_ref lands on spec.policyRef (ADR-0026 decision 6)"
+    );
     assert!(
         sb.status.is_none(),
         "the reconciler writes the status, not the API"

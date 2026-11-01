@@ -53,6 +53,19 @@ spec:
                 items:
                   type: string
                 type: array
+              policyRef:
+                description: |-
+                  The notaio `SandboxPolicy` this sandbox is under, in this namespace (ADR-0026
+                  decision 6). Optional while the bundle is read in shadow: a sandbox without one is
+                  reported, never refused, and naming one grants nothing yet. The claim record keeps
+                  the policy's uid and the bundle version current when the claim was created.
+                nullable: true
+                properties:
+                  name:
+                    type: string
+                required:
+                - name
+                type: object
               poolRef:
                 description: The `VirtualMachinePool` to claim from, in this namespace; copied to the claim.
                 properties:

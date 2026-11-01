@@ -255,6 +255,7 @@ impl Harness {
                     args: vec!["/usr/bin/agent".into()],
                 },
                 refresh_token: None,
+                policy_ref: None,
             })
             .send()
             .await

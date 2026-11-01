@@ -34,6 +34,7 @@ use mediatore_spire::SpireError;
 use mediatore_store::StoreError;
 use uuid::Uuid;
 
+use crate::policy::BundleCache;
 use crate::sandbox::{AgentSandbox, AgentSandboxStatus, FINALIZER};
 use crate::{Action as Intent, Reconciler, next_action};
 
@@ -257,20 +258,32 @@ pub struct Watcher {
     pub(crate) reconciler: Reconciler,
     pub(crate) claims: Arc<dyn ClaimsApi>,
     pub(crate) cfg: WatcherConfig,
+    /// notaio's verified bundles (ADR-0026), filled by the reflector on every replica; empty
+    /// with no `policy` section, which reads as "no sandbox's policy has a bundle".
+    pub(crate) bundles: Arc<BundleCache>,
     first_unresolved: Mutex<HashMap<Uuid, Instant>>,
     declared: Mutex<HashSet<String>>,
 }
 
 impl Watcher {
-    /// Over these.
+    /// Over these, with an empty bundle cache.
     pub fn new(reconciler: Reconciler, claims: Arc<dyn ClaimsApi>, cfg: WatcherConfig) -> Self {
         Self {
             reconciler,
             claims,
             cfg,
+            bundles: Arc::new(BundleCache::default()),
             first_unresolved: Mutex::new(HashMap::new()),
             declared: Mutex::new(HashSet::new()),
         }
+    }
+
+    /// With the reflector's cache, so a record created for a sandbox naming a policy carries
+    /// the bundle it was admitted under (ADR-0026 decision 6).
+    #[must_use]
+    pub fn with_bundles(mut self, bundles: Arc<BundleCache>) -> Self {
+        self.bundles = bundles;
+        self
     }
 
     /// Timings.
@@ -609,6 +622,8 @@ mod tests {
             expires_at: None,
             revoked_at: None,
             sandbox_uid: None,
+            policy_uid: None,
+            bundle_version: None,
         }
     }
 
