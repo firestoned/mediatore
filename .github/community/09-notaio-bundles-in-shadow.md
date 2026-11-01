@@ -75,11 +75,14 @@ are the questions it answers, with the recommendation this roadmap is built on.
       `P001` to `P011`
 - [ ] The CALM model updated for the new flow (bundle ConfigMaps to the broker) and its trust
       anchor (the configured keys)
-- [ ] notaio: the floor decision as a pure function, in a patch release (if decision 4 keeps the
-      recommendation); mediatore pins that tag
-- [ ] The dependency and `deny.toml`; the crate's conformance vectors run in mediatore's own tests
-      (`sandboxpolicy_bundle::conformance::suite()` and `run`), so mediatore's verifier is shown to
-      reach notaio's verdict on every vector
+- [x] notaio: the floor decision as a pure function, in a patch release; mediatore pins that tag.
+      Done 2026-11-01: `next_floor` in notaio v0.3.3, verified like every release
+- [x] The dependency and `deny.toml`; the crate's conformance vectors run in mediatore's own tests,
+      so mediatore's verifier is shown to reach notaio's verdict on every vector. Done
+      2026-11-01: `sandboxpolicy-bundle` at notaio `v0.3.3`, notaio in `allow-git`; the new
+      `mediatore-policy` crate (`trusted_keys`, `admit`); all 14 vectors pass through `admit`
+      over the store, not through notaio's own `run`; no `kube`, `schemars`, `ring` or
+      `openssl-sys` added, and no new duplicate crate
 - [ ] `policy.trusted_keys` and `policy.namespaces` in the configuration, a malformed key refusing
       the start; the reference and the configuration guide
 - [x] `policy_floors` in both migrations, `ClaimStore` methods for it, the store conformance suite
