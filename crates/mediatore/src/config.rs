@@ -1137,7 +1137,7 @@ store: {{ url: \"sqlite:///var/lib/mediatore/store.db\" }}
             ),
         ] {
             let err = with_policy(&policy).unwrap_err().to_string();
-            assert!(err.contains(why), "{policy}: {err}");
+            assert!(err.contains(why), "expected {why:?} in: {err}");
         }
     }
 }
