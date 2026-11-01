@@ -35,6 +35,9 @@ flowchart LR
     data-asset-sealing-key["Sealing Key"]
     service-kubernetes-api["Kubernetes API Server"]
     system-banlieue["banlieue Control Plane"]
+    system-notaio["notaio Policy Control Plane"]
+    data-asset-policy-bundles["SandboxPolicy bundles (ConfigMaps)"]
+    data-asset-policy-trusted-keys["Policy trust anchor (configured keys)"]
     service-spire-server["SPIRE Server (downstream)"]
     service-spire-controller-manager["SPIRE Controller Manager"]
     data-asset-cluster-static-entries["ClusterStaticEntry resources"]
@@ -56,6 +59,7 @@ flowchart LR
         data-asset-claim-store
         data-asset-sts-signing-key
         data-asset-agentsandbox-cr
+        data-asset-policy-trusted-keys
     end
     subgraph sg_system-sandbox-vm [System Sandbox Vm]
         service-spire-agent
@@ -70,6 +74,7 @@ flowchart LR
         system-mediatore
         service-kubernetes-api
         system-banlieue
+        system-notaio
         service-spire-server
         service-spire-controller-manager
         service-spire-agent-k8s
@@ -89,6 +94,11 @@ flowchart LR
     actor-sandbox-user --> data-asset-agentsandbox-cr
     system-banlieue -->|HTTPS| service-kubernetes-api
     service-mediatore-watcher -->|HTTPS| service-kubernetes-api
+    system-notaio -->|HTTPS| service-kubernetes-api
+    service-mediatore-watcher -->|HTTPS| service-kubernetes-api
+    subgraph sg_system-notaio [System Notaio]
+        data-asset-policy-bundles
+    end
     service-spire-controller-manager -->|HTTPS| service-kubernetes-api
     service-spire-controller-manager --> service-spire-server
     system-mediatore --> service-spire-agent-k8s

@@ -78,3 +78,20 @@ flowchart TD
 
 <sub>Source: flow `flow-node-bootstrap` in `architecture.json`.</sub>
 
+
+## A policy bundle, verified and compared in shadow
+
+How notaio's reviewed policy reaches the broker and what the broker does with it in this phase: observe and report, never admit, refuse or mint differently (ADR-0026).
+
+```mermaid
+flowchart TD
+    t1["1. notaio compiles the SandboxPolicy, signs the bundle with its transit key and writes <policy>-bundle in the policy's namespace."]
+    t2["2. The broker's reflector sees the ConfigMap and verifies the envelope against policy.trusted_keys at the current time; a bundle that fails is logged with its reason and goes no further."]
+    t3["3. notaio's floor rule decides from the held floor (the same uid never goes down; a new uid only if issued after the held one); the store writes the next floor only if the held one is still what was read, and a replica that lost the race reads and decides again."]
+    t4["4. Only after the write succeeds does the verified payload enter the cache; each sandbox naming the policy is reconciled, every gap between the broker's configuration and the bundle is logged with its code, and PolicyConformant is set True, False with the codes, or Unknown while no bundle has been read."]
+    t5["5. Tokens are minted exactly as before: the comparison changes no admission, no claim and no mint. The enforcing ADR is the one that makes a gap a refusal."]
+    t1 --> t2 --> t3 --> t4 --> t5
+```
+
+<sub>Source: flow `flow-policy-shadow` in `architecture.json`.</sub>
+
