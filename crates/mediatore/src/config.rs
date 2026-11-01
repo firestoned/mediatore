@@ -197,6 +197,20 @@ impl Default for SandboxesSection {
     }
 }
 
+/// notaio's policy bundles, read, verified and compared with each sandbox in shadow
+/// (ADR-0026). Absent, the broker reads no bundle and compares nothing.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PolicySection {
+    /// The keys notaio signs bundles with (decision 2): from this file only, never from the
+    /// cluster. List two versions of the key while notaio re-signs during a rotation.
+    #[serde(default)]
+    pub trusted_keys: Vec<mediatore_policy::TrustedKey>,
+    /// Namespaces whose bundle `ConfigMap`s are read (decision 3). Empty means
+    /// `[sandboxes.namespace]`, filled in at load.
+    #[serde(default)]
+    pub namespaces: Vec<String>,
+}
+
 /// The wrapping key for refresh material (ADR-0012 decision 3): exactly one of the local
 /// key file (the homelab shape) or `OpenBao` transit (the work shape, ADR-0015).
 #[derive(Debug, Clone, Deserialize)]
@@ -309,6 +323,9 @@ pub struct Config {
     /// Token issuance limits (ADR-0013).
     #[serde(default)]
     pub token: TokenSection,
+    /// notaio's policy bundles, in shadow (ADR-0026). Absent: none of it.
+    #[serde(default)]
+    pub policy: Option<PolicySection>,
 }
 
 fn default_listen() -> ListenConfig {
@@ -428,6 +445,7 @@ impl Config {
             }
         }
         cfg.check_store()?;
+        cfg.check_policy()?;
         if cfg.token.rate_per_minute == 0 {
             anyhow::bail!("token.rate_per_minute must be positive");
         }
@@ -464,6 +482,37 @@ impl Config {
 }
 
 impl Config {
+    /// ADR-0026 decisions 2 and 3: at least one key, every key a well-formed Ed25519 key with
+    /// an id of its own, and namespaces that are Kubernetes names, listed once. Fills in the
+    /// default namespace. A `policy` section without keys is refused rather than read as "off":
+    /// leaving the section out is how the broker is told to read no bundle.
+    fn check_policy(&mut self) -> anyhow::Result<()> {
+        let default_ns = self.sandboxes.namespace.clone();
+        let Some(policy) = self.policy.as_mut() else {
+            return Ok(());
+        };
+        if policy.trusted_keys.is_empty() {
+            anyhow::bail!(
+                "policy.trusted_keys must list notaio's signing key; leave the `policy` section out to read no bundle (ADR-0026)"
+            );
+        }
+        mediatore_policy::trusted_keys(&policy.trusted_keys)
+            .map_err(|e| anyhow::anyhow!("policy.trusted_keys: {e} (ADR-0026)"))?;
+        if policy.namespaces.is_empty() {
+            policy.namespaces.push(default_ns);
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for ns in &policy.namespaces {
+            if !is_dns_label(ns) {
+                anyhow::bail!("policy.namespaces: {ns:?} is not a Kubernetes namespace name");
+            }
+            if !seen.insert(ns.as_str()) {
+                anyhow::bail!("policy.namespaces: {ns} is listed twice");
+            }
+        }
+        Ok(())
+    }
+
     /// ADR-0012 decision 2: a real store outside `dev_mode`, PostgreSQL only over TLS the
     /// client verifies, and no memory SQLite (as lossy as the in-memory store).
     fn check_store(&self) -> anyhow::Result<()> {
@@ -548,6 +597,15 @@ impl Config {
         }
         Ok(())
     }
+}
+
+/// An RFC 1123 label, which is what a namespace name must be.
+fn is_dns_label(s: &str) -> bool {
+    (1..=63).contains(&s.len())
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && !s.starts_with('-')
+        && !s.ends_with('-')
 }
 
 /// True only for a literal loopback socket address: a hostname, even `localhost`, is not
@@ -1013,5 +1071,73 @@ store: {{ url: \"sqlite:///var/lib/mediatore/store.db\" }}
             assert!(err.contains(why), "{err}");
         }
         assert!(Config::parse(base).unwrap().registries.is_empty());
+    }
+
+    /// notaio's published conformance key: a real Ed25519 key, for tests only.
+    fn conformance_key() -> String {
+        sandboxpolicy_bundle::conformance::suite()
+            .unwrap()
+            .trusted_keys[0]
+            .public_key
+            .clone()
+    }
+
+    fn with_policy(policy: &str) -> anyhow::Result<Config> {
+        Config::parse(&format!("{BASE}dev_mode: true\n{policy}"))
+    }
+
+    #[test]
+    fn without_a_policy_section_no_bundle_is_read() {
+        assert!(with_policy("").unwrap().policy.is_none());
+    }
+
+    #[test]
+    fn the_policy_section_takes_keys_and_defaults_to_the_sandbox_namespace() {
+        let k = conformance_key();
+        let cfg = with_policy(&format!(
+            "sandboxes: {{ namespace: team-a }}\npolicy:\n  trusted_keys:\n    - {{ id: \"notaio:v1\", public_key: \"{k}\" }}\n    - {{ id: \"notaio:v2\", public_key: \"{k}\" }}\n"
+        ))
+        .unwrap();
+        let p = cfg.policy.unwrap();
+        assert_eq!(p.trusted_keys.len(), 2, "two versions during a rotation");
+        assert_eq!(p.namespaces, ["team-a"]);
+
+        let cfg = with_policy(&format!(
+            "policy:\n  trusted_keys: [{{ id: \"notaio:v1\", public_key: \"{k}\" }}]\n  namespaces: [sandboxes, team-b]\n"
+        ))
+        .unwrap();
+        assert_eq!(cfg.policy.unwrap().namespaces, ["sandboxes", "team-b"]);
+    }
+
+    #[test]
+    fn a_bad_policy_section_refuses_the_start() {
+        let k = conformance_key();
+        let key = format!("{{ id: \"notaio:v1\", public_key: \"{k}\" }}");
+        for (policy, why) in [
+            ("policy: { trusted_keys: [] }\n".to_string(), "must list"),
+            (
+                "policy: { namespaces: [sandboxes] }\n".to_string(),
+                "must list",
+            ),
+            (
+                "policy: { trusted_keys: [{ id: \"notaio:v1\", public_key: AAAA }] }\n".to_string(),
+                "not 32",
+            ),
+            (
+                format!("policy: {{ trusted_keys: [{key}, {key}] }}\n"),
+                "twice",
+            ),
+            (
+                format!("policy: {{ trusted_keys: [{key}], namespaces: [Team_A] }}\n"),
+                "namespace name",
+            ),
+            (
+                format!("policy: {{ trusted_keys: [{key}], namespaces: [a, a] }}\n"),
+                "listed twice",
+            ),
+        ] {
+            let err = with_policy(&policy).unwrap_err().to_string();
+            assert!(err.contains(why), "{policy}: {err}");
+        }
     }
 }

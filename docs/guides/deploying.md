@@ -65,7 +65,11 @@ URL, your CIDRs. Edit:
   volume, read at start; the homelab overlay mounts one),
   `sts.issuer` (what downstream services will see as `iss`), and
   `spire.entries.class_name` if SPIRE was rendered with another namespace or release
-  name (the class is `<namespace>-<release name>`, `spire-server-spire` in the example);
+  name (the class is `<namespace>-<release name>`, `spire-server-spire` in the example),
+  and, with notaio installed, the `policy` section: notaio's signing public keys and the
+  namespaces whose bundles to read and compare with each sandbox, which refuses nothing
+  yet ([ADR-0026](../adr/0026-notaio-bundles-verified-in-shadow.md)). A key that is not a
+  32-byte Ed25519 key, or an id listed twice, stops the start;
 - `networkpolicy.yaml`: the sandbox segment's CIDR for `:8443`, the control-plane
   addresses for the API server, the node CIDR for the kubelet's probe, and the
   issuer's namespace or addresses;
