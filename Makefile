@@ -149,11 +149,12 @@ dist-tpm-plugin: ## Extract the pinned tpm attestor binaries (server and agent) 
 	  echo "✓ dist/$$bin ($$sha)"; \
 	done
 
-manifests: ## Render deploy/base and the example overlay with kustomize, as a check that both still build
+manifests: ## Render deploy/base, the example overlay and the per-namespace bundle RBAC with kustomize, as a check that all still build
 	@command -v kubectl >/dev/null 2>&1 || { echo "Error: kubectl not found"; exit 1; }
 	kubectl kustomize deploy/base > /dev/null
 	kubectl kustomize deploy/overlays/homelab-example > /dev/null
-	@echo "✓ deploy/base and deploy/overlays/homelab-example render"
+	kubectl kustomize deploy/policy-bundles > /dev/null
+	@echo "✓ deploy/base, deploy/overlays/homelab-example and deploy/policy-bundles render"
 
 # ----- Release assets: what the release page carries beside the two images --------------
 #
