@@ -2411,6 +2411,7 @@ dependencies = [
  "chrono",
  "mediatore-store",
  "sandboxpolicy-bundle",
+ "sandboxpolicy-types",
  "serde",
  "thiserror",
  "tokio",

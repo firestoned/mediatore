@@ -25,6 +25,7 @@ pub(crate) mod fakes;
 pub mod lease;
 pub mod policy;
 pub mod sandbox;
+pub mod shadow;
 pub mod watch;
 
 /// Decision for one observed claim.

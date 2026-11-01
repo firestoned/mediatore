@@ -14,8 +14,8 @@ use k8s_openapi::api::core::v1::ConfigMap;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use sandboxpolicy_bundle::conformance;
 use sandboxpolicy_bundle::{
-    BundleMeta, BundlePayload, Ed25519Signer, Envelope, TrustedKeys, VerifyOptions, sign_bundle,
-    verify_bundle,
+    BundleContent, BundleMeta, BundlePayload, Ed25519Signer, Envelope, TrustedKeys, VerifyOptions,
+    sign_bundle, verify_bundle,
 };
 
 /// The key id the fresh bundle is signed under.
@@ -52,6 +52,19 @@ pub fn fresh_bundle(now: DateTime<Utc>, version: u64) -> FreshBundle {
     )
     .expect("the vector verifies at its own clock")
     .content;
+    signed_bundle(now, version, content)
+}
+
+/// `content` at `version`, issued an hour before `now` and valid an hour after it, signed
+/// under [`KEY_ID`]: a bundle that differs from the conformance one where a test needs it
+/// to (a shorter lease, another audience). The same key as [`fresh_bundle`], so one
+/// reflector admits both.
+///
+/// # Panics
+/// If `content` has no canonical form (a float in it), which the conformance content and
+/// any edit of its integers never has.
+#[must_use]
+pub fn signed_bundle(now: DateTime<Utc>, version: u64, content: BundleContent) -> FreshBundle {
     let payload = BundlePayload::new(
         BundleMeta {
             version,

@@ -116,8 +116,15 @@ are the questions it answers, with the recommendation this roadmap is built on.
       once, when it creates the record, and a sandbox whose policy has no verified bundle is
       admitted with nothing recorded (three reconcile tests over a bundle the testkit signs
       at the real clock, `mediatore_testkit::policy`)
-- [ ] The comparison, with its finding codes, on every reconcile of a sandbox and whenever its
-      policy's bundle changes; the `PolicyConformant` condition
+- [x] The comparison, with its finding codes, on every reconcile of a sandbox and whenever its
+      policy's bundle changes; the `PolicyConformant` condition. Done 2026-11-02:
+      `mediatore_claims::shadow` (`compare`, `covers`, the codes `P001` to `P011`), six
+      unit tests including the covering table; `status.conditions` on `AgentSandbox` with
+      `PolicyConformant` (`True`, `False` with the codes, `Unknown` until the namespace's
+      bundles were listed, absent without a `policy` section), recomputed on every reconcile
+      and on every bundle change the cache announces, the transition time held while the
+      status holds, a log line per gap when the verdict changes; five reconcile tests over
+      bundles the testkit signs; the sandbox guide's table of codes
 - [ ] Live test, `make kind-e2e-policy`: notaio installed from its release manifest in kind,
       signing with the kind OpenBao, a policy and its ceiling, an `AgentSandbox` naming it; a
       conformant sandbox reports no gap; a broker audience the policy lacks is reported with its

@@ -85,10 +85,48 @@ namespace ([ADR-0026](../adr/0026-notaio-bundles-verified-in-shadow.md) decision
 optional, and in this release it grants and refuses nothing: the broker's configuration is
 still the policy, and the bundle notaio signs for the named policy is read in shadow. What
 naming one does is put on the claim record the policy's uid and the version of the verified
-bundle current when the claim was created, for the audit and for the comparison that
-reports where the configuration and the bundle disagree. A sandbox naming a policy with no
-verified bundle (no such policy, or none the broker trusts) is admitted exactly like one
-naming none, with nothing recorded. Like the rest of the spec, the field is immutable.
+bundle current when the claim was created, and give the comparison below something to
+compare with. A sandbox naming a policy with no verified bundle (no such policy, or none
+the broker trusts) is admitted exactly like one naming none, with nothing recorded. Like
+the rest of the spec, the field is immutable.
+
+### What the comparison reports
+
+With a `policy` section configured, every sandbox carries a `PolicyConformant` condition
+(decision 7), recomputed on each reconcile and whenever its policy's bundle changes:
+
+| Status | Reason | Meaning |
+| --- | --- | --- |
+| `True` | `Conformant` | the broker's configuration allows this sandbox nothing the bundle does not |
+| `False` | `Gaps` | the message lists each gap as `<code> <detail>`, separated by `;` |
+| `Unknown` | `BundlesNotRead` | the broker has not finished reading the bundles of this namespace yet |
+
+The codes, each also a `policy gap` warning in the broker's log when it appears or
+changes:
+
+| Code | The broker would allow |
+| --- | --- |
+| `P001` | an audience on the sandbox that the bundle does not list |
+| `P002` | a `max_ttl` for an audience above the bundle audience's `ttlSeconds` |
+| `P003` | an `egress` endpoint for an audience that the bundle audience does not list |
+| `P004` | a rule for an audience that no bundle rule covers, or no rules where the bundle has some |
+| `P005` | a sandbox `ttlSeconds` above the bundle's `lease.maxDurationSeconds` |
+| `P006` | nothing: the bundle holds direct `egress[]`, which the broker has no way to provide |
+| `P010` | no `policyRef` on the sandbox |
+| `P011` | a `policyRef` to no verified, unexpired bundle |
+
+A bundle rule covers a broker rule when it admits every request the broker rule does: the
+same method or `*`, and a path glob matching every path the broker's glob matches (`**`
+covers `*`, `*` does not cover `**`). A covering the broker cannot prove is reported. An
+audience grant without `ttlSeconds` (the ceiling then lives in notaio's knob registry) is
+not compared on `P002`. None of this changes what the sandbox gets: a sandbox with every
+code is admitted, bound and minted for exactly as before.
+
+```
+$ kubectl -n agents get agentsandbox ledgers-2026-10-14 \
+    -o jsonpath='{.status.conditions[?(@.type=="PolicyConformant")]}'
+{"lastTransitionTime":"2026-11-02T09:14:07Z","message":"P002 max_ttl 900 for api://trading-data is above the bundle's ttlSeconds 300","observedGeneration":1,"reason":"Gaps","status":"False","type":"PolicyConformant"}
+```
 
 ### Who may name which subject
 
@@ -151,6 +189,7 @@ Without it every claim mediatore creates is denied at admission, the sandbox sta
 | `entrySet` | the claim's `ClusterStaticEntry` is set on the SPIRE server |
 | `ready` | `phase == Bound` and `entrySet`: the guest can fetch its SVID |
 | `reason` | why the sandbox is `Failed` |
+| `conditions` | `PolicyConformant`, with a `policy` section configured ([above](#what-the-comparison-reports)) |
 
 A sandbox gets one claim, ever. When the claim's TTL fires, banlieue destroys the member
 and the claim leaves `Bound`; the sandbox goes `Releasing`, then `Failed` with reason

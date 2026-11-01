@@ -172,6 +172,19 @@ What roadmap 09 fixed within the decisions above, so a reader of the code finds 
   rewritten by a later bundle: it says what was current when the claim was created, and a
   later bundle is the comparison's business. `POST /v1/claims` carries the name as
   `policy_ref`, the CLI as `--policy`.
+- **The comparison is a pure function** (decision 7), `mediatore_claims::shadow::compare`,
+  over the sandbox's spec, the broker's audiences as configured and the verified bundle; the
+  reconciler writes its findings as the `PolicyConformant` condition (`True`/`Conformant`,
+  `False`/`Gaps` with `<code> <detail>` per gap in the message, `Unknown`/`BundlesNotRead`
+  until the namespace's first list completed) and logs each gap when the verdict's message
+  changes. Rule covering (`P004`) is segment-wise over the proxy's own glob: `**` covers
+  anything, `*` covers `*` or a literal, a literal only itself; what it cannot prove is
+  reported. A grant without `ttlSeconds` is not compared on `P002`: its ceiling is notaio's
+  knob registry, which the bundle does not carry in seconds. The cache announces each
+  policy whose bundle was admitted at a new version or dropped, and the sandbox controller
+  reconciles every sandbox on each announcement, after the reflector on that replica
+  updated the cache, so the comparison never reads a cache that has not caught up.
+  Without a `policy` section no condition is written.
 
 ## Consequences
 

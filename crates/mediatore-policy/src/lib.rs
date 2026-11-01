@@ -20,6 +20,8 @@ use sandboxpolicy_bundle::{BundleError, VerifyOptions, verify_bundle};
 use serde::Deserialize;
 
 pub use sandboxpolicy_bundle::{BundlePayload, Envelope, TrustedKeys};
+/// The parts of a bundle's content (an audience grant, an egress rule, a lease), notaio's.
+pub use sandboxpolicy_types as types;
 
 /// How many times [`admit`] reads and decides again after losing a race for the floor.
 const ATTEMPTS: usize = 3;

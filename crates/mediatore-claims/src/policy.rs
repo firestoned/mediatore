@@ -20,6 +20,7 @@ use kube::runtime::watcher::{self, Event};
 use kube::{Api, Client, ResourceExt};
 use mediatore_policy::{BundlePayload, Envelope, Refusal, TrustedKeys, admit};
 use mediatore_store::ClaimStore;
+use tokio::sync::broadcast;
 
 /// The label notaio puts on the `ConfigMap`s it writes; the reflector watches nothing else.
 pub const BUNDLE_SELECTOR: &str = "app.kubernetes.io/managed-by=notaio";
@@ -54,16 +55,65 @@ struct Verified {
     configmap: String,
 }
 
-type PolicyKey = (String, String);
+/// A policy, as `(namespace, name)`.
+pub type PolicyKey = (String, String);
 
 /// The verified bundles, by policy. Shared with the comparison; a bundle past its
-/// `notAfter` is never handed out.
-#[derive(Debug, Default)]
+/// `notAfter` is never handed out. Every change to a policy's entry (admitted at another
+/// version, dropped) is announced to subscribers, so the sandboxes naming that policy are
+/// compared again; and each namespace is marked once its first list completed, so the
+/// comparison can tell "no bundle" from "not read yet".
+#[derive(Debug)]
 pub struct BundleCache {
     inner: RwLock<HashMap<PolicyKey, Verified>>,
+    synced: RwLock<HashSet<String>>,
+    changed: broadcast::Sender<PolicyKey>,
+}
+
+/// How many changes a slow subscriber may fall behind before it is told it lagged.
+const CHANGES_BUFFERED: usize = 256;
+
+impl Default for BundleCache {
+    fn default() -> Self {
+        Self {
+            inner: RwLock::new(HashMap::new()),
+            synced: RwLock::new(HashSet::new()),
+            changed: broadcast::channel(CHANGES_BUFFERED).0,
+        }
+    }
 }
 
 impl BundleCache {
+    /// Changes to come: the policy whose entry was admitted at a new version or dropped.
+    /// A receiver that falls behind gets `Lagged` and should compare everything again.
+    #[must_use]
+    pub fn subscribe(&self) -> broadcast::Receiver<PolicyKey> {
+        self.changed.subscribe()
+    }
+
+    /// Whether the first list of `namespace`'s bundles completed, so a policy with no entry
+    /// has no verified bundle rather than one not read yet.
+    #[must_use]
+    pub fn synced(&self, namespace: &str) -> bool {
+        self.synced
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(namespace)
+    }
+
+    fn mark_synced(&self, namespace: &str) {
+        self.synced
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(namespace.to_owned());
+    }
+
+    fn announce(&self, key: PolicyKey) {
+        // No subscriber is not an error: the reflector runs on every replica, the
+        // comparison only on the leader.
+        let _ = self.changed.send(key);
+    }
+
     /// The verified bundle of `namespace/name` if one is cached and still valid at `now`.
     #[must_use]
     pub fn get(
@@ -100,21 +150,39 @@ impl BundleCache {
         self.inner.write().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Insert, announcing the policy when its bundle is new or differs from the one held.
     fn put(&self, key: PolicyKey, v: Verified) {
-        self.write().insert(key, v);
+        let changed = {
+            let mut map = self.write();
+            let same = map.get(&key).is_some_and(|held| {
+                held.payload.meta.version == v.payload.meta.version
+                    && held.payload.content_digest == v.payload.content_digest
+            });
+            map.insert(key.clone(), v);
+            !same
+        };
+        if changed {
+            self.announce(key);
+        }
     }
 
-    /// Drop every entry `keep` rejects; the keys dropped.
+    /// Drop every entry `keep` rejects, announcing each; the keys dropped.
     fn retain(&self, keep: impl Fn(&PolicyKey, &Verified) -> bool) -> Vec<PolicyKey> {
-        let mut map = self.write();
-        let mut dropped = Vec::new();
-        map.retain(|k, v| {
-            let kept = keep(k, v);
-            if !kept {
-                dropped.push(k.clone());
-            }
-            kept
-        });
+        let dropped = {
+            let mut map = self.write();
+            let mut dropped = Vec::new();
+            map.retain(|k, v| {
+                let kept = keep(k, v);
+                if !kept {
+                    dropped.push(k.clone());
+                }
+                kept
+            });
+            dropped
+        };
+        for key in &dropped {
+            self.announce(key.clone());
+        }
         dropped
     }
 }
@@ -233,6 +301,7 @@ impl BundleReflector {
         let dropped = self
             .cache
             .retain(|k, v| k.0 != namespace || seen.contains(&v.configmap));
+        self.cache.mark_synced(namespace);
         for (ns, policy) in &dropped {
             tracing::info!(namespace = %ns, policy = %policy, "policy bundle gone since the last list");
         }
@@ -403,6 +472,44 @@ mod tests {
                 .cache()
                 .get(&self.suite.policy.namespace, &self.suite.policy.name, now)
         }
+    }
+
+    #[tokio::test]
+    async fn a_change_to_a_policys_bundle_is_announced_and_a_namespace_is_synced_by_its_first_list()
+    {
+        let r = rig();
+        let cache = r.reflector.cache();
+        let mut changes = cache.subscribe();
+        let key = (
+            r.suite.policy.namespace.clone(),
+            r.suite.policy.name.clone(),
+        );
+        assert!(!cache.synced(&key.0), "nothing listed yet");
+
+        let v = vector(&r.suite, "accepted-first-sight");
+        let cm = bundle_configmap(&r.suite, "agent-bundle", v);
+        r.reflector.applied_at(&cm, v.now).await;
+        assert_eq!(changes.try_recv().unwrap(), key, "admitted: announced");
+        // The same bundle delivered again changes nothing and announces nothing.
+        r.reflector.applied_at(&cm, v.now).await;
+        assert!(changes.try_recv().is_err(), "a re-delivery is silent");
+        // A refusal announces nothing either.
+        let forged = vector(&r.suite, "refused-forged-signature");
+        r.reflector
+            .applied_at(
+                &bundle_configmap(&r.suite, "agent-bundle", forged),
+                forged.now,
+            )
+            .await;
+        assert!(changes.try_recv().is_err(), "a refusal is silent");
+        // The first list completing marks the namespace, and dropping the policy announces it.
+        r.reflector.resynced(&key.0, &HashSet::new());
+        assert!(cache.synced(&key.0));
+        assert!(!cache.synced("elsewhere"));
+        assert_eq!(changes.try_recv().unwrap(), key, "dropped: announced");
+        assert!(r.cached(v.now).is_none());
+        // (A bundle admitted at another version is announced too: the sandbox tests, which
+        // sign their own, check that.)
     }
 
     #[tokio::test]
