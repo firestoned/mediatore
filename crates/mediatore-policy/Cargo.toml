@@ -1,0 +1,23 @@
+[package]
+name = "mediatore-policy"
+description = "notaio's policy bundles as the broker reads them (ADR-0026): trusted keys from configuration, and verify, decide the version floor, persist, then use"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+sandboxpolicy-bundle.workspace = true
+mediatore-store.workspace = true
+base64.workspace = true
+chrono.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+
+[lints]
+workspace = true

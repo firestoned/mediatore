@@ -139,6 +139,15 @@ What roadmap 09 fixed within the decisions above, so a reader of the code finds 
   `uid`, `version` and `issued_at` otherwise. A replica that lost a race gets `Conflict`,
   reads again and decides again. This gives decision 4's guarantee with no row lock, which
   sqlx's `Any` driver cannot express on SQLite.
+- **The crate is `mediatore-policy`,** shared with the guest when it verifies too (notaio
+  roadmap 00, phase 3). `trusted_keys` checks the configured keys (decision 2; notaio's
+  `TrustedKeys` would let a duplicate id silently replace the first, so the broker refuses it)
+  and `admit` is decision 4: verify, decide with notaio's `next_floor`, compare and set, retry
+  a lost race twice, then use. A refusal carries a stable `code()`, notaio's error name where it
+  is notaio's refusal.
+- **A bundle must be read from its own policy's namespace.** `admit` takes the namespace the
+  ConfigMap was read from and refuses a payload naming another (`Misplaced`): a bundle copied
+  next to someone else's policy is a copy, not that policy's.
 - **`issued_at` is kept to the nanosecond,** as RFC 3339 text, unlike the store's other
   timestamps (microseconds): notaio's `issuedAt` has nanoseconds, and the floor orders
   incarnations by it.

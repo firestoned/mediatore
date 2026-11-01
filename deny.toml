@@ -29,4 +29,8 @@ deny = [
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
-allow-git = ["https://github.com/firestoned/banlieue"]
+allow-git = [
+  "https://github.com/firestoned/banlieue",
+  # notaio's sandboxpolicy-bundle, pinned to a release tag (ADR-0026 decision 1).
+  "https://github.com/firestoned/notaio",
+]
