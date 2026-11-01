@@ -23,6 +23,7 @@ use uuid::Uuid;
 #[cfg(test)]
 pub(crate) mod fakes;
 pub mod lease;
+pub mod policy;
 pub mod sandbox;
 pub mod watch;
 

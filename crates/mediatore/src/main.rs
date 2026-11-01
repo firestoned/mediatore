@@ -14,6 +14,7 @@ use clap::{Parser, Subcommand};
 use mediatore_api::{AppState, Limiter};
 use mediatore_claims::Reconciler;
 use mediatore_claims::lease::LeaseConfig;
+use mediatore_claims::policy::BundleReflector;
 use mediatore_claims::sandbox::{KubeSandboxes, SandboxFrontDoor};
 use mediatore_claims::watch::{KubeClaimsApi, Watcher, WatcherConfig};
 use mediatore_entra::{Backend, ClientAssertion, Validator};
@@ -178,17 +179,50 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
     ) {
         let configs = broker_identity(&spire.workload_api_socket, &naming).await?;
         let s = mediatore_tls::serve(sandbox, configs, sandbox_router, shutdown());
+        let policy_client = client.clone();
+        let p = async {
+            policy_reflector(&cfg, policy_client, &state)
+                .await
+                .map_err(std::io::Error::other)
+        };
         let w = async {
             claim_watcher(&cfg, client, &state)
                 .await
                 .map_err(std::io::Error::other)
         };
-        tokio::try_join!(u, s, w)?;
+        tokio::try_join!(u, s, w, p)?;
     } else {
+        if cfg.policy.is_some() {
+            tracing::warn!("policy configured but no cluster client (dev_mode): no bundle is read");
+        }
         let s = axum::serve(sandbox, sandbox_router).with_graceful_shutdown(shutdown());
         tokio::try_join!(u, s)?;
     }
     Ok(())
+}
+
+/// notaio's bundle reflector (ADR-0026 decision 3) on every replica, outside the Lease:
+/// each replica needs the cache it will compare with (decision 4). Until shutdown; nothing
+/// to do without a `policy` section. A watch that ends is an error, so the pod restarts
+/// with the cause in its log instead of comparing against a cache going stale.
+async fn policy_reflector(
+    cfg: &Config,
+    client: kube::Client,
+    state: &Arc<AppState>,
+) -> anyhow::Result<()> {
+    let Some(policy) = cfg.policy.as_ref() else {
+        return Ok(());
+    };
+    let keys = mediatore_policy::trusted_keys(&policy.trusted_keys)?;
+    let reflector = Arc::new(BundleReflector::new(
+        state.store.clone(),
+        keys,
+        policy.namespaces.clone(),
+    ));
+    tokio::select! {
+        r = mediatore_claims::policy::run(client, reflector) => r,
+        () = shutdown() => Ok(()),
+    }
 }
 
 /// The claim watcher on the replica holding the Lease (ADR-0011), until shutdown.

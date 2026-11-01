@@ -16,6 +16,7 @@ path = "src/bin/crdgen.rs"
 mediatore-proto.workspace = true
 mediatore-store.workspace = true
 mediatore-spire.workspace = true
+mediatore-policy.workspace = true
 kube.workspace = true
 k8s-openapi.workspace = true
 tokio.workspace = true
@@ -35,6 +36,7 @@ clap.workspace = true
 
 [dev-dependencies]
 mediatore-testkit.workspace = true
+sandboxpolicy-bundle.workspace = true
 
 [lints]
 workspace = true

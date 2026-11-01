@@ -99,9 +99,15 @@ are the questions it answers, with the recommendation this roadmap is built on.
       decided from a floor that moved refused, a floor written under another policy refused) on
       the memory store, SQLite and PostgreSQL 17. The floor rule itself (a downgrade, a new
       incarnation, a replay) is notaio's `next_floor`, tested there and run by the broker
-- [ ] The bundle reflector and the per-namespace Role in `deploy/`: verify, decide the floor,
+- [x] The bundle reflector and the per-namespace Role in `deploy/`: verify, decide the floor,
       persist, then cache the verified payload by policy; a bundle that fails is logged with its
-      reason and leaves the cache as it was
+      reason and leaves the cache as it was. Done 2026-11-01: `mediatore_claims::policy`
+      (`BundleReflector`, `BundleCache`), on every replica outside the Lease, one watch per
+      namespace on notaio's label; seven unit tests over notaio's vectors (admitted and cached,
+      a non-bundle ignored, four refusals and an expiry leaving cache and floor as they were, a
+      replay below the floor refused and a re-delivery admitted, a deletion and a relist
+      dropping the policy with the floor kept, the sweep); `deploy/policy-bundles` the Role
+      and its binding, the deploying guide's step 1
 - [ ] `spec.policyRef` on `AgentSandbox` (`make crds`), immutable under the existing admission
       policy; the record's policy uid and bundle version
 - [ ] The comparison, with its finding codes, on every reconcile of a sandbox and whenever its

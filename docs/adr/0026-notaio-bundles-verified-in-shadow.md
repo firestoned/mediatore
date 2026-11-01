@@ -155,6 +155,14 @@ What roadmap 09 fixed within the decisions above, so a reader of the code finds 
 - **`issued_at` is kept to the nanosecond,** as RFC 3339 text, unlike the store's other
   timestamps (microseconds): notaio's `issuedAt` has nanoseconds, and the floor orders
   incarnations by it.
+- **The reflector runs on every replica, outside the Lease** (decision 4), one watch per
+  listed namespace on the label notaio writes (`crates/mediatore-claims/src/policy.rs`). The
+  cache is keyed by policy and remembers which `ConfigMap` filled it: the `ConfigMap`'s
+  deletion drops the policy, and a relist (a restart, a reconnect) drops any policy whose
+  `ConfigMap` was not listed again. The floor stays (decision 5). A bundle is admitted
+  through `mediatore-policy::admit` and nothing else, so a re-delivery at the same floor is
+  admitted again without a write, and a replay below it is refused before it reaches the
+  cache. The RBAC is `deploy/policy-bundles`, one copy per namespace.
 
 ## Consequences
 

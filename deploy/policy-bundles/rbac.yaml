@@ -1,0 +1,34 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+#
+# The broker's read of notaio's policy bundles (ADR-0026 decision 3): in each namespace
+# listed under `policy.namespaces`, a Role granting get, list and watch on ConfigMaps and
+# nothing else, bound to the broker's ServiceAccount. The broker can neither write a
+# bundle nor read any other kind here; what it reads it verifies against the keys in its
+# own configuration, never against anything in the cluster.
+#
+# One copy per listed namespace: `kubectl apply -k deploy/policy-bundles` applies it to
+# `sandboxes`, the default; for another namespace, an overlay of two lines
+# (`resources: [../policy-bundles]` and `namespace: <that namespace>`). The namespace must
+# exist: it is where the pool and the sandboxes already live.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: mediatore-policy-bundles
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: mediatore-policy-bundles
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: mediatore-policy-bundles
+subjects:
+  - kind: ServiceAccount
+    name: mediatore
+    namespace: banlieue-system
