@@ -56,7 +56,8 @@ text changed after it ran fails the start, which is the point. There is nothing 
 by hand before upgrading, and no downgrade path: back up before you upgrade.
 
 The database role mediatore connects as needs `SELECT`, `INSERT`, `UPDATE` and `DELETE`
-on `claims` and `nodes`, `SELECT` and `INSERT` on `claim_audit`, and DDL for the
+on `claims` and `nodes`; `SELECT`, `INSERT` and `DELETE` on `sessions`; `SELECT`, `INSERT`
+and `UPDATE` on `policy_floors`; `SELECT` and `INSERT` on `claim_audit`; and DDL for the
 migrations. Do not grant `DELETE` on `claim_audit`: mediatore never issues it, and the
 grant is what would let a compromised broker erase a trail.
 
@@ -65,7 +66,8 @@ grant is what would let a compromised broker erase a trail.
 Everything in the store. A revoked claim stays revoked and `/v1/token` keeps refusing
 it. A bound claim keeps its entry id, so the reconciler declares nothing twice. A node
 that registered is still known, so its claim rebinds without the guest registering
-again. The `make kind-e2e-sandbox` tier restarts the broker on PostgreSQL with a sandbox
+again. The version floor of each notaio policy (ADR-0026) stays where it was, so a bundle
+older than one already accepted is still refused. The `make kind-e2e-sandbox` tier restarts the broker on PostgreSQL with a sandbox
 `Ready` and asserts exactly that: still `Ready`, no second record, no second entry.
 
 ## Refresh material

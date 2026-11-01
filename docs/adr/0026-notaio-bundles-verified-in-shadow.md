@@ -129,6 +129,20 @@ where they disagree is from refused sandboxes. This ADR reads the bundle first a
    sandbox with every code above is served exactly as today. The only new refusal is decision 2's,
    at start, for a malformed key.
 
+## Implementation notes
+
+What roadmap 09 fixed within the decisions above, so a reader of the code finds it here:
+
+- **The floor's write is a compare and set** (decision 4). `ClaimStore::advance_policy_floor`
+  takes the floor the caller read and decided from and the next one, and writes only if the
+  row is still exactly what was read: an `INSERT` when there was none, an `UPDATE` matching
+  `uid`, `version` and `issued_at` otherwise. A replica that lost a race gets `Conflict`,
+  reads again and decides again. This gives decision 4's guarantee with no row lock, which
+  sqlx's `Any` driver cannot express on SQLite.
+- **`issued_at` is kept to the nanosecond,** as RFC 3339 text, unlike the store's other
+  timestamps (microseconds): notaio's `issuedAt` has nanoseconds, and the floor orders
+  incarnations by it.
+
 ## Consequences
 
 - The operator learns, per sandbox and before anything is enforced, where the reviewed policy and

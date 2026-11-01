@@ -155,6 +155,24 @@ pub struct SessionRecord {
     pub created_at: DateTime<Utc>,
 }
 
+/// The version floor of one notaio policy (ADR-0026 decision 5): which incarnation it holds
+/// (the policy's `uid`), the highest bundle version accepted for it, and that bundle's
+/// `issuedAt`. The rule that moves it is notaio's (`next_floor`); the store keeps it and
+/// refuses a write decided from a floor that has moved since.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyFloor {
+    /// The policy's namespace.
+    pub namespace: String,
+    /// The policy's name.
+    pub name: String,
+    /// The incarnation: the `SandboxPolicy`'s `uid`.
+    pub uid: String,
+    /// The highest bundle version accepted for that incarnation.
+    pub version: u64,
+    /// `issuedAt` of the bundle the floor was last moved by, kept to the nanosecond.
+    pub issued_at: DateTime<Utc>,
+}
+
 /// Storage contract.
 #[async_trait]
 pub trait ClaimStore: Send + Sync + 'static {
@@ -198,8 +216,40 @@ pub trait ClaimStore: Send + Sync + 'static {
     async fn delete_session(&self, sandbox_uid: Uuid) -> Result<(), StoreError>;
     /// Remove every session delegated before `before`. Returns how many.
     async fn sweep_sessions(&self, before: DateTime<Utc>) -> Result<usize, StoreError>;
+    /// The floor held for a policy, if one was ever recorded.
+    async fn get_policy_floor(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> Result<Option<PolicyFloor>, StoreError>;
+    /// Move a policy's floor from `held`, what the caller read and decided from (`None` for no
+    /// floor yet), to `next`, which names the same policy. Compare and set: `Conflict` when the
+    /// stored floor is no longer `held`, because another replica moved it in between; read it
+    /// again and decide again. So no two writers can move a floor down.
+    async fn advance_policy_floor(
+        &self,
+        held: Option<&PolicyFloor>,
+        next: PolicyFloor,
+    ) -> Result<(), StoreError>;
+
     /// A round trip to the backend; what `/healthz` reports.
     async fn ping(&self) -> Result<(), StoreError>;
+}
+
+/// `Conflict` when `next` names another policy than `held`: a caller bug, never written.
+fn same_policy(held: Option<&PolicyFloor>, next: &PolicyFloor) -> Result<(), StoreError> {
+    match held {
+        Some(h)
+            if (h.namespace.as_str(), h.name.as_str())
+                != (next.namespace.as_str(), next.name.as_str()) =>
+        {
+            Err(StoreError::Conflict(format!(
+                "floor of {}/{} written as {}/{}",
+                h.namespace, h.name, next.namespace, next.name
+            )))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// In-memory store. Not durable; for `dev_mode` and tests.
@@ -209,6 +259,7 @@ pub struct MemoryStore {
     nodes: RwLock<HashMap<String, NodeRecord>>,
     audit: RwLock<Vec<ClaimAudit>>,
     sessions: RwLock<HashMap<Uuid, SessionRecord>>,
+    floors: RwLock<HashMap<(String, String), PolicyFloor>>,
 }
 
 impl MemoryStore {
@@ -384,6 +435,37 @@ impl ClaimStore for MemoryStore {
         let n = m.len();
         m.retain(|_, s| s.created_at >= before);
         Ok(n - m.len())
+    }
+
+    async fn get_policy_floor(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> Result<Option<PolicyFloor>, StoreError> {
+        Ok(self
+            .floors
+            .read()
+            .await
+            .get(&(namespace.to_string(), name.to_string()))
+            .cloned())
+    }
+
+    async fn advance_policy_floor(
+        &self,
+        held: Option<&PolicyFloor>,
+        next: PolicyFloor,
+    ) -> Result<(), StoreError> {
+        same_policy(held, &next)?;
+        let mut m = self.floors.write().await;
+        let key = (next.namespace.clone(), next.name.clone());
+        if m.get(&key) != held {
+            return Err(StoreError::Conflict(format!(
+                "the floor of {}/{} moved",
+                key.0, key.1
+            )));
+        }
+        m.insert(key, next);
+        Ok(())
     }
 
     async fn ping(&self) -> Result<(), StoreError> {

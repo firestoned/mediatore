@@ -82,9 +82,12 @@ are the questions it answers, with the recommendation this roadmap is built on.
       reach notaio's verdict on every vector
 - [ ] `policy.trusted_keys` and `policy.namespaces` in the configuration, a malformed key refusing
       the start; the reference and the configuration guide
-- [ ] `policy_floors` in both migrations, `ClaimStore` methods for it, the store conformance suite
-      extended (the floor going up, a downgrade refused, a new incarnation, a replay of an older
-      one)
+- [x] `policy_floors` in both migrations, `ClaimStore` methods for it, the store conformance suite
+      extended. Done 2026-11-01: `get_policy_floor` and `advance_policy_floor`, a compare and set
+      (ADR-0026, implementation notes); three cases (a round trip to the nanosecond, a write
+      decided from a floor that moved refused, a floor written under another policy refused) on
+      the memory store, SQLite and PostgreSQL 17. The floor rule itself (a downgrade, a new
+      incarnation, a replay) is notaio's `next_floor`, tested there and run by the broker
 - [ ] The bundle reflector and the per-namespace Role in `deploy/`: verify, decide the floor,
       persist, then cache the verified payload by policy; a bundle that fails is logged with its
       reason and leaves the cache as it was

@@ -10,7 +10,7 @@ use mediatore_proto::{Provider, Subject, Workload};
 use uuid::Uuid;
 
 use crate::seal::{LocalKeySealer, Sealer};
-use crate::{ClaimRecord, ClaimStore, NodeRecord, SessionRecord, StoreError};
+use crate::{ClaimRecord, ClaimStore, NodeRecord, PolicyFloor, SessionRecord, StoreError};
 
 /// One `#[tokio::test]` per listed case, each over a fresh store from `$make`.
 macro_rules! cases {
@@ -43,6 +43,9 @@ macro_rules! suite {
                 ban_marks_the_node_and_needs_an_existing_row,
                 a_sweep_moves_ended_claims_into_the_audit_table,
                 a_session_is_taken_once_deleted_on_demand_and_swept_when_stale,
+                a_policy_floor_round_trips_to_the_nanosecond,
+                a_policy_floor_moves_only_from_what_is_held,
+                a_floor_written_under_another_policy_is_refused,
                 ping_answers,
             );
         }
@@ -386,6 +389,104 @@ pub(crate) async fn a_session_is_taken_once_deleted_on_demand_and_swept_when_sta
     assert_eq!(s.sweep_sessions(at(50)).await.unwrap(), 1);
     assert!(s.take_session(old.sandbox_uid).await.unwrap().is_none());
     assert!(s.take_session(fresh.sandbox_uid).await.unwrap().is_some());
+}
+
+fn floor(name: &str, uid: &str, version: u64, issued_at: DateTime<Utc>) -> PolicyFloor {
+    PolicyFloor {
+        namespace: "sandboxes".into(),
+        name: name.into(),
+        uid: uid.into(),
+        version,
+        issued_at,
+    }
+}
+
+pub(crate) async fn a_policy_floor_round_trips_to_the_nanosecond(s: &dyn ClaimStore) {
+    assert_eq!(
+        s.get_policy_floor("sandboxes", "agent").await.unwrap(),
+        None
+    );
+    // notaio's issuedAt carries nanoseconds; the floor orders incarnations by it.
+    let issued = at(0) + Duration::nanoseconds(927_958_397);
+    let f = floor("agent", "uid-1", 3, issued);
+    s.advance_policy_floor(None, f.clone()).await.unwrap();
+    assert_eq!(
+        s.get_policy_floor("sandboxes", "agent").await.unwrap(),
+        Some(f)
+    );
+    assert_eq!(
+        s.get_policy_floor("sandboxes", "other").await.unwrap(),
+        None
+    );
+    assert_eq!(
+        s.get_policy_floor("elsewhere", "agent").await.unwrap(),
+        None
+    );
+}
+
+pub(crate) async fn a_policy_floor_moves_only_from_what_is_held(s: &dyn ClaimStore) {
+    let v3 = floor("agent", "uid-1", 3, at(0));
+    s.advance_policy_floor(None, v3.clone()).await.unwrap();
+
+    // A second replica that also read "no floor" loses the race.
+    let err = s
+        .advance_policy_floor(None, floor("agent", "uid-1", 2, at(0)))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::Conflict(_)), "{err}");
+
+    let v4 = floor("agent", "uid-1", 4, at(10));
+    s.advance_policy_floor(Some(&v3), v4.clone()).await.unwrap();
+
+    // Decided from v3, which is no longer held: refused, and v4 stays.
+    let err = s
+        .advance_policy_floor(Some(&v3), floor("agent", "uid-1", 3, at(5)))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::Conflict(_)), "{err}");
+    // Held matching on uid and version but not issuedAt is not held either.
+    let mut almost = v4.clone();
+    almost.issued_at = at(10) + Duration::nanoseconds(1);
+    let err = s
+        .advance_policy_floor(Some(&almost), floor("agent", "uid-1", 5, at(20)))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::Conflict(_)), "{err}");
+    assert_eq!(
+        s.get_policy_floor("sandboxes", "agent").await.unwrap(),
+        Some(v4.clone())
+    );
+
+    // A new incarnation replaces the row; another policy's floor is its own.
+    let recreated = floor("agent", "uid-2", 1, at(30));
+    s.advance_policy_floor(Some(&v4), recreated.clone())
+        .await
+        .unwrap();
+    s.advance_policy_floor(None, floor("other", "uid-9", 1, at(0)))
+        .await
+        .unwrap();
+    assert_eq!(
+        s.get_policy_floor("sandboxes", "agent").await.unwrap(),
+        Some(recreated)
+    );
+}
+
+pub(crate) async fn a_floor_written_under_another_policy_is_refused(s: &dyn ClaimStore) {
+    let held = floor("agent", "uid-1", 1, at(0));
+    s.advance_policy_floor(None, held.clone()).await.unwrap();
+    let err = s
+        .advance_policy_floor(Some(&held), floor("other", "uid-1", 2, at(1)))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::Conflict(_)), "{err}");
+    assert_eq!(
+        s.get_policy_floor("sandboxes", "other").await.unwrap(),
+        None
+    );
+    assert_eq!(
+        s.get_policy_floor("sandboxes", "agent").await.unwrap(),
+        Some(held)
+    );
 }
 
 pub(crate) async fn ping_answers(s: &dyn ClaimStore) {
