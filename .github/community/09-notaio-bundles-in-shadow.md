@@ -83,8 +83,12 @@ are the questions it answers, with the recommendation this roadmap is built on.
       `mediatore-policy` crate (`trusted_keys`, `admit`); all 14 vectors pass through `admit`
       over the store, not through notaio's own `run`; no `kube`, `schemars`, `ring` or
       `openssl-sys` added, and no new duplicate crate
-- [ ] `policy.trusted_keys` and `policy.namespaces` in the configuration, a malformed key refusing
-      the start; the reference and the configuration guide
+- [x] `policy.trusted_keys` and `policy.namespaces` in the configuration, a malformed key refusing
+      the start; the reference and the configuration guide. Done 2026-11-01: `PolicySection`,
+      checked at load through `mediatore_policy::trusted_keys` (an empty, malformed or
+      duplicate key, a keyless section, a namespace that is not a Kubernetes name or is listed
+      twice all refuse the start; ADR-0026, implementation notes); the example overlay's
+      commented `policy` block and the deploying guide's step 1
 - [x] `policy_floors` in both migrations, `ClaimStore` methods for it, the store conformance suite
       extended. Done 2026-11-01: `get_policy_floor` and `advance_policy_floor`, a compare and set
       (ADR-0026, implementation notes); three cases (a round trip to the nanosecond, a write

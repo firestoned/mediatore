@@ -47,6 +47,14 @@ sts:
 sandboxes:
   # Where `POST /v1/claims` creates AgentSandbox resources; the pool must live there.
   namespace: sandboxes
+# notaio's signed policy bundles, read and compared with each sandbox in shadow: nothing
+# is refused on their account (ADR-0026). Leave the section out to read none. The key is
+# notaio's OpenBao transit public key, `notaio:v<N>` and its base64; list two versions
+# during a rotation. Never take it from the cluster.
+# policy:
+#   trusted_keys:
+#     - { id: "notaio:v1", public_key: "<base64 Ed25519 public key>" }
+#   namespaces: [sandboxes]   # default: sandboxes.namespace
 store:
   # One replica only (kustomization.yaml): a file on the PVC. Secret mediatore-store
   # overrides this with MEDIATORE_STORE_URL when present.

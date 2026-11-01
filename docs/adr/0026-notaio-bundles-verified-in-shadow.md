@@ -148,6 +148,10 @@ What roadmap 09 fixed within the decisions above, so a reader of the code finds 
 - **A bundle must be read from its own policy's namespace.** `admit` takes the namespace the
   ConfigMap was read from and refuses a payload naming another (`Misplaced`): a bundle copied
   next to someone else's policy is a copy, not that policy's.
+- **A `policy` section without keys is refused,** not read as "off" (decision 2 says an
+  empty section turns this ADR off): `policy:` with only `namespaces`, or with an empty
+  `trusted_keys`, is more likely a key someone forgot than a choice. Leaving the section out
+  is how the broker reads no bundle. Namespaces must be Kubernetes names, listed once.
 - **`issued_at` is kept to the nanosecond,** as RFC 3339 text, unlike the store's other
   timestamps (microseconds): notaio's `issuedAt` has nanoseconds, and the floor orders
   incarnations by it.
