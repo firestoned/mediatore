@@ -3,12 +3,12 @@
 
 # 09: notaio's policy bundles, read and verified in shadow
 
-**Status: not started.** The first step of moving sandbox policy out of the broker's configuration
-and into notaio's signed bundles (notaio roadmap 00, phase 1). The broker watches the bundles,
-verifies each, keeps a version floor that survives restarts, and compares every sandbox with its
-policy. It refuses nothing on the bundle's account: this roadmap finds the gaps between what the
-broker allows today and what the policy says, while the broker's configuration is still the
-authority. Enforcing the bundle is the next roadmap.
+**Status: in progress.** ADR-0026 accepted (2026-11-01). The first step of moving sandbox policy out
+of the broker's configuration and into notaio's signed bundles (notaio roadmap 00, phase 1). The
+broker watches the bundles, verifies each, keeps a version floor that survives restarts, and
+compares every sandbox with its policy. It refuses nothing on the bundle's account: this roadmap
+finds the gaps between what the broker allows today and what the policy says, while the broker's
+configuration is still the authority. Enforcing the bundle is the next roadmap.
 
 Depends on roadmap 08 (the `AgentSandbox` a policy is named on) and roadmap 05 (the store the
 floor lives in). On notaio's side, depends on a released `sandboxpolicy-bundle` (v0.3.2 or later:
@@ -70,10 +70,11 @@ are the questions it answers, with the recommendation this roadmap is built on.
 
 ## Work
 
-- [ ] ADR-0026 accepted, answering the decisions above, with the CALM model updated for the new
-      flow (bundle ConfigMaps to the broker) and its trust anchor (the configured keys). Proposed
-      2026-10-31 as [ADR-0026](../../docs/adr/0026-notaio-bundles-verified-in-shadow.md), with
-      the finding codes `P001` to `P011`
+- [x] ADR-0026 accepted, answering the decisions above. Done 2026-11-01 as
+      [ADR-0026](../../docs/adr/0026-notaio-bundles-verified-in-shadow.md), with the finding codes
+      `P001` to `P011`
+- [ ] The CALM model updated for the new flow (bundle ConfigMaps to the broker) and its trust
+      anchor (the configured keys)
 - [ ] notaio: the floor decision as a pure function, in a patch release (if decision 4 keeps the
       recommendation); mediatore pins that tag
 - [ ] The dependency and `deny.toml`; the crate's conformance vectors run in mediatore's own tests
