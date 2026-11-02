@@ -1,0 +1,30 @@
+# Copyright (c) 2026 Erick Bourgeois, notaio
+# SPDX-License-Identifier: Apache-2.0
+#
+# notaio's per-namespace bundle Role, copied unchanged from deploy/policy-namespace/
+# notaio-bundles.yaml at the tag `make kind-notaio` installs (NOTAIO_VERSION in the
+# Makefile). The release manifest leaves it out on purpose: it is applied once per policy
+# namespace, which `dev/kind/policy-e2e.sh` does for the e2e namespace. What it grants:
+# the controller may write ConfigMaps there, so it can publish each policy's bundle, and
+# nothing cluster wide.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: notaio-bundles
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: notaio-bundles
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: notaio-bundles
+subjects:
+  - kind: ServiceAccount
+    name: notaio
+    namespace: notaio-system

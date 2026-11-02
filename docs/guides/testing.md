@@ -122,6 +122,7 @@ Suites today:
 | `make kind-e2e-sandbox` | 0008, 0012 | the `AgentSandbox` CRD and its subject policy, a sandbox becoming an owned claim and a record, the claim bound end to end to a claim entry and the guest fetching the subject, a broker restart on the store with the sandbox staying `Ready`, deletion through the finalizer, the released row swept into the audit table, below |
 | `make kind-e2e-store` | 0012 | the broker on PostgreSQL over `verify-full`, the store conformance suite against that database, below |
 | `make kind-e2e-dex` | 0013 | the real CLI logging in at a real Dex from inside the cluster and delegating the session, a refresh at Dex before every issue, the claim released when the user leaves the gated group in the directory and when the refresh token is deleted at Dex, below |
+| `make kind-e2e-policy` | 0026 | notaio installed from its release manifests and signing with the kind OpenBao, its bundle admitted by the broker and recorded on each claim, the `PolicyConformant` verdicts and codes on four sandboxes, a newer bundle followed, the earlier one delivered again refused by the version floor before and after a broker restart, nothing refused on the bundle's account, below |
 | `make kind-e2e-tpm` | 0018 | an agent attesting with a vTPM behind the kind node through the `tpm` plugin, on `image/spire/agent.conf`, refused under a CA that never signed its EK and listed under the EK's hash under the right one, the member's certificate becoming the node entry under that agent, the guest registering over the SVID it issues and only then announcing `GuestReady` (ADR-0019), a fresh pod re-attesting as the same agent; not part of `make kind-e2e` and not in CI (it needs `sudo`, swtpm and the kernel's vtpm proxy on the host), below |
 
 ### The store: PostgreSQL over TLS the client verifies
@@ -400,6 +401,33 @@ claim controller binding a real member, the guest reading the EK from its own TP
 tier the parent agent `spiffe://<td>/spire/agent/tpm/<ek>` never exists: the server
 accepts entries for a parent that has not attested, which is exactly the order a node
 entry is declared in.
+
+### notaio's bundles in shadow
+
+`make kind-e2e-policy` (`dev/kind/policy-e2e.sh`) is ADR-0026 end to end. `make kind-notaio`
+(`dev/kind/notaio-install.sh`) first installs notaio the way its install guide says an
+operator should: the CRDs and the controller manifests of the pinned release, downloaded
+from GitHub and checked against the SHA-256 values the Makefile pins (from the release's
+own `checksums.sha256`, which is sigstore-signed; verify it with `cosign verify-blob` by
+hand after a bump), the image pinned by digest inside, the two site-specific edits
+applied (where OpenBao is, for the controller and its NetworkPolicy), and the signer set
+up in the kind OpenBao as notaio's own setup does: a non-exportable Ed25519 transit key,
+a policy that allows signing with it and nothing else, a Kubernetes auth role for
+notaio's ServiceAccount. The public key comes out of OpenBao as `notaio:v1` and goes into
+the broker's `policy` section for the run; the overlay's configuration is restored after.
+
+The tier then applies notaio's bundle Role and the broker's read Role
+(`deploy/policy-bundles`) in the e2e namespace, a `SandboxPolicy` with its
+`ExposureCeiling` (notaio's example, the `internal-git` audience the kind configuration
+mirrors exactly), waits for the signed bundle ConfigMap, and checks the broker admitted
+it. Four sandboxes are created as the broker ServiceAccount: one conformant (`True`),
+one asking for an audience the bundle does not list (`False`, `P001`), one without a
+`policyRef` (`P010`), one naming a policy with no bundle (`P011`); each gets its claim
+and stays `Pending`, which is the point of shadow mode. The policy is then changed, the
+newer bundle is admitted and every verdict names it; the earlier envelope is delivered
+again under another ConfigMap name and refused as a downgrade, its deletion leaves the
+cache alone, and after a broker restart on the kind PostgreSQL the same replay is refused
+again, because the floor came back from the store.
 
 ### TPM attestation with a vTPM behind the node
 
