@@ -3,7 +3,7 @@
 
 # ADR-0026: notaio's policy bundles, verified by the broker and compared in shadow
 
-**Status:** Accepted · **Date:** 2026-11-01
+**Status:** Implemented · **Date:** 2026-11-01 · **Implemented:** 2026-11-02 (roadmap 09; the threat-model pass of that day)
 
 Roadmap 09, the first step of notaio's roadmap 00 (M3, "integrate the consumers"), phase 1.
 Decides notaio's question D3 (where a sandbox names its policy) for this phase. Amends

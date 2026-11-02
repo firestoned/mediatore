@@ -13,10 +13,11 @@ one the pieces accept today, at mediatore 0.1 and notaio v0.1.0.
 > tiers (`make kind-e2e-dex`, `make kind-e2e-sandbox`, `make kind-e2e-tpm`,
 > [testing](testing.md)) with the guest in a pod; booting the VM image on a libvirt host
 > is roadmap 06's live item, not yet done. notaio's side runs as notaio v0.1.0 ships it:
-> the lint, the controller, the signed bundle in a ConfigMap. The one seam that is design
-> only is notaio's M3: mediatore does not read, verify or relay the bundle yet, and the
-> guest does not render the jail from it. Section 5 says what enforces each line of the
-> policy today instead.
+> the lint, the controller, the signed bundle in a ConfigMap. Since
+> [ADR-0026](../adr/0026-notaio-bundles-verified-in-shadow.md) mediatore reads and verifies
+> that bundle and compares the sandbox with it in shadow (`make kind-e2e-policy`); what is
+> still design only is enforcing it, and the guest rendering the jail from it. Section 5
+> says what enforces each line of the policy today, and what the comparison reports.
 
 ## The cast
 
@@ -317,25 +318,29 @@ At the deadline, or on `mediatore sandbox delete`, the entry is retracted, the s
 revoked (tokens stop at once), the jail killed, the ruleset dropped, the tmpfs unmounted, and
 banlieue destroys the member. Nothing of the run survives on it.
 
-## 5. What enforces each line today, and what M3 changes
+## 5. What enforces each line today, what the comparison reports, and what M3 changes
 
-| In the policy | Enforced today by | Under notaio M3 |
-| --- | --- | --- |
-| `profileRef: standard` | nothing in mediatore: the profile is notaio's, applied at lint and compile | the bundle's knobs, verified by mediatore at every mint and by the guest before it renders the jail |
-| `subjects.groups` | the issuer's `required_group`, one for the broker | the policy's groups, per policy, at the claim |
-| `audiences[].name` | `audiences[]` in the broker's config; a claim naming one not there is refused before any VM exists | the same, with the policy's set as the ceiling and the version stamped into the token |
-| `audiences[].access: Write`, `scopes` | not expressed: a token carries `aud`, `sub` and `act`; what it may do is the git host's authorization of `octocat` | the bundle's access and scopes, carried in the token |
-| `ttlSeconds: 900` | the audience's `max_ttl` and the broker's 15-minute cap | the bundle's value |
-| `egress: []` and the audience's host | the audience's `egress` in the broker's config, rendered by the guest into nftables keyed by the sandbox uid and into the egress proxy's routes; the audience's `rules` bound the methods and paths the proxy forwards ([ADR-0025](../adr/0025-phantom-token-egress-proxy.md)) | rendered from the bundle, with the direct hosts the policy allows and the endpoint rules it names |
-| the image (K8.1) | `workload.image` on the claim, pulled by the guest, verified by digest | the step's meaning, from the register |
-| `lease.maxDurationSeconds` | the claim's `ttl_seconds`, the member destroyed at the deadline | the bundle's value as the ceiling |
-| the `ExposureCeiling` | notaio: no ceiling, no bundle | unchanged |
+| In the policy | Enforced today by | Reported in shadow (ADR-0026) | Under notaio M3 |
+| --- | --- | --- | --- |
+| `profileRef: standard` | nothing in mediatore: the profile is notaio's, applied at lint and compile | nothing: the knobs are not compared | the bundle's knobs, verified by mediatore at every mint and by the guest before it renders the jail |
+| `subjects.groups` | the issuer's `required_group`, one for the broker | nothing: eligibility is the enforcing step's | the policy's groups, per policy, at the claim |
+| `audiences[].name` | `audiences[]` in the broker's config; a claim naming one not there is refused before any VM exists | `P001`, an audience on the sandbox the bundle does not list | the same, with the policy's set as the ceiling and the version stamped into the token |
+| `audiences[].access: Write`, `scopes` | not expressed: a token carries `aud`, `sub` and `act`; what it may do is the git host's authorization of `octocat` | nothing: the broker has no setting to compare | the bundle's access and scopes, carried in the token |
+| `ttlSeconds: 900` | the audience's `max_ttl` and the broker's 15-minute cap | `P002`, a `max_ttl` above the bundle's `ttlSeconds` | the bundle's value |
+| `egress: []` and the audience's host | the audience's `egress` in the broker's config, rendered by the guest into nftables keyed by the sandbox uid and into the egress proxy's routes; the audience's `rules` bound the methods and paths the proxy forwards ([ADR-0025](../adr/0025-phantom-token-egress-proxy.md)) | `P003`, an endpoint the bundle audience does not list; `P004`, a rule no bundle rule covers; `P006`, direct egress in the bundle the broker cannot provide | rendered from the bundle, with the direct hosts the policy allows and the endpoint rules it names |
+| the image (K8.1) | `workload.image` on the claim, pulled by the guest, verified by digest | nothing | the step's meaning, from the register |
+| `lease.maxDurationSeconds` | the claim's `ttl_seconds`, the member destroyed at the deadline | `P005`, a sandbox `ttlSeconds` above it | the bundle's value as the ceiling |
+| the `ExposureCeiling` | notaio: no ceiling, no bundle | `P011`, a policy with no verified bundle | unchanged |
 
-The honest summary: today the broker's configuration is the policy, the operator who edits
-it is the policy owner, and notaio's bundle is published beside it, signed and checkable,
-read by nobody. M3 moves the authority into the bundle and makes the broker and the guest
-its verifiers. The bundle's shape, its signature and the ConfigMap are already what they will
-be then, which is why the policy on this page is worth writing now.
+The honest summary: today the broker's configuration is the policy and the operator who
+edits it is the policy owner. notaio's bundle is published beside it, signed, and since
+ADR-0026 the broker verifies it and reports, on every sandbox that names the policy, where
+the configuration allows more than the bundle: the `PolicyConformant` condition, `True` on
+a conformant sandbox, `False` with the codes above otherwise
+([the policy bundle, in shadow](the-policy-bundle.md)). A sandbox with every code is still
+served exactly as before. M3's next step moves the authority into the bundle and makes the
+broker and the guest its verifiers; the condition is the list of what that step would
+refuse, which is why the policy on this page is worth writing now.
 
 ## Where to go next
 

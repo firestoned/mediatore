@@ -92,41 +92,11 @@ the rest of the spec, the field is immutable.
 
 ### What the comparison reports
 
-With a `policy` section configured, every sandbox carries a `PolicyConformant` condition
-(decision 7), recomputed on each reconcile and whenever its policy's bundle changes:
-
-| Status | Reason | Meaning |
-| --- | --- | --- |
-| `True` | `Conformant` | the broker's configuration allows this sandbox nothing the bundle does not |
-| `False` | `Gaps` | the message lists each gap as `<code> <detail>`, separated by `;` |
-| `Unknown` | `BundlesNotRead` | the broker has not finished reading the bundles of this namespace yet |
-
-The codes, each also a `policy gap` warning in the broker's log when it appears or
-changes:
-
-| Code | The broker would allow |
-| --- | --- |
-| `P001` | an audience on the sandbox that the bundle does not list |
-| `P002` | a `max_ttl` for an audience above the bundle audience's `ttlSeconds` |
-| `P003` | an `egress` endpoint for an audience that the bundle audience does not list |
-| `P004` | a rule for an audience that no bundle rule covers, or no rules where the bundle has some |
-| `P005` | a sandbox `ttlSeconds` above the bundle's `lease.maxDurationSeconds` |
-| `P006` | nothing: the bundle holds direct `egress[]`, which the broker has no way to provide |
-| `P010` | no `policyRef` on the sandbox |
-| `P011` | a `policyRef` to no verified, unexpired bundle |
-
-A bundle rule covers a broker rule when it admits every request the broker rule does: the
-same method or `*`, and a path glob matching every path the broker's glob matches (`**`
-covers `*`, `*` does not cover `**`). A covering the broker cannot prove is reported. An
-audience grant without `ttlSeconds` (the ceiling then lives in notaio's knob registry) is
-not compared on `P002`. None of this changes what the sandbox gets: a sandbox with every
-code is admitted, bound and minted for exactly as before.
-
-```
-$ kubectl -n agents get agentsandbox ledgers-2026-10-14 \
-    -o jsonpath='{.status.conditions[?(@.type=="PolicyConformant")]}'
-{"lastTransitionTime":"2026-11-02T09:14:07Z","message":"P002 max_ttl 900 for api://trading-data is above the bundle's ttlSeconds 300","observedGeneration":1,"reason":"Gaps","status":"False","type":"PolicyConformant"}
-```
+With a `policy` section configured, every sandbox carries a `PolicyConformant` condition:
+`True` when the broker's configuration allows the sandbox nothing the bundle does not,
+`False` with a code per gap in its message, `Unknown` until the broker has read the
+namespace's bundles. [The policy bundle, in shadow](the-policy-bundle.md) has the codes
+and how to read them. None of it changes what the sandbox gets.
 
 ### Who may name which subject
 
@@ -189,7 +159,7 @@ Without it every claim mediatore creates is denied at admission, the sandbox sta
 | `entrySet` | the claim's `ClusterStaticEntry` is set on the SPIRE server |
 | `ready` | `phase == Bound` and `entrySet`: the guest can fetch its SVID |
 | `reason` | why the sandbox is `Failed` |
-| `conditions` | `PolicyConformant`, with a `policy` section configured ([above](#what-the-comparison-reports)) |
+| `conditions` | `PolicyConformant`, with a `policy` section configured ([the policy bundle](the-policy-bundle.md#reading-the-findings)) |
 
 A sandbox gets one claim, ever. When the claim's TTL fires, banlieue destroys the member
 and the claim leaves `Bound`; the sandbox goes `Releasing`, then `Failed` with reason
