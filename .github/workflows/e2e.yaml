@@ -16,7 +16,9 @@
 # round trip as the broker's own ServiceAccount, then the broker image on the CSI
 # socket with agent-issued client SVIDs over SPIFFE mTLS, then the claim watcher
 # against banlieue's CRDs (lease, node-entry trigger), then the AgentSandbox CRD, its
-# subject policy and reconciler from request to Ready and back: `make kind-e2e-ci`.
+# subject policy and reconciler from request to Ready and back, then notaio from its
+# release signing with OpenBao and the broker comparing sandboxes with its bundle in
+# shadow: `make kind-e2e-ci`.
 #
 # Not here: the TPM attestation path (ADR-0018, `make kind-e2e-tpm`) needs a vTPM
 # behind the kind node, which is swtpm through the kernel's tpm_vtpm_proxy module. The

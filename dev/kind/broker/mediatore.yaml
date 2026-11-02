@@ -33,6 +33,14 @@ issuers:
 audiences:
   - { name: e2e, via: sts }
   - { name: e2e-sts, via: sts, max_ttl: 900 }
+  # Exactly what notaio's example policy allows for this audience, so the policy tier's
+  # conformant sandbox has no gap (ADR-0026 decision 7); the endpoint is never reached.
+  - name: internal-git
+    via: sts
+    max_ttl: 300
+    egress: ["git.foo.io:443"]
+    rules:
+      - { method: GET, path: "/repos/**" }
 sts:
   issuer: https://mediatore.sandbox.test
   kid: kind

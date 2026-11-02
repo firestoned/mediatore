@@ -46,6 +46,13 @@ MUSL_TARGET        := x86_64-unknown-linux-musl
 KIND_IMAGE         := ghcr.io/firestoned/mediatore:kind
 # Test-only: the binary plus the testkit's dex-driver, for the Dex tier's user-side pod.
 KIND_E2E_IMAGE     := localhost/mediatore-e2e:kind
+# notaio in kind (ADR-0026), installed from its release manifests as an operator would:
+# the version, and the SHA-256 of each manifest from the release's checksums.sha256
+# (itself sigstore-signed; `cosign verify-blob` by hand after a bump, notaio's install
+# guide has the identity). A bump is these three lines.
+NOTAIO_VERSION         ?= 0.3.3
+NOTAIO_CRDS_SHA256     := f26c2d9e7aa967f7ca815e6da269a1e1f1bf21213a787c3cfbf68663fbffc5c9
+NOTAIO_MANIFEST_SHA256 := 3581bd524a822e3cb773d05a4587ad28d139b7073613711654bb598b8eedbd2c
 
 # CALM (FINOS Common Architecture Language Model) configuration
 CALM_CLI_VERSION  ?= 1.37.0
@@ -402,6 +409,12 @@ kind-e2e-sandbox: kind-banlieue-crds kind-broker ## ADR-0008 live: the subject p
 kind-e2e-store: kind-broker ## ADR-0012 live: the broker on PostgreSQL over verify-full, the store conformance suite against that database
 	./dev/kind/store-e2e.sh $(KIND_KUBECONFIG) $(KIND_DIR)/pg/ca.pem
 
+kind-notaio: kind-create kind-openbao ## notaio from its release manifests (version and checksums pinned above), signing with the kind OpenBao; the public key the broker trusts into .kind/notaio
+	./dev/kind/notaio-install.sh $(KIND_KUBECONFIG) $(KIND_DIR) $(NOTAIO_VERSION) $(NOTAIO_CRDS_SHA256) $(NOTAIO_MANIFEST_SHA256)
+
+kind-e2e-policy: kind-banlieue-crds kind-broker kind-notaio ## ADR-0026 live: notaio's signed bundle admitted and recorded, the PolicyConformant verdicts and codes, a newer version followed, a replay refused by the floor across a restart, nothing refused
+	./dev/kind/policy-e2e.sh $(KIND_KUBECONFIG) $(KIND_SA_KUBECONFIG) $(KIND_DIR)
+
 kind-e2e-dex: kind-banlieue-crds kind-broker ## ADR-0013 live: the real CLI logs in at a real Dex and delegates the session, every token issue refreshes it, a group removal and a revocation at Dex release the claim
 	$(KIND_KUBECTL) -n banlieue-system rollout restart deploy/mediatore
 	$(KIND_KUBECTL) -n banlieue-system rollout status deploy/mediatore --timeout=300s
@@ -412,7 +425,7 @@ kind-e2e-tpm: kind-vtpm kind-banlieue-crds kind-broker ## ADR-0018 live: an agen
 	$(KIND_KUBECTL) -n banlieue-system rollout status deploy/mediatore --timeout=300s
 	TPM_PLUGIN_AGENT_IMG=$(TPM_PLUGIN_AGENT_IMG) ./dev/kind/tpm-e2e.sh $(KIND_KUBECONFIG) $(SPIRE_TRUST_DOMAIN) $(KIND_VTPM_DIR)
 
-kind-e2e: kind-e2e-entries kind-e2e-mtls kind-e2e-watcher kind-e2e-sandbox kind-e2e-store kind-e2e-dex ## Every live suite against kind that needs nothing of the host (grows with the roadmap); kind-e2e-tpm needs a vTPM
+kind-e2e: kind-e2e-entries kind-e2e-mtls kind-e2e-watcher kind-e2e-sandbox kind-e2e-store kind-e2e-dex kind-e2e-policy ## Every live suite against kind that needs nothing of the host (grows with the roadmap); kind-e2e-tpm needs a vTPM
 
 kind-e2e-ci: ## CI shape: $(KIND_E2E_SUITES), cluster state on failure, cluster deleted after
 	@$(MAKE) $(KIND_E2E_SUITES) || { $(MAKE) kind-e2e-logs; $(MAKE) kind-delete; exit 1; }
@@ -434,6 +447,9 @@ kind-e2e-logs: ## What a failing live suite needs: entries, policy, broker and c
 	-$(KIND_KUBECTL) -n mediatore-e2e-watcher get virtualmachines,virtualmachineclaims -o yaml
 	-$(KIND_KUBECTL) -n mediatore-e2e-sandbox get agentsandboxes,virtualmachineclaims,pods -o yaml
 	-$(KIND_KUBECTL) -n mediatore-e2e-sandbox logs pod/node --tail=50
+	-$(KIND_KUBECTL) -n mediatore-e2e-sandbox get sandboxpolicies,exposureceilings,configmaps -o yaml
+	-$(KIND_KUBECTL) -n notaio-system get pods -o wide
+	-$(KIND_KUBECTL) -n notaio-system logs deploy/notaio --tail=80
 	-$(KIND_KUBECTL) -n mediatore-e2e-tpm get pods -o wide
 	-$(KIND_KUBECTL) -n mediatore-e2e-tpm logs deploy/member -c spire-agent --tail=80
 	-$(KIND_KUBECTL) -n mediatore-e2e-tpm logs deploy/member -c guest --tail=40

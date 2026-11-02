@@ -125,11 +125,15 @@ are the questions it answers, with the recommendation this roadmap is built on.
       and on every bundle change the cache announces, the transition time held while the
       status holds, a log line per gap when the verdict changes; five reconcile tests over
       bundles the testkit signs; the sandbox guide's table of codes
-- [ ] Live test, `make kind-e2e-policy`: notaio installed from its release manifest in kind,
+- [x] Live test, `make kind-e2e-policy`: notaio installed from its release manifest in kind,
       signing with the kind OpenBao, a policy and its ceiling, an `AgentSandbox` naming it; a
       conformant sandbox reports no gap; a broker audience the policy lacks is reported with its
       code; a replayed older bundle is refused by the floor across a broker restart; nothing is
-      refused that is not refused today
+      refused that is not refused today. Done 2026-11-02: `make kind-notaio`
+      (`dev/kind/notaio-install.sh`, the release manifests with pinned checksums, the signer
+      in the kind OpenBao) and `dev/kind/policy-e2e.sh`, in `make kind-e2e` and so in CI;
+      four sandboxes (`True`, `P001`, `P010`, `P011`) all with their claim, a newer version
+      followed, the replay refused before and after a restart; the testing guide
 - [ ] User guide: naming a policy on a sandbox, the trusted keys, reading the findings; the
       research agent walkthrough's section 5 updated
 - [ ] Threat model pass: the bundle as a new input across TB-2 (read from the Kubernetes API), the
