@@ -72,7 +72,8 @@ URL, your CIDRs. Edit:
   32-byte Ed25519 key, or an id listed twice, stops the start. The broker reads bundles
   with a Role per listed namespace, `get`, `list` and `watch` on ConfigMaps and nothing
   else: `kubectl apply -k deploy/policy-bundles` grants it in `sandboxes`, and another
-  namespace is a two-line overlay of that directory setting `namespace:`;
+  namespace is a two-line overlay of that directory setting `namespace:`
+  ([the policy bundle, in shadow](the-policy-bundle.md));
 - `networkpolicy.yaml`: the sandbox segment's CIDR for `:8443`, the control-plane
   addresses for the API server, the node CIDR for the kubelet's probe, and the
   issuer's namespace or addresses;

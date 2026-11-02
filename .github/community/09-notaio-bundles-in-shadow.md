@@ -3,7 +3,7 @@
 
 # 09: notaio's policy bundles, read and verified in shadow
 
-**Status: in progress.** ADR-0026 accepted (2026-11-01). The first step of moving sandbox policy out
+**Status: done (2026-11-02).** ADR-0026 accepted 2026-11-01, implemented 2026-11-02. The first step of moving sandbox policy out
 of the broker's configuration and into notaio's signed bundles (notaio roadmap 00, phase 1). The
 broker watches the bundles, verifies each, keeps a version floor that survives restarts, and
 compares every sandbox with its policy. It refuses nothing on the bundle's account: this roadmap
@@ -134,11 +134,18 @@ are the questions it answers, with the recommendation this roadmap is built on.
       in the kind OpenBao) and `dev/kind/policy-e2e.sh`, in `make kind-e2e` and so in CI;
       four sandboxes (`True`, `P001`, `P010`, `P011`) all with their claim, a newer version
       followed, the replay refused before and after a restart; the testing guide
-- [ ] User guide: naming a policy on a sandbox, the trusted keys, reading the findings; the
-      research agent walkthrough's section 5 updated
-- [ ] Threat model pass: the bundle as a new input across TB-2 (read from the Kubernetes API), the
+- [x] User guide: naming a policy on a sandbox, the trusted keys, reading the findings; the
+      research agent walkthrough's section 5 updated. Done 2026-11-02:
+      [the policy bundle, in shadow](../../docs/guides/the-policy-bundle.md) (notaio beside the
+      broker, the keys, the floor, naming a policy, the verdict and the codes, what comes
+      next), linked from the nav, the index, the deploying and sandbox guides; the
+      walkthrough's section 5 gains the "reported in shadow" column
+- [x] Threat model pass: the bundle as a new input across TB-2 (read from the Kubernetes API), the
       configured keys as a trust anchor, the floor as the T5.4 control (notaio's threat model), the
-      shadow mode's residual risk (the configuration still rules)
+      shadow mode's residual risk (the configuration still rules). Done 2026-11-02: stamp
+      bumped to ADR-0026; notaio in §2, §4 and the diagram; A-19 (the trusted keys) and A-20
+      (the floor); eight TB-2 rows and one TB-9 row; §7 one item; R-17 (shadow mode: the
+      configuration still rules); §9 notaio's own threat model and the database role; §10
 
 ## Out of scope
 

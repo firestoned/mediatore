@@ -36,6 +36,8 @@ the component that finishes the story.
   through the API or declaratively, who may name which subject, and what its status says.
 - [The store](guides/the-store.md): SQLite or PostgreSQL by URL, what survives a restart,
   sealed refresh material, retention and the audit table.
+- [The policy bundle, in shadow](guides/the-policy-bundle.md): notaio beside the broker, the
+  keys it trusts, naming a policy on a sandbox, and reading the `PolicyConformant` verdict.
 - [System architecture](architecture/diagrams/system.md) and
   [flows](architecture/diagrams/flows.md), rendered from the
   [CALM](https://calm.finos.org/) architecture-as-code model.
