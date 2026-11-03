@@ -165,6 +165,7 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
         sealer,
         limiter: Limiter::new(cfg.token.rate_per_minute),
         dev_mode: cfg.dev_mode,
+        gateways: cfg.gateways.clone(),
     });
 
     let user = tokio::net::TcpListener::bind(&cfg.listen.user).await?;

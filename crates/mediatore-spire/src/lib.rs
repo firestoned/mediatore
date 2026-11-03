@@ -92,6 +92,20 @@ impl Naming {
             .strip_prefix(&prefix)
             .and_then(|s| Uuid::parse_str(s).ok())
     }
+
+    /// `spiffe://<td>/gateway`: the one identity every egress gateway of the environment
+    /// holds (ADR-0028 decision 2). The platform team registers it; the broker never mints
+    /// it, a gateway not being a claim.
+    #[must_use]
+    pub fn gateway_id(&self) -> String {
+        format!("spiffe://{}/gateway", self.trust_domain)
+    }
+
+    /// Whether a peer SPIFFE ID is the gateway identity: exactly it, nothing under it.
+    #[must_use]
+    pub fn is_gateway(&self, spiffe_id: &str) -> bool {
+        spiffe_id == self.gateway_id()
+    }
 }
 
 /// `mediatore-node-<ek-hash>`: deterministic, so "ensure" is a create that tolerates 409.
@@ -306,6 +320,22 @@ mod tests {
             n.node_ek_from(&format!("spiffe://other.test/banlieue/node/{EK}")),
             None
         );
+    }
+
+    #[test]
+    fn the_gateway_identity_is_exactly_one_id_and_nothing_near_it() {
+        let n = Naming {
+            trust_domain: "sandbox.test".into(),
+        };
+        assert_eq!(n.gateway_id(), "spiffe://sandbox.test/gateway");
+        assert!(n.is_gateway("spiffe://sandbox.test/gateway"));
+        assert!(!n.is_gateway("spiffe://sandbox.test/gateway/"));
+        assert!(!n.is_gateway("spiffe://sandbox.test/gateway/1"));
+        assert!(!n.is_gateway("spiffe://sandbox.test/gatewayx"));
+        assert!(!n.is_gateway("spiffe://other.test/gateway"));
+        assert!(!n.is_gateway(&n.broker_id()));
+        assert!(n.claim_uid_from(&n.gateway_id()).is_none());
+        assert!(n.node_ek_from(&n.gateway_id()).is_none());
     }
 
     #[test]

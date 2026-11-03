@@ -140,9 +140,10 @@ What roadmap 09 fixed within the decisions above, so a reader of the code finds 
   reads again and decides again. This gives decision 4's guarantee with no row lock, which
   sqlx's `Any` driver cannot express on SQLite.
 - **The crate is `mediatore-policy`,** shared with the guest when it verifies too (notaio
-  roadmap 00, phase 3). `trusted_keys` checks the configured keys (decision 2; notaio's
-  `TrustedKeys` would let a duplicate id silently replace the first, so the broker refuses it)
-  and `admit` is decision 4: verify, decide with notaio's `next_floor`, compare and set, retry
+  roadmap 00, phase 3). `trusted_keys` checks the configured keys (decision 2), refusing a
+  duplicate id itself before notaio's `TrustedKeys` sees it; since notaio v0.3.4 `TrustedKeys`
+  refuses one too (it used to replace the first key silently), so the broker's check is belt and
+  braces. `admit` is decision 4: verify, decide with notaio's `next_floor`, compare and set, retry
   a lost race twice, then use. A refusal carries a stable `code()`, notaio's error name where it
   is notaio's refusal.
 - **A bundle must be read from its own policy's namespace.** `admit` takes the namespace the

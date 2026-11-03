@@ -61,6 +61,7 @@ impl Harness {
             sealer: None,
             limiter: Limiter::new(10),
             dev_mode: false,
+            gateways: vec![],
         });
         let user = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
