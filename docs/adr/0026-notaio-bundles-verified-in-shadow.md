@@ -183,8 +183,10 @@ What roadmap 09 fixed within the decisions above, so a reader of the code finds 
   knob registry, which the bundle does not carry in seconds. The cache announces each
   policy whose bundle was admitted at a new version or dropped, and the sandbox controller
   reconciles every sandbox on each announcement, after the reflector on that replica
-  updated the cache, so the comparison never reads a cache that has not caught up.
-  Without a `policy` section no condition is written.
+  updated the cache, so the comparison never reads a cache that has not caught up. The
+  condition is written on every pass, a `Failed` sandbox's included (refused, its claim gone
+  or not its own): the verdict is about the spec and the bundle, not the claim. Without a
+  `policy` section no condition is written.
 
 ## Consequences
 

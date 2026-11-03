@@ -456,6 +456,7 @@ impl Watcher {
                     phase: SandboxPhase::Failed,
                     reason: Some(reason),
                     observed_generation: sb.metadata.generation,
+                    conditions: self.conditions(sb, &current.conditions),
                     ..AgentSandboxStatus::default()
                 },
             )
@@ -473,6 +474,7 @@ impl Watcher {
                         phase: SandboxPhase::Failed,
                         reason: Some(reason),
                         observed_generation: sb.metadata.generation,
+                        conditions: self.conditions(sb, &current.conditions),
                         ..current
                     },
                 )
@@ -493,6 +495,7 @@ impl Watcher {
                         ready: false,
                         reason: Some("claim gone".into()),
                         observed_generation: sb.metadata.generation,
+                        conditions: self.conditions(sb, &current.conditions),
                         ..current
                     },
                 )
@@ -542,8 +545,10 @@ impl Watcher {
 
     /// The sandbox's conditions after this pass: `previous` with `PolicyConformant` replaced
     /// by the comparison's verdict (ADR-0026 decision 7), or untouched without a `policy`
-    /// section. `lastTransitionTime` holds while the status does. Each gap is logged when
-    /// the verdict's message changes: a new bundle, a new gap, a gap closed.
+    /// section. Computed on every pass, a terminal sandbox's included: the verdict is about
+    /// the spec and the bundle, not the claim. `lastTransitionTime` holds while the status
+    /// does. Each gap is logged when the verdict's message changes: a new bundle, a new
+    /// gap, a gap closed.
     fn conditions(&self, sb: &AgentSandbox, previous: &[Condition]) -> Vec<Condition> {
         let Some(bundles) = self.bundles.as_ref() else {
             return previous.to_vec();
@@ -1745,6 +1750,57 @@ mod tests {
             "no policy section, no condition"
         );
         assert_eq!(held.status.as_ref().unwrap().phase, SandboxPhase::Pending);
+    }
+
+    /// A sandbox that ended (refused, its claim gone, its claim not its own) still carries
+    /// the verdict, recomputed on every pass like a live one: the condition is absent only
+    /// without a `policy` section (ADR-0026 decision 7).
+    #[tokio::test]
+    async fn a_terminal_sandbox_still_carries_the_policy_verdict() {
+        let a = admitted_bundle(1).await;
+
+        // Refused before any claim: the audience is not configured, and it is not in the
+        // bundle either.
+        let r = rig_with(cfg_with_git(), Some(a.cache()));
+        let mut refused = a.sb.clone();
+        refused.spec.audiences = vec!["nowhere".into()];
+        r.claims.put_sandbox(refused.clone());
+        r.watcher.reconcile_sandbox(&refused).await.unwrap();
+        let held = r.claims.sandbox("conformance", "sb-1").unwrap();
+        assert_eq!(held.status.as_ref().unwrap().phase, SandboxPhase::Failed);
+        let c = conformant(&held);
+        assert_eq!(c.status, "False");
+        assert!(c.message.starts_with("P001"), "{}", c.message);
+
+        // Its claim gone: the verdict follows a newer bundle even then.
+        let r = rig_with(cfg_with_git(), Some(a.cache()));
+        r.claims.put_sandbox(a.sb.clone());
+        r.watcher.reconcile_sandbox(&a.sb).await.unwrap();
+        let cur = r.claims.sandbox("conformance", "sb-1").unwrap();
+        assert_eq!(conformant(&cur).status, "True");
+        r.claims.remove_claim("conformance", "sb-1");
+        a.admit(2, |b| b.content.lease.max_duration_seconds = 60)
+            .await;
+        r.watcher.reconcile_sandbox(&cur).await.unwrap();
+        let held = r.claims.sandbox("conformance", "sb-1").unwrap();
+        let st = held.status.as_ref().unwrap();
+        assert_eq!(st.phase, SandboxPhase::Failed);
+        assert_eq!(st.reason.as_deref(), Some("claim gone"));
+        let c = conformant(&held);
+        assert_eq!(c.status, "False");
+        assert!(c.message.starts_with("P005"), "{}", c.message);
+
+        // A claim of its name it does not own.
+        let r = rig_with(cfg_with_git(), Some(a.cache()));
+        r.claims.put_sandbox(a.sb.clone());
+        let mut stranger = claim_for(&a.sb).unwrap();
+        stranger.metadata.owner_references = None;
+        stranger.metadata.uid = Some(Uuid::new_v4().to_string());
+        r.claims.put_claim(stranger);
+        r.watcher.reconcile_sandbox(&a.sb).await.unwrap();
+        let held = r.claims.sandbox("conformance", "sb-1").unwrap();
+        assert_eq!(held.status.as_ref().unwrap().phase, SandboxPhase::Failed);
+        assert_eq!(conformant(&held).status, "False");
     }
 
     #[tokio::test]

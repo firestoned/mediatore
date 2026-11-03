@@ -136,7 +136,10 @@ none, with nothing recorded; the record is never rewritten by a later bundle.
 ## Reading the findings
 
 With a `policy` section configured, every sandbox carries a `PolicyConformant` condition
-(decision 7), recomputed on each reconcile and whenever its policy's bundle changes:
+(decision 7), recomputed on each reconcile and whenever its policy's bundle changes. A
+`Failed` sandbox keeps it, and keeps following the bundle: the verdict is about the spec,
+not the claim. It is only written for sandboxes in the namespaces the `policy` section
+lists; a sandbox elsewhere stays `Unknown`.
 
 | Status | Reason | Meaning |
 | --- | --- | --- |
