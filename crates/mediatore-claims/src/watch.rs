@@ -25,7 +25,7 @@ use banlieue_api::banlieue::{
 };
 use futures::{Stream, StreamExt};
 use kube::api::{DeleteParams, ListParams, Patch, PatchParams, PostParams};
-use kube::runtime::controller::{Action, Controller};
+use kube::runtime::controller::{self, Action, Controller};
 use kube::runtime::watcher;
 use kube::{Api, Client, ResourceExt};
 use mediatore_proto::ClaimPhase;
@@ -529,6 +529,37 @@ fn bundle_changes(changes: broadcast::Receiver<PolicyKey>) -> impl Stream<Item =
     })
 }
 
+/// Whether an error from a watch stream is routine: a watch that expired (`410 Gone`, "too
+/// old resource version") is re-listed by the watcher on its own and deserves no warning.
+pub(crate) fn watch_error_is_routine(err: &watcher::Error) -> bool {
+    matches!(err, watcher::Error::WatchError(status) if status.code == 410)
+}
+
+/// Whether an error from a controller's stream deserves a warning. Routine, and logged at
+/// debug: an expired watch; a reconcile scheduled for an object deleted meanwhile (the
+/// object left the store between the event and the pass); a failed reconcile, which the
+/// error policy has already warned about and requeued. Everything else is warned.
+pub(crate) fn deserves_warning<R: std::error::Error + 'static>(
+    err: &controller::Error<R, watcher::Error>,
+) -> bool {
+    match err {
+        controller::Error::QueueError(e) => !watch_error_is_routine(e),
+        controller::Error::ObjectNotFound(_) | controller::Error::ReconcilerFailed(..) => false,
+        controller::Error::RunnerError(_) => true,
+    }
+}
+
+/// One line per stream error, at the level [`deserves_warning`] says.
+fn log_stream_error<R: std::error::Error + 'static>(
+    controller: &str,
+    err: &controller::Error<R, watcher::Error>,
+) {
+    if deserves_warning(err) {
+        tracing::warn!(error = %err, "{controller} controller");
+    } else {
+        tracing::debug!(error = %err, "{controller} controller: routine");
+    }
+}
 /// The three controllers (claims, pool members, sandboxes) and the resync ticker, until
 /// the first one ends (they do not end on their own). Run this on the Lease holder only.
 pub async fn run(client: Client, watcher: Arc<Watcher>) -> anyhow::Result<()> {
@@ -561,7 +592,7 @@ pub async fn run(client: Client, watcher: Arc<Watcher>) -> anyhow::Result<()> {
     )
     .for_each(|r| async move {
         if let Err(e) = r {
-            tracing::warn!(error = %e, "sandbox controller");
+            log_stream_error("sandbox", &e);
         }
     });
     let claims = Controller::new(
@@ -578,7 +609,7 @@ pub async fn run(client: Client, watcher: Arc<Watcher>) -> anyhow::Result<()> {
     )
     .for_each(|r| async move {
         if let Err(e) = r {
-            tracing::warn!(error = %e, "claim controller");
+            log_stream_error("claim", &e);
         }
     });
     let machines = Controller::new(
@@ -595,7 +626,7 @@ pub async fn run(client: Client, watcher: Arc<Watcher>) -> anyhow::Result<()> {
     )
     .for_each(|r| async move {
         if let Err(e) = r {
-            tracing::warn!(error = %e, "machine controller");
+            log_stream_error("machine", &e);
         }
     });
     let resync = async {
@@ -632,6 +663,42 @@ mod tests {
 
     use super::*;
     use crate::fakes::{node, rig};
+
+    type StreamError = controller::Error<WatchError, watcher::Error>;
+
+    fn expired_watch(code: u16) -> StreamError {
+        controller::Error::QueueError(watcher::Error::WatchError(
+            kube::core::Status::failure("too old resource version: 1 (2)", "Expired")
+                .with_code(code)
+                .boxed(),
+        ))
+    }
+
+    #[test]
+    fn an_expired_watch_a_vanished_object_and_a_failed_pass_are_routine_and_the_rest_warn() {
+        let gone = kube::runtime::reflector::ObjectRef::<VirtualMachineClaim>::new("gone")
+            .within("sandboxes")
+            .erase();
+        assert!(!deserves_warning(&expired_watch(410)));
+        assert!(!deserves_warning(&StreamError::ObjectNotFound(Box::new(
+            gone.clone()
+        ))));
+        assert!(!deserves_warning(&StreamError::ReconcilerFailed(
+            WatchError::Reconcile("held".into()),
+            Box::new(gone)
+        )));
+        assert!(deserves_warning(&expired_watch(403)));
+        assert!(deserves_warning(&expired_watch(500)));
+        assert!(deserves_warning(&StreamError::QueueError(
+            watcher::Error::NoResourceVersion
+        )));
+        assert!(watch_error_is_routine(&watcher::Error::WatchError(
+            kube::core::Status::failure("gone", "Expired")
+                .with_code(410)
+                .boxed()
+        )));
+        assert!(!watch_error_is_routine(&watcher::Error::NoResourceVersion));
+    }
 
     const UID: &str = "6b0a3e9c-1f4d-4c2e-9a7b-0d1e2f3a4b5c";
 

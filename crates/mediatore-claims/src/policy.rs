@@ -358,6 +358,9 @@ pub async fn run(client: Client, reflector: Arc<BundleReflector>) -> anyhow::Res
                     Ok(Event::Delete(cm)) => {
                         r.deleted(&cm);
                     }
+                    Err(e) if crate::watch::watch_error_is_routine(&e) => {
+                        tracing::debug!(namespace = %ns, error = %e, "bundle watch: routine");
+                    }
                     Err(e) => tracing::warn!(namespace = %ns, error = %e, "bundle watch"),
                 }
             }
