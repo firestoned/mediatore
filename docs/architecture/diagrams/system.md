@@ -50,6 +50,7 @@ flowchart LR
     service-guest-agent["mediatore guest"]
     service-sandbox-workload["Jailed Workload"]
     service-egress-proxy["mediatore egress-proxy"]
+    service-egress-gateway["Egress gateway (Envoy + mediatore gateway)"]
     network-sandbox-segment["Sandbox Network Segment"]
     subgraph sg_system-mediatore [System Mediatore]
         service-mediatore-user-api
@@ -109,6 +110,7 @@ flowchart LR
     service-guest-agent -->|HTTPS| ecosystem-oci-registry
     service-sandbox-workload -->|HTTP| service-egress-proxy
     service-egress-proxy -->|mTLS| service-mediatore-sandbox-api
+    service-egress-gateway -->|mTLS| service-mediatore-sandbox-api
     service-egress-proxy -->|HTTPS| ecosystem-downstream-api
     actor-sandbox-user --> data-asset-claim-store
     system-mediatore -->|TLS| database-store

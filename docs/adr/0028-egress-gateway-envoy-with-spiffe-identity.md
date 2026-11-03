@@ -146,6 +146,30 @@ that identity.
     placed one per failure domain (banlieue ADR-0098), on a `tpmEnabled` class like every
     VM from now on. banlieue gains no kind, no field and no controller.
 
+## Implementation notes
+
+What roadmap 10 fixed within the decisions above, as it is built:
+
+- **The gateway-only route is `GET /v1/gateway/claims/{uid}` on the sandbox listener**
+  (decision 4), `claim_egress` in `crates/mediatore-api/src/lib.rs`. The listener's
+  authorizer admits `spiffe://<td>/gateway` beside node and claim identities, exactly that
+  id and nothing under it (`Naming::is_gateway`); which routes each identity may use stays
+  the handlers' business, so a gateway on `/v1/me` or `/v1/token` is `403` like a node on
+  this route. The answer (`ClaimEgress`, `crates/mediatore-proto/src/lib.rs`) is the claim
+  uid, the claim's deadline and `egress`: the union of its audiences' `egress`, sorted and
+  deduplicated, the one list `GET /v1/me` hands the guest, so the gateway and the ruleset
+  never disagree. A claim the store does not know, one not yet bound (no deadline, so no
+  identity for a tunnel to carry), one released or past its deadline is `404` alike: the
+  authorizer needs one signal for "deny, and drop what was cached", and telling the cases
+  apart would tell a caller which uids exist. This settles the answer format left to the
+  test plan in *Still to decide*; the cache bound stays with the authorizer.
+- **`gateways` is a top-level list in the broker's config** (decision 6), `host:port` pairs
+  parsed like `audiences[].egress`, one listed twice refused at start, empty by default;
+  `Me::gateways` carries it in that order and an old broker reads as an empty list. The
+  environment is the broker's: one broker, one segment, one gateway set (ADR-0103).
+- **Not yet:** `mediatore gateway`, `mediatore forward`, the ruleset change, the gateway
+  image and VMs, the threat-model pass, which comes with the rest of the roadmap.
+
 ## Consequences
 
 - **Identity reaches the network edge.** Each tunnel is attributable to a claim, and

@@ -91,6 +91,7 @@ fn state(idp: &FakeIdp, dev_mode: bool) -> Arc<AppState> {
         sealer: None,
         limiter: Limiter::new(10),
         dev_mode,
+        gateways: vec![],
     })
 }
 
@@ -357,6 +358,46 @@ async fn a_ca_shaped_certificate_is_not_a_peer() {
     // keyCertSign: the leaf constraints refuse it before the chain is even checked.
     let ca_shaped = h.ca.ca_shaped_svid(&node_svid());
     assert!(h.healthz(&Harness::mtls(&ca_shaped)).await.is_err());
+}
+
+/// The gateway identity completes the handshake (ADR-0028 decision 4, amending ADR-0007
+/// decision 2) and reaches its own route and nothing else; nothing under its path is a peer.
+#[tokio::test]
+async fn the_gateway_identity_is_a_peer_for_its_own_route_only() {
+    let h = Harness::start().await;
+    let gateway = h.mtls_as(&format!("spiffe://{TRUST_DOMAIN}/gateway"));
+    assert_eq!(h.healthz(&gateway).await.unwrap(), 200);
+    assert!(
+        h.healthz(&h.mtls_as(&format!("spiffe://{TRUST_DOMAIN}/gateway/1")))
+            .await
+            .is_err(),
+        "the gateway identity is one id, not a prefix"
+    );
+
+    let node = h.mtls_as(&node_svid());
+    assert_eq!(h.register_node(&node).await.status(), 200);
+    let claim = h.create_claim(&h.login("octocat")).await;
+    let uid = claim.uid.expect("uid");
+    let url = format!("{}/v1/gateway/claims/{uid}", h.sandbox_url);
+
+    let resp = gateway.get(&url).send().await.expect("gateway");
+    assert_eq!(resp.status(), 200);
+    let answer: mediatore_proto::ClaimEgress = resp.json().await.expect("body");
+    assert_eq!(answer.claim_uid, uid);
+
+    // The certificate is the identity: the node on the gateway's route, the gateway on
+    // the node's and the claim's, each refused.
+    assert_eq!(node.get(&url).send().await.expect("node").status(), 403);
+    assert_eq!(
+        gateway
+            .get(format!("{}/v1/me", h.sandbox_url))
+            .send()
+            .await
+            .expect("me")
+            .status(),
+        403
+    );
+    assert_eq!(h.token(&gateway).await.status(), 403);
 }
 
 #[tokio::test]

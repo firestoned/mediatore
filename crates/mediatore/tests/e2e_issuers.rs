@@ -108,6 +108,7 @@ impl Harness {
             sealer: Some(Arc::new(LocalKeySealer::new([5u8; 32]))),
             limiter: Limiter::new(60),
             dev_mode: true,
+            gateways: vec![],
         });
         let user = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let sandbox = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

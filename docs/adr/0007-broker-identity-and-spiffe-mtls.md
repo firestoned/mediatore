@@ -5,7 +5,10 @@
 
 **Status:** Accepted · **Date:** 2026-10-10 · **Accepted:** 2026-10-11 · **Amended:** 2026-10-13
 (TLS layer: `mediatore-tls` instead of `spiffe-rustls`; decisions 2, 5, 6 and 8, see the
-amendment note)
+amendment note) · **Amended:** 2026-11-03 by
+[ADR-0028](0028-egress-gateway-envoy-with-spiffe-identity.md) decision 4 (decision 2: the
+sandbox listener's authorizer admits the gateway identity `spiffe://<td>/gateway`, exactly
+that id, beside node and claim identities; it reaches its own route and nothing else)
 
 Companion: [ADR-0006](0006-registration-entries-as-clusterstaticentry.md) (registration
 entries). Together they are roadmap 01 and delete threat-model accepted risk **R-1**.

@@ -18,8 +18,8 @@ use chrono::Duration;
 use mediatore_api::{AppState, Limiter};
 use mediatore_entra::{Backend, IssuerConfig, Validator};
 use mediatore_proto::{
-    ClaimRequest, ClaimResponse, ErrorBody, Me, NodeRegistered, NodeRegistration, TokenResponse,
-    Workload,
+    ClaimEgress, ClaimRequest, ClaimResponse, Endpoint, ErrorBody, Me, NodeRegistered,
+    NodeRegistration, TokenResponse, Workload,
 };
 use mediatore_spire::Naming;
 use mediatore_store::MemoryStore;
@@ -39,6 +39,12 @@ const AUDIENCE: &str = "grafana.test";
 const REQUIRED_GROUP: &str = "firestoned:sandbox-users";
 const PEER_HEADER: &str = "x-mediatore-peer-spiffe-id";
 const EK_HASH: &str = "72c566555391e835a15c522680b51ec3b840561ed70af5605a5ae4835f040ee8";
+/// The environment's gateways, in the broker's order (ADR-0028 decision 6).
+const GATEWAYS: [&str; 3] = [
+    "198.51.100.2:3128",
+    "198.51.100.3:3128",
+    "198.51.100.4:3128",
+];
 
 fn node_svid() -> String {
     format!("spiffe://{TRUST_DOMAIN}/banlieue/node/{EK_HASH}")
@@ -46,6 +52,10 @@ fn node_svid() -> String {
 
 fn claim_svid(uid: &uuid::Uuid) -> String {
     format!("spiffe://{TRUST_DOMAIN}/banlieue/claim/{uid}")
+}
+
+fn gateway_svid() -> String {
+    format!("spiffe://{TRUST_DOMAIN}/gateway")
 }
 
 struct Harness {
@@ -125,6 +135,7 @@ impl Harness {
             sealer: None,
             limiter: Limiter::new(10),
             dev_mode: true,
+            gateways: GATEWAYS.iter().map(|g| g.parse().unwrap()).collect(),
         });
 
         let user = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -362,6 +373,111 @@ async fn full_loop_from_login_to_cutoff() {
         404,
         "released claim no longer answers /v1/me"
     );
+}
+
+/// The gateway-only route (ADR-0028 decision 4): the gateway identity reads what one claim
+/// may reach, and the answer is the list the guest got; a node, the claim itself, or no
+/// peer is refused; a pending, unknown or released claim is `404`.
+#[tokio::test]
+async fn the_gateway_reads_a_claims_egress_and_nobody_else_does() {
+    let h = Harness::start().await;
+    let user_token = h.login("octocat");
+    let (status, claim) = h.create_claim(&user_token).await;
+    assert_eq!(status, 201);
+    assert_eq!(
+        claim.phase,
+        mediatore_proto::ClaimPhase::Pending,
+        "no node yet"
+    );
+    let uid = claim.uid.expect("uid");
+    let url = format!("{}/v1/gateway/claims/{uid}", h.sandbox_url);
+    let as_gateway = || h.http.get(&url).header(PEER_HEADER, gateway_svid());
+
+    // Pending: no deadline, no identity, nothing a gateway could admit.
+    assert_eq!(as_gateway().send().await.expect("pending").status(), 404);
+
+    // The node registers and the dev binder binds the claim: the gateway gets its answer.
+    h.register_node().await;
+    let resp = as_gateway().send().await.expect("bound");
+    assert_eq!(resp.status(), 200);
+    let answer: ClaimEgress = resp.json().await.expect("body");
+    assert_eq!(answer.claim_uid, uid);
+    let want: Vec<Endpoint> = ["192.0.2.10:8443", "api.home.example:443"]
+        .iter()
+        .map(|e| e.parse().unwrap())
+        .collect();
+    assert_eq!(
+        answer.egress, want,
+        "the same list the guest's ruleset admits"
+    );
+    let me: Me = h
+        .http
+        .get(format!("{}/v1/me", h.sandbox_url))
+        .header(PEER_HEADER, node_svid())
+        .send()
+        .await
+        .expect("me")
+        .json()
+        .await
+        .expect("me body");
+    assert_eq!(answer.expires_at, me.expires_at, "the claim's own deadline");
+    // And the guest got the gateways in the broker's order (ADR-0028 decision 6).
+    assert_eq!(
+        me.gateways,
+        GATEWAYS.map(|g| g.parse::<Endpoint>().unwrap())
+    );
+
+    // Anyone but the gateway, the claim asked about included, is refused; no peer is 401.
+    for peer in [
+        node_svid(),
+        claim_svid(&uid),
+        format!("{}/x", gateway_svid()),
+    ] {
+        let resp = h
+            .http
+            .get(&url)
+            .header(PEER_HEADER, &peer)
+            .send()
+            .await
+            .expect("peer");
+        assert_eq!(resp.status(), 403, "{peer}");
+    }
+    assert_eq!(h.http.get(&url).send().await.expect("anon").status(), 401);
+
+    // Unknown, and malformed.
+    let other = format!(
+        "{}/v1/gateway/claims/{}",
+        h.sandbox_url,
+        uuid::Uuid::new_v4()
+    );
+    let resp = h
+        .http
+        .get(&other)
+        .header(PEER_HEADER, gateway_svid())
+        .send()
+        .await
+        .expect("unknown");
+    assert_eq!(resp.status(), 404);
+    let bad = format!("{}/v1/gateway/claims/not-a-uuid", h.sandbox_url);
+    let resp = h
+        .http
+        .get(&bad)
+        .header(PEER_HEADER, gateway_svid())
+        .send()
+        .await
+        .expect("bad");
+    assert_eq!(resp.status(), 400);
+
+    // Released: the answer the gateway takes as "drop the cache, deny".
+    let del = h
+        .http
+        .delete(format!("{}/v1/claims/{}", h.user_url, claim.name))
+        .bearer_auth(&user_token)
+        .send()
+        .await
+        .expect("delete");
+    assert_eq!(del.status(), 204);
+    assert_eq!(as_gateway().send().await.expect("released").status(), 404);
 }
 
 #[tokio::test]

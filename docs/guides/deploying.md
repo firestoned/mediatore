@@ -73,7 +73,12 @@ URL, your CIDRs. Edit:
   with a Role per listed namespace, `get`, `list` and `watch` on ConfigMaps and nothing
   else: `kubectl apply -k deploy/policy-bundles` grants it in `sandboxes`, and another
   namespace is a two-line overlay of that directory setting `namespace:`
-  ([the policy bundle, in shadow](the-policy-bundle.md));
+  ([the policy bundle, in shadow](the-policy-bundle.md)), and, once the environment has
+  its egress gateways, `gateways`: their `sandbox` addresses and data-plane port as
+  `host:port` pairs, addresses not names, in the order every guest receives them on
+  `GET /v1/me` ([ADR-0028](../adr/0028-egress-gateway-envoy-with-spiffe-identity.md)
+  decision 6; one listed twice stops the start). Leave it out until then: the jail
+  then reaches the audiences' `egress` directly, as before;
 - `networkpolicy.yaml`: the sandbox segment's CIDR for `:8443`, the control-plane
   addresses for the API server, the node CIDR for the kubelet's probe, and the
   issuer's namespace or addresses;
@@ -324,6 +329,7 @@ volumes:
 | Direction | Peer | Port | Why |
 | --- | --- | --- | --- |
 | ingress | the sandbox segment | 8443 | the guest and the jailed workload, over SPIFFE mTLS (TB-6) |
+| ingress | the gateways' `egress` addresses | 8443 | the gateway's authorizer asking what a claim may reach, over SPIFFE mTLS with the gateway SVID ([ADR-0028](../adr/0028-egress-gateway-envoy-with-spiffe-identity.md) decision 4); only once the gateways exist |
 | ingress | the ingress controller's namespace | 8080 | people and their tools, bearer over the ingress's TLS (TB-1) |
 | ingress | the node CIDR | 8080 | the kubelet's readiness probe, where the CNI does not exempt it |
 | egress | kube-dns | 53 | names |

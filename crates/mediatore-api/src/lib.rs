@@ -35,8 +35,9 @@ use mediatore_entra::{IdpError, Validated, Validator};
 use mediatore_proto::ek::is_ek_hash;
 use mediatore_proto::image::ImageReference;
 use mediatore_proto::{
-    ClaimPhase, ClaimRequest, ClaimResponse, Endpoint, EndpointRule, ErrorBody, Me, NodeRegistered,
-    NodeRegistration, RegistryCredential, Route, Secret, TokenRequest, TokenResponse,
+    ClaimEgress, ClaimPhase, ClaimRequest, ClaimResponse, Endpoint, EndpointRule, ErrorBody, Me,
+    NodeRegistered, NodeRegistration, RegistryCredential, Route, Secret, TokenRequest,
+    TokenResponse,
 };
 use mediatore_spire::{EntryManager, Naming};
 use mediatore_store::seal::{SealError, Sealer};
@@ -92,6 +93,9 @@ pub struct AppState {
     pub limiter: Limiter,
     /// Accept a peer-identity header instead of mTLS. Never in production.
     pub dev_mode: bool,
+    /// The environment's egress gateways in the broker's order (`gateways`, ADR-0028
+    /// decision 6), handed to every guest on `GET /v1/me`.
+    pub gateways: Vec<Endpoint>,
 }
 
 /// The per-claim gate on `POST /v1/token`: a token bucket (`per_minute` issues a minute,
@@ -282,12 +286,16 @@ fn peer_spiffe_id(
 }
 
 /// Who may complete a handshake with the sandbox listener: node and claim identities of
-/// this trust domain, parsed by the same rules the handlers apply, and nothing else, not
-/// even another broker (ADR-0007 decision 2).
+/// this trust domain, parsed by the same rules the handlers apply, and the gateway
+/// identity (ADR-0028 decision 4, amending ADR-0007 decision 2), and nothing else, not
+/// even another broker. Which routes each may use is the handlers' business: the gateway
+/// reaches its own route and nothing a node or a claim reaches.
 pub fn sandbox_authorizer(naming: Naming) -> mediatore_tls::Authorizer {
     Arc::new(move |id: &mediatore_tls::SpiffeId| {
         let id = id.to_string();
-        naming.node_ek_from(&id).is_some() || naming.claim_uid_from(&id).is_some()
+        naming.node_ek_from(&id).is_some()
+            || naming.claim_uid_from(&id).is_some()
+            || naming.is_gateway(&id)
     })
 }
 
@@ -781,15 +789,7 @@ async fn me(
         .ok_or_else(|| ApiError::internal("bound claim has no deadline".to_owned()))?;
     // The destinations are the claim's audiences' (ADR-0020 decision 2): an audience that
     // declares none contributes none, and the jail reaches the broker only.
-    let mut egress: Vec<Endpoint> = rec
-        .audiences
-        .iter()
-        .filter_map(|a| st.egress.get(a))
-        .flatten()
-        .cloned()
-        .collect();
-    egress.sort();
-    egress.dedup();
+    let egress = egress_of(&st, &rec);
     // The proxy's routes (ADR-0025 decision 4): the same destinations, each with its
     // audience and that audience's rules; the config guarantees one audience per endpoint.
     let mut routes: Vec<Route> = rec
@@ -828,6 +828,58 @@ async fn me(
         egress,
         routes,
         registry_credential,
+        gateways: st.gateways.clone(),
+    }))
+}
+
+/// The `host:port` pairs a claim may reach: the union of its audiences' `egress`, sorted
+/// and deduplicated. The same list for the guest's ruleset and for the gateway's answer.
+fn egress_of(st: &AppState, rec: &ClaimRecord) -> Vec<Endpoint> {
+    let mut egress: Vec<Endpoint> = rec
+        .audiences
+        .iter()
+        .filter_map(|a| st.egress.get(a))
+        .flatten()
+        .cloned()
+        .collect();
+    egress.sort();
+    egress.dedup();
+    egress
+}
+
+/// `GET /v1/gateway/claims/{uid}`: what a gateway may let the claim reach (ADR-0028
+/// decision 4). The peer must be the gateway identity, `spiffe://<td>/gateway`: a node, a
+/// claim, even the claim asked about, is `403`. A claim the store does not know, one not
+/// bound (no deadline yet, so no identity for a tunnel to carry), one released or past its
+/// deadline is `404`, the one answer the gateway takes as "deny, and drop what was cached".
+async fn claim_egress(
+    State(st): State<Shared>,
+    headers: HeaderMap,
+    peer: Option<Extension<PeerSpiffeId>>,
+    Path(uid): Path<String>,
+) -> Result<Json<ClaimEgress>, ApiError> {
+    let peer = peer_spiffe_id(&st, peer.as_ref().map(|e| &e.0), &headers)?;
+    if !st.naming.is_gateway(&peer) {
+        return Err(ApiError::forbidden("peer is not the gateway identity"));
+    }
+    let uid = Uuid::parse_str(&uid)
+        .map_err(|_| ApiError::bad_request("invalid_claim_uid", "claim uid must be a UUID"))?;
+    let unknown = || ApiError::not_found("no live claim with this uid");
+    let rec = st.store.get_claim(uid).await.map_err(|e| match e {
+        StoreError::NotFound(_) => unknown(),
+        other => ApiError::internal(other.to_string()),
+    })?;
+    let now = Utc::now();
+    let Some(expires_at) = rec.expires_at.filter(|_| rec.is_live(now)) else {
+        tracing::debug!(claim_uid = %uid, "gateway asked about a claim that is not live");
+        return Err(unknown());
+    };
+    let egress = egress_of(&st, &rec);
+    tracing::debug!(claim_uid = %uid, endpoints = egress.len(), "claim egress answered to the gateway");
+    Ok(Json(ClaimEgress {
+        claim_uid: uid,
+        expires_at,
+        egress,
     }))
 }
 
@@ -1091,6 +1143,7 @@ pub fn sandbox_router(state: Shared) -> Router {
         .route("/v1/nodes", post(register_node))
         .route("/v1/me", get(me))
         .route("/v1/token", post(token))
+        .route("/v1/gateway/claims/{uid}", get(claim_egress))
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state)
 }

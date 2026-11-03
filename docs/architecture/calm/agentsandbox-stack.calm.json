@@ -378,7 +378,7 @@
       "unique-id": "agentsandbox-egress-gateway",
       "node-type": "service",
       "name": "Egress gateway",
-      "description": "Three Envoy proxy VMs per environment (banlieue ADR-0103), each with its own SPIFFE identity from a local SPIRE agent. Requires mutual TLS from the sandbox forwarder, authorizes every CONNECT on the caller's claim SPIFFE ID and the requested authority against the broker's per-claim answer, resolves names itself, and logs one line per tunnel. Sits outside the guest, so it holds even if guest root is compromised. Proposed in ADR-0028, not built.",
+      "description": "Three Envoy proxy VMs per environment (banlieue ADR-0103), each with its own SPIFFE identity from a local SPIRE agent. Requires mutual TLS from the sandbox forwarder, authorizes every CONNECT on the caller's claim SPIFFE ID and the requested authority against the broker's per-claim answer, resolves names itself, and logs one line per tunnel. Sits outside the guest, so it holds even if guest root is compromised. Proposed in ADR-0028. Built so far: the broker's gateway-only route and the gateways list on GET /v1/me (roadmap 10); the VMs, Envoy and the authorizer are not built.",
       "metadata": {
         "status": "proposed",
         "diagram-style": "dashed orange: proposed, not built yet"
@@ -885,6 +885,25 @@
       "metadata": {
         "status": "proposed",
         "diagram-style": "dashed orange: proposed, not built yet"
+      }
+    },
+    {
+      "unique-id": "agentsandbox-rel-gateway-to-mediatore",
+      "description": "The gateway's authorizer asks the broker what one claim may reach: GET /v1/gateway/claims/{uid} over mutual TLS with the gateway SVID, answered to that identity only; a released, expired, pending or unknown claim is 404 (ADR-0028 decision 4). The route exists in the broker; the authorizer that calls it is not built.",
+      "relationship-type": {
+        "connects": {
+          "source": {
+            "node": "agentsandbox-egress-gateway"
+          },
+          "destination": {
+            "node": "agentsandbox-mediatore"
+          }
+        }
+      },
+      "protocol": "mTLS",
+      "metadata": {
+        "status": "in progress",
+        "diagram-style": "dashed orange: the broker's route exists, the caller does not yet"
       }
     },
     {

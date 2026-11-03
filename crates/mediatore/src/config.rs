@@ -326,6 +326,12 @@ pub struct Config {
     /// notaio's policy bundles, in shadow (ADR-0026). Absent: none of it.
     #[serde(default)]
     pub policy: Option<PolicySection>,
+    /// The egress gateways of this environment (ADR-0028 decision 6): each gateway's
+    /// `sandbox` address and data-plane port, `host:port`, in the order `GET /v1/me` hands
+    /// the guest. Addresses, not names: the segment has no resolver (ADR-0028 decision 7).
+    /// Empty until the gateways exist; the jail then reaches `audiences[].egress` directly.
+    #[serde(default, deserialize_with = "endpoints")]
+    pub gateways: Vec<Endpoint>,
 }
 
 fn default_listen() -> ListenConfig {
@@ -364,6 +370,18 @@ impl Config {
                         r.path
                     );
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// Each gateway listed once: a repeated entry is a copy-paste, not a second gateway,
+    /// and the forwarder's failover would retry the same one.
+    fn check_gateways(&self) -> anyhow::Result<()> {
+        let mut seen = std::collections::BTreeSet::new();
+        for g in &self.gateways {
+            if !seen.insert(g) {
+                anyhow::bail!("gateways: {g} is listed twice (ADR-0028)");
             }
         }
         Ok(())
@@ -446,6 +464,7 @@ impl Config {
         }
         cfg.check_store()?;
         cfg.check_policy()?;
+        cfg.check_gateways()?;
         if cfg.token.rate_per_minute == 0 {
             anyhow::bail!("token.rate_per_minute must be positive");
         }
@@ -649,6 +668,37 @@ listen: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }
         let err = Config::parse(
             "trust_domain: sandbox.test\nissuers: []\nlisten: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }\ndev_mode: true\naudiences:\n  - { name: grafana.home.example, via: sts, egress: [\"grafana.home.example\"] }\n",
         )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("host:port"), "{err}");
+    }
+
+    #[test]
+    fn gateways_are_parsed_in_order_default_to_none_and_are_listed_once() {
+        let cfg = Config::parse(&format!(
+            "{BASE}dev_mode: true\ngateways: [\"198.51.100.2:3128\", \"[2001:db8::2]:3128\", \"198.51.100.3:3128\"]\n"
+        ))
+        .unwrap();
+        let listed: Vec<String> = cfg.gateways.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            listed,
+            [
+                "198.51.100.2:3128",
+                "[2001:db8::2]:3128",
+                "198.51.100.3:3128"
+            ]
+        );
+        let cfg = Config::parse(&format!("{BASE}dev_mode: true\n")).unwrap();
+        assert_eq!(cfg.gateways, Vec::<Endpoint>::new(), "no gateway yet");
+        let err = Config::parse(&format!(
+            "{BASE}dev_mode: true\ngateways: [\"198.51.100.2:3128\", \"198.51.100.2:3128\"]\n"
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("listed twice"), "{err}");
+        let err = Config::parse(&format!(
+            "{BASE}dev_mode: true\ngateways: [\"198.51.100.2\"]\n"
+        ))
         .unwrap_err()
         .to_string();
         assert!(err.contains("host:port"), "{err}");

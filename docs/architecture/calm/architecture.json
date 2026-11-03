@@ -182,6 +182,16 @@
       "description": "The egress-proxy role of the one binary (ADR-0025), one process per claim started by the guest as the sandbox user outside the jail, in the VM's namespace and filesystem. A reverse proxy on 127.0.0.1:3128: the workload calls /<host>[:<port>]/<path> with the phantom token, the proxy checks the host against the claim's routes (one per audience and egress endpoint, from GET /v1/me) and the method and path against that audience's rules (nono's endpoint_rules shape: method or *, a path glob with * one segment and ** any), swaps the phantom for a token for that audience fetched over the claim SVID at POST /v1/token and cached until shortly before its expiry, and forwards over TLS 1.3 to the Mozilla roots, or to the CA the route carries for an audience on a private PKI (audiences[].ca_file, ADR-0025 decision 7). No TLS interception. A request with no Authorization header is forwarded bare, one with a foreign bearer is 401, one outside the rules 403, one to a host not in the routes 404. The only process that ever holds a downstream token; the uid-keyed table drops packets to its port from any other uid, and a proxy that exits ends the claim. crates/mediatore-guest/src/egress.rs."
     },
     {
+      "unique-id": "service-egress-gateway",
+      "node-type": "service",
+      "name": "Egress gateway (Envoy + mediatore gateway)",
+      "description": "The egress gateway of ADR-0028: Envoy on each of banlieue's three proxy VMs per environment, with its own SPIFFE identity spiffe://<td>/gateway from a local SPIRE agent, and the authorizer role of the one binary, mediatore gateway, beside it. Phase one is identity, allowlist and audit, no interception. Built so far (roadmap 10): the broker side, GET /v1/gateway/claims/{uid} on the sandbox listener, answered to the gateway identity only, and the gateways list every guest receives on GET /v1/me. The VMs, Envoy's configuration, the authorizer and the forwarder are not built; the stack model (agentsandbox-stack.calm.json) carries them as proposed.",
+      "metadata": {
+        "status": "in progress",
+        "diagram-style": "dashed orange: the broker's route exists, the gateway does not yet"
+      }
+    },
+    {
       "unique-id": "ecosystem-downstream-api",
       "node-type": "ecosystem",
       "name": "Downstream APIs",
@@ -543,7 +553,7 @@
     },
     {
       "unique-id": "rel-guest-agent-mediatore",
-      "description": "POST /v1/nodes (EK hash + DMI UUID + hostname) over the node SVID at boot; then polls GET /v1/me until a claim is bound and the subject comes back. Since ADR-0022 the answer to GET /v1/me includes the pull credential for the claim's image registry when the operator configured one.",
+      "description": "POST /v1/nodes (EK hash + DMI UUID + hostname) over the node SVID at boot; then polls GET /v1/me until a claim is bound and the subject comes back. Since ADR-0022 the answer to GET /v1/me includes the pull credential for the claim's image registry when the operator configured one. Since ADR-0028 decision 6 the answer also carries gateways, the environment's egress gateways in the broker's order, for the forwarder and the ruleset; empty until the gateways exist.",
       "relationship-type": {
         "connects": {
           "source": {
@@ -614,6 +624,24 @@
         }
       },
       "protocol": "mTLS"
+    },
+    {
+      "unique-id": "rel-gateway-mediatore-claim-egress",
+      "description": "GET /v1/gateway/claims/{uid} over SPIFFE mTLS with the gateway SVID (ADR-0028 decision 4, amending ADR-0007 decision 2: the sandbox listener now admits spiffe://<td>/gateway beside node and claim identities). The answer is the claim's allowlist, the union of its audiences' egress sorted and deduplicated, exactly what GET /v1/me hands the guest, with the claim's deadline; a node, a claim, or anything under the gateway path is refused; a pending, released, expired or unknown claim is 404, which the authorizer takes as deny and drop the cache. Nothing is cached broker-side; the authorizer's bounded per-claim cache is the gateway's, not built yet.",
+      "relationship-type": {
+        "connects": {
+          "source": {
+            "node": "service-egress-gateway"
+          },
+          "destination": {
+            "node": "service-mediatore-sandbox-api"
+          }
+        }
+      },
+      "protocol": "mTLS",
+      "metadata": {
+        "status": "in progress"
+      }
     },
     {
       "unique-id": "rel-egress-proxy-downstream",

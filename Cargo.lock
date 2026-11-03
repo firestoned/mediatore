@@ -3342,8 +3342,8 @@ dependencies = [
 
 [[package]]
 name = "sandboxpolicy-bundle"
-version = "0.3.3"
-source = "git+https://github.com/firestoned/notaio?tag=v0.3.3#a561294a92ee6184b1eced3c473200656d14d522"
+version = "0.3.4"
+source = "git+https://github.com/firestoned/notaio?tag=v0.3.4#2f6081703c268ce291df5b856478ded83fd1fa4e"
 dependencies = [
  "base64 0.23.1",
  "chrono",
@@ -3357,8 +3357,8 @@ dependencies = [
 
 [[package]]
 name = "sandboxpolicy-types"
-version = "0.3.3"
-source = "git+https://github.com/firestoned/notaio?tag=v0.3.3#a561294a92ee6184b1eced3c473200656d14d522"
+version = "0.3.4"
+source = "git+https://github.com/firestoned/notaio?tag=v0.3.4#2f6081703c268ce291df5b856478ded83fd1fa4e"
 dependencies = [
  "chrono",
  "serde",

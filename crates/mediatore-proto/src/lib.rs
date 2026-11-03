@@ -314,6 +314,30 @@ pub struct Me {
     /// pull, kept nowhere.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub registry_credential: Option<RegistryCredential>,
+    /// The egress gateways of this environment, in the broker's order (ADR-0028 decision 6):
+    /// each gateway's `sandbox` address and data-plane port. The authoritative list for the
+    /// forwarder, which starts at a random position and fails over along it (decision 7),
+    /// and for the ruleset, which admits the sandbox uid to them (ADR-0027 decision 4 lets
+    /// the pool's bootstrap list disagree; this one wins). Empty with an old broker, or an
+    /// environment with no gateway yet: the jail then reaches what `egress` names directly.
+    #[serde(default)]
+    pub gateways: Vec<Endpoint>,
+}
+
+/// `GET /v1/gateway/claims/{uid}` response (ADR-0028 decision 4): what a gateway may let
+/// one claim reach. Answered to the gateway identity only, and only for a claim that is
+/// bound and live; a released, expired, pending or unknown claim is `404`, which the
+/// gateway's authorizer takes as "drop the cached answer, deny".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimEgress {
+    /// The claim, as its SVID names it.
+    pub claim_uid: Uuid,
+    /// The claim's deadline; no cached answer outlives it.
+    pub expires_at: DateTime<Utc>,
+    /// The `host:port` pairs the claim may reach: the union of its audiences' `egress`,
+    /// sorted and deduplicated, exactly what `GET /v1/me` hands the guest.
+    #[serde(default)]
+    pub egress: Vec<Endpoint>,
 }
 
 /// The operator's pull credential for one registry, handed to the guest for the registry
@@ -402,6 +426,29 @@ mod tests {
         .unwrap();
         assert_eq!(me.egress, Vec::<Endpoint>::new());
         assert_eq!(me.routes, Vec::<Route>::new(), "an old broker: no routes");
+        assert_eq!(
+            me.gateways,
+            Vec::<Endpoint>::new(),
+            "an old broker: no gateway"
+        );
+    }
+
+    #[test]
+    fn a_claims_egress_round_trips_and_an_old_broker_names_none() {
+        let full = ClaimEgress {
+            claim_uid: Uuid::nil(),
+            expires_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+            egress: vec!["api.home.example:443".parse().unwrap()],
+        };
+        let json = serde_json::to_value(&full).unwrap();
+        assert_eq!(json["egress"][0]["host"], "api.home.example");
+        assert_eq!(serde_json::from_value::<ClaimEgress>(json).unwrap(), full);
+        let bare: ClaimEgress = serde_json::from_value(serde_json::json!({
+            "claim_uid": "00000000-0000-0000-0000-000000000001",
+            "expires_at": "2026-01-01T00:00:00Z"
+        }))
+        .unwrap();
+        assert_eq!(bare.egress, Vec::<Endpoint>::new());
     }
 
     #[test]
