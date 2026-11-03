@@ -8,7 +8,9 @@
     "https://github.com/firestoned/banlieue/blob/main/docs/adr/0049-attestation-trust-anchors.md",
     "docs/adr/0008-agentsandbox-crd-owned-by-mediatore.md",
     "docs/adr/0009-kubernetes-orchestrates-vms-run-agents.md",
-    "docs/adr/0010-no-inbound-to-sandboxes.md"
+    "docs/adr/0010-no-inbound-to-sandboxes.md",
+    "docs/adr/0028-egress-gateway-envoy-with-spiffe-identity.md",
+    "https://github.com/firestoned/banlieue/blob/main/docs/adr/0103-isolated-sandbox-network-with-proxy-egress.md"
   ],
   "metadata": {
     "owner": "mediatore-maintainers",
@@ -353,6 +355,16 @@
       "description": "Runs as root in the VM. Attests the VM to SPIRE, verifies the signed bundle and refuses downgrades, renders and applies the nsjail, nftables and settings configuration, and holds the VM's only connection out."
     },
     {
+      "unique-id": "agentsandbox-egress-forwarder",
+      "node-type": "service",
+      "name": "mediatore forward (proposed)",
+      "description": "Proposed, not built: a role of the one binary (ADR-0014) running as the claim's sb- user on a loopback port. It is the workload's only proxy; it presents the claim SVID to a gateway over mutual TLS and tunnels each connection with CONNECT. ADR-0028 decisions 3 and 7.",
+      "metadata": {
+        "status": "proposed",
+        "diagram-style": "dashed orange: proposed, not built yet"
+      }
+    },
+    {
       "unique-id": "agentsandbox-sandboxpolicy-render",
       "node-type": "service",
       "name": "sandboxpolicy-render (proposed library)",
@@ -366,8 +378,27 @@
       "unique-id": "agentsandbox-egress-gateway",
       "node-type": "service",
       "name": "Egress gateway",
-      "description": "Enforces an allowlist taken from the signed bundle. Sits outside the guest, so it holds even if guest root is compromised.",
+      "description": "Three Envoy proxy VMs per environment (banlieue ADR-0103), each with its own SPIFFE identity from a local SPIRE agent. Requires mutual TLS from the sandbox forwarder, authorizes every CONNECT on the caller's claim SPIFFE ID and the requested authority against the broker's per-claim answer, resolves names itself, and logs one line per tunnel. Sits outside the guest, so it holds even if guest root is compromised. Proposed in ADR-0028, not built.",
+      "metadata": {
+        "status": "proposed",
+        "diagram-style": "dashed orange: proposed, not built yet"
+      },
       "controls": {
+        "identity-aware-allowlist": {
+          "description": "Each tunnel is admitted only for a peer holding a claim SVID under the environment's trust domain and only to an authority the broker lists for that claim; a released or unknown claim, or an unreachable broker with no cached answer, is a deny.",
+          "requirements": [
+            {
+              "requirement-url": "https://github.com/firestoned/mediatore/blob/main/docs/adr/0028-egress-gateway-envoy-with-spiffe-identity.md",
+              "config": {
+                "framework": "mediatore ADR",
+                "controls": [
+                  "ADR-0028 Decisions 2, 4 and 5 (Accepted, not built)"
+                ],
+                "evidence": "docs/adr/0028-egress-gateway-envoy-with-spiffe-identity.md"
+              }
+            }
+          ]
+        },
         "enforcement-outside-guest": {
           "description": "Egress enforcement that must hold against guest root sits outside the guest, at the gateway and in host or network firewalling; in-guest nftables is a second layer.",
           "requirements": [
@@ -499,6 +530,7 @@
           "nodes": [
             "agentsandbox-jailed-agent",
             "agentsandbox-mediatore-guest",
+            "agentsandbox-egress-forwarder",
             "agentsandbox-sandboxpolicy-render",
             "agentsandbox-nono"
           ]
@@ -807,7 +839,7 @@
     },
     {
       "unique-id": "agentsandbox-rel-guest-to-gateway",
-      "description": "Jailed traffic leaves the VM only towards the egress gateway (diagram e14).",
+      "description": "Jailed traffic leaves the VM only towards the egress gateway (diagram e14). ADR-0028 routes it through the forwarder, below.",
       "relationship-type": {
         "connects": {
           "source": {
@@ -817,6 +849,42 @@
             "node": "agentsandbox-egress-gateway"
           }
         }
+      }
+    },
+    {
+      "unique-id": "agentsandbox-rel-jail-to-forwarder",
+      "description": "Proposed: the jailed agent's proxy environment points at the forwarder on loopback; nftables admits the sandbox uid to nothing else but the broker and the gateways (ADR-0028 decisions 3 and 6).",
+      "relationship-type": {
+        "connects": {
+          "source": {
+            "node": "agentsandbox-jailed-agent"
+          },
+          "destination": {
+            "node": "agentsandbox-egress-forwarder"
+          }
+        }
+      },
+      "metadata": {
+        "status": "proposed",
+        "diagram-style": "dashed orange: proposed, not built yet"
+      }
+    },
+    {
+      "unique-id": "agentsandbox-rel-forwarder-to-gateway",
+      "description": "Proposed: mutual TLS with the claim SVID, CONNECT inside; the gateway answers with its own SVID (ADR-0028 decisions 2 to 4).",
+      "relationship-type": {
+        "connects": {
+          "source": {
+            "node": "agentsandbox-egress-forwarder"
+          },
+          "destination": {
+            "node": "agentsandbox-egress-gateway"
+          }
+        }
+      },
+      "metadata": {
+        "status": "proposed",
+        "diagram-style": "dashed orange: proposed, not built yet"
       }
     },
     {

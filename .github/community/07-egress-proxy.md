@@ -57,6 +57,9 @@ Threat model R-3 was accepted until the ADR for this was written; it is rewritte
       upstream, if a workload needs them
 - [ ] notaio M3: the bundle renders the routes and the rules, so the jail's two layers
       and the proxy come from one signed policy
+- [ ] Gateway: [ADR-0028](../../docs/adr/0028-egress-gateway-envoy-with-spiffe-identity.md) (roadmap 10)
+      adds the egress gateway behind this proxy: Envoy on banlieue's proxy VMs, with its own SPIFFE
+      identity, authorizing each tunnel by claim SVID.
 
 **Reference design (2026-10-30).** nono's supervisor and `nono-proxy`
 ([always-further/nono](https://github.com/always-further/nono)) are this roadmap built for

@@ -178,5 +178,7 @@ nav:
       - "ADR-0024: Landlock inside the jail": adr/0024-landlock-inside-the-jail.md
       - "ADR-0025: The egress proxy, a phantom token in the jail": adr/0025-phantom-token-egress-proxy.md
       - "ADR-0026: notaio's policy bundles, verified in shadow": adr/0026-notaio-bundles-verified-in-shadow.md
+      - "ADR-0027: A control relay on the egress gateway": adr/0027-control-plane-relay-on-the-egress-gateway.md
+      - "ADR-0028: The egress gateway, Envoy with a SPIFFE identity": adr/0028-egress-gateway-envoy-with-spiffe-identity.md
   - Security:
       - Threat model: security/threat-model.md
