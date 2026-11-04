@@ -1,0 +1,31 @@
+#!/usr/sbin/nft -f
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+#
+# The gateway host's table (ADR-0027 decision 5, ADR-0028 decision 8), rendered from the
+# env file by mediatore-gateway-nft.service before either Envoy may start. Input is
+# default drop. On the sandbox interface only the data plane and the two relay ports are
+# admitted, a new connection to a relay port counted per source and dropped over the cap
+# (the control plane has no identity to rate-limit by). On the egress interface nothing
+# new arrives: replies to the gateway's own connections only. Forwarding is off in sysctl
+# and dropped here as well. Loopback carries the authorizer and nothing else listens.
+flush ruleset
+table inet mediatore_gateway {
+  set relay_ports { type inet_service; elements = { @RELAY_SPIRE_PORT@, @RELAY_BROKER_PORT@ } }
+  # One element per sandbox source address, counting its connections to the relay.
+  set relay_sources { type ipv4_addr; flags dynamic; size 65535; }
+  chain input {
+    type filter hook input priority filter; policy drop;
+    iif "lo" accept
+    ct state established,related accept
+    ct state invalid drop
+    iifname "@SANDBOX_IF@" tcp dport @relay_ports ct state new add @relay_sources { ip saddr ct count over @RELAY_CAP@ } log prefix "mediatore-gateway cap: " counter drop
+    iifname "@SANDBOX_IF@" tcp dport @relay_ports ct state new accept
+    iifname "@SANDBOX_IF@" tcp dport @DATA_PORT@ ct state new accept
+    log prefix "mediatore-gateway drop: " counter drop
+  }
+  chain forward {
+    type filter hook forward priority filter; policy drop;
+    log prefix "mediatore-gateway forward: " counter drop
+  }
+}

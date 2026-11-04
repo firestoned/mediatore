@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Build gate: license headers, signed commits, fmt, clippy, tests, cargo-audit,
-# cargo-deny, the one static binary with CycloneDX SBOMs, and the server
-# container image (SBOM'd, Cosign-signed and provenance-attested on push/release).
+# cargo-deny, the one static binary with CycloneDX SBOMs, the server container
+# image and the two VM images, sandbox and gateway (SBOM'd, Cosign-signed and
+# provenance-attested on push/release).
 #
 # Mirrors banlieue's build.yaml at mediatore's scale. Deliberately not ported yet:
 # the grype/VEX triage loop and the SLSA generator (they depend on banlieue-vex
@@ -445,13 +446,103 @@ jobs:
           if-no-files-found: error
 
   # ───────────────────────────────────────────────────────────────────────────
+  # Egress gateway VM image (ADR-0028 decision 10): the Kairos derivative with Envoy
+  # that the three proxy VMs boot.
+  # Built and checked on every event, pushed + signed + SBOM'd on non-PR.
+  # ───────────────────────────────────────────────────────────────────────────
+  gateway-image:
+    name: 🚪 Gateway VM Image
+    runs-on: ubuntu-latest
+    needs: [test, clippy]
+    permissions:
+      contents: read
+      packages: write # GHCR push (non-PR only)
+      id-token: write # keyless Cosign
+    outputs:
+      digest: ${{ steps.gateway_build.outputs.digest }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The binary reports the release's version; fails if Cargo.toml then disagrees.
+      - name: Set the workspace version (release)
+        if: github.event_name == 'release'
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: make set-version VERSION="${TAG#v}"
+
+      - name: Set up Docker (login + buildx)
+        uses: firestoned/github-actions/docker/setup-docker@f52366c4f57f0110012035ac1bcd0bee4075b3e9 # v1.4.0
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: gateway_meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ghcr.io/${{ github.repository }}-gateway
+          flavor: |
+            latest=false
+          tags: |
+            type=ref,event=pr
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable=${{ github.event_name == 'push' }}
+            type=semver,pattern={{version}},enable=${{ github.event_name == 'release' }}
+            type=semver,pattern={{major}}.{{minor}},enable=${{ github.event_name == 'release' }}
+
+      - name: Build (and push on non-PR)
+        id: gateway_build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: image/gateway/Dockerfile
+          platforms: linux/amd64
+          load: ${{ github.event_name == 'pull_request' }}
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.gateway_meta.outputs.tags }}
+          labels: ${{ steps.gateway_meta.outputs.labels }}
+          cache-from: type=gha,scope=gateway
+          cache-to: type=gha,mode=max,scope=gateway
+          sbom: ${{ github.event_name != 'pull_request' }}
+          provenance: ${{ github.event_name != 'pull_request' }}
+
+      - name: Check the image (ADR-0028 decision 8 and ADR-0027, and the kind bootstrap against the image's template)
+        if: github.event_name == 'pull_request'
+        run: make gateway-image-check GATEWAY_IMAGE="${{ fromJSON(steps.gateway_meta.outputs.json).tags[0] }}"
+
+      - name: Install Cosign
+        if: github.event_name != 'pull_request'
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Cosign sign (keyless, by digest)
+        if: github.event_name != 'pull_request'
+        run: cosign sign --yes "ghcr.io/${{ github.repository }}-gateway@${{ steps.gateway_build.outputs.digest }}"
+
+      - name: Generate image SBOM
+        if: github.event_name != 'pull_request'
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          image: ghcr.io/${{ github.repository }}-gateway@${{ steps.gateway_build.outputs.digest }}
+          format: cyclonedx-json
+          output-file: gateway-image-sbom.json
+          upload-release-assets: false
+
+      - name: Upload image SBOM artifact
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: gateway-image-sbom
+          path: gateway-image-sbom.json
+          if-no-files-found: error
+
+  # ───────────────────────────────────────────────────────────────────────────
   # Attest: GitHub build-provenance attestation for the pushed images.
   # ───────────────────────────────────────────────────────────────────────────
   attest:
     name: 🔏 Attest Image
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
-    needs: [docker, guest-image]
+    needs: [docker, guest-image, gateway-image]
     permissions:
       id-token: write
       attestations: write
@@ -478,6 +569,13 @@ jobs:
           subject-digest: ${{ needs.guest-image.outputs.digest }}
           push-to-registry: true
 
+      - name: Attest build provenance (gateway VM image, ADR-0028)
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/${{ github.repository }}-gateway
+          subject-digest: ${{ needs.gateway-image.outputs.digest }}
+          push-to-registry: true
+
   # ───────────────────────────────────────────────────────────────────────────
   # Release assets: what the release page carries beside the two images, gathered
   # by `make release-assets` and attested file by file (`gh attestation verify
@@ -487,7 +585,7 @@ jobs:
     name: 🚀 Release Assets
     if: github.event_name == 'release'
     runs-on: ubuntu-latest
-    needs: [dist, dist-darwin, docker, guest-image, attest]
+    needs: [dist, dist-darwin, docker, guest-image, gateway-image, attest]
     permissions:
       contents: write # upload the assets to the release
       id-token: write # keyless attestation of the files
@@ -502,12 +600,12 @@ jobs:
           path: ./artifacts
 
       - name: Stage them where make release-assets looks
-        run: mkdir -p dist && cp artifacts/mediatore-linux-amd64-musl/* artifacts/mediatore-darwin-arm64/* artifacts/docker-sbom/* artifacts/guest-image-sbom/* dist/ && chmod +x dist/mediatore dist/mediatore-darwin-arm64
+        run: mkdir -p dist && cp artifacts/mediatore-linux-amd64-musl/* artifacts/mediatore-darwin-arm64/* artifacts/docker-sbom/* artifacts/guest-image-sbom/* artifacts/gateway-image-sbom/* dist/ && chmod +x dist/mediatore dist/mediatore-darwin-arm64
 
       - name: Gather the assets
         env:
           TAG: ${{ github.event.release.tag_name }}
-        run: make release-assets VERSION="${TAG#v}" IMAGE_DIGEST=${{ needs.docker.outputs.digest }} GUEST_DIGEST=${{ needs.guest-image.outputs.digest }} RELEASE_DIR=release
+        run: make release-assets VERSION="${TAG#v}" IMAGE_DIGEST=${{ needs.docker.outputs.digest }} GUEST_DIGEST=${{ needs.guest-image.outputs.digest }} GATEWAY_DIGEST=${{ needs.gateway-image.outputs.digest }} RELEASE_DIR=release
 
       - name: Attest build provenance (every asset)
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2

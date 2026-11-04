@@ -1,0 +1,31 @@
+#cloud-config
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+
+# The base layer of the egress gateway VM image's cloud-config (ADR-0028 decision 10, the
+# shape of ADR-0023): nothing here is deployment-specific or per VM. The binaries, the
+# templates, the units and the users are in the image (image/gateway/Dockerfile); this
+# layer is what Kairos has to be told at install and at every boot. The deployment's layer
+# (image/gateway/cloud-config-deployment.example.yaml) adds the install block, the SPIRE
+# agent's configuration, the trust bundle and the gateway's env file; the VM's userData
+# adds vm.env, the one value that differs per gateway (its sandbox address).
+install:
+  # The agent's key and state live on the sealed persistent partition, never in the image
+  # (banlieue ADR-0108 decision 3): /var/lib is ephemeral on Kairos unless bound.
+  bind_mounts:
+    - /var/lib/spire
+stages:
+  boot:
+    - name: spire-dirs
+      commands:
+        - install -d -o spire -g spire -m 0700 /var/lib/spire/agent
+        - install -d -o spire -g spire -m 0755 /run/spire/sockets
+      systemctl:
+        enable:
+          - spire-agent
+          - mediatore-gateway-network
+          - mediatore-gateway-nft
+          - envoy-gateway
+          - envoy-relay
+          - mediatore-gateway
+          - qemu-guest-agent

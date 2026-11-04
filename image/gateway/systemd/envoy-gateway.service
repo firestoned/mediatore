@@ -1,0 +1,51 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+
+[Unit]
+Description=Envoy, the egress gateway's data plane (ADR-0028)
+# No table, no listener; no interface, no listener; the SVID comes from the agent over SDS;
+# the authorizer is asked on every tunnel, so it is started first (Envoy retries the
+# cluster meanwhile and refuses every CONNECT until it answers).
+Requires=mediatore-gateway-nft.service mediatore-gateway-network.service spire-agent.service
+After=mediatore-gateway-nft.service mediatore-gateway-network.service spire-agent.service network-online.target mediatore-gateway.service
+Wants=network-online.target mediatore-gateway.service
+ConditionPathExists=|/run/cos/active_mode
+ConditionPathExists=|/run/cos/passive_mode
+
+[Service]
+User=envoy
+Group=envoy
+# The bootstrap is rendered by root from the env files at every start, into the runtime
+# directory the table's unit created; the templates are the image's, the values the
+# deployment's and the VM's (ADR-0028 decision 10).
+ExecStartPre=+/usr/libexec/mediatore-gateway/render /usr/share/mediatore-gateway/envoy/gateway.yaml.in /run/mediatore-gateway/gateway.yaml /etc/mediatore-gateway/env /etc/mediatore-gateway/vm.env
+ExecStartPre=/usr/bin/envoy --mode validate -c /run/mediatore-gateway/gateway.yaml
+ExecStart=/usr/bin/envoy -c /run/mediatore-gateway/gateway.yaml --log-level info --disable-hot-restart
+Restart=on-failure
+RestartSec=2
+# ADR-0028 decision 8: no new privileges, no capability (the listener's port is
+# unprivileged), a private /tmp, a read-only root. Only the agent's socket and the runtime
+# directory are reached; the logs go to the journal.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+ReadOnlyPaths=/run/mediatore-gateway /run/spire/sockets
+
+[Install]
+WantedBy=multi-user.target

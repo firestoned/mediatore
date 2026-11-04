@@ -485,7 +485,9 @@ fn entry_manager(
     Arc::new(KubeEntryManager::new(
         client.clone(),
         naming,
-        (&spire.entries).into(),
+        (&spire.entries)
+            .try_into()
+            .expect("the config checked spire.entries.claim_svid_ttl at parse"),
     ))
 }
 
@@ -751,6 +753,30 @@ mod tests {
             mediatore_guest::jail::JAIL_BINARY,
             mediatore_spire::GUEST_AGENT_PATH
         );
+    }
+
+    #[test]
+    fn the_guest_reads_the_pools_gateway_list_at_its_fixed_path_unless_told_otherwise() {
+        let Ok(Cmd::Guest(args)) = parse(&["mediatore", "guest", "--mediatore-url", "https://b"])
+        else {
+            panic!("guest did not parse");
+        };
+        assert_eq!(
+            args.gateways_file.to_str(),
+            Some("/etc/mediatore/gateways"),
+            "ADR-0027 decision 4: the pool's cloud-config writes it there"
+        );
+        let Ok(Cmd::Guest(args)) = parse(&[
+            "mediatore",
+            "guest",
+            "--mediatore-url",
+            "https://b",
+            "--gateways-file",
+            "/tmp/g",
+        ]) else {
+            panic!("guest did not parse");
+        };
+        assert_eq!(args.gateways_file.to_str(), Some("/tmp/g"));
     }
 
     #[test]

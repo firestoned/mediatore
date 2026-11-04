@@ -83,16 +83,23 @@ pub struct EntriesConfig {
     pub class_name: String,
     /// How long a declaration may take to become `set` before the bind fails.
     pub ready_timeout: Duration,
-    /// `x509SVIDTTL` on claim entries; bounds an offline agent after release.
-    pub claim_svid_ttl: String,
+    /// `x509SVIDTTL` on claim entries, the most a claim SVID lives: bounds an agent that
+    /// is offline when the entry disappears, and the identity a sandbox keeps when it can
+    /// no longer renew (ADR-0027 decision 7: at most [`MAX_CLAIM_SVID_TTL`], and never
+    /// more than the claim has left).
+    pub claim_svid_ttl: Duration,
 }
+
+/// The most `claim_svid_ttl` may be (ADR-0027 decision 7): a released or cut-off claim's
+/// identity ends within this.
+pub const MAX_CLAIM_SVID_TTL: Duration = Duration::from_mins(15);
 
 impl Default for EntriesConfig {
     fn default() -> Self {
         Self {
             class_name: "spire-server-spire".into(),
             ready_timeout: Duration::from_secs(30),
-            claim_svid_ttl: "1h".into(),
+            claim_svid_ttl: MAX_CLAIM_SVID_TTL,
         }
     }
 }
@@ -114,6 +121,18 @@ impl KubeEntryManager {
             naming,
             cfg,
         }
+    }
+
+    /// The claim entry's `x509SVIDTTL`: the configured bound, or the time the claim has
+    /// left when that is shorter, never below one second; in seconds, a form the controller
+    /// manager and the admission policy's `duration()` both read.
+    fn claim_svid_ttl(&self, claim_ttl: Duration) -> String {
+        let ttl = self
+            .cfg
+            .claim_svid_ttl
+            .min(claim_ttl)
+            .max(Duration::from_secs(1));
+        format!("{}s", ttl.as_secs())
     }
 
     fn labels(kind: EntryKind, claim_uid: Option<Uuid>) -> BTreeMap<String, String> {
@@ -284,6 +303,7 @@ impl EntryManager for KubeEntryManager {
         ek_hash: &str,
         claim_uid: Uuid,
         unix_user: &str,
+        claim_ttl: Duration,
     ) -> Result<String, SpireError> {
         validate_ek_hash(ek_hash)?;
         validate_unix_user(unix_user)?;
@@ -293,7 +313,7 @@ impl EntryManager for KubeEntryManager {
             parent_id: self.naming.agent_id(ek_hash),
             selectors: vec![format!("unix:user:{unix_user}")],
             class_name: Some(self.cfg.class_name.clone()),
-            x509_svid_ttl: Some(self.cfg.claim_svid_ttl.clone()),
+            x509_svid_ttl: Some(self.claim_svid_ttl(claim_ttl)),
             hint: Some("claim".into()),
         };
         self.declare(&name, Self::labels(EntryKind::Claim, Some(claim_uid)), spec)
@@ -486,7 +506,7 @@ mod tests {
         let cfg = EntriesConfig {
             class_name: "test-class".into(),
             ready_timeout: Duration::from_millis(400),
-            claim_svid_ttl: "1h".into(),
+            claim_svid_ttl: Duration::from_mins(15),
         };
         let m = KubeEntryManager::new(
             client,
@@ -532,7 +552,10 @@ mod tests {
             );
             assert_eq!(v["spec"]["selectors"], json!(["unix:user:sb-0123456789ab"]));
             assert_eq!(v["spec"]["className"], "test-class");
-            assert_eq!(v["spec"]["x509SVIDTTL"], "1h");
+            assert_eq!(
+                v["spec"]["x509SVIDTTL"], "900s",
+                "the configured bound, the claim having longer left"
+            );
             assert!(v["spec"].get("admin").is_none());
             assert!(v["spec"].get("downstream").is_none());
             assert!(v["spec"].get("storeSVID").is_none());
@@ -557,7 +580,7 @@ mod tests {
             ]),
         ]);
         let got = m
-            .create_claim_entry(EK, uid, "sb-0123456789ab")
+            .create_claim_entry(EK, uid, "sb-0123456789ab", Duration::from_hours(1))
             .await
             .unwrap();
         assert_eq!(got, name);
@@ -653,7 +676,7 @@ mod tests {
             )]),
         ]);
         let err = m
-            .create_claim_entry(EK, uid, "sb-0123456789ab")
+            .create_claim_entry(EK, uid, "sb-0123456789ab", Duration::from_hours(1))
             .await
             .unwrap_err();
         assert!(matches!(err, SpireError::Masked(n) if n == name));
@@ -673,7 +696,7 @@ mod tests {
             )]),
         ]);
         let err = m
-            .create_claim_entry(EK, uid, "sb-0123456789ab")
+            .create_claim_entry(EK, uid, "sb-0123456789ab", Duration::from_hours(1))
             .await
             .unwrap_err();
         assert!(matches!(err, SpireError::Invalid(msg) if msg.contains("did not render")));
@@ -715,7 +738,7 @@ mod tests {
             EntriesConfig {
                 class_name: "c".into(),
                 ready_timeout: Duration::from_millis(100),
-                claim_svid_ttl: "1h".into(),
+                claim_svid_ttl: Duration::from_mins(15),
             },
         );
         let err = m.ensure_node_entry(EK).await.unwrap_err();
@@ -735,7 +758,7 @@ mod tests {
             ),
         ]);
         let err = m
-            .create_claim_entry(EK, uid, "sb-0123456789ab")
+            .create_claim_entry(EK, uid, "sb-0123456789ab", Duration::from_hours(1))
             .await
             .unwrap_err();
         assert!(matches!(err, SpireError::Denied(msg) if msg.contains("never admin")));
@@ -750,9 +773,25 @@ mod tests {
             Err(SpireError::Invalid(_))
         ));
         assert!(matches!(
-            m.create_claim_entry(EK, Uuid::new_v4(), "root").await,
+            m.create_claim_entry(EK, Uuid::new_v4(), "root", Duration::from_hours(1))
+                .await,
             Err(SpireError::Invalid(_))
         ));
+        finish(m, task).await;
+    }
+
+    #[tokio::test]
+    async fn the_claim_svid_ttl_is_the_bound_or_what_the_claim_has_left_whichever_is_shorter() {
+        let (m, task) = manager(vec![]);
+        assert_eq!(m.claim_svid_ttl(Duration::from_hours(1)), "900s");
+        assert_eq!(m.claim_svid_ttl(Duration::from_mins(15)), "900s");
+        assert_eq!(
+            m.claim_svid_ttl(Duration::from_mins(5)),
+            "300s",
+            "ADR-0027 decision 7: never past the claim's deadline"
+        );
+        assert_eq!(m.claim_svid_ttl(Duration::ZERO), "1s");
+        assert!(EntriesConfig::default().claim_svid_ttl <= MAX_CLAIM_SVID_TTL);
         finish(m, task).await;
     }
 

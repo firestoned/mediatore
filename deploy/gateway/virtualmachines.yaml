@@ -1,0 +1,127 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+#
+# The three egress gateways (ADR-0028 decision 10, banlieue ADR-0109 decision 4): ordinary
+# VirtualMachines of the two-interface class, the egress address of each in its
+# networkOverrides (banlieue writes it as the first static NIC), the sandbox address of each
+# in its userData (the image writes it: vm.env, image/gateway/vm.env.example), spread one
+# per failure domain by a required anti-affinity on the host key (banlieue ADR-0098). The
+# three sandbox addresses are what the pool's /etc/mediatore/gateways and the broker's
+# `gateways` list, in any order. Placeholders throughout.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gateway-01-vm-env
+  labels: { mediatore.io/role: gateway }
+data:
+  user-data: |
+    #cloud-config
+    stages:
+      initramfs:
+        - name: mediatore-gateway-vm-env
+          files:
+            - path: /etc/mediatore-gateway/vm.env
+              permissions: 0644
+              owner: 0
+              group: 0
+              content: |
+                SANDBOX_ADDRESS=198.51.100.1
+---
+apiVersion: banlieue.io/v1alpha1
+kind: VirtualMachine
+metadata:
+  name: gateway-01
+  labels: { mediatore.io/role: gateway }
+spec:
+  classRef: { name: gateway-standard }
+  imageRef: { name: mediatore-gateway }
+  desiredPowerState: PoweredOn
+  networkOverrides:
+    - name: egress
+      static: { address: 192.0.2.11, prefix: 24, gateway: 192.0.2.1, nameservers: [192.0.2.53] }
+  userData:
+    configMapRef: { name: gateway-01-vm-env }
+  placement:
+    antiAffinity:
+      - labelSelector: { matchLabels: { mediatore.io/role: gateway } }
+        topologyKey: host
+        mode: required
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gateway-02-vm-env
+  labels: { mediatore.io/role: gateway }
+data:
+  user-data: |
+    #cloud-config
+    stages:
+      initramfs:
+        - name: mediatore-gateway-vm-env
+          files:
+            - path: /etc/mediatore-gateway/vm.env
+              permissions: 0644
+              owner: 0
+              group: 0
+              content: |
+                SANDBOX_ADDRESS=198.51.100.2
+---
+apiVersion: banlieue.io/v1alpha1
+kind: VirtualMachine
+metadata:
+  name: gateway-02
+  labels: { mediatore.io/role: gateway }
+spec:
+  classRef: { name: gateway-standard }
+  imageRef: { name: mediatore-gateway }
+  desiredPowerState: PoweredOn
+  networkOverrides:
+    - name: egress
+      static: { address: 192.0.2.12, prefix: 24, gateway: 192.0.2.1, nameservers: [192.0.2.53] }
+  userData:
+    configMapRef: { name: gateway-02-vm-env }
+  placement:
+    antiAffinity:
+      - labelSelector: { matchLabels: { mediatore.io/role: gateway } }
+        topologyKey: host
+        mode: required
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gateway-03-vm-env
+  labels: { mediatore.io/role: gateway }
+data:
+  user-data: |
+    #cloud-config
+    stages:
+      initramfs:
+        - name: mediatore-gateway-vm-env
+          files:
+            - path: /etc/mediatore-gateway/vm.env
+              permissions: 0644
+              owner: 0
+              group: 0
+              content: |
+                SANDBOX_ADDRESS=198.51.100.3
+---
+apiVersion: banlieue.io/v1alpha1
+kind: VirtualMachine
+metadata:
+  name: gateway-03
+  labels: { mediatore.io/role: gateway }
+spec:
+  classRef: { name: gateway-standard }
+  imageRef: { name: mediatore-gateway }
+  desiredPowerState: PoweredOn
+  networkOverrides:
+    - name: egress
+      static: { address: 192.0.2.13, prefix: 24, gateway: 192.0.2.1, nameservers: [192.0.2.53] }
+  userData:
+    configMapRef: { name: gateway-03-vm-env }
+  placement:
+    antiAffinity:
+      - labelSelector: { matchLabels: { mediatore.io/role: gateway } }
+        topologyKey: host
+        mode: required

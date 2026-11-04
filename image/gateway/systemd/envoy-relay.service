@@ -1,0 +1,49 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+
+[Unit]
+Description=Envoy, the egress gateway's control relay (ADR-0027)
+# Its own process and user, with no SPIRE socket, no SVID and no credential: the two
+# bootstrap connections (the agent to the SPIRE server, the guest to the broker) pass
+# through it as ciphertext to fixed upstreams. Needs the table and the interface, not the
+# agent: it runs before any identity on the VM exists.
+Requires=mediatore-gateway-nft.service mediatore-gateway-network.service
+After=mediatore-gateway-nft.service mediatore-gateway-network.service network-online.target
+Wants=network-online.target
+ConditionPathExists=|/run/cos/active_mode
+ConditionPathExists=|/run/cos/passive_mode
+
+[Service]
+User=envoy-relay
+Group=envoy-relay
+ExecStartPre=+/usr/libexec/mediatore-gateway/render /usr/share/mediatore-gateway/envoy/relay.yaml.in /run/mediatore-gateway/relay.yaml /etc/mediatore-gateway/env /etc/mediatore-gateway/vm.env
+ExecStartPre=/usr/bin/envoy --mode validate -c /run/mediatore-gateway/relay.yaml
+ExecStart=/usr/bin/envoy -c /run/mediatore-gateway/relay.yaml --log-level info --disable-hot-restart
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_INET AF_INET6
+# ADR-0027 decision 1: the relay cannot reach the Workload API, so a compromise of it
+# yields no identity. Enforced by the mount namespace, not only by file modes.
+InaccessiblePaths=/run/spire
+ReadOnlyPaths=/run/mediatore-gateway
+
+[Install]
+WantedBy=multi-user.target

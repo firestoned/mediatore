@@ -1,0 +1,40 @@
+#!/bin/sh
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+#
+# Fill a template's @NAME@ placeholders from one or more env files (KEY=value lines,
+# whole-line comments). Every placeholder must be defined, or nothing is written: a
+# gateway that started on a half-filled bootstrap would listen in the wrong place or
+# relay to the wrong upstream. Used by the gateway image's units at every start
+# (/usr/libexec/mediatore-gateway/render) and by make to render and check the kind
+# tier's envoy.yaml from the same template.
+#
+#   render <template> <out|-> <env-file>...
+set -eu
+[ $# -ge 3 ] || { echo "usage: render <template> <out|-> <env-file>..." >&2; exit 2; }
+tmpl=$1; out=$2; shift 2
+expr=''
+for env in "$@"; do
+  [ -f "$env" ] || { echo "render: $env: no such file" >&2; exit 1; }
+  while IFS= read -r line || [ -n "$line" ]; do
+    case $line in ''|'#'*) continue ;; esac
+    key=${line%%=*}; value=${line#*=}
+    case $key in *[!A-Z0-9_]*|'') echo "render: $env: not KEY=value: $line" >&2; exit 1 ;; esac
+    case $value in *'|'*) echo "render: $env: $key holds a '|'" >&2; exit 1 ;; esac
+    expr="$expr -e s|@$key@|$value|g"
+  done < "$env"
+done
+# shellcheck disable=SC2086 # the expressions are built above, one word each
+rendered=$(sed $expr "$tmpl")
+left=$(printf '%s\n' "$rendered" | grep -o '@[A-Z][A-Z0-9_]*@' | sort -u | tr '\n' ' ' || true)
+if [ -n "$left" ]; then
+  echo "render: $tmpl: no value for $left" >&2
+  exit 1
+fi
+if [ "$out" = - ]; then
+  printf '%s\n' "$rendered"
+else
+  tmp="$out.tmp.$$"
+  printf '%s\n' "$rendered" > "$tmp"
+  mv "$tmp" "$out"
+fi

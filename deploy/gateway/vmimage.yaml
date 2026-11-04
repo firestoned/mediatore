@@ -1,0 +1,78 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+#
+# The egress gateway's VM image and class (ADR-0028 decision 10; the shape of the sandbox
+# pool's deploy/overlays/homelab-example/vmimage.yaml). The three cloud-config layers are
+# Secrets in banlieue's imagebuild namespace, created first:
+#
+#   kubectl -n banlieue-imagebuild create secret generic mediatore-gateway-base \
+#     --from-file=cloud-config.yaml=image/gateway/cloud-config.yaml
+#   kubectl -n banlieue-imagebuild create secret generic banlieue-guest-ek-certificate \
+#     --from-file=cloud-config.yaml=<banlieue>/examples/21-cloud-config-guest-ek-certificate.yaml
+#   kubectl -n banlieue-imagebuild create secret generic mediatore-gateway-deployment \
+#     --from-file=cloud-config.yaml=<your copy of image/gateway/cloud-config-deployment.example.yaml>
+#
+# Pin the image by the digest of a release of ghcr.io/firestoned/mediatore-gateway (the
+# Build workflow signs and attests it; `gh attestation verify oci://<image> --repo
+# firestoned/mediatore`). The class has two interfaces in the order banlieue ADR-0109
+# decision 6 requires: `egress` first, on a routable class, carrying the static address
+# and the default route the VirtualMachine's networkOverrides give it; `sandbox` second,
+# on the segment, with no address from banlieue at all: the image writes it from vm.env.
+---
+apiVersion: banlieue.io/v1alpha1
+kind: VMImage
+metadata:
+  name: mediatore-gateway
+spec:
+  osFamily: linux
+  osDistribution: debian
+  osVersion: "13"
+  architecture: amd64
+  guestAgent: cloud-init
+  sources:
+    - providerClass: libvirt
+      kind: Url
+      ref: unused-for-url-sources # required by the schema; ignored for kind: Url
+      importFrom: ghcr.io/firestoned/mediatore-gateway@sha256:0000000000000000000000000000000000000000000000000000000000000000 # placeholder: a release digest
+  cloudConfigs:
+    - secretRef: { name: mediatore-gateway-base, key: cloud-config.yaml }
+    - secretRef: { name: banlieue-guest-ek-certificate, key: cloud-config.yaml }
+    - secretRef: { name: mediatore-gateway-deployment, key: cloud-config.yaml }
+  template:
+    # Each gateway installs itself at first boot with its own vTPM present (banlieue
+    # ADR-0040), like a pool member.
+    installMode: deferred
+---
+apiVersion: banlieue.io/v1alpha1
+kind: VMClass
+metadata:
+  name: gateway-standard
+spec:
+  hardware:
+    cpus: 2
+    memoryMiB: 2048
+    disks:
+      - name: os
+        sizeGiB: 20
+        storageClass: standard
+        provisioning: thin
+  network:
+    interfaces:
+      # The routable side: a network class the Provider advertises; the subnet's gateway and
+      # resolver here, the address per VM (virtualmachines.yaml). Envoy resolves the tunnels'
+      # authorities with this resolver and connects from this address.
+      - name: egress
+        networkClass: routable
+        ipam:
+          static:
+            prefix: 24
+            gateway: 192.0.2.1
+            nameservers: [192.0.2.53]
+      # The segment: layer 2 only, no address from banlieue, no gateway, no resolver.
+      - name: sandbox
+        networkClass: sandbox-segment
+        ipam: {}
+  firmware: efi # a vTPM needs EFI
+  features:
+    - vtpm
+  tpmEnabled: true

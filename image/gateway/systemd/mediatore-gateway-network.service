@@ -1,0 +1,21 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+
+[Unit]
+Description=The egress gateway's sandbox interface (banlieue ADR-0109 decision 6)
+# The address is the image's, not banlieue's: rendered from the deployment's env files
+# into networkd's runtime directory and applied before anything may listen on it.
+After=systemd-networkd.service
+Wants=systemd-networkd.service
+Before=network-online.target envoy-gateway.service envoy-relay.service
+ConditionPathExists=|/run/cos/active_mode
+ConditionPathExists=|/run/cos/passive_mode
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/libexec/mediatore-gateway/render /usr/share/mediatore-gateway/network.in /run/systemd/network/20-sandbox.network /etc/mediatore-gateway/env /etc/mediatore-gateway/vm.env
+ExecStart=/usr/bin/networkctl reload
+
+[Install]
+WantedBy=multi-user.target

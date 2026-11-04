@@ -129,6 +129,29 @@ guest-image: ## Build the sandbox VM image, a Kairos derivative (ADR-0023); BINA
 guest-image-check: ## Check the built VM image carries what ADR-0023 says, and no listener
 	CONTAINER_CLI=$(CONTAINER_CLI) ./image/check.sh $(GUEST_IMAGE)
 
+# The egress gateway VM image (ADR-0028 decision 10): the same Kairos base with Envoy
+# (pinned by digest, the digest the kind tier runs), the authorizer, the agent, the two
+# bootstrap templates and the host table; image/gateway/Dockerfile.
+GATEWAY_IMAGE ?= ghcr.io/firestoned/mediatore-gateway:dev
+gateway-image: ## Build the egress gateway VM image, a Kairos derivative with Envoy (ADR-0028 decision 10); BINARY_FROM=host copies dist/mediatore
+	$(CONTAINER_CLI) build -f image/gateway/Dockerfile --build-arg BINARY_FROM=$(BINARY_FROM) -t $(GATEWAY_IMAGE) .
+
+gateway-image-check: gateway-render-check ## Check the built gateway image carries what ADR-0028 decision 8 and ADR-0027 say: both Envoys unprivileged, the relay without the agent's socket, the table, no sshd, no forwarding
+	CONTAINER_CLI=$(CONTAINER_CLI) ./image/gateway/check.sh $(GATEWAY_IMAGE)
+
+# The kind tier's Envoy bootstrap is the image's template rendered with the tier's values
+# (dev/kind/gateway/envoy.env), so what the tier proves is what the image carries.
+kind-gateway-envoy: ## Render dev/kind/gateway/envoy.yaml from image/gateway/envoy/gateway.yaml.in and the tier's env
+	./image/gateway/render image/gateway/envoy/gateway.yaml.in dev/kind/gateway/envoy.yaml dev/kind/gateway/envoy.env
+
+gateway-render-check: ## Fail when dev/kind/gateway/envoy.yaml drifted from the image's template, or an example env leaves a placeholder unfilled
+	@./image/gateway/render image/gateway/envoy/gateway.yaml.in - dev/kind/gateway/envoy.env | diff -u dev/kind/gateway/envoy.yaml - \
+	  || { echo "dev/kind/gateway/envoy.yaml drifted from image/gateway/envoy/gateway.yaml.in: run make kind-gateway-envoy"; exit 1; }
+	@for t in envoy/gateway.yaml.in envoy/relay.yaml.in nftables.conf.in network.in; do \
+	  ./image/gateway/render image/gateway/$$t - image/gateway/env.example image/gateway/vm.env.example > /dev/null || exit 1; \
+	done
+	@echo "✓ the kind bootstrap is the image's template, and the example env files fill every template"
+
 crds: ## Render mediatore's CRDs from their Rust types into deploy/base/crds/ (ADR-0008; never hand-edited, a unit test fails on a stale file)
 	cargo run -q -p mediatore-claims --bin crdgen -- --out-dir deploy/base/crds
 
@@ -156,12 +179,13 @@ dist-tpm-plugin: ## Extract the pinned tpm attestor binaries (server and agent) 
 	  echo "✓ dist/$$bin ($$sha)"; \
 	done
 
-manifests: ## Render deploy/base, the example overlay and the per-namespace bundle RBAC with kustomize, as a check that all still build
+manifests: ## Render deploy/base, the example overlay, the per-namespace bundle RBAC and the gateway's objects with kustomize, as a check that all still build
 	@command -v kubectl >/dev/null 2>&1 || { echo "Error: kubectl not found"; exit 1; }
 	kubectl kustomize deploy/base > /dev/null
 	kubectl kustomize deploy/overlays/homelab-example > /dev/null
 	kubectl kustomize deploy/policy-bundles > /dev/null
-	@echo "✓ deploy/base, deploy/overlays/homelab-example and deploy/policy-bundles render"
+	kubectl kustomize deploy/gateway > /dev/null
+	@echo "✓ deploy/base, deploy/overlays/homelab-example, deploy/policy-bundles and deploy/gateway render"
 
 # ----- Release assets: what the release page carries beside the two images --------------
 #
@@ -173,13 +197,15 @@ manifests: ## Render deploy/base, the example overlay and the per-namespace bund
 RELEASE_DIR    ?= release
 RELEASE_IMAGE  := ghcr.io/firestoned/mediatore
 RELEASE_GUEST  := ghcr.io/firestoned/mediatore-guest
+RELEASE_GATEWAY := ghcr.io/firestoned/mediatore-gateway
 RELEASE_BINARY ?= dist/mediatore
 RELEASE_BINARY_DARWIN ?= dist/mediatore-darwin-arm64
 
-release-assets: ## Gather RELEASE_DIR for VERSION: the linux and darwin binaries (+ SBOMs staged in dist/), mediatore-VERSION.yaml pinned to IMAGE_DIGEST, the VMImage pinned to GUEST_DIGEST, the cloud-config layers, checksums
+release-assets: ## Gather RELEASE_DIR for VERSION: the linux and darwin binaries (+ SBOMs staged in dist/), mediatore-VERSION.yaml pinned to IMAGE_DIGEST, the VMImages pinned to GUEST_DIGEST and GATEWAY_DIGEST, the cloud-config layers, checksums
 	@test -n "$(VERSION)" || { echo "set VERSION, e.g. 0.1.0"; exit 1; }
 	@echo "$(IMAGE_DIGEST)" | grep -Eq '^sha256:[0-9a-f]{64}$$' || { echo "set IMAGE_DIGEST to sha256:<64 hex>, got '$(IMAGE_DIGEST)'"; exit 1; }
 	@echo "$(GUEST_DIGEST)" | grep -Eq '^sha256:[0-9a-f]{64}$$' || { echo "set GUEST_DIGEST to sha256:<64 hex>, got '$(GUEST_DIGEST)'"; exit 1; }
+	@echo "$(GATEWAY_DIGEST)" | grep -Eq '^sha256:[0-9a-f]{64}$$' || { echo "set GATEWAY_DIGEST to sha256:<64 hex>, got '$(GATEWAY_DIGEST)'"; exit 1; }
 	@test -x "$(RELEASE_BINARY)" || { echo "$(RELEASE_BINARY) missing or not executable: make dist first"; exit 1; }
 	@test -x "$(RELEASE_BINARY_DARWIN)" || { echo "$(RELEASE_BINARY_DARWIN) missing or not executable: make dist-darwin on a Mac, or stage the artifact"; exit 1; }
 	@command -v kubectl >/dev/null 2>&1 || { echo "Error: kubectl not found"; exit 1; }
@@ -191,6 +217,7 @@ release-assets: ## Gather RELEASE_DIR for VERSION: the linux and darwin binaries
 	@if [ -f dist/mediatore.cdx.json ]; then cp dist/mediatore.cdx.json "$(RELEASE_DIR)/mediatore-$(VERSION)-linux-amd64.cdx.json"; fi
 	@if [ -f dist/docker-sbom.json ]; then cp dist/docker-sbom.json "$(RELEASE_DIR)/mediatore-$(VERSION)-image.sbom.spdx.json"; fi
 	@if [ -f dist/guest-image-sbom.json ]; then cp dist/guest-image-sbom.json "$(RELEASE_DIR)/mediatore-guest-$(VERSION)-image.sbom.spdx.json"; fi
+	@if [ -f dist/gateway-image-sbom.json ]; then cp dist/gateway-image-sbom.json "$(RELEASE_DIR)/mediatore-gateway-$(VERSION)-image.sbom.spdx.json"; fi
 	@{ printf '# mediatore %s: the CRD, the broker Deployment, RBAC, the admission policies, the services, the image pinned by digest.\n' "$(VERSION)"; \
 	   printf '# Rendered from deploy/base. What is yours is an overlay (deploy/overlays/homelab-example): mediatore.yaml, the Secrets, the ingress.\n'; \
 	   kubectl kustomize deploy/base; } \
@@ -198,16 +225,20 @@ release-assets: ## Gather RELEASE_DIR for VERSION: the linux and darwin binaries
 	@sed -E -e 's#$(RELEASE_GUEST)@sha256:[0-9a-f]{64} *(\# placeholder:[^\n]*)?#$(RELEASE_GUEST)@$(GUEST_DIGEST)#' deploy/overlays/homelab-example/vmimage.yaml > "$(RELEASE_DIR)/mediatore-guest-$(VERSION)-vmimage.yaml"
 	@cp image/cloud-config.yaml "$(RELEASE_DIR)/mediatore-guest-$(VERSION)-cloud-config-base.yaml"
 	@cp image/cloud-config-deployment.example.yaml "$(RELEASE_DIR)/mediatore-guest-$(VERSION)-cloud-config-deployment.example.yaml"
+	@sed -E -e 's#$(RELEASE_GATEWAY)@sha256:[0-9a-f]{64} *(\# placeholder:[^\n]*)?#$(RELEASE_GATEWAY)@$(GATEWAY_DIGEST)#' deploy/gateway/vmimage.yaml > "$(RELEASE_DIR)/mediatore-gateway-$(VERSION)-vmimage.yaml"
+	@cp image/gateway/cloud-config.yaml "$(RELEASE_DIR)/mediatore-gateway-$(VERSION)-cloud-config-base.yaml"
+	@cp image/gateway/cloud-config-deployment.example.yaml "$(RELEASE_DIR)/mediatore-gateway-$(VERSION)-cloud-config-deployment.example.yaml"
 	@cd "$(RELEASE_DIR)" && rm -f checksums.sha256 && shasum -a 256 ./* > checksums.sha256
-	@echo "✓ $(RELEASE_DIR): $$(ls "$(RELEASE_DIR)" | wc -l | tr -d ' ') files; $(RELEASE_IMAGE)@$(IMAGE_DIGEST); $(RELEASE_GUEST)@$(GUEST_DIGEST)"
+	@echo "✓ $(RELEASE_DIR): $$(ls "$(RELEASE_DIR)" | wc -l | tr -d ' ') files; $(RELEASE_IMAGE)@$(IMAGE_DIGEST); $(RELEASE_GUEST)@$(GUEST_DIGEST); $(RELEASE_GATEWAY)@$(GATEWAY_DIGEST)"
 
-release-assets-test: ## Prove release-assets pins both images by digest, keeps every kind the install needs, and checksums every file
+release-assets-test: ## Prove release-assets pins the three images by digest, keeps every kind the install needs, and checksums every file
 	@tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
 	  printf '#!/bin/sh\necho "mediatore 0.0.0-test"\n' > "$$tmp/mediatore" && chmod +x "$$tmp/mediatore"; cp "$$tmp/mediatore" "$$tmp/mediatore-darwin"; \
 	  d1=sha256:$$(printf 'release-assets-test-image' | shasum -a 256 | cut -d' ' -f1); \
 	  d2=sha256:$$(printf 'release-assets-test-guest' | shasum -a 256 | cut -d' ' -f1); \
-	  $(MAKE) --no-print-directory -s release-assets VERSION=0.0.0-test IMAGE_DIGEST=$$d1 GUEST_DIGEST=$$d2 RELEASE_DIR="$$tmp/release" RELEASE_BINARY="$$tmp/mediatore" RELEASE_BINARY_DARWIN="$$tmp/mediatore-darwin" >/dev/null && \
-	  python3 scripts/check_release_assets.py "$$tmp/release" 0.0.0-test "$(RELEASE_IMAGE)@$$d1" "$(RELEASE_GUEST)@$$d2" && \
+	  d3=sha256:$$(printf 'release-assets-test-gateway' | shasum -a 256 | cut -d' ' -f1); \
+	  $(MAKE) --no-print-directory -s release-assets VERSION=0.0.0-test IMAGE_DIGEST=$$d1 GUEST_DIGEST=$$d2 GATEWAY_DIGEST=$$d3 RELEASE_DIR="$$tmp/release" RELEASE_BINARY="$$tmp/mediatore" RELEASE_BINARY_DARWIN="$$tmp/mediatore-darwin" >/dev/null && \
+	  python3 scripts/check_release_assets.py "$$tmp/release" 0.0.0-test "$(RELEASE_IMAGE)@$$d1" "$(RELEASE_GUEST)@$$d2" "$(RELEASE_GATEWAY)@$$d3" && \
 	  echo "release-assets-test: ok"
 
 # The binary reports the release's version (`mediatore --version`, clap's `version` reads
@@ -415,7 +446,7 @@ kind-notaio: kind-create kind-openbao ## notaio from its release manifests (vers
 kind-e2e-policy: kind-banlieue-crds kind-broker kind-notaio ## ADR-0026 live: notaio's signed bundle admitted and recorded, the PolicyConformant verdicts and codes, a newer version followed, a replay refused by the floor across a restart, nothing refused
 	./dev/kind/policy-e2e.sh $(KIND_KUBECONFIG) $(KIND_SA_KUBECONFIG) $(KIND_DIR)
 
-kind-gateway: kind-broker ## The egress gateway in kind (ADR-0028): Envoy from its official image, pinned by digest in dev/kind/gateway, on the gateway SVID over SDS, mediatore gateway beside it, and the TLS destination the tier reaches through it (its certificate minted here)
+kind-gateway: kind-broker gateway-render-check ## The egress gateway in kind (ADR-0028): Envoy from its official image, pinned by digest in dev/kind/gateway, on the gateway SVID over SDS, mediatore gateway beside it, and the TLS destination the tier reaches through it (its certificate minted here)
 	cargo run -q -p mediatore-testkit --bin tls-fixture -- --out-dir $(KIND_DIR)/gateway --dns destination.mediatore-e2e-gateway.svc.cluster.local
 	@$(KIND_KUBECTL) get ns mediatore-e2e-gateway >/dev/null 2>&1 || $(KIND_KUBECTL) create ns mediatore-e2e-gateway
 	$(KIND_KUBECTL) -n mediatore-e2e-gateway create secret generic destination-tls --from-file=$(KIND_DIR)/gateway/server.pem --from-file=$(KIND_DIR)/gateway/server-key.pem --dry-run=client -o yaml | $(KIND_KUBECTL) apply -f -

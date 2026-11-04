@@ -1,0 +1,105 @@
+#cloud-config
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+
+# The deployment's layer of the egress gateway VM image's cloud-config (ADR-0028 decision
+# 10): the install block and what the image deliberately does not carry, the SPIRE agent's
+# configuration, the trust bundle and the gateway's env file. Copy it outside the
+# repository, replace the placeholders, and store it as the third cloud-config Secret
+# deploy/gateway/vmimage.yaml names. Public material only: the bundle is the same for every
+# gateway by design (banlieue ADR-0108 decision 2), the env file holds addresses and ports,
+# and the agent's key is generated on each gateway's first boot onto the sealed persistent
+# partition and never appears here. The sandbox address of each gateway is not here either:
+# it is the VirtualMachine's userData (deploy/gateway/virtualmachines.yaml).
+install:
+  auto: true
+  device: auto
+  # Deferred mode (banlieue ADR-0040): each gateway runs this install at its own first
+  # boot, with its own vTPM attached, and seals the persistent partition to it.
+  reboot: true
+  poweroff: false
+  encrypted_partitions:
+    - COS_PERSISTENT
+# Console break-glass only: the image has no sshd (ADR-0028 decision 8). A hashed
+# password, or `install.nousers: true` for a gateway nobody can log in to.
+users:
+  - name: kairos-admin
+    groups: ["admin"]
+    passwd: "$6$replace-me$with-a-hash-from-mkpasswd"
+stages:
+  initramfs:
+    # /etc is an ephemeral overlay on Kairos: written at every boot, from this layer.
+    - name: spire-agent-config
+      files:
+        - path: /etc/spire/bundle.pem
+          permissions: 0644
+          owner: 0
+          group: 0
+          # `spire-server bundle show` on your SPIRE server (deploying guide, step 6).
+          content: |
+            -----BEGIN CERTIFICATE-----
+            ...your trust bundle...
+            -----END CERTIFICATE-----
+        - path: /etc/spire/agent.conf
+          permissions: 0644
+          owner: 0
+          group: 0
+          # image/spire/agent.conf with the two placeholders replaced. The gateway reaches
+          # the SPIRE server on its egress side, directly: by address, since the gateway
+          # is what resolves names for everyone else and needs none itself.
+          content: |
+            agent {
+              trust_domain = "sandbox.home.example"
+              server_address = "192.0.2.20"
+              server_port = "8081"
+              trust_bundle_path = "/etc/spire/bundle.pem"
+              socket_path = "/run/spire/sockets/agent.sock"
+              data_dir = "/var/lib/spire/agent"
+              log_level = "INFO"
+            }
+            plugins {
+              NodeAttestor "tpm" {
+                plugin_cmd = "/usr/lib/spire/tpm_attestor_agent"
+                plugin_checksum = "ffb7e266c7a10a7b1bdb349409d6c2ded8090715770287813055431cb692575c"
+                plugin_data {
+                  pve { enabled = false }
+                }
+              }
+              KeyManager "disk" {
+                plugin_data {
+                  directory = "/var/lib/spire/agent"
+                }
+              }
+              WorkloadAttestor "unix" {
+                plugin_data {
+                  discover_workload_path = true
+                }
+              }
+            }
+    - name: mediatore-gateway-env
+      files:
+        - path: /etc/mediatore-gateway/env
+          permissions: 0644
+          owner: 0
+          group: 0
+          # image/gateway/env.example with your values: the trust domain, the sandbox
+          # NIC's name and prefix, the SPIRE server's and the broker's addresses on the
+          # egress side, the broker's URL for the authorizer. Whole-line comments only.
+          content: |
+            TRUST_DOMAIN=sandbox.home.example
+            SANDBOX_IF=enp2s0
+            SANDBOX_PREFIX=24
+            DATA_PORT=8443
+            RELAY_SPIRE_PORT=3129
+            RELAY_BROKER_PORT=3130
+            RELAY_CAP=16
+            SPIRE_SERVER_ADDRESS=192.0.2.20
+            SPIRE_SERVER_PORT=8081
+            BROKER_ADDRESS=192.0.2.21
+            BROKER_PORT=443
+            AUTHORIZER_ADDRESS=127.0.0.1
+            AUTHORIZER_PORT=9001
+            SPIRE_SOCKET=/run/spire/sockets/agent.sock
+            MEDIATORE_URL=https://192.0.2.21
+            SPIFFE_ENDPOINT_SOCKET=unix:///run/spire/sockets/agent.sock
+            RUST_LOG=info

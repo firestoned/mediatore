@@ -155,7 +155,7 @@
       "unique-id": "system-sandbox-vm",
       "node-type": "system",
       "name": "Sandbox VM (pool member)",
-      "description": "A banlieue pool member with a fresh vTPM, attested at boot before any claim exists. Boots the sandbox VM image, a Kairos Debian derivative built from this repository (image/Dockerfile, published as ghcr.io/firestoned/mediatore-guest, signed and attested; ADR-0023): the one mediatore binary at /usr/bin/mediatore, the SPIRE agent and its TPM attestor plugin in the immutable rootfs, nftables, tpm2-tools, qemu-guest-agent, no sshd or other listener; the agent's configuration and the trust bundle from the deployment's cloud-config layer at every boot, the agent's key on the sealed persistent partition, never in the image. Carries the in-guest agent and, once bound, the jailed workload. Its units start only on the installed disk, and its GuestReady is announced by the in-guest agent after registration (ADR-0019), not by a boot stage."
+      "description": "A banlieue pool member with a fresh vTPM, attested at boot before any claim exists. Boots the sandbox VM image, a Kairos Debian derivative built from this repository (image/Dockerfile, published as ghcr.io/firestoned/mediatore-guest, signed and attested; ADR-0023): the one mediatore binary at /usr/bin/mediatore, the SPIRE agent and its TPM attestor plugin in the immutable rootfs, nftables, tpm2-tools, qemu-guest-agent, no sshd or other listener; the agent's configuration and the trust bundle from the deployment's cloud-config layer at every boot, the agent's key on the sealed persistent partition, never in the image. Carries the in-guest agent and, once bound, the jailed workload. Its units start only on the installed disk, and its GuestReady is announced by the in-guest agent after registration (ADR-0019), not by a boot stage. With egress gateways, the pool's cloud-config layer points the agent's server_address and MEDIATORE_URL at a gateway's sandbox address and the control relay's ports, by address, and writes the bootstrap list /etc/mediatore/gateways the guest uses until the broker's gateways arrive (ADR-0027 decisions 3 and 4)."
     },
     {
       "unique-id": "service-spire-agent",
@@ -167,7 +167,7 @@
       "unique-id": "service-guest-agent",
       "node-type": "service",
       "name": "mediatore guest",
-      "description": "Root daemon, the guest role of the one mediatore binary (ADR-0014): registers the node (EK hash + DMI UUID), then announces GuestReady to the hypervisor over the channel banlieue reads (the /run marker, guestinfo or vsock; ADR-0019), so the pool counts the member only once it is attested and registered; polls GET /v1/me for a bound claim, creates the per-subject user (sb- + 12 hex, ADR-0004), mounts a size-bounded tmpfs at /mnt/sandbox (nosuid, nodev, mode 0711 so the egress proxy reaches its files; ADR-0021 amended) and pulls the claim's workload image from its registry into it as the rootfs (with the operator's credential for that registry when the broker handed one over, used for the pull and kept nowhere; ADR-0022), manifest and layers verified against their digests, the manifest digest logged (ADR-0021), loads the per-claim nftables ruleset keyed by that uid (the broker, the audiences' egress endpoints, DNS; no ruleset, no jail; ADR-0020), bind-mounts the binary at the pinned path read-only into the jail and supervises the nsjail until the deadline, then tears down; what nsjail execs is the binary's jail-exec role, which applies Landlock to itself (the rootfs readable, /work, /tmp and the home writable, TCP connect to the egress proxy's port only, no bind) before the workload's argv runs, and a refusal (exit 125) ends the claim instead of restarting (ADR-0024). Since ADR-0025 it also generates the claim's phantom token, writes the routes GET /v1/me returned to a file of the sandbox user's, starts mediatore egress-proxy as that user outside the jail before the jail, and ends the claim if the proxy exits. crates/mediatore-guest."
+      "description": "Root daemon, the guest role of the one mediatore binary (ADR-0014): registers the node (EK hash + DMI UUID), then announces GuestReady to the hypervisor over the channel banlieue reads (the /run marker, guestinfo or vsock; ADR-0019), so the pool counts the member only once it is attested and registered; polls GET /v1/me for a bound claim, creates the per-subject user (sb- + 12 hex, ADR-0004), mounts a size-bounded tmpfs at /mnt/sandbox (nosuid, nodev, mode 0711 so the egress proxy reaches its files; ADR-0021 amended) and pulls the claim's workload image from its registry into it as the rootfs (with the operator's credential for that registry when the broker handed one over, used for the pull and kept nowhere; ADR-0022), manifest and layers verified against their digests, the manifest digest logged (ADR-0021), loads the per-claim nftables ruleset keyed by that uid (the broker, the audiences' egress endpoints, DNS; no ruleset, no jail; ADR-0020), bind-mounts the binary at the pinned path read-only into the jail and supervises the nsjail until the deadline, then tears down; what nsjail execs is the binary's jail-exec role, which applies Landlock to itself (the rootfs readable, /work, /tmp and the home writable, TCP connect to the egress proxy's port only, no bind) before the workload's argv runs, and a refusal (exit 125) ends the claim instead of restarting (ADR-0024). Since ADR-0025 it also generates the claim's phantom token, writes the routes GET /v1/me returned to a file of the sandbox user's, starts mediatore egress-proxy as that user outside the jail before the jail, and ends the claim if the proxy exits. crates/mediatore-guest. The ruleset has two shapes since ADR-0028 decision 6 (net::Shape): with gateways, from GET /v1/me or the pool's /etc/mediatore/gateways, the relay, the gateways and the proxy by address and no DNS rule at all, a broker or gateway given by name refusing the claim; without, ADR-0020's list, the broker, the audiences' endpoints resolved at load, the proxy and DNS."
     },
     {
       "unique-id": "service-sandbox-workload",
@@ -184,11 +184,19 @@
     {
       "unique-id": "service-egress-gateway",
       "node-type": "service",
-      "name": "Egress gateway (Envoy + mediatore gateway)",
-      "description": "The egress gateway of ADR-0028: Envoy on each of banlieue's three proxy VMs per environment, with its own SPIFFE identity spiffe://<td>/gateway from a local SPIRE agent, and the authorizer role of the one binary, mediatore gateway, beside it. Phase one is identity, allowlist and audit, no interception. Built so far (roadmap 10): the broker side, GET /v1/gateway/claims/{uid} on the sandbox listener, answered to the gateway identity only, and the gateways list every guest receives on GET /v1/me; the authorizer, mediatore gateway (crates/mediatore-gateway): Envoy's external authorization service over gRPC on loopback (Envoy's own Check call; its HTTP mode cannot carry a CONNECT check), reading the peer SPIFFE ID, the method and the authority from what Envoy verified, answering OK or PERMISSION_DENIED with a code from a bounded cache of one allowlist per claim (fresh 30 s, stale for 300 s more while the broker is unreachable, never past the claim's deadline, dropped on the broker's 404, least recently used evicted past 4096 claims, one ask per claim at a time), deny on no answer. And Envoy's bootstrap (dev/kind/gateway/envoy.yaml): SDS from the SPIRE agent, the claim prefix required of every peer, CONNECT only through the authorizer, the authority resolved by Envoy, one access-log line per tunnel, proven in kind against Envoy 1.40.2 (make kind-e2e-gateway, through the real egress proxy and its forwarder since 2026-11-04). The forwarder is built, as the egress proxy's dialer (service-egress-proxy); the VMs are not, and the stack model (agentsandbox-stack.calm.json) carries them as proposed.",
+      "name": "Egress gateway (Envoy + mediatore gateway, with the control relay beside them)",
+      "description": "The egress gateway of ADR-0028 on each of banlieue's three proxy VMs per environment (banlieue ADR-0109), built as image content (image/gateway/, published as ghcr.io/firestoned/mediatore-gateway, signed and attested; the VMs, the two-interface class and the entries in deploy/gateway/). The data plane: Envoy on the sandbox address, mutual TLS 1.3 with X25519MLKEM768 offered first, its own identity spiffe://<td>/gateway over SDS from the local SPIRE agent (the VM attests with its vTPM like a pool member, two ClusterStaticEntry objects per VM, unix:user:envoy and unix:user:mediatore-gateway, applied by the platform team), every peer required to be a claim of the trust domain before any filter runs, CONNECT the only route, each tunnel checked with the authorizer beside it, mediatore gateway (crates/mediatore-gateway: Envoy's own Check call over gRPC on loopback; the peer from the verified certificate, the method and the authority; OK or PERMISSION_DENIED with a stable code from a bounded cache of one allowlist per claim, fresh 30 s, stale for 300 s more while the broker is unreachable, never past the claim's deadline, dropped on the broker's 404, least recently used evicted past 4096 claims, one ask per claim at a time, deny on no answer), the authority resolved and dialled by Envoy from the egress address, one access-log line per tunnel keyed by the peer's SPIFFE ID, no admin interface, no interception. The host: forwarding off, an nftables table with default-drop input admitting the data port and the relay ports on the sandbox interface only, nothing new on egress, both Envoys as their own users with no capability and a read-only root (ADR-0028 decision 8, ADR-0027 decision 5). The bootstrap the kind tier proves is the image's template rendered with the tier's values (make kind-e2e-gateway, make gateway-render-check). The image is built and checked (image/gateway/check.sh), not booted: the live run on gateway VMs is roadmap 06's proof.",
       "metadata": {
-        "status": "in progress",
-        "diagram-style": "dashed orange: the broker's route exists, the gateway does not yet"
+        "status": "implemented"
+      }
+    },
+    {
+      "unique-id": "service-control-relay",
+      "node-type": "service",
+      "name": "Control relay (Envoy, no identity)",
+      "description": "ADR-0027's control plane on each gateway VM: a second Envoy, its own systemd unit and user (envoy-relay, image/gateway/systemd/envoy-relay.service), with no SPIRE socket (InaccessiblePaths=/run/spire), no SVID and no credential of any kind. Two tcp_proxy listeners on the sandbox address, 3129 to the SPIRE server's attestation port and 3130 to the broker's sandbox listener, each a fixed upstream by address from the deployment's env file (image/gateway/envoy/relay.yaml.in): no CONNECT, no authority from the client, no name resolution for the sandbox. It carries the pool VM's three bootstrap connections as ciphertext, the TLS end to end between the agent and the server and between the node or the claim and the broker, and sees only metadata, which it logs one line per connection (source, upstream, bytes each way, duration). The host table bounds each sandbox source's new relay connections (ct count over RELAY_CAP in a dynamic set, ADR-0027 decision 5), since the relay has no identity to rate-limit by. It is the only way a pool VM reaches the identity plane: the segment has no route and no resolver.",
+      "metadata": {
+        "status": "implemented"
       }
     },
     {
@@ -207,7 +215,7 @@
       "unique-id": "network-sandbox-segment",
       "node-type": "network",
       "name": "Sandbox Network Segment",
-      "description": "Pool members' network. Egress only: SPIRE server (TCP 8081), mediatore's sandbox listener (TCP 443), the workload image registry (reached by the guest as root, ADR-0021) and the allowed downstream APIs. Nothing inbound to the VM; from inside the jail the sandbox uid reaches the broker, its audiences' egress endpoints and the resolvers, nothing else (ADR-0020), so the Kube API and the SPIRE server are unreachable from it."
+      "description": "Pool members' network, layer 2 only (banlieue ADR-0109): no route anywhere and no resolver. A member reaches exactly the three gateways' sandbox addresses: the data plane (TCP 8443, mutual TLS with the claim SVID, CONNECT to the claim's allowlist) and the control relay (TCP 3129 to the SPIRE server, 3130 to the broker, the TLS inside end to end). The SPIRE server, the broker's sandbox listener, the workload image registry and the downstream APIs are reached through the gateways and never directly; from inside the jail the sandbox uid reaches the egress proxy on loopback alone, and the proxy's own sockets the relay and the gateways by address (ADR-0020 as amended by ADR-0028 decision 6 and ADR-0027 decision 6). Nothing inbound to a VM. In an environment without gateways yet, the older shape: the broker, the audiences' egress endpoints and the resolvers."
     }
   ],
   "relationships": [
@@ -247,12 +255,14 @@
     },
     {
       "unique-id": "rel-vm-deployed-in-segment",
-      "description": "Pool members live on the egress-only sandbox segment.",
+      "description": "Pool members live on the layer 2 sandbox segment; the gateways and their control relay have their sandbox interface on it and their egress interface on a routable network (banlieue ADR-0109 decision 4).",
       "relationship-type": {
         "deployed-in": {
           "container": "network-sandbox-segment",
           "nodes": [
-            "system-sandbox-vm"
+            "system-sandbox-vm",
+            "service-egress-gateway",
+            "service-control-relay"
           ]
         }
       }
@@ -538,7 +548,7 @@
     },
     {
       "unique-id": "rel-spire-agent-server",
-      "description": "TPM node attestation at boot (EK certificate + credential activation), then SVID rotation. Claim-independent: a warm member is attested before any claim exists.",
+      "description": "TPM node attestation at boot (EK certificate + credential activation), then SVID rotation. Claim-independent: a warm member is attested before any claim exists. With egress gateways the agent's server_address is a gateway's sandbox address and the relay's SPIRE port (ADR-0027 decision 3): the attestation's TLS is end to end, the relay sees ciphertext. One address, so the agent fails over between gateways only when it restarts (ADR-0027's open item).",
       "relationship-type": {
         "connects": {
           "source": {
@@ -553,7 +563,7 @@
     },
     {
       "unique-id": "rel-guest-agent-mediatore",
-      "description": "POST /v1/nodes (EK hash + DMI UUID + hostname) over the node SVID at boot; then polls GET /v1/me until a claim is bound and the subject comes back. Since ADR-0022 the answer to GET /v1/me includes the pull credential for the claim's image registry when the operator configured one. Since ADR-0028 decision 6 the answer also carries gateways, the environment's egress gateways in the broker's order, for the forwarder and the ruleset; empty until the gateways exist.",
+      "description": "POST /v1/nodes (EK hash + DMI UUID + hostname) over the node SVID at boot; then polls GET /v1/me until a claim is bound and the subject comes back. Since ADR-0022 the answer to GET /v1/me includes the pull credential for the claim's image registry when the operator configured one. Since ADR-0028 decision 6 the answer also carries gateways, the environment's egress gateways in the broker's order, for the forwarder and the ruleset; empty until the gateways exist. With egress gateways the connection itself runs through a gateway's control relay (ADR-0027 decision 3), the node SVID's mutual TLS end to end inside it, and the guest falls back to the pool's bootstrap list /etc/mediatore/gateways when the answer lists none (decision 4).",
       "relationship-type": {
         "connects": {
           "source": {
@@ -612,7 +622,7 @@
     },
     {
       "unique-id": "rel-egress-proxy-mediatore",
-      "description": "POST /v1/token over the claim SVID, by the egress proxy since ADR-0025 (the workload before it): one audience per request, from the claim's allowlist, capped at 15 minutes, never a refresh token; fetched when a request needs it and cached until shortly before its expiry. Rate-limited per claim (token.rate_per_minute, 429 beyond it) ahead of any upstream call (ADR-0013).",
+      "description": "POST /v1/token over the claim SVID, by the egress proxy since ADR-0025 (the workload before it): one audience per request, from the claim's allowlist, capped at 15 minutes, never a refresh token; fetched when a request needs it and cached until shortly before its expiry. Rate-limited per claim (token.rate_per_minute, 429 beyond it) ahead of any upstream call (ADR-0013). With egress gateways this connection too runs through a gateway's control relay, the claim SVID's mutual TLS end to end inside it (ADR-0027 decision 3).",
       "relationship-type": {
         "connects": {
           "source": {
@@ -638,10 +648,82 @@
           }
         }
       },
-      "protocol": "mTLS",
-      "metadata": {
-        "status": "in progress"
-      }
+      "protocol": "mTLS"
+    },
+    {
+      "unique-id": "rel-egress-proxy-gateway",
+      "description": "The forwarder's tunnel (ADR-0028 decisions 3 and 7, a dialer inside the egress proxy by ADR-0027 decision 8): TCP to a gateway's sandbox address and data port, TLS 1.3 on the sandbox leg's configuration (X25519MLKEM768 only) presenting the claim SVID and verifying the gateway as exactly spiffe://<td>/gateway, CONNECT host:port for the upstream the request names, the upstream's own TLS inside the tunnel end to end. The list from GET /v1/me walked from a random start per connection, a connect or handshake failure moving to the next, a gateway's answer other than 200 final (502 gateway_refused at the workload, the authorizer's code in the log; gateway_unreachable when none carried it). Proven against a stand-in gateway in crates/mediatore/tests/e2e_forward.rs and against the real Envoy in kind.",
+      "relationship-type": {
+        "connects": {
+          "source": {
+            "node": "service-egress-proxy"
+          },
+          "destination": {
+            "node": "service-egress-gateway"
+          }
+        }
+      },
+      "protocol": "mTLS"
+    },
+    {
+      "unique-id": "rel-gateway-downstream",
+      "description": "The admitted tunnel: Envoy resolves the CONNECT authority on its own resolver and connects from the egress address to the host:port the authorizer allowed for that claim, relaying the bytes untouched (no interception, ADR-0028 decisions 5 and 9); the TLS inside is the proxy's with the downstream API. One access-log line per tunnel: the peer's SPIFFE ID, the authority, the status, the flags, bytes each way.",
+      "relationship-type": {
+        "connects": {
+          "source": {
+            "node": "service-egress-gateway"
+          },
+          "destination": {
+            "node": "ecosystem-downstream-api"
+          }
+        }
+      },
+      "protocol": "TCP"
+    },
+    {
+      "unique-id": "rel-sandbox-vm-relay",
+      "description": "A pool VM's three bootstrap connections, as ciphertext (ADR-0027 decisions 2 and 3): the SPIRE agent's attestation and renewals to the relay's 3129, the guest's node session and the egress proxy's claim session to its 3130; each sandbox source bounded by the host table's connection cap (decision 5).",
+      "relationship-type": {
+        "connects": {
+          "source": {
+            "node": "system-sandbox-vm"
+          },
+          "destination": {
+            "node": "service-control-relay"
+          }
+        }
+      },
+      "protocol": "TCP"
+    },
+    {
+      "unique-id": "rel-relay-spire-server",
+      "description": "The relay's fixed SPIRE upstream, by address, from the gateway's egress interface: the attestation's TLS passes through unread (ADR-0027 decision 3). The network admits the gateways' egress addresses on this port and nothing from the sandbox range.",
+      "relationship-type": {
+        "connects": {
+          "source": {
+            "node": "service-control-relay"
+          },
+          "destination": {
+            "node": "service-spire-server"
+          }
+        }
+      },
+      "protocol": "TCP"
+    },
+    {
+      "unique-id": "rel-relay-mediatore",
+      "description": "The relay's fixed broker upstream, by address, from the gateway's egress interface: the node's and the claim's mutual TLS with the sandbox listener pass through unread (ADR-0027 decision 3); the broker verifies the peer's SVID exactly as before and sees the relay's source address.",
+      "relationship-type": {
+        "connects": {
+          "source": {
+            "node": "service-control-relay"
+          },
+          "destination": {
+            "node": "service-mediatore-sandbox-api"
+          }
+        }
+      },
+      "protocol": "TCP"
     },
     {
       "unique-id": "rel-egress-proxy-downstream",

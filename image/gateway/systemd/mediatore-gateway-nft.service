@@ -1,0 +1,24 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+
+[Unit]
+Description=The egress gateway's host table (ADR-0027 decision 5, ADR-0028 decision 8)
+# Default-drop input, the sandbox ports admitted with the per-source cap, nothing new on
+# egress, forward dropped. Rendered from the env files and loaded in one transaction
+# before either Envoy starts; a table that does not load means no listener (fail closed).
+Before=envoy-gateway.service envoy-relay.service mediatore-gateway.service
+ConditionPathExists=|/run/cos/active_mode
+ConditionPathExists=|/run/cos/passive_mode
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+RuntimeDirectory=mediatore-gateway
+RuntimeDirectoryPreserve=yes
+RuntimeDirectoryMode=0755
+ExecStart=/usr/libexec/mediatore-gateway/render /usr/share/mediatore-gateway/nftables.conf.in /run/mediatore-gateway/nftables.conf /etc/mediatore-gateway/env /etc/mediatore-gateway/vm.env
+ExecStart=/usr/sbin/nft -f /run/mediatore-gateway/nftables.conf
+ExecStop=/usr/sbin/nft delete table inet mediatore_gateway
+
+[Install]
+WantedBy=multi-user.target

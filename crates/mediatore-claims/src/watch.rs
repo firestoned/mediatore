@@ -68,12 +68,12 @@ pub struct WatcherConfig {
 impl Default for WatcherConfig {
     fn default() -> Self {
         Self {
-            resync: Duration::from_secs(300),
+            resync: Duration::from_mins(5),
             resolve_timeout: Duration::from_secs(60),
             requeue: Duration::from_secs(5),
             audiences: vec![],
             issuers: vec![],
-            retention: Duration::from_secs(3600),
+            retention: Duration::from_hours(1),
         }
     }
 }
@@ -1019,7 +1019,12 @@ mod tests {
         r.watcher.reconcile_claim(&kept_claim).await.unwrap();
         // an entry nobody's record knows about
         r.entries
-            .create_claim_entry(RSA_EK_HASH, Uuid::new_v4(), "sb-0123456789ab")
+            .create_claim_entry(
+                RSA_EK_HASH,
+                Uuid::new_v4(),
+                "sb-0123456789ab",
+                std::time::Duration::from_hours(1),
+            )
             .await
             .unwrap();
         r.claims.mark_existing(kept);

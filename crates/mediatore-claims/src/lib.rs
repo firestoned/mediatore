@@ -76,9 +76,11 @@ impl Reconciler {
             return Ok(()); // idempotent on restart
         }
         let user = rec.subject.sandbox_username();
+        // The SVID never outlives the claim (ADR-0027 decision 7): the clock starts now.
+        let claim_ttl = std::time::Duration::from_secs(u64::from(rec.ttl_seconds));
         let entry = self
             .spire
-            .create_claim_entry(ek_hash, claim_uid, &user)
+            .create_claim_entry(ek_hash, claim_uid, &user, claim_ttl)
             .await?;
         rec.entry_id = Some(entry);
         rec.node_id = Some(self.naming.agent_id(ek_hash));
@@ -263,7 +265,12 @@ mod tests {
         store.revoke_claim(revoked, Utc::now()).await.unwrap();
         // An entry declared by a previous broker instance for a claim this store never saw.
         entries
-            .create_claim_entry(EK, unknown, "sb-0123456789ab")
+            .create_claim_entry(
+                EK,
+                unknown,
+                "sb-0123456789ab",
+                std::time::Duration::from_hours(1),
+            )
             .await
             .unwrap();
         entries.ensure_node_entry(EK).await.unwrap();

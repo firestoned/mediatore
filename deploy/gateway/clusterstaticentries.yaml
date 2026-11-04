@@ -1,0 +1,102 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+#
+# The gateway identity (ADR-0028 decision 2): spiffe://<td>/gateway on every gateway VM,
+# for two workloads of it, Envoy's data plane (SDS over the agent's socket, as user envoy)
+# and the authorizer (the Workload API, as user mediatore-gateway). One entry per workload
+# per VM, since a SPIRE entry's selectors are a conjunction; the parent is the VM's own
+# agent, spiffe://<td>/spire/agent/tpm/<sha256 of its EK's DER SubjectPublicKeyInfo>,
+# which the SPIRE server logs when the gateway first attests (`spire-server agent list`
+# shows it too). Applied by the platform team, never by the broker, whose admission policy
+# constrains only its own ServiceAccount (deploy/base/admission). The relay (ADR-0027
+# decision 1) has no entry: it holds no identity by design.
+---
+apiVersion: spire.spiffe.io/v1alpha1
+kind: ClusterStaticEntry
+metadata:
+  name: gateway-01-envoy
+  labels: { mediatore.io/role: gateway }
+spec:
+  # the data plane, Envoy on gateway-01.
+  className: spire-server-spire
+  spiffeID: spiffe://sandbox.home.example/gateway
+  parentID: spiffe://sandbox.home.example/spire/agent/tpm/0000000000000000000000000000000000000000000000000000000000000001 # placeholder: gateway-01's EK hash
+  selectors:
+    - unix:user:envoy
+  x509SVIDTTL: 1h
+  hint: gateway
+---
+apiVersion: spire.spiffe.io/v1alpha1
+kind: ClusterStaticEntry
+metadata:
+  name: gateway-01-mediatore-gateway
+  labels: { mediatore.io/role: gateway }
+spec:
+  # the authorizer, mediatore gateway on gateway-01.
+  className: spire-server-spire
+  spiffeID: spiffe://sandbox.home.example/gateway
+  parentID: spiffe://sandbox.home.example/spire/agent/tpm/0000000000000000000000000000000000000000000000000000000000000001 # placeholder: gateway-01's EK hash
+  selectors:
+    - unix:user:mediatore-gateway
+  x509SVIDTTL: 1h
+  hint: gateway
+---
+apiVersion: spire.spiffe.io/v1alpha1
+kind: ClusterStaticEntry
+metadata:
+  name: gateway-02-envoy
+  labels: { mediatore.io/role: gateway }
+spec:
+  # the data plane, Envoy on gateway-02.
+  className: spire-server-spire
+  spiffeID: spiffe://sandbox.home.example/gateway
+  parentID: spiffe://sandbox.home.example/spire/agent/tpm/0000000000000000000000000000000000000000000000000000000000000002 # placeholder: gateway-02's EK hash
+  selectors:
+    - unix:user:envoy
+  x509SVIDTTL: 1h
+  hint: gateway
+---
+apiVersion: spire.spiffe.io/v1alpha1
+kind: ClusterStaticEntry
+metadata:
+  name: gateway-02-mediatore-gateway
+  labels: { mediatore.io/role: gateway }
+spec:
+  # the authorizer, mediatore gateway on gateway-02.
+  className: spire-server-spire
+  spiffeID: spiffe://sandbox.home.example/gateway
+  parentID: spiffe://sandbox.home.example/spire/agent/tpm/0000000000000000000000000000000000000000000000000000000000000002 # placeholder: gateway-02's EK hash
+  selectors:
+    - unix:user:mediatore-gateway
+  x509SVIDTTL: 1h
+  hint: gateway
+---
+apiVersion: spire.spiffe.io/v1alpha1
+kind: ClusterStaticEntry
+metadata:
+  name: gateway-03-envoy
+  labels: { mediatore.io/role: gateway }
+spec:
+  # the data plane, Envoy on gateway-03.
+  className: spire-server-spire
+  spiffeID: spiffe://sandbox.home.example/gateway
+  parentID: spiffe://sandbox.home.example/spire/agent/tpm/0000000000000000000000000000000000000000000000000000000000000003 # placeholder: gateway-03's EK hash
+  selectors:
+    - unix:user:envoy
+  x509SVIDTTL: 1h
+  hint: gateway
+---
+apiVersion: spire.spiffe.io/v1alpha1
+kind: ClusterStaticEntry
+metadata:
+  name: gateway-03-mediatore-gateway
+  labels: { mediatore.io/role: gateway }
+spec:
+  # the authorizer, mediatore gateway on gateway-03.
+  className: spire-server-spire
+  spiffeID: spiffe://sandbox.home.example/gateway
+  parentID: spiffe://sandbox.home.example/spire/agent/tpm/0000000000000000000000000000000000000000000000000000000000000003 # placeholder: gateway-03's EK hash
+  selectors:
+    - unix:user:mediatore-gateway
+  x509SVIDTTL: 1h
+  hint: gateway

@@ -13,6 +13,10 @@ spire:
   entries:
     # The SPIRE Controller Manager's class (the chart's release name plus `-spire`).
     class_name: spire-server-spire
+    # The claim SVID's TTL: 15m by default and at most (ADR-0027 decision 7), never more
+    # than the claim has left; a sandbox that loses its gateways keeps its identity for
+    # this long at most.
+    # claim_svid_ttl: 15m
 issuers:
   - url: https://dex.home.example
     backend: sts
@@ -36,6 +40,12 @@ audiences:
       - { method: GET, path: "/api/**" }
       - { method: POST, path: "/api/ds/query" }
     # ca_file: /etc/mediatore-cas/home.pem
+# The environment's egress gateways (ADR-0028 decision 6): the three gateways' sandbox
+# addresses and data-plane port, addresses not names, in the order every guest receives
+# them on GET /v1/me. With it the egress proxy tunnels every upstream through one of them as
+# the claim and the sandbox ruleset admits the gateways and the control relay alone, no
+# DNS; without it the proxy dials the audiences' egress directly (deploying guide, step 7).
+# gateways: ["198.51.100.1:8443", "198.51.100.2:8443", "198.51.100.3:8443"]
 # Private registries (ADR-0022): the login and a token file from a Secret mounted like the
 # STS key; the guest gets the credential for the registry its claim's image names.
 # registries:

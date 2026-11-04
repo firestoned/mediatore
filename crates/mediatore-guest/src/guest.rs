@@ -6,6 +6,10 @@
 //! State machine (runbook Part 6.1):
 //! boot → node registered → `GuestReady` announced → subject fetched → user created →
 //! tmpfs mounted → image pulled → ruleset loaded → egress proxy up → jail running → torn down.
+//!
+//! The gateways the ruleset and the proxy use come from `GET /v1/me`, or from the pool's
+//! bootstrap file when the broker lists none (ADR-0027 decision 4); with none at all the
+//! proxy dials its upstreams directly (ADR-0028's implementation notes).
 
 use std::path::{Path, PathBuf};
 
@@ -75,6 +79,10 @@ pub struct GuestArgs {
         default_value_t = egress::DEFAULT_PORT
     )]
     pub egress_proxy_port: u16,
+    /// The pool's bootstrap list of egress gateways (ADR-0027 decision 4), one host:port
+    /// per line, used when the broker lists none; absent on a pool with no gateway
+    #[arg(long, env = "MEDIATORE_GATEWAYS_FILE", default_value = net::GATEWAYS_FILE)]
+    pub gateways_file: PathBuf,
     /// Where the installed-guest marker goes once the node is registered (banlieue
     /// ADR-0043, read by libvirt's provider through the guest agent; ADR-0019)
     #[arg(long, default_value = ready::PHASE_FILE)]
@@ -302,27 +310,50 @@ async fn serve_claim(
         bytes = pulled.bytes,
         "workload image pulled"
     );
+    // The gateways (ADR-0028 decision 6, ADR-0027 decision 4): the broker's list, or the
+    // pool's bootstrap file when the broker has none, or neither and the proxy dials
+    // directly. Which one decides the ruleset's shape and the proxy's dialer alike.
+    let bootstrap = net::bootstrap_gateways(&args.gateways_file)?;
+    let (gateways, source) = net::choose_gateways(&me.gateways, &bootstrap);
+    match source {
+        net::GatewaySource::Broker if !bootstrap.is_empty() && bootstrap != gateways => {
+            tracing::info!(
+                claim_uid = %me.claim_uid,
+                broker = gateways.len(),
+                bootstrap = bootstrap.len(),
+                "the broker's gateways replace the pool's bootstrap list (ADR-0027 decision 4)"
+            );
+        }
+        net::GatewaySource::Broker => {}
+        net::GatewaySource::Bootstrap => tracing::info!(
+            claim_uid = %me.claim_uid,
+            file = %args.gateways_file.display(),
+            gateways = gateways.len(),
+            "the broker lists no gateway: the pool's bootstrap list is used (ADR-0027 decision 4)"
+        ),
+        net::GatewaySource::None => tracing::warn!(
+            claim_uid = %me.claim_uid,
+            "the environment lists no egress gateway: the proxy dials its upstreams directly and the ruleset admits the audiences' endpoints and DNS"
+        ),
+    }
     let ruleset = net::Ruleset::resolve(
         uid,
         &args.mediatore_url,
         &me.egress,
-        &me.gateways,
+        &gateways,
         Path::new(net::RESOLV_CONF),
         args.egress_proxy_port,
     )
     .await?;
-    // The proxy's inputs (ADR-0025, ADR-0028): the routes and the gateways the broker
-    // returned and a fresh phantom, in files of the sandbox user's outside the jail; the
-    // phantom also goes to the jail through nsjail's environment.
+    // The proxy's inputs (ADR-0025, ADR-0028): the routes, the gateways and a fresh
+    // phantom, in files of the sandbox user's outside the jail; the phantom also goes to
+    // the jail through nsjail's environment.
     let phantom = egress::Phantom::generate()?;
     let routes = egress::Routes::new(me.routes.clone())?;
     if routes.is_empty() {
         tracing::warn!(claim_uid = %me.claim_uid, "the claim has no routes: the jail reaches nowhere");
     }
-    if me.gateways.is_empty() {
-        tracing::warn!(claim_uid = %me.claim_uid, "the environment lists no egress gateway: the proxy dials its upstreams directly");
-    }
-    let files = egress::write_files(&layout.egress, &me.routes, &me.gateways, &phantom, uid, gid)?;
+    let files = egress::write_files(&layout.egress, &me.routes, &gateways, &phantom, uid, gid)?;
     let listen = std::net::SocketAddr::from(([127, 0, 0, 1], args.egress_proxy_port));
     let proxy_args = egress::command_args(
         listen,
@@ -345,6 +376,7 @@ async fn serve_claim(
         claim_uid = %me.claim_uid,
         user = username,
         uid,
+        shape = %ruleset.shape,
         destinations = ruleset.allow.len(),
         resolvers = ruleset.dns.len(),
         proxy_port = ruleset.proxy_port,
@@ -367,7 +399,8 @@ async fn serve_claim(
         user = username,
         %listen,
         routes = routes.len(),
-        gateways = me.gateways.len(),
+        gateways = gateways.len(),
+        gateways_from = ?source,
         "egress proxy ready"
     );
     let result = supervise::run(&spec, me.expires_at, &mut proxy).await;

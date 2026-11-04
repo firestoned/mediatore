@@ -358,10 +358,9 @@
       "unique-id": "agentsandbox-egress-forwarder",
       "node-type": "service",
       "name": "The forwarder (the egress proxy's dialer)",
-      "description": "Built (roadmap 10, 2026-11-04): the sandbox leg of ADR-0028 decisions 3 and 7, a dialer inside mediatore egress-proxy as ADR-0027 decision 8 placed it, not a second listener or subcommand (crates/mediatore-guest/src/forward.rs). The proxy runs as the claim's sb- user outside the jail and is the workload's only proxy; when GET /v1/me lists gateways, each upstream connection is TLS 1.3 to a gateway presenting the claim SVID and verifying spiffe://<td>/gateway, CONNECT host:port, the upstream's TLS inside; the list walked from a random start, failover on a connect or handshake failure, a gateway's refusal final. Proven against a stand-in gateway in make check and against the real Envoy in kind; not yet run on a pool VM.",
+      "description": "Built (roadmap 10, 2026-11-04): the sandbox leg of ADR-0028 decisions 3 and 7, a dialer inside mediatore egress-proxy as ADR-0027 decision 8 placed it, not a second listener or subcommand (crates/mediatore-guest/src/forward.rs). The proxy runs as the claim's sb- user outside the jail and is the workload's only proxy; when GET /v1/me lists gateways, each upstream connection is TLS 1.3 to a gateway presenting the claim SVID and verifying spiffe://<td>/gateway, CONNECT host:port, the upstream's TLS inside; the list walked from a random start, failover on a connect or handshake failure, a gateway's refusal final. Proven against a stand-in gateway in make check and against the real Envoy in kind; the live run on a pool VM behind real gateways is roadmap 06's proof.",
       "metadata": {
-        "status": "in progress",
-        "diagram-style": "dashed orange: built and proven in kind, not yet run on a pool VM"
+        "status": "implemented"
       }
     },
     {
@@ -378,10 +377,9 @@
       "unique-id": "agentsandbox-egress-gateway",
       "node-type": "service",
       "name": "Egress gateway",
-      "description": "Three Envoy proxy VMs per environment (banlieue ADR-0103), each with its own SPIFFE identity from a local SPIRE agent. Requires mutual TLS from the sandbox forwarder, authorizes every CONNECT on the caller's claim SPIFFE ID and the requested authority against the broker's per-claim answer, resolves names itself, and logs one line per tunnel. Sits outside the guest, so it holds even if guest root is compromised. Proposed in ADR-0028. Built so far: the broker's gateway-only route, the gateways list on GET /v1/me, the authorizer Envoy asks over gRPC, mediatore gateway, and Envoy's bootstrap, proven in kind against a real Envoy (roadmap 10); the VMs are not built.",
+      "description": "Three Envoy proxy VMs per environment (banlieue ADR-0109), each with its own SPIFFE identity spiffe://<td>/gateway from a local SPIRE agent attesting with the VM's vTPM. Requires mutual TLS from the sandbox forwarder, authorizes every CONNECT on the caller's claim SPIFFE ID and the requested authority against the broker's per-claim answer (mediatore gateway, over gRPC on loopback), resolves names itself, and logs one line per tunnel. Beside it, ADR-0027's control relay: a second Envoy with no identity carrying the pool VM's attestation and broker sessions to fixed upstreams as ciphertext, the only way a pool VM reaches the identity plane. Sits outside the guest, so it holds even if guest root is compromised. Built (roadmap 10, 2026-11-04): the gateway VM image (image/gateway/: both Envoys as hardened units of their own users, the authorizer, the host table with the per-source cap, no sshd, no forwarding), the VMs' and entries' manifests (deploy/gateway/), the data plane proven in kind against a real Envoy on the bootstrap the image renders. Built and checked, not yet booted: the live run on gateway VMs is roadmap 06's proof.",
       "metadata": {
-        "status": "proposed",
-        "diagram-style": "dashed orange: proposed, not built yet"
+        "status": "implemented"
       },
       "controls": {
         "identity-aware-allowlist": {
@@ -392,7 +390,7 @@
               "config": {
                 "framework": "mediatore ADR",
                 "controls": [
-                  "ADR-0028 Decisions 2, 4 and 5 (Accepted, not built)"
+                  "ADR-0028 Decisions 2, 4 and 5 (Accepted, implemented 2026-11-04; built as image content and manifests, the live run pending)"
                 ],
                 "evidence": "docs/adr/0028-egress-gateway-envoy-with-spiffe-identity.md"
               }
@@ -853,7 +851,7 @@
     },
     {
       "unique-id": "agentsandbox-rel-jail-to-forwarder",
-      "description": "Built: the jailed agent's proxy environment points at the egress proxy on loopback (MEDIATORE_EGRESS_PROXY, ADR-0025), whose dialer is the forwarder; nftables admits the sandbox uid to the proxy, the broker, the audiences' endpoints and the gateways (ADR-0028 decision 6's reshaping, the gateways in place of the endpoints and no DNS, is the roadmap's guest item).",
+      "description": "Built: the jailed agent's proxy environment points at the egress proxy on loopback (MEDIATORE_EGRESS_PROXY, ADR-0025), whose dialer is the forwarder; with gateways the sandbox uid's nftables table admits the proxy on loopback, the gateways and the broker through their control relay, by address, and nothing else, no DNS (ADR-0028 decision 6 amending ADR-0020, net::Shape); without them the older list, the broker, the audiences' endpoints and DNS.",
       "relationship-type": {
         "connects": {
           "source": {
@@ -865,8 +863,7 @@
         }
       },
       "metadata": {
-        "status": "in progress",
-        "diagram-style": "dashed orange: built and proven in kind, not yet run on a pool VM"
+        "status": "implemented"
       }
     },
     {
@@ -883,13 +880,12 @@
         }
       },
       "metadata": {
-        "status": "in progress",
-        "diagram-style": "dashed orange: built and proven in kind, not yet run on a pool VM"
+        "status": "implemented"
       }
     },
     {
       "unique-id": "agentsandbox-rel-gateway-to-mediatore",
-      "description": "The gateway's authorizer asks the broker what one claim may reach: GET /v1/gateway/claims/{uid} over mutual TLS with the gateway SVID, answered to that identity only; a released, expired, pending or unknown claim is 404 (ADR-0028 decision 4). The route exists in the broker and the authorizer that calls it, mediatore gateway, is built, and the Envoy that asks it is configured and proven in kind; the gateway VM is not built.",
+      "description": "The gateway's authorizer asks the broker what one claim may reach: GET /v1/gateway/claims/{uid} over mutual TLS with the gateway SVID, answered to that identity only; a released, expired, pending or unknown claim is 404 (ADR-0028 decision 4). The route, the authorizer (mediatore gateway) and the Envoy that asks it are built and proven in kind; the gateway VM image carries all three (roadmap 10).",
       "relationship-type": {
         "connects": {
           "source": {
@@ -902,13 +898,29 @@
       },
       "protocol": "mTLS",
       "metadata": {
-        "status": "in progress",
-        "diagram-style": "dashed orange: built and proven in kind, not yet deployed on a gateway VM"
+        "status": "implemented"
+      }
+    },
+    {
+      "unique-id": "agentsandbox-rel-sandbox-vm-via-relay",
+      "description": "A pool VM reaches the SPIRE server and the broker only through the control relay on a gateway (ADR-0027 decisions 1 to 3): its agent's server_address and MEDIATORE_URL are a gateway's sandbox address and the relay's ports, the TLS end to end, the relay credential-less and bounded per source by the gateway's host table (decision 5). The pool's bootstrap list of gateways rides its cloud-config until the broker's arrives (decision 4).",
+      "relationship-type": {
+        "connects": {
+          "source": {
+            "node": "agentsandbox-sandbox-vm"
+          },
+          "destination": {
+            "node": "agentsandbox-egress-gateway"
+          }
+        }
+      },
+      "metadata": {
+        "status": "implemented"
       }
     },
     {
       "unique-id": "agentsandbox-rel-gateway-to-destinations",
-      "description": "Only allowlisted destinations are reachable (diagram e15).",
+      "description": "Only allowlisted destinations are reachable (diagram e15): Envoy resolves and dials the authority the authorizer admitted for that claim, from the gateway's egress address, and relays the tunnel untouched (ADR-0028 decisions 5 and 9).",
       "relationship-type": {
         "connects": {
           "source": {
