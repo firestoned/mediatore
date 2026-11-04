@@ -204,9 +204,30 @@ What roadmap 10 fixed within the decisions above, as it is built:
   pinned by digest. The ML-KEM question is answered: the pinned build negotiates
   X25519MLKEM768 with a client that offers nothing else, which is what `mediatore-tls`'s
   client config does.
+- **The forwarder is the egress proxy's dialer** (decisions 3 and 7, as ADR-0027 decision 8
+  placed it): `crates/mediatore-guest/src/forward.rs`, no `forward` subcommand. The proxy
+  of ADR-0025 already runs as the sandbox user outside the jail and is the one process
+  holding the claim SVID, so the jail keeps its one loopback port and the proxy's upstream
+  dial changes shape: when `GET /v1/me` lists gateways (the guest writes them beside the
+  routes, `--gateways`), each upstream connection is TCP to a gateway, TLS 1.3 on the
+  sandbox leg's configuration (`mediatore-tls`, X25519MLKEM768 only) presenting the claim
+  SVID from the shared Workload API source and verifying the gateway as exactly
+  `spiffe://<td>/gateway`, `CONNECT host:port`, and the upstream's own TLS inside the
+  tunnel, end to end as decision 3 says. The list is walked in the broker's order from a
+  random position per connection; a connect, handshake or transport failure, or no answer
+  within ten seconds, moves to the next; a gateway's answer other than `200` is the
+  environment's verdict and ends the attempt. The workload sees `502` with
+  `gateway_refused` (the authorizer's code in the proxy's log) or `gateway_unreachable`.
+  An empty list, an old broker or an environment with no gateway yet, dials the upstream
+  directly as before, said once at start. The guest's ruleset admits the gateways beside
+  what it admitted already; its reshaping (decision 6: the gateways in place of the
+  audiences' endpoints, no DNS) is the roadmap's guest item. Proven with no Envoy in
+  `crates/mediatore/tests/e2e_forward.rs` against a stand-in gateway on the production
+  mTLS configuration, and in kind against the real one (`make kind-e2e-gateway`, the real
+  proxy as a sidecar beside a workload with no socket).
 - **Not yet:** the gateway image and VMs (decision 10, with decision 8's host hardening),
-  `mediatore forward` (decision 3), the ruleset change (decision 6), the threat-model pass,
-  which comes with the rest of the roadmap.
+  the ruleset change (decision 6), the threat-model pass, which comes with the rest of the
+  roadmap.
 
 ## Consequences
 
@@ -229,8 +250,9 @@ What roadmap 10 fixed within the decisions above, as it is built:
   the claim-egress answer. An outage degrades to cached answers, then to deny. New claims
   cannot egress while the broker is down, which is consistent with `/v1/token` already
   being a `503` that revokes nothing (ADR-0015).
-- **New code:** `mediatore forward` and `mediatore gateway` in `crates/mediatore`
-  (libraries in `mediatore-guest` and a new crate for the authorizer), `Me::gateways`
+- **New code:** the forwarder and `mediatore gateway` in `crates/mediatore` (the forwarder
+  a module of `mediatore-guest` inside the egress proxy, per ADR-0027 decision 8, and a
+  new crate for the authorizer), `Me::gateways`
   in `mediatore-proto`, the gateway route in `mediatore-api`, the ruleset change in
   `crates/mediatore-guest/src/net.rs`. A kustomize or image fragment for the gateway VM
   lives under `image/`. banlieue ADR-0103 gets an amendment; nothing else in banlieue

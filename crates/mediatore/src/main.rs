@@ -687,6 +687,8 @@ mod tests {
             "https://mediatore.test:8443",
             "--routes",
             "/mnt/sandbox/egress/routes.json",
+            "--gateways",
+            "/mnt/sandbox/egress/gateways.json",
             "--phantom-file",
             "/mnt/sandbox/egress/phantom",
         ]);
@@ -705,6 +707,7 @@ mod tests {
         // The guest's command line for it is what the parser accepts.
         let files = mediatore_guest::egress::EgressFiles {
             routes: "/r".into(),
+            gateways: "/g".into(),
             phantom: "/p".into(),
         };
         let mut line = vec!["mediatore".to_owned()];
@@ -716,8 +719,22 @@ mod tests {
         ));
         let line: Vec<&str> = line.iter().map(String::as_str).collect();
         assert!(matches!(parse(&line), Ok(Cmd::EgressProxy(_))), "{line:?}");
-        // The routes and the phantom are required.
+        // The routes, the gateways and the phantom are required.
         assert!(parse(&["mediatore", "egress-proxy", "--mediatore-url", "https://b"]).is_err());
+        assert!(
+            parse(&[
+                "mediatore",
+                "egress-proxy",
+                "--mediatore-url",
+                "https://b",
+                "--routes",
+                "/r",
+                "--phantom-file",
+                "/p"
+            ])
+            .is_err(),
+            "ADR-0028: the gateways file is not optional, an empty list is explicit"
+        );
     }
 
     #[test]

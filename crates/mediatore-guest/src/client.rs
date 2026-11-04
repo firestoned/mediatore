@@ -3,6 +3,7 @@
 
 //! The HTTP client both VM-side roles use against the sandbox listener.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use mediatore_tls::{MaterialSource, SpiffeId, WorkloadApiSource};
@@ -32,7 +33,7 @@ enum Transport {
     /// The SVID from the Workload API as the client certificate; the broker accepted only
     /// as `spiffe://<td>/mediatore`.
     Mtls {
-        source: WorkloadApiSource,
+        source: Arc<dyn MaterialSource>,
         server: SpiffeId,
     },
     /// The peer identity as a header, for a loopback `dev_mode` server.
@@ -40,17 +41,42 @@ enum Transport {
     DevHeader(String),
 }
 
+/// This process's identity from the Workload API at `workload_api_socket`, within
+/// [`WORKLOAD_API_WAIT`]: one source, shared by every client of it (the broker's, and since
+/// ADR-0028 the gateways'), so a rotation reaches them all. Fails closed: no Workload API,
+/// no identity.
+pub async fn workload_api_source(
+    workload_api_socket: &str,
+) -> anyhow::Result<Arc<WorkloadApiSource>> {
+    let endpoint = mediatore_tls::endpoint(workload_api_socket);
+    let source = WorkloadApiSource::connect(&endpoint, WORKLOAD_API_WAIT)
+        .await
+        .map_err(|e| anyhow::anyhow!("Workload API at {endpoint}: {e}"))?;
+    let own = source.current()?;
+    tracing::info!(spiffe_id = %own.spiffe_id, "SVID from the Workload API");
+    Ok(Arc::new(source))
+}
+
 impl SandboxClient {
     /// Obtain the transport identity from the Workload API at `workload_api_socket`,
     /// within [`WORKLOAD_API_WAIT`]. Fails closed: no Workload API, no client.
     pub async fn connect(mediatore_url: &str, workload_api_socket: &str) -> anyhow::Result<Self> {
-        let endpoint = mediatore_tls::endpoint(workload_api_socket);
-        let source = WorkloadApiSource::connect(&endpoint, WORKLOAD_API_WAIT)
-            .await
-            .map_err(|e| anyhow::anyhow!("Workload API at {endpoint}: {e}"))?;
+        let source = workload_api_source(workload_api_socket).await?;
+        Self::with_material(mediatore_url, source)
+    }
+
+    /// A client over mTLS with whatever `source` supplies; the broker is expected to be
+    /// `spiffe://<td>/mediatore` for the material's trust domain.
+    ///
+    /// # Errors
+    /// No material to read the trust domain from.
+    pub fn with_material(
+        mediatore_url: &str,
+        source: Arc<dyn MaterialSource>,
+    ) -> anyhow::Result<Self> {
         let own = source.current()?;
         let server = SpiffeId::new(format!("spiffe://{}/mediatore", own.trust_domain()))?;
-        tracing::info!(spiffe_id = %own.spiffe_id, broker = %server, "SVID from the Workload API");
+        tracing::debug!(spiffe_id = %own.spiffe_id, broker = %server, "sandbox client");
         Ok(Self {
             base: Self::base_of(mediatore_url),
             transport: Transport::Mtls { source, server },

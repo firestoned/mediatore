@@ -10,10 +10,13 @@
 //! issuer down. [`TestCa`] plays the part of the SPIRE server's CA: it mints SPIFFE-shaped
 //! X.509 SVIDs that the real mTLS verifiers accept, and [`MemoryMaterial`] stands in for
 //! the Workload API so rotation can be driven by hand. [`MemorySandboxes`] stands in for
-//! the Kubernetes API behind the user API's `AgentSandbox` front door.
+//! the Kubernetes API behind the user API's `AgentSandbox` front door. [`StandInGateway`]
+//! stands in for the egress gateway (ADR-0028) on the production mTLS configuration, so
+//! the forwarder is proven with no Envoy.
 
 pub mod ek;
 pub mod entra;
+pub mod gateway;
 pub mod https;
 pub mod pem;
 pub mod policy;
@@ -23,6 +26,7 @@ pub mod svid;
 pub mod transit;
 
 pub use entra::tempdir;
+pub use gateway::{StandInGateway, dead_endpoint};
 pub use https::TlsUpstream;
 pub use pem::fixture_ca_pem;
 pub use sandboxes::MemorySandboxes;

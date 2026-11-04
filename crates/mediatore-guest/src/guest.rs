@@ -231,6 +231,7 @@ pub async fn run(args: GuestArgs) -> anyhow::Result<()> {
         expires_at = %me.expires_at,
         egress = me.egress.len(),
         routes = me.routes.len(),
+        gateways = me.gateways.len(),
         registry_credential = me.registry_credential.as_ref().map(|c| c.host.as_str()),
         "subject fetched"
     );
@@ -305,19 +306,23 @@ async fn serve_claim(
         uid,
         &args.mediatore_url,
         &me.egress,
+        &me.gateways,
         Path::new(net::RESOLV_CONF),
         args.egress_proxy_port,
     )
     .await?;
-    // The proxy's inputs (ADR-0025): the routes the broker returned and a fresh phantom,
-    // in files of the sandbox user's outside the jail; the phantom also goes to the jail
-    // through nsjail's environment.
+    // The proxy's inputs (ADR-0025, ADR-0028): the routes and the gateways the broker
+    // returned and a fresh phantom, in files of the sandbox user's outside the jail; the
+    // phantom also goes to the jail through nsjail's environment.
     let phantom = egress::Phantom::generate()?;
     let routes = egress::Routes::new(me.routes.clone())?;
     if routes.is_empty() {
         tracing::warn!(claim_uid = %me.claim_uid, "the claim has no routes: the jail reaches nowhere");
     }
-    let files = egress::write_files(&layout.egress, &me.routes, &phantom, uid, gid)?;
+    if me.gateways.is_empty() {
+        tracing::warn!(claim_uid = %me.claim_uid, "the environment lists no egress gateway: the proxy dials its upstreams directly");
+    }
+    let files = egress::write_files(&layout.egress, &me.routes, &me.gateways, &phantom, uid, gid)?;
     let listen = std::net::SocketAddr::from(([127, 0, 0, 1], args.egress_proxy_port));
     let proxy_args = egress::command_args(
         listen,
@@ -362,6 +367,7 @@ async fn serve_claim(
         user = username,
         %listen,
         routes = routes.len(),
+        gateways = me.gateways.len(),
         "egress proxy ready"
     );
     let result = supervise::run(&spec, me.expires_at, &mut proxy).await;

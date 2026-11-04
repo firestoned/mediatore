@@ -23,6 +23,7 @@ use chrono::Duration;
 use mediatore_api::{AppState, Limiter};
 use mediatore_entra::{Backend, IssuerConfig, Validator};
 use mediatore_guest::egress::{Phantom, Proxy, Routes, TokenSource};
+use mediatore_guest::forward::Dialer;
 use mediatore_proto::{
     ClaimRequest, ClaimResponse, EndpointRule, Me, NodeRegistration, TokenRequest, TokenResponse,
     Workload,
@@ -300,6 +301,7 @@ impl Harness {
                 Routes::new(routes).expect("routes"),
                 phantom.clone(),
                 tokens.clone(),
+                Dialer::Direct,
             )
             .expect("a proxy from the claim's routes"),
         );

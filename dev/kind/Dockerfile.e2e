@@ -4,8 +4,9 @@
 # Test-only image for the Dex and gateway kind tiers (`make kind-e2e-dex`,
 # `make kind-e2e-gateway`): the shipped binary plus the testkit's dex-driver, which plays
 # the user's browser and drives `mediatore login` and `mediatore sandbox create` from inside
-# the cluster, and gateway-probe, which stands in for `mediatore forward` and for a
-# destination behind the gateway. Built from `dist/`; never published.
+# the cluster, and gateway-probe, which plays the jailed workload driving the real egress
+# proxy beside it and the TLS destination behind the gateway. Built from `dist/`; never
+# published.
 FROM cgr.dev/chainguard/static:latest
 COPY dist/mediatore dist/dex-driver dist/gateway-probe /usr/bin/
 USER 65532:65532

@@ -415,17 +415,20 @@ kind-notaio: kind-create kind-openbao ## notaio from its release manifests (vers
 kind-e2e-policy: kind-banlieue-crds kind-broker kind-notaio ## ADR-0026 live: notaio's signed bundle admitted and recorded, the PolicyConformant verdicts and codes, a newer version followed, a replay refused by the floor across a restart, nothing refused
 	./dev/kind/policy-e2e.sh $(KIND_KUBECONFIG) $(KIND_SA_KUBECONFIG) $(KIND_DIR)
 
-kind-gateway: kind-broker ## The egress gateway in kind (ADR-0028): Envoy from its official image, pinned by digest in dev/kind/gateway, on the gateway SVID over SDS, mediatore gateway beside it, and the destination the tier reaches through it
+kind-gateway: kind-broker ## The egress gateway in kind (ADR-0028): Envoy from its official image, pinned by digest in dev/kind/gateway, on the gateway SVID over SDS, mediatore gateway beside it, and the TLS destination the tier reaches through it (its certificate minted here)
+	cargo run -q -p mediatore-testkit --bin tls-fixture -- --out-dir $(KIND_DIR)/gateway --dns destination.mediatore-e2e-gateway.svc.cluster.local
+	@$(KIND_KUBECTL) get ns mediatore-e2e-gateway >/dev/null 2>&1 || $(KIND_KUBECTL) create ns mediatore-e2e-gateway
+	$(KIND_KUBECTL) -n mediatore-e2e-gateway create secret generic destination-tls --from-file=$(KIND_DIR)/gateway/server.pem --from-file=$(KIND_DIR)/gateway/server-key.pem --dry-run=client -o yaml | $(KIND_KUBECTL) apply -f -
 	$(KIND_KUBECTL) apply -k dev/kind/gateway
 	@# Same tag, new image: a restart is what makes the loaded image the running one.
 	$(KIND_KUBECTL) -n mediatore-e2e-gateway rollout restart deploy/gateway deploy/destination
 	$(KIND_KUBECTL) -n mediatore-e2e-gateway rollout status deploy/gateway --timeout=300s
 	$(KIND_KUBECTL) -n mediatore-e2e-gateway rollout status deploy/destination --timeout=300s
 
-kind-e2e-gateway: kind-banlieue-crds kind-broker kind-gateway ## ADR-0028 live: a claim's CONNECT through a real Envoy to its one destination and nothing else, a node SVID refused by the validator, the cache standing in through a broker outage then denying, a released claim cut off
+kind-e2e-gateway: kind-banlieue-crds kind-broker kind-gateway ## ADR-0028 live: the real egress proxy tunnelling a claim's requests through a real Envoy to its one destination and nothing else, a node SVID refused by the validator, the cache standing in through a broker outage then denying, a released claim cut off
 	$(KIND_KUBECTL) -n banlieue-system rollout restart deploy/mediatore
 	$(KIND_KUBECTL) -n banlieue-system rollout status deploy/mediatore --timeout=300s
-	./dev/kind/gateway-e2e.sh $(KIND_KUBECONFIG) $(KIND_SA_KUBECONFIG) $(SPIRE_TRUST_DOMAIN) $(KIND_DIR)/ek.pem $(KIND_DIR)/ek.hash
+	./dev/kind/gateway-e2e.sh $(KIND_KUBECONFIG) $(KIND_SA_KUBECONFIG) $(SPIRE_TRUST_DOMAIN) $(KIND_DIR)/ek.pem $(KIND_DIR)/ek.hash $(KIND_DIR)/gateway/ca.pem
 
 kind-e2e-dex: kind-banlieue-crds kind-broker ## ADR-0013 live: the real CLI logs in at a real Dex and delegates the session, every token issue refreshes it, a group removal and a revocation at Dex release the claim
 	$(KIND_KUBECTL) -n banlieue-system rollout restart deploy/mediatore

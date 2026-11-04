@@ -274,8 +274,11 @@ diagram):
    into it (every blob checked against its digest, the manifest digest logged), loads the
    nftables ruleset keyed by the sandbox uid (the broker and `git.home.example:443` for the
    proxy's sockets, the proxy's loopback port for the jail's, DNS to the member's
-   resolvers, nothing else), starts `mediatore egress-proxy` as that user with the routes
-   and a fresh phantom token, and starts the argv under `nsjail` as that user with the
+   resolvers, nothing else), starts `mediatore egress-proxy` as that user with the routes,
+   the environment's gateways (none here, so the proxy dials the endpoint directly;
+   with them it tunnels through one as the claim,
+   [ADR-0028](../adr/0028-egress-gateway-envoy-with-spiffe-identity.md)) and a fresh
+   phantom token, and starts the argv under `nsjail` as that user with the
    phantom in its environment; inside, the binary applies Landlock to its own process
    before the argv runs, so writes stay in `/work`, `/tmp` and the home and TCP reaches
    the proxy's port only ([ADR-0024](../adr/0024-landlock-inside-the-jail.md),
@@ -285,7 +288,7 @@ diagram):
    INFO mediatore_guest::guest: node registered node_id=…
    INFO mediatore_guest::guest: workload image pulled claim_uid=… image=ghcr.io/octocat/research-agent@sha256:9f86… image_digest=sha256:9f86… layers=6 bytes=58213441
    INFO mediatore_guest::guest: sandbox ruleset loaded claim_uid=… user=sb-… uid=… destinations=3 resolvers=1 proxy_port=3128 ruleset_sha256=…
-   INFO mediatore_guest::guest: egress proxy ready claim_uid=… pid=… user=sb-… listen=127.0.0.1:3128 routes=1
+   INFO mediatore_guest::guest: egress proxy ready claim_uid=… pid=… user=sb-… listen=127.0.0.1:3128 routes=1 gateways=0
    INFO mediatore_guest::supervise: jail started pid=… user=sb-…
    ```
 

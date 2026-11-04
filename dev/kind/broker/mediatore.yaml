@@ -33,9 +33,9 @@ issuers:
 audiences:
   - { name: e2e, via: sts }
   - { name: e2e-sts, via: sts, max_ttl: 900 }
-  # The gateway tier's claim: one destination, the probe in its serve mode behind the
-  # gateway (ADR-0028 decision 4); the authorizer's allowlist is this list.
-  - { name: e2e-egress, via: sts, egress: ["destination.mediatore-e2e-gateway.svc.cluster.local:8080"] }
+  # The gateway tier's claim: one destination, the probe in its serve mode over TLS behind
+  # the gateway (ADR-0028 decision 4); the authorizer's allowlist is this list.
+  - { name: e2e-egress, via: sts, egress: ["destination.mediatore-e2e-gateway.svc.cluster.local:8443"] }
   # Exactly what notaio's example policy allows for this audience, so the policy tier's
   # conformant sandbox has no gap (ADR-0026 decision 7); the endpoint is never reached.
   - name: internal-git
