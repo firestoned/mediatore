@@ -78,6 +78,12 @@ hyper-util   = { version = "0.1", features = ["server-auto", "server-graceful", 
 # (they pull ring).
 nono         = { version = "=0.81.0", default-features = false }
 arc-swap     = "1"
+# Envoy's external authorization over gRPC (ADR-0028 decision 4): the gateway's authorizer
+# serves Envoy's own Check call, Envoy's protos from envoy-types, tonic as the spiffe crate
+# already brings it (no TLS feature: the call is loopback). Envoy's HTTP mode cannot carry a
+# CONNECT check (verified on 1.40.2), which is the one reason gRPC is spoken here.
+envoy-types  = "0.7.7"
+tonic        = { version = "0.14", default-features = false, features = ["codegen", "router", "server", "channel"] }
 # AF_VSOCK for the guest's GuestReady report on Cloud Hypervisor (ADR-0019); `all` carries the vsock API
 socket2      = { version = "0.6", features = ["all"] }
 async-trait  = "0.1"

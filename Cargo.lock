@@ -1098,6 +1098,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "envoy-types"
+version = "0.7.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e1fdd3fa7e8347872dd5d6e8626441589f0fd87d7fcf3003a4cca2103ecc39c0"
+dependencies = [
+ "futures-core",
+ "prost",
+ "tonic",
+ "tonic-prost",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2240,6 +2252,7 @@ dependencies = [
  "base64 0.23.1",
  "chrono",
  "clap",
+ "envoy-types",
  "jsonwebtoken",
  "k8s-openapi",
  "kube",
@@ -2264,6 +2277,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tonic",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -2365,10 +2379,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "clap",
- "http",
- "http-body-util",
- "hyper",
- "hyper-util",
+ "envoy-types",
  "mediatore-proto",
  "mediatore-spire",
  "mediatore-testkit",
@@ -2376,6 +2387,7 @@ dependencies = [
  "reqwest",
  "thiserror",
  "tokio",
+ "tonic",
  "tracing",
  "uuid",
 ]
@@ -4462,6 +4474,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ac2a5518c70fa84342385732db33fb3f44bc4cc748936eb5833d2df34d6445ef"
 dependencies = [
  "async-trait",
+ "axum",
  "base64 0.22.1",
  "bytes",
  "h2",

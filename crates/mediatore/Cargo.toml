@@ -58,6 +58,8 @@ jsonwebtoken.workspace = true
 uuid.workspace = true
 tempfile.workspace = true
 sandboxpolicy-bundle.workspace = true
+envoy-types.workspace = true
+tonic.workspace = true
 
 [lints]
 workspace = true

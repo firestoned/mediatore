@@ -110,10 +110,10 @@ dist-darwin: ## The CLI for a Mac (the same binary, every role) into dist/mediat
 	@mkdir -p dist
 	cp target/release/mediatore dist/mediatore-darwin-arm64
 
-dist-e2e: ## The testkit's dex-driver (musl) into dist/, for the test-only e2e image
-	cargo build --release --target $(MUSL_TARGET) -p mediatore-testkit --bin dex-driver
+dist-e2e: ## The testkit's dex-driver and gateway-probe (musl) into dist/, for the test-only e2e image
+	cargo build --release --target $(MUSL_TARGET) -p mediatore-testkit --bin dex-driver --bin gateway-probe
 	@mkdir -p dist
-	cp target/$(MUSL_TARGET)/release/dex-driver dist/
+	cp target/$(MUSL_TARGET)/release/dex-driver target/$(MUSL_TARGET)/release/gateway-probe dist/
 
 image: ## Build the server container image locally (the binary is compiled inside the image)
 	$(CONTAINER_CLI) build -t ghcr.io/firestoned/mediatore:dev .
@@ -415,6 +415,18 @@ kind-notaio: kind-create kind-openbao ## notaio from its release manifests (vers
 kind-e2e-policy: kind-banlieue-crds kind-broker kind-notaio ## ADR-0026 live: notaio's signed bundle admitted and recorded, the PolicyConformant verdicts and codes, a newer version followed, a replay refused by the floor across a restart, nothing refused
 	./dev/kind/policy-e2e.sh $(KIND_KUBECONFIG) $(KIND_SA_KUBECONFIG) $(KIND_DIR)
 
+kind-gateway: kind-broker ## The egress gateway in kind (ADR-0028): Envoy from its official image, pinned by digest in dev/kind/gateway, on the gateway SVID over SDS, mediatore gateway beside it, and the destination the tier reaches through it
+	$(KIND_KUBECTL) apply -k dev/kind/gateway
+	@# Same tag, new image: a restart is what makes the loaded image the running one.
+	$(KIND_KUBECTL) -n mediatore-e2e-gateway rollout restart deploy/gateway deploy/destination
+	$(KIND_KUBECTL) -n mediatore-e2e-gateway rollout status deploy/gateway --timeout=300s
+	$(KIND_KUBECTL) -n mediatore-e2e-gateway rollout status deploy/destination --timeout=300s
+
+kind-e2e-gateway: kind-banlieue-crds kind-broker kind-gateway ## ADR-0028 live: a claim's CONNECT through a real Envoy to its one destination and nothing else, a node SVID refused by the validator, the cache standing in through a broker outage then denying, a released claim cut off
+	$(KIND_KUBECTL) -n banlieue-system rollout restart deploy/mediatore
+	$(KIND_KUBECTL) -n banlieue-system rollout status deploy/mediatore --timeout=300s
+	./dev/kind/gateway-e2e.sh $(KIND_KUBECONFIG) $(KIND_SA_KUBECONFIG) $(SPIRE_TRUST_DOMAIN) $(KIND_DIR)/ek.pem $(KIND_DIR)/ek.hash
+
 kind-e2e-dex: kind-banlieue-crds kind-broker ## ADR-0013 live: the real CLI logs in at a real Dex and delegates the session, every token issue refreshes it, a group removal and a revocation at Dex release the claim
 	$(KIND_KUBECTL) -n banlieue-system rollout restart deploy/mediatore
 	$(KIND_KUBECTL) -n banlieue-system rollout status deploy/mediatore --timeout=300s
@@ -425,7 +437,7 @@ kind-e2e-tpm: kind-vtpm kind-banlieue-crds kind-broker ## ADR-0018 live: an agen
 	$(KIND_KUBECTL) -n banlieue-system rollout status deploy/mediatore --timeout=300s
 	TPM_PLUGIN_AGENT_IMG=$(TPM_PLUGIN_AGENT_IMG) ./dev/kind/tpm-e2e.sh $(KIND_KUBECONFIG) $(SPIRE_TRUST_DOMAIN) $(KIND_VTPM_DIR)
 
-kind-e2e: kind-e2e-entries kind-e2e-mtls kind-e2e-watcher kind-e2e-sandbox kind-e2e-store kind-e2e-dex kind-e2e-policy ## Every live suite against kind that needs nothing of the host (grows with the roadmap); kind-e2e-tpm needs a vTPM
+kind-e2e: kind-e2e-entries kind-e2e-mtls kind-e2e-watcher kind-e2e-sandbox kind-e2e-store kind-e2e-dex kind-e2e-policy kind-e2e-gateway ## Every live suite against kind that needs nothing of the host (grows with the roadmap); kind-e2e-tpm needs a vTPM
 
 kind-e2e-ci: ## CI shape: $(KIND_E2E_SUITES), cluster state on failure, cluster deleted after
 	@$(MAKE) $(KIND_E2E_SUITES) || { $(MAKE) kind-e2e-logs; $(MAKE) kind-delete; exit 1; }
@@ -446,6 +458,10 @@ kind-e2e-logs: ## What a failing live suite needs: entries, policy, broker and c
 	-$(KIND_KUBECTL) -n banlieue-system get lease mediatore-watcher -o yaml
 	-$(KIND_KUBECTL) -n mediatore-e2e-watcher get virtualmachines,virtualmachineclaims -o yaml
 	-$(KIND_KUBECTL) -n mediatore-e2e-sandbox get agentsandboxes,virtualmachineclaims,pods -o yaml
+	-$(KIND_KUBECTL) -n mediatore-e2e-gateway get pods -o wide
+	-$(KIND_KUBECTL) -n mediatore-e2e-gateway logs deploy/gateway -c envoy --tail=80
+	-$(KIND_KUBECTL) -n mediatore-e2e-gateway logs deploy/gateway -c authorizer --tail=80
+	-$(KIND_KUBECTL) -n mediatore-e2e-gateway logs deploy/destination --tail=30
 	-$(KIND_KUBECTL) -n mediatore-e2e-sandbox logs pod/node --tail=50
 	-$(KIND_KUBECTL) -n mediatore-e2e-sandbox get sandboxpolicies,exposureceilings,configmaps -o yaml
 	-$(KIND_KUBECTL) -n notaio-system get pods -o wide

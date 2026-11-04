@@ -28,6 +28,10 @@ path = "src/bin/tls_fixture.rs"
 name = "dex-driver"
 path = "src/bin/dex_driver.rs"
 
+[[bin]]
+name = "gateway-probe"
+path = "src/bin/gateway_probe.rs"
+
 [dependencies]
 mediatore-proto.workspace = true
 mediatore-tls.workspace = true

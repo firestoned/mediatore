@@ -278,17 +278,37 @@ decision 4, `mediatore gateway`, is proven against the broker in `make check`, w
 Envoy and no VM: `crates/mediatore/tests/e2e_gateway.rs` runs the fake issuer, the broker's
 sandbox listener over the production mTLS listener under the testkit's `TestCa`, the real
 `Authorizer` with its broker client presenting the gateway SVID from that CA, and the check
-listener Envoy would call, on loopback. A stand-in for Envoy sends the check with the three
-headers Envoy sets from the downstream connection (the peer's SPIFFE ID, the method, the
-authority). What is proven: a bound claim reaches each `host:port` of its audiences' egress
-and nothing else; a foreign method, a malformed authority, the node that holds the claim and
-a claim the broker never saw are refused with their codes; a check Envoy did not form is
-refused; a released claim still answers from the cache within the fresh bound and is cut off
-by the broker's `404` after it; an authorizer whose broker is down denies from the first
-check; one presenting a node SVID is refused by the route and denies; one presenting an
-identity under the gateway path cannot complete the handshake and denies. The cache's own
-bounds (fresh, stale, the claim's deadline, the size, one ask per claim at a time) are unit
-tests in `crates/mediatore-gateway/src/lib.rs` over a scripted source.
+service Envoy would call, on loopback. A stand-in for Envoy sends Envoy's own `Check` call
+over gRPC with what Envoy fills in from the downstream connection (the peer's SPIFFE ID as
+the principal, the method, the authority). What is proven: a bound claim reaches each
+`host:port` of its audiences' egress and nothing else; a foreign method, a malformed
+authority, the node that holds the claim, a check with no principal and a claim the broker
+never saw are refused with their codes; a released claim still answers from the cache
+within the fresh bound and is cut off by the broker's `404` after it; an authorizer whose
+broker is down denies from the first check; one presenting a node SVID is refused by the
+route and denies; one presenting an identity under the gateway path cannot complete the
+handshake and denies. The cache's own bounds (fresh, stale, the claim's deadline, the size,
+one ask per claim at a time) are unit tests in `crates/mediatore-gateway/src/lib.rs` over
+a scripted source.
+
+### The egress gateway: in `make kind-e2e`
+
+`make kind-e2e-gateway` runs ADR-0028's data plane against a real Envoy and a real SPIRE:
+`dev/kind/gateway` is a pod standing in for a gateway VM, Envoy from its official image
+(pinned by digest) on the bootstrap the image will carry beside `mediatore gateway`, both
+holding `spiffe://<td>/gateway` from the agent through the CSI volume, and a destination
+behind it (the testkit's `gateway-probe` in its serve mode). `dev/kind/gateway-e2e.sh`
+binds a sandbox as the sandbox tier does, so the broker has a live claim whose allowlist is
+that one destination, gives a probe pod the claim's SVID through a fixture entry, and drives
+`gateway-probe` as the forwarder will: the claim SVID over TLS 1.3 to the gateway, its SVID
+verified, `CONNECT host:port`, one request inside the tunnel. Proven: the tunnel to the
+destination opens and the destination answers, another host and another port are refused
+with `not_allowed`, a node SVID is refused by Envoy's validator before any check, with the
+broker scaled to zero the cached allowlist stands in until the stale bound and then the
+outage is `broker_unreachable`, a deleted sandbox is `claim_gone` once its answer is stale,
+and Envoy's access log, the authorizer's decisions and the destination's requests agree on
+who reached what. The probe's checks are listed in the script; a mismatch names the
+authority, the outcome and what was expected.
 
 ### The sandbox filesystem and the pull: by hand, on the build host
 
