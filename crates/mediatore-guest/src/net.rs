@@ -3,8 +3,11 @@
 
 //! The jail's network bound (ADR-0020): one nftables table per claim whose output hook
 //! sends the sandbox uid's packets to a chain that admits the broker, the resolved egress
-//! endpoints of the claim's audiences, the egress proxy on loopback (ADR-0025) and DNS to
-//! the VM's resolvers, then logs and drops. Every other uid is untouched, except that a
+//! endpoints of the claim's audiences, the environment's egress gateways (ADR-0028 decision
+//! 6, the proxy's tunnels), the egress proxy on loopback (ADR-0025) and DNS to the VM's
+//! resolvers, then logs and drops. The reshaping ADR-0028 decision 6 asks for (the gateways
+//! in place of the audiences' endpoints, no DNS) is roadmap 10's guest item; until then the
+//! gateways are admitted beside the rest. Every other uid is untouched, except that a
 //! packet to the proxy's loopback port from any other uid is dropped (ADR-0025 decision 5).
 //! Rendered as text so the exact ruleset is pinned by tests and hashed in the log; loaded in
 //! one `nft -f` transaction before the jail starts.
@@ -45,18 +48,19 @@ pub struct Ruleset {
 }
 
 impl Ruleset {
-    /// The broker and `egress` resolved for `uid`, the proxy at `127.0.0.1:proxy_port`, the
-    /// resolvers read from `resolv_conf`.
+    /// The broker, `egress` and `gateways` resolved for `uid`, the proxy at
+    /// `127.0.0.1:proxy_port`, the resolvers read from `resolv_conf`.
     ///
     /// # Errors
     /// A broker URL without a host or port, or a broker that resolves to nothing: nothing
-    /// would work. A broker or egress endpoint on the proxy's port: the workload's one
-    /// allowed port must name one destination (ADR-0025 decision 5). An egress endpoint
-    /// that does not resolve is omitted with a warning.
+    /// would work. A broker, egress endpoint or gateway on the proxy's port: the workload's
+    /// one allowed port must name one destination (ADR-0025 decision 5). An egress endpoint
+    /// or gateway that does not resolve is omitted with a warning.
     pub async fn resolve(
         uid: u32,
         mediatore_url: &str,
         egress: &[Endpoint],
+        gateways: &[Endpoint],
         resolv_conf: &Path,
         proxy_port: u16,
     ) -> anyhow::Result<Self> {
@@ -70,14 +74,16 @@ impl Ruleset {
             "the broker {broker} resolves to no address"
         );
         allow.extend(addrs);
-        for e in egress {
-            match lookup(e).await {
-                Ok(a) if !a.is_empty() => allow.extend(a),
-                Ok(_) => {
-                    tracing::warn!(endpoint = %e, "egress endpoint resolves to no address; omitted");
-                }
-                Err(err) => {
-                    tracing::warn!(endpoint = %e, error = %err, "egress endpoint does not resolve; omitted");
+        for (what, list) in [("egress endpoint", egress), ("gateway", gateways)] {
+            for e in list {
+                match lookup(e).await {
+                    Ok(a) if !a.is_empty() => allow.extend(a),
+                    Ok(_) => {
+                        tracing::warn!(endpoint = %e, "{what} resolves to no address; omitted");
+                    }
+                    Err(err) => {
+                        tracing::warn!(endpoint = %e, error = %err, "{what} does not resolve; omitted");
+                    }
                 }
             }
         }
@@ -431,6 +437,7 @@ table inet mediatore_sandbox {
             4242,
             "https://192.0.2.10:8443",
             &[ep("198.51.100.7:443"), ep("no-such-host.invalid:443")],
+            &[ep("203.0.113.1:8443"), ep("no-such-gateway.invalid:8443")],
             &resolv,
             3128,
         )
@@ -439,13 +446,14 @@ table inet mediatore_sandbox {
         let want: BTreeSet<(IpAddr, u16)> = [
             ("192.0.2.10".parse().unwrap(), 8443),
             ("198.51.100.7".parse().unwrap(), 443),
+            ("203.0.113.1".parse().unwrap(), 8443),
             ("127.0.0.1".parse().unwrap(), 3128),
         ]
         .into_iter()
         .collect();
         assert_eq!(
             rs.allow, want,
-            "the broker always, the literal, the proxy on loopback, not the unresolvable name"
+            "the broker always, the literal, the gateway (ADR-0028 decision 6), the proxy on loopback, not the unresolvable names"
         );
         assert_eq!(rs.uid, 4242);
         assert_eq!(rs.proxy_port, 3128);
@@ -458,6 +466,7 @@ table inet mediatore_sandbox {
             1,
             "https://192.0.2.10:8443",
             &[ep("198.51.100.7:3128")],
+            &[],
             Path::new("/nonexistent"),
             3128,
         )
@@ -470,7 +479,23 @@ table inet mediatore_sandbox {
         );
         let err = Ruleset::resolve(
             1,
+            "https://192.0.2.10:8443",
+            &[],
+            &[ep("203.0.113.1:3128")],
+            Path::new("/nonexistent"),
+            3128,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("203.0.113.1:3128"),
+            "a gateway on the proxy's port: {err}"
+        );
+        let err = Ruleset::resolve(
+            1,
             "https://192.0.2.10:3128",
+            &[],
             &[],
             Path::new("/nonexistent"),
             3128,
@@ -486,6 +511,7 @@ table inet mediatore_sandbox {
         let err = Ruleset::resolve(
             1,
             "https://no-such-host.invalid",
+            &[],
             &[],
             Path::new("/nonexistent"),
             3128,

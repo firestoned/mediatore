@@ -114,12 +114,12 @@ sequenceDiagram
     G->>M: GET /v1/me (mTLS, node SVID)
     M-->>G: subject, expires_at, workload {image, args}, egress, routes, gateways
     G->>G: useradd sb-hash, tmpfs at /mnt/sandbox, pull image into rootfs (digests checked),<br/>nft ruleset keyed by its uid, phantom token
-    G->>P: start mediatore egress-proxy as sb-hash (routes, phantom)
+    G->>P: start mediatore egress-proxy as sb-hash (routes, gateways, phantom)
     G->>W: nsjail as sb-hash: exec workload.args, MEDIATORE_TOKEN = phantom
     W->>P: http://127.0.0.1:3128/host/path, Authorization: Bearer phantom
     P->>M: POST /v1/token {audience} (mTLS, claim SVID)
     M-->>P: 15-min token, aud = one audience, acting for subject
-    P->>D: the request with the real token (audit shows broker on behalf of subject)
+    P->>D: the request with the real token, through a gateway's tunnel when the environment has them<br/>(audit shows broker on behalf of subject)
     D-->>P: response
     P-->>W: response
     Note over M,W: TTL expires or DELETE /v1/claims:<br/>entry deleted, tokens refused, jail torn down, VM destroyed
@@ -245,13 +245,13 @@ under nsjail as the per-subject user. The jail gives it:
 
 | Inside the jail | Purpose |
 | --- | --- |
-| `MEDIATORE_EGRESS_PROXY` env (`http://127.0.0.1:3128`) | The **only** way out: a reverse proxy on the VM's loopback, run by the guest as your `sb-` user outside the jail. Call `$MEDIATORE_EGRESS_PROXY/<host>[:<port>]/<path>` and the proxy forwards to `https://<host>:<port>/<path>`, for the `egress` endpoints of the claim's audiences and no other host, trusting the Mozilla roots or the CA the operator named for that audience ([ADR-0025](../adr/0025-phantom-token-egress-proxy.md)) |
+| `MEDIATORE_EGRESS_PROXY` env (`http://127.0.0.1:3128`) | The **only** way out: a reverse proxy on the VM's loopback, run by the guest as your `sb-` user outside the jail. Call `$MEDIATORE_EGRESS_PROXY/<host>[:<port>]/<path>` and the proxy forwards to `https://<host>:<port>/<path>`, for the `egress` endpoints of the claim's audiences and no other host, trusting the Mozilla roots or the CA the operator named for that audience ([ADR-0025](../adr/0025-phantom-token-egress-proxy.md)); in an environment with egress gateways the connection is a tunnel through one of them, opened as your claim, and a gateway's refusal is `502` with `gateway_refused` ([ADR-0028](../adr/0028-egress-gateway-envoy-with-spiffe-identity.md)) |
 | `MEDIATORE_TOKEN` env | A **phantom** token: send it as `Authorization: Bearer $MEDIATORE_TOKEN` and the proxy replaces it with a real token for the host's audience on the way out. The real token lives in the proxy and never enters the jail. Any other `Authorization` value is refused (`401`); no header at all is forwarded bare |
 | The audience's rules | The operator may bound an audience to methods and paths (`audiences[].rules`, nono's `endpoint_rules` shape: `{ method, path }`, `*` one segment, `**` any). A request outside them is refused (`403`) before anything is forwarded; no rules means every method and path |
 | The rootfs (read-only) | Your image's filesystem as pulled: root-owned, setuid bits dropped, no device nodes ([ADR-0021](../adr/0021-sandbox-filesystem-tmpfs-and-rootfs-from-the-registry.md)) |
 | `/work` (writable), tmpfs `/tmp` + `$HOME` | Scratch space; `/work` is your `sb-` user's on the per-claim tmpfs, gone with the unmount at teardown |
 | `/usr/bin/mediatore` (read-only, the same file the guest runs from) | What `nsjail` execs before your argv, for the confinement below; the rootfs ships nothing of mediatore's ([ADR-0014](../adr/0014-one-binary-roles-as-subcommands.md)). `mediatore token` is still in it, with no socket and no route to the broker: inside the jail it does nothing |
-| The VM's network, filtered by the sandbox uid | TCP to the proxy on loopback, and for the proxy's own sockets (the same uid) the broker, the `egress` endpoints and DNS to the VM's resolvers; everything else the uid sends is logged (`mediatore-sandbox drop:`) and dropped, and a packet to the proxy's port from any other uid is dropped ([ADR-0020](../adr/0020-jail-network-nftables-keyed-by-sandbox-uid.md), [ADR-0025](../adr/0025-phantom-token-egress-proxy.md)) |
+| The VM's network, filtered by the sandbox uid | TCP to the proxy on loopback, and for the proxy's own sockets (the same uid) the broker, the `egress` endpoints, the environment's gateways and DNS to the VM's resolvers; everything else the uid sends is logged (`mediatore-sandbox drop:`) and dropped, and a packet to the proxy's port from any other uid is dropped ([ADR-0020](../adr/0020-jail-network-nftables-keyed-by-sandbox-uid.md), [ADR-0025](../adr/0025-phantom-token-egress-proxy.md)) |
 | Landlock, applied before your argv runs | What `nsjail` execs is `mediatore jail-exec`, which confines its own process and then execs your command: writes only to `/work`, `/tmp` and `$HOME` whatever your image's file modes say, TCP `connect()` only to the proxy's port, no `bind()`, signals and abstract sockets scoped to the jail; inherited by every process you start. A write elsewhere fails with `EACCES`, a listener fails at `bind()`, a direct connection to anything fails too ([ADR-0024](../adr/0024-landlock-inside-the-jail.md)) |
 
 No socket, no token files, no baked-in secrets, and no network beyond the proxy and,

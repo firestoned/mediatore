@@ -11,13 +11,19 @@
 //! (fetched over the claim SVID at `POST /v1/token`, cached until shortly before its expiry)
 //! and forwards over TLS 1.3 to the Mozilla roots, or to the CA the route carries for an
 //! upstream on a private PKI (`audiences[].ca_file`). The token is in this process's memory
-//! and nowhere else; the workload holds a phantom that is useless anywhere but here.
+//! and nowhere else; the workload holds a phantom that is useless anywhere but here. In an
+//! environment with egress gateways (ADR-0028) the upstream is not dialled directly: the
+//! proxy opens a tunnel through one of them as the claim, `CONNECT host:port` over mutual
+//! TLS with the claim SVID, and the upstream TLS runs inside it ([`crate::forward`], the
+//! forwarder of ADR-0028 decision 3, a dialer in this process by ADR-0027 decision 8).
 //!
 //! Refusals: `404` for a host outside the routes, `403` for a request outside the audience's
 //! rules, `401` for an `Authorization` that is not the phantom (the workload has no credential
 //! of its own this layer carries), `502` when the token or the upstream cannot be had. A
-//! request with no `Authorization` is forwarded bare. Nothing but the audience, the host,
-//! the method, the path and the status is logged.
+//! request with no `Authorization` is forwarded bare; `502` with `gateway_refused` when the
+//! gateway answered the tunnel with the environment's no (the authorizer's code is logged),
+//! `gateway_unreachable` when no gateway carried it. Nothing but the audience, the host,
+//! the method, the path, the gateway and the status is logged.
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
@@ -34,9 +40,10 @@ use hyper_util::rt::TokioIo;
 use mediatore_proto::{Endpoint, Route, TokenRequest, TokenResponse};
 use rustls::pki_types::ServerName;
 use tokio::io::AsyncBufReadExt as _;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 
 use crate::client::SandboxClient;
+use crate::forward::{DialError, Dialer, Forwarder};
 
 /// The proxy's loopback port unless the guest is told otherwise.
 pub const DEFAULT_PORT: u16 = 3128;
@@ -50,6 +57,7 @@ pub const READY_LINE: &str = "ready";
 const REFRESH_MARGIN_SECS: i64 = 30;
 /// File names under the sandbox's `egress/` directory.
 const ROUTES_FILE: &str = "routes.json";
+const GATEWAYS_FILE: &str = "gateways.json";
 const PHANTOM_FILE: &str = "phantom";
 
 /// Arguments of the `egress-proxy` role.
@@ -71,6 +79,10 @@ pub struct EgressArgs {
     /// The claim's routes, JSON as `GET /v1/me` returned them
     #[arg(long)]
     pub routes: PathBuf,
+    /// The environment's egress gateways, JSON as `GET /v1/me` returned them (ADR-0028);
+    /// an empty list dials the upstreams directly
+    #[arg(long)]
+    pub gateways: PathBuf,
     /// The file holding the phantom token the jail was given
     #[arg(long)]
     pub phantom_file: PathBuf,
@@ -333,13 +345,15 @@ impl TokenCache {
     }
 }
 
-/// The proxy: the claim's routes, its phantom, where tokens come from and how the upstream
-/// is trusted, per route.
+/// The proxy: the claim's routes, its phantom, where tokens come from, how an upstream is
+/// reached (directly, or through the environment's gateways as the claim) and how it is
+/// trusted, per route.
 pub struct Proxy {
     routes: Routes,
     phantom: Phantom,
     tokens: Arc<dyn TokenSource>,
     cache: TokenCache,
+    dialer: Dialer,
     /// The trust for a route without a CA of its own.
     tls: Arc<rustls::ClientConfig>,
     /// Per audience, the trust for routes that carry a CA (`Route::ca_pem`): exactly that
@@ -358,7 +372,8 @@ fn http1_only(mut tls: rustls::ClientConfig) -> Arc<rustls::ClientConfig> {
 impl Proxy {
     /// A proxy over `tls` for the routes that carry no CA (the Mozilla roots in production,
     /// [`Self::with_webpki_roots`]); a route with a `ca_pem` gets a config trusting that CA
-    /// alone, built here.
+    /// alone, built here. Upstreams are reached through `dialer`: directly, or as a tunnel
+    /// through one of the environment's gateways (ADR-0028).
     ///
     /// # Errors
     /// A `ca_pem` that holds no certificate: the claim must not start with a route whose
@@ -368,6 +383,7 @@ impl Proxy {
         phantom: Phantom,
         tokens: Arc<dyn TokenSource>,
         tls: rustls::ClientConfig,
+        dialer: Dialer,
     ) -> anyhow::Result<Self> {
         let mut tls_by_audience = HashMap::new();
         for r in routes.by_endpoint.values() {
@@ -386,6 +402,7 @@ impl Proxy {
             phantom,
             tokens,
             cache: TokenCache::default(),
+            dialer,
             tls: http1_only(tls),
             tls_by_audience,
         })
@@ -400,13 +417,21 @@ impl Proxy {
         routes: Routes,
         phantom: Phantom,
         tokens: Arc<dyn TokenSource>,
+        dialer: Dialer,
     ) -> anyhow::Result<Self> {
         Self::new(
             routes,
             phantom,
             tokens,
             mediatore_proto::tls::https_client_config(),
+            dialer,
         )
+    }
+
+    /// How upstreams are reached.
+    #[must_use]
+    pub fn dialer(&self) -> &Dialer {
+        &self.dialer
     }
 
     /// The trust for `route`: its audience's CA when it carries one, the default otherwise.
@@ -479,8 +504,15 @@ impl Proxy {
             None
         };
         let upstream = rewrite(req, &forward, bearer.as_deref());
-        match connect_and_send(&route.endpoint, self.tls_for(&route), upstream).await {
-            Ok(resp) => {
+        match connect_and_send(
+            &self.dialer,
+            &route.endpoint,
+            self.tls_for(&route),
+            upstream,
+        )
+        .await
+        {
+            Ok((resp, via)) => {
                 tracing::info!(
                     audience = %route.audience,
                     host = %route.endpoint,
@@ -488,6 +520,7 @@ impl Proxy {
                     path = %path_log,
                     status = %resp.status(),
                     credential = forward.inject,
+                    via = %via.as_ref().map_or_else(|| "direct".to_owned(), ToString::to_string),
                     "forwarded"
                 );
                 let mut resp = resp.map(BodyExt::boxed);
@@ -496,7 +529,16 @@ impl Proxy {
                 }
                 resp
             }
-            Err(e) => {
+            Err(SendError::Dial(e @ DialError::Refused { .. })) => {
+                // The environment's verdict on this tunnel, with the authorizer's code.
+                tracing::warn!(audience = %route.audience, host = %route.endpoint, error = %e, "the gateway refused the tunnel");
+                refuse(&Refusal::new(StatusCode::BAD_GATEWAY, e.code()))
+            }
+            Err(SendError::Dial(e)) => {
+                tracing::error!(audience = %route.audience, host = %route.endpoint, error = %e, "upstream unreachable");
+                refuse(&Refusal::new(StatusCode::BAD_GATEWAY, e.code()))
+            }
+            Err(SendError::Upstream(e)) => {
                 tracing::error!(audience = %route.audience, host = %route.endpoint, error = %e, "upstream unreachable");
                 refuse(&Refusal::new(
                     StatusCode::BAD_GATEWAY,
@@ -549,25 +591,48 @@ fn host_header(e: &Endpoint) -> String {
     }
 }
 
-/// TLS to `endpoint`, one HTTP/1.1 connection, one request.
+/// Why a request did not come back from the upstream.
+enum SendError {
+    /// The dial: no connection, no gateway carried the tunnel, or a gateway refused it.
+    Dial(DialError),
+    /// Connected, then the upstream's TLS or HTTP failed.
+    Upstream(anyhow::Error),
+}
+
+/// To `endpoint` through `dialer`, the upstream's TLS over whatever it opened (a tunnel's
+/// bytes are relayed untouched by the gateway, so the upstream sees this handshake and
+/// nothing in between does), one HTTP/1.1 connection, one request. Returns the response
+/// and the gateway that carried it, if one did.
 async fn connect_and_send(
+    dialer: &Dialer,
     endpoint: &Endpoint,
     tls: Arc<rustls::ClientConfig>,
     req: Request<Incoming>,
-) -> anyhow::Result<Response<Incoming>> {
-    let tcp = TcpStream::connect((endpoint.host.as_str(), endpoint.port)).await?;
-    let name = ServerName::try_from(endpoint.host.clone())
-        .map_err(|e| anyhow::anyhow!("{} is not a server name: {e}", endpoint.host))?;
+) -> Result<(Response<Incoming>, Option<Endpoint>), SendError> {
+    let opened = dialer.dial(endpoint).await.map_err(SendError::Dial)?;
+    let name = ServerName::try_from(endpoint.host.clone()).map_err(|e| {
+        SendError::Upstream(anyhow::anyhow!(
+            "{} is not a server name: {e}",
+            endpoint.host
+        ))
+    })?;
     let stream = tokio_rustls::TlsConnector::from(tls)
-        .connect(name, tcp)
-        .await?;
-    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream)).await?;
+        .connect(name, opened.conn)
+        .await
+        .map_err(|e| SendError::Upstream(e.into()))?;
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+        .await
+        .map_err(|e| SendError::Upstream(e.into()))?;
     tokio::spawn(async move {
         if let Err(e) = conn.await {
             tracing::debug!(error = %e, "upstream connection ended with an error");
         }
     });
-    Ok(sender.send_request(req).await?)
+    let resp = sender
+        .send_request(req)
+        .await
+        .map_err(|e| SendError::Upstream(e.into()))?;
+    Ok((resp, opened.via))
 }
 
 /// A refusal as the workload sees it: the status and a JSON body with the code.
@@ -595,18 +660,21 @@ fn refuse(r: &Refusal) -> Response<Body> {
 pub struct EgressFiles {
     /// The routes, JSON.
     pub routes: PathBuf,
+    /// The environment's gateways, JSON (ADR-0028).
+    pub gateways: PathBuf,
     /// The phantom.
     pub phantom: PathBuf,
 }
 
-/// Write the routes and the phantom into `dir` for the sandbox user: mode 0400, owned by
-/// `uid:gid`, outside the jail's mounts.
+/// Write the routes, the gateways and the phantom into `dir` for the sandbox user: mode
+/// 0400, owned by `uid:gid`, outside the jail's mounts.
 ///
 /// # Errors
 /// On any filesystem failure.
 pub fn write_files(
     dir: &Path,
     routes: &[Route],
+    gateways: &[Endpoint],
     phantom: &Phantom,
     uid: u32,
     gid: u32,
@@ -614,11 +682,13 @@ pub fn write_files(
     use std::os::unix::fs::PermissionsExt as _;
     let files = EgressFiles {
         routes: dir.join(ROUTES_FILE),
+        gateways: dir.join(GATEWAYS_FILE),
         phantom: dir.join(PHANTOM_FILE),
     };
     std::fs::write(&files.routes, serde_json::to_vec(routes)?)?;
+    std::fs::write(&files.gateways, serde_json::to_vec(gateways)?)?;
     std::fs::write(&files.phantom, phantom.expose().as_bytes())?;
-    for p in [&files.routes, &files.phantom] {
+    for p in [&files.routes, &files.gateways, &files.phantom] {
         std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o400))?;
         std::os::unix::fs::chown(p, Some(uid), Some(gid))?;
     }
@@ -644,6 +714,8 @@ pub fn command_args(
         workload_api_socket.to_owned(),
         "--routes".into(),
         files.routes.display().to_string(),
+        "--gateways".into(),
+        files.gateways.display().to_string(),
         "--phantom-file".into(),
         files.phantom.display().to_string(),
     ]
@@ -694,28 +766,46 @@ pub async fn spawn(
     }
 }
 
-/// Run the role: read the routes and the phantom, obtain the claim SVID, listen, say so.
+/// Run the role: read the routes, the gateways and the phantom, obtain the claim SVID (one
+/// source for the broker's client and the gateways' tunnels), listen, say so.
 ///
 /// # Errors
-/// Anything missing: no routes file, no phantom, no Workload API, the port taken.
+/// Anything missing: no routes, gateways or phantom file, no Workload API, the port taken.
 pub async fn run(args: EgressArgs) -> anyhow::Result<()> {
     let routes: Vec<Route> = serde_json::from_slice(&std::fs::read(&args.routes)?)?;
     let routes = Routes::new(routes)?;
+    let gateways: Vec<Endpoint> = serde_json::from_slice(&std::fs::read(&args.gateways)?)?;
     let phantom = Phantom::parse(&std::fs::read_to_string(&args.phantom_file)?)?;
     anyhow::ensure!(
         args.listen.ip().is_loopback(),
         "the egress proxy listens on loopback only; got {}",
         args.listen
     );
-    let client = SandboxClient::connect(&args.mediatore_url, &args.workload_api_socket).await?;
+    let source = crate::client::workload_api_source(&args.workload_api_socket).await?;
+    let client = SandboxClient::with_material(&args.mediatore_url, source.clone())?;
+    let dialer = if gateways.is_empty() {
+        tracing::warn!(
+            "no egress gateway listed: upstreams are dialled directly (ADR-0028 decision 3 applies once the environment has gateways)"
+        );
+        Dialer::Direct
+    } else {
+        let forwarder = Forwarder::new(gateways, source)?;
+        tracing::info!(
+            gateways = ?forwarder.gateways().iter().map(ToString::to_string).collect::<Vec<_>>(),
+            gateway_id = %forwarder.gateway_id(),
+            "upstreams are tunnelled through the egress gateways as the claim"
+        );
+        Dialer::Gateways(forwarder)
+    };
     let listener = TcpListener::bind(args.listen).await?;
     let addr = listener.local_addr()?;
     let proxy = Arc::new(Proxy::with_webpki_roots(
         routes,
         phantom,
         Arc::new(BrokerTokens { client }),
+        dialer,
     )?);
-    tracing::info!(%addr, routes = proxy.routes.len(), "egress proxy listening");
+    tracing::info!(%addr, routes = proxy.routes.len(), dial = %proxy.dialer, "egress proxy listening");
     // The one line on standard output: the guest starts the jail when it reads it.
     println!("{READY_LINE} {addr}");
     proxy.serve(listener).await
@@ -761,6 +851,7 @@ mod tests {
             Routes::new(vec![private.clone(), public.clone()]).unwrap(),
             phantom(),
             Arc::new(NoTokens),
+            Dialer::Direct,
         )
         .unwrap();
         let for_private = proxy.tls_for(&private);
@@ -784,6 +875,7 @@ mod tests {
             Routes::new(vec![broken]).unwrap(),
             phantom(),
             Arc::new(NoTokens),
+            Dialer::Direct,
         )
         .err()
         .expect("a CA that is not a certificate refuses the proxy")
@@ -797,7 +889,8 @@ mod tests {
             Proxy::with_webpki_roots(
                 Routes::new(vec![empty]).unwrap(),
                 phantom(),
-                Arc::new(NoTokens)
+                Arc::new(NoTokens),
+                Dialer::Direct,
             )
             .is_err(),
             "an empty ca_pem is not the Mozilla roots; it is a refusal"
@@ -1040,6 +1133,7 @@ mod tests {
     fn the_command_line_is_the_pinned_binarys_role_with_the_files() {
         let files = EgressFiles {
             routes: "/mnt/sandbox/egress/routes.json".into(),
+            gateways: "/mnt/sandbox/egress/gateways.json".into(),
             phantom: "/mnt/sandbox/egress/phantom".into(),
         };
         let a = command_args(
@@ -1060,6 +1154,8 @@ mod tests {
                 "/run/spire/sockets/agent.sock",
                 "--routes",
                 "/mnt/sandbox/egress/routes.json",
+                "--gateways",
+                "/mnt/sandbox/egress/gateways.json",
                 "--phantom-file",
                 "/mnt/sandbox/egress/phantom",
             ]
@@ -1075,12 +1171,13 @@ mod tests {
         let files = write_files(
             &dir,
             &[route("a", "api.home.example:443", &[("GET", "/**")])],
+            &["198.51.100.7:8443".parse().unwrap()],
             &p,
             me.uid(),
             me.gid(),
         )
         .unwrap();
-        for f in [&files.routes, &files.phantom] {
+        for f in [&files.routes, &files.gateways, &files.phantom] {
             let m = std::fs::metadata(f).unwrap();
             assert_eq!(m.permissions().mode() & 0o777, 0o400, "{}", f.display());
             assert_eq!((m.uid(), m.gid()), (me.uid(), me.gid()));
@@ -1091,5 +1188,8 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&files.phantom).unwrap(), p.expose());
         let back: Vec<Route> = serde_json::from_str(&routes).unwrap();
         assert_eq!(back.len(), 1);
+        let gateways: Vec<Endpoint> =
+            serde_json::from_slice(&std::fs::read(&files.gateways).unwrap()).unwrap();
+        assert_eq!(gateways, ["198.51.100.7:8443".parse().unwrap()]);
     }
 }

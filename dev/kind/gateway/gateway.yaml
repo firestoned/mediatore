@@ -6,8 +6,12 @@
 # with the gateway SVID from the real agent through the CSI volume (the ClusterSPIFFEID is a
 # test fixture an admin creates; on a VM it is the platform team's ClusterStaticEntry,
 # decision 2). Beside it, the destination the tier reaches through the gateway: the
-# testkit's probe in its serve mode, plain HTTP, answering with the host it was asked for.
-# The claim-side probe pods are created by dev/kind/gateway-e2e.sh once the claim exists.
+# testkit's probe in its serve mode, answering with the host it was asked for, over TLS on
+# the certificate `make kind-gateway` mints (Secret destination-tls, the fixture CA on the
+# proxy's route as the audience's CA), since the egress proxy speaks HTTPS to every
+# upstream (ADR-0025 decision 2). The claim-side pods, the real egress proxy with its
+# forwarder and a workload driving it, are created by dev/kind/gateway-e2e.sh once the
+# claim exists.
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -75,11 +79,13 @@ spec:
             - gateway
             - --listen
             - 127.0.0.1:9001
-            # Short bounds, so the tier sees the stale window and the outage within minutes.
+            # Short bounds, so the tier sees the stale window and the outage within minutes;
+            # the stale window long enough for a sandbox-shaped pod (the proxy waiting for
+            # its SVID, then the workload) to start inside it on a slow runner.
             - --fresh-secs
             - "5"
             - --stale-secs
-            - "20"
+            - "120"
           env:
             - { name: MEDIATORE_URL, value: "https://mediatore-sandbox.banlieue-system.svc" }
             - { name: SPIFFE_ENDPOINT_SOCKET, value: "unix:///run/spire/sockets/spire-agent.sock" }
@@ -105,7 +111,7 @@ metadata:
 spec:
   selector: { mediatore.dev/e2e-role: destination }
   ports:
-    - { name: http, port: 8080, targetPort: http }
+    - { name: https, port: 8443, targetPort: https }
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -128,10 +134,23 @@ spec:
         - name: destination
           image: localhost/mediatore-e2e:kind
           imagePullPolicy: Never
-          command: ["/usr/bin/gateway-probe", "serve", "--listen", "0.0.0.0:8080"]
+          command:
+            - /usr/bin/gateway-probe
+            - serve
+            - --listen
+            - 0.0.0.0:8443
+            - --tls-cert
+            - /etc/destination-tls/server.pem
+            - --tls-key
+            - /etc/destination-tls/server-key.pem
           ports:
-            - { name: http, containerPort: 8080 }
+            - { name: https, containerPort: 8443 }
+          volumeMounts:
+            - { name: tls, mountPath: /etc/destination-tls, readOnly: true }
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities: { drop: ["ALL"] }
+      volumes:
+        - name: tls
+          secret: { secretName: destination-tls }

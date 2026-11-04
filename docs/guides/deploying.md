@@ -77,8 +77,10 @@ URL, your CIDRs. Edit:
   its egress gateways, `gateways`: their `sandbox` addresses and data-plane port as
   `host:port` pairs, addresses not names, in the order every guest receives them on
   `GET /v1/me` ([ADR-0028](../adr/0028-egress-gateway-envoy-with-spiffe-identity.md)
-  decision 6; one listed twice stops the start). Leave it out until then: the jail
-  then reaches the audiences' `egress` directly, as before;
+  decision 6; one listed twice stops the start). With it set, every guest's egress proxy
+  tunnels its upstreams through one of them as the claim (the forwarder, decisions 3 and
+  7) and the sandbox ruleset admits them. Leave it out until then: the proxy then dials
+  the audiences' `egress` directly, as before, and says so once at start;
 - `networkpolicy.yaml`: the sandbox segment's CIDR for `:8443`, the control-plane
   addresses for the API server, the node CIDR for the kubelet's probe, and the
   issuer's namespace or addresses;
@@ -268,8 +270,8 @@ and take the installer case on yourself.
 
 When a claim binds, the guest loads a ruleset keyed
 by the sandbox user's uid before it starts the jail, and refuses to start the jail
-without it ([ADR-0020](../adr/0020-jail-network-nftables-keyed-by-sandbox-uid.md)): TCP to the broker, to the audiences' `egress` and to the
-egress proxy on loopback, DNS to the VM's resolvers, the rest logged under
+without it ([ADR-0020](../adr/0020-jail-network-nftables-keyed-by-sandbox-uid.md)): TCP to the broker, to the audiences' `egress`, to the
+environment's `gateways` and to the egress proxy on loopback, DNS to the VM's resolvers, the rest logged under
 `mediatore-sandbox drop:` and dropped; a packet to the proxy's port from any other uid is
 dropped too. The guest's log carries the ruleset's SHA-256 per claim, and
 `nft list table inet mediatore_sandbox` on the VM shows what is loaded. Root's own egress
@@ -283,8 +285,13 @@ unit; a claim whose broker or `egress` uses that port is refused), and only then
 socket and no route to the broker: it reaches the proxy, the proxy reaches the broker (for
 tokens, over the claim's SVID) and the audiences' endpoints over TLS 1.3 to the Mozilla
 roots, or to the CA named by the audience's `ca_file`, which travels to the guest on the
-route. The proxy's log names the audience, the host, the method, the path and the status
-of every request it forwards or refuses, never a token.
+route. In an environment with `gateways`, that upstream connection is a tunnel through one
+of them, opened as the claim with its SVID and `CONNECT host:port`, the upstream's TLS
+inside it ([ADR-0028](../adr/0028-egress-gateway-envoy-with-spiffe-identity.md) decision
+3); the list is walked from a random start, a gateway that is down is skipped, and a
+gateway's refusal is `502` with `gateway_refused` at the workload and the authorizer's code
+in the proxy's log. The proxy's log names the audience, the host, the method, the path, the
+gateway and the status of every request it forwards or refuses, never a token.
 
 The guest pulls each claim's `workload.image` itself ([ADR-0021](../adr/0021-sandbox-filesystem-tmpfs-and-rootfs-from-the-registry.md)): over HTTPS with the
 Mozilla roots, anonymously, into a tmpfs it mounts at `/mnt/sandbox` for that claim

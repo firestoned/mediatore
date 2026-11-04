@@ -291,24 +291,54 @@ handshake and denies. The cache's own bounds (fresh, stale, the claim's deadline
 one ask per claim at a time) are unit tests in `crates/mediatore-gateway/src/lib.rs` over
 a scripted source.
 
+### The forwarder: in `make check`
+
+The sandbox leg of [ADR-0028](../adr/0028-egress-gateway-envoy-with-spiffe-identity.md)
+decisions 3 and 7, the dialer inside the egress proxy that
+[ADR-0027](../adr/0027-control-plane-relay-on-the-egress-gateway.md) decision 8 made of
+`mediatore forward`, is proven with no Envoy in `crates/mediatore/tests/e2e_forward.rs`:
+the dev-mode broker with `gateways` in its config, the same TLS upstream as the proxy's
+suite, and `mediatore_testkit::StandInGateway`, a mutual-TLS listener on the production
+sandbox-leg configuration (`TlsConfigs`) presenting whatever SVID the test gives it from
+the testkit CA, admitting claim identities only, answering `CONNECT` from a fixed allowlist
+and relaying the tunnel. The proxy is built through its production constructor with the
+routes and the gateways from `GET /v1/me` and a forwarder presenting the claim SVID. What
+is proven: six requests reach the upstream with the STS token through a list whose first
+gateway is down and whose second presents a valid SVID that is not the gateway's, every
+tunnel recorded at the live gateway from the claim's SPIFFE ID to the upstream's
+`host:port` and none at the rogue; a gateway refusing the tunnel is `502 gateway_refused`
+with nothing reaching the upstream and no second gateway asked; two dead gateways are
+`502 gateway_unreachable`; a forwarder holding the node's SVID gets no tunnel from a live
+gateway while the claim's does. The walk itself (the start position, the wrap-around,
+failover on a failure and not on a refusal, the one pass, the `CONNECT` line and the
+answer's parsing) is unit-tested over a scripted attempt in
+`crates/mediatore-guest/src/forward.rs`.
+
 ### The egress gateway: in `make kind-e2e`
 
 `make kind-e2e-gateway` runs ADR-0028's data plane against a real Envoy and a real SPIRE:
 `dev/kind/gateway` is a pod standing in for a gateway VM, Envoy from its official image
 (pinned by digest) on the bootstrap the image will carry beside `mediatore gateway`, both
 holding `spiffe://<td>/gateway` from the agent through the CSI volume, and a destination
-behind it (the testkit's `gateway-probe` in its serve mode). `dev/kind/gateway-e2e.sh`
-binds a sandbox as the sandbox tier does, so the broker has a live claim whose allowlist is
-that one destination, gives a probe pod the claim's SVID through a fixture entry, and drives
-`gateway-probe` as the forwarder will: the claim SVID over TLS 1.3 to the gateway, its SVID
-verified, `CONNECT host:port`, one request inside the tunnel. Proven: the tunnel to the
-destination opens and the destination answers, another host and another port are refused
-with `not_allowed`, a node SVID is refused by Envoy's validator before any check, with the
-broker scaled to zero the cached allowlist stands in until the stale bound and then the
-outage is `broker_unreachable`, a deleted sandbox is `claim_gone` once its answer is stale,
-and Envoy's access log, the authorizer's decisions and the destination's requests agree on
-who reached what. The probe's checks are listed in the script; a mismatch names the
-authority, the outcome and what was expected.
+behind it (the testkit's `gateway-probe` in its serve mode, over TLS on a certificate
+`make kind-gateway` mints with `tls-fixture`, since the proxy speaks HTTPS to every
+upstream). `dev/kind/gateway-e2e.sh` binds a sandbox as the sandbox tier does, so the
+broker has a live claim whose allowlist is that one destination, then runs pods shaped
+like a sandbox VM: the real `mediatore egress-proxy` as a native sidecar with the claim's
+SVID through a fixture entry, the routes (the destination with the fixture CA as the
+audience's, and two more the gateway will refuse), the gateway list and a phantom from a
+ConfigMap, and beside it a workload with no socket and no route of its own,
+`gateway-probe via-proxy`, asking the proxy as the jail does. Proven, as the workload sees
+it: its request reaches the destination through the proxy's tunnel with the STS token
+swapped in (`200`, the proxy's log naming the gateway and the credential), another host
+and another port are `502 gateway_refused` with `not_allowed` in the proxy's log, a proxy
+holding a node SVID is refused by Envoy's validator at the handshake and the workload sees
+`502 gateway_unreachable`, with the broker scaled to zero the cached allowlist stands in
+until the stale bound and then the outage is a refusal with `broker_unreachable`, a
+deleted sandbox is cut off with `claim_gone` once its answer is stale, and Envoy's access
+log, the authorizer's decisions, the proxy's forwards and the destination's requests agree
+on who reached what. The checks are listed in the script; a mismatch names the authority,
+the status and what was expected.
 
 ### The sandbox filesystem and the pull: by hand, on the build host
 

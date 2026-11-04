@@ -357,11 +357,11 @@
     {
       "unique-id": "agentsandbox-egress-forwarder",
       "node-type": "service",
-      "name": "mediatore forward (proposed)",
-      "description": "Proposed, not built: a role of the one binary (ADR-0014) running as the claim's sb- user on a loopback port. It is the workload's only proxy; it presents the claim SVID to a gateway over mutual TLS and tunnels each connection with CONNECT. ADR-0028 decisions 3 and 7.",
+      "name": "The forwarder (the egress proxy's dialer)",
+      "description": "Built (roadmap 10, 2026-11-04): the sandbox leg of ADR-0028 decisions 3 and 7, a dialer inside mediatore egress-proxy as ADR-0027 decision 8 placed it, not a second listener or subcommand (crates/mediatore-guest/src/forward.rs). The proxy runs as the claim's sb- user outside the jail and is the workload's only proxy; when GET /v1/me lists gateways, each upstream connection is TLS 1.3 to a gateway presenting the claim SVID and verifying spiffe://<td>/gateway, CONNECT host:port, the upstream's TLS inside; the list walked from a random start, failover on a connect or handshake failure, a gateway's refusal final. Proven against a stand-in gateway in make check and against the real Envoy in kind; not yet run on a pool VM.",
       "metadata": {
-        "status": "proposed",
-        "diagram-style": "dashed orange: proposed, not built yet"
+        "status": "in progress",
+        "diagram-style": "dashed orange: built and proven in kind, not yet run on a pool VM"
       }
     },
     {
@@ -853,7 +853,7 @@
     },
     {
       "unique-id": "agentsandbox-rel-jail-to-forwarder",
-      "description": "Proposed: the jailed agent's proxy environment points at the forwarder on loopback; nftables admits the sandbox uid to nothing else but the broker and the gateways (ADR-0028 decisions 3 and 6).",
+      "description": "Built: the jailed agent's proxy environment points at the egress proxy on loopback (MEDIATORE_EGRESS_PROXY, ADR-0025), whose dialer is the forwarder; nftables admits the sandbox uid to the proxy, the broker, the audiences' endpoints and the gateways (ADR-0028 decision 6's reshaping, the gateways in place of the endpoints and no DNS, is the roadmap's guest item).",
       "relationship-type": {
         "connects": {
           "source": {
@@ -865,13 +865,13 @@
         }
       },
       "metadata": {
-        "status": "proposed",
-        "diagram-style": "dashed orange: proposed, not built yet"
+        "status": "in progress",
+        "diagram-style": "dashed orange: built and proven in kind, not yet run on a pool VM"
       }
     },
     {
       "unique-id": "agentsandbox-rel-forwarder-to-gateway",
-      "description": "Proposed: mutual TLS with the claim SVID, CONNECT inside; the gateway answers with its own SVID (ADR-0028 decisions 2 to 4). The gateway side is built and proven in kind with a stand-in for the forwarder.",
+      "description": "Built: mutual TLS 1.3 with the claim SVID, CONNECT host:port inside, the gateway verified as exactly spiffe://<td>/gateway (ADR-0028 decisions 2 to 4); proven end to end in kind, the real proxy's tunnel through the real Envoy (make kind-e2e-gateway), and against a stand-in gateway in make check (crates/mediatore/tests/e2e_forward.rs).",
       "relationship-type": {
         "connects": {
           "source": {
@@ -883,8 +883,8 @@
         }
       },
       "metadata": {
-        "status": "proposed",
-        "diagram-style": "dashed orange: proposed, not built yet"
+        "status": "in progress",
+        "diagram-style": "dashed orange: built and proven in kind, not yet run on a pool VM"
       }
     },
     {
