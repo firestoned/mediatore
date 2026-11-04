@@ -34,6 +34,7 @@ fn claim(uid: Uuid) -> ClaimRecord {
         sandbox_uid: None,
         policy_uid: None,
         bundle_version: None,
+        report: None,
     }
 }
 

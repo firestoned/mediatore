@@ -731,6 +731,7 @@ mod tests {
             sandbox_uid: None,
             policy_uid: None,
             bundle_version: None,
+            report: None,
         }
     }
 

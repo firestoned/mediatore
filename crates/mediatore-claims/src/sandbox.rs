@@ -335,6 +335,7 @@ pub fn record_for(
         sandbox_uid: sandbox_uid_of(sb),
         policy_uid: bundle.map(|b| b.content.policy.uid.clone()),
         bundle_version: bundle.map(|b| b.meta.version),
+        report: None,
     }
 }
 

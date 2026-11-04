@@ -47,8 +47,13 @@
       `mediatore-host-nft.service`: input and forward dropped, output to the gateways' two
       planes and the registries alone, names refused; `make host-table-test`, `nft -c` on
       the build host, `image/check.sh`). A pool without gateways loads none (decision 4)
-- [ ] The ruleset hashes and the image digest reported to the broker so a flush is
-      detected and the record says which bytes ran (ADR-0029 decision 5, its route open)
+- [x] The ruleset hashes and the image digest reported to the broker so a flush is
+      detected and the record says which bytes ran. Done 2026-11-04 as ADR-0029 decision 5:
+      `POST /v1/me/report` over the node SVID once the tables are loaded and before the
+      jail (`crates/mediatore-guest/src/report.rs`), the image digest, the sandbox table's
+      hash and the host table as `nft` lists it (or `missing`), kept on the record and in
+      the audit row (`claims.report`, migration `0005`), shown on `GET /v1/claims/{name}`
+      and by `mediatore sandbox get`; a broker-side comparison stays open in the ADR
 - [x] Pull credentials. Done 2026-10-27 as
       [ADR-0022](../../docs/adr/0022-registry-pull-credentials-from-the-broker.md):
       `registries[]` in the broker's config (host, username, a token file read at

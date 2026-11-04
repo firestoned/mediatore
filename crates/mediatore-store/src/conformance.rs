@@ -87,6 +87,7 @@ pub(crate) fn claim(uid: Uuid) -> ClaimRecord {
         sandbox_uid: None,
         policy_uid: None,
         bundle_version: None,
+        report: None,
     }
 }
 
@@ -117,6 +118,16 @@ pub(crate) async fn a_claim_round_trips_every_field(s: &dyn ClaimStore) {
     rec.expires_at = Some(at(3600));
     rec.policy_uid = Some("3f1b8d2a-0c4e-4b7a-9d6f-2e5c1a7b9f03".into());
     rec.bundle_version = Some(u64::from(u32::MAX) + 1);
+    rec.report = Some(mediatore_proto::ClaimReport {
+        reported_at: at(60),
+        report: mediatore_proto::GuestReport {
+            image_digest: format!("sha256:{}", "ab".repeat(32)),
+            sandbox_ruleset_sha256: "cd".repeat(32),
+            host_table: mediatore_proto::HostTable::Loaded {
+                sha256: "ef".repeat(32),
+            },
+        },
+    });
     s.put_claim(rec.clone()).await.unwrap();
 
     for got in [
@@ -139,6 +150,10 @@ pub(crate) async fn a_claim_round_trips_every_field(s: &dyn ClaimStore) {
         assert_eq!(got.seal_binding(), sandbox_uid);
         assert_eq!(got.policy_uid, rec.policy_uid);
         assert_eq!(got.bundle_version, rec.bundle_version);
+        assert_eq!(
+            got.report, rec.report,
+            "the guest's report round-trips (ADR-0029)"
+        );
         let env = got.refresh.as_ref().expect("envelope survives");
         assert_eq!(env, rec.refresh.as_ref().unwrap());
         assert_eq!(

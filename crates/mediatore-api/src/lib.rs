@@ -35,9 +35,9 @@ use mediatore_entra::{IdpError, Validated, Validator};
 use mediatore_proto::ek::is_ek_hash;
 use mediatore_proto::image::ImageReference;
 use mediatore_proto::{
-    ClaimEgress, ClaimPhase, ClaimRequest, ClaimResponse, Endpoint, EndpointRule, ErrorBody, Me,
-    NodeRegistered, NodeRegistration, RegistryCredential, Route, Secret, TokenRequest,
-    TokenResponse,
+    ClaimEgress, ClaimPhase, ClaimReport, ClaimRequest, ClaimResponse, Endpoint, EndpointRule,
+    ErrorBody, GuestReport, HostTable, Me, NodeRegistered, NodeRegistration, RegistryCredential,
+    Route, Secret, TokenRequest, TokenResponse,
 };
 use mediatore_spire::{EntryManager, Naming};
 use mediatore_store::seal::{SealError, Sealer};
@@ -434,6 +434,7 @@ async fn create_claim(
             sandbox_uid: None,
             policy_uid: None,
             bundle_version: None,
+            report: None,
         })
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
@@ -462,6 +463,7 @@ async fn create_claim(
             ready: rec.entry_id.is_some() && rec.revoked_at.is_none(),
             expires_at: rec.expires_at,
             addresses: vec![],
+            report: None,
         }),
     ))
 }
@@ -610,6 +612,7 @@ fn response_of(sb: &AgentSandbox) -> ClaimResponse {
         ready: st.ready,
         expires_at: st.expires_at.as_ref().and_then(chrono_of),
         addresses: st.addresses,
+        report: None,
     }
 }
 
@@ -664,7 +667,16 @@ async fn get_claim(
 ) -> Result<Json<ClaimResponse>, ApiError> {
     if !st.dev_mode {
         let sb = owned_sandbox(&st, &headers, &name).await?;
-        return Ok(Json(response_of(&sb)));
+        let mut resp = response_of(&sb);
+        // The guest's report lives on the record (ADR-0029 decision 5), not on the
+        // resource; a record not yet written is simply no report.
+        resp.report = st
+            .store
+            .get_claim_by_name(&name)
+            .await
+            .ok()
+            .and_then(|r| r.report);
+        return Ok(Json(resp));
     }
     let rec = owned_claim(&st, &headers, &name).await?;
     Ok(Json(ClaimResponse {
@@ -674,6 +686,7 @@ async fn get_claim(
         ready: rec.entry_id.is_some() && rec.revoked_at.is_none(),
         expires_at: rec.expires_at,
         addresses: vec![],
+        report: rec.report.clone(),
     }))
 }
 
@@ -769,12 +782,14 @@ async fn register_node(
     Ok(Json(NodeRegistered { node_id: agent_id }))
 }
 
-async fn me(
-    State(st): State<Shared>,
-    headers: HeaderMap,
-    peer: Option<Extension<PeerSpiffeId>>,
-) -> Result<Json<Me>, ApiError> {
-    let peer = peer_spiffe_id(&st, peer.as_ref().map(|e| &e.0), &headers)?;
+/// The live claim bound to the node the peer is: the node identity, registered, with a
+/// claim (`GET /v1/me` and `POST /v1/me/report` share it).
+async fn claim_of_node_peer(
+    st: &AppState,
+    headers: &HeaderMap,
+    peer: Option<&PeerSpiffeId>,
+) -> Result<ClaimRecord, ApiError> {
+    let peer = peer_spiffe_id(st, peer, headers)?;
     let ek_hash = st
         .naming
         .node_ek_from(&peer)
@@ -784,8 +799,7 @@ async fn me(
         .get_node(&ek_hash)
         .await
         .map_err(|_| ApiError::forbidden("node not registered"))?;
-    let rec = st
-        .store
+    st.store
         .get_claim_by_node(&node.node_id)
         .await
         .map_err(|_| {
@@ -794,7 +808,49 @@ async fn me(
                 "no_claim",
                 Some("no live claim bound to this node".into()),
             )
-        })?;
+        })
+}
+
+/// `POST /v1/me/report` (ADR-0029 decision 5): the guest, over the node SVID, says what it
+/// pulled and loaded before the workload started; kept on the claim's record, shown to the
+/// subject on `GET /v1/claims/{name}`, swept into the audit row with the claim. One line
+/// per report; a host table missing where gateways exist is said at `warn`.
+async fn report(
+    State(st): State<Shared>,
+    headers: HeaderMap,
+    peer: Option<Extension<PeerSpiffeId>>,
+    Json(body): Json<GuestReport>,
+) -> Result<StatusCode, ApiError> {
+    let mut rec = claim_of_node_peer(&st, &headers, peer.as_ref().map(|e| &e.0)).await?;
+    body.validate()
+        .map_err(|e| ApiError::bad_request("invalid_report", e))?;
+    if body.host_table == HostTable::Missing {
+        tracing::warn!(claim_uid = %rec.uid, "the guest found no host table where the environment has gateways (ADR-0029)");
+    }
+    tracing::info!(
+        claim_uid = %rec.uid,
+        image_digest = %body.image_digest,
+        sandbox_ruleset_sha256 = %body.sandbox_ruleset_sha256,
+        host_table = ?body.host_table,
+        "guest report recorded"
+    );
+    rec.report = Some(ClaimReport {
+        reported_at: Utc::now(),
+        report: body,
+    });
+    st.store
+        .update_claim(rec)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn me(
+    State(st): State<Shared>,
+    headers: HeaderMap,
+    peer: Option<Extension<PeerSpiffeId>>,
+) -> Result<Json<Me>, ApiError> {
+    let rec = claim_of_node_peer(&st, &headers, peer.as_ref().map(|e| &e.0)).await?;
     let expires_at = rec
         .expires_at
         .ok_or_else(|| ApiError::internal("bound claim has no deadline".to_owned()))?;
@@ -1153,6 +1209,7 @@ pub fn sandbox_router(state: Shared) -> Router {
         .route("/healthz", get(healthz))
         .route("/v1/nodes", post(register_node))
         .route("/v1/me", get(me))
+        .route("/v1/me/report", post(report))
         .route("/v1/token", post(token))
         .route("/v1/gateway/claims/{uid}", get(claim_egress))
         .layer(tower_http::trace::TraceLayer::new_for_http())

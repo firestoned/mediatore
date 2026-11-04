@@ -277,6 +277,24 @@ async fn create(args: CreateArgs) -> anyhow::Result<()> {
         println!("{}", serde_json::to_string_pretty(&claim)?);
     } else {
         println!("{}\t{:?}\tready={}", claim.name, claim.phase, claim.ready);
+        print_report(&claim);
     }
     Ok(())
+}
+
+/// The guest's report, when the claim has one (ADR-0029 decision 5): which image digest
+/// and which rules ran, as the broker recorded them.
+fn print_report(claim: &mediatore_proto::ClaimResponse) {
+    let Some(r) = &claim.report else {
+        return;
+    };
+    let host = match &r.report.host_table {
+        mediatore_proto::HostTable::Loaded { sha256 } => format!("loaded sha256={sha256}"),
+        mediatore_proto::HostTable::Missing => "MISSING (the environment has gateways)".to_owned(),
+        mediatore_proto::HostTable::NotLoaded => "none (no gateways)".to_owned(),
+    };
+    println!(
+        "reported_at={}\timage_digest={}\tsandbox_ruleset_sha256={}\thost_table={host}",
+        r.reported_at, r.report.image_digest, r.report.sandbox_ruleset_sha256
+    );
 }

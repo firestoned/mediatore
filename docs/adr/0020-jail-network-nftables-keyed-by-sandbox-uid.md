@@ -88,7 +88,9 @@ come from, when the ruleset is loaded, and what happens when it cannot be.
    installed `nft` refuses, no uid) is an error before `nsjail` is spawned, and the guest
    tears down what it created. The SHA-256 of the loaded ruleset is logged with the claim
    UID; reporting it to the broker, so a flush or change is detected (ADR-0010's outline),
-   is a follow-up item of roadmap 06.
+   is a follow-up item of roadmap 06. *Done 2026-11-04 by
+   [ADR-0029](0029-the-pull-on-a-routeless-segment-and-the-pool-vms-root-rules.md)
+   decision 5: `POST /v1/me/report`, with the host table's hash and the image digest.*
 
 6. **Teardown deletes the table**, after the jail is stopped, best effort like the rest of
    the teardown: the next claim replaces it anyway.
