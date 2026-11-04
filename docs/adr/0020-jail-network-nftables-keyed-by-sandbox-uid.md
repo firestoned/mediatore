@@ -3,7 +3,14 @@
 
 # ADR-0020: The jail's network is the guest's, bounded by nftables keyed by the sandbox uid
 
-**Status:** Accepted · **Date:** 2026-10-24
+**Status:** Accepted · **Date:** 2026-10-24 · **Amended:** 2026-10-31 (decision 1, no user
+namespace); 2026-11-04 by [ADR-0028](0028-egress-gateway-envoy-with-spiffe-identity.md)
+decision 6 and [ADR-0027](0027-control-plane-relay-on-the-egress-gateway.md) decision 6
+(decisions 2 to 4: in an environment with egress gateways the destinations are the
+gateways' `sandbox` addresses and the broker through the control relay, by address, with
+no audience endpoint and no DNS rule; names are refused there, not resolved. Without a
+gateway the ruleset below stands, and the proxy dials the audiences' endpoints directly.
+`crates/mediatore-guest/src/net.rs`, `Shape`)
 
 Roadmap 06, the network item. Implements mediatore's share of
 [ADR-0010](0010-no-inbound-to-sandboxes.md) (no inbound to sandboxes; in-guest nftables

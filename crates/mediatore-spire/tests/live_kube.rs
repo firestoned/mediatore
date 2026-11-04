@@ -186,7 +186,7 @@ async fn run(
 
     // Claim entry.
     let claim = mgr
-        .create_claim_entry(EK, claim_uid, UNIX_USER)
+        .create_claim_entry(EK, claim_uid, UNIX_USER, std::time::Duration::from_hours(1))
         .await
         .map_err(|e| format!("create_claim_entry: {e}"))?;
     assert_eq!(claim, claim_entry_name(claim_uid));
@@ -195,7 +195,11 @@ async fn run(
     assert!(st.rendered && !st.masked, "claim status {st:?}");
     assert_eq!(got.spec.spiffe_id, naming.claim_id(claim_uid));
     assert_eq!(got.spec.selectors, vec![format!("unix:user:{UNIX_USER}")]);
-    assert_eq!(got.spec.x509_svid_ttl.as_deref(), Some("1h"));
+    assert_eq!(
+        got.spec.x509_svid_ttl.as_deref(),
+        Some("900s"),
+        "the default bound (ADR-0027 decision 7), the claim having an hour"
+    );
 
     // Both are listed under the managed-by label with their kinds.
     let listed = mgr.list_entries().await.map_err(|e| e.to_string())?;

@@ -19,13 +19,14 @@ pub mod kube;
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use mediatore_proto::ek::is_ek_hash;
 use uuid::Uuid;
 
 pub use crate::kube::{
-    ClusterStaticEntry, ClusterStaticEntrySpec, EntriesConfig, KubeEntryManager,
+    ClusterStaticEntry, ClusterStaticEntrySpec, EntriesConfig, KubeEntryManager, MAX_CLAIM_SVID_TTL,
 };
 
 /// Label every mediatore-declared entry carries; the orphan sweep selects on it.
@@ -201,18 +202,63 @@ pub fn validate_unix_user(user: &str) -> Result<(), SpireError> {
     }
 }
 
+/// A Go duration as SPIRE and its controller manager write them (`15m`, `900s`, `1h30m`):
+/// whole hours, minutes and seconds in that order, each optional, at least one. What
+/// `spire.entries.claim_svid_ttl` is parsed from.
+///
+/// # Errors
+/// Anything else, including an empty string, a fraction, a unit SPIRE would accept but a
+/// TTL never needs (`ms`, `us`, `ns`), or zero.
+pub fn parse_go_duration(s: &str) -> Result<Duration, String> {
+    let mut rest = s.trim();
+    if rest.is_empty() {
+        return Err("empty duration".into());
+    }
+    let mut secs: u64 = 0;
+    let mut seen: u8 = 0;
+    for (unit, factor, rank) in [("h", 3600u64, 1u8), ("m", 60, 2), ("s", 1, 3)] {
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        if digits.is_empty() || !rest[digits.len()..].starts_with(unit) {
+            continue;
+        }
+        let n: u64 = digits
+            .parse()
+            .map_err(|_| format!("{s:?}: {digits} is too large"))?;
+        secs = secs
+            .checked_add(
+                n.checked_mul(factor)
+                    .ok_or_else(|| format!("{s:?} is too large"))?,
+            )
+            .ok_or_else(|| format!("{s:?} is too large"))?;
+        rest = &rest[digits.len() + unit.len()..];
+        seen = rank;
+    }
+    if !rest.is_empty() || seen == 0 {
+        return Err(format!(
+            "{s:?} is not a duration of hours, minutes and seconds (like 15m or 900s)"
+        ));
+    }
+    if secs == 0 {
+        return Err(format!("{s:?} is zero"));
+    }
+    Ok(Duration::from_secs(secs))
+}
+
 /// Registration entry operations mediatore needs. Every method returns the entry's resource
 /// name; a declaration only succeeds once the entry is set on the SPIRE server.
 #[async_trait]
 pub trait EntryManager: Send + Sync + 'static {
     /// Declare (or find) the node bootstrap entry for a VM whose EK hash is known.
     async fn ensure_node_entry(&self, ek_hash: &str) -> Result<String, SpireError>;
-    /// Declare the claim entry under the node's agent. Idempotent on the name.
+    /// Declare the claim entry under the node's agent. Idempotent on the name. `claim_ttl`
+    /// is the time the claim has left: the entry's SVID TTL never exceeds it (ADR-0027
+    /// decision 7).
     async fn create_claim_entry(
         &self,
         ek_hash: &str,
         claim_uid: Uuid,
         unix_user: &str,
+        claim_ttl: Duration,
     ) -> Result<String, SpireError>;
     /// Retract an entry by name; a missing entry is success.
     async fn delete_entry(&self, name: &str) -> Result<(), SpireError>;
@@ -261,6 +307,7 @@ impl EntryManager for MemoryEntries {
         ek_hash: &str,
         claim_uid: Uuid,
         unix_user: &str,
+        _claim_ttl: Duration,
     ) -> Result<String, SpireError> {
         validate_ek_hash(ek_hash)?;
         validate_unix_user(unix_user)?;
@@ -355,7 +402,7 @@ mod tests {
         let uid = Uuid::new_v4();
         let node = m.ensure_node_entry(EK).await.unwrap();
         let claim = m
-            .create_claim_entry(EK, uid, "sb-0123456789ab")
+            .create_claim_entry(EK, uid, "sb-0123456789ab", Duration::from_hours(1))
             .await
             .unwrap();
         assert_eq!(node, node_entry_name(EK));
@@ -380,9 +427,34 @@ mod tests {
             Err(SpireError::Invalid(_))
         ));
         assert!(matches!(
-            m.create_claim_entry(EK, Uuid::new_v4(), "root").await,
+            m.create_claim_entry(EK, Uuid::new_v4(), "root", Duration::from_hours(1))
+                .await,
             Err(SpireError::Invalid(_))
         ));
         assert_eq!(m.names(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn go_durations_of_hours_minutes_and_seconds_parse_and_nothing_else_does() {
+        for (text, secs) in [
+            ("15m", 900),
+            ("900s", 900),
+            ("1h", 3600),
+            ("1h30m", 5400),
+            ("1h30m15s", 5415),
+            (" 2m ", 120),
+            ("4h", 14400),
+        ] {
+            assert_eq!(
+                parse_go_duration(text).unwrap(),
+                Duration::from_secs(secs),
+                "{text}"
+            );
+        }
+        for bad in [
+            "", "0", "0s", "15", "m", "1.5h", "30m1h", "15min", "100ms", "-1h", "1h1h",
+        ] {
+            assert!(parse_go_duration(bad).is_err(), "{bad:?} parsed");
+        }
     }
 }

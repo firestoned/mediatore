@@ -1,0 +1,74 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+#
+# Envoy's bootstrap for the egress gateway's control relay (ADR-0027 decisions 1, 2, 3 and
+# 9): a second Envoy, its own unit and user (envoy-relay.service), with no SPIRE socket, no
+# SVID and no credential of any kind. Two listeners on the sandbox address, each an L4
+# pass-through to one fixed upstream: the SPIRE server's attestation port and the broker's
+# sandbox listener, by address, as the deployment's env file names them. No CONNECT, no
+# authority from the client, no name resolution on behalf of the sandbox; the TLS inside is
+# the agent's with the server and the node's with the broker, end to end, and the relay sees
+# ciphertext. A new upstream is a new listener here, a reviewed change, never a parameter.
+# One access-log line per connection: time, the sandbox's source address, the upstream,
+# bytes each way, duration. No admin block. The per-source connection cap is the host's
+# nftables table (image/gateway/nftables.conf.in), since the relay has no identity to see.
+node:
+  id: relay
+  cluster: egress-gateway-relay
+static_resources:
+  listeners:
+    - name: spire
+      address:
+        socket_address: { address: @SANDBOX_ADDRESS@, port_value: @RELAY_SPIRE_PORT@ }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                stat_prefix: relay_spire
+                cluster: spire_server
+                access_log:
+                  - name: envoy.access_loggers.stdout
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog
+                      log_format:
+                        text_format_source:
+                          inline_string: "relay upstream=spire source=%DOWNSTREAM_REMOTE_ADDRESS% to=%UPSTREAM_HOST% rx=%BYTES_RECEIVED% tx=%BYTES_SENT% ms=%DURATION% flags=%RESPONSE_FLAGS%\n"
+    - name: broker
+      address:
+        socket_address: { address: @SANDBOX_ADDRESS@, port_value: @RELAY_BROKER_PORT@ }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                stat_prefix: relay_broker
+                cluster: broker
+                access_log:
+                  - name: envoy.access_loggers.stdout
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog
+                      log_format:
+                        text_format_source:
+                          inline_string: "relay upstream=broker source=%DOWNSTREAM_REMOTE_ADDRESS% to=%UPSTREAM_HOST% rx=%BYTES_RECEIVED% tx=%BYTES_SENT% ms=%DURATION% flags=%RESPONSE_FLAGS%\n"
+  clusters:
+    - name: spire_server
+      connect_timeout: 5s
+      type: STATIC
+      load_assignment:
+        cluster_name: spire_server
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: @SPIRE_SERVER_ADDRESS@, port_value: @SPIRE_SERVER_PORT@ }
+    - name: broker
+      connect_timeout: 5s
+      type: STATIC
+      load_assignment:
+        cluster_name: broker
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: @BROKER_ADDRESS@, port_value: @BROKER_PORT@ }

@@ -1,0 +1,154 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+#
+# Envoy's bootstrap for the egress gateway's data plane (ADR-0028 decisions 1 to 5 and 8),
+# one text for the kind tier and the gateway VM: image/gateway/render fills the upper-case
+# placeholders between at signs from an env file (dev/kind/gateway/envoy.env in kind, the result
+# committed as envoy.yaml and checked for drift; /etc/mediatore-gateway/env on a VM, at
+# every start of envoy-gateway.service). No admin block: the admin interface is off. One
+# listener, on the sandbox address: mutual TLS 1.3 with the gateway's own SVID and the
+# trust bundle from the local SPIRE agent over SDS (rotated without a restart), the SPIFFE
+# validator refusing any peer not under spiffe://<td>/banlieue/claim/, CONNECT only. Each
+# CONNECT is checked with the authorizer beside Envoy, mediatore gateway, with Envoy's own
+# Check call over gRPC on loopback (ext_authz with grpc_service): the check carries the
+# peer's identity from its verified certificate, the method and the authority, nothing the
+# client sent. A refusal or an unreachable authorizer is 403. (Envoy's HTTP mode cannot
+# carry a CONNECT check: it copies the tunnel's own request line into the check and resets
+# any 2xx to it, verified on 1.40.2.) The authority is resolved by Envoy itself, on its own
+# interface, and the tunnel's bytes are relayed untouched: no interception. One access-log
+# line per tunnel, keyed by the peer's SPIFFE ID, never the payload. The node block names
+# this Envoy to the SDS server, which requires it.
+node:
+  id: gateway
+  cluster: egress-gateway
+static_resources:
+  listeners:
+    - name: sandbox
+      address:
+        socket_address: { address: @SANDBOX_ADDRESS@, port_value: @DATA_PORT@ }
+      filter_chains:
+        - transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              require_client_certificate: true
+              common_tls_context:
+                tls_params:
+                  tls_minimum_protocol_version: TLSv1_3
+                  tls_maximum_protocol_version: TLSv1_3
+                  # The hybrid first (threat model R-8's reference); classical after it for
+                  # a client that cannot offer it.
+                  ecdh_curves: ["X25519MLKEM768", "X25519", "P-256"]
+                alpn_protocols: ["http/1.1"]
+                tls_certificate_sds_secret_configs:
+                  - name: "spiffe://@TRUST_DOMAIN@/gateway"
+                    sds_config:
+                      resource_api_version: V3
+                      api_config_source:
+                        api_type: GRPC
+                        transport_api_version: V3
+                        grpc_services:
+                          - envoy_grpc: { cluster_name: spire_agent }
+                combined_validation_context:
+                  default_validation_context:
+                    match_typed_subject_alt_names:
+                      - san_type: URI
+                        matcher: { prefix: "spiffe://@TRUST_DOMAIN@/banlieue/claim/" }
+                  validation_context_sds_secret_config:
+                    name: "spiffe://@TRUST_DOMAIN@"
+                    sds_config:
+                      resource_api_version: V3
+                      api_config_source:
+                        api_type: GRPC
+                        transport_api_version: V3
+                        grpc_services:
+                          - envoy_grpc: { cluster_name: spire_agent }
+          filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: sandbox
+                codec_type: HTTP1
+                http_protocol_options: {}
+                access_log:
+                  - name: envoy.access_loggers.stdout
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog
+                      log_format:
+                        text_format_source:
+                          inline_string: "tunnel peer=%DOWNSTREAM_PEER_URI_SAN% method=%REQ(:METHOD)% authority=%REQ(:AUTHORITY)% status=%RESPONSE_CODE% flags=%RESPONSE_FLAGS% upstream=%UPSTREAM_HOST% rx=%BYTES_RECEIVED% tx=%BYTES_SENT% ms=%DURATION%\n"
+                route_config:
+                  name: sandbox
+                  virtual_hosts:
+                    - name: tunnels
+                      domains: ["*"]
+                      routes:
+                        - match: { connect_matcher: {} }
+                          route:
+                            cluster: destinations
+                            upgrade_configs:
+                              - upgrade_type: CONNECT
+                                connect_config: {}
+                http_filters:
+                  - name: envoy.filters.http.ext_authz
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz
+                      transport_api_version: V3
+                      failure_mode_allow: false
+                      status_on_error: { code: Forbidden }
+                      grpc_service:
+                        envoy_grpc: { cluster_name: authorizer }
+                        timeout: 3s
+                  - name: envoy.filters.http.dynamic_forward_proxy
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.dynamic_forward_proxy.v3.FilterConfig
+                      dns_cache_config:
+                        name: destinations
+                        dns_lookup_family: V4_ONLY
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters:
+    # The SPIRE agent's SDS, on the Workload API socket (the CSI driver's mount in kind,
+    # the local agent's on a VM).
+    - name: spire_agent
+      connect_timeout: 1s
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options: {}
+      load_assignment:
+        cluster_name: spire_agent
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    pipe: { path: @SPIRE_SOCKET@ }
+    # The authorizer, mediatore gateway, beside Envoy: Envoy's Check call over gRPC.
+    - name: authorizer
+      connect_timeout: 1s
+      type: STATIC
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options: {}
+      load_assignment:
+        cluster_name: authorizer
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: @AUTHORIZER_ADDRESS@, port_value: @AUTHORIZER_PORT@ }
+    # The destinations: whatever authority an admitted CONNECT names, resolved by Envoy.
+    - name: destinations
+      connect_timeout: 5s
+      lb_policy: CLUSTER_PROVIDED
+      cluster_type:
+        name: envoy.clusters.dynamic_forward_proxy
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.clusters.dynamic_forward_proxy.v3.ClusterConfig
+          dns_cache_config:
+            name: destinations
+            dns_lookup_family: V4_ONLY

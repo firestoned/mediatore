@@ -43,12 +43,16 @@ stages:
           owner: 0
           group: 0
           # image/spire/agent.conf with the two placeholders replaced: the trust domain
-          # and the server's address. The plugin path and checksum stay as they are.
+          # and the server's address. The plugin path and checksum stay as they are. With
+          # egress gateways the server address is a gateway's sandbox address and the
+          # control relay's SPIRE port (ADR-0027 decision 3): the segment has no route
+          # and no resolver, so a name or the server's own address would reach nothing.
+          # Without gateways yet, the server's name or address as the segment reaches it.
           content: |
             agent {
               trust_domain = "sandbox.home.example"
-              server_address = "spire-server.sandbox.home.example"
-              server_port = "8081"
+              server_address = "198.51.100.1"
+              server_port = "3129"
               trust_bundle_path = "/etc/spire/bundle.pem"
               socket_path = "/run/spire/sockets/agent.sock"
               data_dir = "/var/lib/spire/agent"
@@ -79,10 +83,27 @@ stages:
           permissions: 0644
           owner: 0
           group: 0
-          # image/env.example: the broker's sandbox listener, as the members reach it (the
-          # LoadBalancer's port, 443 in deploy/base). Whole-line comments only: systemd's
-          # EnvironmentFile keeps an inline comment as part of the value.
+          # image/env.example: the broker's sandbox listener, as the members reach it. With
+          # egress gateways, a gateway's sandbox address and the control relay's broker
+          # port (ADR-0027 decision 3), by address; without gateways yet, the
+          # LoadBalancer's name or address and port (443 in deploy/base). Whole-line
+          # comments only: systemd's EnvironmentFile keeps an inline comment as part of
+          # the value.
           content: |
-            MEDIATORE_URL=https://mediatore.sandbox.home.example
+            MEDIATORE_URL=https://198.51.100.1:3130
             SPIFFE_ENDPOINT_SOCKET=/run/spire/sockets/agent.sock
             RUST_LOG=info
+    - name: mediatore-gateways
+      files:
+        # The pool's bootstrap list of egress gateways (ADR-0027 decision 4): the three
+        # sandbox addresses and the data-plane port, one per line, the list the guest uses
+        # when the broker's `gateways` is empty (the broker's wins otherwise). Leave the
+        # file out on a pool with no gateway; the guest then dials directly and says so.
+        - path: /etc/mediatore/gateways
+          permissions: 0644
+          owner: 0
+          group: 0
+          content: |
+            198.51.100.1:8443
+            198.51.100.2:8443
+            198.51.100.3:8443

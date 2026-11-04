@@ -106,7 +106,9 @@ pub struct EntriesSection {
     /// Seconds a declaration may take to become `set` before the bind fails (default 30).
     #[serde(default = "default_ready_timeout_secs")]
     pub ready_timeout_secs: u64,
-    /// `x509SVIDTTL` on claim entries (default `1h`; admission caps it at `4h`).
+    /// `x509SVIDTTL` on claim entries, a Go duration (default `15m`, the most it may be:
+    /// ADR-0027 decision 7; admission caps any entry at `4h`). Never more than the claim
+    /// has left.
     #[serde(default = "default_claim_svid_ttl")]
     pub claim_svid_ttl: String,
 }
@@ -115,16 +117,37 @@ fn default_ready_timeout_secs() -> u64 {
     30
 }
 fn default_claim_svid_ttl() -> String {
-    "1h".into()
+    "15m".into()
 }
 
-impl From<&EntriesSection> for mediatore_spire::EntriesConfig {
-    fn from(e: &EntriesSection) -> Self {
-        Self {
+impl EntriesSection {
+    /// The TTL parsed and bounded (ADR-0027 decision 7).
+    ///
+    /// # Errors
+    /// Not a duration of hours, minutes and seconds, zero, or more than
+    /// [`mediatore_spire::MAX_CLAIM_SVID_TTL`].
+    pub fn claim_svid_ttl(&self) -> anyhow::Result<std::time::Duration> {
+        let ttl = mediatore_spire::parse_go_duration(&self.claim_svid_ttl)
+            .map_err(|e| anyhow::anyhow!("spire.entries.claim_svid_ttl: {e}"))?;
+        anyhow::ensure!(
+            ttl <= mediatore_spire::MAX_CLAIM_SVID_TTL,
+            "spire.entries.claim_svid_ttl: {} is more than {}s, the most a claim SVID may live (ADR-0027 decision 7)",
+            self.claim_svid_ttl,
+            mediatore_spire::MAX_CLAIM_SVID_TTL.as_secs()
+        );
+        Ok(ttl)
+    }
+}
+
+impl TryFrom<&EntriesSection> for mediatore_spire::EntriesConfig {
+    type Error = anyhow::Error;
+
+    fn try_from(e: &EntriesSection) -> anyhow::Result<Self> {
+        Ok(Self {
             class_name: e.class_name.clone(),
             ready_timeout: std::time::Duration::from_secs(e.ready_timeout_secs),
-            claim_svid_ttl: e.claim_svid_ttl.clone(),
-        }
+            claim_svid_ttl: e.claim_svid_ttl()?,
+        })
     }
 }
 
@@ -461,6 +484,7 @@ impl Config {
             if e.ready_timeout_secs == 0 {
                 anyhow::bail!("spire.entries.ready_timeout_secs must be positive");
             }
+            e.claim_svid_ttl()?;
         }
         cfg.check_store()?;
         cfg.check_policy()?;
@@ -820,10 +844,47 @@ store: {{ url: \"sqlite:///var/lib/mediatore/store.db\" }}
 "
         ))
         .unwrap();
-        let e: mediatore_spire::EntriesConfig = (&cfg.spire.unwrap().entries).into();
+        let e: mediatore_spire::EntriesConfig = (&cfg.spire.unwrap().entries).try_into().unwrap();
         assert_eq!(e.class_name, "spire-server-spire");
         assert_eq!(e.ready_timeout, std::time::Duration::from_secs(30));
-        assert_eq!(e.claim_svid_ttl, "1h");
+        assert_eq!(
+            e.claim_svid_ttl,
+            std::time::Duration::from_mins(15),
+            "ADR-0027 decision 7: 15 minutes unless told less"
+        );
+    }
+
+    #[test]
+    fn the_claim_svid_ttl_is_a_duration_of_at_most_fifteen_minutes() {
+        let with = |ttl: &str| {
+            Config::parse(&format!(
+                "{BASE}spire:
+  workload_api_socket: unix:///run/spire/sockets/spire-agent.sock
+  entries:
+    class_name: spire-server-spire
+    claim_svid_ttl: {ttl:?}
+store: {{ url: \"sqlite:///var/lib/mediatore/store.db\" }}
+"
+            ))
+        };
+        let cfg = with("5m").unwrap();
+        assert_eq!(
+            cfg.spire.unwrap().entries.claim_svid_ttl().unwrap(),
+            std::time::Duration::from_mins(5)
+        );
+        assert!(with("900s").is_ok());
+        for (bad, why) in [
+            ("1h", "more than"),
+            ("16m", "more than"),
+            ("0s", "zero"),
+            ("soon", "not a duration"),
+        ] {
+            let err = with(bad).unwrap_err().to_string();
+            assert!(
+                err.contains("claim_svid_ttl") && err.contains(why),
+                "{bad}: {err}"
+            );
+        }
     }
 
     #[test]

@@ -3,7 +3,8 @@
 
 # ADR-0027: A sandbox reaches the identity plane only through a control relay on the egress gateway
 
-**Status:** Accepted · **Date:** 2026-10-30
+**Status:** Accepted, implemented 2026-11-04 (decisions 4, 6, 7 and 8 in code; 1, 2, 5 and
+9 in the gateway image) · **Date:** 2026-10-30
 
 Roadmap 10. Amends [ADR-0028](0028-egress-gateway-envoy-with-spiffe-identity.md) decisions 4
 and 6 (what the gateway carries, and whether the sandbox reaches the broker directly),
@@ -135,6 +136,47 @@ credential it produces. No layer is relied on alone.
    - Data plane: ADR-0028 decision 8's per-tunnel line, keyed by claim.
    - Alert on: control connections from a source with no attested node, a source over its
      connection cap, an attestation refused, and a 403 burst from one claim.
+
+## Implementation notes
+
+What roadmap 10 fixed within the decisions above, as it is built:
+
+- **The relay is a second Envoy** (decisions 1, 2 and 9), `envoy-relay.service` in the
+  gateway image (`image/gateway/`), as user `envoy-relay`, on the bootstrap
+  `image/gateway/envoy/relay.yaml.in`: two `tcp_proxy` listeners on the sandbox address,
+  3129 to the SPIRE server and 3130 to the broker, each a static cluster by address from
+  the deployment's env file, no TLS context, no SDS, no admin block, one access-log line per
+  connection (source, upstream, bytes each way, duration, flags). Its unit keeps `/run/spire`
+  inaccessible, so the mount namespace enforces "no socket" beside the file modes, and it
+  needs no agent to start: it runs before any identity on the VM exists.
+- **The host table is `image/gateway/nftables.conf.in`** (decision 5), rendered and loaded
+  by `mediatore-gateway-nft.service` before either Envoy may start: input policy drop,
+  loopback and established traffic accepted, on the sandbox interface the data port and the
+  two relay ports for new connections only, a new relay connection counted per source in a
+  dynamic set and dropped past `RELAY_CAP` (16 by default) with a `cap:` log line, nothing
+  new on egress, the forward hook dropped. It replaces the cgroup filter and the masking of
+  2026-10-30 on the next image.
+- **The bootstrap list is `/etc/mediatore/gateways`** (decision 4), one `host:port` per line
+  with `#` comments, written by the pool's cloud-config layer
+  (`image/cloud-config-deployment.example.yaml`); `mediatore guest` reads it
+  (`--gateways-file`, `net::bootstrap_gateways`) and uses it when `GET /v1/me` lists no
+  gateway, the broker's list otherwise, logging which (`net::choose_gateways`). A line that
+  is not an endpoint refuses the claim: a list the pool wrote wrong is better refused than
+  silently shortened.
+- **The broker leg and the SPIRE leg are addresses** (decision 3): the pool's
+  `MEDIATORE_URL` is `https://<a gateway's sandbox address>:3130` and the agent's
+  `server_address` the same address with port 3129. With gateways the sandbox ruleset
+  admits the broker's address and port as the one the relay has, resolves nothing and
+  carries no DNS rule (decision 6, ADR-0028's implementation notes); a broker given by name
+  in that shape is refused at the guest before the claim starts. The agent's failover
+  between gateways stays as *Still to decide* says.
+- **`x509_svid_ttl` is at most 15 minutes and never more than the claim has left**
+  (decision 7): `spire.entries.claim_svid_ttl` defaults to `15m` and the broker refuses a
+  larger value or one that is not a duration at start (`EntriesSection::claim_svid_ttl`,
+  `mediatore_spire::MAX_CLAIM_SVID_TTL`); on `Bound` the entry carries the smaller of that
+  bound and the claim's own TTL, in seconds (`KubeEntryManager::claim_svid_ttl`,
+  `Reconciler::bind`). The admission policy's `4h` ceiling stands as the outer bound for
+  any entry.
 
 ## Consequences
 

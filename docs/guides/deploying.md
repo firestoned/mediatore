@@ -79,8 +79,13 @@ URL, your CIDRs. Edit:
   `GET /v1/me` ([ADR-0028](../adr/0028-egress-gateway-envoy-with-spiffe-identity.md)
   decision 6; one listed twice stops the start). With it set, every guest's egress proxy
   tunnels its upstreams through one of them as the claim (the forwarder, decisions 3 and
-  7) and the sandbox ruleset admits them. Leave it out until then: the proxy then dials
-  the audiences' `egress` directly, as before, and says so once at start;
+  7) and the sandbox ruleset takes its gateway shape: the relay, the gateways and the
+  proxy by address, no DNS, no audience endpoint ([step 7](#7-the-egress-gateways)).
+  Leave it out until then: the proxy then dials the audiences' `egress` directly, as
+  before, and says so once at start. `spire.entries.claim_svid_ttl` is at most `15m`
+  (the default; [ADR-0027](../adr/0027-control-plane-relay-on-the-egress-gateway.md)
+  decision 7: a claim's identity ends within that of its release or of losing the
+  gateways, and never outlives the claim);
 - `networkpolicy.yaml`: the sandbox segment's CIDR for `:8443`, the control-plane
   addresses for the API server, the node CIDR for the kubelet's probe, and the
   issuer's namespace or addresses;
@@ -270,10 +275,17 @@ and take the installer case on yourself.
 
 When a claim binds, the guest loads a ruleset keyed
 by the sandbox user's uid before it starts the jail, and refuses to start the jail
-without it ([ADR-0020](../adr/0020-jail-network-nftables-keyed-by-sandbox-uid.md)): TCP to the broker, to the audiences' `egress`, to the
-environment's `gateways` and to the egress proxy on loopback, DNS to the VM's resolvers, the rest logged under
-`mediatore-sandbox drop:` and dropped; a packet to the proxy's port from any other uid is
-dropped too. The guest's log carries the ruleset's SHA-256 per claim, and
+without it ([ADR-0020](../adr/0020-jail-network-nftables-keyed-by-sandbox-uid.md)). Its
+shape follows the environment. With egress gateways (the broker's `gateways`, or the
+pool's `/etc/mediatore/gateways` when the broker lists none): TCP to the broker, which is
+the control relay at a gateway's `sandbox` address, to the three gateways' data port and
+to the egress proxy on loopback, every one an address, and nothing else, no DNS rule at
+all ([ADR-0028](../adr/0028-egress-gateway-envoy-with-spiffe-identity.md) decision 6); a
+broker or a gateway given by name refuses the claim, since the segment has no resolver.
+Without a gateway: TCP to the broker, to the audiences' `egress` resolved at load and to
+the proxy, DNS to the VM's resolvers. In both, the rest is logged under
+`mediatore-sandbox drop:` and dropped, and a packet to the proxy's port from any other uid
+is dropped too. The guest's log carries the shape and the ruleset's SHA-256 per claim, and
 `nft list table inet mediatore_sandbox` on the VM shows what is loaded. Root's own egress
 and the input chain are not in that table: those rules come once the image's system users
 are settled (roadmap 06).
@@ -331,12 +343,93 @@ volumes:
     secret: { secretName: mediatore-registry, defaultMode: 0440 }
 ```
 
+## 7. The egress gateways
+
+With the pool attesting, the environment's egress goes through the three gateway VMs of
+banlieue ADR-0109 and [ADR-0028](../adr/0028-egress-gateway-envoy-with-spiffe-identity.md):
+Envoy with the identity `spiffe://<td>/gateway`, authorizing every tunnel on the caller's
+claim against the broker, and beside it the control relay of
+[ADR-0027](../adr/0027-control-plane-relay-on-the-egress-gateway.md), through which a pool
+VM reaches the SPIRE server and the broker at all (the segment has no route and no
+resolver). Everything is image content and ordinary banlieue objects; banlieue gains no
+kind.
+
+**The image.** `image/gateway/Dockerfile` is the same Kairos derivative as the sandbox
+image with Envoy copied from its official image at the digest the kind tier runs
+(`dev/kind/gateway/kustomization.yaml`), the authorizer (`mediatore gateway`, the one
+binary), the agent and the plugin, `nftables`, and three service users. The Build workflow
+publishes it as `ghcr.io/firestoned/mediatore-gateway`, signed and attested; `make
+gateway-image` builds it locally and `make gateway-image-check` proves what it carries
+(both Envoys unprivileged with no capability and a read-only root, the relay kept out of
+`/run/spire`, the host table, no sshd, forwarding off, the examples filling every
+template). Nothing in it is yours: at every unit start `image/gateway/render` fills the two
+Envoy bootstraps, the host table and the sandbox interface's networkd file from two env
+files, the deployment's `/etc/mediatore-gateway/env` (`image/gateway/env.example`: the
+trust domain, the sandbox NIC's name and prefix, the ports, the SPIRE server's and the
+broker's addresses on the egress side, the broker's URL for the authorizer) and the VM's
+`vm.env` (`image/gateway/vm.env.example`: its sandbox address). Addresses, not names,
+throughout: the gateway is what resolves names for everyone else.
+
+**The layers and the objects** are `deploy/gateway/`, with placeholders: the `VMImage`
+(three cloud-config Secrets like the sandbox image's: `image/gateway/cloud-config.yaml`,
+banlieue's EK-certificate layer, your copy of
+`image/gateway/cloud-config-deployment.example.yaml` with the agent's configuration, the
+bundle and the env file), the two-interface `VMClass` (`egress` first, on a routable class
+with the subnet's gateway and resolver, so it carries the static address and the default
+route; `sandbox` second, on the segment, with no address from banlieue), and the three
+`VirtualMachine`s: the egress address of each in `networkOverrides`, its sandbox address in
+a ConfigMap as `userData`, a required anti-affinity across the `host` key so no two share
+a failure domain (banlieue ADR-0098).
+
+```sh
+cp -r deploy/gateway ~/.config/mediatore/gateway     # then put your addresses, hashes and names in
+kubectl kustomize ~/.config/mediatore/gateway | less  # read it once
+kubectl apply -k ~/.config/mediatore/gateway
+```
+
+**The identity.** Each gateway attests with its vTPM like a pool member (the same
+`deploy/spire-tpm` component, its host's CA in the ConfigMap), and the SPIRE server logs
+its agent ID, `spiffe://<td>/spire/agent/tpm/<ek-hash>` (`spire-server agent list` shows
+it). That hash goes into two `ClusterStaticEntry` objects per VM
+(`deploy/gateway/clusterstaticentries.yaml`): `spiffe://<td>/gateway` for `unix:user:envoy`
+(the data plane, over SDS) and for `unix:user:mediatore-gateway` (the authorizer), since one
+entry's selectors are a conjunction. You apply them, not the broker: its admission policy
+constrains only its own ServiceAccount. The relay gets no entry. The data plane refuses
+every peer that is not a claim of the trust domain before any check runs, so a sandbox
+cannot reach the relay's upstreams through it, and the authorizer asks the broker over
+`GET /v1/gateway/claims/{uid}` with the gateway SVID, on the egress side.
+
+**The pool behind them.** The pool's deployment layer changes in three places
+(`image/cloud-config-deployment.example.yaml` shows all three): the agent's
+`server_address` is a gateway's sandbox address with port `3129`, `MEDIATORE_URL` is
+`https://<the same address>:3130`, and `/etc/mediatore/gateways` lists the three sandbox
+addresses with the data port, the list the guest uses until the broker's `gateways` arrives
+(ADR-0027 decision 4). The broker's `gateways` lists the same three. The agent holds one
+server address, so it fails over between gateways only when it restarts; the forwarder
+fails over per connection.
+
+**What the network must do**, outside this repository: the segment's VLAN trunked on every
+host of the zone (banlieue ADR-0109 decision 3), the three gateways' `egress` addresses
+allowed to reach the SPIRE server's attestation port, the broker's sandbox listener and the
+audiences' endpoints, and the SPIRE server and the broker admitting those three addresses
+and nothing from the sandbox range (ADR-0027's consequences). The broker's
+`networkpolicy.yaml` already carries the row for the gateways' addresses on `8443`; with
+the relay in place the sandbox segment's own row on `8443` is no longer needed, since no
+sandbox reaches the listener directly any more.
+
+**What proves it before a VM does.** `make kind-e2e-gateway` runs the data plane end to end
+against a real Envoy on the bootstrap the image renders (`make gateway-render-check` keeps
+the two identical), `make gateway-image-check` the image, and `nft -c` on the build host
+both rulesets ([testing tiers](testing.md)). The live run on three VMs and a pool VM behind
+them is roadmap 06's libvirt proof extended with the gateways; until then the image is
+built and checked, not booted.
+
 ## What the NetworkPolicy allows
 
 | Direction | Peer | Port | Why |
 | --- | --- | --- | --- |
-| ingress | the sandbox segment | 8443 | the guest and the jailed workload, over SPIFFE mTLS (TB-6) |
-| ingress | the gateways' `egress` addresses | 8443 | the gateway's authorizer asking what a claim may reach, over SPIFFE mTLS with the gateway SVID ([ADR-0028](../adr/0028-egress-gateway-envoy-with-spiffe-identity.md) decision 4); only once the gateways exist |
+| ingress | the sandbox segment | 8443 | the guest and the egress proxy, over SPIFFE mTLS (TB-6); with the control relay in place ([step 7](#7-the-egress-gateways)) this row narrows to the gateways' `egress` addresses below, since no sandbox reaches the listener directly any more |
+| ingress | the gateways' `egress` addresses | 8443 | the gateway's authorizer asking what a claim may reach, over SPIFFE mTLS with the gateway SVID ([ADR-0028](../adr/0028-egress-gateway-envoy-with-spiffe-identity.md) decision 4), and the control relay carrying the pool VMs' own node and claim sessions to the listener ([ADR-0027](../adr/0027-control-plane-relay-on-the-egress-gateway.md) decision 3) |
 | ingress | the ingress controller's namespace | 8080 | people and their tools, bearer over the ingress's TLS (TB-1) |
 | ingress | the node CIDR | 8080 | the kubelet's readiness probe, where the CNI does not exempt it |
 | egress | kube-dns | 53 | names |

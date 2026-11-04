@@ -3,15 +3,15 @@
 
 # ADR-0028: The egress gateway is Envoy, and it knows which claim is calling
 
-**Status:** Accepted · **Date:** 2026-10-28 · **Amended:** 2026-10-30 by
+**Status:** Accepted, implemented 2026-11-04 · **Date:** 2026-10-28 · **Amended:** 2026-10-30 by
 [ADR-0027](0027-control-plane-relay-on-the-egress-gateway.md) (decisions 4 and 6: the
 sandbox reaches the broker and the SPIRE server only through a control relay on the
 gateway, not directly; the data plane stands)
 
 Roadmap 10. Gives the egress gateway of [ADR-0010](0010-no-inbound-to-sandboxes.md)
 decision 4 its software, its identity and its authorization. Amends banlieue
-[ADR-0103](https://github.com/firestoned/banlieue/blob/main/docs/adr/0103-isolated-sandbox-network-with-proxy-egress.md)
-decision 4 (the proxies run Envoy, not haproxy) and
+[ADR-0109](https://github.com/firestoned/banlieue/blob/main/docs/adr/0109-isolated-sandbox-network-with-proxy-egress.md)
+decision 4 (the proxies run Envoy, not haproxy; amended there on 2026-10-28) and
 [ADR-0020](0020-jail-network-nftables-keyed-by-sandbox-uid.md) decisions 2 to 4 (the
 ruleset names the gateways, not the audiences' endpoints). Builds on
 [ADR-0004](0004-spiffe-identity-scheme.md) (identities),
@@ -26,7 +26,7 @@ injection, which stays roadmap 07 and its own ADR.
 ## Context
 
 ADR-0010 puts egress enforcement outside the guest, at a gateway, because guest root can
-flush the in-guest nftables table. banlieue ADR-0103 then fixed the shape of that
+flush the in-guest nftables table. banlieue ADR-0109 then fixed the shape of that
 gateway: three proxy VMs per environment, each with a routable `egress` interface and a
 `sandbox` interface on a layer 2 segment, IP forwarding off, the proxy terminating the
 sandbox's connection and opening a new one from its own address. It chose haproxy as a
@@ -56,9 +56,9 @@ that identity.
 
 ## Decision
 
-1. **The gateway is Envoy, on each of ADR-0103's three proxy VMs.** One `envoy` process
+1. **The gateway is Envoy, on each of ADR-0109's three proxy VMs.** One `envoy` process
    per VM, as a dedicated non-root user. It replaces haproxy; nothing else about
-   ADR-0103's VM shape changes (two interfaces, forwarding off, no sshd, the `sandbox`
+   ADR-0109's VM shape changes (two interfaces, forwarding off, no sshd, the `sandbox`
    address fixed by the image, one environment per segment and proxy set).
 
 2. **The gateway has its own SPIFFE identity.** Each gateway VM runs a SPIRE agent that
@@ -112,10 +112,10 @@ that identity.
 7. **A sandbox picks among the three by list.** The forwarder takes the list in `/v1/me`
    order, starts at a random position per connection, and tries the next on a connect or
    handshake failure. No DNS name, no floating address, no VRRP: the segment stays
-   resolver-free as ADR-0103 decision 7 requires. This settles the first open item of
-   ADR-0103.
+   resolver-free as ADR-0109 decision 7 requires. This settles the first open item of
+   ADR-0109.
 
-8. **The gateway VMs are hardened as ADR-0103 decision 4 and this ADR require.**
+8. **The gateway VMs are hardened as ADR-0109 decision 4 and this ADR require.**
    - `net.ipv4.ip_forward` and `net.ipv6.conf.all.forwarding` are 0.
    - Envoy's only listener is on the `sandbox` address and one port; nothing listens on
      `egress` and an input chain drops everything arriving there that is not
@@ -142,7 +142,7 @@ that identity.
     cloud-config layers that write the Envoy bootstrap, the units and the `sandbox`
     address. The three VMs are ordinary banlieue `VirtualMachine` objects with a
     two-interface `VMClass` (`egress` first, so it carries the static address and the
-    default route; `sandbox` second, written by the image, ADR-0103 decisions 4 and 6),
+    default route; `sandbox` second, written by the image, ADR-0109 decisions 4 and 6),
     placed one per failure domain (banlieue ADR-0098), on a `tpmEnabled` class like every
     VM from now on. banlieue gains no kind, no field and no controller.
 
@@ -166,7 +166,7 @@ What roadmap 10 fixed within the decisions above, as it is built:
 - **`gateways` is a top-level list in the broker's config** (decision 6), `host:port` pairs
   parsed like `audiences[].egress`, one listed twice refused at start, empty by default;
   `Me::gateways` carries it in that order and an old broker reads as an empty list. The
-  environment is the broker's: one broker, one segment, one gateway set (ADR-0103).
+  environment is the broker's: one broker, one segment, one gateway set (ADR-0109).
 - **The authorizer is `mediatore gateway`, in `crates/mediatore-gateway`** (decision 4),
   Envoy's external authorization service, on loopback. It speaks Envoy's own `Check` call
   over gRPC (`ext_authz` with `grpc_service`), the one place mediatore speaks gRPC, for a
@@ -225,9 +225,65 @@ What roadmap 10 fixed within the decisions above, as it is built:
   `crates/mediatore/tests/e2e_forward.rs` against a stand-in gateway on the production
   mTLS configuration, and in kind against the real one (`make kind-e2e-gateway`, the real
   proxy as a sidecar beside a workload with no socket).
-- **Not yet:** the gateway image and VMs (decision 10, with decision 8's host hardening),
-  the ruleset change (decision 6), the threat-model pass, which comes with the rest of the
-  roadmap.
+- **The sandbox's ruleset has two shapes** (decision 6, amending ADR-0020 decisions 2 to
+  4; `crates/mediatore-guest/src/net.rs`, `Shape`). With gateways, the sandbox uid reaches
+  the broker, which is the control relay at a gateway's `sandbox` address (ADR-0027
+  decisions 3 and 6), the gateways' data-plane port and the egress proxy on loopback, all
+  by address, and nothing else: no audience endpoint and no DNS rule at all, since the
+  proxy tunnels every upstream and the gateway resolves the name (decision 5). A broker or
+  a gateway given by name in that shape refuses the claim before it starts: the segment
+  has no resolver, so the proxy could never have dialled it. Without a gateway (an older
+  environment, the dev loop, the kind tiers) the list is ADR-0020's: the broker, the
+  audiences' endpoints resolved at load, the proxy and DNS to the VM's resolvers, and the
+  proxy dials directly. The guest takes the gateways from `GET /v1/me`, or from the pool's
+  bootstrap file `/etc/mediatore/gateways` when the broker lists none (ADR-0027 decision
+  4, `--gateways-file`), and logs which. Decision 3's `HTTPS_PROXY`, `HTTP_PROXY` and
+  `ALL_PROXY` are not set in the jail: the workload's proxy is ADR-0025's reverse proxy on
+  `MEDIATORE_EGRESS_PROXY`, not a `CONNECT` proxy, and a `CONNECT` handler beside it would
+  carry requests the audience's rules cannot see; that is a trust decision for roadmap 07
+  if a workload ever needs a tool that speaks only `HTTPS_PROXY`.
+- **The gateway image is `image/gateway/`** (decisions 1, 2, 8 and 10; ADR-0027 decisions
+  1, 2, 5 and 9): the same Kairos base as the sandbox image (ADR-0023), Envoy's binary
+  copied from the official image at the digest the kind tier runs, the one `mediatore`
+  binary, the SPIRE agent and the TPM plugin, `nftables`, three service users (`envoy`,
+  `envoy-relay`, `mediatore-gateway`), no sshd, forwarding off in `sysctl`
+  (`image/gateway/sysctl/`). The bootstraps are templates in the image rendered at every
+  unit start by `image/gateway/render` from two env files, the deployment's
+  (`/etc/mediatore-gateway/env`: trust domain, ports, the relay's upstream addresses) and
+  the VM's (`vm.env`: its sandbox address, delivered as the `VirtualMachine`'s `userData`,
+  since the three VMs share the image and its layers, banlieue ADR-0109 decision 6);
+  `dev/kind/gateway/envoy.yaml` is the data-plane template rendered with the tier's values
+  and `make gateway-render-check` fails on drift, so the bootstrap proven in kind is the
+  one the image carries. Units: `mediatore-gateway-network` (the sandbox interface, a
+  networkd file in `/run`), `mediatore-gateway-nft` (the host table: default-drop input,
+  the data port and the two relay ports on the sandbox interface only, a per-source
+  connection cap on the relay ports with a dynamic set, nothing new on egress, forward
+  dropped), `envoy-gateway` (the data plane, user `envoy`, `NoNewPrivileges`, no
+  capability, `ProtectSystem=strict`, private `/tmp`, `--mode validate` before start),
+  `envoy-relay` (the control relay, user `envoy-relay`, the same hardening,
+  `InaccessiblePaths=/run/spire`), `mediatore-gateway` (the authorizer on loopback); both
+  Envoys `Require` the table and the interface, so no listener exists without them.
+  `image/gateway/check.sh` proves all of it inside the built image on every pull request
+  (`make gateway-image-check`), as `image/check.sh` does for the sandbox image; the Build
+  workflow publishes it as `ghcr.io/firestoned/mediatore-gateway`, signed and attested,
+  and the release carries its `VMImage` and layers.
+- **The VMs and the entries are `deploy/gateway/`** (decisions 2 and 10): the `VMImage`
+  and a two-interface `VMClass` (`egress` first, on a routable class with the subnet's
+  gateway and resolver; `sandbox` second, on the segment, no address from banlieue), three
+  `VirtualMachine`s with the egress address in `networkOverrides`, the sandbox address in
+  `userData` and a required anti-affinity across the `host` key, and two
+  `ClusterStaticEntry` objects per VM, both `spiffe://<td>/gateway` under that VM's agent:
+  `unix:user:envoy` for the data plane and `unix:user:mediatore-gateway` for the
+  authorizer, since one entry's selectors are a conjunction. This settles the selectors
+  item of *Still to decide*; the bootstrap of the first entry is the platform team reading
+  the agent ID the SPIRE server logs when the gateway first attests. The relay has no
+  entry. The network (the segment's VLAN on every host, the firewall on the three
+  `egress` addresses and on the SPIRE server and the broker admitting them) is the
+  deployment's, stated in the deploying guide; nothing in this repository can apply it.
+- **Not yet, and not this roadmap's:** the live run on three gateway VMs and a pool VM
+  behind them. The image is built and checked, not booted (threat model R-15 covers the
+  gateway image as it covers the sandbox image); the first live environment is roadmap
+  06's libvirt proof extended with the gateways.
 
 ## Consequences
 
@@ -255,7 +311,7 @@ What roadmap 10 fixed within the decisions above, as it is built:
   new crate for the authorizer), `Me::gateways`
   in `mediatore-proto`, the gateway route in `mediatore-api`, the ruleset change in
   `crates/mediatore-guest/src/net.rs`. A kustomize or image fragment for the gateway VM
-  lives under `image/`. banlieue ADR-0103 gets an amendment; nothing else in banlieue
+  lives under `image/`. banlieue ADR-0109 gets an amendment; nothing else in banlieue
   changes.
 - **Envoy's TLS stack decides what the sandbox leg can offer.** The broker's sandbox leg
   is X25519MLKEM768 only (threat model R-8's reference). The gateway offers it first if
@@ -264,7 +320,7 @@ What roadmap 10 fixed within the decisions above, as it is built:
 - **Rejected:**
   - haproxy and `spiffe-helper` (SVID files on disk, no per-peer SPIFFE ID check in the
     stream, authorization by a second system);
-  - haproxy as in ADR-0103 (no identity: one list for every claim);
+  - haproxy as in ADR-0109 (no identity: one list for every claim);
   - identity by source address (addresses are drawn from a pool and recycled; an address
     names a VM, never a claim, and a malicious guest chooses its own);
   - a gateway in the cluster (ADR-0009 decision 2 and 4: the segment never routes to a
@@ -286,7 +342,9 @@ What roadmap 10 fixed within the decisions above, as it is built:
   reads it.
 - ~~**The allowlist's cache bound** and the answer format between the authorizer and the
   broker, settled in the implementation's test plan.~~ Settled, see *Implementation notes*.
-- **The registration entries' selectors for the gateway workload** (the Envoy user on a
-  gateway VM) and how the first entry is bootstrapped after the agent first attests.
+- ~~**The registration entries' selectors for the gateway workload** (the Envoy user on a
+  gateway VM) and how the first entry is bootstrapped after the agent first attests.~~
+  Settled, see *Implementation notes*: `unix:user:envoy` and `unix:user:mediatore-gateway`,
+  two entries per VM, applied by the platform team against the agent ID the server logs.
 - ~~**The ML-KEM question above,** on the Envoy build chosen.~~ Answered, see
   *Implementation notes*: Envoy 1.40.2 negotiates X25519MLKEM768.

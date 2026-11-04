@@ -229,8 +229,19 @@ skips without it:
 MEDIATORE_NFT='sudo /usr/sbin/nft' cargo test -p mediatore-guest net:: -- --include-ignored
 ```
 
-Run it on the build host whenever `net.rs` changes. The kind tiers run the guest with
-`--dev-skip-setup` and load no ruleset; the live proof is a libvirt member (roadmap 06).
+Run it on the build host whenever `net.rs` changes; it hands `nft -c` both shapes, the
+direct one and the gateway one ([ADR-0028](../adr/0028-egress-gateway-envoy-with-spiffe-identity.md)
+decision 6: the relay, the gateways and the proxy by address, no DNS). The gateway host's
+own table (`image/gateway/nftables.conf.in`, [ADR-0027](../adr/0027-control-plane-relay-on-the-egress-gateway.md)
+decision 5) is checked the same way, rendered from the examples:
+
+```sh
+./image/gateway/render image/gateway/nftables.conf.in /tmp/gw.conf image/gateway/env.example image/gateway/vm.env.example
+sudo /usr/sbin/nft -c -f /tmp/gw.conf
+```
+
+The kind tiers run the guest with `--dev-skip-setup` and load no ruleset; the live proof is
+a libvirt member (roadmap 06).
 
 ### The jail's confinement: by hand, on the build host
 
@@ -318,7 +329,10 @@ answer's parsing) is unit-tested over a scripted attempt in
 
 `make kind-e2e-gateway` runs ADR-0028's data plane against a real Envoy and a real SPIRE:
 `dev/kind/gateway` is a pod standing in for a gateway VM, Envoy from its official image
-(pinned by digest) on the bootstrap the image will carry beside `mediatore gateway`, both
+(pinned by digest, the digest the gateway image copies the binary from) on the bootstrap
+the image carries (`image/gateway/envoy/gateway.yaml.in` rendered with
+`dev/kind/gateway/envoy.env`; `make gateway-render-check` fails on drift and runs before
+the tier) beside `mediatore gateway`, both
 holding `spiffe://<td>/gateway` from the agent through the CSI volume, and a destination
 behind it (the testkit's `gateway-probe` in its serve mode, over TLS on a certificate
 `make kind-gateway` mints with `tls-fixture`, since the proxy speaks HTTPS to every
@@ -358,7 +372,7 @@ MEDIATORE_PULL_IMAGE=docker.io/library/busybox:1.37 cargo test -p mediatore-gues
 
 Run them on the build host whenever `sandboxfs.rs` or `image.rs` changes.
 
-### The VM image: built and checked, not booted
+### The VM images: built and checked, not booted
 
 The sandbox VM image ([ADR-0023](../adr/0023-sandbox-vm-image-kairos-derivative.md)) is a
 Kairos derivative that CI builds on every pull request and checks with `image/check.sh`:
@@ -370,8 +384,24 @@ no `sshd` and no other listener, no private key. The same on the build host:
 make dist && make guest-image BINARY_FROM=host CONTAINER_CLI=podman && make guest-image-check CONTAINER_CLI=podman
 ```
 
-Nothing boots it: the install, the sealed partition, the EK export and a claim on a real
-member are roadmap 06's live item.
+The egress gateway image ([ADR-0028](../adr/0028-egress-gateway-envoy-with-spiffe-identity.md)
+decision 10, `image/gateway/`) is built and checked the same way, `image/gateway/check.sh`:
+Envoy at the pinned version and running, the authorizer, the agent and the plugin, the
+render script and the templates, the example env files filling every template and both
+rendered bootstraps accepted by `envoy --mode validate`, no admin block, the relay's
+bootstrap with no TLS and no SDS, the three service users none of them in the TPM group,
+the six units enabled and pointing where the image put things, both Envoys unprivileged
+with no capability and a read-only root, the relay kept out of `/run/spire`, both
+requiring the table and the interface first, forwarding off, the table default-drop with
+the per-source cap, no `sshd`, the distribution's `nftables` unit masked, no private key.
+
+```sh
+make dist && make gateway-image BINARY_FROM=host CONTAINER_CLI=podman && make gateway-image-check CONTAINER_CLI=podman
+```
+
+Nothing boots either: the install, the sealed partition, the EK export and a claim on a
+real member, and the three gateways with a pool VM behind them, are roadmap 06's live
+item.
 
 ### Broker and client pods over SPIFFE mTLS
 

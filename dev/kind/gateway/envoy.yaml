@@ -1,20 +1,23 @@
 # Copyright (c) 2026 Erick Bourgeois, mediatore
 # SPDX-License-Identifier: Apache-2.0
 #
-# Envoy's bootstrap for the egress gateway (ADR-0028 decisions 1 to 5 and 8), as the kind
-# tier runs it and as the gateway image will carry it. No admin block: the admin interface
-# is off. One listener, on the sandbox side: mutual TLS 1.3 with the gateway's own SVID and
-# the trust bundle from the local SPIRE agent over SDS (rotated without a restart), the
-# SPIFFE validator refusing any peer not under spiffe://<td>/banlieue/claim/, CONNECT only.
-# Each CONNECT is checked with the authorizer beside Envoy, mediatore gateway, with Envoy's
-# own Check call over gRPC on loopback (ext_authz with grpc_service): the check carries the
+# Envoy's bootstrap for the egress gateway's data plane (ADR-0028 decisions 1 to 5 and 8),
+# one text for the kind tier and the gateway VM: image/gateway/render fills the upper-case
+# placeholders between at signs from an env file (dev/kind/gateway/envoy.env in kind, the result
+# committed as envoy.yaml and checked for drift; /etc/mediatore-gateway/env on a VM, at
+# every start of envoy-gateway.service). No admin block: the admin interface is off. One
+# listener, on the sandbox address: mutual TLS 1.3 with the gateway's own SVID and the
+# trust bundle from the local SPIRE agent over SDS (rotated without a restart), the SPIFFE
+# validator refusing any peer not under spiffe://<td>/banlieue/claim/, CONNECT only. Each
+# CONNECT is checked with the authorizer beside Envoy, mediatore gateway, with Envoy's own
+# Check call over gRPC on loopback (ext_authz with grpc_service): the check carries the
 # peer's identity from its verified certificate, the method and the authority, nothing the
 # client sent. A refusal or an unreachable authorizer is 403. (Envoy's HTTP mode cannot
 # carry a CONNECT check: it copies the tunnel's own request line into the check and resets
-# any 2xx to it, verified on 1.40.2.) The authority is resolved by Envoy itself,
-# on its own interface, and the tunnel's bytes are relayed untouched: no interception.
-# One access-log line per tunnel, keyed by the peer's SPIFFE ID, never the payload.
-# The node block names this Envoy to the SDS server, which requires it.
+# any 2xx to it, verified on 1.40.2.) The authority is resolved by Envoy itself, on its own
+# interface, and the tunnel's bytes are relayed untouched: no interception. One access-log
+# line per tunnel, keyed by the peer's SPIFFE ID, never the payload. The node block names
+# this Envoy to the SDS server, which requires it.
 node:
   id: gateway
   cluster: egress-gateway
@@ -106,7 +109,8 @@ static_resources:
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
   clusters:
-    # The SPIRE agent's SDS, on the Workload API socket the CSI driver mounts.
+    # The SPIRE agent's SDS, on the Workload API socket (the CSI driver's mount in kind,
+    # the local agent's on a VM).
     - name: spire_agent
       connect_timeout: 1s
       typed_extension_protocol_options:
@@ -121,7 +125,7 @@ static_resources:
               - endpoint:
                   address:
                     pipe: { path: /run/spire/sockets/spire-agent.sock }
-    # The authorizer, mediatore gateway, in the same pod: Envoy's Check call over gRPC.
+    # The authorizer, mediatore gateway, beside Envoy: Envoy's Check call over gRPC.
     - name: authorizer
       connect_timeout: 1s
       type: STATIC
