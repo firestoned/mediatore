@@ -88,6 +88,79 @@ impl Subject {
     }
 }
 
+/// What the guest found loaded for the pool VM's host table (ADR-0029 decision 3) when it
+/// reported: the hash of the table as `nft` lists it, or that it was missing where the
+/// environment has gateways, or that none is loaded in an environment without them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum HostTable {
+    /// `inet mediatore_host` is loaded; the SHA-256 of `nft -s list table` output, hex.
+    Loaded {
+        /// The hash.
+        sha256: String,
+    },
+    /// The environment has gateways and the table is not loaded: flushed, or never loaded.
+    Missing,
+    /// No gateways, no host table (ADR-0029 decision 4).
+    NotLoaded,
+}
+
+/// `POST /v1/me/report`: what the guest pulled and loaded before it started the workload
+/// (ADR-0029 decision 5), sent over the node SVID once per claim, so the record says which
+/// bytes and which rules ran and a later `nft list table` can be compared.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuestReport {
+    /// The manifest digest the pull resolved to, `sha256:<64 hex>`.
+    pub image_digest: String,
+    /// SHA-256 of the sandbox uid's ruleset as loaded (`net::Ruleset::sha256`), hex.
+    pub sandbox_ruleset_sha256: String,
+    /// The host table.
+    pub host_table: HostTable,
+}
+
+impl GuestReport {
+    /// The two hashes and the digest in their one shape.
+    ///
+    /// # Errors
+    /// A digest not `sha256:` plus 64 hex characters, a hash not 64 hex characters.
+    pub fn validate(&self) -> Result<(), String> {
+        let hex64 = |s: &str| {
+            s.len() == 64
+                && s.bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        };
+        match self.image_digest.strip_prefix("sha256:") {
+            Some(h) if hex64(h) => {}
+            _ => {
+                return Err(format!(
+                    "image_digest {:?} is not sha256:<64 hex>",
+                    self.image_digest
+                ));
+            }
+        }
+        if !hex64(&self.sandbox_ruleset_sha256) {
+            return Err("sandbox_ruleset_sha256 is not 64 hex characters".into());
+        }
+        if let HostTable::Loaded { sha256 } = &self.host_table
+            && !hex64(sha256)
+        {
+            return Err("host_table.sha256 is not 64 hex characters".into());
+        }
+        Ok(())
+    }
+}
+
+/// The guest's report as the broker keeps it on the claim and shows it on
+/// `GET /v1/claims/{name}` (ADR-0029 decision 5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimReport {
+    /// When the broker received it.
+    pub reported_at: DateTime<Utc>,
+    /// What the guest said.
+    #[serde(flatten)]
+    pub report: GuestReport,
+}
+
 /// What the sandbox should run once identity is established.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Workload {
@@ -285,6 +358,10 @@ pub struct ClaimResponse {
     /// Guest addresses, once known.
     #[serde(default)]
     pub addresses: Vec<String>,
+    /// What the guest pulled and loaded before the workload started, once it reported
+    /// (ADR-0029 decision 5); absent until then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report: Option<ClaimReport>,
 }
 
 /// `GET /v1/me`, answered to the in-guest agent over the node SVID.

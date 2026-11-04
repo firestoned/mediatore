@@ -49,7 +49,7 @@ impl Engine {
     }
 
     fn migrator(self) -> Migrator {
-        let steps: [(i64, &'static str, &'static str); 4] = match self {
+        let steps: [(i64, &'static str, &'static str); 5] = match self {
             Self::Sqlite => [
                 (
                     1,
@@ -70,6 +70,11 @@ impl Engine {
                     4,
                     "policy_ref",
                     include_str!("../migrations/sqlite/0004_policy_ref.sql"),
+                ),
+                (
+                    5,
+                    "guest_report",
+                    include_str!("../migrations/sqlite/0005_guest_report.sql"),
                 ),
             ],
             Self::Postgres => [
@@ -92,6 +97,11 @@ impl Engine {
                     4,
                     "policy_ref",
                     include_str!("../migrations/postgres/0004_policy_ref.sql"),
+                ),
+                (
+                    5,
+                    "guest_report",
+                    include_str!("../migrations/postgres/0005_guest_report.sql"),
                 ),
             ],
         };
@@ -200,7 +210,7 @@ fn is_unique_violation(e: &sqlx::Error) -> bool {
 
 const CLAIM_COLUMNS: &str = "uid, name, subject, entry_id, node_id, audiences, workload, ttl_seconds, \
      refresh_key_id, refresh_nonce, refresh_ciphertext, created_at, expires_at, revoked_at, \
-     sandbox_uid, policy_uid, bundle_version";
+     sandbox_uid, policy_uid, bundle_version, report";
 
 /// The three columns of a [`Sealed`] envelope, or three `NULL`s.
 fn sealed_columns(s: Option<&Sealed>) -> (Option<String>, Option<Vec<u8>>, Option<Vec<u8>>) {
@@ -276,7 +286,17 @@ fn claim_of(row: &AnyRow) -> Result<ClaimRecord, StoreError> {
             .map(u64::try_from)
             .transpose()
             .map_err(backend)?,
+        report: report_of(row)?,
     })
+}
+
+/// The `report` column, JSON or `NULL`.
+fn report_of(row: &AnyRow) -> Result<Option<mediatore_proto::ClaimReport>, StoreError> {
+    row.try_get::<Option<String>, _>("report")
+        .map_err(backend)?
+        .as_deref()
+        .map(unjson)
+        .transpose()
 }
 
 const NODE_COLUMNS: &str = "ek_hash, node_id, dmi_uuid, hostname, provider, banned, registered_at";
@@ -343,7 +363,7 @@ impl ClaimStore for SqlStore {
     async fn put_claim(&self, rec: ClaimRecord) -> Result<(), StoreError> {
         let (key_id, nonce, ciphertext) = sealed_columns(rec.refresh.as_ref());
         let sql = format!(
-            "INSERT INTO claims ({CLAIM_COLUMNS}) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)"
+            "INSERT INTO claims ({CLAIM_COLUMNS}) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)"
         );
         let result = sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(rec.uid.to_string())
@@ -363,6 +383,7 @@ impl ClaimStore for SqlStore {
             .bind(rec.sandbox_uid.map(|u| u.to_string()))
             .bind(&rec.policy_uid)
             .bind(rec.bundle_version.map(floor_version).transpose()?)
+            .bind(rec.report.as_ref().map(json).transpose()?)
             .execute(&self.pool)
             .await;
         match result {
@@ -402,7 +423,7 @@ impl ClaimStore for SqlStore {
             "UPDATE claims SET name = $1, subject = $2, entry_id = $3, node_id = $4, audiences = $5, \
              workload = $6, ttl_seconds = $7, refresh_key_id = $8, refresh_nonce = $9, \
              refresh_ciphertext = $10, created_at = $11, expires_at = $12, revoked_at = $13, \
-             sandbox_uid = $14, policy_uid = $15, bundle_version = $16 WHERE uid = $17",
+             sandbox_uid = $14, policy_uid = $15, bundle_version = $16, report = $17 WHERE uid = $18",
         )
         .bind(&rec.name)
         .bind(json(&rec.subject)?)
@@ -420,6 +441,7 @@ impl ClaimStore for SqlStore {
         .bind(rec.sandbox_uid.map(|u| u.to_string()))
         .bind(&rec.policy_uid)
         .bind(rec.bundle_version.map(floor_version).transpose()?)
+        .bind(rec.report.as_ref().map(json).transpose()?)
         .bind(rec.uid.to_string())
         .execute(&self.pool)
         .await
@@ -576,8 +598,8 @@ impl ClaimStore for SqlStore {
             .collect::<Result<_, _>>()?;
         for c in &ended {
             sqlx::query(
-                "INSERT INTO claim_audit (uid, name, subject, node_id, created_at, expires_at, revoked_at, swept_at) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                "INSERT INTO claim_audit (uid, name, subject, node_id, created_at, expires_at, revoked_at, report, swept_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
             )
             .bind(c.uid.to_string())
             .bind(&c.name)
@@ -586,6 +608,7 @@ impl ClaimStore for SqlStore {
             .bind(micros(c.created_at))
             .bind(c.expires_at.map(micros))
             .bind(c.revoked_at.map(micros))
+            .bind(c.report.as_ref().map(json).transpose()?)
             .bind(micros(swept_at))
             .execute(&mut *tx)
             .await
@@ -602,7 +625,7 @@ impl ClaimStore for SqlStore {
 
     async fn list_audit(&self) -> Result<Vec<ClaimAudit>, StoreError> {
         let rows = sqlx::query(
-            "SELECT uid, name, subject, node_id, created_at, expires_at, revoked_at, swept_at \
+            "SELECT uid, name, subject, node_id, created_at, expires_at, revoked_at, report, swept_at \
              FROM claim_audit ORDER BY swept_at, id",
         )
         .fetch_all(&self.pool)
@@ -620,6 +643,7 @@ impl ClaimStore for SqlStore {
                     created_at: from_micros(row.try_get("created_at").map_err(backend)?)?,
                     expires_at: opt_micros(row.try_get("expires_at").map_err(backend)?)?,
                     revoked_at: opt_micros(row.try_get("revoked_at").map_err(backend)?)?,
+                    report: report_of(row)?,
                     swept_at: from_micros(row.try_get("swept_at").map_err(backend)?)?,
                 })
             })

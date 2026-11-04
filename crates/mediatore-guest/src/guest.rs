@@ -18,7 +18,7 @@ use reqwest::Method;
 use uuid::Uuid;
 
 use crate::client::SandboxClient;
-use crate::{egress, identity, image, jail, net, ready, sandboxfs, supervise, user};
+use crate::{egress, identity, image, jail, net, ready, report, sandboxfs, supervise, user};
 
 /// Seconds between registration retries while mediatore is unreachable.
 const REGISTER_RETRY_SECS: u64 = 5;
@@ -275,7 +275,7 @@ pub async fn run(args: GuestArgs) -> anyhow::Result<()> {
 
     // 5. Build and run the sandbox, then tear down. Also tear down on an error: no
     //    partial-trust mode.
-    let result = serve_claim(&args, &me, &username, &reference, uid, gid).await;
+    let result = serve_claim(&args, &client, &me, &username, &reference, uid, gid).await;
     supervise::teardown(&args.sandbox_root, &username).await;
     result
 }
@@ -283,9 +283,10 @@ pub async fn run(args: GuestArgs) -> anyhow::Result<()> {
 /// Tmpfs, rootfs, ruleset, egress proxy, jail (ADR-0021 decision 5, ADR-0025), then
 /// supervise until the deadline. No jail without the ruleset (ADR-0020 decision 5) or
 /// without the proxy (ADR-0025 decision 1), no ruleset without the rootfs.
-#[allow(clippy::too_many_lines)] // one straight line of steps, each logged; splitting it would hide the order
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)] // one straight line of steps, each logged; splitting it would hide the order
 async fn serve_claim(
     args: &GuestArgs,
+    client: &SandboxClient,
     me: &Me,
     username: &str,
     reference: &mediatore_proto::image::ImageReference,
@@ -395,6 +396,26 @@ async fn serve_claim(
         ruleset_sha256 = %sha256,
         "sandbox ruleset loaded"
     );
+    // What ran, to the record (ADR-0029 decision 5): the image's digest, the sandbox
+    // table's hash, the host table as nft lists it. The record's, not the jail's gate.
+    let guest_report = mediatore_proto::GuestReport {
+        image_digest: pulled.digest.clone(),
+        sandbox_ruleset_sha256: sha256.clone(),
+        host_table: report::host_table(ruleset.shape == net::Shape::Gateways).await,
+    };
+    match report::send(client, &guest_report).await {
+        Ok(()) => tracing::info!(
+            claim_uid = %me.claim_uid,
+            image_digest = %guest_report.image_digest,
+            host_table = ?guest_report.host_table,
+            "report recorded at the broker"
+        ),
+        Err(e) => tracing::warn!(
+            claim_uid = %me.claim_uid,
+            error = %e,
+            "the report did not reach the broker; the record will show none"
+        ),
+    }
     // The proxy before the jail: the workload's only route out must exist when its first
     // instruction runs (ADR-0025 decision 1).
     let mut proxy = egress::spawn(

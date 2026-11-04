@@ -29,6 +29,7 @@ pub mod image;
 pub mod jail;
 pub mod net;
 pub mod ready;
+pub mod report;
 pub mod sandboxfs;
 mod supervise;
 pub mod token;

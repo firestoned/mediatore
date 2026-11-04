@@ -255,7 +255,79 @@ impl Harness {
     }
 }
 
+/// The guest's report (ADR-0029 decision 5): the node identity reports for its claim, the
+/// shapes are checked, the report is kept on the record and shown to the subject; a claim
+/// identity cannot report and a malformed report is refused.
+async fn report_round_trip(h: &Harness, claim: &ClaimResponse, uid: uuid::Uuid, user_token: &str) {
+    let report = mediatore_proto::GuestReport {
+        image_digest: format!("sha256:{}", "ab".repeat(32)),
+        sandbox_ruleset_sha256: "cd".repeat(32),
+        host_table: mediatore_proto::HostTable::Loaded {
+            sha256: "ef".repeat(32),
+        },
+    };
+    let before_report: ClaimResponse = h
+        .http
+        .get(format!("{}/v1/claims/{}", h.user_url, claim.name))
+        .bearer_auth(user_token)
+        .send()
+        .await
+        .expect("get claim")
+        .json()
+        .await
+        .expect("get body");
+    assert!(
+        before_report.report.is_none(),
+        "no report before the guest made one"
+    );
+    let resp = h
+        .http
+        .post(format!("{}/v1/me/report", h.sandbox_url))
+        .header(PEER_HEADER, claim_svid(&uid))
+        .json(&report)
+        .send()
+        .await
+        .expect("report as the claim");
+    assert_eq!(resp.status(), 403, "a claim identity is not the node");
+    let mut bad = report.clone();
+    bad.image_digest = "not-a-digest".into();
+    let resp = h
+        .http
+        .post(format!("{}/v1/me/report", h.sandbox_url))
+        .header(PEER_HEADER, node_svid())
+        .json(&bad)
+        .send()
+        .await
+        .expect("bad report");
+    assert_eq!(resp.status(), 400);
+    let body: serde_json::Value = resp.json().await.expect("body");
+    assert_eq!(body["error"], "invalid_report", "{body}");
+    let resp = h
+        .http
+        .post(format!("{}/v1/me/report", h.sandbox_url))
+        .header(PEER_HEADER, node_svid())
+        .json(&report)
+        .send()
+        .await
+        .expect("report as the node");
+    assert_eq!(resp.status(), 204);
+    let after_report: ClaimResponse = h
+        .http
+        .get(format!("{}/v1/claims/{}", h.user_url, claim.name))
+        .bearer_auth(user_token)
+        .send()
+        .await
+        .expect("get claim")
+        .json()
+        .await
+        .expect("get body");
+    let recorded = after_report.report.expect("the report is on the record");
+    assert_eq!(recorded.report, report);
+    assert!(recorded.reported_at <= chrono::Utc::now());
+}
+
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // one straight loop from login to cut-off, in the order the system runs it
 async fn full_loop_from_login_to_cutoff() {
     let h = Harness::start().await;
 
@@ -315,6 +387,7 @@ async fn full_loop_from_login_to_cutoff() {
     let sandbox_user = me.subject.sandbox_username();
     assert!(sandbox_user.starts_with("sb-"));
 
+    report_round_trip(&h, &claim, uid, &user_token).await; // the guest's report, ADR-0029
     // The jailed workload trades its claim SVID for an audience-scoped token.
     let claim_svid = claim_svid(&uid);
     let tok_resp = h.token_for(&claim_svid, AUDIENCE).await;

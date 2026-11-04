@@ -109,12 +109,11 @@ where root is allowed to go, which is the pull.
    pool's env names gateways, as the sandbox ruleset's gateway shape does. Threat model
    R-13 then reads: closed with gateways, open without, the same bound as R-12.
 
-5. **The ruleset hashes and the image digest reach the broker** (the next slice, not
-   this one). The guest reports, with the claim, the SHA-256 of the host table it found
-   loaded and of the sandbox table it loaded, and the manifest digest it pulled (ADR-0020
-   decision 5's follow-up; roadmap 06). A broker-side comparison is a later roadmap; the
-   record saying which rules and which bytes ran is this one. Its route is the open item
-   below.
+5. **The ruleset hashes and the image digest reach the broker.** The guest reports, with
+   the claim, the SHA-256 of the host table it found loaded and of the sandbox table it
+   loaded, and the manifest digest it pulled (ADR-0020 decision 5's follow-up; roadmap
+   06). A broker-side comparison is a later roadmap; the record saying which rules and
+   which bytes ran is this one.
 
 ## Consequences
 
@@ -142,11 +141,34 @@ where root is allowed to go, which is the pull.
   - a registry on the gateway VMs (a fourth service on the most exposed VM);
   - a route from the segment to the registry (banlieue ADR-0109 decision 1).
 
+## Implementation notes
+
+What roadmap 06 fixed within the decisions above, as it is built (2026-11-04):
+
+- **The report is `POST /v1/me/report` on the sandbox listener** (decision 5), over the
+  node SVID, for the claim bound to that node as `GET /v1/me` finds it: `GuestReport`
+  (`crates/mediatore-proto`) carries the manifest digest, the sandbox table's SHA-256 as
+  loaded (`net::Ruleset::sha256`) and the host table as `nft -s list table inet
+  mediatore_host` prints it, hashed, or `missing` where the environment has gateways and
+  no table is loaded, or `not_loaded` where none is expected (`crates/mediatore-guest/src/report.rs`).
+  The broker validates the shapes, logs one line (a missing table at `warn`), stamps
+  `reported_at` and keeps it on the record (`claims.report`, migration `0005`, swept into
+  the audit row with the claim); `GET /v1/claims/{name}` shows it to the subject and
+  `mediatore sandbox get` prints it. The guest sends it once, after the tables are loaded
+  and before the jail starts, bounded at fifteen seconds; a broker unreachable then is
+  said at `warn` and the claim goes on: the report is the record's, not the jail's gate,
+  and a record with no report is itself visible. The `AgentSandbox` status does not carry
+  it yet; the resource says the claim's phase, the record says what ran.
+
 ### Still to decide
 
 - Whether `reach: relay` is ever worth its listener: the homelab runs a mirror on the
   segment (decided 2026-11-04); an environment that cannot host one reopens it.
+- Whether the report belongs on the `AgentSandbox` status too, for a requester who reads
+  the resource and not the API; and whether the guest re-reports on a change (today once).
+- A broker-side comparison: the host table's expected hash per pool image, so a flushed
+  or altered table is refused rather than recorded.
 - The clock: whether pool VMs need NTP through the gateway, or the hypervisor's clock
   suffices (libvirt's and Cloud Hypervisor's guests take it from the host).
-- The report of decision 5: on `POST /v1/nodes`, on a new route, or in the proxy's
-  readiness.
+- ~~The report of decision 5: on `POST /v1/nodes`, on a new route, or in the proxy's
+  readiness.~~ Settled, see *Implementation notes*: `POST /v1/me/report`.
