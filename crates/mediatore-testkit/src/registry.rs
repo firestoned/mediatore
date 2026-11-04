@@ -428,6 +428,8 @@ pub struct FakeRegistry {
     inner: Arc<Inner>,
     host: String,
     _task: tokio::task::JoinHandle<()>,
+    /// The TLS server, when started with [`Self::start_tls`]; dropped with the registry.
+    tls: Option<crate::TlsUpstream>,
 }
 
 impl FakeRegistry {
@@ -442,11 +444,7 @@ impl FakeRegistry {
             .expect("bind the fake registry");
         let host = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
         inner.host.lock().unwrap().clone_from(&host);
-        let app = Router::new()
-            .route("/v2/", get(base))
-            .route("/v2/{*rest}", get(v2))
-            .route("/token", get(token))
-            .with_state(inner.clone());
+        let app = Self::router(&inner);
         let task = tokio::spawn(async move {
             axum::serve(listener, app)
                 .await
@@ -456,7 +454,41 @@ impl FakeRegistry {
             inner,
             host,
             _task: task,
+            tls: None,
         }
+    }
+
+    /// The same registry over TLS 1.3 on a CA of its own (`crate::TlsUpstream`), as a
+    /// mirror on the operator's PKI is (ADR-0029); [`Self::ca_pem`] is what the puller
+    /// must be told to trust.
+    ///
+    /// # Panics
+    /// When the listener cannot be bound or the certificates not minted.
+    pub async fn start_tls() -> Self {
+        let inner = Arc::new(Inner::default());
+        let tls = crate::TlsUpstream::start(Self::router(&inner)).await;
+        let host = format!("127.0.0.1:{}", tls.addr.port());
+        inner.host.lock().unwrap().clone_from(&host);
+        Self {
+            inner,
+            host,
+            _task: tokio::spawn(async {}),
+            tls: Some(tls),
+        }
+    }
+
+    /// The CA the TLS registry's certificate chains to; `None` for the plain one.
+    #[must_use]
+    pub fn ca_pem(&self) -> Option<String> {
+        self.tls.as_ref().map(crate::TlsUpstream::ca_pem)
+    }
+
+    fn router(inner: &Arc<Inner>) -> Router {
+        Router::new()
+            .route("/v2/", get(base))
+            .route("/v2/{*rest}", get(v2))
+            .route("/token", get(token))
+            .with_state(inner.clone())
     }
 
     /// `127.0.0.1:<port>`: the registry part of a reference, reached over plain HTTP.

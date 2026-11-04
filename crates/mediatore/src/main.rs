@@ -169,6 +169,7 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
         limiter: Limiter::new(cfg.token.rate_per_minute),
         dev_mode: cfg.dev_mode,
         gateways: cfg.gateways.clone(),
+        reachable_registries: cfg.reachable_registries(),
     });
 
     let user = tokio::net::TcpListener::bind(&cfg.listen.user).await?;
@@ -275,6 +276,7 @@ async fn claim_watcher(
                 })
                 .collect(),
             issuers: cfg.issuers.iter().map(|i| i.url.clone()).collect(),
+            reachable_registries: cfg.reachable_registries(),
             retention: std::time::Duration::from_secs(cfg.store.retention_secs),
             ..WatcherConfig::default()
         },
@@ -519,11 +521,17 @@ fn registries(
 ) -> anyhow::Result<std::collections::BTreeMap<String, mediatore_proto::RegistryCredential>> {
     let mut out = std::collections::BTreeMap::new();
     for r in &cfg.registries {
-        let password = std::fs::read_to_string(&r.password_file).map_err(|e| {
+        let host = mediatore_proto::image::canonical_registry(&r.host);
+        let Some((username, password_file)) = r.credential() else {
+            // An anonymous registry, declared for its reach alone (ADR-0029 decision 2).
+            tracing::info!(registry = %host, reach = ?r.reach, "registry declared without a credential");
+            continue;
+        };
+        let password = std::fs::read_to_string(password_file).map_err(|e| {
             anyhow::anyhow!(
                 "registries[{}].password_file {}: {e}",
                 r.host,
-                r.password_file.display()
+                password_file.display()
             )
         })?;
         let password = password.trim();
@@ -531,15 +539,14 @@ fn registries(
             !password.is_empty(),
             "registries[{}].password_file {} is empty",
             r.host,
-            r.password_file.display()
+            password_file.display()
         );
-        let host = mediatore_proto::image::canonical_registry(&r.host);
-        tracing::info!(registry = %host, username = %r.username, "registry credential loaded");
+        tracing::info!(registry = %host, username, reach = ?r.reach, "registry credential loaded");
         out.insert(
             host.clone(),
             mediatore_proto::RegistryCredential {
                 host,
-                username: r.username.clone(),
+                username: username.to_owned(),
                 password: mediatore_proto::Secret(password.to_string()),
             },
         );
@@ -777,6 +784,24 @@ mod tests {
             panic!("guest did not parse");
         };
         assert_eq!(args.gateways_file.to_str(), Some("/tmp/g"));
+        assert_eq!(
+            args.registry_ca, None,
+            "the Mozilla roots alone unless a mirror's CA is given"
+        );
+        let Ok(Cmd::Guest(args)) = parse(&[
+            "mediatore",
+            "guest",
+            "--mediatore-url",
+            "https://b",
+            "--registry-ca",
+            "/etc/mediatore/registry-ca.pem",
+        ]) else {
+            panic!("guest did not parse");
+        };
+        assert_eq!(
+            args.registry_ca.as_deref().and_then(|p| p.to_str()),
+            Some("/etc/mediatore/registry-ca.pem")
+        );
     }
 
     #[test]

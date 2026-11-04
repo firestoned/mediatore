@@ -3,8 +3,8 @@
 
 [Unit]
 Description=mediatore in-guest agent (banlieue sandbox)
-After=spire-agent.service network-online.target
-Requires=spire-agent.service
+After=spire-agent.service network-online.target mediatore-host-nft.service
+Requires=spire-agent.service mediatore-host-nft.service
 Wants=network-online.target
 # Only the system booted from the installed disk (banlieue ADR-0043 decision 2, ADR-0019
 # decision 4): Kairos runs the same enabled units in the live installer and in recovery,

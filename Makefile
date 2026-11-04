@@ -126,8 +126,11 @@ BINARY_FROM ?= container
 guest-image: ## Build the sandbox VM image, a Kairos derivative (ADR-0023); BINARY_FROM=host copies dist/mediatore
 	$(CONTAINER_CLI) build -f image/Dockerfile --build-arg BINARY_FROM=$(BINARY_FROM) -t $(GUEST_IMAGE) .
 
-guest-image-check: ## Check the built VM image carries what ADR-0023 says, and no listener
+guest-image-check: host-table-test ## Check the built VM image carries what ADR-0023 says, and no listener
 	CONTAINER_CLI=$(CONTAINER_CLI) ./image/check.sh $(GUEST_IMAGE)
+
+host-table-test: ## Pin the pool VM's host table (ADR-0029): the exact render from a pool's files, names and missing inputs refused
+	@./image/host-table-test.sh
 
 # The egress gateway VM image (ADR-0028 decision 10): the same Kairos base with Envoy
 # (pinned by digest, the digest the kind tier runs), the authorizer, the agent, the two

@@ -36,11 +36,19 @@
       and DNS to the VM's resolvers, then logs and drops; no ruleset, no jail; the table
       deleted at teardown; the SHA-256 logged per claim. Ruleset text pinned by unit
       tests, accepted by `nft -c` on the build host
-- [ ] The rest of ADR-0010's ruleset outline, with the image: root's egress (the broker
-      and the workload image registry the guest pulls from, ADR-0021 decision 5) and the
-      input chain, once the image's system users (DHCP, NTP, the SPIRE agent) are known;
-      the ruleset hash and the image digest reported to the broker so a flush is detected
-      and the record says which bytes ran
+- [x] The rest of ADR-0010's ruleset outline, with the image: root's egress and the
+      input chain. Done 2026-11-04 as
+      [ADR-0029](../../docs/adr/0029-the-pull-on-a-routeless-segment-and-the-pool-vms-root-rules.md)
+      decisions 1 to 4: roadmap 10's routeless segment had left the image pull with no
+      path, so a gateway-era pool pulls from a mirror on the segment (`registries[].reach`,
+      an anonymous entry allowed, the claim refused for any other registry, the mirror's CA
+      beside the Mozilla roots), and the image loads `inet mediatore_host` from the pool's
+      own files before the agent and the guest (`image/host-table`,
+      `mediatore-host-nft.service`: input and forward dropped, output to the gateways' two
+      planes and the registries alone, names refused; `make host-table-test`, `nft -c` on
+      the build host, `image/check.sh`). A pool without gateways loads none (decision 4)
+- [ ] The ruleset hashes and the image digest reported to the broker so a flush is
+      detected and the record says which bytes ran (ADR-0029 decision 5, its route open)
 - [x] Pull credentials. Done 2026-10-27 as
       [ADR-0022](../../docs/adr/0022-registry-pull-credentials-from-the-broker.md):
       `registries[]` in the broker's config (host, username, a token file read at

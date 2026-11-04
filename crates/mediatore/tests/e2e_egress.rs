@@ -187,6 +187,7 @@ impl Harness {
                 .into_iter()
                 .collect(),
             registries: std::collections::BTreeMap::new(),
+            reachable_registries: None,
             sandboxes: None,
             sandbox_namespace: "sandboxes".into(),
             sealer: None,

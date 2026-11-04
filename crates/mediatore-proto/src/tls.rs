@@ -62,6 +62,37 @@ pub fn https_client_config_with_ca(pem: &[u8]) -> Result<rustls::ClientConfig, s
     )
 }
 
+/// A TLS 1.3-only client config over the Mozilla root store with the CA certificates in
+/// `pem` added beside them: for the pool's registry mirror on a private PKI
+/// (`MEDIATORE_REGISTRY_CA`, ADR-0029 decision 1), reached by the same client as any public
+/// registry. Fails if `pem` holds no certificate.
+pub fn https_client_config_with_extra_roots(
+    pem: &[u8],
+) -> Result<rustls::ClientConfig, std::io::Error> {
+    use rustls::pki_types::CertificateDer;
+    use rustls::pki_types::pem::PemObject as _;
+
+    ensure_provider();
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let mut added = 0;
+    for cert in CertificateDer::pem_slice_iter(pem) {
+        let cert = cert.map_err(|e| std::io::Error::other(format!("registry CA: {e}")))?;
+        roots
+            .add(cert)
+            .map_err(|e| std::io::Error::other(format!("registry CA: {e}")))?;
+        added += 1;
+    }
+    if added == 0 {
+        return Err(std::io::Error::other("registry CA holds no certificate"));
+    }
+    Ok(
+        rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

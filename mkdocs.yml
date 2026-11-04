@@ -180,5 +180,6 @@ nav:
       - "ADR-0026: notaio's policy bundles, verified in shadow": adr/0026-notaio-bundles-verified-in-shadow.md
       - "ADR-0027: A control relay on the egress gateway": adr/0027-control-plane-relay-on-the-egress-gateway.md
       - "ADR-0028: The egress gateway, Envoy with a SPIFFE identity": adr/0028-egress-gateway-envoy-with-spiffe-identity.md
+      - "ADR-0029: The image pull on a routeless segment, and the pool VM's root rules": adr/0029-the-pull-on-a-routeless-segment-and-the-pool-vms-root-rules.md
   - Security:
       - Threat model: security/threat-model.md

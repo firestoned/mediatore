@@ -60,6 +60,10 @@ pub struct WatcherConfig {
     pub audiences: Vec<Audience>,
     /// Issuers mediatore trusts; a sandbox's subject must come from one.
     pub issuers: Vec<String>,
+    /// The registries a gateway-era pool can reach (`registries[].reach`, ADR-0029): a
+    /// sandbox whose image names another fails before any claim exists. `None` without
+    /// gateways.
+    pub reachable_registries: Option<std::collections::BTreeSet<String>>,
     /// How long a claim row outlives its claim before the resync sweeps it into the audit
     /// table (ADR-0012 decision 4).
     pub retention: Duration,
@@ -73,6 +77,7 @@ impl Default for WatcherConfig {
             requeue: Duration::from_secs(5),
             audiences: vec![],
             issuers: vec![],
+            reachable_registries: None,
             retention: Duration::from_hours(1),
         }
     }

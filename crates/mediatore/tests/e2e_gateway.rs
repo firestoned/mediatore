@@ -100,6 +100,7 @@ fn state(idp: &FakeIdp) -> Arc<AppState> {
         rules: std::collections::BTreeMap::new(),
         cas: std::collections::BTreeMap::new(),
         registries: std::collections::BTreeMap::new(),
+        reachable_registries: None,
         sandboxes: None,
         sandbox_namespace: "sandboxes".into(),
         sealer: None,

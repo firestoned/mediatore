@@ -46,6 +46,29 @@ pub fn is_sha256_digest(s: &str) -> bool {
         .is_some_and(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
+/// Why `image` cannot be pulled by this environment's pool (ADR-0029 decision 1): its
+/// registry is not among the ones the operator declared reachable. `None` when nothing is
+/// restricted (no gateways) or the registry is declared.
+#[must_use]
+pub fn unreachable_registry(
+    reachable: Option<&std::collections::BTreeSet<String>>,
+    image: &ImageReference,
+) -> Option<String> {
+    let reachable = reachable?;
+    if reachable.contains(&image.registry) {
+        return None;
+    }
+    let listed = if reachable.is_empty() {
+        "none is declared".to_owned()
+    } else {
+        reachable.iter().cloned().collect::<Vec<_>>().join(", ")
+    };
+    Some(format!(
+        "registry {} is not reachable from this environment's pool; the pool reaches: {listed} (registries[].reach, ADR-0029)",
+        image.registry
+    ))
+}
+
 /// A registry host as the API reaches it: Docker Hub's name becomes its API host,
 /// anything else is itself.
 #[must_use]

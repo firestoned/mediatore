@@ -56,6 +56,7 @@ impl Harness {
             rules: std::collections::BTreeMap::new(),
             cas: std::collections::BTreeMap::new(),
             registries: std::collections::BTreeMap::new(),
+            reachable_registries: None,
             sandboxes: front_door.then(|| sandboxes.clone() as _),
             sandbox_namespace: NAMESPACE.into(),
             sealer: None,

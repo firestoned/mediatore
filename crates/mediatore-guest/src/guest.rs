@@ -68,6 +68,10 @@ pub struct GuestArgs {
         value_delimiter = ','
     )]
     pub plain_http_registries: Vec<String>,
+    /// A PEM of CA certificates trusted beside the Mozilla roots for the pull: the
+    /// registry mirror on the segment, on the operator's PKI (ADR-0029 decision 1)
+    #[arg(long, env = "MEDIATORE_REGISTRY_CA", value_name = "PEM")]
+    pub registry_ca: Option<PathBuf>,
     /// The mediatore binary to mount read-only into the jail and to start the egress proxy
     /// from: the path the node entry pins, never the path this process happens to run from
     #[arg(long, default_value = mediatore_proto::AGENT_BINARY_PATH)]
@@ -294,7 +298,15 @@ async fn serve_claim(
     };
     tmpfs.mount().await?;
     let layout = sandboxfs::prepare(&args.sandbox_root, uid, gid)?;
-    let pulled = image::Puller::new(&args.plain_http_registries)?
+    let mut registry_client = image::Puller::new(&args.plain_http_registries)?;
+    if let Some(ca) = &args.registry_ca {
+        let pem =
+            std::fs::read(ca).map_err(|e| anyhow::anyhow!("registry CA {}: {e}", ca.display()))?;
+        registry_client = registry_client
+            .with_registry_ca(&pem)
+            .map_err(|e| anyhow::anyhow!("registry CA {}: {e}", ca.display()))?;
+    }
+    let pulled = registry_client
         .pull(
             reference,
             me.registry_credential.as_ref(),

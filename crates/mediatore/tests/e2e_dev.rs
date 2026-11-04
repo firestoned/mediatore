@@ -130,6 +130,7 @@ impl Harness {
             )]
             .into_iter()
             .collect(),
+            reachable_registries: None,
             sandboxes: None,
             sandbox_namespace: "sandboxes".into(),
             sealer: None,
