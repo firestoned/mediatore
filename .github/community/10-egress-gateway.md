@@ -24,8 +24,9 @@ injection) builds on this and stays design-only.
       `spiffe://<td>/gateway` only; `404` for a released, expired or unknown claim
       (`GET /v1/gateway/claims/{uid}`, 2026-11-03; a pending claim is `404` too)
 - [x] `mediatore gateway` (ext_authz authorizer with a bounded per-claim cache; deny on no
-      answer) (`crates/mediatore-gateway`, 2026-11-04; Envoy's configuration comes with the
-      image)
+      answer) (`crates/mediatore-gateway`, 2026-11-04; over gRPC, Envoy's HTTP mode cannot
+      carry a CONNECT check) and Envoy's bootstrap (`dev/kind/gateway/envoy.yaml`, proven
+      in kind the same day)
 - [ ] `mediatore forward` (loopback proxy, claim SVID, mutual TLS, CONNECT, gateway list
       with random start and failover)
 - [ ] Guest: proxy environment for the jail, the ruleset naming the gateways and the
@@ -39,7 +40,9 @@ injection) builds on this and stays design-only.
 - [ ] Three gateway `VirtualMachine`s, one per failure domain, on a TPM class
 - [ ] Tests: unit (ruleset, forwarder framing, authorizer cache and fail-closed), kind e2e
       with Envoy and SPIRE (a claim reaches only its own allowlist, a released claim is cut
-      off, a peer outside the claim path is refused, broker down is a deny after the cache)
+      off, a peer outside the claim path is refused, broker down is a deny after the cache).
+      The authorizer's units and the kind tier (`make kind-e2e-gateway`, 2026-11-04, a
+      stand-in for the forwarder) are done; the ruleset's and the forwarder's remain
 - [ ] Threat model: full pass; R-12 revised, new boundary for the sandbox leg to the
       gateway and the gateway to the world
 - [ ] CALM `architecture.json` gains the forwarder, the authorizer and the gateway route

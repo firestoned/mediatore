@@ -1,0 +1,22 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+#
+# The egress gateway in kind (ADR-0028): Envoy's bootstrap as a ConfigMap, the gateway
+# and destination pods. Envoy comes from its official image, pinned by digest (the
+# linux/amd64 manifest of docker.io/envoyproxy/envoy:v1.40.2, resolved 2026-11-04);
+# a bump is this file and the tier run again.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: mediatore-e2e-gateway
+resources:
+  - gateway.yaml
+configMapGenerator:
+  - name: envoy-config
+    files:
+      - envoy.yaml
+generatorOptions:
+  disableNameSuffixHash: true
+images:
+  - name: docker.io/envoyproxy/envoy
+    newTag: v1.40.2
+    digest: sha256:49d3e8b6246d1a804acffaebe42f2799edc77b77a37a97709ef742af90b6d223

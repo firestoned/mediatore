@@ -168,30 +168,45 @@ What roadmap 10 fixed within the decisions above, as it is built:
   `Me::gateways` carries it in that order and an old broker reads as an empty list. The
   environment is the broker's: one broker, one segment, one gateway set (ADR-0103).
 - **The authorizer is `mediatore gateway`, in `crates/mediatore-gateway`** (decision 4),
-  Envoy's external authorization service in HTTP mode, on loopback, no gRPC. Envoy forwards
-  no client header to it by default; the check carries three headers Envoy sets from the
-  downstream connection through `authorization_request.headers_to_add`, which overrides
-  anything the client sent: `x-mediatore-peer` from `%DOWNSTREAM_PEER_URI_SAN%`,
-  `x-mediatore-method` from `%REQ(:method)%`, `x-mediatore-authority` from
-  `%REQ(:authority)%`. A check missing one is refused. The decision: the peer must be a
-  claim identity of the trust domain, the method `CONNECT` (decision 3: one shape), the
-  authority `host:port`, and that pair in the claim's allowlist exactly, host names compared
-  case-insensitively. `200` allows; `403` with a stable code (`not_a_claim`, `not_connect`,
-  `bad_authority`, `not_allowed`, `claim_gone`, `broker_unreachable`, `broker_refused`)
-  refuses, and Envoy's `status_on_error` makes an unreachable authorizer a refusal too.
-  The cache, settling the bound left to the test plan: one answer per claim UID, used
-  without asking for `--fresh-secs` (30), then refreshed; while the broker is unreachable
-  the last answer stands in for a further `--stale-secs` (300) and then an outage is a
-  deny; no answer is used past the claim's deadline; the broker's `404` drops the entry and
-  denies; the broker refusing the gateway's own identity denies whatever is cached; at most
-  `--max-claims` (4096) entries, the least recently used evicted; checks arriving together
-  for one claim share one ask. The broker is asked over mTLS with the gateway SVID from the
-  local Workload API, a client built per ask so a rotated SVID is used next, each ask
-  bounded at five seconds. One log line per decision: claim UID, peer, authority, what
-  served it and the verdict with its code; never a body, never a token.
-- **Not yet:** Envoy's bootstrap and the gateway image and VMs (decisions 1, 2, 5, 8 and
-  10), `mediatore forward` (decision 3), the ruleset change (decision 6), the threat-model
-  pass, which comes with the rest of the roadmap.
+  Envoy's external authorization service, on loopback. It speaks Envoy's own `Check` call
+  over gRPC (`ext_authz` with `grpc_service`), the one place mediatore speaks gRPC, for a
+  reason verified on Envoy 1.40.2 and not a preference: Envoy's HTTP mode copies the
+  downstream request's method and target into the check, so for a tunnel the check is
+  itself a `CONNECT`, and Envoy's own client then resets any `2xx` to it and strips a
+  refusal's body. The gRPC check carries what Envoy verified and nothing the client sent:
+  the peer's identity from its certificate's URI SAN (`source.principal`), the method and
+  the authority (`request.http.method`, `request.http.host`). The decision: the peer must
+  be a claim identity of the trust domain, the method `CONNECT` (decision 3: one shape),
+  the authority `host:port`, and that pair in the claim's allowlist exactly, host names
+  compared case-insensitively. An allow is `OK`; a refusal is `PERMISSION_DENIED` with a
+  stable code (`not_a_claim`, `not_connect`, `bad_authority`, `not_allowed`, `claim_gone`,
+  `broker_unreachable`, `broker_refused`), the same code as the `403` body the client gets;
+  an unreachable authorizer is a refusal by `failure_mode_allow: false`. The cache,
+  settling the bound left to the test plan: one answer per claim UID, used without asking
+  for `--fresh-secs` (30), then refreshed; while the broker is unreachable the last answer
+  stands in for a further `--stale-secs` (300) and then an outage is a deny; no answer is
+  used past the claim's deadline; the broker's `404` drops the entry and denies; the broker
+  refusing the gateway's own identity denies whatever is cached; at most `--max-claims`
+  (4096) entries, the least recently used evicted; checks arriving together for one claim
+  share one ask. The broker is asked over mTLS with the gateway SVID from the local
+  Workload API, a client built per ask so a rotated SVID is used next, each ask bounded at
+  five seconds. One log line per decision: claim UID, peer, authority, what served it and
+  the verdict with its code; never a body, never a token.
+- **Envoy's bootstrap is `dev/kind/gateway/envoy.yaml`** (decisions 1, 2, 4, 5 and 8), the
+  one the gateway image will carry: no admin block; one listener on the sandbox side,
+  TLS 1.3 only, X25519MLKEM768 offered first, the gateway's SVID and the trust bundle over
+  SDS from the SPIRE agent's socket (the secret names are the gateway's SPIFFE ID and the
+  trust domain, as the agent serves them), a client certificate required and its URI SAN
+  matched against the claim prefix before any filter runs; `CONNECT` the only route, through
+  `ext_authz` to the authorizer, then the dynamic forward proxy resolving the authority on
+  Envoy's own resolver; one access-log line per tunnel keyed by the peer's SPIFFE ID with
+  the authority, the status, the flags and the bytes each way. Envoy is the official image
+  pinned by digest. The ML-KEM question is answered: the pinned build negotiates
+  X25519MLKEM768 with a client that offers nothing else, which is what `mediatore-tls`'s
+  client config does.
+- **Not yet:** the gateway image and VMs (decision 10, with decision 8's host hardening),
+  `mediatore forward` (decision 3), the ruleset change (decision 6), the threat-model pass,
+  which comes with the rest of the roadmap.
 
 ## Consequences
 
@@ -251,4 +266,5 @@ What roadmap 10 fixed within the decisions above, as it is built:
   broker, settled in the implementation's test plan.~~ Settled, see *Implementation notes*.
 - **The registration entries' selectors for the gateway workload** (the Envoy user on a
   gateway VM) and how the first entry is bootstrapped after the agent first attests.
-- **The ML-KEM question above,** on the Envoy build chosen.
+- ~~**The ML-KEM question above,** on the Envoy build chosen.~~ Answered, see
+  *Implementation notes*: Envoy 1.40.2 negotiates X25519MLKEM768.

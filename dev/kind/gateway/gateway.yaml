@@ -1,0 +1,137 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+#
+# The egress gateway in kind (`make kind-gateway`, ADR-0028): one pod standing in for a
+# gateway VM, Envoy from its official image beside the authorizer, mediatore gateway, both
+# with the gateway SVID from the real agent through the CSI volume (the ClusterSPIFFEID is a
+# test fixture an admin creates; on a VM it is the platform team's ClusterStaticEntry,
+# decision 2). Beside it, the destination the tier reaches through the gateway: the
+# testkit's probe in its serve mode, plain HTTP, answering with the host it was asked for.
+# The claim-side probe pods are created by dev/kind/gateway-e2e.sh once the claim exists.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mediatore-e2e-gateway
+---
+apiVersion: spire.spiffe.io/v1alpha1
+kind: ClusterSPIFFEID
+metadata:
+  name: mediatore-e2e-gateway
+spec:
+  className: spire-server-spire
+  spiffeIDTemplate: "spiffe://{{ .TrustDomain }}/gateway"
+  podSelector:
+    matchLabels: { mediatore.dev/e2e-role: gateway }
+  namespaceSelector:
+    matchLabels: { kubernetes.io/metadata.name: mediatore-e2e-gateway }
+  ttl: 1h
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway
+  namespace: mediatore-e2e-gateway
+spec:
+  selector: { mediatore.dev/e2e-role: gateway }
+  ports:
+    - { name: sandbox, port: 8443, targetPort: sandbox }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gateway
+  namespace: mediatore-e2e-gateway
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { mediatore.dev/e2e-role: gateway }
+  template:
+    metadata:
+      labels: { mediatore.dev/e2e-role: gateway }
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: envoy
+          image: docker.io/envoyproxy/envoy:v1.40.2
+          args: ["-c", "/etc/envoy/envoy.yaml", "--log-level", "info"]
+          ports:
+            - { name: sandbox, containerPort: 8443 }
+          volumeMounts:
+            - { name: envoy-config, mountPath: /etc/envoy, readOnly: true }
+            - { name: spire-agent-socket, mountPath: /run/spire/sockets, readOnly: true }
+          securityContext:
+            # The image's envoy user.
+            runAsUser: 101
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+        - name: authorizer
+          image: ghcr.io/firestoned/mediatore:kind
+          imagePullPolicy: Never
+          command:
+            - /usr/bin/mediatore
+            - gateway
+            - --listen
+            - 127.0.0.1:9001
+            # Short bounds, so the tier sees the stale window and the outage within minutes.
+            - --fresh-secs
+            - "5"
+            - --stale-secs
+            - "20"
+          env:
+            - { name: MEDIATORE_URL, value: "https://mediatore-sandbox.banlieue-system.svc" }
+            - { name: SPIFFE_ENDPOINT_SOCKET, value: "unix:///run/spire/sockets/spire-agent.sock" }
+            - { name: RUST_LOG, value: "info" }
+          volumeMounts:
+            - { name: spire-agent-socket, mountPath: /run/spire/sockets, readOnly: true }
+          securityContext:
+            runAsUser: 65532
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+      volumes:
+        - name: envoy-config
+          configMap: { name: envoy-config }
+        - name: spire-agent-socket
+          csi: { driver: csi.spiffe.io, readOnly: true }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: destination
+  namespace: mediatore-e2e-gateway
+spec:
+  selector: { mediatore.dev/e2e-role: destination }
+  ports:
+    - { name: http, port: 8080, targetPort: http }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: destination
+  namespace: mediatore-e2e-gateway
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { mediatore.dev/e2e-role: destination }
+  template:
+    metadata:
+      labels: { mediatore.dev/e2e-role: destination }
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: destination
+          image: localhost/mediatore-e2e:kind
+          imagePullPolicy: Never
+          command: ["/usr/bin/gateway-probe", "serve", "--listen", "0.0.0.0:8080"]
+          ports:
+            - { name: http, containerPort: 8080 }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }

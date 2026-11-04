@@ -5,18 +5,25 @@
 //! broker's sandbox listener over SPIFFE mTLS under the testkit CA, `mediatore gateway`'s
 //! authorizer asking it with the gateway SVID, and a stand-in for Envoy calling the check
 //! listener on loopback with the three headers Envoy sets. What is proven: a claim reaches
-//! its own allowlist and nothing else; a node, a foreign method or a malformed authority is
-//! refused; a released claim is cut off once its answer is stale; a broker that is down is
-//! a deny once nothing stands in; a gateway the broker does not recognise is a deny.
+//! its own allowlist and nothing else; a node, a foreign method, a malformed authority or a
+//! check with no principal is refused; a released claim is cut off once its answer is
+//! stale; a broker that is down is a deny once nothing stands in; a gateway the broker does
+//! not recognise is a deny. The stand-in for Envoy speaks Envoy's own Check call over gRPC.
 
 use std::future::IntoFuture;
 use std::sync::Arc;
 use std::time::Duration;
 
+use envoy_types::ext_authz::v3::pb::CheckRequest;
+use envoy_types::pb::envoy::service::auth::v3::AttributeContext;
+use envoy_types::pb::envoy::service::auth::v3::attribute_context::{
+    HttpRequest, Peer, Request as HttpAttributes,
+};
+use envoy_types::pb::envoy::service::auth::v3::authorization_client::AuthorizationClient;
+use envoy_types::pb::envoy::service::auth::v3::check_response::HttpResponse;
 use mediatore_api::{AppState, Limiter};
 use mediatore_entra::{Backend, IssuerConfig, Validator};
 use mediatore_gateway::broker::Broker;
-use mediatore_gateway::serve::{AUTHORITY_HEADER, METHOD_HEADER, PEER_HEADER};
 use mediatore_gateway::{Authorizer, CacheConfig};
 use mediatore_proto::{ClaimRequest, ClaimResponse, NodeRegistration, Workload};
 use mediatore_spire::Naming;
@@ -223,22 +230,47 @@ impl Harness {
         (token, claim)
     }
 
-    /// What Envoy sends: the check with the three headers it sets from the downstream.
+    /// What Envoy sends: its Check call with the peer's principal from the certificate,
+    /// the method and the authority. Returns the HTTP status Envoy would answer the
+    /// downstream with (`200`, or the denied response's) and the denied body.
     async fn check(&self, peer: &str, method: &str, authority: &str) -> (u16, String) {
-        let resp = self
-            .http
-            .post(format!("{}/check", self.check_url))
-            .header(PEER_HEADER, peer)
-            .header(METHOD_HEADER, method)
-            .header(AUTHORITY_HEADER, authority)
-            .send()
+        let mut client = AuthorizationClient::connect(self.check_url.clone())
             .await
-            .expect("check");
-        let status = resp.status().as_u16();
-        (
-            status,
-            resp.text().await.unwrap_or_default().trim().to_owned(),
-        )
+            .expect("check client");
+        let request = CheckRequest {
+            attributes: Some(AttributeContext {
+                source: Some(Peer {
+                    principal: peer.to_owned(),
+                    ..Default::default()
+                }),
+                request: Some(HttpAttributes {
+                    http: Some(HttpRequest {
+                        method: method.to_owned(),
+                        host: authority.to_owned(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        };
+        let response = client.check(request).await.expect("check").into_inner();
+        let status = response.status.clone().unwrap_or_default();
+        match response.http_response {
+            None => {
+                assert_eq!(status.code, 0, "an allow is OK with no HTTP response");
+                (200, String::new())
+            }
+            Some(HttpResponse::OkResponse(_)) => (200, String::new()),
+            Some(HttpResponse::DeniedResponse(d)) => {
+                assert_ne!(status.code, 0, "a denial is not OK");
+                let code = d
+                    .status
+                    .map_or(403, |s| u16::try_from(s.code).unwrap_or(403));
+                (code, d.body.trim().to_owned())
+            }
+            Some(other) => panic!("not an answer the authorizer gives: {other:?}"),
+        }
     }
 }
 
@@ -282,23 +314,11 @@ async fn a_claim_reaches_its_allowlist_and_nothing_else_and_a_released_claim_is_
         (403, "claim_gone".into()),
         "a claim the broker never saw"
     );
-    // A check Envoy did not form, and the health check.
-    let bare = h
-        .http
-        .post(format!("{}/check", h.check_url))
-        .header(AUTHORITY_HEADER, ALLOWED[0])
-        .send()
-        .await
-        .expect("bare");
-    assert_eq!(bare.status(), 403);
-    assert_eq!(bare.text().await.unwrap().trim(), "malformed_check");
-    let health = h
-        .http
-        .get(format!("{}/healthz", h.check_url))
-        .send()
-        .await
-        .expect("healthz");
-    assert_eq!(health.status(), 200);
+    // A check with no principal: whatever Envoy did not verify is nobody.
+    assert_eq!(
+        h.check("", "CONNECT", ALLOWED[0]).await,
+        (403, "not_a_claim".into())
+    );
 
     // Released: within the fresh bound the cached answer still serves (the ADR's bound on
     // revocation), after it the broker's 404 cuts the claim off.
