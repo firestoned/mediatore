@@ -352,7 +352,7 @@
       "unique-id": "agentsandbox-mediatore-guest",
       "node-type": "service",
       "name": "mediatore-guest",
-      "description": "Runs as root in the VM. Attests the VM to SPIRE, verifies the signed bundle and refuses downgrades, renders and applies the nsjail, nftables and settings configuration, and holds the VM's only connection out."
+      "description": "Runs as root in the VM. Attests the VM to SPIRE, verifies the signed bundle and refuses downgrades, renders and applies the nsjail, nftables and settings configuration, and holds the VM's only connection out. With egress gateways the image's host table bounds root and every uid to the gateways' two planes and the registry mirror on the segment before the guest starts (ADR-0029), and the workload image is pulled from that mirror."
     },
     {
       "unique-id": "agentsandbox-egress-forwarder",

@@ -92,6 +92,7 @@ stages:
           content: |
             MEDIATORE_URL=https://198.51.100.1:3130
             SPIFFE_ENDPOINT_SOCKET=/run/spire/sockets/agent.sock
+            MEDIATORE_REGISTRY_CA=/etc/mediatore/registry-ca.pem
             RUST_LOG=info
     - name: mediatore-gateways
       files:
@@ -107,3 +108,23 @@ stages:
             198.51.100.1:8443
             198.51.100.2:8443
             198.51.100.3:8443
+        # The registries on the segment (ADR-0029 decision 1): the mirror's address and
+        # port, one per line, by address; what the host table admits for the pull beside
+        # the gateways. The broker declares the same hosts with `reach: segment`.
+        - path: /etc/mediatore/registries
+          permissions: 0644
+          owner: 0
+          group: 0
+          content: |
+            198.51.100.10:5000
+        # The mirror's CA when it serves HTTPS on your PKI (MEDIATORE_REGISTRY_CA in the
+        # env above); leave it out for a plain-HTTP mirror named in
+        # MEDIATORE_PLAIN_HTTP_REGISTRIES, pinning images by digest then.
+        - path: /etc/mediatore/registry-ca.pem
+          permissions: 0644
+          owner: 0
+          group: 0
+          content: |
+            -----BEGIN CERTIFICATE-----
+            ...your registry CA...
+            -----END CERTIFICATE-----

@@ -52,16 +52,45 @@ fn endpoints<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Endpoint>, D:
 }
 
 /// A registry the pool's images live in and the operator's credential for pulling from it
-/// (ADR-0022): handed by `GET /v1/me` to the guest whose claim names that registry.
+/// (ADR-0022): handed by `GET /v1/me` to the guest whose claim names that registry. Since
+/// ADR-0029 also where the pool reaches it from: with `gateways` set every entry needs a
+/// `reach`, and an entry may carry no credential at all (an anonymous mirror on the
+/// segment), declared by its host and its reach alone.
 #[derive(Debug, Clone, Deserialize)]
 pub struct RegistryConfig {
     /// The registry as a reference names it (`ghcr.io`, `registry.internal:5000`,
     /// `docker.io`).
     pub host: String,
-    /// The login.
-    pub username: String,
-    /// File holding the password or token, read at start.
-    pub password_file: PathBuf,
+    /// The login; with `password_file`, or neither.
+    #[serde(default)]
+    pub username: Option<String>,
+    /// File holding the password or token, read at start; with `username`, or neither.
+    #[serde(default)]
+    pub password_file: Option<PathBuf>,
+    /// How a gateway-era pool reaches this registry (ADR-0029 decision 2). Required once
+    /// `gateways` is set; a claim naming a registry with none is refused.
+    #[serde(default)]
+    pub reach: Option<RegistryReach>,
+}
+
+/// Where a pool VM on the routeless sandbox segment finds a registry (ADR-0029 decision 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RegistryReach {
+    /// A registry or pull-through mirror with an address on the segment, reached at layer
+    /// 2; the pool's host table admits its address (`/etc/mediatore/registries`).
+    Segment,
+}
+
+impl RegistryConfig {
+    /// The login and the password file, when the entry carries a credential.
+    #[must_use]
+    pub fn credential(&self) -> Option<(&str, &Path)> {
+        match (&self.username, &self.password_file) {
+            (Some(u), Some(p)) => Some((u.as_str(), p.as_path())),
+            _ => None,
+        }
+    }
 }
 
 /// STS signing material.
@@ -410,7 +439,9 @@ impl Config {
         Ok(())
     }
 
-    /// One credential per registry host, Docker Hub's two names being one host.
+    /// One entry per registry host, Docker Hub's two names being one host; a credential
+    /// is a login and a file together or neither; with `gateways`, every entry says how
+    /// the pool reaches it (ADR-0029 decision 2).
     fn check_registries(&self) -> anyhow::Result<()> {
         let mut seen = std::collections::BTreeSet::new();
         for r in &self.registries {
@@ -421,8 +452,21 @@ impl Config {
                     r.host
                 );
             }
-            if r.username.trim().is_empty() {
-                anyhow::bail!("registries[{host}].username must not be empty");
+            match (&r.username, &r.password_file) {
+                (Some(u), Some(_)) if u.trim().is_empty() => {
+                    anyhow::bail!("registries[{host}].username must not be empty");
+                }
+                (Some(_), None) | (None, Some(_)) => {
+                    anyhow::bail!(
+                        "registries[{host}]: username and password_file go together (ADR-0022); leave both out for an anonymous registry"
+                    );
+                }
+                _ => {}
+            }
+            if !self.gateways.is_empty() && r.reach.is_none() {
+                anyhow::bail!(
+                    "registries[{host}].reach is required once gateways are set: a gateway-era pool reaches a registry only where the environment put it, `segment` for a mirror on the sandbox segment (ADR-0029 decision 2)"
+                );
             }
             if !seen.insert(canonical_registry(host)) {
                 anyhow::bail!(
@@ -431,6 +475,23 @@ impl Config {
             }
         }
         Ok(())
+    }
+
+    /// The registries a claim's image may name, canonical hosts, when the environment
+    /// has gateways (ADR-0029 decision 1); `None` without gateways, where nothing is
+    /// restricted.
+    #[must_use]
+    pub fn reachable_registries(&self) -> Option<std::collections::BTreeSet<String>> {
+        if self.gateways.is_empty() {
+            return None;
+        }
+        Some(
+            self.registries
+                .iter()
+                .filter(|r| r.reach.is_some())
+                .map(|r| canonical_registry(&r.host))
+                .collect(),
+        )
     }
 
     /// Load and sanity-check. `MEDIATORE_STORE_URL` in the environment overrides `store.url`.
@@ -1162,6 +1223,16 @@ store: {{ url: \"sqlite:///var/lib/mediatore/store.db\" }}
         .unwrap();
         assert_eq!(cfg.registries.len(), 2);
         assert_eq!(cfg.registries[1].host, "docker.io");
+        assert_eq!(
+            cfg.registries[0].credential(),
+            Some(("octocat", Path::new("/run/secrets/ghcr")))
+        );
+        assert_eq!(cfg.registries[0].reach, None);
+        assert_eq!(
+            cfg.reachable_registries(),
+            None,
+            "no gateways: nothing is restricted"
+        );
         for (bad, why) in [
             (
                 "registries:\n  - { host: docker.io, username: a, password_file: /x }\n  - { host: registry-1.docker.io, username: b, password_file: /y }\n",
@@ -1182,6 +1253,69 @@ store: {{ url: \"sqlite:///var/lib/mediatore/store.db\" }}
             assert!(err.contains(why), "{err}");
         }
         assert!(Config::parse(base).unwrap().registries.is_empty());
+    }
+
+    #[test]
+    fn a_registry_entry_may_carry_no_credential_but_never_half_of_one() {
+        let base = format!("{BASE}dev_mode: true\n");
+        let cfg = Config::parse(&format!(
+            "{base}registries:\n  - {{ host: \"registry.internal:5000\" }}\n"
+        ))
+        .unwrap();
+        assert_eq!(cfg.registries[0].credential(), None, "an anonymous mirror");
+        for half in [
+            "registries:\n  - { host: ghcr.io, username: octocat }\n",
+            "registries:\n  - { host: ghcr.io, password_file: /x }\n",
+        ] {
+            let err = Config::parse(&format!("{base}{half}"))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("go together"), "{half}: {err}");
+        }
+    }
+
+    #[test]
+    fn with_gateways_every_registry_needs_a_reach_and_the_reachable_set_is_those_with_one() {
+        let base = format!("{BASE}dev_mode: true\ngateways: [\"198.51.100.1:8443\"]\n");
+        let err = Config::parse(&format!(
+            "{base}registries:\n  - {{ host: ghcr.io, username: octocat, password_file: /x }}\n"
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("reach is required") && err.contains("ADR-0029"),
+            "{err}"
+        );
+        let cfg = Config::parse(&format!(
+            "{base}registries:\n  - {{ host: \"registry.internal:5000\", reach: segment }}\n  - {{ host: docker.io, username: octocat, password_file: /x, reach: segment }}\n"
+        ))
+        .unwrap();
+        assert_eq!(cfg.registries[0].reach, Some(RegistryReach::Segment));
+        assert_eq!(
+            cfg.reachable_registries()
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![
+                "registry-1.docker.io".to_string(),
+                "registry.internal:5000".to_string()
+            ],
+            "canonical hosts, as a reference's registry is canonicalised"
+        );
+        let err = Config::parse(&format!(
+            "{base}registries:\n  - {{ host: ghcr.io, reach: relay }}\n"
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("relay") || err.contains("unknown variant"),
+            "{err}"
+        );
+        assert_eq!(
+            Config::parse(&base).unwrap().reachable_registries(),
+            Some(std::collections::BTreeSet::new()),
+            "gateways and no registry: every image is unreachable, said at the claim"
+        );
     }
 
     /// notaio's published conformance key: a real Ed25519 key, for tests only.

@@ -80,6 +80,10 @@ pub struct AppState {
     /// (`registries[]`); `GET /v1/me` hands the guest the one its claim's image names
     /// (ADR-0022).
     pub registries: BTreeMap<String, RegistryCredential>,
+    /// The registries a gateway-era pool can reach, canonical hosts (`registries[].reach`,
+    /// ADR-0029 decision 1): a claim whose image names another is refused. `None` in an
+    /// environment without gateways, where nothing is restricted.
+    pub reachable_registries: Option<std::collections::BTreeSet<String>>,
     /// `AgentSandbox` resources through the Kubernetes API (ADR-0008); `None` under
     /// `dev_mode`, where the store and the dev binder stand in. Absent outside `dev_mode`,
     /// the claim endpoints fail closed with `501`.
@@ -363,10 +367,17 @@ async fn create_claim(
         return Err(ApiError::bad_request("unknown_audience", bad.clone()));
     }
     // The guest would refuse it at bind (ADR-0021); say so now (ADR-0022 decision 4).
-    req.workload
+    let image = req
+        .workload
         .image
         .parse::<ImageReference>()
         .map_err(|e| ApiError::bad_request("invalid_workload_image", e))?;
+    // A gateway-era pool reaches its declared registries and no other (ADR-0029).
+    if let Some(reason) =
+        mediatore_proto::image::unreachable_registry(st.reachable_registries.as_ref(), &image)
+    {
+        return Err(ApiError::bad_request("unreachable_registry", reason));
+    }
     let session = session_for(&st, &validated, &req, &bearer_token).await?;
     let sealer = match (session.is_some(), st.sealer.as_ref()) {
         (true, None) => return Err(ApiError::not_implemented("sealing")),

@@ -240,6 +240,17 @@ decision 5) is checked the same way, rendered from the examples:
 sudo /usr/sbin/nft -c -f /tmp/gw.conf
 ```
 
+The pool VM's own host table ([ADR-0029](../adr/0029-the-pull-on-a-routeless-segment-and-the-pool-vms-root-rules.md)
+decision 3, `image/host-table`) is pinned on any host by `make host-table-test` (the exact
+render from a pool's files, names and missing inputs refused; a step of the image check in
+CI) and checked by `nft -c` the same way on the build host, rendered from any four files of
+the shapes the script documents:
+
+```sh
+make host-table-test
+./image/host-table --render gateways registries env agent.conf | sudo /usr/sbin/nft -c -f -
+```
+
 The kind tiers run the guest with `--dev-skip-setup` and load no ruleset; the live proof is
 a libvirt member (roadmap 06).
 
@@ -377,8 +388,10 @@ Run them on the build host whenever `sandboxfs.rs` or `image.rs` changes.
 The sandbox VM image ([ADR-0023](../adr/0023-sandbox-vm-image-kairos-derivative.md)) is a
 Kairos derivative that CI builds on every pull request and checks with `image/check.sh`:
 the binaries at the paths the units and `agent.conf` name, the plugin's checksum, the
-packages, the `spire` user, both units enabled, the sysctl that raises Yama's `ptrace_scope`,
-no `sshd` and no other listener, no private key. The same on the build host:
+packages, the `spire` user, the three units enabled, the host table script rendering
+from a pool's files and refusing a name with the agent and the guest requiring its unit
+(ADR-0029), the sysctl that raises Yama's `ptrace_scope`, no `sshd` and no other listener,
+the distribution's `nftables` unit masked, no private key. The same on the build host:
 
 ```sh
 make dist && make guest-image BINARY_FROM=host CONTAINER_CLI=podman && make guest-image-check CONTAINER_CLI=podman

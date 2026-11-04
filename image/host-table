@@ -1,0 +1,108 @@
+#!/bin/sh
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+#
+# The pool VM's host table (ADR-0029 decision 3; ADR-0010's outline, ADR-0020 decision 3,
+# ADR-0027 decision 6): the bound on every uid, root's included, in an environment with
+# egress gateways. Input is default drop (loopback and established only: a pool VM
+# listens for nobody). Output is default drop but for loopback, established traffic and
+# TCP to the addresses the pool's own files name: the gateways' data port
+# (/etc/mediatore/gateways), the control relay's broker and SPIRE ports (MEDIATORE_URL in
+# the guest's env, server_address and server_port in the agent's configuration) and the
+# registries on the segment (/etc/mediatore/registries). Forward is dropped. Every entry
+# must be an IPv4 address and a port: the segment has no resolver, and a name here would be
+# a rule that admits nothing while looking like one. Loaded in one transaction by
+# mediatore-host-nft.service before the agent and the guest start; the sandbox uid's
+# per-claim table (mediatore_sandbox) sits beside it as the second layer.
+#
+#   host-table [--render] [gateways-file] [registries-file] [guest-env] [agent-conf]
+#
+# --render prints the table instead of loading it. The files default to the paths above;
+# the registries file may be absent, the other three may not.
+set -eu
+
+render=0
+if [ "${1:-}" = --render ]; then render=1; shift; fi
+gateways=${1:-/etc/mediatore/gateways}
+registries=${2:-/etc/mediatore/registries}
+guest_env=${3:-/etc/mediatore-guest/env}
+agent_conf=${4:-/etc/spire/agent.conf}
+
+die() { echo "host-table: $*" >&2; exit 1; }
+
+# An IPv4 address and a port, as `nft` elements want them.
+is_addr_port() {
+  printf '%s' "$1" | grep -Eq '^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9]):([1-9][0-9]{0,4})$'
+}
+
+elements=''
+add() { # <what> <address:port>
+  is_addr_port "$2" || die "$1: $2 is not an IPv4 address and a port (the segment has no resolver; names are refused, ADR-0029)"
+  el="${2%:*} . ${2##*:}"
+  case " $elements " in *" $el,"*|*" $el "*) return ;; esac
+  elements="${elements:+$elements, }$el"
+}
+
+[ -f "$gateways" ] || die "$gateways: no gateway list; without gateways the pool loads no host table (ADR-0029 decision 4)"
+n=0
+while IFS= read -r line || [ -n "$line" ]; do
+  line=$(printf '%s' "$line" | sed 's/[[:space:]]*$//; s/^[[:space:]]*//')
+  case $line in ''|'#'*) continue ;; esac
+  add "$gateways" "$line"; n=$((n+1))
+done < "$gateways"
+[ "$n" -gt 0 ] || die "$gateways names no gateway"
+
+if [ -f "$registries" ]; then
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=$(printf '%s' "$line" | sed 's/[[:space:]]*$//; s/^[[:space:]]*//')
+    case $line in ''|'#'*) continue ;; esac
+    add "$registries" "$line"
+  done < "$registries"
+fi
+
+[ -f "$guest_env" ] || die "$guest_env: no guest environment (MEDIATORE_URL names the control relay's broker port)"
+url=$(sed -n 's/^MEDIATORE_URL=//p' "$guest_env" | tail -1)
+[ -n "$url" ] || die "$guest_env: no MEDIATORE_URL"
+hostport=${url#*://}; hostport=${hostport%%/*}
+case $hostport in *:*) ;; *) case $url in https://*) hostport="$hostport:443" ;; http://*) hostport="$hostport:80" ;; *) die "MEDIATORE_URL $url: unknown scheme" ;; esac ;; esac
+add "MEDIATORE_URL" "$hostport"
+
+[ -f "$agent_conf" ] || die "$agent_conf: no agent configuration (server_address and server_port name the control relay's SPIRE port)"
+sa=$(sed -n 's/^[[:space:]]*server_address[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$agent_conf" | head -1)
+sp=$(sed -n 's/^[[:space:]]*server_port[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$agent_conf" | head -1)
+[ -n "$sa" ] && [ -n "$sp" ] || die "$agent_conf: server_address and server_port are required"
+add "agent.conf server_address" "$sa:$sp"
+
+table=$(cat <<NFT
+# mediatore host table (ADR-0029): every uid reaches the gateways' two planes and the segment's registries; nothing else leaves, nothing comes in
+table inet mediatore_host
+delete table inet mediatore_host
+table inet mediatore_host {
+  set allow4 { type ipv4_addr . inet_service; elements = { $elements } }
+  chain input {
+    type filter hook input priority filter; policy drop;
+    iif "lo" accept
+    ct state established,related accept
+    ct state invalid drop
+    log prefix "mediatore-host input: " counter drop
+  }
+  chain forward {
+    type filter hook forward priority filter; policy drop;
+    log prefix "mediatore-host forward: " counter drop
+  }
+  chain output {
+    type filter hook output priority filter; policy drop;
+    oif "lo" accept
+    ct state established,related accept
+    ip daddr . tcp dport @allow4 accept
+    log prefix "mediatore-host drop: " counter drop
+  }
+}
+NFT
+)
+if [ "$render" = 1 ]; then
+  printf '%s\n' "$table"
+else
+  printf '%s\n' "$table" | nft -f -
+  echo "host-table: loaded inet mediatore_host with $(printf '%s' "$elements" | tr ',' '\n' | wc -l | tr -d ' ') destinations"
+fi

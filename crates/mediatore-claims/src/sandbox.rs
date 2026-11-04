@@ -408,6 +408,23 @@ impl Watcher {
         if !self.cfg.issuers.iter().any(|i| i == &spec.subject.issuer) {
             return Some(format!("issuer {} is not configured", spec.subject.issuer));
         }
+        // The guest would refuse the image at bind (ADR-0021), and a gateway-era pool
+        // reaches its declared registries and no other (ADR-0029): say so here.
+        match spec
+            .workload
+            .image
+            .parse::<mediatore_proto::image::ImageReference>()
+        {
+            Err(e) => return Some(format!("workload image {:?}: {e}", spec.workload.image)),
+            Ok(image) => {
+                if let Some(reason) = mediatore_proto::image::unreachable_registry(
+                    self.cfg.reachable_registries.as_ref(),
+                    &image,
+                ) {
+                    return Some(reason);
+                }
+            }
+        }
         None
     }
 
@@ -1231,6 +1248,58 @@ mod tests {
                 r.store.list_claims().await.unwrap().is_empty(),
                 "{want}: no record"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_image_the_pool_cannot_reach_or_cannot_parse_fails_the_sandbox_without_a_claim() {
+        // A gateway-era environment whose only reachable registry is the mirror (ADR-0029).
+        let reachable = WatcherConfig {
+            reachable_registries: Some(["registry.internal:5000".to_owned()].into_iter().collect()),
+            ..cfg()
+        };
+        for (cfg, image, want) in [
+            (
+                reachable.clone(),
+                "ghcr.io/firestoned/agent:1",
+                "registry ghcr.io is not reachable from this environment's pool; the pool reaches: registry.internal:5000 (registries[].reach, ADR-0029)",
+            ),
+            (cfg(), "not a reference!", "workload image"),
+        ] {
+            let r = rig(cfg);
+            let mut sb = sandbox(true, false);
+            sb.spec.workload.image = image.into();
+            r.claims.put_sandbox(sb.clone());
+            assert_eq!(
+                r.watcher.reconcile_sandbox(&sb).await.unwrap(),
+                Action::await_change()
+            );
+            let st = r
+                .claims
+                .sandbox("sandboxes", "sb-1")
+                .unwrap()
+                .status
+                .unwrap();
+            assert_eq!(st.phase, SandboxPhase::Failed, "{image}");
+            assert!(
+                st.reason.as_deref().unwrap_or("").contains(want),
+                "{image}: {:?}",
+                st.reason
+            );
+            assert!(
+                r.claims.claim("sandboxes", "sb-1").is_none(),
+                "{image}: no claim"
+            );
+        }
+        // The mirror itself, and any registry without gateways, are fine.
+        for (cfg, image) in [
+            (reachable, "registry.internal:5000/team/agent:1"),
+            (cfg(), "ghcr.io/firestoned/agent:1"),
+        ] {
+            let r = rig(cfg);
+            let mut sb = sandbox(true, false);
+            sb.spec.workload.image = image.into();
+            assert_eq!(r.watcher.refuse(&sb.spec), None, "{image}");
         }
     }
 

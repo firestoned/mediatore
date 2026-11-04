@@ -65,6 +65,11 @@ RUN apt-get update \
 RUN useradd --system --user-group --home-dir /var/lib/spire --no-create-home --shell /usr/sbin/nologin spire \
     && usermod -aG tss spire
 
+# The pool VM's host table (ADR-0029): the bound on every uid in an environment with
+# gateways, rendered from the pool's own files and loaded before the agent and the guest.
+COPY image/host-table /usr/libexec/mediatore/host-table
+RUN chmod 0755 /usr/libexec/mediatore/host-table
+
 # Two directories the immutable root must already have, since nothing can create them at
 # boot: the sandbox root the guest mounts its per-claim tmpfs on (ADR-0021; the base has
 # no /mnt), and the agent's configuration directory, which the deployment layer's files
@@ -79,11 +84,11 @@ COPY --from=nsjail /nsjail/nsjail /usr/bin/nsjail
 RUN chmod 0755 /usr/bin/mediatore /usr/bin/spire-agent /usr/lib/spire/tpm_attestor_agent /usr/bin/nsjail \
     && echo "${TPM_PLUGIN_AGENT_SHA}  /usr/lib/spire/tpm_attestor_agent" | sha256sum -c -
 
-COPY image/systemd/spire-agent.service image/systemd/mediatore-guest.service /etc/systemd/system/
+COPY image/systemd/spire-agent.service image/systemd/mediatore-guest.service image/systemd/mediatore-host-nft.service /etc/systemd/system/
 # Yama's ptrace scope raised to 1: the second line behind the jail's PID namespace between
 # the workload and the egress proxy, both the sandbox uid (ADR-0025, roadmap 06).
 COPY image/sysctl/99-mediatore.conf /etc/sysctl.d/99-mediatore.conf
 COPY image/spire/agent.conf /usr/share/mediatore/agent.conf.example
 RUN grep -q "plugin_checksum = \"${TPM_PLUGIN_AGENT_SHA}\"" /usr/share/mediatore/agent.conf.example \
-    && systemctl enable spire-agent.service mediatore-guest.service qemu-guest-agent.service \
-    && systemctl mask ssh.service ssh.socket sshd.service
+    && systemctl enable spire-agent.service mediatore-guest.service mediatore-host-nft.service qemu-guest-agent.service \
+    && systemctl mask ssh.service ssh.socket sshd.service nftables.service

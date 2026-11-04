@@ -1,0 +1,21 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+
+[Unit]
+Description=The pool VM's host table (ADR-0029 decision 3)
+# Only in an environment with egress gateways (the pool's bootstrap list exists): the bound
+# on every uid, loaded in one transaction before the agent and the guest may start. Without
+# the list the unit is skipped and the pool runs as before (ADR-0029 decision 4).
+ConditionPathExists=/etc/mediatore/gateways
+Before=spire-agent.service mediatore-guest.service
+ConditionPathExists=|/run/cos/active_mode
+ConditionPathExists=|/run/cos/passive_mode
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/libexec/mediatore/host-table
+ExecStop=/usr/sbin/nft delete table inet mediatore_host
+
+[Install]
+WantedBy=multi-user.target

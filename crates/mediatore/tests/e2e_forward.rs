@@ -156,7 +156,12 @@ struct Harness {
 }
 
 impl Harness {
-    async fn start(ca: TestCa, upstream: Upstream, gateways: Vec<Endpoint>) -> Self {
+    async fn start(
+        ca: TestCa,
+        upstream: Upstream,
+        gateways: Vec<Endpoint>,
+        reachable_registries: Option<std::collections::BTreeSet<String>>,
+    ) -> Self {
         let idp = FakeIdp::start().await;
         let sts = Sts::new(
             "https://mediatore.test",
@@ -193,6 +198,7 @@ impl Harness {
                 .into_iter()
                 .collect(),
             registries: std::collections::BTreeMap::new(),
+            reachable_registries,
             sandboxes: None,
             sandbox_namespace: "sandboxes".into(),
             sealer: None,
@@ -347,6 +353,7 @@ async fn the_workload_reaches_its_upstream_through_a_gateway_as_the_claim() {
         ca,
         upstream,
         vec![dead.clone(), rogue.endpoint(), live.endpoint()],
+        None,
     )
     .await;
     let (_claim, me) = h.bound().await;
@@ -404,7 +411,7 @@ async fn a_gateway_that_refuses_the_tunnel_is_502_and_nothing_reaches_the_upstre
     // The gateway's allowlist (the broker's answer, at a real one) does not hold the
     // upstream: the authorizer's no.
     let gateway = StandInGateway::start(&ca, &gateway_svid(), vec![]).await;
-    let h = Harness::start(ca, upstream, vec![gateway.endpoint()]).await;
+    let h = Harness::start(ca, upstream, vec![gateway.endpoint()], None).await;
     let (_claim, me) = h.bound().await;
     let (proxy, phantom, tokens) = h.start_proxy(&me, &claim_svid(&me.claim_uid)).await;
 
@@ -435,7 +442,7 @@ async fn no_gateway_reachable_is_502_and_a_node_identity_gets_no_tunnel() {
         mediatore_testkit::dead_endpoint().await,
         mediatore_testkit::dead_endpoint().await,
     );
-    let h = Harness::start(ca, upstream, vec![dead_1, dead_2]).await;
+    let h = Harness::start(ca, upstream, vec![dead_1, dead_2], None).await;
     let (_claim, me) = h.bound().await;
     let (proxy, phantom, _tokens) = h.start_proxy(&me, &claim_svid(&me.claim_uid)).await;
     let resp = h.get(&proxy, &phantom, "/api/things").await;
@@ -470,4 +477,54 @@ async fn no_gateway_reachable_is_502_and_a_node_identity_gets_no_tunnel() {
     assert_eq!(resp.status(), 200);
     assert_eq!(h.upstream.seen().len(), 1);
     assert_eq!(gateway.tunnels().len(), 1);
+}
+
+/// ADR-0029 decision 1: in an environment with gateways the broker refuses a claim whose
+/// image names a registry the pool cannot reach, naming the ones it can, and admits the
+/// mirror; without gateways nothing is restricted (every other suite).
+#[tokio::test]
+async fn a_claim_naming_a_registry_the_pool_cannot_reach_is_refused_and_the_mirror_is_not() {
+    let ca = TestCa::new(TRUST_DOMAIN);
+    let upstream = Upstream::start().await;
+    let dead = mediatore_testkit::dead_endpoint().await;
+    let reachable = ["registry.internal:5000".to_owned()].into_iter().collect();
+    let h = Harness::start(ca, upstream, vec![dead], Some(reachable)).await;
+    let claim = |image: &str| ClaimRequest {
+        pool_ref: "pool-a".into(),
+        ttl_seconds: 3600,
+        audiences: vec![AUDIENCE.into()],
+        workload: Workload {
+            image: image.into(),
+            args: vec!["/usr/bin/agent".into()],
+        },
+        refresh_token: None,
+        policy_ref: None,
+    };
+    let resp = h
+        .http
+        .post(format!("{}/v1/claims", h.user_url))
+        .bearer_auth(h.login("octocat"))
+        .json(&claim("ghcr.io/firestoned/agent:1"))
+        .send()
+        .await
+        .expect("create claim");
+    assert_eq!(resp.status(), 400);
+    let body: serde_json::Value = resp.json().await.expect("body");
+    assert_eq!(body["error"], "unreachable_registry", "{body}");
+    let detail = body["detail"].as_str().unwrap_or_default().to_owned();
+    assert!(
+        detail.contains("ghcr.io")
+            && detail.contains("registry.internal:5000")
+            && detail.contains("ADR-0029"),
+        "{body}"
+    );
+    let resp = h
+        .http
+        .post(format!("{}/v1/claims", h.user_url))
+        .bearer_auth(h.login("octocat"))
+        .json(&claim("registry.internal:5000/team/agent:1"))
+        .send()
+        .await
+        .expect("create claim");
+    assert_eq!(resp.status(), 201, "the mirror is reachable");
 }

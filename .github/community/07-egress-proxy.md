@@ -51,15 +51,22 @@ Threat model R-3 was accepted until the ADR for this was written; it is rewritte
 - [ ] Per-request approval: the proxy asks before forwarding a request a rule marks
       as needing one (nono's approval backends; mediatore's would ask the broker, which
       asks the requester). The instrument that narrows R-3 further
-- [ ] The proxy answers names for the jail, or the image pins a filtering resolver,
-      so the sandbox uid needs no DNS of its own (R-12)
+- [x] ~~The proxy answers names for the jail, or the image pins a filtering resolver,
+      so the sandbox uid needs no DNS of its own (R-12)~~ Settled another way by
+      roadmap 10 (2026-11-04): with egress gateways the sandbox uid's ruleset carries no
+      DNS rule at all and the gateway resolves the tunnel's authority on its egress side
+      ([ADR-0028](../../docs/adr/0028-egress-gateway-envoy-with-spiffe-identity.md)
+      decisions 5 and 6, `net::Shape::Gateways`); R-12 is closed there and stands only
+      for an environment without gateways
 - [ ] Upstream connection reuse (one connection per request today) and HTTP/2 to the
       upstream, if a workload needs them
 - [ ] notaio M3: the bundle renders the routes and the rules, so the jail's two layers
       and the proxy come from one signed policy
-- [ ] Gateway: [ADR-0028](../../docs/adr/0028-egress-gateway-envoy-with-spiffe-identity.md) (roadmap 10)
-      adds the egress gateway behind this proxy: Envoy on banlieue's proxy VMs, with its own SPIFFE
-      identity, authorizing each tunnel by claim SVID.
+- [x] Gateway: [ADR-0028](../../docs/adr/0028-egress-gateway-envoy-with-spiffe-identity.md) (roadmap 10,
+      done 2026-11-04) adds the egress gateway behind this proxy: Envoy on banlieue's proxy VMs, with its own SPIFFE
+      identity, authorizing each tunnel by claim SVID; the proxy's dialer is the forwarder
+      ([ADR-0027](../../docs/adr/0027-control-plane-relay-on-the-egress-gateway.md) decision 8,
+      `crates/mediatore-guest/src/forward.rs`).
 
 **Reference design (2026-10-30).** nono's supervisor and `nono-proxy`
 ([always-further/nono](https://github.com/always-further/nono)) are this roadmap built for

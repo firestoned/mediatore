@@ -3,8 +3,11 @@
 
 [Unit]
 Description=SPIRE agent (TPM node attestation)
-After=network-online.target
+After=network-online.target mediatore-host-nft.service
 Wants=network-online.target
+# With egress gateways the host table bounds this VM before anything connects (ADR-0029);
+# a table that fails to load keeps the agent down. Without gateways the unit is skipped.
+Requires=mediatore-host-nft.service
 # Only the system booted from the installed disk (banlieue ADR-0043 decision 2, ADR-0019
 # decision 4): Kairos runs the same enabled units in the live installer and in recovery,
 # and an installer that attests with the member's vTPM is an agent nobody wanted. A

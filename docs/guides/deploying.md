@@ -399,14 +399,43 @@ every peer that is not a claim of the trust domain before any check runs, so a s
 cannot reach the relay's upstreams through it, and the authorizer asks the broker over
 `GET /v1/gateway/claims/{uid}` with the gateway SVID, on the egress side.
 
-**The pool behind them.** The pool's deployment layer changes in three places
-(`image/cloud-config-deployment.example.yaml` shows all three): the agent's
-`server_address` is a gateway's sandbox address with port `3129`, `MEDIATORE_URL` is
-`https://<the same address>:3130`, and `/etc/mediatore/gateways` lists the three sandbox
+**The pool behind them.** The pool's deployment layer changes in four places
+(`image/cloud-config-deployment.example.yaml` shows them): the agent's `server_address`
+is a gateway's sandbox address with port `3129`, `MEDIATORE_URL` is
+`https://<the same address>:3130`, `/etc/mediatore/gateways` lists the three sandbox
 addresses with the data port, the list the guest uses until the broker's `gateways` arrives
-(ADR-0027 decision 4). The broker's `gateways` lists the same three. The agent holds one
-server address, so it fails over between gateways only when it restarts; the forwarder
-fails over per connection.
+(ADR-0027 decision 4), and `/etc/mediatore/registries` lists the mirror below. The broker's
+`gateways` lists the same three. The agent holds one server address, so it fails over
+between gateways only when it restarts; the forwarder fails over per connection.
+
+**The mirror, and the host table.** A pool VM on the segment reaches the gateways and its
+neighbours and nothing else, so it cannot pull a workload image from `ghcr.io` or
+`docker.io`: a gateway-era pool pulls from the operator's registry on the segment, a
+registry or pull-through mirror with an address there
+([ADR-0029](../adr/0029-the-pull-on-a-routeless-segment-and-the-pool-vms-root-rules.md)
+decision 1), and the images your requesters name are the ones you mirrored, which is also
+where image review belongs. Declare it twice, once on each side. On the broker,
+`registries[]` gains `reach: segment` on every entry once `gateways` is set (the broker
+refuses to start otherwise), and an entry may carry no credential at all for an anonymous
+mirror (`- { host: "198.51.100.10:5000", reach: segment }`); a claim whose image names any
+other registry is refused at `POST /v1/claims` with `unreachable_registry`, and an
+`AgentSandbox` naming one fails before any claim exists, both naming the registries the
+pool reaches. On the pool, `/etc/mediatore/registries` lists the mirror's address and port
+(addresses, like everything on the segment), and either `MEDIATORE_PLAIN_HTTP_REGISTRIES`
+names it for a plain-HTTP mirror (pin by digest; no credential crosses plain HTTP,
+ADR-0022) or `MEDIATORE_REGISTRY_CA` points at the PEM of the CA your mirror's certificate
+chains to, trusted beside the Mozilla roots for the pull.
+
+With `/etc/mediatore/gateways` present the image loads a second table at boot,
+`inet mediatore_host`, before the agent and the guest may start (ADR-0029 decision 3;
+`image/host-table`, `mediatore-host-nft.service`): input default drop but loopback and
+established traffic, output default drop but loopback, established traffic and TCP to the
+three gateways' data port, the relay's two ports (read from `MEDIATORE_URL` and the agent's
+`server_address`) and the registries file, forward dropped, every entry an IPv4 address
+and a port or the table refuses to load and the VM stays down. That is the bound on root
+and every other uid; the sandbox uid's per-claim table sits beside it. Without the
+gateways file the unit is skipped and the pool runs as before. `nft list table inet
+mediatore_host` on a member shows it; `make host-table-test` pins the text.
 
 **What the network must do**, outside this repository: the segment's VLAN trunked on every
 host of the zone (banlieue ADR-0109 decision 3), the three gateways' `egress` addresses

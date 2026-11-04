@@ -37,16 +37,20 @@ check "the sandbox root and the agent's configuration directory, 0755, in the im
 check "tpm2-tools, for the EK certificate export (banlieue examples/21)" 'command -v tpm2_nvread'
 check "qemu-guest-agent, the libvirt channel for GuestReady (ADR-0019)" 'command -v qemu-ga'
 check "the spire user, in the TPM device group" 'id -nG spire | tr " " "\n" | grep -qx tss'
-check "both units installed" \
-  'test -f /etc/systemd/system/spire-agent.service && test -f /etc/systemd/system/mediatore-guest.service'
-check "both units enabled" \
-  'test -L /etc/systemd/system/multi-user.target.wants/spire-agent.service && test -L /etc/systemd/system/multi-user.target.wants/mediatore-guest.service'
+check "the three units installed" \
+  'test -f /etc/systemd/system/spire-agent.service && test -f /etc/systemd/system/mediatore-guest.service && test -f /etc/systemd/system/mediatore-host-nft.service'
+check "the three units enabled" \
+  'for u in spire-agent mediatore-guest mediatore-host-nft; do test -L /etc/systemd/system/multi-user.target.wants/$u.service || exit 1; done'
+check "the host table script, rendering from the pool's files and refusing a name (ADR-0029)" \
+  'test -x /usr/libexec/mediatore/host-table && d=$(mktemp -d) && printf "198.51.100.1:8443\n" > $d/g && printf "198.51.100.10:5000\n" > $d/r && printf "MEDIATORE_URL=https://198.51.100.1:3130\n" > $d/e && printf "agent {\n  server_address = \"198.51.100.1\"\n  server_port = \"3129\"\n}\n" > $d/a && /usr/libexec/mediatore/host-table --render $d/g $d/r $d/e $d/a | grep -q "policy drop" && printf "mirror.home.example:5000\n" > $d/r && ! /usr/libexec/mediatore/host-table --render $d/g $d/r $d/e $d/a >/dev/null 2>&1'
+check "the host table unit runs only with a gateway list, before the agent and the guest, which require it" \
+  'grep -q "^ConditionPathExists=/etc/mediatore/gateways" /etc/systemd/system/mediatore-host-nft.service && grep -q "^ExecStart=/usr/libexec/mediatore/host-table" /etc/systemd/system/mediatore-host-nft.service && grep -q "^Requires=.*mediatore-host-nft.service" /etc/systemd/system/spire-agent.service && grep -q "^Requires=.*mediatore-host-nft.service" /etc/systemd/system/mediatore-guest.service'
 check "the units point at the paths the image has" \
   'grep -q "^ExecStart=/usr/bin/spire-agent run -config /etc/spire/agent.conf" /etc/systemd/system/spire-agent.service && grep -q "^ExecStart=/usr/bin/mediatore guest" /etc/systemd/system/mediatore-guest.service'
 check "the agent unit: a private /tmp for the attestor plugin, CAP_SYS_PTRACE for the unix attestor, its runtime directory" \
   'grep -q "^PrivateTmp=yes" /etc/systemd/system/spire-agent.service && grep -q "^AmbientCapabilities=CAP_SYS_PTRACE" /etc/systemd/system/spire-agent.service && grep -q "^RuntimeDirectory=spire" /etc/systemd/system/spire-agent.service'
-check "no sshd, and ssh masked (ADR-0010: nothing inbound)" \
-  '! command -v sshd && for u in ssh.service ssh.socket; do test "$(readlink /etc/systemd/system/$u)" = /dev/null || exit 1; done'
+check "no sshd, ssh and the distribution's nftables unit masked (ADR-0010: nothing inbound; ADR-0029: one owner of the table)" \
+  '! command -v sshd && for u in ssh.service ssh.socket nftables.service; do test "$(readlink /etc/systemd/system/$u)" = /dev/null || exit 1; done'
 check "no other listener the base shipped (snmpd, lldpd, rpcbind)" \
   '! command -v snmpd && ! command -v lldpd && ! command -v rpcbind'
 check "Yama's ptrace scope raised in the image's sysctl (ADR-0025, roadmap 06)" \

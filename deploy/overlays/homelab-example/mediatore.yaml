@@ -46,10 +46,14 @@ audiences:
 # the claim and the sandbox ruleset admits the gateways and the control relay alone, no
 # DNS; without it the proxy dials the audiences' egress directly (deploying guide, step 7).
 # gateways: ["198.51.100.1:8443", "198.51.100.2:8443", "198.51.100.3:8443"]
-# Private registries (ADR-0022): the login and a token file from a Secret mounted like the
-# STS key; the guest gets the credential for the registry its claim's image names.
+# Registries (ADR-0022, ADR-0029): a private one gets its login and a token file from a
+# Secret mounted like the STS key, and the guest gets that credential for the registry its
+# claim's image names. With `gateways` set every entry also says how the pool reaches it,
+# `reach: segment` for a mirror on the sandbox segment, and a claim naming any other
+# registry is refused; an anonymous mirror is declared by its host and reach alone.
 # registries:
-#   - { host: registry.internal:5000, username: pool, password_file: /etc/mediatore-registry/token }
+#   - { host: registry.internal:5000, username: pool, password_file: /etc/mediatore-registry/token, reach: segment }
+#   - { host: "198.51.100.10:5000", reach: segment }
 sts:
   issuer: https://mediatore.home.example
   kid: homelab-1

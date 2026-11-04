@@ -112,9 +112,13 @@ rely on: a container runtime in the VM (none is baked, and none should be, the j
   sequence of decision 5 and no longer asks for a pre-populated rootfs. Two crates enter
   the graph: `tar` and `flate2` (its Rust back end), both permissive.
 - The image needs nothing new: `mount` and `umount` are util-linux, and the pull is the
-  one binary's. The segment's firewall (ADR-0010 decision 4) must let the members reach
+  one binary's. ~~The segment's firewall (ADR-0010 decision 4) must let the members reach
   the registry, which [the deploying guide](../guides/deploying.md) now lists beside the
-  broker and the audiences' endpoints.
+  broker and the audiences' endpoints.~~ *Amended 2026-11-04 by
+  [ADR-0029](0029-the-pull-on-a-routeless-segment-and-the-pool-vms-root-rules.md): the
+  segment of banlieue ADR-0109 routes nowhere, so a gateway-era pool pulls from a registry
+  on the segment, declared on both sides, and nothing else; the guest trusts the mirror's
+  CA beside the Mozilla roots when told (`MEDIATORE_REGISTRY_CA`).*
 - Tests: the reference grammar, the mount arguments and the layout are unit-tested; the
   pull is tested against a fake registry in `mediatore-testkit` on a real listener
   (layers built in the test: order, whiteouts, an escaping entry, a symlink out, setuid

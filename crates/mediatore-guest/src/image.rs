@@ -156,6 +156,23 @@ impl Puller {
         })
     }
 
+    /// Trust the CA certificates in `pem` beside the Mozilla roots, for a registry mirror
+    /// on the operator's PKI (`MEDIATORE_REGISTRY_CA`, ADR-0029 decision 1). The client is
+    /// rebuilt; an empty or unparsable PEM is an error, never the public roots alone in
+    /// its place.
+    ///
+    /// # Errors
+    /// `pem` holds no certificate, or the client cannot be built.
+    pub fn with_registry_ca(mut self, pem: &[u8]) -> anyhow::Result<Self> {
+        self.http = reqwest::Client::builder()
+            .use_preconfigured_tls(mediatore_proto::tls::https_client_config_with_extra_roots(
+                pem,
+            )?)
+            .user_agent(concat!("mediatore-guest/", env!("CARGO_PKG_VERSION")))
+            .build()?;
+        Ok(self)
+    }
+
     /// Select another platform from an index than this machine's. Tests only.
     #[cfg(test)]
     fn with_platform(mut self, p: Platform) -> Self {
@@ -1135,6 +1152,55 @@ mod tests {
             .unwrap();
         assert_eq!(reg.token_requests(), 1);
         assert_eq!(std::fs::read_to_string(s.rootfs.join("b")).unwrap(), "b");
+    }
+
+    #[tokio::test]
+    async fn a_mirror_on_the_operators_pki_is_pulled_with_its_ca_and_refused_without() {
+        let reg = FakeRegistry::start_tls().await;
+        let img = Image::new()
+            .layer(Layer::new().file("a", 0o644, b"a"), Compression::None)
+            .build();
+        let want = reg.push("team/tool", "v1", &img);
+        let ca = reg.ca_pem().expect("a TLS registry has a CA");
+        // Not listed as plain: HTTPS, which fails without the CA beside the Mozilla roots.
+        let s = scratch();
+        let err = Puller::new(&[])
+            .unwrap()
+            .pull(
+                &reference(&reg, "team/tool:v1"),
+                None,
+                &s.rootfs,
+                &s.scratch,
+            )
+            .await
+            .unwrap_err();
+        assert!(!format!("{err:#}").contains("http://"), "{err:#}");
+        // With it: the pull succeeds (ADR-0029 decision 1, MEDIATORE_REGISTRY_CA).
+        let s = scratch();
+        let got = Puller::new(&[])
+            .unwrap()
+            .with_registry_ca(ca.as_bytes())
+            .unwrap()
+            .pull(
+                &reference(&reg, "team/tool:v1"),
+                None,
+                &s.rootfs,
+                &s.scratch,
+            )
+            .await
+            .unwrap();
+        assert_eq!(got.digest, want);
+        assert_eq!(std::fs::read(s.rootfs.join("a")).unwrap(), b"a");
+        // An empty PEM is an error, never the public roots alone in its place.
+        assert!(Puller::new(&[]).unwrap().with_registry_ca(b"").is_err());
+        assert!(
+            Puller::new(&[])
+                .unwrap()
+                .with_registry_ca(
+                    b"-----BEGIN CERTIFICATE-----\nnot base64\n-----END CERTIFICATE-----\n"
+                )
+                .is_err()
+        );
     }
 
     #[tokio::test]
