@@ -167,8 +167,31 @@ What roadmap 10 fixed within the decisions above, as it is built:
   parsed like `audiences[].egress`, one listed twice refused at start, empty by default;
   `Me::gateways` carries it in that order and an old broker reads as an empty list. The
   environment is the broker's: one broker, one segment, one gateway set (ADR-0103).
-- **Not yet:** `mediatore gateway`, `mediatore forward`, the ruleset change, the gateway
-  image and VMs, the threat-model pass, which comes with the rest of the roadmap.
+- **The authorizer is `mediatore gateway`, in `crates/mediatore-gateway`** (decision 4),
+  Envoy's external authorization service in HTTP mode, on loopback, no gRPC. Envoy forwards
+  no client header to it by default; the check carries three headers Envoy sets from the
+  downstream connection through `authorization_request.headers_to_add`, which overrides
+  anything the client sent: `x-mediatore-peer` from `%DOWNSTREAM_PEER_URI_SAN%`,
+  `x-mediatore-method` from `%REQ(:method)%`, `x-mediatore-authority` from
+  `%REQ(:authority)%`. A check missing one is refused. The decision: the peer must be a
+  claim identity of the trust domain, the method `CONNECT` (decision 3: one shape), the
+  authority `host:port`, and that pair in the claim's allowlist exactly, host names compared
+  case-insensitively. `200` allows; `403` with a stable code (`not_a_claim`, `not_connect`,
+  `bad_authority`, `not_allowed`, `claim_gone`, `broker_unreachable`, `broker_refused`)
+  refuses, and Envoy's `status_on_error` makes an unreachable authorizer a refusal too.
+  The cache, settling the bound left to the test plan: one answer per claim UID, used
+  without asking for `--fresh-secs` (30), then refreshed; while the broker is unreachable
+  the last answer stands in for a further `--stale-secs` (300) and then an outage is a
+  deny; no answer is used past the claim's deadline; the broker's `404` drops the entry and
+  denies; the broker refusing the gateway's own identity denies whatever is cached; at most
+  `--max-claims` (4096) entries, the least recently used evicted; checks arriving together
+  for one claim share one ask. The broker is asked over mTLS with the gateway SVID from the
+  local Workload API, a client built per ask so a rotated SVID is used next, each ask
+  bounded at five seconds. One log line per decision: claim UID, peer, authority, what
+  served it and the verdict with its code; never a body, never a token.
+- **Not yet:** Envoy's bootstrap and the gateway image and VMs (decisions 1, 2, 5, 8 and
+  10), `mediatore forward` (decision 3), the ruleset change (decision 6), the threat-model
+  pass, which comes with the rest of the roadmap.
 
 ## Consequences
 
@@ -224,8 +247,8 @@ What roadmap 10 fixed within the decisions above, as it is built:
   claim's resolved binding with the answer. Decide with notaio ADR-0003's gateway item.
 - **How the log leaves the gateway** (the platform's collector, a syslog target) and who
   reads it.
-- **The allowlist's cache bound** and the answer format between the authorizer and the
-  broker, settled in the implementation's test plan.
+- ~~**The allowlist's cache bound** and the answer format between the authorizer and the
+  broker, settled in the implementation's test plan.~~ Settled, see *Implementation notes*.
 - **The registration entries' selectors for the gateway workload** (the Envoy user on a
   gateway VM) and how the first entry is bootstrapped after the agent first attests.
 - **The ML-KEM question above,** on the Envoy build chosen.

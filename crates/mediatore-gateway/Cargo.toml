@@ -1,0 +1,39 @@
+[package]
+name = "mediatore-gateway"
+description = "The egress gateway's authorizer (ADR-0028 decision 4): Envoy's external authorization service, answering each CONNECT from a bounded cache of what the broker says a claim may reach"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+mediatore-proto.workspace = true
+mediatore-spire.workspace = true
+mediatore-tls.workspace = true
+reqwest.workspace = true
+# The check server Envoy calls: HTTP/1.1 on loopback, any method the check request carries.
+hyper.workspace = true
+hyper-util.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+clap.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+mediatore-testkit.workspace = true
+
+[features]
+# `--dev-spiffe-id`: the gateway identity as a header against a loopback `dev_mode` broker,
+# for the dev loop only. Off in release builds (ADR-0007 decision 5).
+dev = []
+
+[lints]
+workspace = true

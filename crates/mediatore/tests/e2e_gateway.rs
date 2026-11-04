@@ -1,0 +1,453 @@
+// Copyright (c) 2026 Erick Bourgeois, mediatore
+// SPDX-License-Identifier: Apache-2.0
+
+//! The gateway's authorizer against the broker, end to end (ADR-0028 decision 4): the
+//! broker's sandbox listener over SPIFFE mTLS under the testkit CA, `mediatore gateway`'s
+//! authorizer asking it with the gateway SVID, and a stand-in for Envoy calling the check
+//! listener on loopback with the three headers Envoy sets. What is proven: a claim reaches
+//! its own allowlist and nothing else; a node, a foreign method or a malformed authority is
+//! refused; a released claim is cut off once its answer is stale; a broker that is down is
+//! a deny once nothing stands in; a gateway the broker does not recognise is a deny.
+
+use std::future::IntoFuture;
+use std::sync::Arc;
+use std::time::Duration;
+
+use mediatore_api::{AppState, Limiter};
+use mediatore_entra::{Backend, IssuerConfig, Validator};
+use mediatore_gateway::broker::Broker;
+use mediatore_gateway::serve::{AUTHORITY_HEADER, METHOD_HEADER, PEER_HEADER};
+use mediatore_gateway::{Authorizer, CacheConfig};
+use mediatore_proto::{ClaimRequest, ClaimResponse, NodeRegistration, Workload};
+use mediatore_spire::Naming;
+use mediatore_store::MemoryStore;
+use mediatore_sts::Sts;
+use mediatore_testkit::{FakeIdp, MemoryMaterial, TestCa};
+use mediatore_tls::{SpiffeId, TlsConfigs};
+
+/// Throwaway P-256 key for the e2e STS. Test material only; never reuse.
+const STS_TEST_KEY: &str = "-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgnjPFPJtOewKuQZS0
+WTXasKCqUusD6hs+6AaBUWw5lOyhRANCAAQy0awwI1IJ/BKoy/Zj4KtfYOiJOaX2
+bVIP4yKaVz1Zp2QNVZJ0t2NIXK0K55dfgdM/B4JF09EKDd/q/nHoAfis
+-----END PRIVATE KEY-----
+";
+
+const TRUST_DOMAIN: &str = "sandbox.test";
+const AUDIENCE: &str = "grafana.test";
+const REQUIRED_GROUP: &str = "firestoned:sandbox-users";
+const EK_HASH: &str = "72c566555391e835a15c522680b51ec3b840561ed70af5605a5ae4835f040ee8";
+/// What the audience's egress declares: the claim's whole allowlist.
+const ALLOWED: [&str; 2] = ["api.home.example:443", "192.0.2.10:8443"];
+
+fn broker_id() -> SpiffeId {
+    SpiffeId::new(format!("spiffe://{TRUST_DOMAIN}/mediatore")).expect("broker id")
+}
+
+fn node_svid() -> String {
+    format!("spiffe://{TRUST_DOMAIN}/banlieue/node/{EK_HASH}")
+}
+
+fn claim_svid(uid: &uuid::Uuid) -> String {
+    format!("spiffe://{TRUST_DOMAIN}/banlieue/claim/{uid}")
+}
+
+fn gateway_svid() -> String {
+    format!("spiffe://{TRUST_DOMAIN}/gateway")
+}
+
+fn state(idp: &FakeIdp) -> Arc<AppState> {
+    let sts = Sts::new(
+        "https://mediatore.test",
+        "e2e-1",
+        STS_TEST_KEY.as_bytes(),
+        chrono::Duration::minutes(15),
+    )
+    .expect("sts");
+    Arc::new(AppState {
+        store: MemoryStore::shared(),
+        spire: Arc::new(mediatore_spire::MemoryEntries::default()),
+        naming: Naming {
+            trust_domain: TRUST_DOMAIN.into(),
+        },
+        validator: Validator::new(vec![IssuerConfig {
+            url: idp.issuer.clone(),
+            backend: Backend::Sts,
+            client_id: "mediatore".into(),
+            subject_claim: "preferred_username".into(),
+            required_group: Some(REQUIRED_GROUP.into()),
+            session: None,
+            ca_file: None,
+            entra: None,
+            groups_claim: None,
+        }]),
+        sts: Some(sts),
+        audiences: vec![AUDIENCE.into()],
+        obo_audiences: vec![],
+        egress: [(
+            AUDIENCE.to_owned(),
+            ALLOWED.iter().map(|e| e.parse().unwrap()).collect(),
+        )]
+        .into_iter()
+        .collect(),
+        rules: std::collections::BTreeMap::new(),
+        cas: std::collections::BTreeMap::new(),
+        registries: std::collections::BTreeMap::new(),
+        sandboxes: None,
+        sandbox_namespace: "sandboxes".into(),
+        sealer: None,
+        limiter: Limiter::new(10),
+        dev_mode: true,
+        gateways: vec![],
+    })
+}
+
+/// The broker under the testkit CA, and the authorizer's check listener beside it.
+struct Harness {
+    idp: FakeIdp,
+    user_url: String,
+    sandbox_url: String,
+    ca: TestCa,
+    http: reqwest::Client,
+    /// The check listener a stand-in Envoy calls.
+    check_url: String,
+}
+
+impl Harness {
+    /// The broker as `spiffe://sandbox.test/mediatore`; the authorizer as `identity`, with
+    /// the cache bounds given, asking `broker_url` (the real listener unless overridden).
+    async fn start(identity: &str, cfg: CacheConfig, broker_url: Option<&str>) -> Self {
+        mediatore_proto::tls::ensure_provider();
+        let ca = TestCa::new(TRUST_DOMAIN);
+        let idp = FakeIdp::start().await;
+        let st = state(&idp);
+
+        let user = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind user");
+        let user_url = format!("http://{}", user.local_addr().expect("addr"));
+        tokio::spawn(axum::serve(user, mediatore_api::user_router(st.clone())).into_future());
+
+        let sandbox = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind sandbox");
+        let sandbox_url = format!("https://{}", sandbox.local_addr().expect("addr"));
+        let broker = MemoryMaterial::new(ca.svid(&broker_id().to_string()));
+        let configs =
+            TlsConfigs::spawn(broker, mediatore_api::sandbox_authorizer(st.naming.clone()))
+                .expect("tls configs");
+        tokio::spawn(mediatore_tls::serve(
+            sandbox,
+            configs,
+            mediatore_api::sandbox_router(st),
+            std::future::pending(),
+        ));
+
+        // The authorizer, with `identity`'s SVID from the same CA.
+        let material = MemoryMaterial::new(ca.svid(identity));
+        let source = Broker::with_material(broker_url.unwrap_or(&sandbox_url), material)
+            .expect("broker client");
+        let authorizer = Arc::new(Authorizer::new(TRUST_DOMAIN, Arc::new(source), cfg));
+        let check = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind check");
+        let check_url = format!("http://{}", check.local_addr().expect("addr"));
+        tokio::spawn(mediatore_gateway::serve::serve(authorizer, check));
+
+        Self {
+            idp,
+            user_url,
+            sandbox_url,
+            ca,
+            http: reqwest::Client::new(),
+            check_url,
+        }
+    }
+
+    fn login(&self, login: &str) -> String {
+        self.idp.token(serde_json::json!({
+            "aud": "mediatore",
+            "preferred_username": login,
+            "email": format!("{login}@example.com"),
+            "groups": [REQUIRED_GROUP],
+        }))
+    }
+
+    /// A client presenting a fresh SVID for `spiffe_id` from this harness's CA.
+    fn mtls_as(&self, spiffe_id: &str) -> reqwest::Client {
+        let cfg = mediatore_tls::client_config(&self.ca.svid(spiffe_id), &broker_id())
+            .expect("client config");
+        reqwest::Client::builder()
+            .use_preconfigured_tls(cfg)
+            .build()
+            .expect("client")
+    }
+
+    /// A bound claim: the node registers over mTLS, the user claims, the dev binder binds.
+    async fn bound_claim(&self) -> (String, ClaimResponse) {
+        let resp = self
+            .mtls_as(&node_svid())
+            .post(format!("{}/v1/nodes", self.sandbox_url))
+            .json(&NodeRegistration {
+                ek_hash: EK_HASH.into(),
+                dmi_uuid: uuid::Uuid::new_v4(),
+                hostname: "pool-a-7".into(),
+                provider: Some(mediatore_proto::Provider::Libvirt),
+            })
+            .send()
+            .await
+            .expect("register");
+        assert_eq!(resp.status(), 200);
+        let token = self.login("octocat");
+        let resp = self
+            .http
+            .post(format!("{}/v1/claims", self.user_url))
+            .bearer_auth(&token)
+            .json(&ClaimRequest {
+                pool_ref: "pool-a".into(),
+                ttl_seconds: 3600,
+                audiences: vec![AUDIENCE.into()],
+                workload: Workload {
+                    image: "registry.internal:5000/sandbox:latest".into(),
+                    args: vec![],
+                },
+                refresh_token: None,
+                policy_ref: None,
+            })
+            .send()
+            .await
+            .expect("create claim");
+        assert_eq!(resp.status(), 201);
+        let claim: ClaimResponse = resp.json().await.expect("claim body");
+        assert_eq!(claim.phase, mediatore_proto::ClaimPhase::Bound);
+        (token, claim)
+    }
+
+    /// What Envoy sends: the check with the three headers it sets from the downstream.
+    async fn check(&self, peer: &str, method: &str, authority: &str) -> (u16, String) {
+        let resp = self
+            .http
+            .post(format!("{}/check", self.check_url))
+            .header(PEER_HEADER, peer)
+            .header(METHOD_HEADER, method)
+            .header(AUTHORITY_HEADER, authority)
+            .send()
+            .await
+            .expect("check");
+        let status = resp.status().as_u16();
+        (
+            status,
+            resp.text().await.unwrap_or_default().trim().to_owned(),
+        )
+    }
+}
+
+#[tokio::test]
+async fn a_claim_reaches_its_allowlist_and_nothing_else_and_a_released_claim_is_cut_off() {
+    let h = Harness::start(&gateway_svid(), CacheConfig::default(), None).await;
+    let (token, claim) = h.bound_claim().await;
+    let uid = claim.uid.expect("uid");
+    let peer = claim_svid(&uid);
+
+    for authority in ALLOWED {
+        assert_eq!(
+            h.check(&peer, "CONNECT", authority).await,
+            (200, String::new()),
+            "{authority}"
+        );
+    }
+    for (authority, code) in [
+        ("other.home.example:443", "not_allowed"),
+        ("api.home.example:8443", "not_allowed"),
+        ("api.home.example", "bad_authority"),
+    ] {
+        assert_eq!(
+            h.check(&peer, "CONNECT", authority).await,
+            (403, code.into()),
+            "{authority}"
+        );
+    }
+    assert_eq!(
+        h.check(&peer, "GET", ALLOWED[0]).await,
+        (403, "not_connect".into())
+    );
+    assert_eq!(
+        h.check(&node_svid(), "CONNECT", ALLOWED[0]).await,
+        (403, "not_a_claim".into()),
+        "the node holding the claim is not the claim"
+    );
+    assert_eq!(
+        h.check(&claim_svid(&uuid::Uuid::new_v4()), "CONNECT", ALLOWED[0])
+            .await,
+        (403, "claim_gone".into()),
+        "a claim the broker never saw"
+    );
+    // A check Envoy did not form, and the health check.
+    let bare = h
+        .http
+        .post(format!("{}/check", h.check_url))
+        .header(AUTHORITY_HEADER, ALLOWED[0])
+        .send()
+        .await
+        .expect("bare");
+    assert_eq!(bare.status(), 403);
+    assert_eq!(bare.text().await.unwrap().trim(), "malformed_check");
+    let health = h
+        .http
+        .get(format!("{}/healthz", h.check_url))
+        .send()
+        .await
+        .expect("healthz");
+    assert_eq!(health.status(), 200);
+
+    // Released: within the fresh bound the cached answer still serves (the ADR's bound on
+    // revocation), after it the broker's 404 cuts the claim off.
+    let del = h
+        .http
+        .delete(format!("{}/v1/claims/{}", h.user_url, claim.name))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("delete");
+    assert_eq!(del.status(), 204);
+    assert_eq!(
+        h.check(&peer, "CONNECT", ALLOWED[0]).await.0,
+        200,
+        "still fresh: the cache answers"
+    );
+    let h2 = Harness::start(
+        &gateway_svid(),
+        CacheConfig {
+            fresh_for: Duration::ZERO,
+            ..CacheConfig::default()
+        },
+        None,
+    )
+    .await;
+    let (token, claim) = h2.bound_claim().await;
+    let peer = claim_svid(&claim.uid.expect("uid"));
+    assert_eq!(h2.check(&peer, "CONNECT", ALLOWED[0]).await.0, 200);
+    let del = h2
+        .http
+        .delete(format!("{}/v1/claims/{}", h2.user_url, claim.name))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("delete");
+    assert_eq!(del.status(), 204);
+    assert_eq!(
+        h2.check(&peer, "CONNECT", ALLOWED[0]).await,
+        (403, "claim_gone".into())
+    );
+}
+
+#[tokio::test]
+async fn a_broker_that_is_down_is_a_deny_and_so_is_a_gateway_the_broker_does_not_know() {
+    // Nothing listens there: every ask is an outage, and nothing was ever cached.
+    let h = Harness::start(
+        &gateway_svid(),
+        CacheConfig::default(),
+        Some("https://127.0.0.1:9"),
+    )
+    .await;
+    let (_, claim) = h.bound_claim().await;
+    let peer = claim_svid(&claim.uid.expect("uid"));
+    assert_eq!(
+        h.check(&peer, "CONNECT", ALLOWED[0]).await,
+        (403, "broker_unreachable".into())
+    );
+
+    // The authorizer presenting a node SVID: the handshake completes, the route refuses it.
+    let h = Harness::start(&node_svid(), CacheConfig::default(), None).await;
+    let (_, claim) = h.bound_claim().await;
+    let peer = claim_svid(&claim.uid.expect("uid"));
+    assert_eq!(
+        h.check(&peer, "CONNECT", ALLOWED[0]).await,
+        (403, "broker_refused".into())
+    );
+
+    // The authorizer presenting something under the gateway path: not a peer at all.
+    let h = Harness::start(
+        &format!("{}/1", gateway_svid()),
+        CacheConfig::default(),
+        None,
+    )
+    .await;
+    let (_, claim) = h.bound_claim().await;
+    let peer = claim_svid(&claim.uid.expect("uid"));
+    assert_eq!(
+        h.check(&peer, "CONNECT", ALLOWED[0]).await,
+        (403, "broker_unreachable".into())
+    );
+}
+
+/// The dev transport: the gateway identity as a header against a loopback `dev_mode`
+/// broker, which is what the dev loop runs.
+#[cfg(feature = "dev")]
+#[tokio::test]
+async fn the_dev_header_transport_reaches_a_dev_mode_broker() {
+    mediatore_proto::tls::ensure_provider();
+    let idp = FakeIdp::start().await;
+    let st = state(&idp);
+    let user = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let user_url = format!("http://{}", user.local_addr().unwrap());
+    tokio::spawn(axum::serve(user, mediatore_api::user_router(st.clone())).into_future());
+    let sandbox = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let sandbox_url = format!("http://{}", sandbox.local_addr().unwrap());
+    tokio::spawn(axum::serve(sandbox, mediatore_api::sandbox_router(st)).into_future());
+
+    let http = reqwest::Client::new();
+    let resp = http
+        .post(format!("{sandbox_url}/v1/nodes"))
+        .header("x-mediatore-peer-spiffe-id", node_svid())
+        .json(&NodeRegistration {
+            ek_hash: EK_HASH.into(),
+            dmi_uuid: uuid::Uuid::new_v4(),
+            hostname: "pool-a-7".into(),
+            provider: Some(mediatore_proto::Provider::Libvirt),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let token = idp.token(serde_json::json!({
+        "aud": "mediatore",
+        "preferred_username": "octocat",
+        "email": "octocat@example.com",
+        "groups": [REQUIRED_GROUP],
+    }));
+    let claim: ClaimResponse = http
+        .post(format!("{user_url}/v1/claims"))
+        .bearer_auth(&token)
+        .json(&ClaimRequest {
+            pool_ref: "pool-a".into(),
+            ttl_seconds: 3600,
+            audiences: vec![AUDIENCE.into()],
+            workload: Workload {
+                image: "registry.internal:5000/sandbox:latest".into(),
+                args: vec![],
+            },
+            refresh_token: None,
+            policy_ref: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let peer = claim_svid(&claim.uid.unwrap());
+
+    let source = Broker::dev_header(&sandbox_url, &gateway_svid());
+    let authorizer = Authorizer::new(TRUST_DOMAIN, Arc::new(source), CacheConfig::default());
+    let d = authorizer.authorize(&peer, "CONNECT", ALLOWED[0]).await;
+    assert_eq!(d.verdict, Ok(()));
+    let d = authorizer
+        .authorize(&peer, "CONNECT", "other.home.example:443")
+        .await;
+    assert_eq!(d.verdict, Err(mediatore_gateway::Refusal::NotAllowed));
+    let source = Broker::dev_header(&sandbox_url, &node_svid());
+    let authorizer = Authorizer::new(TRUST_DOMAIN, Arc::new(source), CacheConfig::default());
+    let d = authorizer.authorize(&peer, "CONNECT", ALLOWED[0]).await;
+    assert_eq!(d.verdict, Err(mediatore_gateway::Refusal::BrokerRefused));
+}

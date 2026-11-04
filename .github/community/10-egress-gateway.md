@@ -5,8 +5,8 @@
 
 **Status: in progress** (since 2026-11-03). [ADR-0028](../../docs/adr/0028-egress-gateway-envoy-with-spiffe-identity.md)
 is Accepted (2026-10-28 proposed, accepted 2026-11-02) and the CALM stack model carries the gateway and the forwarder
-as proposed nodes. The broker side is built: the `gateways` list on `GET /v1/me` and the
-gateway-only route. The gateway is what makes ADR-0010's "enforcement
+as proposed nodes. Built: the `gateways` list on `GET /v1/me`, the gateway-only route, and
+the authorizer Envoy asks. The gateway is what makes ADR-0010's "enforcement
 outside the guest" true, and what closes threat-model R-12 (DNS from the jail).
 
 Depends on roadmap 02 (SPIRE the VMs can attest to, with the TPM plugin, ADR-0018) and on
@@ -23,8 +23,9 @@ injection) builds on this and stays design-only.
 - [x] Broker: the gateway-only route answering a claim's allowed `host:port` pairs, peer
       `spiffe://<td>/gateway` only; `404` for a released, expired or unknown claim
       (`GET /v1/gateway/claims/{uid}`, 2026-11-03; a pending claim is `404` too)
-- [ ] `mediatore gateway` (ext_authz authorizer with a bounded per-claim cache; deny on no
-      answer)
+- [x] `mediatore gateway` (ext_authz authorizer with a bounded per-claim cache; deny on no
+      answer) (`crates/mediatore-gateway`, 2026-11-04; Envoy's configuration comes with the
+      image)
 - [ ] `mediatore forward` (loopback proxy, claim SVID, mutual TLS, CONNECT, gateway list
       with random start and failover)
 - [ ] Guest: proxy environment for the jail, the ruleset naming the gateways and the
