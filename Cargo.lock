@@ -2247,6 +2247,7 @@ dependencies = [
  "mediatore-claims",
  "mediatore-client",
  "mediatore-entra",
+ "mediatore-gateway",
  "mediatore-guest",
  "mediatore-policy",
  "mediatore-proto",
@@ -2350,6 +2351,29 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "mediatore-gateway"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "clap",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "mediatore-proto",
+ "mediatore-spire",
+ "mediatore-testkit",
+ "mediatore-tls",
+ "reqwest",
  "thiserror",
  "tokio",
  "tracing",

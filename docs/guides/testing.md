@@ -271,6 +271,25 @@ Mozilla roots did not sign it. The policy itself (`judge`, the
 route lookup, the rule glob) is unit-tested in `crates/mediatore-guest/src/egress.rs` and
 `crates/mediatore-proto/src/lib.rs`, and the ruleset's two new lines in `net.rs`.
 
+### The gateway's authorizer: in `make check`
+
+The authorizer of [ADR-0028](../adr/0028-egress-gateway-envoy-with-spiffe-identity.md)
+decision 4, `mediatore gateway`, is proven against the broker in `make check`, with no
+Envoy and no VM: `crates/mediatore/tests/e2e_gateway.rs` runs the fake issuer, the broker's
+sandbox listener over the production mTLS listener under the testkit's `TestCa`, the real
+`Authorizer` with its broker client presenting the gateway SVID from that CA, and the check
+listener Envoy would call, on loopback. A stand-in for Envoy sends the check with the three
+headers Envoy sets from the downstream connection (the peer's SPIFFE ID, the method, the
+authority). What is proven: a bound claim reaches each `host:port` of its audiences' egress
+and nothing else; a foreign method, a malformed authority, the node that holds the claim and
+a claim the broker never saw are refused with their codes; a check Envoy did not form is
+refused; a released claim still answers from the cache within the fresh bound and is cut off
+by the broker's `404` after it; an authorizer whose broker is down denies from the first
+check; one presenting a node SVID is refused by the route and denies; one presenting an
+identity under the gateway path cannot complete the handshake and denies. The cache's own
+bounds (fresh, stale, the claim's deadline, the size, one ask per claim at a time) are unit
+tests in `crates/mediatore-gateway/src/lib.rs` over a scripted source.
+
 ### The sandbox filesystem and the pull: by hand, on the build host
 
 The tmpfs the guest mounts per claim and the image pull

@@ -24,6 +24,7 @@ mediatore-store.workspace = true
 mediatore-policy.workspace = true
 mediatore-claims.workspace = true
 mediatore-guest.workspace = true
+mediatore-gateway.workspace = true
 mediatore-client.workspace = true
 tokio.workspace = true
 axum.workspace = true
@@ -41,7 +42,7 @@ uuid.workspace = true
 # The loopback header path of the guest and token roles (`--dev-spiffe-id`), for the dev
 # loop only. `make dist`, the Dockerfile and the build workflow never enable it (ADR-0007
 # decision 5, ADR-0014 decision 2).
-dev = ["mediatore-guest/dev"]
+dev = ["mediatore-guest/dev", "mediatore-gateway/dev"]
 
 [dev-dependencies]
 mediatore-proto.workspace = true

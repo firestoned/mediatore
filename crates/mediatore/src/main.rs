@@ -56,6 +56,8 @@ enum Cmd {
     JailExec(mediatore_guest::confine::JailExecArgs),
     /// Beside the jail, as the sandbox user: the reverse proxy that swaps the jail's phantom token for the audience's real one (ADR-0025).
     EgressProxy(mediatore_guest::egress::EgressArgs),
+    /// On an egress gateway VM: Envoy's authorizer, answering each tunnel from what the broker says the claim may reach (ADR-0028).
+    Gateway(mediatore_gateway::serve::GatewayArgs),
     /// The user's tools: `login`, `sandbox create|get|delete`, `session`.
     #[command(flatten)]
     User(mediatore_client::cli::UserCmd),
@@ -89,6 +91,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Guest(args) => mediatore_guest::guest::run(args).await,
         Cmd::Token(args) => mediatore_guest::token::run(args).await,
         Cmd::EgressProxy(args) => mediatore_guest::egress::run(args).await,
+        Cmd::Gateway(args) => mediatore_gateway::serve::run(args).await,
         Cmd::JailExec(args) => {
             // Returns only when the workload did not run; on success this process is the workload.
             let err = mediatore_guest::confine::run(&args);
