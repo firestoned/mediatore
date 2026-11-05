@@ -67,6 +67,9 @@ pub struct WatcherConfig {
     /// How long a claim row outlives its claim before the resync sweeps it into the audit
     /// table (ADR-0012 decision 4).
     pub retention: Duration,
+    /// `policy.egress` (ADR-0030): decides whether a bundle's direct egress is `P006` or,
+    /// as the broker serves it, only its unservable entries are `P007`.
+    pub egress_mode: crate::policy::EgressMode,
 }
 
 impl Default for WatcherConfig {
@@ -79,6 +82,7 @@ impl Default for WatcherConfig {
             issuers: vec![],
             reachable_registries: None,
             retention: Duration::from_hours(1),
+            egress_mode: crate::policy::EgressMode::default(),
         }
     }
 }

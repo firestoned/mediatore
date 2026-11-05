@@ -199,6 +199,7 @@ impl Harness {
                 .collect(),
             registries: std::collections::BTreeMap::new(),
             reachable_registries,
+            policy_egress: None,
             sandboxes: None,
             sandbox_namespace: "sandboxes".into(),
             sealer: None,

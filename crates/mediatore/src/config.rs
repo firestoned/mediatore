@@ -261,6 +261,11 @@ pub struct PolicySection {
     /// `[sandboxes.namespace]`, filled in at load.
     #[serde(default)]
     pub namespaces: Vec<String>,
+    /// Whether a bundle's direct `egress[]` reaches the gateway (ADR-0030 decision 4):
+    /// `shadow` (the default) serves today's answer and logs the difference, `enforce`
+    /// serves the union. Per broker deployment, so per environment.
+    #[serde(default)]
+    pub egress: mediatore_claims::policy::EgressMode,
 }
 
 /// The wrapping key for refresh material (ADR-0012 decision 3): exactly one of the local
@@ -1352,6 +1357,19 @@ store: {{ url: \"sqlite:///var/lib/mediatore/store.db\" }}
         ))
         .unwrap();
         assert_eq!(cfg.policy.unwrap().namespaces, ["sandboxes", "team-b"]);
+    }
+
+    #[test]
+    fn the_policy_egress_switch_defaults_to_shadow_and_refuses_a_misspelling() {
+        use mediatore_claims::policy::EgressMode;
+        let k = conformance_key();
+        let keys = format!("  trusted_keys: [{{ id: \"notaio:v1\", public_key: \"{k}\" }}]\n");
+        let default = with_policy(&format!("policy:\n{keys}")).unwrap();
+        assert_eq!(default.policy.unwrap().egress, EgressMode::Shadow);
+        let on = with_policy(&format!("policy:\n{keys}  egress: enforce\n")).unwrap();
+        assert_eq!(on.policy.unwrap().egress, EgressMode::Enforce);
+        // Fail closed: a value the broker does not know is a refused start, not shadow.
+        assert!(with_policy(&format!("policy:\n{keys}  egress: enforced\n")).is_err());
     }
 
     #[test]

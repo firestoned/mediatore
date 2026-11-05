@@ -104,6 +104,7 @@ impl Harness {
             cas: std::collections::BTreeMap::new(),
             registries: std::collections::BTreeMap::new(),
             reachable_registries: None,
+            policy_egress: None,
             sandboxes: None,
             sandbox_namespace: "sandboxes".into(),
             sealer: Some(Arc::new(LocalKeySealer::new([5u8; 32]))),

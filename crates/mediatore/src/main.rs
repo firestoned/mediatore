@@ -138,6 +138,11 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
 
     let registries = registries(&cfg)?;
 
+    // The reflector needs the store the state is about to own, and the state needs the
+    // reflector's cache (ADR-0030): built first.
+    let reflector = bundle_reflector(&cfg, &store, client.is_some())?;
+    let policy_egress = policy_egress(&cfg, reflector.as_deref());
+
     let state = Arc::new(AppState {
         store,
         spire,
@@ -170,6 +175,7 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
         dev_mode: cfg.dev_mode,
         gateways: cfg.gateways.clone(),
         reachable_registries: cfg.reachable_registries(),
+        policy_egress,
     });
 
     let user = tokio::net::TcpListener::bind(&cfg.listen.user).await?;
@@ -188,7 +194,6 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
         // One cache: the reflector fills it on this replica, the watcher reads it when it
         // creates a record (ADR-0026 decision 6). Empty, and never filled, without a
         // `policy` section.
-        let reflector = bundle_reflector(&cfg, &state)?;
         let bundles = reflector.as_ref().map(|r| r.cache());
         let policy_client = client.clone();
         let p = async {
@@ -212,18 +217,33 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// What the broker serves a policy's direct egress from (ADR-0030): the reflector's cache
+/// and the `policy.egress` switch. `None` without a reflector, so under `dev_mode`, where
+/// no bundle is read, nothing is served from one.
+fn policy_egress(
+    cfg: &Config,
+    reflector: Option<&BundleReflector>,
+) -> Option<mediatore_api::PolicyEgress> {
+    let (reflector, policy) = reflector.zip(cfg.policy.as_ref())?;
+    Some(mediatore_api::PolicyEgress {
+        bundles: reflector.cache(),
+        mode: policy.egress,
+    })
+}
+
 /// notaio's bundle reflector (ADR-0026 decision 3) over the configured keys and namespaces;
 /// `None` without a `policy` section.
 fn bundle_reflector(
     cfg: &Config,
-    state: &Arc<AppState>,
+    store: &Arc<dyn ClaimStore>,
+    has_cluster: bool,
 ) -> anyhow::Result<Option<Arc<BundleReflector>>> {
-    let Some(policy) = cfg.policy.as_ref() else {
+    let Some(policy) = cfg.policy.as_ref().filter(|_| has_cluster) else {
         return Ok(None);
     };
     let keys = mediatore_policy::trusted_keys(&policy.trusted_keys)?;
     Ok(Some(Arc::new(BundleReflector::new(
-        state.store.clone(),
+        store.clone(),
         keys,
         policy.namespaces.clone(),
     ))))
@@ -278,6 +298,7 @@ async fn claim_watcher(
             issuers: cfg.issuers.iter().map(|i| i.url.clone()).collect(),
             reachable_registries: cfg.reachable_registries(),
             retention: std::time::Duration::from_secs(cfg.store.retention_secs),
+            egress_mode: cfg.policy.as_ref().map(|p| p.egress).unwrap_or_default(),
             ..WatcherConfig::default()
         },
     );

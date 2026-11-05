@@ -582,7 +582,12 @@ impl Watcher {
         let (status, reason, message) = if bundles.synced(&namespace) {
             let bundle = self.bundle_of(sb);
             let version = bundle.as_ref().map(|b| b.meta.version);
-            let findings = shadow::compare(&sb.spec, &self.cfg.audiences, bundle.as_deref());
+            let findings = shadow::compare_with(
+                &sb.spec,
+                &self.cfg.audiences,
+                bundle.as_deref(),
+                self.cfg.egress_mode,
+            );
             if findings.is_empty() {
                 (
                     "True",
