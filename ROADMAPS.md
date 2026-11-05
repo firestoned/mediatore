@@ -20,6 +20,7 @@ the same commit that changes a roadmap item's state.
 | 08 | AgentSandbox CRD and reconciler (ADR-0008) | ✅ done | [08-agentsandbox-crd.md](.github/community/08-agentsandbox-crd.md) |
 | 09 | notaio bundles, verified in shadow (ADR-0026) | ✅ done | [09-notaio-bundles-in-shadow.md](.github/community/09-notaio-bundles-in-shadow.md) |
 | 10 | Egress gateway (Envoy, SPIFFE identity, ADR-0028) | ✅ done | [10-egress-gateway.md](.github/community/10-egress-gateway.md) |
+| 11 | A policy's direct egress at the gateway (ADR-0030) | 🔶 in progress | [11-policy-egress-at-the-gateway.md](.github/community/11-policy-egress-at-the-gateway.md) |
 
 Statuses: ✅ done · 🔶 in progress · ⛔ not started · 📄 reference doc.
 ADRs are separate and live in [`docs/adr/`](docs/adr/).

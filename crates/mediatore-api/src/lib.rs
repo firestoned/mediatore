@@ -84,6 +84,10 @@ pub struct AppState {
     /// ADR-0029 decision 1): a claim whose image names another is refused. `None` in an
     /// environment without gateways, where nothing is restricted.
     pub reachable_registries: Option<std::collections::BTreeSet<String>>,
+    /// The verified bundles and the `policy.egress` switch (ADR-0030): a claim's direct
+    /// egress joins its allowlist in `enforce`. `None` without a `policy` section, or under
+    /// `dev_mode`, where no bundle is read: the audience endpoints alone.
+    pub policy_egress: Option<PolicyEgress>,
     /// `AgentSandbox` resources through the Kubernetes API (ADR-0008); `None` under
     /// `dev_mode`, where the store and the dev binder stand in. Absent outside `dev_mode`,
     /// the claim endpoints fail closed with `501`.
@@ -899,9 +903,63 @@ async fn me(
     }))
 }
 
-/// The `host:port` pairs a claim may reach: the union of its audiences' `egress`, sorted
-/// and deduplicated. The same list for the guest's ruleset and for the gateway's answer.
+/// What the broker needs to serve a policy's direct egress (ADR-0030).
+#[derive(Clone)]
+pub struct PolicyEgress {
+    /// The reflector's cache of verified bundles (ADR-0026).
+    pub bundles: Arc<mediatore_claims::policy::BundleCache>,
+    /// `policy.egress`.
+    pub mode: mediatore_claims::policy::EgressMode,
+}
+
+/// The `host:port` pairs a claim may reach: the union of its audiences' `egress` and, when
+/// `policy.egress` is `enforce`, the direct egress of its policy's verified, unexpired bundle
+/// (ADR-0030), sorted and deduplicated. The same list for the guest's ruleset and for the
+/// gateway's answer. A claim with no policy, or whose bundle is missing, expired or not
+/// verified, gets the audience endpoints only.
 fn egress_of(st: &AppState, rec: &ClaimRecord) -> Vec<Endpoint> {
+    let mut egress = audience_egress(st, rec);
+    let Some(pe) = st.policy_egress.as_ref() else {
+        return egress;
+    };
+    let Some(uid) = rec.policy_uid.as_deref() else {
+        return egress;
+    };
+    let Some(bundle) = pe.bundles.by_uid(uid, Utc::now()) else {
+        return egress;
+    };
+    let direct = mediatore_claims::policy::direct_egress(&bundle);
+    for n in &direct.not_served {
+        tracing::debug!(claim_uid = %rec.uid, policy_uid = uid, endpoint = %n.endpoint, reason = n.reason, "direct egress not served");
+    }
+    let added: Vec<Endpoint> = direct
+        .served
+        .into_iter()
+        .filter(|e| !egress.contains(e))
+        .collect();
+    match pe.mode {
+        mediatore_claims::policy::EgressMode::Enforce => {
+            egress.extend(added);
+            egress.sort();
+            egress.dedup();
+        }
+        mediatore_claims::policy::EgressMode::Shadow => {
+            if !added.is_empty() {
+                tracing::info!(
+                    claim_uid = %rec.uid,
+                    policy_uid = uid,
+                    bundle_version = bundle.meta.version,
+                    would_add = %added.iter().map(ToString::to_string).collect::<Vec<_>>().join(","),
+                    "policy.egress is shadow: direct egress not served"
+                );
+            }
+        }
+    }
+    egress
+}
+
+/// The union of the claim's audiences' `egress`, sorted and deduplicated.
+fn audience_egress(st: &AppState, rec: &ClaimRecord) -> Vec<Endpoint> {
     let mut egress: Vec<Endpoint> = rec
         .audiences
         .iter()

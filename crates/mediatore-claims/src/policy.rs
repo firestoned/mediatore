@@ -19,6 +19,7 @@ use kube::runtime::WatchStreamExt as _;
 use kube::runtime::watcher::{self, Event};
 use kube::{Api, Client, ResourceExt};
 use mediatore_policy::{BundlePayload, Envelope, Refusal, TrustedKeys, admit};
+use mediatore_proto::Endpoint;
 use mediatore_store::ClaimStore;
 use tokio::sync::broadcast;
 
@@ -53,6 +54,72 @@ pub enum Outcome {
 struct Verified {
     payload: Arc<BundlePayload>,
     configmap: String,
+}
+
+/// Whether a policy's direct `egress[]` reaches the gateway (ADR-0030 decision 4). The
+/// broker's own configuration, never cluster state; `shadow` unless an operator turns it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EgressMode {
+    /// Serve the audience endpoints only and log what the bundle would have added.
+    #[default]
+    Shadow,
+    /// Serve the union of the audience endpoints and the bundle's servable direct egress.
+    Enforce,
+}
+
+/// A direct `egress[]` entry the gateway cannot enforce exactly, and why (ADR-0030 decision 3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotServed {
+    /// The entry as the bundle spells it.
+    pub endpoint: String,
+    /// A stable, secret-free reason.
+    pub reason: &'static str,
+}
+
+/// A bundle's direct `egress[]` sorted into what the gateway can serve and what it cannot.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DirectEgress {
+    /// Exact `host:port` entries with a DNS host, lowercased, sorted, deduplicated.
+    pub served: Vec<Endpoint>,
+    /// Entries refused, in bundle order.
+    pub not_served: Vec<NotServed>,
+}
+
+/// Sort `bundle`'s direct `egress[]` (ADR-0030 decision 3). The gateway matches the CONNECT
+/// authority exactly and sees no path, so an entry is served only when it is a DNS
+/// `host:port` with no wildcard and no `rules`; anything else is reported, never
+/// reinterpreted.
+#[must_use]
+pub fn direct_egress(bundle: &BundlePayload) -> DirectEgress {
+    let mut out = DirectEgress::default();
+    for entry in &bundle.content.egress {
+        let refuse = |reason| NotServed {
+            endpoint: entry.endpoint.clone(),
+            reason,
+        };
+        if !entry.rules.is_empty() {
+            out.not_served.push(refuse("has_rules"));
+            continue;
+        }
+        let Ok(mut endpoint) = entry.endpoint.parse::<Endpoint>() else {
+            out.not_served.push(refuse("not_host_port"));
+            continue;
+        };
+        if endpoint.host.contains('*') {
+            out.not_served.push(refuse("wildcard"));
+            continue;
+        }
+        if endpoint.host.parse::<std::net::IpAddr>().is_ok() {
+            out.not_served.push(refuse("ip_literal"));
+            continue;
+        }
+        endpoint.host = endpoint.host.to_ascii_lowercase();
+        out.served.push(endpoint);
+    }
+    out.served.sort();
+    out.served.dedup();
+    out
 }
 
 /// A policy, as `(namespace, name)`.
@@ -126,6 +193,18 @@ impl BundleCache {
         map.get(&(namespace.to_owned(), name.to_owned()))
             .filter(|v| v.payload.meta.not_after > now)
             .map(|v| v.payload.clone())
+    }
+
+    /// The verified bundle of the policy whose `uid` is `uid`, if one is cached and still
+    /// valid at `now`: the claim's bundle, found from the record (ADR-0030 decision 2). The
+    /// current bundle, never the version the claim was created under.
+    #[must_use]
+    pub fn by_uid(&self, uid: &str, now: DateTime<Utc>) -> Option<Arc<BundlePayload>> {
+        self.read()
+            .values()
+            .filter(|v| v.payload.meta.not_after > now && v.payload.content.policy.uid == uid)
+            .map(|v| v.payload.clone())
+            .max_by_key(|p| p.meta.version)
     }
 
     /// How many bundles are cached, expired ones included until the next sweep.
@@ -727,5 +806,85 @@ mod tests {
         assert_eq!(r.reflector.cache().len(), 1);
         assert_eq!(r.reflector.sweep(not_after), 1);
         assert!(r.reflector.cache().is_empty());
+    }
+
+    fn bundle_with_egress(entries: &[(&str, bool)]) -> BundlePayload {
+        let mut b = mediatore_testkit::policy::fresh_bundle(Utc::now(), 1).payload;
+        b.content.egress = entries
+            .iter()
+            .map(
+                |(endpoint, with_rules)| mediatore_policy::types::EgressRule {
+                    endpoint: (*endpoint).into(),
+                    rules: if *with_rules {
+                        vec![mediatore_policy::types::EndpointRule {
+                            method: "GET".into(),
+                            path: "/**".into(),
+                        }]
+                    } else {
+                        vec![]
+                    },
+                },
+            )
+            .collect();
+        b
+    }
+
+    #[test]
+    fn direct_egress_serves_only_what_the_gateway_can_match_exactly() {
+        let b = bundle_with_egress(&[
+            ("Repo.Home.Example:443", false),
+            ("api.home.example:443", false),
+            ("api.home.example:443", false),
+            ("*.home.example:443", false),
+            ("192.0.2.7:443", false),
+            ("[2001:db8::1]:443", false),
+            ("nohost", false),
+            ("only-some.home.example:443", true),
+        ]);
+        let d = direct_egress(&b);
+        let served: Vec<String> = d.served.iter().map(ToString::to_string).collect();
+        assert_eq!(served, ["api.home.example:443", "repo.home.example:443"]);
+        let reasons: Vec<(&str, &str)> = d
+            .not_served
+            .iter()
+            .map(|n| (n.endpoint.as_str(), n.reason))
+            .collect();
+        assert_eq!(
+            reasons,
+            [
+                ("*.home.example:443", "wildcard"),
+                ("192.0.2.7:443", "ip_literal"),
+                ("[2001:db8::1]:443", "ip_literal"),
+                ("nohost", "not_host_port"),
+                ("only-some.home.example:443", "has_rules"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_bundle_is_found_by_its_policy_uid_while_valid() {
+        let cache = BundleCache::default();
+        let fresh = mediatore_testkit::policy::fresh_bundle(Utc::now(), 3).payload;
+        let uid = fresh.content.policy.uid.clone();
+        let key = (
+            fresh.content.policy.namespace.clone(),
+            fresh.content.policy.name.clone(),
+        );
+        cache.put(
+            key,
+            Verified {
+                payload: Arc::new(fresh),
+                configmap: "cm".into(),
+            },
+        );
+        let now = Utc::now();
+        assert_eq!(cache.by_uid(&uid, now).map(|p| p.meta.version), Some(3));
+        assert!(cache.by_uid("some-other-uid", now).is_none());
+        assert!(
+            cache
+                .by_uid(&uid, now + chrono::Duration::hours(3))
+                .is_none(),
+            "an expired bundle is never handed out"
+        );
     }
 }

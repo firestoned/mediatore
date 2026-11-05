@@ -12,6 +12,7 @@ use std::fmt;
 use mediatore_policy::BundlePayload;
 use mediatore_proto::{Endpoint, EndpointRule};
 
+use crate::policy::{EgressMode, direct_egress};
 use crate::sandbox::AgentSandboxSpec;
 
 /// One audience as the broker's configuration has it: what the broker would allow.
@@ -55,8 +56,13 @@ pub enum Code {
     P004,
     /// The sandbox's `ttlSeconds` above the bundle's `lease.maxDurationSeconds`.
     P005,
-    /// The bundle holds direct `egress[]`, which the broker has no way to provide.
+    /// The bundle holds direct `egress[]`, which the broker has no way to provide
+    /// (`policy.egress: shadow`; ADR-0030 decision 6).
     P006,
+    /// The bundle holds a direct `egress[]` entry the broker does not serve even when
+    /// enforcing: an IP literal, a wildcard, a malformed entry, or one with `rules`
+    /// (ADR-0030 decisions 3 and 6).
+    P007,
     /// No `policyRef` on the sandbox.
     P010,
     /// A `policyRef` to no verified, unexpired bundle in the cache.
@@ -72,6 +78,7 @@ impl fmt::Display for Code {
             Self::P004 => "P004",
             Self::P005 => "P005",
             Self::P006 => "P006",
+            Self::P007 => "P007",
             Self::P010 => "P010",
             Self::P011 => "P011",
         })
@@ -108,6 +115,19 @@ pub fn compare(
     spec: &AgentSandboxSpec,
     audiences: &[Audience],
     bundle: Option<&BundlePayload>,
+) -> Vec<Finding> {
+    compare_with(spec, audiences, bundle, EgressMode::Shadow)
+}
+
+/// [`compare`] with the broker's `policy.egress` switch (ADR-0030 decision 6): in `Shadow`
+/// the bundle's direct egress is `P006`; in `Enforce` the broker serves what it can, and
+/// only the entries it will not serve are reported, each as `P007` with its reason.
+#[must_use]
+pub fn compare_with(
+    spec: &AgentSandboxSpec,
+    audiences: &[Audience],
+    bundle: Option<&BundlePayload>,
+    mode: EgressMode,
 ) -> Vec<Finding> {
     let Some(policy) = spec.policy_ref.as_ref() else {
         return vec![finding(Code::P010, "no policyRef on the sandbox")];
@@ -190,14 +210,26 @@ pub fn compare(
             ),
         ));
     }
-    if !bundle.content.egress.is_empty() {
-        out.push(finding(
+    match mode {
+        EgressMode::Shadow if !bundle.content.egress.is_empty() => out.push(finding(
             Code::P006,
             format!(
                 "the bundle holds {} direct egress entries the broker cannot provide",
                 bundle.content.egress.len()
             ),
-        ));
+        )),
+        EgressMode::Shadow => {}
+        EgressMode::Enforce => {
+            for n in direct_egress(bundle).not_served {
+                out.push(finding(
+                    Code::P007,
+                    format!(
+                        "direct egress {} is not served by the broker: {}",
+                        n.endpoint, n.reason
+                    ),
+                ));
+            }
+        }
     }
     out
 }
@@ -494,5 +526,31 @@ mod tests {
                 "{bm} {bp} covers {m} {p}"
             );
         }
+    }
+
+    #[test]
+    fn enforcing_reports_only_the_direct_egress_it_will_not_serve() {
+        let mut b = bundle();
+        b.content.egress = vec![
+            EgressRule {
+                endpoint: "repo.home.example:443".into(),
+                rules: vec![],
+            },
+            EgressRule {
+                endpoint: "192.0.2.7:443".into(),
+                rules: vec![],
+            },
+        ];
+        let sb = spec(&["internal-git"], Some("agent"));
+        let shadow = compare_with(&sb, &[conformant()], Some(&b), EgressMode::Shadow);
+        assert_eq!(codes(&shadow), vec![Code::P006]);
+        let enforce = compare_with(&sb, &[conformant()], Some(&b), EgressMode::Enforce);
+        assert_eq!(codes(&enforce), vec![Code::P007], "{enforce:?}");
+        assert!(
+            enforce[0].detail.contains("192.0.2.7:443") && enforce[0].detail.contains("ip_literal")
+        );
+        b.content.egress.truncate(1);
+        let left = compare_with(&sb, &[conformant()], Some(&b), EgressMode::Enforce);
+        assert_eq!(codes(&left), Vec::<Code>::new(), "{left:?}");
     }
 }

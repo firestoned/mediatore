@@ -63,7 +63,7 @@ fn gateway_svid() -> String {
     format!("spiffe://{TRUST_DOMAIN}/gateway")
 }
 
-fn state(idp: &FakeIdp) -> Arc<AppState> {
+fn state(idp: &FakeIdp, policy_egress: Option<mediatore_api::PolicyEgress>) -> Arc<AppState> {
     let sts = Sts::new(
         "https://mediatore.test",
         "e2e-1",
@@ -101,6 +101,7 @@ fn state(idp: &FakeIdp) -> Arc<AppState> {
         cas: std::collections::BTreeMap::new(),
         registries: std::collections::BTreeMap::new(),
         reachable_registries: None,
+        policy_egress,
         sandboxes: None,
         sandbox_namespace: "sandboxes".into(),
         sealer: None,
@@ -119,16 +120,30 @@ struct Harness {
     http: reqwest::Client,
     /// The check listener a stand-in Envoy calls.
     check_url: String,
+    /// The broker's store, to give a claim the policy uid a sandbox's record would carry.
+    store: Arc<dyn mediatore_store::ClaimStore>,
 }
 
 impl Harness {
     /// The broker as `spiffe://sandbox.test/mediatore`; the authorizer as `identity`, with
     /// the cache bounds given, asking `broker_url` (the real listener unless overridden).
     async fn start(identity: &str, cfg: CacheConfig, broker_url: Option<&str>) -> Self {
+        Self::start_with(identity, cfg, broker_url, None).await
+    }
+
+    /// [`start`](Self::start) with the broker serving direct egress from `policy_egress`
+    /// (ADR-0030).
+    async fn start_with(
+        identity: &str,
+        cfg: CacheConfig,
+        broker_url: Option<&str>,
+        policy_egress: Option<mediatore_api::PolicyEgress>,
+    ) -> Self {
         mediatore_proto::tls::ensure_provider();
         let ca = TestCa::new(TRUST_DOMAIN);
         let idp = FakeIdp::start().await;
-        let st = state(&idp);
+        let st = state(&idp, policy_egress);
+        let store = st.store.clone();
 
         let user = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -169,6 +184,7 @@ impl Harness {
             ca,
             http: reqwest::Client::new(),
             check_url,
+            store,
         }
     }
 
@@ -409,7 +425,7 @@ async fn a_broker_that_is_down_is_a_deny_and_so_is_a_gateway_the_broker_does_not
 async fn the_dev_header_transport_reaches_a_dev_mode_broker() {
     mediatore_proto::tls::ensure_provider();
     let idp = FakeIdp::start().await;
-    let st = state(&idp);
+    let st = state(&idp, None);
     let user = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let user_url = format!("http://{}", user.local_addr().unwrap());
     tokio::spawn(axum::serve(user, mediatore_api::user_router(st.clone())).into_future());
@@ -471,4 +487,148 @@ async fn the_dev_header_transport_reaches_a_dev_mode_broker() {
     let authorizer = Authorizer::new(TRUST_DOMAIN, Arc::new(source), CacheConfig::default());
     let d = authorizer.authorize(&peer, "CONNECT", ALLOWED[0]).await;
     assert_eq!(d.verdict, Err(mediatore_gateway::Refusal::BrokerRefused));
+}
+
+/// A reflector that admitted a bundle for the conformance policy whose direct `egress[]` is
+/// `entries` (host:port, and whether the entry carries a rule), and the cache it filled.
+async fn cache_with_direct_egress(
+    entries: &[(&str, bool)],
+    now: chrono::DateTime<chrono::Utc>,
+) -> (Arc<mediatore_claims::policy::BundleCache>, String) {
+    let base = mediatore_testkit::policy::fresh_bundle(now, 1).payload;
+    let mut content = base.content.clone();
+    content.egress = entries
+        .iter()
+        .map(
+            |(endpoint, with_rules)| mediatore_policy::types::EgressRule {
+                endpoint: (*endpoint).into(),
+                rules: if *with_rules {
+                    vec![mediatore_policy::types::EndpointRule {
+                        method: "GET".into(),
+                        path: "/**".into(),
+                    }]
+                } else {
+                    vec![]
+                },
+            },
+        )
+        .collect();
+    let signed = mediatore_testkit::policy::signed_bundle(now, 2, content);
+    let uid = signed.payload.content.policy.uid.clone();
+    let namespace = signed.payload.content.policy.namespace.clone();
+    let reflector = mediatore_claims::policy::BundleReflector::new(
+        MemoryStore::shared(),
+        signed.keys,
+        vec![namespace.clone()],
+    );
+    let cm =
+        mediatore_testkit::policy::bundle_configmap(&namespace, "agent-bundle", &signed.envelope);
+    let outcome = reflector.applied_at(&cm, now).await;
+    assert!(
+        matches!(outcome, mediatore_claims::policy::Outcome::Admitted { .. }),
+        "{outcome:?}"
+    );
+    (reflector.cache(), uid)
+}
+
+/// Give the claim the policy uid its record would carry under a sandbox naming a policy.
+async fn name_policy(h: &Harness, uid: &uuid::Uuid, policy_uid: &str) {
+    let mut rec = h.store.get_claim(*uid).await.expect("record");
+    rec.policy_uid = Some(policy_uid.to_owned());
+    h.store.update_claim(rec).await.expect("update");
+}
+
+const DIRECT: &str = "repo.home.example:443";
+
+#[tokio::test]
+async fn enforcing_serves_a_policys_direct_egress_and_shadow_serves_none_of_it() {
+    for (mode, reaches) in [
+        (mediatore_claims::policy::EgressMode::Enforce, true),
+        (mediatore_claims::policy::EgressMode::Shadow, false),
+    ] {
+        let (bundles, policy_uid) = cache_with_direct_egress(
+            &[
+                (DIRECT, false),
+                ("only-some.home.example:443", true),
+                ("192.0.2.77:443", false),
+                ("*.home.example:443", false),
+            ],
+            chrono::Utc::now(),
+        )
+        .await;
+        let h = Harness::start_with(
+            &gateway_svid(),
+            CacheConfig::default(),
+            None,
+            Some(mediatore_api::PolicyEgress { bundles, mode }),
+        )
+        .await;
+        let (_, claim) = h.bound_claim().await;
+        let uid = claim.uid.expect("uid");
+        name_policy(&h, &uid, &policy_uid).await;
+        let peer = claim_svid(&uid);
+
+        let direct = h.check(&peer, "CONNECT", DIRECT).await;
+        if reaches {
+            assert_eq!(direct, (200, String::new()), "{mode:?}");
+        } else {
+            assert_eq!(direct, (403, "not_allowed".into()), "{mode:?}");
+        }
+        // Whatever the mode, the audience endpoints stand, and what the gateway cannot
+        // enforce exactly (a rule, an IP literal, a wildcard) is never served.
+        assert_eq!(
+            h.check(&peer, "CONNECT", ALLOWED[0]).await,
+            (200, String::new())
+        );
+        for refused in [
+            "only-some.home.example:443",
+            "192.0.2.77:443",
+            "x.home.example:443",
+        ] {
+            assert_eq!(
+                h.check(&peer, "CONNECT", refused).await,
+                (403, "not_allowed".into()),
+                "{refused} in {mode:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_claim_with_no_policy_or_a_bundle_the_cache_does_not_hold_gets_the_audience_endpoints_only()
+ {
+    // Each case is its own broker and gateway: the authorizer's cache would otherwise
+    // answer the second ask of a claim from the first.
+    for named in [None, Some("a-policy-uid-nobody-published")] {
+        let (bundles, _published) =
+            cache_with_direct_egress(&[(DIRECT, false)], chrono::Utc::now()).await;
+        let h = Harness::start_with(
+            &gateway_svid(),
+            CacheConfig::default(),
+            None,
+            Some(mediatore_api::PolicyEgress {
+                bundles,
+                mode: mediatore_claims::policy::EgressMode::Enforce,
+            }),
+        )
+        .await;
+        let (_, claim) = h.bound_claim().await;
+        let uid = claim.uid.expect("uid");
+        // None names no policy (P010); the other names one no verified bundle holds, as a
+        // stale, tampered or never-read bundle leaves it.
+        if let Some(policy_uid) = named {
+            name_policy(&h, &uid, policy_uid).await;
+        }
+        let peer = claim_svid(&uid);
+        assert_eq!(
+            h.check(&peer, "CONNECT", DIRECT).await,
+            (403, "not_allowed".into()),
+            "{named:?}"
+        );
+        assert_eq!(
+            h.check(&peer, "CONNECT", ALLOWED[0]).await,
+            (200, String::new()),
+            "{named:?}"
+        );
+    }
 }

@@ -87,6 +87,7 @@ fn state(idp: &FakeIdp, dev_mode: bool) -> Arc<AppState> {
         cas: std::collections::BTreeMap::new(),
         registries: std::collections::BTreeMap::new(),
         reachable_registries: None,
+        policy_egress: None,
         sandboxes: None,
         sandbox_namespace: "sandboxes".into(),
         sealer: None,
