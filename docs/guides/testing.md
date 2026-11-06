@@ -383,7 +383,7 @@ MEDIATORE_PULL_IMAGE=docker.io/library/busybox:1.37 cargo test -p mediatore-gues
 
 Run them on the build host whenever `sandboxfs.rs` or `image.rs` changes.
 
-### The VM images: built and checked, not booted
+### The VM images: built and checked in CI, booted by the live runs
 
 The sandbox VM image ([ADR-0023](../adr/0023-sandbox-vm-image-kairos-derivative.md)) is a
 Kairos derivative that CI builds on every pull request and checks with `image/check.sh`:
@@ -403,18 +403,24 @@ Envoy at the pinned version and running, the authorizer, the agent and the plugi
 render script and the templates, the example env files filling every template and both
 rendered bootstraps accepted by `envoy --mode validate`, no admin block, the relay's
 bootstrap with no TLS and no SDS, the three service users none of them in the TPM group,
-the six units enabled and pointing where the image put things, both Envoys unprivileged
-with no capability and a read-only root, the relay kept out of `/run/spire`, both
-requiring the table and the interface first, forwarding off, the table default-drop with
-the per-source cap, no `sshd`, the distribution's `nftables` unit masked, no private key.
+the six units enabled and pointing where the image put things, the agent's unit the
+gateway's own (requiring the gateway's host table, never the pool's, which a gateway does
+not have), the sandbox interface rendered as a `10-` networkd file that sorts before the
+base's DHCP catch-all, both Envoys unprivileged with no capability and a read-only root,
+the relay kept out of `/run/spire`, both requiring the table and the interface first,
+forwarding off, the table default-drop with the per-source cap, no `sshd`, the
+distribution's `nftables` unit masked, no private key. The last two unit checks are what
+the first gateway boot found missing (2026-11-05).
 
 ```sh
 make dist && make gateway-image BINARY_FROM=host CONTAINER_CLI=podman && make gateway-image-check CONTAINER_CLI=podman
 ```
 
-Nothing boots either: the install, the sealed partition, the EK export and a claim on a
-real member, and the three gateways with a pool VM behind them, are roadmap 06's live
-item.
+Nothing here boots either image: the install, the sealed partition, the EK export and a
+claim on a real member, and the three gateways with a pool VM behind them, are roadmap
+06's live item, run by hand on 2026-10-31 (the sandbox image) and 2026-11-05 (both, behind
+the gateways). Each run found defects the checks had not, and each defect became a check
+(threat model R-15).
 
 ### Broker and client pods over SPIFFE mTLS
 

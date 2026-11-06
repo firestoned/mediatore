@@ -135,7 +135,7 @@ async fn main() -> anyhow::Result<()> {
 async fn browse(cli: &Cli, auth_url: &str) -> anyhow::Result<()> {
     let ca = std::fs::read(&cli.ca_file)?;
     let http = reqwest::Client::builder()
-        .use_preconfigured_tls(mediatore_proto::tls::https_client_config_with_ca(&ca)?)
+        .tls_backend_preconfigured(mediatore_proto::tls::https_client_config_with_ca(&ca)?)
         .build()?;
 
     let page = http.get(auth_url).send().await?.error_for_status()?;

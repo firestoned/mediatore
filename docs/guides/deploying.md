@@ -379,7 +379,13 @@ with the subnet's gateway and resolver, so it carries the static address and the
 route; `sandbox` second, on the segment, with no address from banlieue), and the three
 `VirtualMachine`s: the egress address of each in `networkOverrides`, its sandbox address in
 a ConfigMap as `userData`, a required anti-affinity across the `host` key so no two share
-a failure domain (banlieue ADR-0098).
+a failure domain (banlieue ADR-0098). The same `userData` carries a networkd file for the
+egress NIC written from banlieue's placeholders (`${IP}`, `${PREFIX}`, `${GATEWAY}`,
+`${DNS}`): a Kairos guest reads no `network-config` from the seed (banlieue ADR-0114
+decision 4), so `networkOverrides` reaches it through that stage and nothing else. Its
+`Name=` is the first NIC's name on your machine type (`ens2` on libvirt's pc-i440fx,
+`enp1s0` on q35); the sandbox NIC is `SANDBOX_IF` in the deployment layer's env. On one
+host, drop the anti-affinity or set it `preferred`.
 
 ```sh
 cp -r deploy/gateway ~/.config/mediatore/gateway     # then put your addresses, hashes and names in
@@ -399,6 +405,9 @@ every peer that is not a claim of the trust domain before any check runs, so a s
 cannot reach the relay's upstreams through it, and the authorizer asks the broker over
 `GET /v1/gateway/claims/{uid}` with the gateway SVID, on the egress side.
 
+A gateway drops ICMP, so `ping` proves nothing about one; a TCP connect to its relay
+ports from the segment, or `nft list table inet mediatore_gateway` on its console, does.
+
 **The pool behind them.** The pool's deployment layer changes in four places
 (`image/cloud-config-deployment.example.yaml` shows them): the agent's `server_address`
 is a gateway's sandbox address with port `3129`, `MEDIATORE_URL` is
@@ -406,7 +415,13 @@ is a gateway's sandbox address with port `3129`, `MEDIATORE_URL` is
 addresses with the data port, the list the guest uses until the broker's `gateways` arrives
 (ADR-0027 decision 4), and `/etc/mediatore/registries` lists the mirror below. The broker's
 `gateways` lists the same three. The agent holds one server address, so it fails over
-between gateways only when it restarts; the forwarder fails over per connection.
+between gateways only when it restarts; the forwarder fails over per connection. The
+pool's members take their addresses from the pool's `addressing` (banlieue ADR-0056: the
+class's one interface on the segment's network class with `ipam: {}`, a range of the
+segment, no gateway and no nameserver), and, the image being Kairos, from a `userData`
+stage on the pool's template writing `/etc/systemd/network/10-static.network` with
+`Address=${IP}/${PREFIX}`, which banlieue renders per member; without that stage a member
+boots with no address at all, since the segment has no DHCP.
 
 **The mirror, and the host table.** A pool VM on the segment reaches the gateways and its
 neighbours and nothing else, so it cannot pull a workload image from `ghcr.io` or
@@ -414,7 +429,10 @@ neighbours and nothing else, so it cannot pull a workload image from `ghcr.io` o
 registry or pull-through mirror with an address there
 ([ADR-0029](../adr/0029-the-pull-on-a-routeless-segment-and-the-pool-vms-root-rules.md)
 decision 1), and the images your requesters name are the ones you mirrored, which is also
-where image review belongs. Declare it twice, once on each side. On the broker,
+where image review belongs. When the mirror runs on the host that owns the segment's
+bridge, it must listen on that host's segment address itself: libvirt's isolated network
+rejects anything forwarded off the bridge, a container's port mapping included, and a
+member sees `connection refused`. Declare it twice, once on each side. On the broker,
 `registries[]` gains `reach: segment` on every entry once `gateways` is set (the broker
 refuses to start otherwise), and an entry may carry no credential at all for an anonymous
 mirror (`- { host: "198.51.100.10:5000", reach: segment }`); a claim whose image names any
@@ -450,8 +468,9 @@ sandbox reaches the listener directly any more.
 against a real Envoy on the bootstrap the image renders (`make gateway-render-check` keeps
 the two identical), `make gateway-image-check` the image, and `nft -c` on the build host
 both rulesets ([testing tiers](testing.md)). The live run on three VMs and a pool VM behind
-them is roadmap 06's libvirt proof extended with the gateways; until then the image is
-built and checked, not booted.
+them, roadmap 06's libvirt proof extended with the gateways, happened on 2026-11-05
+against v0.2.0-rc.4: the whole path held, and what it found (the three image defects,
+the mirror behind a port mapping, the Kairos stages above) is fixed or written here.
 
 ## What the NetworkPolicy allows
 

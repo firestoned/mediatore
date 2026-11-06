@@ -81,7 +81,7 @@ RUN chmod 0755 /usr/bin/mediatore /usr/bin/envoy /usr/bin/spire-agent /usr/lib/s
 COPY image/gateway/render /usr/libexec/mediatore-gateway/render
 COPY image/gateway/envoy/gateway.yaml.in image/gateway/envoy/relay.yaml.in /usr/share/mediatore-gateway/envoy/
 COPY image/gateway/nftables.conf.in image/gateway/network.in image/gateway/env.example image/gateway/vm.env.example /usr/share/mediatore-gateway/
-COPY image/systemd/spire-agent.service \
+COPY image/gateway/systemd/spire-agent.service \
      image/gateway/systemd/mediatore-gateway-network.service \
      image/gateway/systemd/mediatore-gateway-nft.service \
      image/gateway/systemd/envoy-gateway.service \

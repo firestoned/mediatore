@@ -145,7 +145,7 @@ impl Puller {
         // TLS 1.3 over the Mozilla roots on aws-lc-rs (ADR-0007 decision 6): the registry
         // is a system we do not operate, so the far end keeps a classical fallback.
         let http = reqwest::Client::builder()
-            .use_preconfigured_tls(mediatore_proto::tls::https_client_config())
+            .tls_backend_preconfigured(mediatore_proto::tls::https_client_config())
             .user_agent(concat!("mediatore-guest/", env!("CARGO_PKG_VERSION")))
             .build()?;
         Ok(Self {
@@ -165,7 +165,7 @@ impl Puller {
     /// `pem` holds no certificate, or the client cannot be built.
     pub fn with_registry_ca(mut self, pem: &[u8]) -> anyhow::Result<Self> {
         self.http = reqwest::Client::builder()
-            .use_preconfigured_tls(mediatore_proto::tls::https_client_config_with_extra_roots(
+            .tls_backend_preconfigured(mediatore_proto::tls::https_client_config_with_extra_roots(
                 pem,
             )?)
             .user_agent(concat!("mediatore-guest/", env!("CARGO_PKG_VERSION")))

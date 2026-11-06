@@ -159,6 +159,18 @@ What roadmap 06 fixed within the decisions above, as it is built (2026-11-04):
   said at `warn` and the claim goes on: the report is the record's, not the jail's gate,
   and a record with no report is itself visible. The `AgentSandbox` status does not carry
   it yet; the resource says the claim's phase, the record says what ran.
+- **Proven live on 2026-11-05** (the gateway run of roadmap 06, v0.2.0-rc.4): a pool
+  member on the routeless segment with a static address from the pool's range (through a
+  `userData` stage with banlieue's placeholders, since a Kairos guest reads no seed
+  `network-config`), the host table loaded before the agent, the agent and the guest
+  through a gateway's relay, the pull from a pull-through mirror on the segment's host
+  (an anonymous `registries[]` entry with `reach: segment`, plain HTTP, the image named
+  by digest and the manifest index resolved to the platform's manifest), the report at
+  the broker with the host table `loaded` and shown by `mediatore sandbox get`. Two
+  things the run settled for the deploying guide: the mirror must listen on the host's
+  segment address itself (libvirt's isolated network rejects forwarded traffic, a
+  container port mapping included), and the host table drops ICMP, so `ping` proves
+  nothing about a member.
 
 ### Still to decide
 

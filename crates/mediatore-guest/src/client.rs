@@ -112,7 +112,7 @@ impl SandboxClient {
             Transport::Mtls { source, server } => {
                 let cfg = mediatore_tls::client_config(source.current()?.as_ref(), server)?;
                 reqwest::Client::builder()
-                    .use_preconfigured_tls(cfg)
+                    .tls_backend_preconfigured(cfg)
                     .build()?
                     .request(method, url)
             }

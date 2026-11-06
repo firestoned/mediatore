@@ -130,7 +130,7 @@ impl Broker {
                     .map_err(|e| AskError::Unreachable(format!("no gateway SVID: {e}")))?;
                 let cfg = mediatore_tls::client_config(&material, server)
                     .map_err(|e| AskError::Unreachable(format!("client config: {e}")))?;
-                builder.use_preconfigured_tls(cfg)
+                builder.tls_backend_preconfigured(cfg)
             }
             #[cfg(feature = "dev")]
             Transport::DevHeader(_) => builder,

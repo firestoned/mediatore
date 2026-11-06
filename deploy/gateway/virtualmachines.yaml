@@ -27,6 +27,24 @@ data:
               group: 0
               content: |
                 SANDBOX_ADDRESS=198.51.100.1
+            # The egress NIC's static address, written by the guest from banlieue's placeholders
+            # (banlieue ADR-0114 decision 4): a Kairos guest reads no network-config from its
+            # seed, so `networkOverrides` below reaches it only through this stage; banlieue
+            # renders ${IP}, ${PREFIX}, ${GATEWAY} and ${DNS} from the first static
+            # interface. Name= is the first NIC's name on your machine type (`ens2` on a
+            # libvirt pc-i440fx machine, `enp1s0` on q35); the sandbox NIC is SANDBOX_IF in
+            # the deployment layer's env, so the two never match the same file.
+            - path: /etc/systemd/network/10-egress.network
+              permissions: 0644
+              owner: 0
+              group: 0
+              content: |
+                [Match]
+                Name=ens2
+                [Network]
+                Address=${IP}/${PREFIX}
+                Gateway=${GATEWAY}
+                DNS=${DNS}
 ---
 apiVersion: banlieue.io/v1alpha1
 kind: VirtualMachine
@@ -66,6 +84,24 @@ data:
               group: 0
               content: |
                 SANDBOX_ADDRESS=198.51.100.2
+            # The egress NIC's static address, written by the guest from banlieue's placeholders
+            # (banlieue ADR-0114 decision 4): a Kairos guest reads no network-config from its
+            # seed, so `networkOverrides` below reaches it only through this stage; banlieue
+            # renders ${IP}, ${PREFIX}, ${GATEWAY} and ${DNS} from the first static
+            # interface. Name= is the first NIC's name on your machine type (`ens2` on a
+            # libvirt pc-i440fx machine, `enp1s0` on q35); the sandbox NIC is SANDBOX_IF in
+            # the deployment layer's env, so the two never match the same file.
+            - path: /etc/systemd/network/10-egress.network
+              permissions: 0644
+              owner: 0
+              group: 0
+              content: |
+                [Match]
+                Name=ens2
+                [Network]
+                Address=${IP}/${PREFIX}
+                Gateway=${GATEWAY}
+                DNS=${DNS}
 ---
 apiVersion: banlieue.io/v1alpha1
 kind: VirtualMachine
@@ -105,6 +141,24 @@ data:
               group: 0
               content: |
                 SANDBOX_ADDRESS=198.51.100.3
+            # The egress NIC's static address, written by the guest from banlieue's placeholders
+            # (banlieue ADR-0114 decision 4): a Kairos guest reads no network-config from its
+            # seed, so `networkOverrides` below reaches it only through this stage; banlieue
+            # renders ${IP}, ${PREFIX}, ${GATEWAY} and ${DNS} from the first static
+            # interface. Name= is the first NIC's name on your machine type (`ens2` on a
+            # libvirt pc-i440fx machine, `enp1s0` on q35); the sandbox NIC is SANDBOX_IF in
+            # the deployment layer's env, so the two never match the same file.
+            - path: /etc/systemd/network/10-egress.network
+              permissions: 0644
+              owner: 0
+              group: 0
+              content: |
+                [Match]
+                Name=ens2
+                [Network]
+                Address=${IP}/${PREFIX}
+                Gateway=${GATEWAY}
+                DNS=${DNS}
 ---
 apiVersion: banlieue.io/v1alpha1
 kind: VirtualMachine

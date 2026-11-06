@@ -52,6 +52,10 @@ check "both Envoys unprivileged, no capability, read-only root, no new privilege
   'for u in envoy-gateway envoy-relay; do f=/etc/systemd/system/$u.service; grep -q "^NoNewPrivileges=yes" $f && grep -q "^CapabilityBoundingSet=$" $f && grep -q "^ProtectSystem=strict" $f && grep -q "^PrivateTmp=yes" $f || exit 1; done && grep -q "^User=envoy$" /etc/systemd/system/envoy-gateway.service && grep -q "^User=envoy-relay$" /etc/systemd/system/envoy-relay.service'
 check "the relay is kept out of /run/spire by its unit (ADR-0027 decision 1)" \
   'grep -q "^InaccessiblePaths=/run/spire" /etc/systemd/system/envoy-relay.service'
+check "the agent's unit is the gateway's: it requires the gateway's host table, not the pool's" \
+  'grep -q "^Requires=mediatore-gateway-nft.service" /etc/systemd/system/spire-agent.service && ! grep -qE "^(Requires|After|Wants)=.*mediatore-host-nft" /etc/systemd/system/spire-agent.service'
+check "the sandbox interface file sorts before the base's DHCP catch-all (10- before 20-dhcp)" \
+  'grep -q "^ExecStart=.* /run/systemd/network/10-sandbox.network " /etc/systemd/system/mediatore-gateway-network.service && ! grep -q "^ExecStart=.*/[2-9][0-9]-sandbox.network" /etc/systemd/system/mediatore-gateway-network.service'
 check "the Envoys require the table and the interface first (fail closed)" \
   'for u in envoy-gateway envoy-relay; do grep -q "^Requires=.*mediatore-gateway-nft.service" /etc/systemd/system/$u.service && grep -q "^Requires=.*mediatore-gateway-network.service" /etc/systemd/system/$u.service || exit 1; done'
 check "forwarding off in the image's sysctl (ADR-0028 decision 8)" \

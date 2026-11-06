@@ -3,7 +3,7 @@
 
 # ADR-0026: notaio's policy bundles, verified by the broker and compared in shadow
 
-**Status:** Implemented · **Date:** 2026-11-01 · **Implemented:** 2026-11-02 (roadmap 09; the threat-model pass of that day)
+**Status:** Implemented · **Date:** 2026-11-01 · **Implemented:** 2026-11-02 (roadmap 09; the threat-model pass of that day) · **Amended:** 2026-11-05 (decision 6: a `policyRef` resolved across the watched namespaces, from the first live run)
 
 Roadmap 09, the first step of notaio's roadmap 00 (M3, "integrate the consumers"), phase 1.
 Decides notaio's question D3 (where a sandbox names its policy) for this phase. Amends
@@ -95,7 +95,12 @@ where they disagree is from refused sandboxes. This ADR reads the bundle first a
    them in memory, as it keeps the claims.
 
 6. **A sandbox names its policy with `spec.policyRef`** (amends ADR-0008; notaio's D3). The name
-   of a `SandboxPolicy` in the sandbox's own namespace. Immutable, as the whole spec already is
+   of a `SandboxPolicy`, resolved in the sandbox's own namespace first and then across
+   `policy.namespaces` in their listed order (amended 2026-11-05: the first live run had the pool
+   and its sandboxes in the controller's namespace and notaio's policies in `sandboxes`, as the
+   section's default already suggests, and a lookup bound to the sandbox's namespace found
+   nothing; the bundle names its policy's namespace and `uid`, so the record stays exact).
+   Immutable, as the whole spec already is
    under the ADR-0008 admission policy. Optional in this ADR: a sandbox without one is reported
    (decision 7), never refused, so no existing sandbox or client breaks. The claim record gains
    the policy's `uid` and the bundle version current when the claim was created, for the audit
@@ -164,6 +169,14 @@ What roadmap 09 fixed within the decisions above, so a reader of the code finds 
   through `mediatore-policy::admit` and nothing else, so a re-delivery at the same floor is
   admitted again without a write, and a replay below it is refused before it reaches the
   cache. The RBAC is `deploy/policy-bundles`, one copy per namespace.
+- **A `policyRef` is resolved across the watched namespaces** (decision 6 as amended
+  2026-11-05): `BundleCache::resolve` tries the sandbox's own namespace, then
+  `policy.namespaces` in order, and `PolicyConformant` stays `Unknown`/`BundlesNotRead` until
+  every watched namespace completed its first list (`BundleCache::synced_all`), since the
+  policy may sit in any of them. Found on the homelab: the pool in `banlieue-system`, the
+  policies in `sandboxes`, the condition `Unknown` for a bundle the reflector had admitted.
+  The kind policy tier shares one namespace and could not see it; the unit tests now hold the
+  two apart.
 - **The record reads the cache once** (decision 6). `spec.policyRef` is a `{ name }` like
   `poolRef`, optional, rendered into the CRD by `make crds`; the admission policy's
   `object.spec == oldObject.spec` already freezes it. When the reconciler creates the claim

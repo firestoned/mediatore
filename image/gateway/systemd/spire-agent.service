@@ -1,0 +1,49 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+
+[Unit]
+Description=SPIRE agent (TPM node attestation) on an egress gateway (ADR-0028 decision 2)
+After=network-online.target mediatore-gateway-nft.service
+Wants=network-online.target
+# The gateway's own host table bounds this VM before anything connects (ADR-0027 decision
+# 5); a table that fails to load keeps the agent down. The pool image's unit requires the
+# pool host table instead (mediatore-host-nft, ADR-0029), a unit a gateway does not have:
+# the first gateway boot (2026-11-05) found systemd silently never scheduling the agent, and
+# with it the authorizer and the data plane, for that missing requirement.
+Requires=mediatore-gateway-nft.service
+# Only the system booted from the installed disk (banlieue ADR-0043 decision 2, ADR-0019
+# decision 4): Kairos runs the same enabled units in the live installer and in recovery,
+# and an installer that attests with the member's vTPM is an agent nobody wanted. A
+# non-Kairos image drops these two lines or provides the sentinel.
+ConditionPathExists=|/run/cos/active_mode
+ConditionPathExists=|/run/cos/passive_mode
+
+[Service]
+User=spire
+SupplementaryGroups=tss
+ExecStart=/usr/bin/spire-agent run -config /etc/spire/agent.conf
+# The vTPM, for the tpm attestor plugin (ADR-0018): the resource manager device first,
+# the raw device as go-attestation's fallback; nothing else under /dev.
+DeviceAllow=/dev/tpmrm0 rw
+DeviceAllow=/dev/tpm0 rw
+DevicePolicy=closed
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/spire /run/spire
+# /run/spire exists before the first start (the sockets dir inside it is the base layer's),
+# and survives a restart: the guest's healthcheck and the proxy hold the socket path.
+RuntimeDirectory=spire
+RuntimeDirectoryPreserve=yes
+# The TPM attestor plugin is a go-plugin child that opens a temp file at start; under
+# ProtectSystem=strict the system /tmp is read-only, a private one is not.
+PrivateTmp=yes
+# The unix workload attestor resolves a caller's binary through /proc/<pid>/exe
+# (discover_workload_path, image/spire/agent.conf). The callers are Envoy and the
+# authorizer, each its own user, neither this one: the capability, as an ambient one, is
+# what lets an unprivileged agent read them. Found on the first live member (roadmap 06).
+AmbientCapabilities=CAP_SYS_PTRACE
+
+[Install]
+WantedBy=multi-user.target

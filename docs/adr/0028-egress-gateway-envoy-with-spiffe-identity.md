@@ -280,10 +280,28 @@ What roadmap 10 fixed within the decisions above, as it is built:
   entry. The network (the segment's VLAN on every host, the firewall on the three
   `egress` addresses and on the SPIRE server and the broker admitting them) is the
   deployment's, stated in the deploying guide; nothing in this repository can apply it.
-- **Not yet, and not this roadmap's:** the live run on three gateway VMs and a pool VM
-  behind them. The image is built and checked, not booted (threat model R-15 covers the
-  gateway image as it covers the sandbox image); the first live environment is roadmap
-  06's libvirt proof extended with the gateways.
+- **Booted live on 2026-11-05** (roadmap 06's libvirt proof extended with the gateways,
+  v0.2.0-rc.4 on a homelab cluster): three gateway VMs from the published image on an
+  isolated libvirt network, a pool member behind them, one claim through the whole path.
+  Observed, as the decisions say: the agents attested over their vTPMs and the two entries
+  per VM gave Envoy and the authorizer the gateway SVID over SDS; the member registered
+  through the relay; the proxy tunnelled every allowed request through a gateway as the
+  claim, Envoy's access log named the claim's SPIFFE ID, the authority and the upstream,
+  the authorizer answered `allow` from the broker and then from its cache at the fresh
+  bound, a path outside the rules was refused at the proxy, and the release retracted the
+  entry while the pool destroyed the member. Three defects of the never-booted image
+  surfaced and are fixed in the change after the run: the agent's unit was the sandbox
+  image's and required the pool's host-table unit, which a gateway does not have, so
+  systemd never scheduled the agent, the authorizer or the data plane (the gateway now
+  carries its own unit requiring the gateway's table); the sandbox interface's networkd
+  file sorted after the base's DHCP catch-all and lost (rendered as `10-sandbox.network`
+  now); and a Kairos guest reads no `network-config` from banlieue's seed, so the egress
+  static address needs a stage in the VM's `userData` with banlieue's placeholders
+  (`deploy/gateway/virtualmachines.yaml` carries it). `image/gateway/check.sh` pins the
+  first two. Also learned: the host table drops ICMP, so `ping` is no liveness probe for a
+  gateway; and the segment's host must serve what the segment reaches (the mirror)
+  directly, since libvirt's isolated network rejects anything forwarded off the bridge,
+  a container port mapping included. Threat model R-15 is revised accordingly.
 
 ## Consequences
 

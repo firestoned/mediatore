@@ -254,7 +254,7 @@ impl Validator {
         Self {
             issuers,
             http: reqwest::Client::builder()
-                .use_preconfigured_tls(mediatore_proto::tls::https_client_config())
+                .tls_backend_preconfigured(mediatore_proto::tls::https_client_config())
                 .build()
                 .expect("reqwest client over the workspace TLS config"),
             pinned: HashMap::new(),
@@ -285,7 +285,7 @@ impl Validator {
         let cfg = mediatore_proto::tls::https_client_config_with_ca(pem)
             .map_err(|e| IdpError::Upstream(format!("{url}: {e}")))?;
         let client = reqwest::Client::builder()
-            .use_preconfigured_tls(cfg)
+            .tls_backend_preconfigured(cfg)
             .build()
             .map_err(|e| IdpError::Upstream(e.to_string()))?;
         self.pinned.insert(url.to_owned(), client);

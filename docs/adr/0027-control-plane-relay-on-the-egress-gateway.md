@@ -223,9 +223,17 @@ What roadmap 10 fixed within the decisions above, as it is built:
 ### Still to decide
 
 - **How the agent fails over** between the three gateways when one is down: a restart by
-  the guest's unit after N failures, or a local balancer on loopback.
+  the guest's unit after N failures, or a local balancer on loopback. Measured 2026-11-05
+  on the live run: with one gateway's relay stopped for ninety seconds the member's agent
+  logged its synchronisation failing within forty seconds and recovered on the relay's
+  restart, while the workload's requests kept flowing through another gateway's data
+  plane the whole time (decision 1 holds: the planes are independent). The failover
+  itself is still open.
 - **The per-source cap** and the rate it implies, which depends on how many sandboxes
   start at once, and whether `ct count` is enough or a rate limit is also needed.
+  Measured 2026-11-05: a member holds one connection to the relay's SPIRE port (the
+  agent's stream) and none open to the broker port between calls, so the example's
+  `RELAY_CAP=16` is an order of magnitude above need; a rate limit was not needed.
 - **Whether the broker's node leg needs a second, separate listener** from the one the
   gateway's own SVID uses, or one listener that accepts both SVID shapes.
 - **The bundle's age limit:** how often the image's bundle is rebuilt so a long-lived image
