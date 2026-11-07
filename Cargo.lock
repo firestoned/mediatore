@@ -234,9 +234,9 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "aws-lc-rs"
-version = "1.18.2"
+version = "1.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "faac5829c2b74c28f830747e7818ccfb684261b5f48a1118b1e2a13d36dfab13"
+checksum = "048006790404103c488e6c5616b3e7e702a71292aadda08e8f7698a9e0d2eb53"
 dependencies = [
  "aws-lc-sys",
  "untrusted 0.7.1",
@@ -245,9 +245,9 @@ dependencies = [
 
 [[package]]
 name = "aws-lc-sys"
-version = "0.46.0"
+version = "0.47.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f1622d8446a2d4b2ce0c7eefc73dd43a99779028d5ee5c2dd8073a658ba8a2bc"
+checksum = "8bfbe32ac36b3c428696ce315464181bc4029d689fd58e3f2a4e58c252242f52"
 dependencies = [
  "cc",
  "cmake",
@@ -324,7 +324,7 @@ name = "banlieue-api"
 version = "0.4.6"
 source = "git+https://github.com/firestoned/banlieue?tag=v0.4.14#933f94d870d65c89c747c41f69c016b960bdadd0"
 dependencies = [
- "k8s-openapi",
+ "k8s-openapi 0.28.0",
  "kube",
  "schemars 1.2.3",
  "serde",
@@ -2046,12 +2046,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "k8s-openapi"
+version = "0.29.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab0d13801242174b1f3966907c3f32039f2d6b36c7ce82c61225d66ed5d1eb70"
+dependencies = [
+ "base64 0.22.1",
+ "jiff",
+ "schemars 1.2.3",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "kube"
 version = "4.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "208d7fe1380066abb194812a8a8e303cb896a33bb3d7b3177b71bd03ff39bf18"
 dependencies = [
- "k8s-openapi",
+ "k8s-openapi 0.28.0",
  "kube-client",
  "kube-core",
  "kube-derive",
@@ -2077,7 +2090,7 @@ dependencies = [
  "hyper-util",
  "jiff",
  "jsonpath-rust",
- "k8s-openapi",
+ "k8s-openapi 0.28.0",
  "kube-core",
  "pem 3.0.6",
  "rustls",
@@ -2105,7 +2118,7 @@ dependencies = [
  "http",
  "jiff",
  "json-patch",
- "k8s-openapi",
+ "k8s-openapi 0.28.0",
  "schemars 1.2.3",
  "serde",
  "serde-value",
@@ -2142,7 +2155,7 @@ dependencies = [
  "hashbrown 0.16.1",
  "hostname",
  "json-patch",
- "k8s-openapi",
+ "k8s-openapi 0.28.0",
  "kube-client",
  "parking_lot",
  "pin-project",
@@ -2253,7 +2266,7 @@ dependencies = [
  "clap",
  "envoy-types",
  "jsonwebtoken",
- "k8s-openapi",
+ "k8s-openapi 0.29.0",
  "kube",
  "mediatore-api",
  "mediatore-claims",
@@ -2315,7 +2328,7 @@ dependencies = [
  "chrono",
  "clap",
  "futures",
- "k8s-openapi",
+ "k8s-openapi 0.29.0",
  "kube",
  "mediatore-policy",
  "mediatore-proto",
@@ -2478,7 +2491,7 @@ dependencies = [
  "futures",
  "http",
  "http-body-util",
- "k8s-openapi",
+ "k8s-openapi 0.29.0",
  "kube",
  "mediatore-proto",
  "serde",
@@ -2543,7 +2556,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "jsonwebtoken",
- "k8s-openapi",
+ "k8s-openapi 0.29.0",
  "kube",
  "mediatore-claims",
  "mediatore-proto",
@@ -4468,9 +4481,9 @@ dependencies = [
 
 [[package]]
 name = "tonic"
-version = "0.14.6"
+version = "0.14.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac2a5518c70fa84342385732db33fb3f44bc4cc748936eb5833d2df34d6445ef"
+checksum = "e2cdfc673aabd30fe8fee92e65837b644c37c5d47f0f97ae6d5e0f1237d15e1b"
 dependencies = [
  "async-trait",
  "axum",
@@ -4489,6 +4502,7 @@ dependencies = [
  "sync_wrapper",
  "tokio",
  "tokio-stream",
+ "tokio-util",
  "tower",
  "tower-layer",
  "tower-service",
