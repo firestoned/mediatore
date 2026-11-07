@@ -166,7 +166,7 @@ impl Harness {
     fn mtls(material: &Material) -> reqwest::Client {
         let cfg = mediatore_tls::client_config(material, &broker_id()).expect("client config");
         reqwest::Client::builder()
-            .use_preconfigured_tls(cfg)
+            .tls_backend_preconfigured(cfg)
             .build()
             .expect("client")
     }
@@ -188,7 +188,7 @@ impl Harness {
             .with_custom_certificate_verifier(verifier)
             .with_no_client_auth();
         reqwest::Client::builder()
-            .use_preconfigured_tls(cfg)
+            .tls_backend_preconfigured(cfg)
             .build()
             .expect("client")
     }

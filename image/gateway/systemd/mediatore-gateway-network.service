@@ -4,7 +4,11 @@
 [Unit]
 Description=The egress gateway's sandbox interface (banlieue ADR-0109 decision 6)
 # The address is the image's, not banlieue's: rendered from the deployment's env files
-# into networkd's runtime directory and applied before anything may listen on it.
+# into networkd's runtime directory and applied before anything may listen on it. The
+# file sorts before the base's catch-all (Kairos ships /etc/systemd/network/20-dhcp.network,
+# `Name=en*`): networkd takes the first match across its directories by name, and a
+# 20-sandbox file lost to it on the first gateway boot (2026-11-05), leaving the sandbox
+# NIC on DHCP with no address.
 After=systemd-networkd.service
 Wants=systemd-networkd.service
 Before=network-online.target envoy-gateway.service envoy-relay.service
@@ -14,7 +18,7 @@ ConditionPathExists=|/run/cos/passive_mode
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/usr/libexec/mediatore-gateway/render /usr/share/mediatore-gateway/network.in /run/systemd/network/20-sandbox.network /etc/mediatore-gateway/env /etc/mediatore-gateway/vm.env
+ExecStart=/usr/libexec/mediatore-gateway/render /usr/share/mediatore-gateway/network.in /run/systemd/network/10-sandbox.network /etc/mediatore-gateway/env /etc/mediatore-gateway/vm.env
 ExecStart=/usr/bin/networkctl reload
 
 [Install]

@@ -149,14 +149,14 @@ struct TokenReply {
 fn http() -> anyhow::Result<reqwest::Client> {
     mediatore_proto::tls::ensure_provider();
     Ok(reqwest::Client::builder()
-        .use_preconfigured_tls(mediatore_proto::tls::https_client_config())
+        .tls_backend_preconfigured(mediatore_proto::tls::https_client_config())
         .build()?)
 }
 
 /// An HTTPS client trusting exactly the CA certificates in `pem`.
 fn http_with_ca(pem: &[u8]) -> anyhow::Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
-        .use_preconfigured_tls(mediatore_proto::tls::https_client_config_with_ca(pem)?)
+        .tls_backend_preconfigured(mediatore_proto::tls::https_client_config_with_ca(pem)?)
         .build()?)
 }
 

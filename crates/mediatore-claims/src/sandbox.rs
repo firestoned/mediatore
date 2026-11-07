@@ -552,9 +552,12 @@ impl Watcher {
     /// The verified bundle of the policy `sb` names, if it names one and the cache holds one
     /// that is valid now (ADR-0026 decision 6). Read when the record is created and never
     /// again: the record says what was current then.
+    /// The verified bundle the sandbox's `policyRef` names, resolved in the sandbox's own
+    /// namespace first and then across the watched ones (ADR-0026 decision 6, amended
+    /// 2026-11-05: a pool's namespace and the policies' need not be one).
     fn bundle_of(&self, sb: &AgentSandbox) -> Option<Arc<BundlePayload>> {
         let policy = sb.spec.policy_ref.as_ref()?;
-        self.bundles.as_ref()?.get(
+        self.bundles.as_ref()?.resolve(
             &sb.namespace().unwrap_or_default(),
             &policy.name,
             Utc::now(),
@@ -579,7 +582,7 @@ impl Watcher {
             .as_ref()
             .map_or("none", |p| p.name.as_str());
         let held = previous.iter().find(|c| c.type_ == POLICY_CONFORMANT);
-        let (status, reason, message) = if bundles.synced(&namespace) {
+        let (status, reason, message) = if bundles.synced_all() {
             let bundle = self.bundle_of(sb);
             let version = bundle.as_ref().map(|b| b.meta.version);
             let findings = shadow::compare_with(
@@ -614,7 +617,10 @@ impl Watcher {
             (
                 "Unknown",
                 "BundlesNotRead",
-                format!("no bundle has been read from {namespace} yet"),
+                format!(
+                    "no bundle has been read from {} yet",
+                    bundles.namespaces().join(", ")
+                ),
             )
         };
         let last_transition_time = held.filter(|c| c.status == status).map_or_else(
@@ -1708,6 +1714,37 @@ mod tests {
         assert!(
             rec.policy_uid.is_none() && rec.bundle_version.is_none(),
             "created once, never rewritten"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sandbox_in_the_pools_namespace_finds_its_policy_in_the_watched_one() {
+        // The live run of 2026-11-05: the pool and its sandboxes in one namespace, notaio's
+        // bundles in another; the policyRef must still resolve, for the record and the verdict.
+        let a = admitted_bundle(3).await;
+        let mut sb = a.sb.clone();
+        sb.metadata.namespace = Some("pool-ns".into());
+        let r = rig_with(cfg_with_git(), Some(a.cache()));
+        r.claims.put_sandbox(sb.clone());
+        r.watcher.reconcile_sandbox(&sb).await.unwrap();
+        let held = r.claims.sandbox("pool-ns", "sb-1").unwrap();
+        let c = conformant(&held);
+        assert_eq!(
+            (c.status.as_str(), c.reason.as_str()),
+            ("True", "Conformant"),
+            "{}",
+            c.message
+        );
+        let claim = r.claims.claim("pool-ns", "sb-1").expect("claim created");
+        let rec = r
+            .store
+            .get_claim(claim_uid_of(&claim).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(rec.bundle_version, Some(3));
+        assert_eq!(
+            rec.policy_uid.as_deref(),
+            Some(a.payload.content.policy.uid.as_str())
         );
     }
 

@@ -202,7 +202,7 @@ impl Harness {
         let cfg = mediatore_tls::client_config(&self.ca.svid(spiffe_id), &broker_id())
             .expect("client config");
         reqwest::Client::builder()
-            .use_preconfigured_tls(cfg)
+            .tls_backend_preconfigured(cfg)
             .build()
             .expect("client")
     }

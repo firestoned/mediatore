@@ -122,7 +122,7 @@ impl Client {
             None => mediatore_proto::tls::https_client_config(),
         };
         let http = reqwest::Client::builder()
-            .use_preconfigured_tls(tls)
+            .tls_backend_preconfigured(tls)
             .build()
             .map_err(|e| Error::Config(format!("client: {e}")))?;
         let client = Self {

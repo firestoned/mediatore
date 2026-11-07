@@ -3,9 +3,10 @@
 #
 # The sandbox interface (banlieue ADR-0109 decisions 4 and 6: the second NIC, its fixed
 # address written by the image, never by banlieue). Rendered to
-# /run/systemd/network/20-sandbox.network by mediatore-gateway-network.service from the
-# per-VM env file. No gateway and no resolver on this side: the segment is layer 2 only,
-# and the default route is the egress interface's.
+# /run/systemd/network/10-sandbox.network by mediatore-gateway-network.service from the
+# per-VM env file, a name that sorts before the base's DHCP catch-all. No gateway and no
+# resolver on this side: the segment is layer 2 only, and the default route is the egress
+# interface's, which the VM's userData sets (deploy/gateway/virtualmachines.yaml).
 [Match]
 Name=@SANDBOX_IF@
 

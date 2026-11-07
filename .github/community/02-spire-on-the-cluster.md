@@ -34,9 +34,14 @@ installed beyond a `ServiceAccount` a live test left behind.
       the overlay's copy filled in, the three Secrets created, `kubectl apply -k`
 - [ ] `make live-admission-test` against the cluster as the broker's ServiceAccount
       (needs `deploy/base`'s ServiceAccount, RBAC and admission policy applied first)
-- [ ] `mediatore login` at the cluster's Dex and `sandbox create` through the Tailscale
+- [x] `mediatore login` at the cluster's Dex and `sandbox create` through the Tailscale
       ingress: the `AgentSandbox` created, the claim owned, `Pending` until a pool
-      member attests (the second half)
+      member attests (the second half). Done 2026-10-31 (rc.3) and again 2026-11-05
+      (rc.4, through the egress gateways): login at the cluster's Dex, the claim bound
+      to an attested member, the tokens minted. One limit found: Dex's GitHub connector
+      refreshes an identity with the GitHub token it stored at login, so a session older
+      than that token's life cannot mint tokens any more (the broker says
+      `upstream_unavailable`, the proxy fails closed); log in shortly before claiming
 
 ## Second half: VMs attest ([ADR-0018](../../docs/adr/0018-tpm-attestation-with-the-spiffe-plugin.md))
 
@@ -70,9 +75,11 @@ installed beyond a `ServiceAccount` a live test left behind.
       into `/opt/spire/conf/bundle.pem`
 - [ ] The VM image with the agent, the plugin from `dist/` and the fragments baked by
       banlieue-imagebuilder (roadmap 06's image item; the mediatore side is `image/`)
-- [ ] Part 3 acceptance on libvirt: a fresh member appears in `agent list` as type
+- [x] Part 3 acceptance on libvirt: a fresh member appears in `agent list` as type
       `tpm` within 60 s, EK hash matches the local computation, reboot does not create
-      a second agent
+      a second agent. Done 2026-10-31 and 2026-11-05: every member and every gateway
+      attested as `tpm` with the ID the broker had declared from the EK banlieue read,
+      the reboot kept the agent ID (roadmap 06's live item)
 - [ ] The broker Deployment on the CSI socket proven as `make kind-e2e-mtls` does in
       kind, against this cluster: a sandbox turning `Ready`, the guest fetching its
       subject, a token issued to the workload

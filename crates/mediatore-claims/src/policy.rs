@@ -135,6 +135,9 @@ pub struct BundleCache {
     inner: RwLock<HashMap<PolicyKey, Verified>>,
     synced: RwLock<HashSet<String>>,
     changed: broadcast::Sender<PolicyKey>,
+    /// The namespaces the reflector reads (ADR-0026 decision 3), in the order listed: the
+    /// order a `policyRef` is resolved in beyond the sandbox's own namespace (decision 6).
+    namespaces: Vec<String>,
 }
 
 /// How many changes a slow subscriber may fall behind before it is told it lagged.
@@ -146,11 +149,27 @@ impl Default for BundleCache {
             inner: RwLock::new(HashMap::new()),
             synced: RwLock::new(HashSet::new()),
             changed: broadcast::channel(CHANGES_BUFFERED).0,
+            namespaces: Vec::new(),
         }
     }
 }
 
 impl BundleCache {
+    /// A cache for a reflector over `namespaces`, in the order they are listed.
+    #[must_use]
+    pub fn watching(namespaces: Vec<String>) -> Self {
+        Self {
+            namespaces,
+            ..Self::default()
+        }
+    }
+
+    /// The namespaces watched, in the order listed.
+    #[must_use]
+    pub fn namespaces(&self) -> &[String] {
+        &self.namespaces
+    }
+
     /// Changes to come: the policy whose entry was admitted at a new version or dropped.
     /// A receiver that falls behind gets `Lagged` and should compare everything again.
     #[must_use]
@@ -166,6 +185,35 @@ impl BundleCache {
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .contains(namespace)
+    }
+
+    /// Whether every watched namespace completed its first list: before that, a policy a
+    /// sandbox names may simply not have been read yet (ADR-0026 decision 7), whichever
+    /// namespace holds it.
+    #[must_use]
+    pub fn synced_all(&self) -> bool {
+        let synced = self.synced.read().unwrap_or_else(PoisonError::into_inner);
+        !self.namespaces.is_empty() && self.namespaces.iter().all(|n| synced.contains(n))
+    }
+
+    /// The verified bundle a sandbox's `policyRef` names (ADR-0026 decision 6, amended
+    /// 2026-11-05): the sandbox's own namespace first, then the watched namespaces in their
+    /// listed order. A pool and its sandboxes need not share a namespace with the policies
+    /// notaio signs for them; the live run found them apart.
+    #[must_use]
+    pub fn resolve(
+        &self,
+        sandbox_namespace: &str,
+        name: &str,
+        now: DateTime<Utc>,
+    ) -> Option<Arc<BundlePayload>> {
+        if let Some(b) = self.get(sandbox_namespace, name, now) {
+            return Some(b);
+        }
+        self.namespaces
+            .iter()
+            .filter(|n| n.as_str() != sandbox_namespace)
+            .find_map(|n| self.get(n, name, now))
     }
 
     fn mark_synced(&self, namespace: &str) {
@@ -282,8 +330,8 @@ impl BundleReflector {
         Self {
             store,
             keys,
+            cache: Arc::new(BundleCache::watching(namespaces.clone())),
             namespaces,
-            cache: Arc::new(BundleCache::default()),
         }
     }
 
@@ -554,6 +602,43 @@ mod tests {
                 .cache()
                 .get(&self.suite.policy.namespace, &self.suite.policy.name, now)
         }
+    }
+
+    #[tokio::test]
+    async fn a_policy_is_resolved_in_the_sandboxs_namespace_first_then_across_the_watched_ones() {
+        // The reflector watches two namespaces; the bundle lives in the second.
+        let suite = suite();
+        let reflector = BundleReflector::new(
+            Arc::new(MemoryStore::default()),
+            keys(&suite),
+            vec!["other".into(), suite.policy.namespace.clone()],
+        );
+        let cache = reflector.cache();
+        assert_eq!(
+            cache.namespaces(),
+            ["other", suite.policy.namespace.as_str()]
+        );
+        let v = vector(&suite, "accepted-first-sight");
+        reflector
+            .applied_at(&bundle_configmap(&suite, "agent-bundle", v), v.now)
+            .await;
+        let name = suite.policy.name.as_str();
+        // From a sandbox in the policy's own namespace, in another watched one, and in one
+        // the reflector does not read at all (a pool's): the same bundle.
+        for from in [suite.policy.namespace.as_str(), "other", "pool-ns"] {
+            let b = cache.resolve(from, name, v.now).expect(from);
+            assert_eq!(b.content.policy.namespace, suite.policy.namespace);
+        }
+        assert!(cache.resolve("pool-ns", "no-such-policy", v.now).is_none());
+        // Synced means every watched namespace listed once, whatever the sandbox's is.
+        assert!(!cache.synced_all());
+        reflector.resynced(
+            &suite.policy.namespace,
+            &HashSet::from(["agent-bundle".to_owned()]),
+        );
+        assert!(!cache.synced_all(), "one of two listed");
+        reflector.resynced("other", &HashSet::new());
+        assert!(cache.synced_all());
     }
 
     #[tokio::test]

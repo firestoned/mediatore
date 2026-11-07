@@ -137,8 +137,19 @@
       (`image/Dockerfile` carries `/mnt/sandbox` and `/etc/spire`; the agent unit gains
       `PrivateTmp`, `AmbientCapabilities=CAP_SYS_PTRACE` and its runtime directory; the
       tmpfs is 0711, ADR-0021 amended; the jail runs without a user namespace, ADR-0020
-      amended; `image/check.sh` proves the directories and the unit lines), to be proven
-      again on a member before v0.2.0 is cut.
+      amended; `image/check.sh` proves the directories and the unit lines). Proven again
+      on 2026-11-05 against v0.2.0-rc.4, this time behind the egress gateways (roadmap
+      10): a member on the routeless segment installed from the AuroraBoot ISO, attested
+      and registered through a gateway's control relay, loaded the host table, pulled the
+      workload image from the mirror on the segment, reported to the broker, and ran a
+      claim whose proxy tunnelled through Envoy on the gateway SVID with the claim SVID as
+      the peer; the three gateway VMs booted from the published gateway image. Both images
+      have now run end to end (threat model R-15 revised). The run surfaced three defects
+      of the never-booted gateway image, one banlieue fact (a Kairos guest takes its static
+      address from `userData` placeholders, not the seed) and one broker gap (a
+      `policyRef` was looked up in the sandbox's namespace only, ADR-0026 amended), all
+      fixed in the change after the run; the deployment layers carried stopgaps for them
+      during the run, as the rc.3 layer had.
 - [ ] A tier that runs the guest under the image's own units on a Kairos VM, on the
       build host: the kind tiers run the guest in a pod with `--dev-skip-setup`, which is
       how six of the defects above reached a release candidate. The shape: the ISO built

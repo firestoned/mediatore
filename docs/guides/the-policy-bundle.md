@@ -106,9 +106,11 @@ cannot move a floor down between them. Rows are never deleted with their policy.
 
 ## Naming a policy on a sandbox
 
-`spec.policyRef` names the `SandboxPolicy` the sandbox is under, in the sandbox's own
-namespace. It is optional in this release and, like the rest of the spec, immutable after
-creation.
+`spec.policyRef` names the `SandboxPolicy` the sandbox is under, looked up in the
+sandbox's own namespace first and then in the broker's `policy.namespaces` in their listed
+order (ADR-0026 decision 6 as amended 2026-11-05): the pool and its sandboxes may live in
+the controller's namespace while the policies live in `sandboxes`. It is optional in this
+release and, like the rest of the spec, immutable after creation.
 
 ```yaml
 spec:
