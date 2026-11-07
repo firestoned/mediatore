@@ -30,7 +30,7 @@ flowchart LR
     data-asset-agentsandbox-cr["AgentSandbox resources"]
     data-asset-claim-store["Claim Store"]
     database-store["Store Database (PostgreSQL / SQLite)"]
-    service-openbao["OpenBao (transit)"]
+    service-openbao["OpenBao (transit, PKI)"]
     data-asset-sts-signing-key["STS Signing Key"]
     data-asset-sealing-key["Sealing Key"]
     service-kubernetes-api["Kubernetes API Server"]
@@ -124,6 +124,7 @@ flowchart LR
     system-mediatore -->|TLS| database-store
     system-mediatore -->|TLS| service-openbao
     actor-sandbox-user --> data-asset-cluster-static-entries
+    service-spire-server -->|HTTPS| service-openbao
 ```
 
 <sub>Source: nodes and relationships in `architecture.json`.</sub>

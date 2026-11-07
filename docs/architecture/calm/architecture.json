@@ -64,8 +64,8 @@
     {
       "unique-id": "service-openbao",
       "node-type": "service",
-      "name": "OpenBao (transit)",
-      "description": "Encryption as a service for the refresh envelopes (ADR-0015): the transit engine holds the derived sealing key, encrypts and decrypts on request with the binding UID as context, authorises every call by a token it issued to the broker's ServiceAccount (Kubernetes auth, audience openbao) and rotates the key in place. Since ADR-0016 the same engine may hold the RSA key that signs the broker's client assertion for Entra (transit sign, PSS), so the credential that lets mediatore act as itself at Entra never enters the process. Reached over TLS the broker verifies against a configured CA. In kind: make kind-openbao."
+      "name": "OpenBao (transit, PKI)",
+      "description": "Encryption as a service for the refresh envelopes (ADR-0015): the transit engine holds the derived sealing key, encrypts and decrypts on request with the binding UID as context, authorises every call by a token it issued to the broker's ServiceAccount (Kubernetes auth, audience openbao) and rotates the key in place. Since ADR-0016 the same engine may hold the RSA key that signs the broker's client assertion for Entra (transit sign, PSS), so the credential that lets mediatore act as itself at Entra never enters the process. Since ADR-0031 its PKI engine is also the SPIRE server's upstream authority: a ten-year root on a dedicated mount signs the server's intermediate CA every ca_ttl (root/sign-intermediate, the one path the server's role may call), so the trust bundle every pool VM and gateway starts from is that root and outlives the server's CA. Reached over TLS the broker and the server verify against a configured CA. In kind: make kind-openbao."
     },
     {
       "unique-id": "data-asset-sts-signing-key",
@@ -113,7 +113,7 @@
       "unique-id": "service-spire-server",
       "node-type": "service",
       "name": "SPIRE Server (downstream)",
-      "description": "The environment-scoped SPIRE server: holds the TPM attestor, the EK trust bundle and the k8s_psat config for this cluster, and issues node identities and workload SVIDs. Its registration entries are rendered by the SPIRE Controller Manager in the same pod over a private Unix socket; no admin API is reachable over the network. mediatore's two entry kinds (/banlieue/node/<ek-hash>, /banlieue/claim/<uid>, ADR-0004) arrive as ClusterStaticEntry resources (ADR-0006). In the enterprise topology it chains to the root via an intermediate CA; in the homelab it is the whole tree (ADR-0005). The TPM node attestor is spiffe/spire-tpm-plugin as a kustomize component (deploy/spire-tpm: an init container from the digest-pinned image, the checksum in server.conf) and its EK trust bundle is one swtpm local CA issuing certificate per hypervisor host, copied beside the plugin by the init container (ADR-0018)."
+      "description": "The environment-scoped SPIRE server: holds the TPM attestor, the EK trust bundle and the k8s_psat config for this cluster, and issues node identities and workload SVIDs. Its registration entries are rendered by the SPIRE Controller Manager in the same pod over a private Unix socket; no admin API is reachable over the network. mediatore's two entry kinds (/banlieue/node/<ek-hash>, /banlieue/claim/<uid>, ADR-0004) arrive as ClusterStaticEntry resources (ADR-0006). In the enterprise topology it chains to the root via an intermediate CA; in the homelab it is the whole tree (ADR-0005), its CA since ADR-0031 an intermediate signed by OpenBao's PKI engine (deploy/spire-upstream: the vault UpstreamAuthority with a projected ServiceAccount token, audience openbao), so agents anchor on a root that outlives it. The TPM node attestor is spiffe/spire-tpm-plugin as a kustomize component (deploy/spire-tpm: an init container from the digest-pinned image, the checksum in server.conf) and its EK trust bundle is one swtpm local CA issuing certificate per hypervisor host, copied beside the plugin by the init container (ADR-0018)."
     },
     {
       "unique-id": "service-spire-controller-manager",
@@ -793,6 +793,21 @@
           ]
         }
       }
+    },
+    {
+      "unique-id": "rel-spire-server-openbao-pki",
+      "description": "ADR-0031: the server's CA is an intermediate OpenBao's PKI engine signs at root/sign-intermediate every ca_ttl (24h); the server authenticates with a projected ServiceAccount token (Kubernetes auth, audience openbao) to a role whose policy allows that one path, and every signing is in OpenBao's audit log. The trust bundle the server publishes, hence the one a deployment's layer hands every member, is the PKI root: a layer stays good for the root's life, not for one ca_ttl. In the homelab collapse this is the upstream authority ADR-0005 names for the root server.",
+      "relationship-type": {
+        "connects": {
+          "source": {
+            "node": "service-spire-server"
+          },
+          "destination": {
+            "node": "service-openbao"
+          }
+        }
+      },
+      "protocol": "HTTPS"
     }
   ],
   "flows": [
@@ -988,6 +1003,11 @@
     "docs/adr/0023-sandbox-vm-image-kairos-derivative.md",
     "docs/adr/0024-landlock-inside-the-jail.md",
     "docs/adr/0025-phantom-token-egress-proxy.md",
-    "docs/adr/0026-notaio-bundles-verified-in-shadow.md"
+    "docs/adr/0026-notaio-bundles-verified-in-shadow.md",
+    "docs/adr/0027-control-plane-relay-on-the-egress-gateway.md",
+    "docs/adr/0028-egress-gateway-envoy-with-spiffe-identity.md",
+    "docs/adr/0029-the-pull-on-a-routeless-segment-and-the-pool-vms-root-rules.md",
+    "docs/adr/0030-policy-egress-enforced-at-the-gateway.md",
+    "docs/adr/0031-a-trust-anchor-that-outlives-the-servers-ca.md"
   ]
 }

@@ -1,0 +1,30 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+#
+# What the vault UpstreamAuthority needs in the server pod (ADR-0031 decision 2): the CA
+# that verifies OpenBao's TLS certificate, from the operator's ConfigMap, and a projected
+# ServiceAccount token with audience openbao that OpenBao's Kubernetes auth method
+# reviews. The token is the server's only credential at OpenBao; the role it logs in to
+# carries one capability, update on <mount>/root/sign-intermediate, so a compromised
+# server can ask for intermediates and nothing else, and every signing is in OpenBao's
+# audit log.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: spire-server
+  namespace: spire-server
+spec:
+  template:
+    spec:
+      containers:
+        - name: spire-server
+          volumeMounts:
+            - { name: upstream-ca, mountPath: /upstream/ca, readOnly: true }
+            - { name: upstream-token, mountPath: /upstream/token, readOnly: true }
+      volumes:
+        - name: upstream-ca
+          configMap: { name: spire-upstream-ca }
+        - name: upstream-token
+          projected:
+            sources:
+              - serviceAccountToken: { audience: openbao, expirationSeconds: 3600, path: token }

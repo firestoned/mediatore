@@ -3,7 +3,7 @@
 
 # ADR-0031: The agent's trust anchor outlives the server's CA: OpenBao's PKI as the upstream authority
 
-**Status:** Proposed · **Date:** 2026-11-07
+**Status:** Implemented · **Date:** 2026-11-07 (the homelab cluster's switch is roadmap 02's open item)
 
 Roadmap 02 (the server) and roadmap 06 (the layer that carries the bundle). Amends
 [ADR-0027](0027-control-plane-relay-on-the-egress-gateway.md) decision 3 (what the bundle the
@@ -149,7 +149,48 @@ and the `root/sign-intermediate` path, which the SPIRE plugin uses.
 
 ## Implementation notes
 
-To be filled when implemented: the component's files, the kind targets, the tier's
-assertion, the migration as performed, the threat-model pass (R-7 revised, TB-6 and TB-12
-rows for the server's new upstream call, the CALM relationship from `service-spire-server`
-to `service-openbao`).
+Implemented 2026-11-07, in the repository and in kind; the homelab cluster's switch (OpenBao
+on it first, ADR-0015, then the component and the last layer rebuild of decision 5) is
+roadmap 02's open item and an operator's run.
+
+- **The component**, `deploy/spire-upstream/`: `server.conf.fragment.hcl` with the
+  `UpstreamAuthority "vault"` block (`vault_addr`, `pki_mount_point`, `ca_cert_path`,
+  `k8s_auth` with the mount, the role and the projected token's path, all placeholders);
+  `statefulset-patch.yaml` mounting the OpenBao CA from the ConfigMap `spire-upstream-ca`
+  at `/upstream/ca` and a projected ServiceAccount token (audience `openbao`, one hour) at
+  `/upstream/token`; `kustomization.yaml` as a kustomize Component beside
+  `deploy/spire-tpm`.
+- **The kind side**: `dev/kind/openbao-setup.sh` enables the `spire` PKI mount, generates
+  the P-384 ten-year root `internal` (the key never leaves OpenBao), writes its certificate
+  to `.kind/openbao/upstream-root.pem`, brings the mount's maximum lease down to a week,
+  writes the policy (`spire/root/sign-intermediate`, `update` only) and the Kubernetes-auth
+  role bound to `spire-server/spire-server` with audience `openbao`; it is idempotent, and
+  `make kind-openbao` no longer restarts the in-memory OpenBao, so the root survives a
+  second `make kind-spire`. `make kind-spire` creates `spire-upstream-ca` from OpenBao's
+  serving CA and applies the component; `dev/kind/spire/render-server-conf-patch.sh` reads
+  the fragment and writes the `UpstreamAuthority` into the generated
+  `server-conf-patch.yaml` with the in-cluster OpenBao address. Every kind tier runs its
+  server under the upstream authority.
+- **The tier's assertion**, `dev/kind/tpm-e2e.sh`: `UPSTREAM_ROOT` is required; the script
+  reads `spire-server bundle show`, asserts its SHA-256 fingerprints equal the root file's
+  (one certificate, nothing self-signed), and starts the agent with the OpenBao root alone
+  as `/etc/spire/bundle.pem`. Run on the build host on 2026-11-07 against a tree with this
+  change: `make kind-e2e-ci KIND_E2E_SUITES="kind-e2e-tpm kind-e2e"`, every tier PASS, the
+  TPM tier's agent attested as
+  `spiffe://sandbox.test/spire/agent/tpm/dbabf5bcaeb5f108598e46db585db9ed48b0bdcbcc3f57f37095fa3c52289be4`
+  from a bundle holding the OpenBao root only, re-attested after a member replacement.
+  Rerun of the TPM tier alone against the final tree (the mount's week-long lease cap added
+  after the first launch): PASS, the agent
+  `spiffe://sandbox.test/spire/agent/tpm/2586185606d62837f41cfd53250cc58270251a547337d580152c89a13da7e644`.
+- **CALM**: `rel-spire-server-openbao-pki` (the server to OpenBao over HTTPS), the node
+  descriptions and the ADR list in `docs/architecture/calm/architecture.json`;
+  `make calm-validate` passes, the diagrams re-rendered.
+- **Docs**: the deploying guide's OpenBao side (`bao` commands for the mount, the root, the
+  policy, the role) and the migration of decision 5 replacing "rebuild the layer daily";
+  the testing guide's tier row; README's status table; ADR-0005 and ADR-0027 marked
+  Amended; roadmap 02's item ticked with the homelab switch as its next open item.
+- **Threat model**, full pass stamped 2026-11-07 against ADR-0001 to ADR-0031: new boundary
+  TB-16 (the server to OpenBao's PKI, eight rows), new asset A-22 (the root key), one TB-4
+  row for the first-boot window the rc.3 and rc.4 live runs hit, **R-7 revised** (the key
+  on the server's volume is now a 24-hour intermediate's), **R-21 new** (OpenBao as a
+  dependency of CA rotation).
