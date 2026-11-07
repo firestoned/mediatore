@@ -1,0 +1,31 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+#
+# The trust anchor that outlives the server's CA (ADR-0031), as a kustomize component the
+# operator's SPIRE kustomization includes beside deploy/spire-tpm:
+#
+#   components:
+#     - ../mediatore/deploy/spire-upstream
+#
+# The server's CA becomes an intermediate signed by an OpenBao PKI mount (the `vault`
+# UpstreamAuthority, root/sign-intermediate), rotating every ca_ttl under a root that
+# lives for years. The bundle the server publishes, and so the bundle.pem a deployment's
+# cloud-config layer hands every pool VM and gateway, holds that root: a layer stays good
+# for the root's life, not for one ca_ttl.
+#
+# Two things are the operator's: the ConfigMap `spire-upstream-ca` in the server's
+# namespace, key `ca.pem`, the CA that signed OpenBao's own TLS certificate (created
+# before the server starts, since the server cannot sign its CA without it; the kind tier
+# creates it from the certificate it minted), and the OpenBao side: a PKI mount with a
+# root, a policy allowing update on <mount>/root/sign-intermediate alone, and a
+# Kubernetes auth role bound to the server's ServiceAccount (deploying guide). The
+# server.conf block is in server.conf.fragment.hcl, the operator's to merge as for
+# deploy/spire-tpm.
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+patches:
+  - path: statefulset-patch.yaml
+    target:
+      kind: StatefulSet
+      name: spire-server
+      namespace: spire-server

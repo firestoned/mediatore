@@ -210,9 +210,13 @@ put it in the libvirt pool the `VMClass`'s storage class maps to (`virsh pool-re
 and declare `sources: [{providerClass: libvirt, kind: BackingFile, ref: <name>.iso}]` with
 `installMode: deferred`: the member installs from the CD-ROM, which is ejected when the
 guest reports its phase. Two things to know for either route. The bundle in the deployment
-layer admits a member's first boot for as long as the server's CA lives (`ca_ttl`; 24 h in
-a default Helm render means refreshing the layer daily, a week or more means an image that
-keeps), and `/etc/mediatore-guest/env` takes whole-line comments only, since systemd's
+layer is what a member trusts on its first boot: with the server under the OpenBao upstream
+authority ([ADR-0031](../adr/0031-a-trust-anchor-that-outlives-the-servers-ca.md), the
+`deploy/spire-upstream` block below) it is the PKI root and a layer stays good for the
+root's ten years; on a server signing with its own CA it is that CA and the layer admits a
+first boot only for its `ca_ttl` (24 h in a default Helm render: the pool churns a day
+after the layer was built, which both rc.3 and rc.4 ran into). And
+`/etc/mediatore-guest/env` takes whole-line comments only, since systemd's
 `EnvironmentFile` keeps an inline comment as part of the value.
 
 ```sh
@@ -244,6 +248,49 @@ kubectl -n spire-server rollout status statefulset/spire-server
 kubectl -n spire-server exec spire-server-0 -c spire-server -- \
   spire-server bundle show > bundle.pem        # the trust bundle for the VM image
 ```
+
+The trust domain's root lives in OpenBao's PKI engine, not on the server
+([ADR-0031](../adr/0031-a-trust-anchor-that-outlives-the-servers-ca.md)): the second
+component, `deploy/spire-upstream`, makes the server's CA an intermediate OpenBao signs
+every `ca_ttl`, and the bundle every layer carries becomes the root. The OpenBao side is
+a PKI mount, a root, a policy that allows signing intermediates and nothing else, and a
+Kubernetes auth role for the server's ServiceAccount (the same OpenBao as the transit
+sealer, [ADR-0015](../adr/0015-transit-sealer.md); `dev/kind/openbao-setup.sh` is the
+reference, with the kind names):
+
+```sh
+# At OpenBao, as an administrator. The root is ten years; the mount's maximum lease then
+# comes down to a week, which caps any intermediate the server's token could ask for.
+bao secrets enable -path=spire pki
+bao secrets tune -max-lease-ttl=87600h spire
+bao write spire/root/generate/internal common_name=sandbox.home.example key_type=ec key_bits=384 ttl=87600h issuer_name=root
+bao secrets tune -max-lease-ttl=168h spire
+bao policy write spire-upstream - <<'HCL'
+path "spire/root/sign-intermediate" { capabilities = ["update"] }
+HCL
+bao write auth/kubernetes/role/spire-server bound_service_account_names=spire-server \
+  bound_service_account_namespaces=spire-server audience=openbao token_policies=spire-upstream token_ttl=1h
+bao read -field=certificate spire/cert/ca > upstream-root.pem   # what every layer's bundle.pem becomes
+
+# On the cluster: the CA that signed OpenBao's TLS certificate, before the server starts,
+# then the component and the fragment's block (vault_addr and the role are yours).
+kubectl -n spire-server create configmap spire-upstream-ca --from-file=ca.pem=openbao-ca.pem
+cp -r deploy/spire-upstream ~/.config/mediatore/spire-upstream
+kubectl apply -k ~/.config/mediatore/spire
+kubectl -n spire-server rollout status statefulset/spire-server
+kubectl -n spire-server exec spire-server-0 -c spire-server -- spire-server bundle show
+```
+
+The switch has no cliff. The server's bundle after the restart holds the OpenBao root and,
+until the old CA retires one `ca_ttl` later, the self-signed CA; running agents receive
+it over the attested channel; a layer built before the switch still verifies the server
+for the rest of that CA's life; the next layer you build carries the root alone
+(`upstream-root.pem` above, or `bundle show` once the old CA is gone) and is the last one
+you rebuild for this reason. If OpenBao is away when the server prepares its next
+intermediate (halfway through `ca_ttl`, so twelve hours of slack) the server keeps
+signing with the current one until it expires and issues nothing after; size OpenBao for
+that. A chart-managed server reaches the same state through the hardened chart's
+`upstreamAuthority.vault` values instead of the component.
 
 A new hypervisor is a new key in the ConfigMap and the same restart. The whole path,
 from this component to an agent attesting with a vTPM, a refusal under a CA that did not

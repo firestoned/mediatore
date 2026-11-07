@@ -4,7 +4,10 @@
 # ADR-0027: A sandbox reaches the identity plane only through a control relay on the egress gateway
 
 **Status:** Accepted, implemented 2026-11-04 (decisions 4, 6, 7 and 8 in code; 1, 2, 5 and
-9 in the gateway image) · **Date:** 2026-10-30
+9 in the gateway image) · **Date:** 2026-10-30 · **Amended:** 2026-11-07 by
+[ADR-0031](0031-a-trust-anchor-that-outlives-the-servers-ca.md) (decision 3: the bundle the
+agent starts with is the PKI root the server's CA chains to, good for years, not the
+server's CA of the day)
 
 Roadmap 10. Amends [ADR-0028](0028-egress-gateway-envoy-with-spiffe-identity.md) decisions 4
 and 6 (what the gateway carries, and whether the sandbox reaches the broker directly),
@@ -79,7 +82,9 @@ credential it produces. No layer is relied on alone.
      `server_address` is the gateway's `sandbox` address and the relay's SPIRE port, so the
      VM needs no resolver. The bundle the agent starts with is the image's
      (ADR-0018 decision 3); later rotations arrive over the attested channel. An image
-     whose bundle shares no root with the server's fails closed and needs a rebuild.
+     whose bundle shares no root with the server's fails closed and needs a rebuild; since
+     ADR-0031 that bundle is OpenBao's PKI root and the server's CA an intermediate under
+     it, so a layer stays good for the root's life and not for one `ca_ttl`.
    - The broker leg: mutual TLS with the node SVID, end to end through the relay, exactly as
      ADR-0007 specifies. The broker's gateway-only route of ADR-0028 decision 4 is a
      different route (the gateway's own SVID); this one is the node's.

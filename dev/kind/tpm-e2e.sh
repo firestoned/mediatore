@@ -5,7 +5,8 @@
 # ADR-0018 against a real SPIRE (`make kind-e2e-tpm`): the attestation path a pool VM
 # takes, with a vTPM behind the kind node (dev/kind/vtpm.sh) in place of libvirt's. A pod
 # runs the SPIRE agent on the image's own configuration (image/spire/agent.conf, the two
-# placeholders replaced, the trust bundle exported with `spire-server bundle show`) with
+# placeholders replaced, the trust bundle the OpenBao PKI root alone, ADR-0031: the server's
+# bundle is checked to be that root and nothing self-signed of its own) with
 # the tpm attestor plugin from its pinned image and /dev/tpmrm0 from the node; the server
 # runs deploy/spire-tpm. First the EK trust bundle is a CA that never signed this EK, and
 # the agent is refused. Then it is the vTPM's own local CA, and the agent attests as
@@ -17,7 +18,7 @@
 # agent ID re-attests, the server lists one agent, the node registers again, no clone is
 # reported.
 #
-#   tpm-e2e.sh <admin kubeconfig> <trust domain> <vtpm dir>   (TPM_PLUGIN_AGENT_IMG set)
+#   tpm-e2e.sh <admin kubeconfig> <trust domain> <vtpm dir>   (TPM_PLUGIN_AGENT_IMG and UPSTREAM_ROOT set)
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
@@ -25,6 +26,8 @@ KUBECONFIG_PATH=${1:?admin kubeconfig}
 TD=${2:?trust domain}
 VTPM=${3:?vtpm dir}
 PLUGIN_IMG=${TPM_PLUGIN_AGENT_IMG:?TPM_PLUGIN_AGENT_IMG}
+# The root the server's CA chains to, as `make kind-openbao` read it from the PKI mount (ADR-0031).
+UPSTREAM_ROOT=${UPSTREAM_ROOT:?UPSTREAM_ROOT}
 K=(kubectl --kubeconfig "$KUBECONFIG_PATH")
 BROKER_NS=banlieue-system
 SPIRE_NS=spire-server
@@ -185,13 +188,27 @@ wait_for "$TIMEOUT" "lease mediatore-watcher held by ${BROKER_POD#pod/}" holder_
 wait_for "$TIMEOUT" "'claim watcher running' in the broker log" log_has "claim watcher running"
 echo "held by ${BROKER_POD#pod/}; controllers running"
 
-say "the agent's side as the image carries it: image/spire/agent.conf and the exported trust bundle"
+say "the agent's side as the image carries it: image/spire/agent.conf and the upstream root as the whole trust bundle (ADR-0031)"
 "${K[@]}" delete namespace "$NS" --ignore-not-found --wait=true >/dev/null
 "${K[@]}" delete clusterstaticentries -l "$ENTRY_SELECTOR" --ignore-not-found --wait=true >/dev/null
 "${K[@]}" create namespace "$NS" >/dev/null
-# Part 1.5 of the runbook, the command the deploying guide gives for the VM image.
-"${K[@]}" -n "$SPIRE_NS" exec "$SERVER_POD" -c spire-server -- spire-server bundle show > "$VTPM/bundle.pem"
-grep -q 'BEGIN CERTIFICATE' "$VTPM/bundle.pem" || fail "spire-server bundle show returned no certificate"
+# Part 1.5 of the runbook, the command the deploying guide gives for the VM image: since
+# ADR-0031 it prints the OpenBao root, the server's own CA being an intermediate under it.
+# The bundle the layer carries is that root, read from OpenBao, not from the server; the
+# server's bundle must agree, one root and nothing self-signed of the server's own.
+"${K[@]}" -n "$SPIRE_NS" exec "$SERVER_POD" -c spire-server -- spire-server bundle show > "$VTPM/bundle-server.pem"
+grep -q 'BEGIN CERTIFICATE' "$VTPM/bundle-server.pem" || fail "spire-server bundle show returned no certificate"
+fingerprints() {
+  local d; d=$(mktemp -d)
+  awk -v d="$d" '/BEGIN CERTIFICATE/ { n++; f = d "/cert-" n ".pem" } { print > f }' "$1"
+  for c in "$d"/cert-*.pem; do openssl x509 -in "$c" -noout -fingerprint -sha256; done | sort
+  rm -rf "$d"
+}
+[ "$(grep -c 'BEGIN CERTIFICATE' "$UPSTREAM_ROOT")" = 1 ] || fail "$UPSTREAM_ROOT holds more than one certificate"
+[ "$(fingerprints "$VTPM/bundle-server.pem")" = "$(fingerprints "$UPSTREAM_ROOT")" ] \
+  || fail "the server's bundle is not the upstream root alone: $(fingerprints "$VTPM/bundle-server.pem" | tr '\n' ' ') vs $(fingerprints "$UPSTREAM_ROOT")"
+cp "$UPSTREAM_ROOT" "$VTPM/bundle.pem"
+echo "the server's bundle is the OpenBao root and nothing else ($(fingerprints "$UPSTREAM_ROOT" | sed 's/.*=//' | cut -c1-23)…); the agent starts from that root"
 # The two placeholders, and the port: a VM reaches the server on 8081 where the operator
 # exposes it; a pod reaches the Service, which maps 443 to the pod's 8081.
 sed -e "s#spire-server.sandbox.home.example#spire-server.$SPIRE_NS#" -e "s#sandbox.home.example#$TD#" \
@@ -199,7 +216,7 @@ sed -e "s#spire-server.sandbox.home.example#spire-server.$SPIRE_NS#" -e "s#sandb
 grep -q "trust_domain = \"$TD\"" "$VTPM/agent.conf" || fail "the trust domain placeholder was not replaced"
 grep -q 'server_port = "443"' "$VTPM/agent.conf" || fail "the server port was not replaced"
 "${K[@]}" -n "$NS" create configmap tpm-agent --from-file=agent.conf="$VTPM/agent.conf" --from-file=bundle.pem="$VTPM/bundle.pem" >/dev/null
-echo "bundle exported ($(grep -c 'BEGIN CERTIFICATE' "$VTPM/bundle.pem") certificate(s)); agent.conf for $TD at spire-server.$SPIRE_NS:443; plugin $PLUGIN_IMG"
+echo "bundle: the upstream root ($(grep -c 'BEGIN CERTIFICATE' "$VTPM/bundle.pem") certificate); agent.conf for $TD at spire-server.$SPIRE_NS:443; plugin $PLUGIN_IMG"
 
 say "refused: a CA that never signed this EK, then the local CA's root alone, make the vTPM no agent"
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 1 -subj /CN=stranger-localca \
@@ -278,4 +295,4 @@ wait_for "$TIMEOUT" "'GuestReady announced' in the new guest's log" announced
 announced_after_registered
 echo "re-attested as $AGENT_ID (${OLD_POD} replaced by $(member_pod member)); one tpm agent; registered and announced again"
 
-say "PASS: ADR-0018 holds against a real SPIRE with a vTPM (the image's agent.conf, the pinned plugin on both sides, the EK CA fail-closed, the agent ID the hash of the EK, the node entry under it, re-attestation), and ADR-0019's GuestReady follows the registration"
+say "PASS: ADR-0018 holds against a real SPIRE with a vTPM (the image's agent.conf, the pinned plugin on both sides, the EK CA fail-closed, the agent ID the hash of the EK, the node entry under it, re-attestation), and ADR-0019's GuestReady follows the registration; the agent bootstrapped from the OpenBao root alone and the server's bundle is that root, ADR-0031"

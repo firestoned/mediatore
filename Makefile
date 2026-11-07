@@ -39,6 +39,8 @@ SPIRE_KUSTOMIZATION := dev/kind/spire
 SPIRE_TRUST_DOMAIN  ?= sandbox.test
 SPIRE_NAMESPACE     := spire-server
 SPIRE_CLASS_NAME    := spire-server-spire
+# The kind OpenBao as the server's upstream authority sees it (ADR-0031; dev/kind/openbao).
+KIND_OPENBAO_ADDR   := https://mediatore-openbao.banlieue-system.svc:8200
 # Images: `docker` or `podman` (kind follows KIND_EXPERIMENTAL_PROVIDER). The kind tags
 # are loaded into the cluster with `kind load`, never pulled, never pushed.
 CONTAINER_CLI      ?= docker
@@ -337,13 +339,15 @@ kind-spire-render: ## Render SPIRE's distribution (hardened charts, pinned versi
 	  -n $(SPIRE_NAMESPACE) --kube-version $(KIND_K8S_VERSION) --no-hooks --skip-tests \
 	  -f $(SPIRE_KUSTOMIZATION)/values.yaml > $(SPIRE_KUSTOMIZATION)/spire.yaml
 	./$(SPIRE_KUSTOMIZATION)/render-server-conf-patch.sh $(SPIRE_KUSTOMIZATION)/spire.yaml deploy/spire-tpm/server.conf.fragment.hcl \
-	  > $(SPIRE_KUSTOMIZATION)/server-conf-patch.yaml
+	  deploy/spire-upstream/server.conf.fragment.hcl $(KIND_OPENBAO_ADDR) > $(SPIRE_KUSTOMIZATION)/server-conf-patch.yaml
 	@kubectl kustomize $(SPIRE_KUSTOMIZATION) >/dev/null
 	@echo "✓ rendered spire-crds $(SPIRE_CRDS_VERSION) and spire $(SPIRE_CHART_VERSION) into $(SPIRE_KUSTOMIZATION)"
 
-kind-spire: kind-create ## Apply SPIRE (server, controller manager, agent, CSI driver) and the TPM attestor component from the rendered manifests
+kind-spire: kind-create kind-openbao ## Apply SPIRE (server, controller manager, agent, CSI driver), the TPM attestor and the OpenBao upstream authority components from the rendered manifests
 	@$(KIND_KUBECTL) get ns $(SPIRE_NAMESPACE) >/dev/null 2>&1 || $(KIND_KUBECTL) create ns $(SPIRE_NAMESPACE)
 	@$(KIND_KUBECTL) get ns spire-system >/dev/null 2>&1 || $(KIND_KUBECTL) create ns spire-system
+	@# The server signs its CA at OpenBao before it serves anything (ADR-0031), so OpenBao's CA is in place first.
+	$(KIND_KUBECTL) -n $(SPIRE_NAMESPACE) create configmap spire-upstream-ca --from-file=ca.pem=$(KIND_DIR)/openbao/ca.pem --dry-run=client -o yaml | $(KIND_KUBECTL) apply -f -
 	$(KIND_KUBECTL) apply -f $(SPIRE_KUSTOMIZATION)/crds.yaml
 	@$(KIND_KUBECTL) wait --for=condition=established --timeout=60s -f $(SPIRE_KUSTOMIZATION)/crds.yaml >/dev/null
 	$(KIND_KUBECTL) apply -k $(SPIRE_KUSTOMIZATION)
@@ -396,17 +400,18 @@ kind-dex: kind-create ## Dex over TLS with a glauth directory behind it (ADR-001
 	$(KIND_KUBECTL) -n banlieue-system rollout status deploy/mediatore-glauth --timeout=300s
 	$(KIND_KUBECTL) -n banlieue-system rollout status deploy/mediatore-dex --timeout=300s
 
-kind-openbao: kind-create ## OpenBao over TLS (ADR-0015): minted certificate, initialised and unsealed, transit with a derived key, Kubernetes auth role for the broker
+kind-openbao: kind-create ## OpenBao over TLS (ADR-0015, ADR-0031): minted certificate, initialised and unsealed, transit with a derived key and a role for the broker, a PKI root and a role for the SPIRE server
 	@$(KIND_KUBECTL) get ns banlieue-system >/dev/null 2>&1 || $(KIND_KUBECTL) create ns banlieue-system
-	cargo run -q -p mediatore-testkit --bin tls-fixture -- --out-dir $(KIND_DIR)/openbao --dns mediatore-openbao.banlieue-system.svc --dns localhost
-	$(KIND_KUBECTL) -n banlieue-system create secret generic mediatore-openbao-tls --from-file=$(KIND_DIR)/openbao/server.pem --from-file=$(KIND_DIR)/openbao/server-key.pem --dry-run=client -o yaml | $(KIND_KUBECTL) apply -f -
-	$(KIND_KUBECTL) -n banlieue-system create configmap mediatore-openbao-ca --from-file=$(KIND_DIR)/openbao/ca.pem --dry-run=client -o yaml | $(KIND_KUBECTL) apply -f -
+	@# Minted once per cluster: a new certificate would need a new pod, and in-memory storage would start over, with the root the SPIRE server chains to (ADR-0031).
+	@if ! $(KIND_KUBECTL) -n banlieue-system get secret mediatore-openbao-tls >/dev/null 2>&1; then \
+	  cargo run -q -p mediatore-testkit --bin tls-fixture -- --out-dir $(KIND_DIR)/openbao --dns mediatore-openbao.banlieue-system.svc --dns localhost && \
+	  $(KIND_KUBECTL) -n banlieue-system create secret generic mediatore-openbao-tls --from-file=$(KIND_DIR)/openbao/server.pem --from-file=$(KIND_DIR)/openbao/server-key.pem && \
+	  $(KIND_KUBECTL) -n banlieue-system create configmap mediatore-openbao-ca --from-file=$(KIND_DIR)/openbao/ca.pem && \
+	  rm -f $(KIND_DIR)/openbao/init.json; \
+	fi
 	$(KIND_KUBECTL) apply -f dev/kind/openbao/openbao.yaml
-	@# A new certificate needs a new pod; in-memory storage starts over, the setup redoes it.
-	$(KIND_KUBECTL) -n banlieue-system rollout restart deploy/mediatore-openbao
 	$(KIND_KUBECTL) -n banlieue-system rollout status deploy/mediatore-openbao --timeout=300s
-	@rm -f $(KIND_DIR)/openbao/init.json
-	./dev/kind/openbao-setup.sh $(KIND_KUBECONFIG) $(KIND_DIR)/openbao
+	./dev/kind/openbao-setup.sh $(KIND_KUBECONFIG) $(KIND_DIR)/openbao $(SPIRE_TRUST_DOMAIN)
 
 kind-broker: kind-up kind-images kind-postgres kind-dex kind-openbao ## deploy/base in kind on the CSI driver's socket, the kind PostgreSQL, Dex and OpenBao (dev/kind/broker overlay), rolled out
 	$(KIND_KUBECTL) apply -k dev/kind/broker
@@ -472,7 +477,7 @@ kind-e2e-dex: kind-banlieue-crds kind-broker ## ADR-0013 live: the real CLI logs
 kind-e2e-tpm: kind-vtpm kind-banlieue-crds kind-broker ## ADR-0018 live: an agent attesting with the vTPM behind the node on the image's agent.conf, the EK CA fail-closed, the node entry under that agent, re-attestation
 	$(KIND_KUBECTL) -n banlieue-system rollout restart deploy/mediatore
 	$(KIND_KUBECTL) -n banlieue-system rollout status deploy/mediatore --timeout=300s
-	TPM_PLUGIN_AGENT_IMG=$(TPM_PLUGIN_AGENT_IMG) ./dev/kind/tpm-e2e.sh $(KIND_KUBECONFIG) $(SPIRE_TRUST_DOMAIN) $(KIND_VTPM_DIR)
+	TPM_PLUGIN_AGENT_IMG=$(TPM_PLUGIN_AGENT_IMG) UPSTREAM_ROOT=$(KIND_DIR)/openbao/upstream-root.pem ./dev/kind/tpm-e2e.sh $(KIND_KUBECONFIG) $(SPIRE_TRUST_DOMAIN) $(KIND_VTPM_DIR)
 
 kind-e2e: kind-e2e-entries kind-e2e-mtls kind-e2e-watcher kind-e2e-sandbox kind-e2e-store kind-e2e-dex kind-e2e-policy kind-e2e-gateway ## Every live suite against kind that needs nothing of the host (grows with the roadmap); kind-e2e-tpm needs a vTPM
 

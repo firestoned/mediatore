@@ -14,7 +14,7 @@ a real cluster address or a real credential in a tracked file.
 | Dev-mode loop | `make e2e` | The roles of the one binary agree on the wire contract as separate processes | everywhere, every PR |
 | Session e2e | `make check` (`crates/mediatore/tests/e2e_session.rs`) | The session path (ADR-0013) over real listeners against the fake issuer's real authorization-code and refresh grants: delegation, rotation, fresh groups, outage, revocation, the group gate at refresh, the per-claim limit; the CLI's PKCE login in `crates/mediatore-client` | everywhere, every commit |
 | Live against SPIRE in kind | `make kind-e2e` | Kubernetes, the SPIRE Controller Manager and the admission policy behave as the ADRs say, as the broker's own ServiceAccount; the broker image runs on the CSI driver's socket and agent-issued SVIDs meet on the sandbox listener | CI on every PR, any laptop with a container runtime |
-| TPM attestation in kind | `make kind-e2e-tpm` | A SPIRE agent on the image's own configuration attests with a vTPM through the pinned plugin on both sides, the EK trust bundle refuses what it should, the node entry lands under that agent | by hand, a Linux host with `sudo`, swtpm and the `tpm_vtpm_proxy` module (not GitHub's runners) |
+| TPM attestation in kind | `make kind-e2e-tpm` | A SPIRE agent on the image's own configuration attests with a vTPM through the pinned plugin on both sides, the EK trust bundle refuses what it should, the node entry lands under that agent; the agent starts from the OpenBao PKI root alone and the server's bundle is that root (ADR-0031) | by hand, a Linux host with `sudo`, swtpm and the `tpm_vtpm_proxy` module (not GitHub's runners) |
 | Live against a real cluster | `make live-admission-test` | The same, against a deployment you operate | by hand, before a release or after changing the deployment |
 
 ## Unit: `make check`
@@ -123,7 +123,7 @@ Suites today:
 | `make kind-e2e-store` | 0012 | the broker on PostgreSQL over `verify-full`, the store conformance suite against that database, below |
 | `make kind-e2e-dex` | 0013 | the real CLI logging in at a real Dex from inside the cluster and delegating the session, a refresh at Dex before every issue, the claim released when the user leaves the gated group in the directory and when the refresh token is deleted at Dex, below |
 | `make kind-e2e-policy` | 0026 | notaio installed from its release manifests and signing with the kind OpenBao, its bundle admitted by the broker and recorded on each claim, the `PolicyConformant` verdicts and codes on four sandboxes, a newer bundle followed, the earlier one delivered again refused by the version floor before and after a broker restart, nothing refused on the bundle's account, below |
-| `make kind-e2e-tpm` | 0018 | an agent attesting with a vTPM behind the kind node through the `tpm` plugin, on `image/spire/agent.conf`, refused under a CA that never signed its EK and listed under the EK's hash under the right one, the member's certificate becoming the node entry under that agent, the guest registering over the SVID it issues and only then announcing `GuestReady` (ADR-0019), a fresh pod re-attesting as the same agent; not part of `make kind-e2e` and not in CI (it needs `sudo`, swtpm and the kernel's vtpm proxy on the host), below |
+| `make kind-e2e-tpm` | 0018 | an agent attesting with a vTPM behind the kind node through the `tpm` plugin, on `image/spire/agent.conf`, refused under a CA that never signed its EK and listed under the EK's hash under the right one, the member's certificate becoming the node entry under that agent, the guest registering over the SVID it issues and only then announcing `GuestReady` (ADR-0019), a fresh pod re-attesting as the same agent; since ADR-0031 the agent's bundle is the OpenBao PKI root alone and the server's `bundle show` is asserted to be that root and nothing self-signed of its own; not part of `make kind-e2e` and not in CI (it needs `sudo`, swtpm and the kernel's vtpm proxy on the host), below |
 
 ### The store: PostgreSQL over TLS the client verifies
 
@@ -551,7 +551,13 @@ again, because the floor came back from the store.
 
 `make kind-e2e-tpm` (`dev/kind/tpm-e2e.sh`) runs the attestation path a pool VM takes
 ([ADR-0018](../adr/0018-tpm-attestation-with-the-spiffe-plugin.md)), with a vTPM in
-place of libvirt's. `make kind-vtpm` (`dev/kind/vtpm.sh`) starts swtpm behind the
+place of libvirt's, and since
+[ADR-0031](../adr/0031-a-trust-anchor-that-outlives-the-servers-ca.md) with the trust
+bundle a layer would carry: the OpenBao PKI root `make kind-openbao` read from the `spire`
+mount (`.kind/openbao/upstream-root.pem`), not the server's `bundle show`, which the
+script asserts to be that root and nothing else before the agent starts. Every kind tier
+runs the server under that upstream authority (`make kind-spire` depends on
+`make kind-openbao` for it and copies OpenBao's CA into the server's namespace first). `make kind-vtpm` (`dev/kind/vtpm.sh`) starts swtpm behind the
 kernel's vtpm proxy (`tpm_vtpm_proxy`), which makes it a character device on the host,
 `/dev/tpmrmN`; the EK certificate is signed by a throwaway swtpm local CA the script
 creates under `.kind/vtpm`, the way `swtpm_setup` does on a hypervisor, never the host's
