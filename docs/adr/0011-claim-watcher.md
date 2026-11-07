@@ -91,8 +91,8 @@ API stays stateless and runs on every replica.
 `banlieue-api` is a git dependency pinned by commit (banlieue PR #98 of 2026-10-13, which
 makes the crate depend on kube's `derive` feature only: with kube's default features it
 dragged the `ring` provider into this graph and `cargo deny` refused it; the pin moves to
-the merge commit, then to a tag when banlieue cuts a release with `VirtualMachineClaim`),
-so schema drift is a compile error (ADR-0002). `cargo deny` already allows that one git source. The watcher runs only
+the merge commit, then to a tag when banlieue cuts a release with `VirtualMachineClaim`;
+on the `v0.4.14` tag since 2026-11-07), so schema drift is a compile error (ADR-0002). `cargo deny` already allows that one git source. The watcher runs only
 outside `dev_mode`; under `dev_mode` the dev binder is unchanged and the dev loop needs no
 cluster.
 

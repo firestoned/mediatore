@@ -3,7 +3,7 @@
 
 # 03: Claim watcher against banlieue
 
-**Status: in progress.** Replace the dev binder with the real thing: watch
+**Status: done (2026-11-07).** Replace the dev binder with the real thing: watch
 `VirtualMachineClaim`, bind on Bound, release on Releasing/Failed/deletion.
 Decisions: [ADR-0011](../../docs/adr/0011-claim-watcher.md) (2026-10-13).
 
@@ -34,6 +34,8 @@ Decisions: [ADR-0011](../../docs/adr/0011-claim-watcher.md) (2026-10-13).
 - [x] `POST /v1/claims` creating the resource: done in roadmap 08 (2026-10-14), where the
       resource is an `AgentSandbox` (ADR-0008 decision 4) and the reconciler creates the
       claim and the record
-- [ ] banlieue side: revise ADR-0049 (SPIRE attestation supersedes quote-over-nonce;
-      retire `status.nonce`) — tracked here, implemented in the banlieue repo
+- [x] banlieue side: revise ADR-0049 (SPIRE attestation supersedes quote-over-nonce;
+      retire `status.nonce`): tracked here, done in banlieue #142 (v0.4.14, 2026-11-07);
+      the controller no longer mints the nonce and the field is deprecated, never set.
+      mediatore never read it; the pin moved to the v0.4.14 tag in the same change
 - [x] Threat model pass (2026-10-13): TB-2 gains five rows, TB-4 one; stamp to ADR-0011
