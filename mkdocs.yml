@@ -181,5 +181,7 @@ nav:
       - "ADR-0027: A control relay on the egress gateway": adr/0027-control-plane-relay-on-the-egress-gateway.md
       - "ADR-0028: The egress gateway, Envoy with a SPIFFE identity": adr/0028-egress-gateway-envoy-with-spiffe-identity.md
       - "ADR-0029: The image pull on a routeless segment, and the pool VM's root rules": adr/0029-the-pull-on-a-routeless-segment-and-the-pool-vms-root-rules.md
+      - "ADR-0030: A policy's direct egress, enforced at the gateway behind a switch": adr/0030-policy-egress-enforced-at-the-gateway.md
+      - "ADR-0031: The agent's trust anchor outlives the server's CA": adr/0031-a-trust-anchor-that-outlives-the-servers-ca.md
   - Security:
       - Threat model: security/threat-model.md

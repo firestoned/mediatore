@@ -73,6 +73,12 @@ installed beyond a `ServiceAccount` a live test left behind.
       attestor. CI no longer needs Helm
 - [ ] Trust bundle exported for the VM image (Part 1.5): `spire-server bundle show`
       into `/opt/spire/conf/bundle.pem`
+- [ ] ADR-0031 (proposed 2026-11-07): the anchor the layer carries outlives the server's
+      CA. OpenBao's PKI as the `vault` upstream authority, the server's CA an intermediate
+      under a ten-year root, the layer holding the root; `make kind-e2e-tpm` attests from a
+      bundle with the root alone; `deploy/spire-upstream/` and the migration part in the
+      deploying guide. Closes the first-boot window the live runs of rc.3 and rc.4 hit
+      (a layer good for one `ca_ttl`, the pool churning past it); R-7 narrows
 - [ ] The VM image with the agent, the plugin from `dist/` and the fragments baked by
       banlieue-imagebuilder (roadmap 06's image item; the mediatore side is `image/`)
 - [x] Part 3 acceptance on libvirt: a fresh member appears in `agent list` as type
