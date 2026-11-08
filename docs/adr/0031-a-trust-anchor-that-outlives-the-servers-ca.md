@@ -194,3 +194,22 @@ roadmap 02's open item and an operator's run.
   row for the first-boot window the rc.3 and rc.4 live runs hit, **R-7 revised** (the key
   on the server's volume is now a 24-hour intermediate's), **R-21 new** (OpenBao as a
   dependency of CA rotation).
+- **On the homelab cluster, 2026-11-08** (roadmap 02). The OpenBao of ADR-0004 was already
+  there, so the PKI mount, root, policy and role went beside notaio's transit key; the
+  server is a Helm release there, so decision 7's component became the chart's
+  `upstreamAuthority.vault` values with the same CA ConfigMap and projected token. Two
+  things the kind tier, which starts its server fresh, could not show: a server that
+  already has a CA (and the next one prepared) keeps signing with it after the upgrade
+  until it prepares a new authority, so the root entered the bundle only once
+  `localauthority x509 prepare` and `activate` ran on each server; and after that, the
+  servers' own serving certificates, issued by the old CA with a four-hour life, stayed
+  until their half-life, so a member booting from the root alone logged "Trust Bundle and
+  Server don't agree" until the servers were restarted and re-minted them under the new
+  authority, chain included (the guide carries both steps). The first-boot window was
+  live at the time, a member replaced every provisioning timeout. The last layer rebuild
+  was both installer ISOs with the root alone; the pool's image moved to the new one and
+  its members recycled onto it. The proof: the endpoint presents the serving certificate
+  and the OpenBao-signed intermediate, and `openssl verify` against the root alone passes;
+  the first recycled member's `/etc/spire/bundle.pem` holds one certificate, the root, and
+  its agent attested as `tpm/cbe86780…` within three minutes of the servers' restart, the
+  node entry declared and `GuestReady` announced. The pool's churn stopped there.
