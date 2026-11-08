@@ -112,6 +112,9 @@ spec:
   selector: { mediatore.dev/e2e-role: destination }
   ports:
     - { name: https, port: 8443, targetPort: https }
+    # The same destination on a second port: a policy's direct egress entry in the gateway
+    # policy tier (ADR-0030), refused under shadow, reached under enforce.
+    - { name: direct, port: 8081, targetPort: direct }
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -145,6 +148,26 @@ spec:
             - /etc/destination-tls/server-key.pem
           ports:
             - { name: https, containerPort: 8443 }
+          volumeMounts:
+            - { name: tls, mountPath: /etc/destination-tls, readOnly: true }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+        - name: direct
+          image: localhost/mediatore-e2e:kind
+          imagePullPolicy: Never
+          command:
+            - /usr/bin/gateway-probe
+            - serve
+            - --listen
+            - 0.0.0.0:8081
+            - --tls-cert
+            - /etc/destination-tls/server.pem
+            - --tls-key
+            - /etc/destination-tls/server-key.pem
+          ports:
+            - { name: direct, containerPort: 8081 }
           volumeMounts:
             - { name: tls, mountPath: /etc/destination-tls, readOnly: true }
           securityContext:

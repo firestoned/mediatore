@@ -20,5 +20,11 @@ Depends on roadmap 09 (the verified bundle cache) and roadmap 10 (the gateway an
 - [x] `P006` follows the switch; `P007` for entries not served
 - [x] e2e in `e2e_gateway.rs`: negative cases included
 - [x] README and rollout documented; threat-model full pass, stamp bumped (2026-11-05)
-- [ ] Live proof: `make kind-e2e-gateway` with a bundle in the cluster, through the real Envoy
-- [ ] Rollout: shadow, then enforce in dev, then each tier
+- [x] Live proof: `make kind-e2e-gateway-policy` (2026-11-08), the gateway tier under a notaio
+      bundle in the cluster, through the real Envoy: the bundle's direct entry for the
+      destination's second port is refused at the gateway under `shadow` (the broker logging
+      `would_add`, the sandbox reporting P006) and opens under `enforce` (a tunnel, the
+      destination answering through it, the authorizer's allow from the broker), an entry
+      with rules is never served (P007), the audience endpoints stand in both modes
+- [ ] Rollout: shadow, then enforce in dev, then each tier. Shadow everywhere today: the
+      kind overlay and the homelab broker set no `policy.egress`, so the default stands
