@@ -109,6 +109,9 @@ own change; this ADR does not touch it.
   watcher gets the mode through `WatcherConfig::egress_mode`.
 - A cache that has not completed its first list is empty, so a replica that is not ready
   serves the audience endpoints only, with no separate check.
+- The broker logs the switch at start (`policy.egress … mode=shadow|enforce`,
+  `policy_egress` in `crates/mediatore/src/main.rs`), so a rollout step is read off the log;
+  the kind tier waits on that line after each restart.
 - Live (2026-11-08): `make kind-e2e-gateway-policy` runs the gateway tier under a notaio bundle
   whose `egress[]` names the destination's second port and a host with rules. Under `shadow`
   the second port is `403 not_allowed` at the gateway as before, the broker logs

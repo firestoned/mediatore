@@ -31,5 +31,6 @@ Depends on roadmap 09 (the verified bundle cache) and roadmap 10 (the gateway an
       `would_add` line (neither of its bundles names direct egress, so the gateway's answer
       is unchanged and the first entry a policy adds will be served); the broker restarted
       on the value, both bundles admitted, the API healthy. The kind overlay stays on the
-      default. Open: the other tiers, as they exist; a startup log line naming the mode
-      would have made the check direct, instead of inferred from the start succeeding
+      default. Open: the other tiers, as they exist. The broker names the mode in its
+      start-up log since the same day (`policy.egress … mode=enforce`), the kind tier
+      waits on that line; the homelab check had to infer it from the start succeeding

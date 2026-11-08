@@ -68,6 +68,24 @@ pub enum EgressMode {
     Enforce,
 }
 
+impl EgressMode {
+    /// The value as the configuration spells it, for the broker's start-up log: an
+    /// operator reads the mode off the log instead of inferring it from the start succeeding.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Shadow => "shadow",
+            Self::Enforce => "enforce",
+        }
+    }
+}
+
+impl std::fmt::Display for EgressMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// A direct `egress[]` entry the gateway cannot enforce exactly, and why (ADR-0030 decision 3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NotServed {
@@ -912,6 +930,15 @@ mod tests {
             )
             .collect();
         b
+    }
+
+    #[test]
+    fn the_egress_mode_prints_as_the_configuration_spells_it() {
+        assert_eq!(EgressMode::Shadow.as_str(), "shadow");
+        assert_eq!(EgressMode::Enforce.to_string(), "enforce");
+        assert_eq!(EgressMode::default(), EgressMode::Shadow);
+        let parsed: EgressMode = serde_json::from_str("\"enforce\"").unwrap();
+        assert_eq!(parsed.to_string(), "enforce");
     }
 
     #[test]

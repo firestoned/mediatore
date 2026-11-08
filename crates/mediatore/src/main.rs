@@ -226,6 +226,9 @@ fn policy_egress(
     reflector: Option<&BundleReflector>,
 ) -> Option<mediatore_api::PolicyEgress> {
     let (reflector, policy) = reflector.zip(cfg.policy.as_ref())?;
+    // Named at start so an operator reads the mode off the log (the homelab rollout of
+    // 2026-11-08 had to infer it from the start succeeding).
+    tracing::info!(mode = %policy.egress, namespaces = ?policy.namespaces, "policy.egress: a bundle's direct egress is served under enforce, logged under shadow (ADR-0030)");
     Some(mediatore_api::PolicyEgress {
         bundles: reflector.cache(),
         mode: policy.egress,

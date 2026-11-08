@@ -259,6 +259,8 @@ broker_policy_config() { # <shadow|enforce>
   BROKER_POD=$(broker_pod)
   [ -n "$BROKER_POD" ] || fail "no Running broker pod in $BROKER_NS"
   wait_for "$TIMEOUT" "'policy bundle reflector running' in the broker log" log_has "policy bundle reflector running"
+  # The mode is read off the log, never inferred from the start succeeding.
+  wait_for "$TIMEOUT" "'policy.egress' mode=$1 in the broker log" log_has "policy.egress" "mode=$1"
 }
 
 if [ -n "$POLICY_STATE" ]; then
