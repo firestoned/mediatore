@@ -167,6 +167,7 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
             .map(|a| (a.name.clone(), a.rules.clone()))
             .collect(),
         cas: audience_cas(&cfg)?,
+        no_credential: no_credential_audiences(&cfg),
         registries,
         sandboxes,
         sandbox_namespace: cfg.sandboxes.namespace.clone(),
@@ -369,6 +370,16 @@ async fn store(cfg: &Config) -> anyhow::Result<Arc<dyn ClaimStore>> {
         "store: migrated and connected"
     );
     Ok(Arc::new(store))
+}
+
+/// The audiences declared `via: none` (ADR-0025 decision 8): a route without a credential,
+/// and no token from `POST /v1/token`.
+fn no_credential_audiences(cfg: &Config) -> std::collections::BTreeSet<String> {
+    cfg.audiences
+        .iter()
+        .filter(|a| a.via == Backend::None)
+        .map(|a| a.name.clone())
+        .collect()
 }
 
 /// The CA bundles the egress proxy trusts per audience (`audiences[].ca_file`, ADR-0025

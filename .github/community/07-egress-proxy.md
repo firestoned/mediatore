@@ -45,14 +45,19 @@ Threat model R-3 was accepted until the ADR for this was written; it is rewritte
       Mozilla roots for the rest; a PEM that does not parse refuses the proxy and the
       claim. Proven in `e2e_egress.rs` through the production constructor against the
       test kit's CA, and refused with the CA stripped
-- [ ] A route without a credential, for what a policy admits without a token: a bundle's
+- [x] A route without a credential, for what a policy admits without a token: a bundle's
       direct `egress[]` (ADR-0030) and an audience whose upstream rejects the minted bearer
       (GitHub, the 2026-11-05 run). The gateway admits the direct entry under `enforce`
-      (proven 2026-11-08), but `/v1/me` renders routes from the claim's audiences only, so a
-      jail behind the gateways cannot ask the proxy for it: the proxy forwards a bare
-      request bare already (decision 3); what is missing is the route, rendered from the
-      bundle's served entries with no audience and no swap. An ADR amendment to ADR-0025
-      (the route shape) before code
+      (proven 2026-11-08), but `/v1/me` rendered routes from the claim's audiences only, so
+      a jail behind the gateways could not ask the proxy for it. Done 2026-11-08, ADR-0025
+      decision 8: `Route::credential` (`token` or `none`), the audience optional; under
+      `enforce` `/v1/me` renders a route per served direct entry (no audience, no rules,
+      the Mozilla roots), an audience `via: none` keeps its routes with `credential: none`
+      and gets no token from `POST /v1/token`; the proxy drops the phantom on such a route
+      and forwards bare, a foreign bearer stays `401`. Proven in `e2e_egress.rs`,
+      `e2e_gateway.rs` and `make kind-e2e-gateway-policy` (the direct route in the broker's
+      shape, the forward logged `credential=false`). Open beside it: a direct entry on a
+      private PKI has no CA on its route, so it is reachable on the public roots alone
 - [ ] An audience served directly, without the proxy, declared per audience for a
       protocol that is not HTTP; never a default. Until then such an audience is
       unreachable from the jail

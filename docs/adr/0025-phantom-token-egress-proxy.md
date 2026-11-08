@@ -4,7 +4,7 @@
 # ADR-0025: The egress proxy, a phantom token in the jail and the real one in a process the workload cannot read
 
 **Status:** Accepted · **Date:** 2026-10-30 · **Amended:** 2026-10-30 (decision 7, the
-audience's own CA)
+audience's own CA) · 2026-11-08 (decision 8, a route without a credential)
 
 Roadmap 07, the credential-injecting egress proxy: phase 2 of the delegation model that
 [ADR-0003](0003-token-backends.md) recorded as a trade-off and that threat model R-3
@@ -132,6 +132,42 @@ audience, and the audience chooses the token.
    default roots in its place. The CA is per audience, not per endpoint, since an audience
    is one API behind one authority.
 
+8. **A route without a credential.** (Amendment, 2026-11-08.) Two things the jail may be
+   allowed to reach carry no token of mediatore's: a direct `egress[]` entry of the claim's
+   policy bundle, which the gateway admits under `policy.egress: enforce`
+   ([ADR-0030](0030-policy-egress-enforced-at-the-gateway.md)) but which until now had no
+   route at the proxy, since `GET /v1/me` rendered routes from the claim's audiences alone
+   (the live tier of 2026-11-08 wrote that route by hand); and an audience whose upstream
+   has no use for a minted bearer (a public API reached as the subject's own, or
+   anonymously). The route gains `credential: token | none`, `token` when absent so every
+   route written before this amendment keeps its meaning, and its `audience` becomes
+   optional. Three rules:
+   - *Where a credential-less route comes from.* In `enforce`, `GET /v1/me` renders one
+     route per direct egress entry the broker serves for the claim (ADR-0030 decision 3:
+     exact `host:port`, no rules, the same list the gateway is given, decision 5 there),
+     with no audience, no rules, no CA (the Mozilla roots) and `credential: none`; an entry
+     whose endpoint is already an audience's gets no second route, the audience's stands,
+     since an endpoint names one route (decision 4). In `shadow` none is rendered: the
+     gateway would refuse the tunnel, and a route that leads nowhere is a lie to the
+     workload. An audience declared `via: none` in the broker's configuration renders its
+     routes as today, name, `egress`, `rules` and `ca_file`, with `credential: none`;
+     `POST /v1/token` refuses it (`403 no_credential`) for whoever asks, the proxy never
+     asks, and the `sts` section is not required for it.
+   - *What the proxy does there.* A request with no `Authorization` is forwarded bare, as on
+     every route. A request with the phantom is forwarded bare too: the phantom is dropped,
+     never sent upstream, and the log line says `credential=false`. Tools send
+     `Authorization: Bearer $MEDIATORE_TOKEN` to every host they are pointed at, and what
+     the route says is that nothing goes in its place. Any other `Authorization` stays
+     `401`: a credential baked into an image is still refused, whatever the route. The
+     rules and the CA on the route apply as on any other; a direct entry has neither.
+   - *What does not change.* The route is the proxy's, the allowlist is the gateway's:
+     a direct entry the broker does not serve (rules, a wildcard, an IP literal, `P007`)
+     gets no route, and a route is never a reason for the gateway to admit a tunnel. The
+     proxy refuses to start on a route that says `token` and names no audience. An older
+     guest, given a route without an `audience`, refuses the whole answer to `GET /v1/me`
+     and the claim does not start: guest images are upgraded before `enforce` is turned on
+     where bundles hold direct egress.
+
 ## Consequences
 
 - `crates/mediatore-guest/src/egress.rs` (the `egress-proxy` role: the routes, the
@@ -153,6 +189,16 @@ audience, and the audience chooses the token.
   the token fetched once for two requests, and the same upstream refused (`502`, nothing
   reaching it) when the route carries no CA. The image is unchanged; the kind tiers start
   no jail and no proxy.
+- Decision 8 (2026-11-08): `Credential` and `Route::credential`, `Route::audience` optional
+  (`crates/mediatore-proto`); `Backend::None` and the audience's `via: none`
+  (`crates/mediatore-entra`, `config.rs`, refused for an issuer); `served_direct_egress`
+  and the routes of `GET /v1/me`, `POST /v1/token`'s refusal (`crates/mediatore-api`);
+  `Routes::new`, `judge` and the trust per endpoint in the proxy
+  (`crates/mediatore-guest/src/egress.rs`). Proven in `e2e_egress.rs` (the phantom dropped
+  on a credential-less route, nothing fetched, a foreign bearer still refused, the `via:
+  none` audience's token refused) and `e2e_gateway.rs` (`GET /v1/me` carries the route
+  under `enforce` and not under `shadow`), and in kind by `make kind-e2e-gateway-policy`,
+  whose direct route is now the shape the broker renders.
 - What the workload sees: no socket, no `mediatore token`, a base URL and a phantom.
   Tools that take a base URL and a bearer from the environment work unchanged; `git`
   takes the URL and `http.extraheader`. The research agent walkthrough shows both.

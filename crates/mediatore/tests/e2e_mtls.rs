@@ -85,6 +85,7 @@ fn state(idp: &FakeIdp, dev_mode: bool) -> Arc<AppState> {
         egress: std::collections::BTreeMap::new(),
         rules: std::collections::BTreeMap::new(),
         cas: std::collections::BTreeMap::new(),
+        no_credential: std::collections::BTreeSet::new(),
         registries: std::collections::BTreeMap::new(),
         reachable_registries: None,
         policy_egress: None,

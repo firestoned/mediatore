@@ -16,7 +16,9 @@ use serde::Deserialize;
 pub struct AudienceConfig {
     /// Audience value as written into `aud`.
     pub name: String,
-    /// Backend that mints for it.
+    /// Backend that mints for it; `none` for an audience reached without a credential
+    /// (ADR-0025 decision 8): its route carries `credential: none`, `POST /v1/token`
+    /// refuses it, and `egress`, `rules` and `ca_file` apply as for any other.
     pub via: Backend,
     /// Maximum token lifetime in seconds (default 900).
     #[serde(default = "default_max_ttl")]
@@ -672,6 +674,10 @@ impl Config {
                     "issuer {}: an `entra` section needs backend entra-obo",
                     issuer.url
                 ),
+                (Backend::None, _) => anyhow::bail!(
+                    "issuer {}: backend none is an audience's (a route without a credential, ADR-0025 decision 8), never an issuer's",
+                    issuer.url
+                ),
                 _ => {}
             }
             let Some(entra) = &issuer.entra else {
@@ -821,6 +827,26 @@ listen: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }
             Some(std::path::Path::new("/etc/mediatore-cas/home.pem"))
         );
         assert_eq!(cfg.audiences[1].ca_file, None, "no file: the Mozilla roots");
+    }
+
+    #[test]
+    fn an_audience_via_none_is_reached_without_a_credential_and_an_issuer_cannot_be() {
+        let cfg = Config::parse(
+            "trust_domain: sandbox.test\nissuers: []\nlisten: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }\ndev_mode: true\naudiences:\n  - name: api.example.com\n    via: none\n    egress: [\"api.example.com:443\"]\n    rules:\n      - { method: GET, path: \"/repos/**\" }\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.audiences[0].via, Backend::None);
+        assert_eq!(cfg.audiences[0].rules.len(), 1, "the rules still apply");
+        assert!(
+            cfg.audiences.iter().all(|a| a.via != Backend::Sts),
+            "no sts audience, so no sts section is needed"
+        );
+        let err = Config::parse(
+            "trust_domain: sandbox.test\nlisten: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }\ndev_mode: true\naudiences: []\nissuers:\n  - url: https://idp.example.com\n    backend: none\n    client_id: mediatore\n    subject_claim: email\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("never an issuer's"), "{err}");
     }
 
     #[test]

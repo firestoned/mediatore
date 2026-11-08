@@ -117,11 +117,13 @@ own change; this ADR does not touch it.
   second port opens (Envoy `status=200`, the authorizer's `allow` served by the broker, the
   destination's request line on that port), the host with rules stays `not_allowed` and is
   P007 (`has_rules`), the other host and the audience endpoint behave as before. One thing the
-  tier writes by hand that the guest does not: a route for the direct entry. `/v1/me` renders
-  routes from the claim's audiences only, so on a gateway-era pool the jail has no way to ask
-  the proxy for a direct egress host even once the gateway admits it. That is the
-  credential-less route of roadmap 07, not this ADR's: the gateway side is what this ADR
-  decides, and it holds.
+  tier wrote by hand that day that the guest did not: a route for the direct entry. `/v1/me`
+  rendered routes from the claim's audiences only, so on a gateway-era pool the jail had no
+  way to ask the proxy for a direct egress host even once the gateway admitted it. Closed the
+  same day by ADR-0025 decision 8 (roadmap 07): in `enforce`, `/v1/me` renders a route per
+  served entry with no audience and `credential: none`, the proxy drops the phantom there and
+  forwards bare; `served_direct_egress` feeds the routes and the gateway's answer alike, so
+  decision 5 holds for the routes too. The tier's direct route is now that shape.
 - Tests: units in `policy.rs`, `shadow.rs` and `config.rs`; end to end in
   `crates/mediatore/tests/e2e_gateway.rs` (enforce adds, shadow does not, no policy or an
   unknown policy adds nothing, rules, IP literals and wildcards are never served). The

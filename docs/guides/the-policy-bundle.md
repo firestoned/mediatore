@@ -175,15 +175,18 @@ policy and the bundle version when it appears or changes:
 | `P003` | an `egress` endpoint for an audience that the bundle audience does not list |
 | `P004` | a rule for an audience that no bundle rule covers, or no rules where the bundle has some |
 | `P005` | a sandbox `ttlSeconds` above the bundle's `lease.maxDurationSeconds` |
-| `P006` | nothing: the bundle holds direct `egress[]`, which the broker has no way to provide |
+| `P006` | nothing: the bundle holds direct `egress[]`, which the broker does not provide while `policy.egress` is `shadow` (under `enforce` it does, and only an entry it cannot serve is reported, as `P007`) |
 | `P010` | no `policyRef` on the sandbox |
 | `P011` | a `policyRef` to no verified, unexpired bundle |
 
 Reading them: `P001` to `P005` are the places where `audiences[]` in `mediatore.yaml`, or
 the request itself, is looser than the reviewed policy; each becomes a refusal one for one
 when the bundle is enforced, so the fix is in the configuration or the policy, now, while
-nothing breaks. `P006` is a policy that expects direct egress, which the broker's design
-does not provide (every call is brokered through the proxy). `P010` says the sandbox is
+nothing breaks. `P006` is a policy that expects direct egress while the broker is in
+`shadow`; under `enforce` the exact `host:port` entries are served to the gateway and the
+proxy gets a route for each with no credential ([ADR-0030](../adr/0030-policy-egress-enforced-at-the-gateway.md),
+[ADR-0025](../adr/0025-phantom-token-egress-proxy.md) decision 8), and what cannot be
+served (rules, a wildcard, an IP literal) is `P007`. `P010` says the sandbox is
 outside the policy altogether; `P011` that it names one notaio has not published a bundle
 for, or one the broker does not trust: check the broker's log for the refusal.
 
