@@ -52,6 +52,15 @@ the live run against a tenant, by hand.
       secret on refreshes, `groups_claim`; Google and Auth0 as fake profiles with the
       real login code run against them (`crates/mediatore/tests/e2e_issuers.rs`); the
       issuers guide covers GitHub-through-Dex, Google, Auth0 and Entra
+- [ ] A third backend, `via: secret`: an operator-held credential for an audience, read from
+      a mounted Secret at start, handed to the proxy by `POST /v1/token` with the header it
+      goes in (`authorization` as a bearer, or a named header such as `x-api-key`), the
+      phantom recognised in that header too and the owned headers stripped on every route;
+      never in the jail. The first use is Claude from inside the sandbox: the SDK or Claude
+      Code pointed at the proxy with `ANTHROPIC_BASE_URL` and the phantom as
+      `ANTHROPIC_AUTH_TOKEN`. [ADR-0032](../../docs/adr/0032-operator-held-credentials-as-an-audience-backend.md)
+      proposed 2026-11-08; then the federation exchange (the STS token for a short-lived
+      Anthropic one) as the attributed end state
 - [ ] The live run against a tenant (`crates/mediatore/tests/live_entra.rs`, ignored,
       by hand): the exchange, the refresh for mediatore's own resource, the refresh for
       a downstream audience, a revoked Entra session answering `invalid_grant`; the
