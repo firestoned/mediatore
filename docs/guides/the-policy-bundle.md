@@ -104,6 +104,16 @@ and both stay refused after a restart because the floor came back from the store
 rule is notaio's (`next_floor`); the store's part is a compare-and-set, so two replicas
 cannot move a floor down between them. Rows are never deleted with their policy.
 
+notaio re-signs every bundle when half its lifetime is left (the default lifetime is 15
+minutes, a site value between 5 minutes and a day): the same version and content digest,
+a later `issuedAt` and `notAfter`. The broker admits that refresh as it admits any bundle
+at or above the floor, replaces the held copy so the new `notAfter` takes, and compares no
+sandbox again, since nothing the comparison reads has changed. Expiry is strict: a bundle
+past `notAfter` is gone for every reader at once, with no skew allowance, so the broker's
+clock may run ahead of notaio's by less than the refresh margin (half the lifetime) or the
+policy briefly reads as having no bundle (`P011`, and under ADR-0030's `enforce` the
+gateway's answer shrinks to the audience endpoints on its next ask). Keep both on NTP.
+
 ## Naming a policy on a sandbox
 
 `spec.policyRef` names the `SandboxPolicy` the sandbox is under, looked up in the
