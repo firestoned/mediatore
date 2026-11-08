@@ -3,7 +3,7 @@
 
 # ADR-0030: A policy's direct egress, enforced at the gateway behind a switch
 
-**Status:** Implemented · **Date:** 2026-11-05 (accepted and implemented the same day; the live proof against the real Envoy is open, roadmap 11)
+**Status:** Implemented · **Date:** 2026-11-05 (accepted and implemented the same day; proven against the real Envoy in kind on 2026-11-08, `make kind-e2e-gateway-policy`; the rollout is roadmap 11's)
 
 Roadmap 11. The first enforcing step of [ADR-0026](0026-notaio-bundles-verified-in-shadow.md),
 limited to one thing: the verified bundle's direct `egress[]`. Amends
@@ -109,6 +109,19 @@ own change; this ADR does not touch it.
   watcher gets the mode through `WatcherConfig::egress_mode`.
 - A cache that has not completed its first list is empty, so a replica that is not ready
   serves the audience endpoints only, with no separate check.
+- Live (2026-11-08): `make kind-e2e-gateway-policy` runs the gateway tier under a notaio bundle
+  whose `egress[]` names the destination's second port and a host with rules. Under `shadow`
+  the second port is `403 not_allowed` at the gateway as before, the broker logs
+  `policy.egress is shadow: direct egress not served` with `would_add` naming that port alone,
+  and the sandbox reports P006; after the switch to `enforce` and a restart, the tunnel to the
+  second port opens (Envoy `status=200`, the authorizer's `allow` served by the broker, the
+  destination's request line on that port), the host with rules stays `not_allowed` and is
+  P007 (`has_rules`), the other host and the audience endpoint behave as before. One thing the
+  tier writes by hand that the guest does not: a route for the direct entry. `/v1/me` renders
+  routes from the claim's audiences only, so on a gateway-era pool the jail has no way to ask
+  the proxy for a direct egress host even once the gateway admits it. That is the
+  credential-less route of roadmap 07, not this ADR's: the gateway side is what this ADR
+  decides, and it holds.
 - Tests: units in `policy.rs`, `shadow.rs` and `config.rs`; end to end in
   `crates/mediatore/tests/e2e_gateway.rs` (enforce adds, shadow does not, no policy or an
   unknown policy adds nothing, rules, IP literals and wildcards are never served). The

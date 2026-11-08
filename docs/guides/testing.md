@@ -123,6 +123,8 @@ Suites today:
 | `make kind-e2e-store` | 0012 | the broker on PostgreSQL over `verify-full`, the store conformance suite against that database, below |
 | `make kind-e2e-dex` | 0013 | the real CLI logging in at a real Dex from inside the cluster and delegating the session, a refresh at Dex before every issue, the claim released when the user leaves the gated group in the directory and when the refresh token is deleted at Dex, below |
 | `make kind-e2e-policy` | 0026 | notaio installed from its release manifests and signing with the kind OpenBao, its bundle admitted by the broker and recorded on each claim, the `PolicyConformant` verdicts and codes on four sandboxes, a newer bundle followed, the earlier one delivered again refused by the version floor before and after a broker restart, nothing refused on the bundle's account, below |
+| `make kind-e2e-gateway` | 0028 | the real egress proxy tunnelling a claim's requests through a real Envoy on the gateway SVID to its one destination and nothing else, the authorizer's cache through a broker outage, the cut-off on release, below |
+| `make kind-e2e-gateway-policy` | 0030 | the gateway tier under a notaio bundle: a direct egress entry refused under `policy.egress: shadow` and opened at the real Envoy under `enforce`, an entry with rules never served, below |
 | `make kind-e2e-tpm` | 0018 | an agent attesting with a vTPM behind the kind node through the `tpm` plugin, on `image/spire/agent.conf`, refused under a CA that never signed its EK and listed under the EK's hash under the right one, the member's certificate becoming the node entry under that agent, the guest registering over the SVID it issues and only then announcing `GuestReady` (ADR-0019), a fresh pod re-attesting as the same agent; since ADR-0031 the agent's bundle is the OpenBao PKI root alone and the server's `bundle show` is asserted to be that root and nothing self-signed of its own; not part of `make kind-e2e` and not in CI (it needs `sudo`, swtpm and the kernel's vtpm proxy on the host), below |
 
 ### The store: PostgreSQL over TLS the client verifies
@@ -364,6 +366,17 @@ deleted sandbox is cut off with `claim_gone` once its answer is stale, and Envoy
 log, the authorizer's decisions, the proxy's forwards and the destination's requests agree
 on who reached what. The checks are listed in the script; a mismatch names the authority,
 the status and what was expected.
+
+`make kind-e2e-gateway-policy` is the same run under a policy (ADR-0030): notaio (from
+`make kind-notaio`) publishes the bundle of a policy whose direct `egress[]` names the
+destination's second port and a host with rules, the broker's configuration gains a `policy`
+section trusting notaio's key with `egress: shadow`, and the sandbox names the policy. Under
+shadow the second port is refused at the gateway as in the plain run, the broker logs what
+enforce would add and the sandbox reports P006; the script then switches the broker to
+`enforce`, waits for P007 (the host with rules, never served) in place of P006, and a probe
+reaches the second port through a tunnel the authorizer allowed from the broker's answer,
+while the host with rules, another host and the audience endpoint behave as before. The
+broker's configuration is restored to the overlay's at the end, for the tiers after it.
 
 ### The sandbox filesystem and the pull: by hand, on the build host
 

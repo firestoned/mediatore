@@ -469,6 +469,11 @@ kind-e2e-gateway: kind-banlieue-crds kind-broker kind-gateway ## ADR-0028 live: 
 	$(KIND_KUBECTL) -n banlieue-system rollout status deploy/mediatore --timeout=300s
 	./dev/kind/gateway-e2e.sh $(KIND_KUBECONFIG) $(KIND_SA_KUBECONFIG) $(SPIRE_TRUST_DOMAIN) $(KIND_DIR)/ek.pem $(KIND_DIR)/ek.hash $(KIND_DIR)/gateway/ca.pem
 
+kind-e2e-gateway-policy: kind-banlieue-crds kind-broker kind-notaio kind-gateway ## ADR-0030 live: the gateway tier under a notaio bundle whose direct egress names the destination's second port; refused under policy.egress shadow (the broker logging what it would add, P006), opened at the real Envoy under enforce (P007 for an entry with rules, the audience endpoints unchanged)
+	$(KIND_KUBECTL) -n banlieue-system rollout restart deploy/mediatore
+	$(KIND_KUBECTL) -n banlieue-system rollout status deploy/mediatore --timeout=300s
+	./dev/kind/gateway-e2e.sh $(KIND_KUBECONFIG) $(KIND_SA_KUBECONFIG) $(SPIRE_TRUST_DOMAIN) $(KIND_DIR)/ek.pem $(KIND_DIR)/ek.hash $(KIND_DIR)/gateway/ca.pem $(KIND_DIR)
+
 kind-e2e-dex: kind-banlieue-crds kind-broker ## ADR-0013 live: the real CLI logs in at a real Dex and delegates the session, every token issue refreshes it, a group removal and a revocation at Dex release the claim
 	$(KIND_KUBECTL) -n banlieue-system rollout restart deploy/mediatore
 	$(KIND_KUBECTL) -n banlieue-system rollout status deploy/mediatore --timeout=300s
@@ -479,7 +484,7 @@ kind-e2e-tpm: kind-vtpm kind-banlieue-crds kind-broker ## ADR-0018 live: an agen
 	$(KIND_KUBECTL) -n banlieue-system rollout status deploy/mediatore --timeout=300s
 	TPM_PLUGIN_AGENT_IMG=$(TPM_PLUGIN_AGENT_IMG) UPSTREAM_ROOT=$(KIND_DIR)/openbao/upstream-root.pem ./dev/kind/tpm-e2e.sh $(KIND_KUBECONFIG) $(SPIRE_TRUST_DOMAIN) $(KIND_VTPM_DIR)
 
-kind-e2e: kind-e2e-entries kind-e2e-mtls kind-e2e-watcher kind-e2e-sandbox kind-e2e-store kind-e2e-dex kind-e2e-policy kind-e2e-gateway ## Every live suite against kind that needs nothing of the host (grows with the roadmap); kind-e2e-tpm needs a vTPM
+kind-e2e: kind-e2e-entries kind-e2e-mtls kind-e2e-watcher kind-e2e-sandbox kind-e2e-store kind-e2e-dex kind-e2e-policy kind-e2e-gateway kind-e2e-gateway-policy ## Every live suite against kind that needs nothing of the host (grows with the roadmap); kind-e2e-tpm needs a vTPM
 
 kind-e2e-ci: ## CI shape: $(KIND_E2E_SUITES), cluster state on failure, cluster deleted after
 	@$(MAKE) $(KIND_E2E_SUITES) || { $(MAKE) kind-e2e-logs; $(MAKE) kind-delete; exit 1; }

@@ -12,7 +12,16 @@
 # and bound as in the sandbox tier, so the broker has a live claim whose allowlist is one
 # destination, a TLS server on the fixture CA `make kind-gateway` minted.
 #
-#   gateway-e2e.sh <admin kubeconfig> <broker SA kubeconfig> <trust domain> <ek pem> <ek hash file> <destination ca pem>
+#   gateway-e2e.sh <admin kubeconfig> <broker SA kubeconfig> <trust domain> <ek pem> <ek hash file> <destination ca pem> [<state dir>]
+#
+# With a state dir (`make kind-e2e-gateway-policy`, ADR-0030), the same run goes under a
+# policy: notaio publishes a bundle for the claim's policy whose direct `egress[]` names the
+# destination's second port and an entry with rules; the broker, trusting notaio's key, runs
+# in `policy.egress: shadow` first, so the second port stays refused at the gateway while the
+# broker logs what it would have added and the sandbox reports P006; then in `enforce`, so a
+# tunnel to the second port opens and the destination answers through it, the entry with
+# rules is still refused (P007) and the audience endpoints stand. The rest of the run is the
+# same in both modes, which is what "shadow serves today's answer" means.
 #
 # What it proves: the workload's request reaches its one destination through the proxy's
 # tunnel, with the STS token swapped in, and the destination answers; a second host and a
@@ -32,6 +41,8 @@ TD=${3:?trust domain}
 EK_PEM=${4:?ek pem}
 EK_HASH=$(tr -d '\n' < "${5:?ek hash file}")
 DEST_CA_PEM=${6:?destination ca pem}
+# Set: the ADR-0030 stages, with notaio's key in <state dir>/notaio/public-key.txt.
+POLICY_STATE=${7:-}
 K=(kubectl --kubeconfig "$ADMIN_KUBECONFIG")
 KSA=(kubectl --kubeconfig "$SA_KUBECONFIG")
 BROKER_NS=banlieue-system
@@ -42,6 +53,13 @@ ENTRY_SELECTOR=app.kubernetes.io/managed-by=mediatore
 GATEWAY=gateway.$NS.svc.cluster.local:8443
 DEST_HOST=destination.$NS.svc.cluster.local
 DESTINATION=$DEST_HOST:8443
+# ADR-0030: the destination's second port, a policy's direct egress entry the gateway can
+# enforce exactly; and one it cannot (rules), never served.
+DIRECT=$DEST_HOST:8081
+RULED=only-some.$NS.svc.cluster.local:443
+POLICY=e2e-gateway
+BUNDLE_CM=$POLICY-bundle
+VERSION_ANN='sandbox\.firestoned\.io/bundle-version'
 PROXY=http://127.0.0.1:3128
 # The phantom the workload presents (ADR-0025 decision 3); a fixture, never a secret.
 PHANTOM=e2e-phantom-0123456789abcdef0123456789abcdef
@@ -50,6 +68,7 @@ FRESH_SECS=5
 STALE_SECS=120
 
 command -v jq >/dev/null || { echo "jq is required" >&2; exit 1; }
+[ -z "$POLICY_STATE" ] || [ -f "$POLICY_STATE/notaio/public-key.txt" ] || { echo "no $POLICY_STATE/notaio/public-key.txt: run make kind-notaio first" >&2; exit 1; }
 
 say()  { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 fail() { printf '\033[31mFAIL: %s\033[0m\n' "$*"; dump; exit 1; }
@@ -62,7 +81,8 @@ envoy_logs()  { "${K[@]}" -n "$NS" logs deploy/gateway -c envoy 2>/dev/null || t
 # The authorizer's and the proxy's string fields print quoted (tracing's Debug form);
 # the quotes are dropped so a field can be matched as key=value.
 authz_logs()  { "${K[@]}" -n "$NS" logs deploy/gateway -c authorizer 2>/dev/null | plain | tr -d '"' || true; }
-dest_logs()   { "${K[@]}" -n "$NS" logs deploy/destination 2>/dev/null || true; }
+dest_logs()   { "${K[@]}" -n "$NS" logs deploy/destination -c destination 2>/dev/null || true; }
+direct_logs() { "${K[@]}" -n "$NS" logs deploy/destination -c direct 2>/dev/null || true; }
 pod_logs()    { "${K[@]}" -n "$NS" logs "pod/$1" -c workload 2>/dev/null | plain || true; }
 proxy_logs()  { "${K[@]}" -n "$NS" logs "pod/$1" -c proxy 2>/dev/null | plain | tr -d '"' || true; }
 node_logs()   { "${K[@]}" -n "$NS" logs pod/node 2>/dev/null | plain || true; }
@@ -70,14 +90,22 @@ pod_phase()   { "${K[@]}" -n "$NS" get pod "$1" -o jsonpath='{.status.phase}' 2>
 entries()     { "${K[@]}" get clusterstaticentries -l "$ENTRY_SELECTOR" -o jsonpath='{range .items[*]}{.metadata.name} {.spec.spiffeID}{"\n"}{end}' 2>/dev/null || true; }
 sandbox()     { "${K[@]}" -n "$NS" get agentsandbox "$1" -o json 2>/dev/null || true; }
 field()       { sandbox "$1" | jq -r "$2 // empty"; }
+verdict()     { sandbox "$1" | jq -r '.status.conditions[]? | select(.type == "PolicyConformant") | "\(.status) \(.reason) \(.message)"'; }
+verdict_has() { verdict sb-gw | grep -F "$1" | grep -qF "${2:-}"; }
+bundle_version() { "${K[@]}" -n "$NS" get configmap "$BUNDLE_CM" -o jsonpath="{.metadata.annotations.$VERSION_ANN}" 2>/dev/null || true; }
 
-PROBES=(probe-claim probe-node probe-warm probe-outage-1 probe-outage-2 probe-released)
+PROBES=(probe-claim probe-node probe-enforce probe-warm probe-outage-1 probe-outage-2 probe-released)
 
 dump() {
   printf '\n--- broker (last 40 lines)\n'; broker_logs | tail -40
   printf '\n--- envoy (last 40 lines)\n'; envoy_logs | tail -40
   printf '\n--- authorizer (last 40 lines)\n'; authz_logs | tail -40
   printf '\n--- destination (last 20 lines)\n'; dest_logs | tail -20
+  if [ -n "$POLICY_STATE" ]; then
+    printf '\n--- destination, direct port (last 10 lines)\n'; direct_logs | tail -10
+    printf '\n--- sb-gw verdict: %s\n' "$(verdict sb-gw)"
+    printf '\n--- notaio (last 20 lines)\n'; "${K[@]}" -n notaio-system logs deploy/notaio --tail=20 2>/dev/null | plain || true
+  fi
   printf '\n--- %s pods\n' "$NS"; "${K[@]}" -n "$NS" get pods -o wide 2>/dev/null || true
   for p in "${PROBES[@]}"; do
     printf '\n--- %s (workload)\n' "$p"; pod_logs "$p" | tail -12
@@ -95,7 +123,16 @@ cleanup() {
   "${K[@]}" delete clusterstaticentries -l "$ENTRY_SELECTOR" --ignore-not-found --wait=false >/dev/null 2>&1 || true
   "${K[@]}" -n "$BROKER_NS" scale deploy/mediatore --replicas=1 >/dev/null 2>&1 || true
 }
-trap cleanup EXIT
+# At the end only (cleanup also runs mid-script, for a clean slate): the policy fixtures
+# removed and the broker's configuration as the overlay ships it, for the tiers after this one.
+policy_teardown() {
+  [ -n "$POLICY_STATE" ] || return 0
+  "${K[@]}" -n "$NS" delete sandboxpolicy "$POLICY" exposureceiling "$POLICY" configmap "$BUNDLE_CM" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  "${K[@]}" apply -k dev/kind/broker >/dev/null 2>&1 || true
+  "${K[@]}" -n "$BROKER_NS" rollout restart deploy/mediatore >/dev/null 2>&1 || true
+  "${K[@]}" -n "$BROKER_NS" rollout status deploy/mediatore --timeout=120s >/dev/null 2>&1 || true
+}
+trap 'cleanup; policy_teardown' EXIT
 
 wait_for() { # <seconds> <description> <command...>
   local secs=$1 what=$2 i; shift 2
@@ -109,6 +146,7 @@ log_has() { broker_logs | grep -F "$1" | grep -qF "${2:-}"; }
 envoy_has() { envoy_logs | grep -F "$1" | grep -F "${2:-}" | grep -qF "${3:-}"; }
 authz_has() { authz_logs | grep -F "$1" | grep -F "${2:-}" | grep -qF "${3:-}"; }
 dest_has()  { dest_logs | grep -F "$1" | grep -qF "${2:-}"; }
+direct_has() { direct_logs | grep -F "$1" | grep -qF "${2:-}"; }
 proxy_has() { proxy_logs "$1" | grep -F "$2" | grep -qF "${3:-}"; }
 LOG_WAIT=30
 wait_for_end() {
@@ -205,6 +243,87 @@ YAML
   [ "$(pod_phase "$name")" = Succeeded ] || fail "$name did not end as expected"
 }
 
+# ADR-0030: the broker's configuration with a `policy` section trusting notaio's key, the
+# bundles read from this namespace, the switch as given; applied and the broker restarted.
+broker_policy_config() { # <shadow|enforce>
+  local key_id public_key
+  read -r key_id public_key < "$POLICY_STATE/notaio/public-key.txt"
+  {
+    cat dev/kind/broker/mediatore.yaml
+    printf 'policy:\n  trusted_keys:\n    - { id: "%s", public_key: "%s" }\n  namespaces: [%s]\n  egress: %s\n' "$key_id" "$public_key" "$NS" "$1"
+  } > "$FILES/mediatore.yaml"
+  "${K[@]}" -n "$BROKER_NS" create configmap mediatore-config --from-file=mediatore.yaml="$FILES/mediatore.yaml" \
+    --dry-run=client -o yaml | "${K[@]}" apply -f - >/dev/null
+  "${K[@]}" -n "$BROKER_NS" rollout restart deploy/mediatore >/dev/null
+  "${K[@]}" -n "$BROKER_NS" rollout status deploy/mediatore --timeout=120s >/dev/null
+  BROKER_POD=$(broker_pod)
+  [ -n "$BROKER_POD" ] || fail "no Running broker pod in $BROKER_NS"
+  wait_for "$TIMEOUT" "'policy bundle reflector running' in the broker log" log_has "policy bundle reflector running"
+}
+
+if [ -n "$POLICY_STATE" ]; then
+  say "policy (ADR-0030): notaio's bundle Role and the broker's read Role in $NS; the broker in policy.egress: shadow"
+  "${K[@]}" -n "$NS" delete sandboxpolicy "$POLICY" exposureceiling "$POLICY" configmap "$BUNDLE_CM" --ignore-not-found --wait=true >/dev/null
+  "${K[@]}" -n "$NS" apply -f dev/kind/notaio/notaio-bundles.yaml >/dev/null
+  mkdir -p "$POLICY_STATE/policy-bundles"
+  printf 'namespace: %s\nresources:\n  - ../../deploy/policy-bundles\n' "$NS" > "$POLICY_STATE/policy-bundles/kustomization.yaml"
+  "${K[@]}" apply -k "$POLICY_STATE/policy-bundles" >/dev/null
+  broker_policy_config shadow
+  echo "reflector running on ${BROKER_POD#pod/}, switch shadow"
+
+  say "policy (ADR-0030): the claim's policy, its audience exactly the broker's, two direct egress entries ($DIRECT; $RULED with rules)"
+  "${K[@]}" -n "$NS" apply -f - >/dev/null <<YAML
+apiVersion: sandbox.firestoned.io/v1alpha2
+kind: ExposureCeiling
+metadata:
+  name: $POLICY
+spec:
+  audiences:
+    - name: e2e-egress
+      access: Read
+      maxTtlSeconds: 900
+      endpoints: ["$DESTINATION"]
+  egressHosts: ["$DIRECT", "$RULED"]
+  tools: []
+  maxLeaseSeconds: 3600
+  approvals:
+    - role: Security
+      reference: https://github.com/firestoned/mediatore/pull/1
+---
+apiVersion: sandbox.firestoned.io/v1alpha2
+kind: SandboxPolicy
+metadata:
+  name: $POLICY
+spec:
+  # lab: the one profile that admits rules on a direct egress entry (K4.1 R2), which the
+  # gateway cannot enforce and the broker never serves (decision 3, P007).
+  profileRef: lab
+  subjects:
+    groups: ["00000000-0000-0000-0000-000000000000"]
+  audiences:
+    - name: e2e-egress
+      access: Read
+      scopes: ["e2e:read"]
+      ttlSeconds: 900
+      endpoints: ["$DESTINATION"]
+      rules: []
+  egress:
+    - { endpoint: "$DIRECT", rules: [] }
+    - endpoint: "$RULED"
+      rules:
+        - { method: GET, path: "/only/**" }
+  tools: []
+  lease:
+    maxDurationSeconds: 3600
+    maxConcurrent: 1
+YAML
+  published() { [ -n "$(bundle_version)" ]; }
+  wait_for "$TIMEOUT" "ConfigMap $BUNDLE_CM with a bundle version" published
+  BUNDLE_V=$(bundle_version)
+  wait_for "$TIMEOUT" "'policy bundle admitted' version=$BUNDLE_V in the broker log" log_has "policy bundle admitted" "version=$BUNDLE_V"
+  echo "bundle v$BUNDLE_V of $NS/$POLICY published by notaio and admitted by the broker"
+fi
+
 say "broker: the watcher Lease is held by the running pod"
 "${K[@]}" -n "$BROKER_NS" rollout status deploy/mediatore --timeout=60s >/dev/null
 BROKER_POD=$(broker_pod)
@@ -235,15 +354,18 @@ say "the proxy's files: the routes (the destination on the fixture CA, two more 
 # since the proxy runs in a pod with the claim's SVID and not on the node that fetched
 # the subject. The two extra routes exist so the proxy admits the requests and the
 # gateway, not the proxy, is what refuses them.
-jq -n --arg ca "$(cat "$DEST_CA_PEM")" --arg host "$DEST_HOST" '[
+# The second port carries the CA too: under ADR-0030's enforce it is reached, over TLS on
+# the same fixture certificate. The ruled host is a route the gateway refuses in every mode.
+jq -n --arg ca "$(cat "$DEST_CA_PEM")" --arg host "$DEST_HOST" --arg ruled "${RULED%:*}" '[
   { audience: "e2e-egress", endpoint: { host: $host, port: 8443 }, rules: [], ca_pem: $ca },
   { audience: "e2e-egress", endpoint: { host: "elsewhere.example.com", port: 443 }, rules: [] },
-  { audience: "e2e-egress", endpoint: { host: $host, port: 8081 }, rules: [] }
+  { audience: "e2e-egress", endpoint: { host: $host, port: 8081 }, rules: [], ca_pem: $ca },
+  { audience: "e2e-egress", endpoint: { host: $ruled, port: 443 }, rules: [] }
 ]' > "$FILES/routes.json"
 jq -n --arg host "gateway.$NS.svc.cluster.local" '[ { host: $host, port: 8443 } ]' > "$FILES/gateways.json"
 printf '%s' "$PHANTOM" > "$FILES/phantom"
 "${K[@]}" -n "$NS" create configmap forward-files --from-file="$FILES/routes.json" --from-file="$FILES/gateways.json" --from-file="$FILES/phantom" --dry-run=client -o yaml | "${K[@]}" apply -f - >/dev/null
-echo "routes: 3 (one with the CA), gateways: 1 ($GATEWAY)"
+echo "routes: 4 (the destination's two ports with the CA), gateways: 1 ($GATEWAY)"
 
 "${K[@]}" apply -f - >/dev/null <<YAML
 apiVersion: spire.spiffe.io/v1alpha1
@@ -310,6 +432,7 @@ spec:
   ttlSeconds: 900
   audiences: ["e2e-egress"]
   workload: { image: "registry.internal:5000/sandbox:e2e", args: ["sh"] }
+$( [ -n "$POLICY_STATE" ] && printf '  policyRef: { name: %s }\n' "$POLICY" )
 YAML
 has_claim() { "${K[@]}" -n "$NS" get virtualmachineclaim sb-gw >/dev/null 2>&1; }
 wait_for "$TIMEOUT" "claim sb-gw" has_claim
@@ -320,6 +443,11 @@ jq -Rs '{status: {phase: "Bound", virtualMachineRef: {name: "member-1"}, tpmEndo
 ready() { [ "$(field sb-gw '.status.ready')" = "true" ] && [ "$(field sb-gw '.status.phase')" = "Bound" ]; }
 wait_for "$TIMEOUT" "sb-gw Ready" ready
 echo "claim $CLAIM_UID bound; its allowlist is $DESTINATION (audience e2e-egress)"
+if [ -n "$POLICY_STATE" ]; then
+  wait_for "$TIMEOUT" "sb-gw's PolicyConformant with P006 under shadow" verdict_has "False Gaps" "P006 the bundle holds 2 direct egress entries"
+  verdict sb-gw | grep -F "P00" | grep -vF "P006" | grep -q . && fail "a gap other than P006 under shadow: $(verdict sb-gw)"
+  echo "under shadow: $(verdict sb-gw)"
+fi
 
 say "claim SVID: a fixture entry for spiffe://$TD/banlieue/claim/$CLAIM_UID (on a VM, the broker's entry)"
 "${K[@]}" apply -f - >/dev/null <<YAML
@@ -360,6 +488,14 @@ wait_for "$LOG_WAIT" "the authorizer's refusal" authz_has "claim_uid=$CLAIM_UID"
 wait_for "$LOG_WAIT" "the destination's request line" dest_has "destination request" "host=$DESTINATION"
 broker_logs | grep -F "claim egress answered to the gateway" | grep -qF "claim_uid=$CLAIM_UID" || true
 echo "Envoy: 200 and 403 keyed by the claim SVID; authorizer: broker then cache, one deny; destination: the requests"
+if [ -n "$POLICY_STATE" ]; then
+  say "shadow (ADR-0030 decision 4): the second port refused as today, the broker logging what enforce would add"
+  wait_for "$LOG_WAIT" "the broker's shadow line for the claim" log_has "policy.egress is shadow: direct egress not served" "claim_uid=$CLAIM_UID"
+  broker_logs | grep -F "policy.egress is shadow" | grep -F "claim_uid=$CLAIM_UID" | grep -qF "would_add=$DIRECT" || fail "the shadow line does not name $DIRECT alone"
+  wait_for "$LOG_WAIT" "Envoy's 403 for the second port" envoy_has "tunnel peer=spiffe://$TD/banlieue/claim/$CLAIM_UID" "authority=$DIRECT" "status=403"
+  wait_for "$LOG_WAIT" "the authorizer's not_allowed for the second port" authz_has "authority=$DIRECT" "verdict=deny" "reason=not_allowed"
+  echo "shadow: $DIRECT refused at the gateway; would_add=$DIRECT logged; $RULED named nowhere"
+fi
 
 say "a node SVID: the proxy's handshake refused by Envoy's validator, no check made, 502 gateway_unreachable at the workload"
 probe probe-node node bare "$DESTINATION=502:gateway_unreachable"
@@ -367,6 +503,29 @@ probe probe-node node bare "$DESTINATION=502:gateway_unreachable"
 wait_for "$LOG_WAIT" "the validator's alert in the proxy's log" proxy_has probe-node "gateway unreachable; trying the next" "fatal alert"
 authz_logs | grep -F "peer=spiffe://$TD/banlieue/node/$EK_HASH" && fail "the node reached the authorizer"
 echo "handshake refused before any check; no gateway carried the tunnel"
+
+if [ -n "$POLICY_STATE" ]; then
+  say "enforce (ADR-0030 decisions 1, 3, 6): the switch flipped, the second port opens, the ruled entry never served"
+  broker_policy_config enforce
+  wait_for "$TIMEOUT" "lease mediatore-watcher held by ${BROKER_POD#pod/}" holder_is_pod
+  wait_for "$TIMEOUT" "'claim watcher running' in the new broker log" log_has "claim watcher running"
+  wait_for "$TIMEOUT" "'policy bundle admitted' version=$BUNDLE_V in the new broker log" log_has "policy bundle admitted" "version=$BUNDLE_V"
+  wait_for "$TIMEOUT" "sb-gw's PolicyConformant with P007 under enforce" verdict_has "False Gaps" "P007 direct egress $RULED is not served by the broker: has_rules"
+  verdict sb-gw | grep -qF "P006" && fail "P006 still reported under enforce: $(verdict sb-gw)"
+  echo "under enforce: $(verdict sb-gw)"
+  probe probe-enforce claim phantom \
+    "$DIRECT=200" \
+    "$RULED=502:gateway_refused" \
+    "elsewhere.example.com:443=502:gateway_refused" \
+    "$DESTINATION=200"
+  pod_logs probe-enforce | grep -F "status=200" | grep -qF "destination reached: host=$DIRECT" || fail "the second port did not answer through the tunnel"
+  wait_for "$LOG_WAIT" "the forward to the second port in the proxy's log" proxy_has probe-enforce "forwarded" "host=$DIRECT"
+  wait_for "$LOG_WAIT" "Envoy's 200 for the second port" envoy_has "tunnel peer=spiffe://$TD/banlieue/claim/$CLAIM_UID" "authority=$DIRECT" "status=200"
+  wait_for "$LOG_WAIT" "the authorizer's allow for the second port, served by the broker" authz_has "authority=$DIRECT" "verdict=allow" "served=broker"
+  wait_for "$LOG_WAIT" "the authorizer's not_allowed for the ruled entry" authz_has "authority=$RULED" "verdict=deny" "reason=not_allowed"
+  wait_for "$LOG_WAIT" "the second port's request line" direct_has "destination request" "host=$DIRECT"
+  echo "enforce: a tunnel to $DIRECT opened and answered; $RULED and the other host refused; $DESTINATION as before"
+fi
 
 say "the broker gone: the cached allowlist stands in, then the outage is a refusal"
 # A fresh answer in the cache right before the broker goes, so the stale window the next
@@ -398,4 +557,5 @@ wait_for "$LOG_WAIT" "the authorizer's claim_gone" authz_has "claim_uid=$CLAIM_U
 wait_for "$LOG_WAIT" "the gateway's claim_gone in the proxy's log" proxy_has probe-released "the gateway refused the tunnel" "claim_gone"
 echo "cut off: the broker's 404 dropped the cache; the workload sees 502 gateway_refused"
 
+[ -z "$POLICY_STATE" ] || say "PASS: ADR-0030 holds against a real Envoy: under shadow the gateway's answer is today's and the broker logs what it would add; under enforce the bundle's exact entry opens at the gateway and the destination answers through it, an entry with rules is never served (P007), the audience endpoints stand"
 say "PASS: ADR-0028 decisions 2 to 5, 7 and 8 hold against a real Envoy through the real forwarder (SDS identity, the validator, the proxy's tunnel through the authorizer with the token swapped in, the cache bounds, the outage, the release)"

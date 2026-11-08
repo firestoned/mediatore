@@ -45,6 +45,14 @@ Threat model R-3 was accepted until the ADR for this was written; it is rewritte
       Mozilla roots for the rest; a PEM that does not parse refuses the proxy and the
       claim. Proven in `e2e_egress.rs` through the production constructor against the
       test kit's CA, and refused with the CA stripped
+- [ ] A route without a credential, for what a policy admits without a token: a bundle's
+      direct `egress[]` (ADR-0030) and an audience whose upstream rejects the minted bearer
+      (GitHub, the 2026-11-05 run). The gateway admits the direct entry under `enforce`
+      (proven 2026-11-08), but `/v1/me` renders routes from the claim's audiences only, so a
+      jail behind the gateways cannot ask the proxy for it: the proxy forwards a bare
+      request bare already (decision 3); what is missing is the route, rendered from the
+      bundle's served entries with no audience and no swap. An ADR amendment to ADR-0025
+      (the route shape) before code
 - [ ] An audience served directly, without the proxy, declared per audience for a
       protocol that is not HTTP; never a default. Until then such an audience is
       unreachable from the jail
