@@ -82,9 +82,16 @@ installed beyond a `ServiceAccount` a live test left behind.
       server's bundle is that root; the OpenBao side and the no-cliff migration in the
       deploying guide. Closes the first-boot window the live runs of rc.3 and rc.4 hit
       (a layer good for one `ca_ttl`, the pool churning past it); R-7 narrows
-- [ ] ADR-0031 on the homelab cluster: OpenBao deployed beside the broker (ADR-0015 is not
-      live there yet), the `spire` mount and role, the component applied, one last layer
-      rebuild with the root; then the pool stops churning a day after each build
+- [x] ADR-0031 on the homelab cluster: the `spire` PKI mount, root, policy and role on the
+      OpenBao already there (notaio's, ADR-0004), the server (a Helm release there) given
+      the chart's `upstreamAuthority.vault` values, a new authority prepared and activated
+      on each server so the root entered the bundle at once, one last layer rebuild (both
+      ISOs) with the root alone; the pool's image moved and its members recycled onto it.
+      Done 2026-11-08: the first recycled member booted with the root as its whole bundle,
+      attested as `tpm` and announced `GuestReady`. Found on the way: a server that already
+      has a CA keeps it across the upgrade until it prepares its next one, and its serving
+      certificate stays until its half-life (the guide now carries the rotation and the
+      restart)
 - [ ] The VM image with the agent, the plugin from `dist/` and the fragments baked by
       banlieue-imagebuilder (roadmap 06's image item; the mediatore side is `image/`)
 - [x] Part 3 acceptance on libvirt: a fresh member appears in `agent list` as type

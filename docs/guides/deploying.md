@@ -281,16 +281,38 @@ kubectl -n spire-server rollout status statefulset/spire-server
 kubectl -n spire-server exec spire-server-0 -c spire-server -- spire-server bundle show
 ```
 
-The switch has no cliff. The server's bundle after the restart holds the OpenBao root and,
-until the old CA retires one `ca_ttl` later, the self-signed CA; running agents receive
-it over the attested channel; a layer built before the switch still verifies the server
-for the rest of that CA's life; the next layer you build carries the root alone
+A server that already has a CA keeps it across the restart, and the next one it had
+prepared too: the upstream signs only when a new authority is prepared, which the server
+does on its own halfway through `ca_ttl`. To have the root in the bundle now rather than
+within a day, prepare and activate a new authority on each server:
+
+```sh
+for p in spire-server-0 spire-server-1; do
+  kubectl -n spire-server exec $p -c spire-server -- spire-server localauthority x509 prepare
+  kubectl -n spire-server exec $p -c spire-server -- spire-server localauthority x509 show   # the prepared authority's ID, upstream-signed
+  kubectl -n spire-server exec $p -c spire-server -- spire-server localauthority x509 activate -authorityID <prepared>
+done
+# The servers' own serving certificates were issued by the old CA and rotate at their
+# half-life; until then a member holding the root alone logs "Trust Bundle and Server
+# don't agree". A restart re-mints them under the new authority, chain included.
+kubectl -n spire-server rollout restart statefulset/spire-server
+kubectl -n spire-server rollout status statefulset/spire-server
+echo | openssl s_client -connect <server address>:8081 -showcerts 2>/dev/null \
+  | openssl verify -CAfile upstream-root.pem   # from the root alone, with the chain presented
+```
+
+The switch has no cliff. The server's bundle after the rotation holds the OpenBao root
+and, until the old CA retires one `ca_ttl` later, the self-signed CA; running agents
+receive it over the attested channel; a layer built before the switch still verifies the
+server for the rest of that CA's life; the next layer you build carries the root alone
 (`upstream-root.pem` above, or `bundle show` once the old CA is gone) and is the last one
 you rebuild for this reason. If OpenBao is away when the server prepares its next
 intermediate (halfway through `ca_ttl`, so twelve hours of slack) the server keeps
 signing with the current one until it expires and issues nothing after; size OpenBao for
 that. A chart-managed server reaches the same state through the hardened chart's
-`upstreamAuthority.vault` values instead of the component.
+`upstreamAuthority.vault` values instead of the component (`caCert` as a ConfigMap with
+the key `ca.crt`, `k8sAuth.token.audience` the role's audience); the chart mounts the CA
+and the projected token itself, and the rotation above is the same.
 
 A new hypervisor is a new key in the ConfigMap and the same restart. The whole path,
 from this component to an agent attesting with a vTPM, a refusal under a CA that did not
