@@ -43,6 +43,8 @@ bVIP4yKaVz1Zp2QNVZJ0t2NIXK0K55dfgdM/B4JF09EKDd/q/nHoAfis
 
 const TRUST_DOMAIN: &str = "sandbox.test";
 const AUDIENCE: &str = "internal-api";
+/// An audience reached without a credential (`via: none`, ADR-0025 decision 8).
+const PUBLIC: &str = "api.example.com";
 const REQUIRED_GROUP: &str = "firestoned:sandbox-users";
 const PEER_HEADER: &str = "x-mediatore-peer-spiffe-id";
 const EK_HASH: &str = "72c566555391e835a15c522680b51ec3b840561ed70af5605a5ae4835f040ee8";
@@ -161,11 +163,17 @@ impl Harness {
                 groups_claim: None,
             }]),
             sts: Some(sts),
-            audiences: vec![AUDIENCE.into()],
+            audiences: vec![AUDIENCE.into(), PUBLIC.into()],
             obo_audiences: vec![],
-            egress: [(AUDIENCE.to_owned(), vec![upstream.endpoint()])]
-                .into_iter()
-                .collect(),
+            egress: [
+                (AUDIENCE.to_owned(), vec![upstream.endpoint()]),
+                (
+                    PUBLIC.to_owned(),
+                    vec!["api.example.com:443".parse().unwrap()],
+                ),
+            ]
+            .into_iter()
+            .collect(),
             rules: [(
                 AUDIENCE.to_owned(),
                 vec![
@@ -186,6 +194,7 @@ impl Harness {
             cas: [(AUDIENCE.to_owned(), upstream.ca_pem())]
                 .into_iter()
                 .collect(),
+            no_credential: [PUBLIC.to_owned()].into_iter().collect(),
             registries: std::collections::BTreeMap::new(),
             reachable_registries: None,
             policy_egress: None,
@@ -246,6 +255,10 @@ impl Harness {
     }
 
     async fn claim(&self) -> ClaimResponse {
+        self.claim_with(&[AUDIENCE]).await
+    }
+
+    async fn claim_with(&self, audiences: &[&str]) -> ClaimResponse {
         let resp = self
             .http
             .post(format!("{}/v1/claims", self.user_url))
@@ -253,7 +266,7 @@ impl Harness {
             .json(&ClaimRequest {
                 pool_ref: "pool-a".into(),
                 ttl_seconds: 3600,
-                audiences: vec![AUDIENCE.into()],
+                audiences: audiences.iter().map(|a| (*a).to_owned()).collect(),
                 workload: Workload {
                     image: "registry.internal:5000/sandbox:latest".into(),
                     args: vec!["/usr/bin/agent".into()],
@@ -349,7 +362,8 @@ async fn the_phantom_is_swapped_for_a_real_token_the_workload_never_sees() {
     // the audience's rules (ADR-0025 decision 4).
     let me = h.me().await;
     assert_eq!(me.routes.len(), 1);
-    assert_eq!(me.routes[0].audience, AUDIENCE);
+    assert_eq!(me.routes[0].audience.as_deref(), Some(AUDIENCE));
+    assert!(me.routes[0].injects());
     assert_eq!(me.routes[0].endpoint, h.upstream.endpoint());
     assert_eq!(me.routes[0].rules.len(), 2);
     assert_eq!(
@@ -445,6 +459,109 @@ async fn the_phantom_is_swapped_for_a_real_token_the_workload_never_sees() {
         "nothing injected without the phantom"
     );
     assert_eq!(tokens.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn a_route_without_a_credential_forwards_bare_and_the_phantom_never_leaves() {
+    let h = Harness::start().await;
+    h.register_node().await;
+    let claim = h.claim_with(&[AUDIENCE, PUBLIC]).await;
+    let uid = claim.uid.expect("uid");
+
+    // The `via: none` audience's route says so (ADR-0025 decision 8), beside the other's.
+    let me = h.me().await;
+    assert_eq!(me.routes.len(), 2);
+    let public = me
+        .routes
+        .iter()
+        .find(|r| r.audience.as_deref() == Some(PUBLIC))
+        .expect("the public audience's route");
+    assert_eq!(public.credential, mediatore_proto::Credential::None);
+    assert!(!public.injects());
+    assert!(
+        me.routes
+            .iter()
+            .find(|r| r.audience.as_deref() == Some(AUDIENCE))
+            .expect("the other route")
+            .injects()
+    );
+    // And the broker mints nothing for it, whoever holds the claim SVID.
+    let resp = h
+        .http
+        .post(format!("{}/v1/token", h.sandbox_url))
+        .header(
+            PEER_HEADER,
+            format!("spiffe://{TRUST_DOMAIN}/banlieue/claim/{uid}"),
+        )
+        .json(&TokenRequest {
+            audience: PUBLIC.into(),
+        })
+        .send()
+        .await
+        .expect("token request");
+    assert_eq!(resp.status(), 403);
+    let body: serde_json::Value = resp.json().await.expect("json");
+    assert_eq!(body["error"], "no_credential");
+
+    // The proxy against the real upstream, its route turned credential-less: the shape a
+    // bundle's direct egress entry arrives in (no audience, no rules, ADR-0030), the CA
+    // kept so the fixture upstream is reachable.
+    let routes: Vec<mediatore_proto::Route> = me
+        .routes
+        .into_iter()
+        .filter(|r| r.audience.as_deref() == Some(AUDIENCE))
+        .map(|r| mediatore_proto::Route {
+            audience: None,
+            rules: vec![],
+            credential: mediatore_proto::Credential::None,
+            ..r
+        })
+        .collect();
+    let (proxy, phantom, tokens) = h.start_proxy(routes, &uid).await;
+    let host = h.upstream.endpoint().to_string();
+
+    // The phantom presented, as every tool does: dropped, the request leaves bare.
+    let resp = h
+        .http
+        .get(format!("{proxy}/{host}/api/things"))
+        .bearer_auth(phantom.expose())
+        .send()
+        .await
+        .expect("through the proxy");
+    assert_eq!(resp.status(), 200);
+    let seen = h.seen();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(
+        seen[0].authorization, None,
+        "the phantom never leaves the proxy and nothing replaces it"
+    );
+    assert_eq!(
+        tokens.calls.load(Ordering::SeqCst),
+        0,
+        "no token is fetched"
+    );
+
+    // No header: bare, as on every route.
+    let resp = h
+        .http
+        .get(format!("{proxy}/{host}/api/public"))
+        .send()
+        .await
+        .expect("bare request");
+    assert_eq!(resp.status(), 200);
+    assert_eq!(h.seen().len(), 2);
+
+    // A credential the image brought: refused on this route as on any other.
+    let resp = h
+        .http
+        .get(format!("{proxy}/{host}/api/things"))
+        .bearer_auth("baked-into-the-image")
+        .send()
+        .await
+        .expect("foreign bearer");
+    assert_eq!(resp.status(), 401);
+    assert_eq!(h.seen().len(), 2, "nothing reached the upstream");
+    assert_eq!(tokens.calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

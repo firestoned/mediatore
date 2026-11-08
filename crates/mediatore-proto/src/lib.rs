@@ -261,13 +261,32 @@ fn glob_matches(pattern: &[&str], path: &[&str]) -> bool {
     }
 }
 
-/// One route of the egress proxy (ADR-0025): an audience, one of its `egress` endpoints,
-/// and the audience's rules. `GET /v1/me` carries one per audience and endpoint of the
-/// claim; the proxy chooses the audience, and so the token, by the endpoint a request names.
+/// What the egress proxy puts in place of the phantom on a route (ADR-0025 decision 8).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Credential {
+    /// The route's audience's bearer, fetched over the claim SVID: the default, so a route
+    /// written before the field existed keeps its meaning.
+    #[default]
+    Token,
+    /// Nothing: the phantom is dropped and the request leaves bare. A policy bundle's
+    /// direct egress (ADR-0030), or an audience declared `via: none`.
+    None,
+}
+
+/// One route of the egress proxy (ADR-0025): one `host:port` the proxy forwards to, the
+/// rules a request must meet there, and what goes in place of the phantom. `GET /v1/me`
+/// carries one per audience and `egress` endpoint of the claim and, in `policy.egress:
+/// enforce`, one per direct egress entry its bundle holds that the gateway serves
+/// (decision 8); the proxy chooses the route, and so the credential, by the endpoint a
+/// request names.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Route {
-    /// The audience whose token the proxy injects on this route.
-    pub audience: String,
+    /// The audience this route belongs to: whose token goes in when `credential` is
+    /// `token`, whose rules and CA apply either way. Absent on a route rendered from a
+    /// bundle's direct egress, which has no audience and so carries `credential: none`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audience: Option<String>,
     /// The upstream, reached over HTTPS.
     pub endpoint: Endpoint,
     /// The audience's rules; empty admits every method and path.
@@ -278,14 +297,29 @@ pub struct Route {
     /// Public material. Absent, the Mozilla roots.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ca_pem: Option<String>,
+    /// What replaces the phantom on this route (ADR-0025 decision 8); `token` when absent.
+    #[serde(default)]
+    pub credential: Credential,
 }
 
 impl Route {
-    /// Whether a request for `method` and `path` is admitted: always when the audience
-    /// declares no rules, else by at least one of them (ADR-0025 decision 4).
+    /// Whether a request for `method` and `path` is admitted: always when the route carries
+    /// no rules, else by at least one of them (ADR-0025 decision 4).
     #[must_use]
     pub fn admits(&self, method: &str, path: &str) -> bool {
         self.rules.is_empty() || self.rules.iter().any(|r| r.matches(method, path))
+    }
+
+    /// Whether the proxy swaps the phantom for the audience's token here.
+    #[must_use]
+    pub fn injects(&self) -> bool {
+        self.credential == Credential::Token
+    }
+
+    /// The audience for a log line: the name, or `-` on a route without one.
+    #[must_use]
+    pub fn audience_label(&self) -> &str {
+        self.audience.as_deref().unwrap_or("-")
     }
 }
 
@@ -381,7 +415,9 @@ pub struct Me {
     #[serde(default)]
     pub egress: Vec<Endpoint>,
     /// The egress proxy's routes (ADR-0025): one per audience and `egress` endpoint of the
-    /// claim, with the audience's rules, sorted by endpoint. The same destinations as
+    /// claim, with the audience's rules, and in `policy.egress: enforce` one without a
+    /// credential per direct egress entry of the claim's bundle that the gateway serves
+    /// (ADR-0025 decision 8, ADR-0030); sorted by endpoint. The same destinations as
     /// `egress`, which stays for the ruleset. Empty with an old broker: the proxy then
     /// routes nothing and the jail reaches nowhere.
     #[serde(default)]
@@ -559,10 +595,11 @@ mod tests {
     #[test]
     fn a_route_without_rules_admits_everything_and_one_with_rules_only_what_they_say() {
         let open = Route {
-            audience: "internal-git".into(),
+            audience: Some("internal-git".into()),
             endpoint: "git.home.example:443".parse().unwrap(),
             rules: vec![],
             ca_pem: None,
+            credential: Credential::Token,
         };
         assert!(open.admits("DELETE", "/anything/at/all"));
         let narrow = Route {
@@ -593,9 +630,17 @@ mod tests {
         .unwrap();
         assert_eq!(r.rules, Vec::<EndpointRule>::new());
         assert_eq!(r.ca_pem, None, "no ca_pem: the Mozilla roots");
+        assert_eq!(
+            r.credential,
+            Credential::Token,
+            "a route written before the field: the audience's token"
+        );
+        assert!(r.injects());
+        assert_eq!(r.audience_label(), "internal-git");
         let json = serde_json::to_value(&r).unwrap();
         assert_eq!(json["rules"], serde_json::json!([]));
         assert!(json.get("ca_pem").is_none(), "absent, not null: {json}");
+        assert_eq!(json["credential"], "token");
         let with_ca = Route {
             ca_pem: Some("-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----\n".into()),
             ..r
@@ -607,6 +652,31 @@ mod tests {
                 .unwrap()
                 .starts_with("-----BEGIN CERTIFICATE-----")
         );
+    }
+
+    #[test]
+    fn a_route_without_a_credential_needs_no_audience_and_says_so_on_the_wire() {
+        // A bundle's direct egress (ADR-0025 decision 8): no audience, nothing injected.
+        let r: Route = serde_json::from_value(serde_json::json!({
+            "endpoint": { "host": "repo.home.example", "port": 443 },
+            "credential": "none"
+        }))
+        .unwrap();
+        assert_eq!(r.audience, None);
+        assert!(!r.injects());
+        assert_eq!(r.audience_label(), "-");
+        let json = serde_json::to_value(&r).unwrap();
+        assert!(json.get("audience").is_none(), "absent, not null: {json}");
+        assert_eq!(json["credential"], "none");
+        // An audience reached without a token keeps its name (its rules and CA apply).
+        let named: Route = serde_json::from_value(serde_json::json!({
+            "audience": "api.example.com",
+            "endpoint": { "host": "api.example.com", "port": 443 },
+            "credential": "none"
+        }))
+        .unwrap();
+        assert_eq!(named.audience.as_deref(), Some("api.example.com"));
+        assert!(!named.injects());
     }
 
     #[test]

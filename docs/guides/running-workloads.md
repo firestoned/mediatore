@@ -245,8 +245,8 @@ under nsjail as the per-subject user. The jail gives it:
 
 | Inside the jail | Purpose |
 | --- | --- |
-| `MEDIATORE_EGRESS_PROXY` env (`http://127.0.0.1:3128`) | The **only** way out: a reverse proxy on the VM's loopback, run by the guest as your `sb-` user outside the jail. Call `$MEDIATORE_EGRESS_PROXY/<host>[:<port>]/<path>` and the proxy forwards to `https://<host>:<port>/<path>`, for the `egress` endpoints of the claim's audiences and no other host, trusting the Mozilla roots or the CA the operator named for that audience ([ADR-0025](../adr/0025-phantom-token-egress-proxy.md)); in an environment with egress gateways the connection is a tunnel through one of them, opened as your claim, and a gateway's refusal is `502` with `gateway_refused` ([ADR-0028](../adr/0028-egress-gateway-envoy-with-spiffe-identity.md)) |
-| `MEDIATORE_TOKEN` env | A **phantom** token: send it as `Authorization: Bearer $MEDIATORE_TOKEN` and the proxy replaces it with a real token for the host's audience on the way out. The real token lives in the proxy and never enters the jail. Any other `Authorization` value is refused (`401`); no header at all is forwarded bare |
+| `MEDIATORE_EGRESS_PROXY` env (`http://127.0.0.1:3128`) | The **only** way out: a reverse proxy on the VM's loopback, run by the guest as your `sb-` user outside the jail. Call `$MEDIATORE_EGRESS_PROXY/<host>[:<port>]/<path>` and the proxy forwards to `https://<host>:<port>/<path>`, for the `egress` endpoints of the claim's audiences, plus, where the operator has turned `policy.egress` to `enforce`, the direct `egress[]` hosts of the claim's policy bundle, and no other host, trusting the Mozilla roots or the CA the operator named for that audience ([ADR-0025](../adr/0025-phantom-token-egress-proxy.md), [ADR-0030](../adr/0030-policy-egress-enforced-at-the-gateway.md)); in an environment with egress gateways the connection is a tunnel through one of them, opened as your claim, and a gateway's refusal is `502` with `gateway_refused` ([ADR-0028](../adr/0028-egress-gateway-envoy-with-spiffe-identity.md)) |
+| `MEDIATORE_TOKEN` env | A **phantom** token: send it as `Authorization: Bearer $MEDIATORE_TOKEN` and the proxy replaces it with a real token for the host's audience on the way out. The real token lives in the proxy and never enters the jail. On a route without a credential (a policy bundle's direct egress host, or an audience the operator declared `via: none`) the phantom is dropped and the request leaves bare, so a tool that sends it to every host works there too. Any other `Authorization` value is refused (`401`) on every route; no header at all is forwarded bare |
 | The audience's rules | The operator may bound an audience to methods and paths (`audiences[].rules`, nono's `endpoint_rules` shape: `{ method, path }`, `*` one segment, `**` any). A request outside them is refused (`403`) before anything is forwarded; no rules means every method and path |
 | The rootfs (read-only) | Your image's filesystem as pulled: root-owned, setuid bits dropped, no device nodes ([ADR-0021](../adr/0021-sandbox-filesystem-tmpfs-and-rootfs-from-the-registry.md)) |
 | `/work` (writable), tmpfs `/tmp` + `$HOME` | Scratch space; `/work` is your `sb-` user's on the per-claim tmpfs, gone with the unmount at teardown |
@@ -260,7 +260,9 @@ No socket, no token files, no baked-in secrets, and no network beyond the proxy 
 through it, the endpoints the claim's audiences declare (`audiences[].egress` in the
 broker's config, [ADR-0020](../adr/0020-jail-network-nftables-keyed-by-sandbox-uid.md)):
 an audience with none gives nowhere to go, which is the default until the operator says
-where. Tools that take a base URL and a bearer from the environment work unchanged:
+where. A public API your tools reach as themselves, with no token of mediatore's, is an
+audience the operator declares `via: none`: same `egress`, same rules, the phantom dropped
+on the way out. Tools that take a base URL and a bearer from the environment work unchanged:
 `OPENAI_BASE_URL=$MEDIATORE_EGRESS_PROXY/api.openai.com/v1 OPENAI_API_KEY=$MEDIATORE_TOKEN`;
 `git clone -c http.extraheader="Authorization: Bearer $MEDIATORE_TOKEN" $MEDIATORE_EGRESS_PROXY/git.home.example/platform/services.git`.
 Nothing in the jail mints, refreshes or caches a token: the proxy does, over the claim's

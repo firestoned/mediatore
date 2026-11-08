@@ -35,9 +35,9 @@ use mediatore_entra::{IdpError, Validated, Validator};
 use mediatore_proto::ek::is_ek_hash;
 use mediatore_proto::image::ImageReference;
 use mediatore_proto::{
-    ClaimEgress, ClaimPhase, ClaimReport, ClaimRequest, ClaimResponse, Endpoint, EndpointRule,
-    ErrorBody, GuestReport, HostTable, Me, NodeRegistered, NodeRegistration, RegistryCredential,
-    Route, Secret, TokenRequest, TokenResponse,
+    ClaimEgress, ClaimPhase, ClaimReport, ClaimRequest, ClaimResponse, Credential, Endpoint,
+    EndpointRule, ErrorBody, GuestReport, HostTable, Me, NodeRegistered, NodeRegistration,
+    RegistryCredential, Route, Secret, TokenRequest, TokenResponse,
 };
 use mediatore_spire::{EntryManager, Naming};
 use mediatore_store::seal::{SealError, Sealer};
@@ -76,6 +76,9 @@ pub struct AppState {
     /// (`audiences[].ca_file`, ADR-0025 amended); absent, the Mozilla roots. Public material,
     /// validated at start, carried on the route.
     pub cas: BTreeMap<String, String>,
+    /// The audiences declared `via: none` (ADR-0025 decision 8): their routes carry
+    /// `credential: none` and `POST /v1/token` refuses them.
+    pub no_credential: std::collections::BTreeSet<String>,
     /// Per registry host (as the API reaches it), the operator's pull credential
     /// (`registries[]`); `GET /v1/me` hands the guest the one its claim's image names
     /// (ADR-0022).
@@ -859,21 +862,42 @@ async fn me(
         .expires_at
         .ok_or_else(|| ApiError::internal("bound claim has no deadline".to_owned()))?;
     // The destinations are the claim's audiences' (ADR-0020 decision 2): an audience that
-    // declares none contributes none, and the jail reaches the broker only.
-    let egress = egress_of(&st, &rec);
+    // declares none contributes none, and the jail reaches the broker only. Plus, in
+    // `policy.egress: enforce`, the direct egress of its bundle the gateway serves
+    // (ADR-0030), the same list the gateway is given.
+    let audience_endpoints = audience_egress(&st, &rec);
+    let direct = served_direct_egress(&st, &rec, &audience_endpoints);
+    let mut egress = audience_endpoints;
+    egress.extend(direct.iter().cloned());
+    egress.sort();
+    egress.dedup();
     // The proxy's routes (ADR-0025 decision 4): the same destinations, each with its
     // audience and that audience's rules; the config guarantees one audience per endpoint.
+    // A direct entry gets a route with no audience and no credential (decision 8): the
+    // proxy forwards bare, and the gateway, not the proxy, is what admits it.
     let mut routes: Vec<Route> = rec
         .audiences
         .iter()
         .flat_map(|a| {
             st.egress.get(a).into_iter().flatten().map(|e| Route {
-                audience: a.clone(),
+                audience: Some(a.clone()),
                 endpoint: e.clone(),
                 rules: st.rules.get(a).cloned().unwrap_or_default(),
                 ca_pem: st.cas.get(a).cloned(),
+                credential: if st.no_credential.contains(a) {
+                    Credential::None
+                } else {
+                    Credential::Token
+                },
             })
         })
+        .chain(direct.into_iter().map(|e| Route {
+            audience: None,
+            endpoint: e,
+            rules: vec![],
+            ca_pem: None,
+            credential: Credential::None,
+        }))
         .collect();
     routes.sort_by(|a, b| {
         a.endpoint
@@ -919,14 +943,26 @@ pub struct PolicyEgress {
 /// verified, gets the audience endpoints only.
 fn egress_of(st: &AppState, rec: &ClaimRecord) -> Vec<Endpoint> {
     let mut egress = audience_egress(st, rec);
+    let direct = served_direct_egress(st, rec, &egress);
+    egress.extend(direct);
+    egress.sort();
+    egress.dedup();
+    egress
+}
+
+/// The direct egress of the claim's bundle that the broker serves beyond `audience`
+/// (ADR-0030 decisions 1 to 4): in `enforce`, the servable entries not already an
+/// audience's, sorted; in `shadow`, none, with the log line saying what enforce would add.
+/// Empty without a `policy` section, a policy on the record or a usable bundle.
+fn served_direct_egress(st: &AppState, rec: &ClaimRecord, audience: &[Endpoint]) -> Vec<Endpoint> {
     let Some(pe) = st.policy_egress.as_ref() else {
-        return egress;
+        return vec![];
     };
     let Some(uid) = rec.policy_uid.as_deref() else {
-        return egress;
+        return vec![];
     };
     let Some(bundle) = pe.bundles.by_uid(uid, Utc::now()) else {
-        return egress;
+        return vec![];
     };
     let direct = mediatore_claims::policy::direct_egress(&bundle);
     for n in &direct.not_served {
@@ -935,14 +971,10 @@ fn egress_of(st: &AppState, rec: &ClaimRecord) -> Vec<Endpoint> {
     let added: Vec<Endpoint> = direct
         .served
         .into_iter()
-        .filter(|e| !egress.contains(e))
+        .filter(|e| !audience.contains(e))
         .collect();
     match pe.mode {
-        mediatore_claims::policy::EgressMode::Enforce => {
-            egress.extend(added);
-            egress.sort();
-            egress.dedup();
-        }
+        mediatore_claims::policy::EgressMode::Enforce => added,
         mediatore_claims::policy::EgressMode::Shadow => {
             if !added.is_empty() {
                 tracing::info!(
@@ -953,9 +985,9 @@ fn egress_of(st: &AppState, rec: &ClaimRecord) -> Vec<Endpoint> {
                     "policy.egress is shadow: direct egress not served"
                 );
             }
+            vec![]
         }
     }
-    egress
 }
 
 /// The union of the claim's audiences' `egress`, sorted and deduplicated.
@@ -1190,6 +1222,16 @@ async fn token(
     }
     if !rec.audiences.iter().any(|a| a == &req.audience) {
         return Err(ApiError::bad_request("unknown_audience", req.audience));
+    }
+    // ADR-0025 decision 8: an audience reached without a credential has no token to give;
+    // the proxy never asks, and nothing else holding the claim SVID gets one either.
+    if st.no_credential.contains(&req.audience) {
+        tracing::debug!(%claim_uid, audience = %req.audience, "token refused: the audience is served without a credential");
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "no_credential",
+            Some("the audience is reached without a credential (via: none)".to_owned()),
+        ));
     }
     if !st.limiter.allow(claim_uid) {
         return Err(ApiError::new(

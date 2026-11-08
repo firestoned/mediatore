@@ -354,12 +354,14 @@ say "the proxy's files: the routes (the destination on the fixture CA, two more 
 # since the proxy runs in a pod with the claim's SVID and not on the node that fetched
 # the subject. The two extra routes exist so the proxy admits the requests and the
 # gateway, not the proxy, is what refuses them.
-# The second port carries the CA too: under ADR-0030's enforce it is reached, over TLS on
-# the same fixture certificate. The ruled host is a route the gateway refuses in every mode.
+# The second port is the bundle's direct egress entry: its route is the shape the broker
+# renders for one under ADR-0030's enforce (ADR-0025 decision 8: no audience, no rules,
+# credential none, the phantom dropped), with the fixture CA kept so the proxy reaches the
+# destination's TLS. The ruled host is a route the gateway refuses in every mode.
 jq -n --arg ca "$(cat "$DEST_CA_PEM")" --arg host "$DEST_HOST" --arg ruled "${RULED%:*}" '[
   { audience: "e2e-egress", endpoint: { host: $host, port: 8443 }, rules: [], ca_pem: $ca },
   { audience: "e2e-egress", endpoint: { host: "elsewhere.example.com", port: 443 }, rules: [] },
-  { audience: "e2e-egress", endpoint: { host: $host, port: 8081 }, rules: [], ca_pem: $ca },
+  { endpoint: { host: $host, port: 8081 }, rules: [], ca_pem: $ca, credential: "none" },
   { audience: "e2e-egress", endpoint: { host: $ruled, port: 443 }, rules: [] }
 ]' > "$FILES/routes.json"
 jq -n --arg host "gateway.$NS.svc.cluster.local" '[ { host: $host, port: 8443 } ]' > "$FILES/gateways.json"
@@ -520,11 +522,12 @@ if [ -n "$POLICY_STATE" ]; then
     "$DESTINATION=200"
   pod_logs probe-enforce | grep -F "status=200" | grep -qF "destination reached: host=$DIRECT" || fail "the second port did not answer through the tunnel"
   wait_for "$LOG_WAIT" "the forward to the second port in the proxy's log" proxy_has probe-enforce "forwarded" "host=$DIRECT"
+  proxy_logs probe-enforce | grep -F "forwarded" | grep -F "host=$DIRECT" | grep -qF "credential=false" || fail "the forward to the direct entry carried a credential (ADR-0025 decision 8: the phantom is dropped, nothing goes in its place)"
   wait_for "$LOG_WAIT" "Envoy's 200 for the second port" envoy_has "tunnel peer=spiffe://$TD/banlieue/claim/$CLAIM_UID" "authority=$DIRECT" "status=200"
   wait_for "$LOG_WAIT" "the authorizer's allow for the second port, served by the broker" authz_has "authority=$DIRECT" "verdict=allow" "served=broker"
   wait_for "$LOG_WAIT" "the authorizer's not_allowed for the ruled entry" authz_has "authority=$RULED" "verdict=deny" "reason=not_allowed"
   wait_for "$LOG_WAIT" "the second port's request line" direct_has "destination request" "host=$DIRECT"
-  echo "enforce: a tunnel to $DIRECT opened and answered; $RULED and the other host refused; $DESTINATION as before"
+  echo "enforce: a tunnel to $DIRECT opened and answered, bare, on the credential-less route; $RULED and the other host refused; $DESTINATION as before"
 fi
 
 say "the broker gone: the cached allowlist stands in, then the outage is a refusal"

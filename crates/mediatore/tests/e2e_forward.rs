@@ -197,6 +197,7 @@ impl Harness {
             cas: [(AUDIENCE.to_owned(), upstream.tls.ca_pem())]
                 .into_iter()
                 .collect(),
+            no_credential: std::collections::BTreeSet::new(),
             registries: std::collections::BTreeMap::new(),
             reachable_registries,
             policy_egress: None,

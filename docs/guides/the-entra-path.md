@@ -100,7 +100,14 @@ process, not the first claim. `key_file` and `transit` need `certificate_file`;
 audiences:
   - { name: api://trading-data, via: entra-obo, egress: ["api.trading.example:443"] }
   - { name: grafana.home.example, via: sts, max_ttl: 900, egress: ["grafana.home.example:443"] }
+  - { name: api.example.com, via: none, egress: ["api.example.com:443"], rules: [{ method: GET, path: "/repos/**" }] }
 ```
+
+`via: none` is an audience reached without a credential ([ADR-0025](../adr/0025-phantom-token-egress-proxy.md)
+decision 8): the proxy drops the phantom and forwards bare, `POST /v1/token` refuses it,
+and `egress`, `rules` and `ca_file` apply as for any other. Its `max_ttl` still enters the
+shadow comparison with a policy bundle (`P002`), so keep it at or below the bundle
+audience's `ttlSeconds`.
 
 `egress` is where the workload reaches the audience's API from the jail ([ADR-0020](../adr/0020-jail-network-nftables-keyed-by-sandbox-uid.md)): the
 guest admits those `host:port` pairs for the sandbox uid and nothing else beyond the

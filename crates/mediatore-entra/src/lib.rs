@@ -33,7 +33,7 @@ use tokio::sync::RwLock;
 /// How long a fetched JWKS may be served from cache before it is re-fetched.
 const JWKS_CACHE_TTL_SECS: u64 = 300;
 
-/// Which exchange mechanism serves an issuer.
+/// Which exchange mechanism serves an issuer, or mints for an audience.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Backend {
@@ -41,6 +41,10 @@ pub enum Backend {
     EntraObo,
     /// mediatore signs its own tokens (see `mediatore-sts`); upstream is only for login.
     Sts,
+    /// Nothing is minted: an audience the workload reaches through the egress proxy without
+    /// a credential, its endpoints, rules and CA still the route's (ADR-0025 decision 8).
+    /// Never an issuer's backend; the configuration refuses it there.
+    None,
 }
 
 /// The delegated upstream session an issuer requires (ADR-0013): the caller hands over

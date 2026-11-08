@@ -6,12 +6,14 @@
 //! One process per claim, started by the guest as the sandbox user outside the jail. A
 //! reverse proxy on loopback: the workload calls `http://127.0.0.1:<port>/<host>[:<port>]/<path>`
 //! with the phantom token in `Authorization`, the proxy finds the route the host names (one
-//! of the claim's audiences and its `egress` endpoint, from `GET /v1/me`), checks the method
-//! and path against that audience's rules, swaps the phantom for a token for that audience
-//! (fetched over the claim SVID at `POST /v1/token`, cached until shortly before its expiry)
-//! and forwards over TLS 1.3 to the Mozilla roots, or to the CA the route carries for an
-//! upstream on a private PKI (`audiences[].ca_file`). The token is in this process's memory
-//! and nowhere else; the workload holds a phantom that is useless anywhere but here. In an
+//! of the claim's audiences and its `egress` endpoint, or a direct egress entry of its
+//! policy bundle, from `GET /v1/me`), checks the method and path against the route's
+//! rules, swaps the phantom for a token for the route's audience (fetched over the claim
+//! SVID at `POST /v1/token`, cached until shortly before its expiry), or drops it on a route
+//! that carries no credential (ADR-0025 decision 8), and forwards over TLS 1.3 to the
+//! Mozilla roots, or to the CA the route carries for an upstream on a private PKI
+//! (`audiences[].ca_file`). The token is in this process's memory and nowhere else; the
+//! workload holds a phantom that is useless anywhere but here. In an
 //! environment with egress gateways (ADR-0028) the upstream is not dialled directly: the
 //! proxy opens a tunnel through one of them as the claim, `CONNECT host:port` over mutual
 //! TLS with the claim SVID, and the upstream TLS runs inside it ([`crate::forward`], the
@@ -154,11 +156,15 @@ impl Routes {
         let mut by_host: BTreeMap<String, Vec<Endpoint>> = BTreeMap::new();
         for r in routes {
             let e = r.endpoint.clone();
+            anyhow::ensure!(
+                !r.injects() || r.audience.is_some(),
+                "route {e} injects a token but names no audience; the proxy cannot choose one"
+            );
             if let Some(other) = by_endpoint.insert(e.clone(), r) {
                 anyhow::bail!(
-                    "endpoint {e} is on two routes ({} and {}); the proxy cannot choose a token",
-                    other.audience,
-                    by_endpoint[&e].audience
+                    "endpoint {e} is on two routes ({} and {}); the proxy cannot choose a credential",
+                    other.audience_label(),
+                    by_endpoint[&e].audience_label()
                 );
             }
             by_host.entry(e.host.clone()).or_default().push(e);
@@ -222,12 +228,14 @@ pub struct Forward<'a> {
     pub route: &'a Route,
     /// The path and query the upstream gets: everything after the host segment.
     pub path_and_query: String,
-    /// Whether the phantom was presented and a token for the route's audience goes in.
+    /// Whether the phantom was presented and the route injects (decision 8): a token for
+    /// the route's audience goes in. On a route without a credential the phantom is
+    /// dropped and the request leaves bare.
     pub inject: bool,
 }
 
 /// Decide a request from its method, its path and query, and its `Authorization` header
-/// (decisions 2 to 4). Pure, so the whole policy is unit-tested without a socket.
+/// (decisions 2 to 4 and 8). Pure, so the whole policy is unit-tested without a socket.
 ///
 /// # Errors
 /// The refusal the workload gets.
@@ -262,7 +270,7 @@ pub fn judge<'a>(
     }
     let inject = match authorization {
         None => false,
-        Some(v) if phantom.is_bearer(v) => true,
+        Some(v) if phantom.is_bearer(v) => route.injects(),
         Some(_) => return Err(Refusal::new(StatusCode::UNAUTHORIZED, "unknown_credential")),
     };
     Ok(Forward {
@@ -356,9 +364,10 @@ pub struct Proxy {
     dialer: Dialer,
     /// The trust for a route without a CA of its own.
     tls: Arc<rustls::ClientConfig>,
-    /// Per audience, the trust for routes that carry a CA (`Route::ca_pem`): exactly that
-    /// CA, never the default roots as well.
-    tls_by_audience: HashMap<String, Arc<rustls::ClientConfig>>,
+    /// Per endpoint, the trust for a route that carries a CA (`Route::ca_pem`): exactly that
+    /// CA and nothing else (decision 7); keyed by the endpoint since a route without a
+    /// credential may carry one too and names no audience (decision 8).
+    tls_by_endpoint: HashMap<Endpoint, Arc<rustls::ClientConfig>>,
 }
 
 type Body = BoxBody<Bytes, hyper::Error>;
@@ -385,16 +394,18 @@ impl Proxy {
         tls: rustls::ClientConfig,
         dialer: Dialer,
     ) -> anyhow::Result<Self> {
-        let mut tls_by_audience = HashMap::new();
+        let mut tls_by_endpoint = HashMap::new();
         for r in routes.by_endpoint.values() {
-            if let Some(pem) = &r.ca_pem
-                && !tls_by_audience.contains_key(&r.audience)
-            {
+            if let Some(pem) = &r.ca_pem {
                 let cfg = mediatore_proto::tls::https_client_config_with_ca(pem.as_bytes())
                     .map_err(|e| {
-                        anyhow::anyhow!("route {} (audience {}): {e}", r.endpoint, r.audience)
+                        anyhow::anyhow!(
+                            "route {} (audience {}): {e}",
+                            r.endpoint,
+                            r.audience_label()
+                        )
                     })?;
-                tls_by_audience.insert(r.audience.clone(), http1_only(cfg));
+                tls_by_endpoint.insert(r.endpoint.clone(), http1_only(cfg));
             }
         }
         Ok(Self {
@@ -404,7 +415,7 @@ impl Proxy {
             cache: TokenCache::default(),
             dialer,
             tls: http1_only(tls),
-            tls_by_audience,
+            tls_by_endpoint,
         })
     }
 
@@ -434,12 +445,12 @@ impl Proxy {
         &self.dialer
     }
 
-    /// The trust for `route`: its audience's CA when it carries one, the default otherwise.
+    /// The trust for `route`: the CA it carries when it does, the default otherwise.
     fn tls_for(&self, route: &Route) -> Arc<rustls::ClientConfig> {
         route
             .ca_pem
             .as_ref()
-            .and_then(|_| self.tls_by_audience.get(&route.audience))
+            .and_then(|_| self.tls_by_endpoint.get(&route.endpoint))
             .unwrap_or(&self.tls)
             .clone()
     }
@@ -492,16 +503,16 @@ impl Proxy {
         };
         let route = forward.route.clone();
         let path_log = forward.path_and_query.clone();
-        let bearer = if forward.inject {
-            match self.cache.bearer(&*self.tokens, &route.audience).await {
+        let bearer = match (forward.inject, route.audience.as_deref()) {
+            (true, Some(audience)) => match self.cache.bearer(&*self.tokens, audience).await {
                 Ok(b) => Some(b),
                 Err(e) => {
-                    tracing::error!(audience = %route.audience, error = %e, "no token for the proxy");
+                    tracing::error!(audience, error = %e, "no token for the proxy");
                     return refuse(&Refusal::new(StatusCode::BAD_GATEWAY, "token_unavailable"));
                 }
-            }
-        } else {
-            None
+            },
+            // `Routes::new` refused a route that injects with no audience; nothing goes in.
+            _ => None,
         };
         let upstream = rewrite(req, &forward, bearer.as_deref());
         match connect_and_send(
@@ -514,7 +525,7 @@ impl Proxy {
         {
             Ok((resp, via)) => {
                 tracing::info!(
-                    audience = %route.audience,
+                    audience = route.audience_label(),
                     host = %route.endpoint,
                     %method,
                     path = %path_log,
@@ -531,15 +542,15 @@ impl Proxy {
             }
             Err(SendError::Dial(e @ DialError::Refused { .. })) => {
                 // The environment's verdict on this tunnel, with the authorizer's code.
-                tracing::warn!(audience = %route.audience, host = %route.endpoint, error = %e, "the gateway refused the tunnel");
+                tracing::warn!(audience = route.audience_label(), host = %route.endpoint, error = %e, "the gateway refused the tunnel");
                 refuse(&Refusal::new(StatusCode::BAD_GATEWAY, e.code()))
             }
             Err(SendError::Dial(e)) => {
-                tracing::error!(audience = %route.audience, host = %route.endpoint, error = %e, "upstream unreachable");
+                tracing::error!(audience = route.audience_label(), host = %route.endpoint, error = %e, "upstream unreachable");
                 refuse(&Refusal::new(StatusCode::BAD_GATEWAY, e.code()))
             }
             Err(SendError::Upstream(e)) => {
-                tracing::error!(audience = %route.audience, host = %route.endpoint, error = %e, "upstream unreachable");
+                tracing::error!(audience = route.audience_label(), host = %route.endpoint, error = %e, "upstream unreachable");
                 refuse(&Refusal::new(
                     StatusCode::BAD_GATEWAY,
                     "upstream_unreachable",
@@ -814,11 +825,11 @@ pub async fn run(args: EgressArgs) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mediatore_proto::EndpointRule;
+    use mediatore_proto::{Credential, EndpointRule};
 
     fn route(audience: &str, endpoint: &str, rules: &[(&str, &str)]) -> Route {
         Route {
-            audience: audience.into(),
+            audience: Some(audience.into()),
             endpoint: endpoint.parse().unwrap(),
             rules: rules
                 .iter()
@@ -828,6 +839,7 @@ mod tests {
                 })
                 .collect(),
             ca_pem: None,
+            credential: Credential::Token,
         }
     }
 
@@ -935,11 +947,11 @@ mod tests {
     fn the_host_segment_names_the_route_by_endpoint_or_by_a_host_on_one_route() {
         let r = routes();
         assert_eq!(
-            r.resolve("git.home.example").unwrap().audience,
+            r.resolve("git.home.example").unwrap().audience_label(),
             "internal-git"
         );
         assert_eq!(
-            r.resolve("git.home.example:443").unwrap().audience,
+            r.resolve("git.home.example:443").unwrap().audience_label(),
             "internal-git"
         );
         assert!(
@@ -957,9 +969,15 @@ mod tests {
                 .port,
             8443
         );
-        assert_eq!(r.resolve("192.0.2.10").unwrap().audience, "data");
-        assert_eq!(r.resolve("[2001:db8::1]:8443").unwrap().audience, "data6");
-        assert_eq!(r.resolve("[2001:db8::1]").unwrap().audience, "data6");
+        assert_eq!(r.resolve("192.0.2.10").unwrap().audience_label(), "data");
+        assert_eq!(
+            r.resolve("[2001:db8::1]:8443").unwrap().audience_label(),
+            "data6"
+        );
+        assert_eq!(
+            r.resolve("[2001:db8::1]").unwrap().audience_label(),
+            "data6"
+        );
         assert!(r.resolve("evil.example").is_none());
         assert!(r.resolve("").is_none());
         assert_eq!(r.len(), 5);
@@ -990,7 +1008,7 @@ mod tests {
             Some(with_phantom.as_bytes()),
         )
         .unwrap();
-        assert_eq!(f.route.audience, "internal-git");
+        assert_eq!(f.route.audience_label(), "internal-git");
         assert_eq!(
             f.path_and_query,
             "/platform/services.git/info/refs?service=git-upload-pack"
@@ -1035,6 +1053,117 @@ mod tests {
             .status,
             StatusCode::UNAUTHORIZED
         );
+    }
+
+    #[test]
+    fn on_a_route_without_a_credential_the_phantom_is_dropped_and_a_foreign_bearer_still_refused() {
+        // A bundle's direct egress entry (no audience) and a `via: none` audience, both
+        // `credential: none` (ADR-0025 decision 8).
+        let r = Routes::new(vec![
+            Route {
+                audience: None,
+                credential: Credential::None,
+                ..route("-", "repo.home.example:443", &[])
+            },
+            Route {
+                credential: Credential::None,
+                ..route("public", "api.example.com:443", &[("GET", "/repos/**")])
+            },
+            route("internal-git", "git.home.example:443", &[]),
+        ])
+        .unwrap();
+        let p = phantom();
+        let with_phantom = format!("Bearer {}", p.expose());
+        for host in ["repo.home.example", "api.example.com"] {
+            let f = judge(
+                &r,
+                &p,
+                &Method::GET,
+                &format!("/{host}/repos/x"),
+                Some(with_phantom.as_bytes()),
+            )
+            .unwrap();
+            assert!(
+                !f.inject,
+                "{host}: the phantom is dropped, nothing goes in its place"
+            );
+            let bare = judge(&r, &p, &Method::GET, &format!("/{host}/repos/x"), None).unwrap();
+            assert!(!bare.inject);
+            let foreign = judge(
+                &r,
+                &p,
+                &Method::GET,
+                &format!("/{host}/repos/x"),
+                Some(b"Bearer baked-into-the-image"),
+            )
+            .unwrap_err();
+            assert_eq!(
+                foreign,
+                Refusal::new(StatusCode::UNAUTHORIZED, "unknown_credential"),
+                "{host}: an image's own credential is refused on every route"
+            );
+        }
+        // The rules on a `via: none` audience still apply.
+        assert_eq!(
+            judge(&r, &p, &Method::DELETE, "/api.example.com/repos/x", None).unwrap_err(),
+            Refusal::new(StatusCode::FORBIDDEN, "outside_rules")
+        );
+        // A route with a token keeps injecting beside them.
+        let f = judge(
+            &r,
+            &p,
+            &Method::GET,
+            "/git.home.example/x",
+            Some(with_phantom.as_bytes()),
+        )
+        .unwrap();
+        assert!(f.inject);
+        assert_eq!(f.route.audience_label(), "internal-git");
+    }
+
+    #[test]
+    fn a_route_that_injects_without_an_audience_is_refused() {
+        let err = Routes::new(vec![Route {
+            audience: None,
+            ..route("-", "repo.home.example:443", &[])
+        }])
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("names no audience"), "{err}");
+        assert!(
+            Routes::new(vec![Route {
+                audience: None,
+                credential: Credential::None,
+                ..route("-", "repo.home.example:443", &[])
+            }])
+            .is_ok(),
+            "no credential: no audience needed"
+        );
+    }
+
+    #[test]
+    fn a_route_without_a_credential_may_carry_a_ca_of_its_own() {
+        // A `via: none` audience on a private PKI: its CA is trusted for its endpoint alone,
+        // keyed by the endpoint since the route may name no audience.
+        let private = Route {
+            audience: None,
+            credential: Credential::None,
+            ca_pem: Some(mediatore_testkit::fixture_ca_pem()),
+            ..route("-", "repo.home.example:443", &[])
+        };
+        let public = Route {
+            credential: Credential::None,
+            ..route("public", "api.example.com:443", &[])
+        };
+        let proxy = Proxy::with_webpki_roots(
+            Routes::new(vec![private.clone(), public.clone()]).unwrap(),
+            phantom(),
+            Arc::new(NoTokens),
+            Dialer::Direct,
+        )
+        .unwrap();
+        assert!(!Arc::ptr_eq(&proxy.tls_for(&private), &proxy.tls));
+        assert!(Arc::ptr_eq(&proxy.tls_for(&public), &proxy.tls));
     }
 
     #[test]

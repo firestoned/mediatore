@@ -99,6 +99,7 @@ fn state(idp: &FakeIdp, policy_egress: Option<mediatore_api::PolicyEgress>) -> A
         .collect(),
         rules: std::collections::BTreeMap::new(),
         cas: std::collections::BTreeMap::new(),
+        no_credential: std::collections::BTreeSet::new(),
         registries: std::collections::BTreeMap::new(),
         reachable_registries: None,
         policy_egress,
@@ -205,6 +206,18 @@ impl Harness {
             .tls_backend_preconfigured(cfg)
             .build()
             .expect("client")
+    }
+
+    /// What the guest fetches for the proxy, over the node SVID.
+    async fn me(&self) -> mediatore_proto::Me {
+        let resp = self
+            .mtls_as(&node_svid())
+            .get(format!("{}/v1/me", self.sandbox_url))
+            .send()
+            .await
+            .expect("me");
+        assert_eq!(resp.status(), 200);
+        resp.json().await.expect("me body")
     }
 
     /// A bound claim: the node registers over mTLS, the user claims, the dev binder binds.
@@ -552,6 +565,8 @@ async fn enforcing_serves_a_policys_direct_egress_and_shadow_serves_none_of_it()
                 ("only-some.home.example:443", true),
                 ("192.0.2.77:443", false),
                 ("*.home.example:443", false),
+                // An audience's own endpoint named again as direct egress.
+                (ALLOWED[0], false),
             ],
             chrono::Utc::now(),
         )
@@ -589,6 +604,54 @@ async fn enforcing_serves_a_policys_direct_egress_and_shadow_serves_none_of_it()
                 h.check(&peer, "CONNECT", refused).await,
                 (403, "not_allowed".into()),
                 "{refused} in {mode:?}"
+            );
+        }
+
+        // The proxy's side (ADR-0025 decision 8): under enforce the served entry has a
+        // route with no audience and no credential; under shadow it has none. The audience
+        // routes are the same either way, and an endpoint that is both stays the
+        // audience's, with its token.
+        let me = h.me().await;
+        let direct_routes: Vec<_> = me
+            .routes
+            .iter()
+            .filter(|r| r.endpoint.to_string() == DIRECT)
+            .collect();
+        if reaches {
+            assert_eq!(direct_routes.len(), 1, "{mode:?}: {:?}", me.routes);
+            let r = direct_routes[0];
+            assert_eq!(r.audience, None);
+            assert_eq!(r.credential, mediatore_proto::Credential::None);
+            assert!(r.rules.is_empty() && r.ca_pem.is_none());
+            assert!(me.egress.contains(&DIRECT.parse().unwrap()));
+        } else {
+            assert!(direct_routes.is_empty(), "{mode:?}: {:?}", me.routes);
+            assert!(!me.egress.contains(&DIRECT.parse().unwrap()));
+        }
+        let audience_routes: Vec<_> = me
+            .routes
+            .iter()
+            .filter(|r| r.audience.as_deref() == Some(AUDIENCE))
+            .collect();
+        assert_eq!(
+            audience_routes.len(),
+            ALLOWED.len(),
+            "{mode:?}: {:?}",
+            me.routes
+        );
+        assert!(audience_routes.iter().all(|r| r.injects()));
+        assert_eq!(
+            me.routes
+                .iter()
+                .filter(|r| r.endpoint.to_string() == ALLOWED[0])
+                .count(),
+            1,
+            "{mode:?}: one route per endpoint, the audience's"
+        );
+        for never in ["only-some.home.example:443", "192.0.2.77:443"] {
+            assert!(
+                !me.routes.iter().any(|r| r.endpoint.to_string() == never),
+                "{mode:?}: {never} is not served, so it has no route"
             );
         }
     }
