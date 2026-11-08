@@ -294,9 +294,9 @@ the Tailscale operator's namespace, and egress to DNS, the API server and `dex`.
 
 ```sh
 mediatore login --issuer https://dex.<tailnet>
-mediatore sandbox create --server https://mediatore.<tailnet> --pool pool-a \
+mediatore sandbox create --mediatore https://mediatore.<tailnet> --pool pool-a \
   --audience grafana.home.example --image registry.internal:5000/sandbox:latest
-mediatore sandbox get --server https://mediatore.<tailnet> <name>
+mediatore sandbox get --mediatore https://mediatore.<tailnet> <name>
 ```
 
 The CLI logs in as the `mediatore` public client (PKCE, a loopback redirect), delegates

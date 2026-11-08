@@ -143,7 +143,14 @@
       and registered through a gateway's control relay, loaded the host table, pulled the
       workload image from the mirror on the segment, reported to the broker, and ran a
       claim whose proxy tunnelled through Envoy on the gateway SVID with the claim SVID as
-      the peer; the three gateway VMs booted from the published gateway image. Both images
+      the peer; the three gateway VMs booted from the published gateway image. Proven a third
+      time on 2026-11-08 against v0.2.0-rc.6 (banlieue v0.5.0, the trust anchor the
+      OpenBao root of ADR-0031): an allowed request completed through a gateway's Envoy
+      with a 200 from the upstream and the broker-minted bearer present at it (the proxy's
+      `credential=true`, the broker's `token issued`), a path outside the rules 403 at the
+      proxy, a host outside the routes 404 at the proxy, `PolicyConformant` true against
+      the signed bundle, and the release retracted the entry while the pool recycled the
+      member. That closes banlieue ADR-0109's one open item. Both images
       have now run end to end (threat model R-15 revised). The run surfaced three defects
       of the never-booted gateway image, one banlieue fact (a Kairos guest takes its static
       address from `userData` placeholders, not the seed) and one broker gap (a

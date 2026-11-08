@@ -163,10 +163,11 @@ suites.
 
 ```sh
 mediatore login --issuer https://dex.home.example
-mediatore sandbox create --server https://mediatore.<tailnet> --pool pool-a \
+mediatore sandbox create --mediatore https://mediatore.<tailnet> --pool pool-a \
   --audience grafana.home.example --image registry.internal:5000/sandbox:latest
 ```
 
+Each claim spends the delegated refresh token, so log in again before the next one.
 The sandbox turns `Bound` when banlieue hands it a member and `Ready` once the member
 has registered its node and the entry is set ([requesting a sandbox](requesting-a-sandbox.md)).
 Until pool VMs attest with a TPM (roadmap 02's second half: the server's TPM attestor
