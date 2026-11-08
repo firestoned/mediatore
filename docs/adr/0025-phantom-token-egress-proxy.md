@@ -198,7 +198,10 @@ audience, and the audience chooses the token.
   on a credential-less route, nothing fetched, a foreign bearer still refused, the `via:
   none` audience's token refused) and `e2e_gateway.rs` (`GET /v1/me` carries the route
   under `enforce` and not under `shadow`), and in kind by `make kind-e2e-gateway-policy`,
-  whose direct route is now the shape the broker renders.
+  whose direct route is now the shape the broker renders. Live on the homelab the same day
+  (v0.2.0-rc.7): an audience `via: none` on GitHub's public API, the workload's request
+  carrying the phantom forwarded bare through a gateway's Envoy and answered 200, nothing
+  asked of `POST /v1/token`, the rules and the route set still refusing around it.
 - What the workload sees: no socket, no `mediatore token`, a base URL and a phantom.
   Tools that take a base URL and a bearer from the environment work unchanged; `git`
   takes the URL and `http.extraheader`. The research agent walkthrough shows both.

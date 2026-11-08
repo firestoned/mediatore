@@ -56,8 +56,16 @@ Threat model R-3 was accepted until the ADR for this was written; it is rewritte
       and gets no token from `POST /v1/token`; the proxy drops the phantom on such a route
       and forwards bare, a foreign bearer stays `401`. Proven in `e2e_egress.rs`,
       `e2e_gateway.rs` and `make kind-e2e-gateway-policy` (the direct route in the broker's
-      shape, the forward logged `credential=false`). Open beside it: a direct entry on a
-      private PKI has no CA on its route, so it is reachable on the public roots alone
+      shape, the forward logged `credential=false`). Live the same day on the homelab
+      (v0.2.0-rc.7 on the broker and the pool image, the GitHub audience `via: none`): a
+      claim under the research-agent policy fetched one route, the proxy forwarded the
+      workload's request with the phantom and the one without it bare through a gateway
+      (`credential=false`), Envoy's tunnel to GitHub's API answered 200 with the repository,
+      no token was asked of the broker, a path outside the rules was 403 and a host off the
+      claim 404, PolicyConformant true, the sandbox released clean. Open beside it: a direct
+      entry on a private PKI has no CA on its route, so it is reachable on the public roots
+      alone; and a policy repository's comment that the proxy "injects the token" on such an
+      audience reads wrong now that the audience may carry none
 - [ ] An audience served directly, without the proxy, declared per audience for a
       protocol that is not HTTP; never a default. Until then such an audience is
       unreachable from the jail
