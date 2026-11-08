@@ -30,8 +30,9 @@ installed beyond a `ServiceAccount` a live test left behind.
       controller's namespace only; egress to DNS, the API server and the issuer
       (`deploy/overlays/homelab-example/networkpolicy.yaml`; the deploying guide has
       the table)
-- [ ] A `mediatore` public client in the cluster's Dex (its Helm values, not this repo),
-      the overlay's copy filled in, the three Secrets created, `kubectl apply -k`
+- [x] A `mediatore` public client in the cluster's Dex (its Helm values, not this repo),
+      the overlay's copy filled in, the three Secrets created, `kubectl apply -k`. In place
+      since the 2026-10-31 run; every live claim since logged in through it
 - [ ] `make live-admission-test` against the cluster as the broker's ServiceAccount
       (needs `deploy/base`'s ServiceAccount, RBAC and admission policy applied first)
 - [x] `mediatore login` at the cluster's Dex and `sandbox create` through the Tailscale
@@ -71,8 +72,10 @@ installed beyond a `ServiceAccount` a live test left behind.
       fragment; `make kind-spire` applies it with kustomize, sets the webhook to fail
       closed as the chart's hook did, and asserts that the server loaded the `tpm`
       attestor. CI no longer needs Helm
-- [ ] Trust bundle exported for the VM image (Part 1.5): `spire-server bundle show`
-      into `/opt/spire/conf/bundle.pem`
+- [x] ~~Trust bundle exported for the VM image (Part 1.5): `spire-server bundle show`
+      into `/opt/spire/conf/bundle.pem`~~ Superseded by ADR-0031 (next item): the layer
+      carries the OpenBao root alone, not the server's bundle, and never goes stale
+      with the server's CA
 - [x] ADR-0031 (accepted and built 2026-11-07): the anchor the layer carries outlives the
       server's CA. OpenBao's PKI as the `vault` upstream authority (`deploy/spire-upstream`,
       the fragment, the CA mount, the projected token), the server's CA a 24-hour
@@ -99,9 +102,12 @@ installed beyond a `ServiceAccount` a live test left behind.
       a second agent. Done 2026-10-31 and 2026-11-05: every member and every gateway
       attested as `tpm` with the ID the broker had declared from the EK banlieue read,
       the reboot kept the agent ID (roadmap 06's live item)
-- [ ] The broker Deployment on the CSI socket proven as `make kind-e2e-mtls` does in
-      kind, against this cluster: a sandbox turning `Ready`, the guest fetching its
-      subject, a token issued to the workload
+- [x] The broker Deployment on the agent's Workload API socket proven as
+      `make kind-e2e-mtls` does in kind, against this cluster: a sandbox turning `Ready`,
+      the guest fetching its subject, a token issued to the workload. Done 2026-11-08
+      (rc.6): the broker's own SVID from the Workload API, the sandbox `Bound` and ready,
+      `subject fetched` on the member, `token issued` for the audience and the 200 at the
+      upstream with it (roadmap 06's live item has the run)
 - [x] A kind tier for the attestation path (2026-10-23): the kind node carries a vTPM
       (`make kind-vtpm`: swtpm behind the kernel's vtpm proxy on the host, a throwaway
       swtpm local CA for its EK, the device mounted into the node at creation);
