@@ -132,3 +132,9 @@ configured host CA never becomes an agent, let alone a node.
   `mediatore_proto::ek` computes, the node entry under that agent reaching it, and a
   replacement pod re-attesting as the same agent (the plugin answers `CanReattest`).
   Its first run found the two corrections above (the issuing certificate, the copy).
+- The init container is idempotent (2026-11-08): a node reboot keeps the pod and its
+  emptyDir, so the container runs again over the plugin and `cas/` it created, and a plain
+  `mkdir` crash-looped both servers of the homelab cluster (with the agents and the broker
+  behind them) until the pods were deleted. It now removes what it copied before copying.
+  A StatefulSet does not replace unhealthy pods on a rollout, so a cluster already in that
+  state needs the pods deleted after the patched StatefulSet is applied.
