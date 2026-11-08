@@ -40,6 +40,9 @@ For an issuer configured with a `session` (Dex in the homelab,
 refreshes before every token it mints for the sandbox; `mediatore sandbox create` does this
 for you (see [Running workloads](running-workloads.md)). A claim without it is refused with
 `400 session_required`; one for an issuer that takes none, with `400 session_unexpected`.
+The refresh token is spent by the claim that delegates it: the CLI drops it from the session
+file once the broker holds it, so the next `mediatore sandbox create` needs a `mediatore login`
+first, or it is the one refused with `session_required`.
 
 `GET /v1/claims/sandbox-3f9a1c2e` answers from the resource's status: `phase` mirrors the
 claim, `uid` is the claim's UID once the claim exists, `ready` is true once the claim is

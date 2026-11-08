@@ -302,6 +302,16 @@ What roadmap 10 fixed within the decisions above, as it is built:
   gateway; and the segment's host must serve what the segment reaches (the mirror)
   directly, since libvirt's isolated network rejects anything forwarded off the bridge,
   a container port mapping included. Threat model R-15 is revised accordingly.
+- **The 200 with the credential, 2026-11-08** (v0.2.0-rc.6, the same topology): the
+  workload presented the phantom bearer, the proxy swapped in the token the broker issued
+  for the audience, the tunnel went through a different gateway each round (the authorizer
+  `allow` from the broker once, then from its cache), Envoy returned the upstream's 200 and
+  the upstream saw the bearer. A request without `Authorization` beside it was forwarded
+  bare, as decision 3 of the egress proxy says, and reached the upstream without one: a
+  workload that wants the credential asks for it. Two operational facts from the run:
+  the CLI spends the delegated refresh token on each claim (ADR-0013), so a claim is
+  preceded by a login; and the broker's `audiences[].max_ttl` must not exceed the bundle's
+  `ttlSeconds` or every sandbox reports `P002` (the default is 900 s).
 
 ## Consequences
 
