@@ -26,5 +26,10 @@ Depends on roadmap 09 (the verified bundle cache) and roadmap 10 (the gateway an
       `would_add`, the sandbox reporting P006) and opens under `enforce` (a tunnel, the
       destination answering through it, the authorizer's allow from the broker), an entry
       with rules is never served (P007), the audience endpoints stand in both modes
-- [ ] Rollout: shadow, then enforce in dev, then each tier. Shadow everywhere today: the
-      kind overlay and the homelab broker set no `policy.egress`, so the default stands
+- [ ] Rollout: shadow, then enforce in dev, then each tier. Step one done 2026-11-08: the
+      homelab broker runs `policy.egress: enforce` after a week of shadow with no
+      `would_add` line (neither of its bundles names direct egress, so the gateway's answer
+      is unchanged and the first entry a policy adds will be served); the broker restarted
+      on the value, both bundles admitted, the API healthy. The kind overlay stays on the
+      default. Open: the other tiers, as they exist; a startup log line naming the mode
+      would have made the check direct, instead of inferred from the start succeeding
