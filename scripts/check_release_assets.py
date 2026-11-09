@@ -16,14 +16,15 @@ from pathlib import Path
 import yaml
 
 # deploy/base, as kustomize renders it. The overlay (config, Secrets, ingress) is the
-# operator's and deliberately not in the manifest.
+# operator's and deliberately not in the manifest. Three CRDs since ADR-0034 (AgentSandbox,
+# SandboxNode, PolicyFloor); two Roles (the watcher Lease, the session Secrets).
 EXPECTED_KINDS = {
-    "CustomResourceDefinition": 1,
+    "CustomResourceDefinition": 3,
     "ServiceAccount": 1,
     "ClusterRole": 1,
     "ClusterRoleBinding": 1,
-    "Role": 1,
-    "RoleBinding": 1,
+    "Role": 2,
+    "RoleBinding": 2,
     "Deployment": 1,
     "Service": 2,
     "ClusterSPIFFEID": 1,

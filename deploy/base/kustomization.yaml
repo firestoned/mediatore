@@ -6,6 +6,8 @@ kind: Kustomization
 namespace: banlieue-system
 resources:
   - crds/mediatore.io_agentsandboxes.yaml
+  - crds/mediatore.io_sandboxnodes.yaml
+  - crds/mediatore.io_policyfloors.yaml
   - serviceaccount.yaml
   - rbac.yaml
   - deployment.yaml

@@ -1115,6 +1115,23 @@ mod tests {
     }
 
     #[test]
+    fn the_base_kustomization_lists_every_crd() {
+        // A rendered CRD the base does not list is a CRD `kubectl apply -k deploy/base`
+        // never installs (the kind tiers apply the directory, so only this test notices).
+        let path = format!(
+            "{}/../../deploy/base/kustomization.yaml",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let kustomization = std::fs::read_to_string(&path).unwrap();
+        for (file, _) in crd_yamls().unwrap() {
+            assert!(
+                kustomization.contains(&format!("- crds/{file}")),
+                "deploy/base/kustomization.yaml does not list crds/{file}"
+            );
+        }
+    }
+
+    #[test]
     fn the_schema_requires_what_the_reconciler_assumes() {
         let crd = serde_json::to_value(AgentSandbox::crd()).unwrap();
         let v = &crd["spec"]["versions"][0];
