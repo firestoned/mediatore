@@ -56,7 +56,8 @@ platform, and all three are absences.
 FROM docker.io/library/python:3.13-slim@sha256:…
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
-RUN pip install --no-cache-dir anthropic==1.17.0
+COPY requirements.txt /tmp/requirements.txt   # anthropic==1.17.0 and its wheels, pinned by hash
+RUN pip install --no-cache-dir --require-hashes -r /tmp/requirements.txt
 COPY research_agent.py /usr/local/bin/research-agent
 RUN chmod 0755 /usr/local/bin/research-agent
 # No ENTRYPOINT: the claim's workload.args is the argv, in full.

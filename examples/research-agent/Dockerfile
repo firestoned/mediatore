@@ -17,8 +17,11 @@ RUN apt-get update \
     && find / -xdev -perm /6000 -type f -exec chmod a-s {} +
 
 # The Anthropic SDK: it reads ANTHROPIC_BASE_URL and ANTHROPIC_API_KEY, which the agent
-# points at the egress proxy and the phantom (ADR-0025, ADR-0032).
-RUN pip install --no-cache-dir anthropic==1.17.0
+# points at the egress proxy and the phantom (ADR-0025, ADR-0032). Every wheel pinned by
+# hash (requirements.txt from `pip-compile --generate-hashes` over `anthropic==1.17.0`).
+COPY requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir --require-hashes -r /tmp/requirements.txt \
+    && rm -f /tmp/requirements.txt
 
 COPY research_agent.py /usr/local/bin/research-agent
 RUN chmod 0755 /usr/local/bin/research-agent
