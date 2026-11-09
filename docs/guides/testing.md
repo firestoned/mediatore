@@ -850,7 +850,7 @@ released; the interpreter and the program are named by absolute path. And a work
 exited `0` before the deadline was restarted too, so a one-shot agent re-ran until the
 claim was released by hand, as this one was after its first answer; that became
 ADR-0033 the same day (`workload.restart`, the exit recorded and the claim released by the
-broker), proven in `e2e_dev.rs` and awaiting its live run with the next release.
+broker), proven in `e2e_dev.rs` and run live on 2026-11-09 (run 7 below).
 
 The `claude-agent` bundle reached the cluster afterwards (the ceiling signed by Security,
 admitted by Flux, the bundle published by notaio and admitted by the broker at 01:31 UTC),
@@ -862,8 +862,122 @@ the Anthropic API`: the upstream's own refusal, on a key whose workspace had rea
 cap, which is the bound the guide asks the operator to set and the shape a spend limit
 takes when it bites. The two answers above were given before it did.
 
+## Live proofs on the homelab, 2026-11-09
+
+The same environment a day later, on v0.2.0: the broker on the Kubernetes API as its store
+(ADR-0034, no database anywhere) and the one-shot workload of ADR-0033 run live. Both were
+made by hand on 2026-11-09 after the release; the real values stay outside the repository.
+
+### 6. The Kubernetes API as the store, cut over live (ADR-0034, roadmap 05)
+
+The homelab overlay moved from `v0.2.0-rc.8` on a SQLite file to `v0.2.0`: the base at the
+tag, the image pinned to the digest the release attested, no PVC, no data volume, no store
+URL. The SQLite file was archived from the node and left behind with its PVC and Secret;
+nothing of it was migrated (ADR-0034 decision 6: the cutover is a release boundary, the
+pool recycled on the new image). `kubectl apply -k` created exactly what the diff said:
+
+```text
+customresourcedefinition.apiextensions.k8s.io/policyfloors.mediatore.io created
+customresourcedefinition.apiextensions.k8s.io/sandboxnodes.mediatore.io created
+role.rbac.authorization.k8s.io/mediatore-sessions created
+rolebinding.rbac.authorization.k8s.io/mediatore-sessions created
+clusterrole.rbac.authorization.k8s.io/mediatore configured
+deployment.apps/mediatore configured
+```
+
+The broker's first lines, and what the reflector did with the bundles already in the
+cluster, within a second:
+
+```text
+INFO mediatore: store: the Kubernetes API (ADR-0034) namespace="banlieue-system" retention_secs=3600
+INFO mediatore: sealing: local key loaded key_id="5a6269a11c3f563b"
+INFO mediatore_claims::lease: leading lease=mediatore-watcher holder=mediatore-c66d6ddcb-vcs74
+INFO mediatore_claims::policy: policy bundle admitted namespace=sandboxes configmap=claude-agent-bundle policy=claude-agent version=1
+INFO mediatore_claims::policy: policy bundle admitted namespace=sandboxes configmap=proof-agent-bundle policy=proof-agent version=1
+INFO mediatore_claims::policy: policy bundle admitted namespace=sandboxes configmap=research-agent-bundle policy=research-agent version=4
+```
+
+```text
+$ kubectl -n banlieue-system get policyfloors
+NAME                       POLICY           NAMESPACE   VERSION   ISSUED
+sandboxes.claude-agent     claude-agent     sandboxes   1         2026-11-09T20:09:15.580026060Z
+sandboxes.proof-agent      proof-agent      sandboxes   1         2026-11-09T20:14:46.635839944Z
+sandboxes.research-agent   research-agent   sandboxes   4         2026-11-09T20:14:46.635798894Z
+```
+
+The pool recycled on the v0.2.0 image and its members registered as resources, the old
+member and the new one, then the one that replaced the member the claim below consumed:
+
+```text
+$ kubectl -n banlieue-system get sandboxnodes
+NAME                                                               HOSTNAME      PROVIDER   BANNED   REGISTERED
+7523450863cbd0bdf9703315287df0f21ff842fe7ca22d8f981cf93a53e0d758   kairos-d940              false    3m54s
+ce9f137df51dfdf23b046c7715374c49bc4b2570958732762d42d25146c1b8c6   kairos-d216              false    9s
+e81b53d5888da5e332a5e9a510544c12d3dcbe11e144350b5323fbd5f0edf5df   kairos                   false    4m1s
+```
+
+(`PROVIDER` is empty because at this release the guest sent the hint only when started
+with `--provider`, which the image's unit does not pass; since then the guest reads it from
+the firmware vendor, `QEMU` being libvirt, when the flag is absent.)
+
+One lesson, and it was the store's doing at one remove. The registrations above came
+forty minutes after the recycle, not four: every guest logged `mediatore unreachable;
+retrying` against its gateway's relay, and the relay logged `to=<listener>:443 rx=0 tx=0
+flags=UF,URX`, a refused connection. With the PVC gone nothing pinned the broker pod to the
+node that announced the listener's address, it was scheduled elsewhere, and the announcing
+node forwarded to it masqueraded as itself, which the NetworkPolicy of ADR-0007 decision 7
+(the segment's addresses alone on `8443`) refused. `externalTrafficPolicy: Local` on the
+sandbox Service was the fix, applied live and then to `deploy/base` (PR #99): the source
+survives, the load balancer announces from the pod's node, and the two members registered
+within seconds of the apply (`mtls connection peer=<segment's masqueraded address>
+spiffe_id=spiffe://sandbox.home.example/banlieue/node/e81b53d5…`).
+
+### 7. The one-shot workload live (ADR-0033, roadmap 06)
+
+The research agent's `--hello` under `claude-agent` with `--restart never`, right after a
+`mediatore login`:
+
+```text
+$ mediatore sandbox create --pool sandbox-pool --audience anthropic --policy claude-agent \
+    --ttl 900 --restart never --image registry.internal:5000/firestoned/research-agent@sha256:5ad892e2… \
+    --arg /usr/local/bin/python3 --arg /usr/local/bin/research-agent --arg=--hello
+sandbox-57d995da	Pending	ready=false
+```
+
+Ten seconds from the record to the exit, in the broker's log:
+
+```text
+20:54:24  claim created          claim_uid=394e173c-d7b2-47dd-afce-7fb1ef8f5c83
+20:54:31  report                 image_digest=sha256:5ad892e2… host_table=loaded
+20:54:33  token issued           audience=anthropic backend="secret" header=x-api-key
+20:54:34  workload exited and its restart policy ends the claim (ADR-0033) code=Some(0) signal=None restarts=0 restart=never
+20:54:35  entry retracted        name="mediatore-claim-394e173c-…"
+20:54:35  claim released: entry retracted, tokens cut off
+20:54:35  sandbox deleting: record released, claim deleted
+```
+
+And the whole of it on the resource afterwards, the sandbox held by its finalizer with
+`deletionTimestamp` set, the record the store's and the Secret emptied to its labels:
+
+```text
+$ kubectl -n banlieue-system get agentsandbox sandbox-57d995da -o jsonpath='{.status.record}'
+{"bundleVersion":1,"claimUid":"394e173c-d7b2-47dd-afce-7fb1ef8f5c83","createdAt":"2026-11-09T20:54:24Z",
+ "entryId":"mediatore-claim-394e173c-d7b2-47dd-afce-7fb1ef8f5c83",
+ "exit":{"code":0,"exited_at":"2026-11-09T20:54:34.936207200Z","restarts":0},
+ "expiresAt":"2026-11-09T21:09:24Z","nodeId":"spiffe://sandbox.home.example/spire/agent/tpm/e81b53d5…",
+ "policyUid":"c18e8d1b-…","refresh":false,"revokedAt":"2026-11-09T20:54:35Z"}
+$ kubectl -n banlieue-system get secret mediatore-session-<sandbox uid> -o jsonpath='{.metadata.labels} {.metadata.ownerReferences[0].name} {.data}'
+{"mediatore.io/sandbox-uid":"<sandbox uid>","mediatore.io/session":"claimed"} sandbox-57d995da {created_at, issuer, subject}
+```
+
+`PolicyConformant=True` ("the broker allows nothing bundle v1 of claude-agent does not").
+The member that ran it was recycled by the pool as a consumed member, and a fresh one
+registered in its place (the third `SandboxNode` above). The retention sweep (ADR-0034
+decision 4) is due an hour after the exit; its line is appended below when it has run.
+
 ### What is not proven live yet
 
 The full agent reading a repository and asking Claude about it, which needs a policy
 naming both the `github` and the `anthropic` audiences under a profile that allows two.
-Recorded here when it has happened.
+Recorded here when it has happened. The retention sweep of run 7's sandbox, due at the
+hour: its audit line goes under run 7 when it has run.

@@ -3,7 +3,7 @@
 
 # ADR-0034: The Kubernetes API as the broker's store: the resource is the record, no database
 
-**Status:** Accepted · **Date:** 2026-11-09 (accepted the same day)
+**Status:** Implemented · **Date:** 2026-11-09 (accepted, implemented and cut over on the homelab the same day, v0.2.0: `docs/guides/testing.md`, run 6)
 
 Roadmap 05 reopened (the store). Supersedes the engine decisions of
 [ADR-0012](0012-persistent-store.md) (one sqlx query set over SQLite or PostgreSQL, the

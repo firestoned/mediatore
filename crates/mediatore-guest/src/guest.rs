@@ -45,7 +45,7 @@ pub struct GuestArgs {
     /// TPM device
     #[arg(long, default_value = "/dev/tpmrm0")]
     pub tpm: PathBuf,
-    /// Hypervisor hint for audit
+    /// Hypervisor hint for audit; read from the firmware vendor when absent
     #[arg(long, value_enum)]
     pub provider: Option<ProviderArg>,
     /// Sandbox root: a tmpfs mounted per claim (ADR-0021)
@@ -218,7 +218,9 @@ pub async fn run(args: GuestArgs) -> anyhow::Result<()> {
         ek_hash,
         dmi_uuid,
         hostname: identity::hostname().unwrap_or_else(|_| "unknown".into()),
-        provider: args.provider.map(Into::into),
+        provider: args.provider.map(Into::into).or_else(|| {
+            ready::provider_of(&std::fs::read_to_string(ready::DMI_SYS_VENDOR).unwrap_or_default())
+        }),
     };
     tracing::info!(ek_hash = %reg.ek_hash, dmi = %reg.dmi_uuid, "node identity computed");
 

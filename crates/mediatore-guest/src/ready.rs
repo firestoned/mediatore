@@ -67,6 +67,23 @@ pub fn is_vmware(sys_vendor: &str) -> bool {
     sys_vendor.trim().to_ascii_lowercase().starts_with("vmware")
 }
 
+/// The hypervisor the firmware vendor names, for the node's registration when the command
+/// line gives none: `VMware, Inc.` is vSphere, `QEMU` is libvirt, `Cloud Hypervisor` is
+/// itself. Anything else is no hint, never a guess.
+#[must_use]
+pub fn provider_of(sys_vendor: &str) -> Option<mediatore_proto::Provider> {
+    let vendor = sys_vendor.trim().to_ascii_lowercase();
+    if vendor.starts_with("vmware") {
+        Some(mediatore_proto::Provider::Vsphere)
+    } else if vendor.starts_with("qemu") {
+        Some(mediatore_proto::Provider::Libvirt)
+    } else if vendor.starts_with("cloud hypervisor") {
+        Some(mediatore_proto::Provider::CloudHypervisor)
+    } else {
+        None
+    }
+}
+
 /// How one channel went.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
@@ -230,6 +247,19 @@ async fn report_vsock() -> Outcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_firmware_vendor_names_the_provider_and_an_unknown_one_names_none() {
+        use mediatore_proto::Provider;
+        assert_eq!(provider_of("VMware, Inc.\n"), Some(Provider::Vsphere));
+        assert_eq!(provider_of("QEMU\n"), Some(Provider::Libvirt));
+        assert_eq!(
+            provider_of("Cloud Hypervisor\n"),
+            Some(Provider::CloudHypervisor)
+        );
+        assert_eq!(provider_of("Dell Inc.\n"), None);
+        assert_eq!(provider_of(""), None);
+    }
 
     /// A fresh directory under the workspace's `target/`, never the shared system
     /// temporary directory (Semgrep `rust.lang.security.temp-dir`).

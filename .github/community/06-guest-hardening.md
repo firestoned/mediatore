@@ -165,7 +165,7 @@
       `workload.restart` (`always`, the default; `on-failure`; `never`), the guest telling
       the broker `POST /v1/me/exit` when the policy ends the claim, the broker recording
       the exit and releasing the claim as a delete does; `--restart` on `sandbox create`,
-      the exit on `sandbox get`. The live run with the example agent is the next release's
+      the exit on `sandbox get`. The live run with the example agent: 2026-11-09, `docs/guides/testing.md` run 7
 - [ ] A tier that runs the guest under the image's own units on a Kairos VM, on the
       build host: the kind tiers run the guest in a pod with `--dev-skip-setup`, which is
       how six of the defects above reached a release candidate. The shape: the ISO built
