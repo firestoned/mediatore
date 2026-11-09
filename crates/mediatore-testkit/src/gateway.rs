@@ -53,6 +53,21 @@ impl StandInGateway {
     /// # Panics
     /// On a config or bind failure: a broken test environment.
     pub async fn start(ca: &TestCa, identity: &str, allow: Vec<Endpoint>) -> Self {
+        Self::start_with(ca, identity, allow, false).await
+    }
+
+    /// A gateway in trouble of its own: it answers every `CONNECT` with `503` and `DNS
+    /// resolution failure`, as Envoy does when its resolver fails, and records the ask.
+    /// No verdict is given, so the forwarder moves to the next gateway (ADR-0028 decision
+    /// 7 as amended).
+    ///
+    /// # Panics
+    /// As [`Self::start`].
+    pub async fn start_unwell(ca: &TestCa, identity: &str) -> Self {
+        Self::start_with(ca, identity, vec![], true).await
+    }
+
+    async fn start_with(ca: &TestCa, identity: &str, allow: Vec<Endpoint>, unwell: bool) -> Self {
         mediatore_proto::tls::ensure_provider();
         let material = ca.svid(identity);
         let prefix = format!("spiffe://{}/banlieue/claim/", ca.trust_domain());
@@ -85,7 +100,7 @@ impl StandInGateway {
                         .and_then(|leaf| mediatore_tls::leaf_spiffe_id(leaf).ok())
                         .map(|id| id.to_string())
                         .unwrap_or_default();
-                    serve(tls, &peer, &allow, &seen).await;
+                    serve(tls, &peer, &allow, unwell, &seen).await;
                 });
             }
         });
@@ -131,6 +146,7 @@ async fn serve(
     mut tls: tokio_rustls::server::TlsStream<TcpStream>,
     peer: &str,
     allow: &[Endpoint],
+    unwell: bool,
     seen: &Mutex<Vec<SeenTunnel>>,
 ) {
     let mut head = Vec::new();
@@ -156,6 +172,20 @@ async fn serve(
         authority: authority.to_owned(),
         allowed,
     });
+    if unwell {
+        let body = "DNS resolution failure";
+        let _ = tls
+            .write_all(
+                format!(
+                    "HTTP/1.1 503 Service Unavailable\r\ncontent-type: text/plain\r\ncontent-length: {}\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .await;
+        let _ = tls.shutdown().await;
+        return;
+    }
     if !allowed {
         let body = "not_allowed";
         let _ = tls

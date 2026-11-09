@@ -6,7 +6,7 @@
 **Status:** Accepted, implemented 2026-11-04 · **Date:** 2026-10-28 · **Amended:** 2026-10-30 by
 [ADR-0027](0027-control-plane-relay-on-the-egress-gateway.md) (decisions 4 and 6: the
 sandbox reaches the broker and the SPIRE server only through a control relay on the
-gateway, not directly; the data plane stands)
+gateway, not directly; the data plane stands) · 2026-11-09 (decision 7: a gateway's own `5xx` moves the forwarder on; a `4xx` stays the verdict)
 
 Roadmap 10. Gives the egress gateway of [ADR-0010](0010-no-inbound-to-sandboxes.md)
 decision 4 its software, its identity and its authorization. Amends banlieue
@@ -113,7 +113,15 @@ that identity.
    order, starts at a random position per connection, and tries the next on a connect or
    handshake failure. No DNS name, no floating address, no VRRP: the segment stays
    resolver-free as ADR-0109 decision 7 requires. This settles the first open item of
-   ADR-0109.
+   ADR-0109. *Amended 2026-11-09:* what a gateway answers the `CONNECT` with is read in two
+   kinds. A `4xx` is the environment's verdict on the request (the authorizer's `403`, its
+   code in the body) and ends the attempt: no other gateway is asked, since every gateway
+   would answer the same. A `5xx` is the gateway's own condition and no verdict at all
+   (Envoy's resolver failing on that VM, its upstream connect failing; the authorizer never
+   answers with one), and is treated as a connect failure: the next gateway is tried, within
+   the same one pass, and every gateway in trouble is `502 gateway_unreachable`. The live run
+   of 2026-11-09 is the reason: one gateway answered `503 DNS resolution failure` for a name
+   the other two resolved, and the request died with two healthy gateways beside it.
 
 8. **The gateway VMs are hardened as ADR-0109 decision 4 and this ADR require.**
    - `net.ipv4.ip_forward` and `net.ipv6.conf.all.forwarding` are 0.
@@ -214,10 +222,13 @@ What roadmap 10 fixed within the decisions above, as it is built:
   SVID from the shared Workload API source and verifying the gateway as exactly
   `spiffe://<td>/gateway`, `CONNECT host:port`, and the upstream's own TLS inside the
   tunnel, end to end as decision 3 says. The list is walked in the broker's order from a
-  random position per connection; a connect, handshake or transport failure, or no answer
-  within ten seconds, moves to the next; a gateway's answer other than `200` is the
-  environment's verdict and ends the attempt. The workload sees `502` with
-  `gateway_refused` (the authorizer's code in the proxy's log) or `gateway_unreachable`.
+  random position per connection; a connect, handshake or transport failure, no answer
+  within ten seconds, or a `5xx` from the gateway (its own condition, decision 7 as amended;
+  `verdict` in `forward.rs`) moves to the next; a `4xx` is the environment's verdict and
+  ends the attempt. The workload sees `502` with `gateway_refused` (the authorizer's code in
+  the proxy's log) or `gateway_unreachable`. Proven in `e2e_forward.rs` against the stand-in
+  gateway's unwell mode (every gateway unwell: each asked once, `gateway_unreachable`; one
+  healthy beside two unwell: every request lands).
   An empty list, an old broker or an environment with no gateway yet, dials the upstream
   directly as before, said once at start. The guest's ruleset admits the gateways beside
   what it admitted already; its reshaping (decision 6: the gateways in place of the

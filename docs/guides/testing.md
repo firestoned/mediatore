@@ -830,9 +830,9 @@ output tokens and no text block: the shape of a zero-token refusal, the plumbing
 (the broker's issue, the proxy's `credential=true`, Envoy's tunnel with six kilobytes back)
 and nothing to quote. The second met a gateway whose Envoy answered `503 DNS resolution
 failure` for the name that instant, which the forwarder takes as final (`502
-gateway_refused`, ADR-0028 decision 7); a minute later every gateway resolved it. Whether a
-gateway's own `503` should move the forwarder to the next gateway is now a roadmap 07
-question.
+gateway_refused`, ADR-0028 decision 7); a minute later every gateway resolved it. Decision
+7 was amended the same day: a gateway's own `5xx` now moves the forwarder to the next
+gateway, a `4xx` stays the verdict (`e2e_forward.rs`).
 
 Then the example image, `ghcr.io/firestoned/research-agent`, through the Anthropic SDK
 rather than curl: `/usr/local/bin/python3 /usr/local/bin/research-agent --hello`, the SDK

@@ -66,14 +66,14 @@ Threat model R-3 was accepted until the ADR for this was written; it is rewritte
       entry on a private PKI has no CA on its route, so it is reachable on the public roots
       alone; and a policy repository's comment that the proxy "injects the token" on such an
       audience reads wrong now that the audience may carry none
-- [ ] A gateway's own failure moving the forwarder on. ADR-0028 decision 7 takes any
-      answer other than `200` from a gateway as final (`502 gateway_refused`), which is
-      right for the authorizer's refusal and wrong for the gateway's own trouble: on
-      2026-11-09 a gateway's Envoy answered `503 DNS resolution failure` for a name every
-      gateway resolved a minute later, and the request died with two healthy gateways
-      beside it. Decide which upstream statuses (`503` with no authorizer verdict in the
-      log) count as "this gateway, not this request" and move to the next, bounded as a
-      connect failure is; an amendment to decision 7, with the kind tier proving it
+- [x] A gateway's own failure moving the forwarder on. ADR-0028 decision 7 took any
+      answer other than `200` from a gateway as final (`502 gateway_refused`), right for
+      the authorizer's refusal and wrong for the gateway's own trouble: on 2026-11-09 a
+      gateway's Envoy answered `503 DNS resolution failure` for a name every gateway
+      resolved a minute later, and the request died with two healthy gateways beside it.
+      Done 2026-11-09, decision 7 amended: a `5xx` is the gateway's own condition and the
+      next gateway is tried within the one pass, a `4xx` stays the verdict (`verdict` in
+      `forward.rs`; the stand-in gateway's unwell mode in `e2e_forward.rs`)
 - [ ] An audience served directly, without the proxy, declared per audience for a
       protocol that is not HTTP; never a default. Until then such an audience is
       unreachable from the jail
