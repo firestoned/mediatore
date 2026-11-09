@@ -3,7 +3,7 @@
 
 # ADR-0033: A one-shot workload: the restart policy, and the claim released when the workload is done
 
-**Status:** Accepted · **Date:** 2026-11-09
+**Status:** Implemented · **Date:** 2026-11-09 (accepted, implemented and run live the same day: `docs/guides/testing.md`, run 7)
 
 Roadmap 06 (the guest). Amends [ADR-0014](0014-one-binary-roles-as-subcommands.md)
 decision 3 (what the guest does when the jail exits) and

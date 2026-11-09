@@ -3,7 +3,7 @@
 
 # 05: Persistent store
 
-**Status: reopened 2026-11-09** for [ADR-0034](../../docs/adr/0034-the-kubernetes-api-as-the-brokers-store.md),
+**Status: done 2026-11-09** (reopened the same day) for [ADR-0034](../../docs/adr/0034-the-kubernetes-api-as-the-brokers-store.md),
 the Kubernetes API as the store (the `AgentSandbox` status as the record, a Secret per
 sandbox for the sealed session, `SandboxNode` and `PolicyFloor` resources, the finalizer as
 the retention window, no database and no SQLite in the binary); the items are at the end.
@@ -57,7 +57,10 @@ datastore.
       Secret, `kind-postgres` and `kind-e2e-store` removed; the store proven on a real API
       server by the kind tiers (the mappings unit-tested, the conformance suite over the
       in-memory store)
-- [ ] The store guide rewritten, the deploying guide, README, the threat model (TB-9 as the
-      API server, etcd at rest; full pass)
-- [ ] The homelab cutover: drain, upgrade, recycle; the one-shot live run (ADR-0033); then
-      v0.2.0
+- [x] The store guide rewritten, the deploying guide, README, the threat model (TB-9 as the
+      API server, etcd at rest; full pass) (PR #97)
+- [x] The homelab cutover: drain, upgrade, recycle; the one-shot live run (ADR-0033); then
+      v0.2.0 (2026-11-09: v0.2.0 cut, the broker on the Kubernetes store, the pool on the
+      v0.2.0 image, `sandbox-57d995da` run once and released by its exit; the sandbox
+      Service's `externalTrafficPolicy: Local` the one lesson, PR #99; `docs/guides/testing.md`
+      runs 6 and 7)
