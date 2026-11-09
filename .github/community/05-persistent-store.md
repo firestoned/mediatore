@@ -3,7 +3,11 @@
 
 # 05: Persistent store
 
-**Status: done (2026-10-14).** Built [ADR-0012](../../docs/adr/0012-persistent-store.md):
+**Status: reopened 2026-11-09** for [ADR-0034](../../docs/adr/0034-the-kubernetes-api-as-the-brokers-store.md),
+the Kubernetes API as the store (the `AgentSandbox` status as the record, a Secret per
+sandbox for the sealed session, `SandboxNode` and `PolicyFloor` resources, the finalizer as
+the retention window, no database and no SQLite in the binary); the items are at the end.
+What stands below was done 2026-10-14. Built [ADR-0012](../../docs/adr/0012-persistent-store.md):
 claims, nodes and revocations survive a broker restart; threat-model accepted risk **R-5**
 deleted. Under [ADR-0008](../../docs/adr/0008-agentsandbox-crd-owned-by-mediatore.md) the
 non-secret request fields live on the `AgentSandbox` resource and the row keeps a copy;
@@ -34,3 +38,25 @@ the store is where the refresh envelope, revocations, node records and audit row
 - [x] User guide: [the store](../../docs/guides/the-store.md)
 - [x] Threat model pass (2026-10-14): new boundary TB-9, assets A-10 and A-11, R-5
       deleted, R-4 widened, R-10 new; stamp to ADR-0012
+
+## ADR-0034: the Kubernetes API as the store (2026-11-09)
+
+Why: RUSTSEC-2026-0459 in the C SQLite that `libsqlite3-sys` bundles, unreachable through
+sqlx without a waiver or a fork; and a Kubernetes-native broker never needed a second
+datastore.
+
+- [ ] ADR-0034 accepted; CALM: the database node and relation gone, the API server's relation
+      widened
+- [ ] `KubeStore` behind `ClaimStore`: claims on the `AgentSandbox` status with the claim-uid
+      and node labels, sessions as Secrets owned by the sandbox, nodes and floors as
+      resources; `Conflict` from `resourceVersion` on the floors
+- [ ] `SandboxNode` and `PolicyFloor` CRDs from `crdgen`, RBAC for them and for Secrets
+- [ ] Retention by the finalizer, the sweep logging the audit line; `list_audit` and the
+      audit table gone
+- [ ] sqlx, both migration sets, the SQLite file test, `store.url`, the `mediatore-store`
+      Secret, `kind-postgres` and `kind-e2e-store` removed; the conformance suite against
+      `KubeStore` in the kind sandbox tier
+- [ ] The store guide rewritten, the deploying guide, README, the threat model (TB-9 as the
+      API server, etcd at rest; full pass)
+- [ ] The homelab cutover: drain, upgrade, recycle; the one-shot live run (ADR-0033); then
+      v0.2.0
