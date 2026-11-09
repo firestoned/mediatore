@@ -858,9 +858,18 @@ exits `0` before the deadline is restarted too, so a one-shot agent that is not 
 run again should end by waiting for its deadline, or the claim should be released as soon
 as its output is read, as this one was after its first answer.
 
+The `claude-agent` bundle reached the cluster afterwards (the ceiling signed by Security,
+admitted by Flux, the bundle published by notaio and admitted by the broker at 01:31 UTC),
+and one more curl claim, `sandbox-a9b83259` at 01:54, ran under it: `PolicyConformant=True`
+("the broker allows nothing bundle v1 of claude-agent does not"), the proxy forwarding
+`credential=true` through a gateway as before, the 403 and the 401 as before. Anthropic's
+answer that time was `400 invalid_request_error: Your credit balance is too low to access
+the Anthropic API`: the upstream's own refusal, on a key whose workspace had reached its
+cap, which is the bound the guide asks the operator to set and the shape a spend limit
+takes when it bites. The two answers above were given before it did.
+
 ### What is not proven live yet
 
 The full agent reading a repository and asking Claude about it, which needs a policy
-naming both the `github` and the `anthropic` audiences under a profile that allows two;
-and the `claude-agent` bundle on the cluster, so the claim's condition reads
-`PolicyConformant` rather than `P011`. Recorded here when they have happened.
+naming both the `github` and the `anthropic` audiences under a profile that allows two.
+Recorded here when it has happened.
