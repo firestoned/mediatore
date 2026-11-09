@@ -385,9 +385,9 @@ roots, or to the CA named by the audience's `ca_file`, which travels to the gues
 route. In an environment with `gateways`, that upstream connection is a tunnel through one
 of them, opened as the claim with its SVID and `CONNECT host:port`, the upstream's TLS
 inside it ([ADR-0028](../adr/0028-egress-gateway-envoy-with-spiffe-identity.md) decision
-3); the list is walked from a random start, a gateway that is down is skipped, and a
-gateway's refusal is `502` with `gateway_refused` at the workload and the authorizer's code
-in the proxy's log. The proxy's log names the audience, the host, the method, the path, the
+3); the list is walked from a random start, a gateway that is down or answering with its
+own `5xx` is skipped, and a gateway's refusal (`4xx`, the authorizer's `403`) is `502` with
+`gateway_refused` at the workload and the authorizer's code in the proxy's log. The proxy's log names the audience, the host, the method, the path, the
 gateway and the status of every request it forwards or refuses, never a token.
 
 The guest pulls each claim's `workload.image` itself ([ADR-0021](../adr/0021-sandbox-filesystem-tmpfs-and-rootfs-from-the-registry.md)): over HTTPS with the

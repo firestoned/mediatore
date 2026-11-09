@@ -14,10 +14,13 @@
 //!
 //! The list is taken in the broker's order. Each connection starts at a random position and
 //! tries the next gateway on a connect, handshake or transport failure (decision 7). A
-//! gateway that answers the `CONNECT` with anything but `200` has given the environment's
-//! verdict (the authorizer's code is the body), and that is not a reason to ask another:
-//! the attempt ends there and the workload gets `502` with the code. Every gateway failing
-//! is `502` too. Nothing is retried on the workload's behalf beyond that one pass.
+//! gateway that answers the `CONNECT` with a `4xx` has given the environment's verdict
+//! (the authorizer's `403`, its code in the body), and that is not a reason to ask another:
+//! the attempt ends there and the workload gets `502` with the code. A `5xx` is the
+//! gateway's own condition (Envoy's resolver or its upstream connect failing, no verdict
+//! given; decision 7 as amended 2026-11-09) and is treated as a failure: the next gateway
+//! is tried, within the same one pass. Every gateway failing is `502` too. Nothing is
+//! retried on the workload's behalf beyond that one pass.
 //!
 //! Without a gateway (an old broker, an environment with none yet) the dial is direct, as
 //! before ADR-0028, and the proxy says so once at start.
@@ -249,11 +252,19 @@ impl Forwarder {
         if answer.status == 200 {
             Ok(Box::new(Prefixed::new(answer.rest, tls)))
         } else {
-            Err(Attempt::Refused {
-                status: answer.status,
-                code: answer.code,
-            })
+            Err(verdict(answer.status, answer.code))
         }
+    }
+}
+
+/// What a gateway's answer other than `200` means (decision 7, amended 2026-11-09): a
+/// `5xx` is the gateway's own condition and the next one is tried; anything else is the
+/// environment's verdict and final.
+fn verdict(status: u16, code: String) -> Attempt {
+    if status >= 500 {
+        Attempt::Failed(format!("{status} {code}: the gateway's own condition"))
+    } else {
+        Attempt::Refused { status, code }
     }
 }
 
@@ -497,6 +508,31 @@ mod tests {
 
     fn failed() -> Result<(), Attempt> {
         Err(Attempt::Failed("connect: refused".into()))
+    }
+
+    #[test]
+    fn a_5xx_is_the_gateways_own_condition_and_a_4xx_the_verdict() {
+        // Envoy's resolver failing on the gateway, no authorizer verdict given: move on.
+        assert!(matches!(
+            verdict(503, "DNS resolution failure".into()),
+            Attempt::Failed(why) if why == "503 DNS resolution failure: the gateway's own condition"
+        ));
+        assert!(matches!(
+            verdict(502, "Bad Gateway".into()),
+            Attempt::Failed(_)
+        ));
+        // The authorizer's no, and anything else the gateway says about the request: final.
+        assert_eq!(
+            verdict(403, "not_allowed".into()),
+            Attempt::Refused {
+                status: 403,
+                code: "not_allowed".into()
+            }
+        );
+        assert!(matches!(
+            verdict(400, "Bad Request".into()),
+            Attempt::Refused { status: 400, .. }
+        ));
     }
 
     #[tokio::test]

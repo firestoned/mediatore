@@ -482,6 +482,69 @@ async fn no_gateway_reachable_is_502_and_a_node_identity_gets_no_tunnel() {
     assert_eq!(gateway.tunnels().len(), 1);
 }
 
+/// ADR-0028 decision 7 as amended 2026-11-09: a gateway's own `5xx` (Envoy's resolver
+/// failing, no verdict given) moves the forwarder to the next gateway; every gateway in
+/// trouble is `502 gateway_unreachable` after one pass, each asked once. The authorizer's
+/// `403` stays final (the test above).
+#[tokio::test]
+async fn a_gateway_in_trouble_is_skipped_and_every_gateway_in_trouble_is_unreachable() {
+    let ca = TestCa::new(TRUST_DOMAIN);
+    let upstream = Upstream::start().await;
+    let unwell_1 = StandInGateway::start_unwell(&ca, &gateway_svid()).await;
+    let unwell_2 = StandInGateway::start_unwell(&ca, &gateway_svid()).await;
+    let h = Harness::start(
+        ca,
+        upstream,
+        vec![unwell_1.endpoint(), unwell_2.endpoint()],
+        None,
+    )
+    .await;
+    let (_claim, me) = h.bound().await;
+    let (proxy, phantom, _tokens) = h.start_proxy(&me, &claim_svid(&me.claim_uid)).await;
+
+    let resp = h.get(&proxy, &phantom, "/api/things").await;
+    assert_eq!(resp.status(), 502);
+    assert_eq!(
+        error_of(&resp.text().await.unwrap()),
+        "gateway_unreachable",
+        "a 503 is the gateway's condition, not the request's verdict"
+    );
+    assert_eq!(h.upstream.seen(), Vec::new());
+    assert_eq!(
+        (unwell_1.tunnels().len(), unwell_2.tunnels().len()),
+        (1, 1),
+        "both asked once, the second after the first's 503"
+    );
+
+    // A healthy gateway beside them: every request reaches the upstream, whatever the
+    // random start; the unwell ones only ever see asks they answer 503 to.
+    let healthy =
+        StandInGateway::start(&h.ca, &gateway_svid(), vec![h.upstream.tls.endpoint()]).await;
+    let me_mixed = Me {
+        gateways: vec![unwell_1.endpoint(), healthy.endpoint(), unwell_2.endpoint()],
+        ..me.clone()
+    };
+    let (proxy, phantom, _tokens) = h.start_proxy(&me_mixed, &claim_svid(&me.claim_uid)).await;
+    for i in 0..6 {
+        let resp = h.get(&proxy, &phantom, "/api/things").await;
+        assert_eq!(resp.status(), 200, "request {i}");
+    }
+    assert_eq!(h.upstream.seen().len(), 6);
+    assert_eq!(
+        healthy.tunnels().len(),
+        6,
+        "each request ended at the healthy gateway"
+    );
+    assert!(
+        unwell_1
+            .tunnels()
+            .iter()
+            .chain(unwell_2.tunnels().iter())
+            .all(|t| !t.allowed),
+        "an unwell gateway never carried one"
+    );
+}
+
 /// ADR-0029 decision 1: in an environment with gateways the broker refuses a claim whose
 /// image names a registry the pool cannot reach, naming the ones it can, and admits the
 /// mirror; without gateways nothing is restricted (every other suite).
