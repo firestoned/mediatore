@@ -157,6 +157,13 @@
       `policyRef` was looked up in the sandbox's namespace only, ADR-0026 amended), all
       fixed in the change after the run; the deployment layers carried stopgaps for them
       during the run, as the rc.3 layer had.
+- [ ] A one-shot workload. The supervisor restarts a workload that exits before the
+      deadline whatever its status (a crash loop and a finished agent look the same to it):
+      on 2026-11-09 the example agent answered once and was started again every two
+      seconds, calling Claude each time, until the claim was released by hand. Decide the
+      shape: `workload.restart: never` ending the claim on exit 0, or the guest releasing
+      the claim itself once the workload has exited cleanly; the walkthrough's agent is
+      the first user
 - [ ] A tier that runs the guest under the image's own units on a Kairos VM, on the
       build host: the kind tiers run the guest in a pod with `--dev-skip-setup`, which is
       how six of the defects above reached a release candidate. The shape: the ISO built
