@@ -62,9 +62,13 @@ the live run against a tenant, by hand.
       accepted and implemented 2026-11-08 (`e2e_egress.rs`: the phantom in `x-api-key` and
       in `Authorization` both swapped for the operator's key, the beta header beside it, a
       foreign key refused on every route, one fetch for two requests, the credential absent
-      from the subject); the live run against Claude through the gateways follows the next
-      release; then the federation exchange (the STS token for a short-lived Anthropic one)
-      as the attributed end state
+      from the subject). Live 2026-11-09 on the homelab (v0.2.0-rc.8, the key in a mounted
+      Secret, audience `anthropic` in `x-api-key`): Claude answered from inside the jail, by
+      curl and by the example image through the SDK, `credential=true` at the proxy, the
+      tunnel through a gateway, the key never in the jail, a GET outside the rules 403, a
+      baked key 401 ([testing](../../docs/guides/testing.md), section 5 of the live proofs).
+      Open: the federation exchange (the STS token for a short-lived Anthropic one) as the
+      attributed end state
 - [ ] The live run against a tenant (`crates/mediatore/tests/live_entra.rs`, ignored,
       by hand): the exchange, the refresh for mediatore's own resource, the refresh for
       a downstream audience, a revoked Entra session answering `invalid_grant`; the

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/local/bin/python3
 # Copyright (c) 2026 Erick Bourgeois, mediatore
 # SPDX-License-Identifier: Apache-2.0
 """The research agent: reads a repository through the egress proxy, asks Claude about it

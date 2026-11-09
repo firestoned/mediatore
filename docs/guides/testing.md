@@ -791,12 +791,76 @@ with the proxy's `forwarded … status=200 OK credential=false via=192.0.2.12:84
 confirmation that the request arrived bare. `github.com` itself is not on the policy, only
 `api.github.com:443` is, so the 404 is the policy's.
 
+### 5. Claude from inside the sandbox (ADR-0032, roadmap 04)
+
+v0.2.0-rc.8 on the broker and the pool image (2026-11-09, 00:47 UTC; the store backed up
+first, the pool recycled onto the new ISO, the member registered in three minutes). The
+operator's Anthropic key in a Secret mounted into the broker, the audience `anthropic`
+declared `via: secret` with the key placed in `x-api-key` and `anthropic-version` beside
+it, rules `POST /v1/messages` and its token count only; the start-up log reads
+`audience served from an operator-held credential (ADR-0032) audience=anthropic
+header=x-api-key`. The policy `claude-agent` names that one audience. The workload is the
+curl image again; the jail's environment carries the phantom, which it sends as
+`ANTHROPIC_API_KEY` would be sent, in `x-api-key`.
+
+Claim `sandbox-9cc8274d`, bound in one second:
+
+```
+broker    token issued claim_uid=… audience=anthropic subject=octocat backend="secret" header=x-api-key
+proxy     token fetched for the proxy audience="anthropic" expires_at=<now + 900 s> header="x-api-key"
+proxy     forwarded audience="anthropic" host=api.anthropic.com:443 method=POST path=/v1/messages status=200 OK credential=true via=192.0.2.13:8443
+gateway-03 envoy  tunnel peer=spiffe://<td>/banlieue/claim/… method=CONNECT authority=api.anthropic.com:443 status=200
+workload  PROOF claude POST /v1/messages: HTTP 200 1.386741s "model":"claude-opus-5-5" "stop_reason":"end_turn" "output_tokens":20
+workload  CLAUDE SAYS: Hello, Erick, the capital of France is Paris!
+proxy     request refused method=GET path=/api.anthropic.com/v1/models status=403 Forbidden code="outside_rules"
+workload  PROOF claude GET /v1/models (outside the rules): HTTP 403 "error":"outside_rules"
+proxy     request refused method=POST path=/api.anthropic.com/v1/messages status=401 Unauthorized code="unknown_credential"
+workload  PROOF claude with an image key (owned header): HTTP 401 "error":"unknown_credential"
+```
+
+The key never entered the jail: the workload sent the phantom, the proxy fetched the key
+from the broker once (expiry `max_ttl`) and placed it as the request left through a
+gateway, Anthropic answered `end_turn` with twenty output tokens, and the body carried the
+sentence. The GET outside the rules was refused before anything was fetched or forwarded;
+a key baked into the image, sent in the header the proxy owns, was refused on arrival.
+
+Two earlier claims the same half hour are part of the record. The first carried a prompt
+describing the sandbox and the proxy, and came back `200` with `claude-opus-5-5`, zero
+output tokens and no text block: the shape of a zero-token refusal, the plumbing proven
+(the broker's issue, the proxy's `credential=true`, Envoy's tunnel with six kilobytes back)
+and nothing to quote. The second met a gateway whose Envoy answered `503 DNS resolution
+failure` for the name that instant, which the forwarder takes as final (`502
+gateway_refused`, ADR-0028 decision 7); a minute later every gateway resolved it. Whether a
+gateway's own `503` should move the forwarder to the next gateway is now a roadmap 07
+question.
+
+Then the example image, `ghcr.io/firestoned/research-agent`, through the Anthropic SDK
+rather than curl: `/usr/local/bin/python3 /usr/local/bin/research-agent --hello`, the SDK
+reading `ANTHROPIC_BASE_URL` (the proxy, then `api.anthropic.com`) and `ANTHROPIC_API_KEY`
+(the phantom) from the environment the agent sets. Claim `sandbox-92a50de6`:
+
+```
+broker    token issued claim_uid=… audience=anthropic backend="secret" header=x-api-key
+proxy     forwarded audience="anthropic" host=api.anthropic.com:443 method=POST path=/v1/messages status=200 OK credential=true via=192.0.2.11:8443
+gateway-01 envoy  tunnel … method=CONNECT authority=api.anthropic.com:443 status=200 rx=2834 tx=5277 ms=4940
+workload  PROOF claude model=claude-opus-5-5 stop=end_turn input_tokens=74 output_tokens=166
+workload  CLAUDE SAYS: Hello, operator. I can't see my own runtime or network path, but in a setup like
+          that I'd first verify that the egress gateway enforces a strict default-deny allowlist, so that
+          injected credentials can only reach their intended destinations and can't be exfiltrated or
+          misused elsewhere.
+```
+
+Two lessons from this run went into the guides. The jail sets no `PATH` and applies
+nothing of the image's `ENTRYPOINT` or `ENV`, so a bare `research-agent` in
+`workload.args` was exit `127` and the supervisor restarted it until the claim was
+released; the interpreter and the program are named by absolute path. And a workload that
+exits `0` before the deadline is restarted too, so a one-shot agent that is not meant to
+run again should end by waiting for its deadline, or the claim should be released as soon
+as its output is read, as this one was after its first answer.
+
 ### What is not proven live yet
 
-A workload calling Claude from the jail. [ADR-0032](../adr/0032-operator-held-credentials-as-an-audience-backend.md)
-adds the backend the proxy needed (`via: secret`, the operator's key placed in `x-api-key`
-as the request leaves) and `crates/mediatore/tests/e2e_egress.rs` proves it against a TLS
-upstream of the same shape; the example image carries the Anthropic SDK and
-`research-agent --hello` makes one call. The live run, a claim under a policy naming an
-`anthropic` audience, Claude's answer in the workload's log, follows the release that
-carries ADR-0032, and is recorded here when it has happened.
+The full agent reading a repository and asking Claude about it, which needs a policy
+naming both the `github` and the `anthropic` audiences under a profile that allows two;
+and the `claude-agent` bundle on the cluster, so the claim's condition reads
+`PolicyConformant` rather than `P011`. Recorded here when they have happened.

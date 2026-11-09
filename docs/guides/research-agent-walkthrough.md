@@ -70,7 +70,9 @@ reads a repository through the proxy with the GitHub audience and asks Claude ab
 through an `anthropic` audience the operator serves from their own key
 ([ADR-0032](../adr/0032-operator-held-credentials-as-an-audience-backend.md)); the SDK
 reads `ANTHROPIC_BASE_URL` and `ANTHROPIC_API_KEY`, which the agent points at the proxy and
-the phantom. `research-agent --hello` makes one call to Claude and nothing else.
+the phantom. `/usr/local/bin/python3 /usr/local/bin/research-agent --hello` makes one call
+to Claude and nothing else (absolute paths: the jail sets no `PATH` and applies nothing of
+the image's `ENV` or `ENTRYPOINT`).
 
 The agent's loop is short. It reads what it needs from the git host through the egress
 proxy, writes its findings, and pushes. It holds no token: every request carries the
