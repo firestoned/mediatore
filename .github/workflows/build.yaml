@@ -311,10 +311,13 @@ jobs:
             latest=false
           tags: |
             type=ref,event=pr
-            type=sha,prefix=sha-
+            # The merge build already tagged this commit's image sha-<commit>; a release
+            # of the same commit built a different image (the version stamped in) and
+            # overwrote that tag, which GHCR refused on 2026-11-09 (write_package). A
+            # release's images carry the version alone, never a tag another build owns.
+            type=sha,prefix=sha-,enable=${{ github.event_name != 'release' }}
             type=raw,value=latest,enable=${{ github.event_name == 'push' }}
             type=semver,pattern={{version}},enable=${{ github.event_name == 'release' }}
-            type=semver,pattern={{major}}.{{minor}},enable=${{ github.event_name == 'release' }}
 
       - name: Build and push
         id: docker_build
@@ -395,10 +398,13 @@ jobs:
             latest=false
           tags: |
             type=ref,event=pr
-            type=sha,prefix=sha-
+            # The merge build already tagged this commit's image sha-<commit>; a release
+            # of the same commit built a different image (the version stamped in) and
+            # overwrote that tag, which GHCR refused on 2026-11-09 (write_package). A
+            # release's images carry the version alone, never a tag another build owns.
+            type=sha,prefix=sha-,enable=${{ github.event_name != 'release' }}
             type=raw,value=latest,enable=${{ github.event_name == 'push' }}
             type=semver,pattern={{version}},enable=${{ github.event_name == 'release' }}
-            type=semver,pattern={{major}}.{{minor}},enable=${{ github.event_name == 'release' }}
 
       - name: Build (and push on non-PR)
         id: guest_build
@@ -485,10 +491,13 @@ jobs:
             latest=false
           tags: |
             type=ref,event=pr
-            type=sha,prefix=sha-
+            # The merge build already tagged this commit's image sha-<commit>; a release
+            # of the same commit built a different image (the version stamped in) and
+            # overwrote that tag, which GHCR refused on 2026-11-09 (write_package). A
+            # release's images carry the version alone, never a tag another build owns.
+            type=sha,prefix=sha-,enable=${{ github.event_name != 'release' }}
             type=raw,value=latest,enable=${{ github.event_name == 'push' }}
             type=semver,pattern={{version}},enable=${{ github.event_name == 'release' }}
-            type=semver,pattern={{major}}.{{minor}},enable=${{ github.event_name == 'release' }}
 
       - name: Build (and push on non-PR)
         id: gateway_build
