@@ -130,6 +130,17 @@ impl Phantom {
         };
         aws_lc_rs::constant_time::verify_slices_are_equal(token, self.0.as_bytes()).is_ok()
     }
+
+    /// Whether `value`, found in `header`, presents this phantom: `Bearer <phantom>` in
+    /// `Authorization`, the bare phantom in a header a route names for its credential
+    /// (ADR-0032 decision 3). Constant time either way.
+    fn presented_in(&self, header: &HeaderName, value: &[u8]) -> bool {
+        if *header == header::AUTHORIZATION {
+            self.is_bearer(value)
+        } else {
+            aws_lc_rs::constant_time::verify_slices_are_equal(value, self.0.as_bytes()).is_ok()
+        }
+    }
 }
 
 impl std::fmt::Debug for Phantom {
@@ -143,6 +154,10 @@ impl std::fmt::Debug for Phantom {
 pub struct Routes {
     by_endpoint: BTreeMap<Endpoint, Route>,
     by_host: BTreeMap<String, Vec<Endpoint>>,
+    /// The request headers the proxy owns on every route (ADR-0032 decision 3):
+    /// `Authorization`, and every header a route names for its credential. A value in one
+    /// of them is the phantom or a refusal, and none of them crosses the proxy as sent.
+    owned: Vec<HeaderName>,
 }
 
 impl Routes {
@@ -154,12 +169,21 @@ impl Routes {
     pub fn new(routes: Vec<Route>) -> anyhow::Result<Self> {
         let mut by_endpoint = BTreeMap::new();
         let mut by_host: BTreeMap<String, Vec<Endpoint>> = BTreeMap::new();
+        let mut owned = vec![header::AUTHORIZATION];
         for r in routes {
             let e = r.endpoint.clone();
             anyhow::ensure!(
                 !r.injects() || r.audience.is_some(),
                 "route {e} injects a token but names no audience; the proxy cannot choose one"
             );
+            if let Some(h) = &r.credential_header {
+                let name = HeaderName::from_bytes(h.as_bytes()).map_err(|_| {
+                    anyhow::anyhow!("route {e}: credential_header {h:?} is not a header name")
+                })?;
+                if !owned.contains(&name) {
+                    owned.push(name);
+                }
+            }
             if let Some(other) = by_endpoint.insert(e.clone(), r) {
                 anyhow::bail!(
                     "endpoint {e} is on two routes ({} and {}); the proxy cannot choose a credential",
@@ -172,7 +196,14 @@ impl Routes {
         Ok(Self {
             by_endpoint,
             by_host,
+            owned,
         })
+    }
+
+    /// The headers the proxy owns on every route (ADR-0032 decision 3).
+    #[must_use]
+    pub fn owned_headers(&self) -> &[HeaderName] {
+        &self.owned
     }
 
     /// How many routes.
@@ -236,6 +267,8 @@ pub struct Forward<'a> {
 
 /// Decide a request from its method, its path and query, and its `Authorization` header
 /// (decisions 2 to 4 and 8). Pure, so the whole policy is unit-tested without a socket.
+/// The shape every caller had before ADR-0032; [`judge_headers`] reads the whole header
+/// map, so a phantom in a route's named header counts too.
 ///
 /// # Errors
 /// The refusal the workload gets.
@@ -245,6 +278,30 @@ pub fn judge<'a>(
     method: &Method,
     path_and_query: &str,
     authorization: Option<&[u8]>,
+) -> Result<Forward<'a>, Refusal> {
+    let mut headers = http::HeaderMap::new();
+    if let Some(v) = authorization {
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_bytes(v)
+                .map_err(|_| Refusal::new(StatusCode::UNAUTHORIZED, "unknown_credential"))?,
+        );
+    }
+    judge_headers(routes, phantom, method, path_and_query, &headers)
+}
+
+/// [`judge`] over the request's headers: every header the proxy owns (`Authorization` and
+/// each route's `credential_header`, ADR-0032 decision 3) is read on every route; a value
+/// that is not the phantom is `401`, the phantom in any of them is the phantom presented.
+///
+/// # Errors
+/// The refusal the workload gets.
+pub fn judge_headers<'a>(
+    routes: &'a Routes,
+    phantom: &Phantom,
+    method: &Method,
+    path_and_query: &str,
+    headers: &http::HeaderMap,
 ) -> Result<Forward<'a>, Refusal> {
     let rest = path_and_query
         .strip_prefix('/')
@@ -268,11 +325,17 @@ pub fn judge<'a>(
     if !route.admits(method.as_str(), path) {
         return Err(Refusal::new(StatusCode::FORBIDDEN, "outside_rules"));
     }
-    let inject = match authorization {
-        None => false,
-        Some(v) if phantom.is_bearer(v) => route.injects(),
-        Some(_) => return Err(Refusal::new(StatusCode::UNAUTHORIZED, "unknown_credential")),
-    };
+    let mut presented = false;
+    for owned in routes.owned_headers() {
+        for v in headers.get_all(owned) {
+            if phantom.presented_in(owned, v.as_bytes()) {
+                presented = true;
+            } else {
+                return Err(Refusal::new(StatusCode::UNAUTHORIZED, "unknown_credential"));
+            }
+        }
+    }
+    let inject = presented && route.injects();
     Ok(Forward {
         route,
         path_and_query,
@@ -328,28 +391,78 @@ impl TokenSource for BrokerTokens {
     }
 }
 
-/// Tokens by audience, replaced [`REFRESH_MARGIN_SECS`] before they expire. One fetch at a
-/// time: two requests arriving together do not both spend the claim's rate limit.
+/// A credential as the proxy places it (ADR-0032 decision 2): the header, its value, and
+/// the headers that travel beside it. For a minted token, `Authorization: Bearer <token>`.
+#[derive(Clone)]
+struct Placement {
+    header: HeaderName,
+    value: HeaderValue,
+    extra: Vec<(HeaderName, HeaderValue)>,
+}
+
+impl Placement {
+    /// From the broker's answer; a header name or value the wire cannot carry is an error,
+    /// and the request is refused rather than forwarded without the credential.
+    fn from_response(resp: &TokenResponse) -> anyhow::Result<Self> {
+        let (header, value) = match resp.header.as_deref() {
+            None | Some("authorization") => (
+                header::AUTHORIZATION,
+                HeaderValue::from_str(&format!("Bearer {}", resp.access_token)),
+            ),
+            Some(name) => (
+                HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
+                    anyhow::anyhow!("credential header {name:?} is not a header name")
+                })?,
+                HeaderValue::from_str(&resp.access_token),
+            ),
+        };
+        let value = value.map_err(|_| anyhow::anyhow!("the credential is not a header value"))?;
+        let mut extra = Vec::with_capacity(resp.extra_headers.len());
+        for h in &resp.extra_headers {
+            extra.push((
+                HeaderName::from_bytes(h.name.as_bytes()).map_err(|_| {
+                    anyhow::anyhow!("extra header {:?} is not a header name", h.name)
+                })?,
+                HeaderValue::from_str(&h.value).map_err(|_| {
+                    anyhow::anyhow!(
+                        "extra header {:?} has a value the wire cannot carry",
+                        h.name
+                    )
+                })?,
+            ));
+        }
+        Ok(Self {
+            header,
+            value,
+            extra,
+        })
+    }
+}
+
+/// Credentials by audience, replaced [`REFRESH_MARGIN_SECS`] before they expire. One
+/// fetch at a time: two requests arriving together do not both spend the claim's rate limit.
 #[derive(Default)]
 struct TokenCache {
-    tokens: tokio::sync::Mutex<HashMap<String, (String, DateTime<Utc>)>>,
+    tokens: tokio::sync::Mutex<HashMap<String, (Placement, DateTime<Utc>)>>,
 }
 
 impl TokenCache {
-    async fn bearer(&self, source: &dyn TokenSource, audience: &str) -> anyhow::Result<String> {
+    async fn placement(
+        &self,
+        source: &dyn TokenSource,
+        audience: &str,
+    ) -> anyhow::Result<Placement> {
         let mut tokens = self.tokens.lock().await;
-        if let Some((token, expires_at)) = tokens.get(audience)
+        if let Some((placed, expires_at)) = tokens.get(audience)
             && *expires_at - Utc::now() > Duration::seconds(REFRESH_MARGIN_SECS)
         {
-            return Ok(token.clone());
+            return Ok(placed.clone());
         }
         let fresh = source.token(audience).await?;
-        tracing::info!(audience, expires_at = %fresh.expires_at, "token fetched for the proxy");
-        tokens.insert(
-            audience.to_owned(),
-            (fresh.access_token.clone(), fresh.expires_at),
-        );
-        Ok(fresh.access_token)
+        tracing::info!(audience, expires_at = %fresh.expires_at, header = fresh.header.as_deref().unwrap_or("authorization"), "token fetched for the proxy");
+        let placed = Placement::from_response(&fresh)?;
+        tokens.insert(audience.to_owned(), (placed.clone(), fresh.expires_at));
+        Ok(placed)
     }
 }
 
@@ -484,16 +597,12 @@ impl Proxy {
         let Some(path_and_query) = req.uri().path_and_query().map(ToString::to_string) else {
             return refuse(&Refusal::new(StatusCode::BAD_REQUEST, "bad_request"));
         };
-        let authorization = req
-            .headers()
-            .get(header::AUTHORIZATION)
-            .map(HeaderValue::as_bytes);
-        let forward = match judge(
+        let forward = match judge_headers(
             &self.routes,
             &self.phantom,
             &method,
             &path_and_query,
-            authorization,
+            req.headers(),
         ) {
             Ok(f) => f,
             Err(r) => {
@@ -503,9 +612,9 @@ impl Proxy {
         };
         let route = forward.route.clone();
         let path_log = forward.path_and_query.clone();
-        let bearer = match (forward.inject, route.audience.as_deref()) {
-            (true, Some(audience)) => match self.cache.bearer(&*self.tokens, audience).await {
-                Ok(b) => Some(b),
+        let placed = match (forward.inject, route.audience.as_deref()) {
+            (true, Some(audience)) => match self.cache.placement(&*self.tokens, audience).await {
+                Ok(p) => Some(p),
                 Err(e) => {
                     tracing::error!(audience, error = %e, "no token for the proxy");
                     return refuse(&Refusal::new(StatusCode::BAD_GATEWAY, "token_unavailable"));
@@ -514,7 +623,7 @@ impl Proxy {
             // `Routes::new` refused a route that injects with no audience; nothing goes in.
             _ => None,
         };
-        let upstream = rewrite(req, &forward, bearer.as_deref());
+        let upstream = rewrite(req, &forward, placed.as_ref(), self.routes.owned_headers());
         match connect_and_send(
             &self.dialer,
             &route.endpoint,
@@ -561,11 +670,14 @@ impl Proxy {
 }
 
 /// The request as the upstream gets it: origin-form path, `Host` set to the endpoint,
-/// hop-by-hop headers dropped, the phantom replaced by the real bearer when one goes in.
+/// hop-by-hop headers dropped, every header the proxy owns dropped (the phantom never
+/// leaves, ADR-0032 decision 3), and the credential placed where the broker said when one
+/// goes in, with the headers that travel beside it.
 fn rewrite(
     req: Request<Incoming>,
     forward: &Forward<'_>,
-    bearer: Option<&str>,
+    placed: Option<&Placement>,
+    owned: &[HeaderName],
 ) -> Request<Incoming> {
     let (mut parts, body) = req.into_parts();
     parts.uri = forward
@@ -579,14 +691,13 @@ fn rewrite(
     if let Ok(v) = HeaderValue::from_str(&host_header(&forward.route.endpoint)) {
         parts.headers.insert(header::HOST, v);
     }
-    match bearer {
-        Some(b) => {
-            if let Ok(v) = HeaderValue::from_str(&format!("Bearer {b}")) {
-                parts.headers.insert(header::AUTHORIZATION, v);
-            }
-        }
-        None => {
-            parts.headers.remove(header::AUTHORIZATION);
+    for h in owned {
+        parts.headers.remove(h);
+    }
+    if let Some(p) = placed {
+        parts.headers.insert(p.header.clone(), p.value.clone());
+        for (name, value) in &p.extra {
+            parts.headers.insert(name.clone(), value.clone());
         }
     }
     Request::from_parts(parts, body)
@@ -840,6 +951,7 @@ mod tests {
                 .collect(),
             ca_pem: None,
             credential: Credential::Token,
+            credential_header: None,
         }
     }
 
@@ -1138,6 +1250,150 @@ mod tests {
             }])
             .is_ok(),
             "no credential: no audience needed"
+        );
+    }
+
+    #[test]
+    fn the_phantom_in_a_routes_named_header_is_recognised_and_that_header_is_owned_everywhere() {
+        // An audience `via: secret` with `x-api-key` (ADR-0032 decisions 2 and 3).
+        let r = Routes::new(vec![
+            Route {
+                credential_header: Some("x-api-key".into()),
+                ..route(
+                    "anthropic",
+                    "api.anthropic.com:443",
+                    &[("POST", "/v1/messages")],
+                )
+            },
+            route("internal-git", "git.home.example:443", &[]),
+        ])
+        .unwrap();
+        assert_eq!(
+            r.owned_headers(),
+            &[header::AUTHORIZATION, HeaderName::from_static("x-api-key")]
+        );
+        let p = phantom();
+        let key = HeaderName::from_static("x-api-key");
+        let mut in_key = http::HeaderMap::new();
+        in_key.insert(key.clone(), HeaderValue::from_str(p.expose()).unwrap());
+        let f = judge_headers(
+            &r,
+            &p,
+            &Method::POST,
+            "/api.anthropic.com/v1/messages",
+            &in_key,
+        )
+        .unwrap();
+        assert!(
+            f.inject,
+            "the phantom in x-api-key is the phantom presented"
+        );
+        let mut as_bearer = http::HeaderMap::new();
+        as_bearer.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {}", p.expose())).unwrap(),
+        );
+        assert!(
+            judge_headers(
+                &r,
+                &p,
+                &Method::POST,
+                "/api.anthropic.com/v1/messages",
+                &as_bearer
+            )
+            .unwrap()
+            .inject,
+            "and in Authorization, as before"
+        );
+        // A key of the image's own, in the named header, is refused on this route and on
+        // every other: the header is the proxy's wherever a request goes.
+        let mut foreign = http::HeaderMap::new();
+        foreign.insert(
+            key.clone(),
+            HeaderValue::from_static("sk-baked-into-the-image"),
+        );
+        for path in ["/api.anthropic.com/v1/messages", "/git.home.example/x"] {
+            assert_eq!(
+                judge_headers(&r, &p, &Method::POST, path, &foreign).unwrap_err(),
+                Refusal::new(StatusCode::UNAUTHORIZED, "unknown_credential"),
+                "{path}"
+            );
+        }
+        // The phantom in one owned header and a foreign value in another: refused.
+        let mut mixed = as_bearer.clone();
+        mixed.insert(key, HeaderValue::from_static("sk-other"));
+        assert_eq!(
+            judge_headers(
+                &r,
+                &p,
+                &Method::POST,
+                "/api.anthropic.com/v1/messages",
+                &mixed
+            )
+            .unwrap_err()
+            .status,
+            StatusCode::UNAUTHORIZED
+        );
+        // A header no route names passes through judgement untouched.
+        let mut other = http::HeaderMap::new();
+        other.insert(
+            HeaderName::from_static("x-trace"),
+            HeaderValue::from_static("t"),
+        );
+        assert!(
+            !judge_headers(&r, &p, &Method::GET, "/git.home.example/x", &other)
+                .unwrap()
+                .inject
+        );
+        // A route naming something that is not a header name refuses the proxy.
+        assert!(
+            Routes::new(vec![Route {
+                credential_header: Some("not a header".into()),
+                ..route("a", "a.example.com:443", &[])
+            }])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_placement_puts_the_credential_where_the_broker_said_with_its_extra_headers() {
+        let subject = mediatore_proto::Subject {
+            issuer: "https://idp.example".into(),
+            id: "octocat".into(),
+            display: None,
+        };
+        let keyed = TokenResponse {
+            access_token: "sk-real".into(),
+            token_type: "Header".into(),
+            expires_at: Utc::now() + Duration::minutes(10),
+            audience: "anthropic".into(),
+            subject: subject.clone(),
+            header: Some("x-api-key".into()),
+            extra_headers: vec![mediatore_proto::HeaderPair {
+                name: "anthropic-beta".into(),
+                value: "oauth-2025-04-20".into(),
+            }],
+        };
+        let p = Placement::from_response(&keyed).unwrap();
+        assert_eq!(p.header, HeaderName::from_static("x-api-key"));
+        assert_eq!(p.value, HeaderValue::from_static("sk-real"));
+        assert_eq!(p.extra[0].0, HeaderName::from_static("anthropic-beta"));
+        let bearer = TokenResponse {
+            header: None,
+            token_type: "Bearer".into(),
+            extra_headers: vec![],
+            ..keyed.clone()
+        };
+        let b = Placement::from_response(&bearer).unwrap();
+        assert_eq!(b.header, header::AUTHORIZATION);
+        assert_eq!(b.value, HeaderValue::from_static("Bearer sk-real"));
+        assert!(
+            Placement::from_response(&TokenResponse {
+                access_token: "line\nbreak".into(),
+                ..keyed
+            })
+            .is_err(),
+            "a value the wire cannot carry is an error, never forwarded bare"
         );
     }
 

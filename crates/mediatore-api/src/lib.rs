@@ -36,8 +36,8 @@ use mediatore_proto::ek::is_ek_hash;
 use mediatore_proto::image::ImageReference;
 use mediatore_proto::{
     ClaimEgress, ClaimPhase, ClaimReport, ClaimRequest, ClaimResponse, Credential, Endpoint,
-    EndpointRule, ErrorBody, GuestReport, HostTable, Me, NodeRegistered, NodeRegistration,
-    RegistryCredential, Route, Secret, TokenRequest, TokenResponse,
+    EndpointRule, ErrorBody, GuestReport, HeaderPair, HostTable, Me, NodeRegistered,
+    NodeRegistration, RegistryCredential, Route, Secret, TokenRequest, TokenResponse,
 };
 use mediatore_spire::{EntryManager, Naming};
 use mediatore_store::seal::{SealError, Sealer};
@@ -79,6 +79,10 @@ pub struct AppState {
     /// The audiences declared `via: none` (ADR-0025 decision 8): their routes carry
     /// `credential: none` and `POST /v1/token` refuses them.
     pub no_credential: std::collections::BTreeSet<String>,
+    /// The audiences declared `via: secret` (ADR-0032): the operator's credential, read from
+    /// the mounted Secret at start, handed to the proxy by `POST /v1/token` with the header
+    /// it goes in. Prints redacted; never written anywhere.
+    pub secrets: BTreeMap<String, AudienceSecret>,
     /// Per registry host (as the API reaches it), the operator's pull credential
     /// (`registries[]`); `GET /v1/me` hands the guest the one its claim's image names
     /// (ADR-0022).
@@ -889,6 +893,13 @@ async fn me(
                 } else {
                     Credential::Token
                 },
+                // ADR-0032 decision 2: where a `via: secret` credential goes, when not
+                // `Authorization`; the proxy owns that header on every route (decision 3).
+                credential_header: st
+                    .secrets
+                    .get(a)
+                    .filter(|sec| sec.header != "authorization")
+                    .map(|sec| sec.header.clone()),
             })
         })
         .chain(direct.into_iter().map(|e| Route {
@@ -897,6 +908,7 @@ async fn me(
             rules: vec![],
             ca_pem: None,
             credential: Credential::None,
+            credential_header: None,
         }))
         .collect();
     routes.sort_by(|a, b| {
@@ -925,6 +937,41 @@ async fn me(
         registry_credential,
         gateways: st.gateways.clone(),
     }))
+}
+
+/// An operator-held credential for an audience `via: secret` (ADR-0032), as the broker
+/// holds it in memory: the value, where the proxy puts it, what travels beside it, and how
+/// long a proxy may keep its copy (`max_ttl`).
+#[derive(Clone, Debug)]
+pub struct AudienceSecret {
+    /// The credential; `Debug` prints `[redacted]`.
+    pub value: Secret,
+    /// The request header, lowercase: `authorization` sends `Bearer <value>`, any other
+    /// name the bare value (decision 2).
+    pub header: String,
+    /// Headers the proxy adds beside the credential; public material.
+    pub extra_headers: Vec<HeaderPair>,
+    /// How long the proxy may keep its copy before asking again (decision 4).
+    pub ttl: Duration,
+}
+
+impl AudienceSecret {
+    /// The answer to `POST /v1/token` for this audience: the credential as it is, the
+    /// header it goes in (absent for `authorization`, a bearer), what travels beside it,
+    /// and an expiry `ttl` from now so the proxy asks again.
+    #[must_use]
+    pub fn response(&self, audience: String, subject: mediatore_proto::Subject) -> TokenResponse {
+        let bearer = self.header == "authorization";
+        TokenResponse {
+            access_token: self.value.0.clone(),
+            token_type: if bearer { "Bearer" } else { "Header" }.into(),
+            expires_at: Utc::now() + self.ttl,
+            audience,
+            subject,
+            header: (!bearer).then(|| self.header.clone()),
+            extra_headers: self.extra_headers.clone(),
+        }
+    }
 }
 
 /// What the broker needs to serve a policy's direct egress (ADR-0030).
@@ -1240,6 +1287,12 @@ async fn token(
             Some("too many token requests for this claim".to_owned()),
         ));
     }
+    // ADR-0032: an operator-held credential is handed as it is, with the header it goes in;
+    // the proxy keeps it for `max_ttl` and asks again, through this same gate.
+    if let Some(sec) = st.secrets.get(&req.audience) {
+        tracing::info!(%claim_uid, audience = %req.audience, subject = %rec.subject.id, backend = "secret", header = %sec.header, "token issued");
+        return Ok(Json(sec.response(req.audience, rec.subject)));
+    }
     // ADR-0013 decision 4, ADR-0016 decision 2: a session issuer's record is refreshed
     // upstream first, for the audience's resource. One refresh at a time per claim, over
     // the record as it is once the lock is held: the previous one may have rotated the
@@ -1278,6 +1331,8 @@ async fn token(
             expires_at,
             audience: req.audience,
             subject: rec.subject,
+            header: None,
+            extra_headers: vec![],
         }));
     }
     let Some(sts) = st.sts.as_ref() else {
@@ -1300,6 +1355,8 @@ async fn token(
         expires_at: minted.expires_at,
         audience: req.audience,
         subject: rec.subject,
+        header: None,
+        extra_headers: vec![],
     }))
 }
 

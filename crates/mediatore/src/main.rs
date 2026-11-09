@@ -156,18 +156,11 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
             .filter(|a| a.via == Backend::EntraObo)
             .map(|a| a.name.clone())
             .collect(),
-        egress: cfg
-            .audiences
-            .iter()
-            .map(|a| (a.name.clone(), a.egress.clone()))
-            .collect(),
-        rules: cfg
-            .audiences
-            .iter()
-            .map(|a| (a.name.clone(), a.rules.clone()))
-            .collect(),
+        egress: per_audience(&cfg, |a| a.egress.clone()),
+        rules: per_audience(&cfg, |a| a.rules.clone()),
         cas: audience_cas(&cfg)?,
         no_credential: no_credential_audiences(&cfg),
+        secrets: audience_secrets(&cfg)?,
         registries,
         sandboxes,
         sandbox_namespace: cfg.sandboxes.namespace.clone(),
@@ -373,6 +366,56 @@ async fn store(cfg: &Config) -> anyhow::Result<Arc<dyn ClaimStore>> {
         "store: migrated and connected"
     );
     Ok(Arc::new(store))
+}
+
+/// One value per audience, by name.
+fn per_audience<T>(
+    cfg: &Config,
+    f: impl Fn(&config::AudienceConfig) -> T,
+) -> std::collections::BTreeMap<String, T> {
+    cfg.audiences
+        .iter()
+        .map(|a| (a.name.clone(), f(a)))
+        .collect()
+}
+
+/// The audiences declared `via: secret` (ADR-0032 decision 1): each credential read once
+/// from its mounted Secret, one trailing newline trimmed; a missing or empty file refuses
+/// the start. The value is never logged; the audience, the header and the path are.
+fn audience_secrets(
+    cfg: &Config,
+) -> anyhow::Result<std::collections::BTreeMap<String, mediatore_api::AudienceSecret>> {
+    let mut out = std::collections::BTreeMap::new();
+    for a in cfg.audiences.iter().filter(|a| a.via == Backend::Secret) {
+        let Some(path) = a.secret_file.as_ref() else {
+            anyhow::bail!("audience {}: via: secret without secret_file", a.name);
+        };
+        let raw = std::fs::read_to_string(path).map_err(|e| {
+            anyhow::anyhow!(
+                "audience {}: reading secret_file {}: {e}",
+                a.name,
+                path.display()
+            )
+        })?;
+        let value = raw.strip_suffix('\n').unwrap_or(&raw);
+        anyhow::ensure!(
+            !value.trim().is_empty(),
+            "audience {}: secret_file {} is empty (ADR-0032 decision 1: fail closed)",
+            a.name,
+            path.display()
+        );
+        tracing::info!(audience = %a.name, header = %a.secret_header, file = %path.display(), "audience served from an operator-held credential (ADR-0032)");
+        out.insert(
+            a.name.clone(),
+            mediatore_api::AudienceSecret {
+                value: mediatore_proto::Secret(value.to_owned()),
+                header: a.secret_header.clone(),
+                extra_headers: a.secret_extra_headers.clone(),
+                ttl: chrono::Duration::seconds(a.max_ttl),
+            },
+        );
+    }
+    Ok(out)
 }
 
 /// The audiences declared `via: none` (ADR-0025 decision 8): a route without a credential,

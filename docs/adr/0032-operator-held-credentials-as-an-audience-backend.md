@@ -3,7 +3,7 @@
 
 # ADR-0032: An operator-held credential as an audience backend, placed by the proxy, never in the jail
 
-**Status:** Proposed · **Date:** 2026-11-08
+**Status:** Implemented · **Date:** 2026-11-08 (accepted and implemented the same day; the live run against Claude through the gateways is roadmap 04's open item)
 
 Roadmap 04 (the backends) and roadmap 07 (what the proxy puts on the wire). Adds a third
 backend to [ADR-0003](0003-token-backends.md), beside `entra-obo` and `sts`, and amends
@@ -79,15 +79,16 @@ account there.
 4. **Lifetime and revocation.** The credential does not expire with the claim; the proxy's
    copy does. `POST /v1/token` hands it with `expires_at` at `now + max_ttl` (the
    audience's, 900 s by default), so the proxy re-asks within that bound and the broker's
-   rate limit, audit row and `is_live` check apply to every fetch as they do for a minted
+   rate limit, log line and `is_live` check apply to every fetch as they do for a minted
    token. Revocation is the operator's, at the upstream: rotate the Secret, restart the
    broker; every proxy holds the old value for at most `max_ttl` more, and a released claim
    fetches nothing. Nothing of the credential is written anywhere: not the store, not a
-   log, not the audit row (`backend=secret` and the audience are logged, as today).
+   log (`backend=secret`, the claim, the subject and the audience are logged, as today).
 
 5. **Attribution stays in mediatore.** The upstream sees one key for every subject. Who
-   acted is the broker's record: the audit row of every issue names the subject, the claim
-   and the audience, and the proxy's log line names the host, the method and the path.
+   acted is the broker's record: its log line for every issue names the subject, the claim,
+   the audience and the backend, and the proxy's log line names the host, the method and
+   the path.
    The operator is told, in the guide, that the key should be one the upstream lets them
    scope and cap (a Console workspace key with a spend limit, for Anthropic), and that the
    audience's `rules` are what bounds the agent's reach there: `POST /v1/messages` and

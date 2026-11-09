@@ -121,6 +121,7 @@ impl Harness {
             .collect(),
             cas: std::collections::BTreeMap::new(),
             no_credential: std::collections::BTreeSet::new(),
+            secrets: std::collections::BTreeMap::new(),
             registries: [(
                 "registry.internal:5000".to_owned(),
                 mediatore_proto::RegistryCredential {

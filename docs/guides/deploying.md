@@ -119,6 +119,21 @@ Delete the local files afterwards. With the transit sealer ([the store](the-stor
 the sealing Secret is not needed; with Entra ([the Entra path](the-entra-path.md)) a
 fourth Secret holds the client credential.
 
+An audience served from a credential you hold (`via: secret`, [ADR-0032](../adr/0032-operator-held-credentials-as-an-audience-backend.md):
+an API key the upstream issued you, Anthropic's for Claude from inside the sandbox) is one
+more Secret, one key per file, mounted read-only where `audiences[].secret_file` points,
+`defaultMode: 0440` with the `fsGroup` the overlay already sets:
+
+```sh
+# Paste the key when prompted, so it is in neither your shell history nor a file.
+read -rs ANTHROPIC_KEY && kubectl -n banlieue-system create secret generic mediatore-audience-secrets \
+  --from-literal=anthropic="$ANTHROPIC_KEY" && unset ANTHROPIC_KEY
+```
+
+The broker reads each file once at start and refuses to start on an empty one; it never
+writes the value anywhere. Rotate by editing the Secret and restarting the broker: every
+proxy holds the old value for at most that audience's `max_ttl`.
+
 ## 3. Apply, and read the start-up log
 
 ```sh

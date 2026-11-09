@@ -59,8 +59,12 @@ the live run against a tenant, by hand.
       never in the jail. The first use is Claude from inside the sandbox: the SDK or Claude
       Code pointed at the proxy with `ANTHROPIC_BASE_URL` and the phantom as
       `ANTHROPIC_AUTH_TOKEN`. [ADR-0032](../../docs/adr/0032-operator-held-credentials-as-an-audience-backend.md)
-      proposed 2026-11-08; then the federation exchange (the STS token for a short-lived
-      Anthropic one) as the attributed end state
+      accepted and implemented 2026-11-08 (`e2e_egress.rs`: the phantom in `x-api-key` and
+      in `Authorization` both swapped for the operator's key, the beta header beside it, a
+      foreign key refused on every route, one fetch for two requests, the credential absent
+      from the subject); the live run against Claude through the gateways follows the next
+      release; then the federation exchange (the STS token for a short-lived Anthropic one)
+      as the attributed end state
 - [ ] The live run against a tenant (`crates/mediatore/tests/live_entra.rs`, ignored,
       by hand): the exchange, the refresh for mediatore's own resource, the refresh for
       a downstream audience, a revoked Entra session answering `invalid_grant`; the

@@ -45,6 +45,9 @@ pub enum Backend {
     /// a credential, its endpoints, rules and CA still the route's (ADR-0025 decision 8).
     /// Never an issuer's backend; the configuration refuses it there.
     None,
+    /// An operator-held credential for the audience, read from `secret_file` at start and
+    /// placed by the proxy in the header the audience names (ADR-0032). Never an issuer's.
+    Secret,
 }
 
 /// The delegated upstream session an issuer requires (ADR-0013): the caller hands over

@@ -120,6 +120,15 @@ dist-e2e: ## The testkit's dex-driver and gateway-probe (musl) into dist/, for t
 image: ## Build the server container image locally (the binary is compiled inside the image)
 	$(CONTAINER_CLI) build -t ghcr.io/firestoned/mediatore:dev .
 
+# The example workload (docs/guides/research-agent-walkthrough.md): python, git, curl and
+# the Anthropic SDK, the agent at /usr/local/bin/research-agent; nothing of the sandbox
+# machinery. Published as ghcr.io/firestoned/research-agent for the live proofs.
+EXAMPLE_IMAGE ?= ghcr.io/firestoned/research-agent:dev
+example-image: ## Build the example research-agent workload image (examples/research-agent)
+	$(CONTAINER_CLI) build --platform linux/amd64 -t $(EXAMPLE_IMAGE) examples/research-agent
+	$(CONTAINER_CLI) run --rm $(EXAMPLE_IMAGE) python3 -c 'import anthropic; print("anthropic", anthropic.__version__)'
+	$(CONTAINER_CLI) run --rm $(EXAMPLE_IMAGE) sh -c 'test ! -e /usr/bin/mediatore && ! find / -xdev -perm -4000 -type f 2>/dev/null | grep -q . && echo "no mediatore binary, no setuid file"'
+
 # The sandbox VM image (ADR-0023): a Kairos derivative with the guest software in the
 # immutable rootfs. The base, the SPIRE agent and the plugin are pinned by digest in
 # image/Dockerfile; BINARY_FROM=host reuses dist/mediatore (make dist) as the kind tier does.

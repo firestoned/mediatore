@@ -16,6 +16,7 @@ a real cluster address or a real credential in a tracked file.
 | Live against SPIRE in kind | `make kind-e2e` | Kubernetes, the SPIRE Controller Manager and the admission policy behave as the ADRs say, as the broker's own ServiceAccount; the broker image runs on the CSI driver's socket and agent-issued SVIDs meet on the sandbox listener | CI on every PR, any laptop with a container runtime |
 | TPM attestation in kind | `make kind-e2e-tpm` | A SPIRE agent on the image's own configuration attests with a vTPM through the pinned plugin on both sides, the EK trust bundle refuses what it should, the node entry lands under that agent; the agent starts from the OpenBao PKI root alone and the server's bundle is that root (ADR-0031) | by hand, a Linux host with `sudo`, swtpm and the `tpm_vtpm_proxy` module (not GitHub's runners) |
 | Live against a real cluster | `make live-admission-test` | The same, against a deployment you operate | by hand, before a release or after changing the deployment |
+| Live proofs on the homelab | the claims below, by hand | The whole path on real hardware: TPM-attested pool members and gateway VMs, the broker on a real cluster, a workload in the jail reaching a real API through a gateway's Envoy with the credential the design says, and nothing else | by hand, recorded in [Live proofs on the homelab](#live-proofs-on-the-homelab-2026-11-08) |
 
 ## Unit: `make check`
 
@@ -635,3 +636,167 @@ or refused (`kubectl -n spire-server logs statefulset/spire-server -c spire-cont
 and the test prints the resource as the API server last had it. A status that is
 present but not `rendered` means the controller manager refused the spec; `masked`
 means another entry already claims the same parent, selectors and ID.
+
+## Live proofs on the homelab, 2026-11-08
+
+What the tiers above cannot show is the whole path on real hardware: a pool member
+attested by its TPM, gateway VMs holding their own SPIFFE identity, the broker on a real
+cluster behind a real policy bundle, and a workload in the jail reaching a real API. These
+runs were made by hand on the maintainer's homelab on 2026-11-08 and are recorded here
+with the lines each component printed, so the proof is in the repository and not only in a
+terminal. Every name and address below is a placeholder for the real one (`rules/no-real-infrastructure.md`);
+the run log with the real values lives outside the repository. Hashes, claim UIDs, digests
+and request ids are as printed.
+
+The environment, for all four runs: one cluster (banlieue v0.5.0, then v0.5.1 the same
+evening; SPIRE 1.15.3 under the OpenBao upstream authority of ADR-0031), the broker
+`mediatore` in `banlieue-system` from the homelab overlay, three gateway VMs
+`gateway-01..03` on the hypervisor (ADR-0028, each attested through its own TPM), a pool `sandbox-pool` of one warm member on a routeless segment
+(ADR-0029), the workload images from a pull-through mirror on that segment
+(`registry.internal:5000`: `linuxcontainers/alpine`, the curl project's image, and since
+the evening the example `ghcr.io/firestoned/research-agent` from `examples/research-agent`,
+`make example-image`), notaio v0.5.1 publishing the bundles of two policies from the
+`sandboxes` namespace (`proof-agent`, `research-agent`, each with a ceiling signed by
+Security and admitted by Flux), and the CLI on the operator's machine. Every claim below
+is `mediatore sandbox create --pool sandbox-pool --audience <a> --policy <p> --image <i>
+--arg sh --arg=-c --arg <loop>`, after a `mediatore login` (the refresh token is spent per
+claim, ADR-0013).
+
+### 1. The 200 with the broker-minted bearer through a gateway (ADR-0028, roadmap 06)
+
+v0.2.0-rc.6 end to end, 16:43 to 17:46 UTC; the open item of banlieue ADR-0109 (an allowed
+request completing through a gateway's Envoy with a 200). Policy `proof-agent`: one
+audience `proof.lab.home.example` (Read, `GET /v1/**`, `ttlSeconds` 480, endpoint
+`proof.lab.home.example:443`), a TLS service on the hypervisor on the homelab's private PKI
+(`audiences[].ca_file` on the broker, ADR-0025 decision 7) that answers `/v1/hello` with
+`bearer=present` or `bearer=absent` according to the `Authorization` it received. The
+workload is `linuxcontainers/alpine` (busybox, so `wget -S`), probing four URLs every 20 s.
+
+Claim `sandbox-923281d0` (claim uid `0ce7577f…`), bound in under a
+second, `PolicyConformant=True` ("the broker allows nothing bundle v1 of proof-agent does
+not"). What each component printed, in order:
+
+```
+broker    token issued claim_uid=0ce7577f… audience=proof.lab.home.example subject=octocat
+proxy     forwarded audience="proof.lab.home.example" host=proof.lab.home.example:443 method=GET path=/v1/hello status=200 OK credential=true via=192.0.2.13:8443
+gateway-03 authorizer   verdict="allow" served="broker" authority=proof.lab.home.example:443
+gateway-01 authorizer   verdict="allow" served="cache"  authority=proof.lab.home.example:443   (the next round, another gateway, the cached answer)
+envoy     tunnel peer=spiffe://<td>/banlieue/claim/0ce7577f… method=CONNECT authority=proof.lab.home.example:443 status=200 upstream=192.0.2.1:443
+workload  PROOF allowed proof.lab HTTP/1.1 200 OK bearer=present
+workload  PROOF bare proof.lab    HTTP/1.1 200 OK bearer=absent
+workload  PROOF denied outside-rules HTTP/1.1 403 Forbidden
+workload  PROOF denied other-host    HTTP/1.1 404 Not Found
+```
+
+Read together: the broker minted one STS token for the claim's audience; the proxy
+swapped the jail's phantom for it and tunnelled through a gateway, a different one each
+round (the forwarder's random start, ADR-0028 decision 7); the authorizer allowed the
+tunnel on the claim SVID from the broker's answer and then from its cache; Envoy carried
+the CONNECT and logged the 200; the service saw the bearer. The bare probe beside it (no
+`Authorization`) reached the same service with no credential, as ADR-0025 decision 3
+says; `/admin` was refused at the proxy by the audience's rules; `api.github.com`, not on
+this claim, had no route. Released at 17:46:29: `claim released: entry retracted, tokens cut
+off`, the claim's entry gone from the SPIRE server, the member destroyed and the pool warm
+again within the minute.
+
+Two earlier claims the same afternoon are part of the record. `sandbox-ba355c5a` surfaced
+`P002 max_ttl 900 above the bundle's ttlSeconds 480` (the broker's default against the
+policy's value; the overlay now says `max_ttl: 480`) and an image without curl.
+`sandbox-eb7a47fa` probed without `Authorization` and got `bearer=absent` on every round,
+which is the design: the swap needs the phantom. The day also cost a hypervisor reboot
+that crash-looped the SPIRE servers' TPM init container (`mkdir` over a surviving
+emptyDir; fixed by PR #82 and proven with `make kind-e2e-tpm`), and a ceiling signed with
+the wrong key, which Flux refused until re-signed.
+
+### 2. A policy's direct egress at the real Envoy, in kind (ADR-0030, roadmap 11)
+
+Not the homelab but the same day and the same Envoy: `make kind-e2e-gateway-policy` on the
+build host, twice green (the second run with the credential-less route of the next
+section). Under `shadow` the destination's second port is `403 not_allowed` at the gateway,
+the broker logs `policy.egress is shadow: direct egress not served … would_add=<the second
+port>` and the sandbox reports `P006 the bundle holds 2 direct egress entries the broker
+cannot provide`; after the switch to `enforce` and a restart, the tunnel to the second port
+opens (Envoy `status=200`, the authorizer's `allow` with `served=broker`, the destination's
+request line on that port, the proxy's forward `credential=false` on the credential-less
+route), the host with rules stays `not_allowed` and is `P007 … has_rules`, the audience
+endpoint and the other host behave as before. Both PASS lines, exit 0, in about thirty
+minutes including the cluster.
+
+### 3. `policy.egress: enforce` on the homelab broker (ADR-0030 rollout step one)
+
+22:04 UTC. A week of shadow with no `would_add` line in the broker's log (neither policy
+names direct egress), then `egress: enforce` in the overlay, `kubectl apply -k` and a
+restart. The broker started on the value (a malformed one refuses the start), `store:
+migrated and connected`, `policy bundle reflector running namespaces=["sandboxes"]`,
+`policy bundle admitted … policy=proof-agent version=1` and `… policy=research-agent
+version=4`, the user API's `/healthz` 200. rc.6 logs no mode line; PR #87 adds one
+(`policy.egress … mode=enforce`) for the next release, and the kind tier now waits on it.
+
+### 4. The credential-less route live: GitHub reached bare (ADR-0025 decision 8, roadmap 07)
+
+v0.2.0-rc.7 (the broker upgraded 23:04 UTC by the overlay procedure, store backed up
+first; the pool image rebuilt from rc.7 and the pool recycled onto it; the gateways kept
+their rc.6 image, nothing in rc.7 touches them). Policy `research-agent`: one audience
+`github` (`GET /repos/firestoned/**`, `PUT /repos/firestoned/*/contents/**`, `ttlSeconds`
+480, endpoint `api.github.com:443`), declared `via: none` on the broker.
+
+Claim `sandbox-da419aec` (claim uid `9784c3d6…`, the alpine image), bound
+in one second, `PolicyConformant=True` ("the broker allows nothing bundle v4 of
+research-agent does not"):
+
+```
+guest     subject fetched claim_uid=9784c3d6… subject=octocat egress=1 routes=1 gateways=3
+guest     egress proxy ready … routes=1 gateways=3 gateways_from=Broker
+proxy     forwarded audience="github" host=api.github.com:443 method=GET path=/repos/firestoned/mediatore status=200 OK credential=false via=192.0.2.11:8443
+workload  PROOF allowed github phantom HTTP/1.1 200 OK
+proxy     forwarded audience="github" host=api.github.com:443 method=GET path=/repos/firestoned/mediatore status=200 OK credential=false via=192.0.2.11:8443
+workload  PROOF allowed github bare    HTTP/1.1 200 OK
+proxy     request refused method=GET path=/api.github.com/user status=403 Forbidden code="outside_rules"
+workload  PROOF denied outside-rules   HTTP/1.1 403 Forbidden
+proxy     request refused method=GET path=/proof.lab.home.example/v1/hello status=404 Not Found code="no_route"
+workload  PROOF denied other-host      HTTP/1.1 404 Not Found
+gateway-01 envoy  tunnel peer=spiffe://<td>/banlieue/claim/9784c3d6… method=CONNECT authority=api.github.com:443 status=200 upstream=<github>:443 rx=1685 tx=11966
+broker    (no POST /v1/token at all during the claim)
+```
+
+The request carrying the phantom and the request carrying nothing both left the gateway
+bare (`credential=false`), GitHub answered 200 with the repository, the broker was never
+asked for a token, the rules and the route set still refused around it. Released clean.
+
+Then the same with curl, as a reader would type it. Claim `sandbox-aa923665` (claim uid
+`6455eb5c…`), the curl project's own image from GHCR through the mirror,
+and inside the jail:
+
+```sh
+curl -sS -D - -H "Authorization: Bearer $MEDIATORE_TOKEN" \
+  "$MEDIATORE_EGRESS_PROXY/api.github.com/repos/firestoned/mediatore"
+```
+
+```
+curl 8.23.1-DEV (x86_64-pc-linux-musl) libcurl/8.23.1-DEV OpenSSL/3.5.9 …
+proxy=http://127.0.0.1:3128
+PROOF curl api.github.com/repos/firestoned/mediatore: HTTP 200 0.352937s
+PROOF curl api.github.com/user (outside the rules): HTTP 403 0.000842s "error":"outside_rules"
+PROOF curl github.com/firestoned (host not on the policy): HTTP 404 0.000948s "error":"no_route"
+RAW response headers from GitHub through the proxy:
+HTTP/1.1 200 OK
+server: github.com
+x-ratelimit-limit: 60
+x-ratelimit-remaining: 58
+x-github-request-id: <request id>
+```
+
+with the proxy's `forwarded … status=200 OK credential=false via=192.0.2.12:8443` for each
+200. GitHub's `x-ratelimit-limit: 60` is its unauthenticated bucket, an independent
+confirmation that the request arrived bare. `github.com` itself is not on the policy, only
+`api.github.com:443` is, so the 404 is the policy's.
+
+### What is not proven live yet
+
+A workload calling Claude from the jail. [ADR-0032](../adr/0032-operator-held-credentials-as-an-audience-backend.md)
+adds the backend the proxy needed (`via: secret`, the operator's key placed in `x-api-key`
+as the request leaves) and `crates/mediatore/tests/e2e_egress.rs` proves it against a TLS
+upstream of the same shape; the example image carries the Anthropic SDK and
+`research-agent --hello` makes one call. The live run, a claim under a policy naming an
+`anthropic` audience, Claude's answer in the workload's log, follows the release that
+carries ADR-0032, and is recorded here when it has happened.
