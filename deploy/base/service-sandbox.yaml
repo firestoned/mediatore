@@ -7,6 +7,10 @@
 # involved. The address is deployment configuration (set a loadBalancerIP or
 # annotations in an overlay); guests verify the broker by SPIFFE ID, never by
 # hostname, so the address carries no trust.
+# externalTrafficPolicy Local keeps the client's source address: the NetworkPolicy of
+# ADR-0007 decision 7 admits the listener from the sandbox segment's addresses alone, and
+# with Cluster a node forwarding to a broker pod on another node masquerades as itself and
+# is refused. The load balancer then announces from the pod's node.
 apiVersion: v1
 kind: Service
 metadata:
@@ -14,6 +18,7 @@ metadata:
   labels: { app.kubernetes.io/name: mediatore }
 spec:
   type: LoadBalancer
+  externalTrafficPolicy: Local
   selector: { app.kubernetes.io/name: mediatore }
   ports:
     - { name: sandbox, port: 443, targetPort: sandbox }
