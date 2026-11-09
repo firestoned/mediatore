@@ -972,12 +972,21 @@ $ kubectl -n banlieue-system get secret mediatore-session-<sandbox uid> -o jsonp
 
 `PolicyConformant=True` ("the broker allows nothing bundle v1 of claude-agent does not").
 The member that ran it was recycled by the pool as a consumed member, and a fresh one
-registered in its place (the third `SandboxNode` above). The retention sweep (ADR-0034
-decision 4) is due an hour after the exit; its line is appended below when it has run.
+registered in its place (the third `SandboxNode` above). An hour and a resync after the
+exit, the leader swept it (ADR-0034 decision 4): the audit line below, then the resource
+and its Secret were gone (`agentsandboxes.mediatore.io "sandbox-57d995da" not found`,
+`secrets "mediatore-session-<sandbox uid>" not found`).
+
+```text
+21:55:42  INFO mediatore_claims::kubestore: claim swept after its retention (ADR-0034 decision 4): the audit line
+          sandbox=sandbox-57d995da claim_uid=394e173c-d7b2-47dd-afce-7fb1ef8f5c83 subject=octocat
+          node_id="spiffe://sandbox.home.example/spire/agent/tpm/e81b53d5…" created_at=2026-11-09 20:54:24 UTC
+          expires_at=Some(2026-11-09T21:09:24Z) revoked_at=Some(2026-11-09T20:54:35Z) report=true exit=Some((Some(0), None, 0))
+21:55:42  INFO mediatore_claims::watch: resync released=0 swept=0 archived=1
+```
 
 ### What is not proven live yet
 
 The full agent reading a repository and asking Claude about it, which needs a policy
 naming both the `github` and the `anthropic` audiences under a profile that allows two.
-Recorded here when it has happened. The retention sweep of run 7's sandbox, due at the
-hour: its audit line goes under run 7 when it has run.
+Recorded here when it has happened.
