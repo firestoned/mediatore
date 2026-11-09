@@ -272,6 +272,11 @@ with that header, [ADR-0032](../adr/0032-operator-held-credentials-as-an-audienc
 Nothing in the jail mints, refreshes or caches a token: the proxy does, over the claim's
 SVID, as `mediatore token` used to from inside.
 
+The jail sets no `PATH` and reads nothing of the image's configuration (`ENTRYPOINT`,
+`ENV`, `WORKDIR`): `workload.args` is the whole argv, so name the interpreter and the
+program by absolute path (`/usr/local/bin/python3 /usr/local/bin/research-agent …`), and
+expect a `127` from the supervisor when a bare name is not under `/bin` or `/usr/bin`.
+
 ## Interaction patterns
 
 Because nothing inbound reaches the VM, pick one of:
