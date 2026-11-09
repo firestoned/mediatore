@@ -567,3 +567,11 @@ The Workload API is a socket on the node and needs no rule. Nothing else is open
 broker never reaches the internet unless the issuer or OpenBao is there, in which case
 their addresses go in. [ADR-0007](../adr/0007-broker-identity-and-spiffe-mtls.md)
 decision 7 is where this was decided.
+
+The two `8443` rows only hold if the client's source address reaches the pod intact, which
+is why `deploy/base/service-sandbox.yaml` sets `externalTrafficPolicy: Local` on the
+sandbox Service: with the default `Cluster`, a node that forwards to a broker pod on
+another node masquerades the connection as itself and the policy refuses it. Under
+`Local` the load balancer (MetalLB in the homelab) announces the address from the pod's
+node, and the source stays what the segment sent. Since ADR-0034 nothing pins the pod to a
+node, so this matters on the first reschedule.
