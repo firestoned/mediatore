@@ -101,6 +101,15 @@ audiences:
   - { name: api://trading-data, via: entra-obo, egress: ["api.trading.example:443"] }
   - { name: grafana.home.example, via: sts, max_ttl: 900, egress: ["grafana.home.example:443"] }
   - { name: api.example.com, via: none, egress: ["api.example.com:443"], rules: [{ method: GET, path: "/repos/**" }] }
+  - name: anthropic
+    via: secret
+    secret_file: /etc/mediatore-audience-secrets/anthropic
+    secret_header: x-api-key
+    max_ttl: 900
+    egress: ["api.anthropic.com:443"]
+    rules:
+      - { method: POST, path: "/v1/messages" }
+      - { method: POST, path: "/v1/messages/count_tokens" }
 ```
 
 `via: none` is an audience reached without a credential ([ADR-0025](../adr/0025-phantom-token-egress-proxy.md)
@@ -108,6 +117,18 @@ decision 8): the proxy drops the phantom and forwards bare, `POST /v1/token` ref
 and `egress`, `rules` and `ca_file` apply as for any other. Its `max_ttl` still enters the
 shadow comparison with a policy bundle (`P002`), so keep it at or below the bundle
 audience's `ttlSeconds`.
+
+`via: secret` is an operator-held credential ([ADR-0032](../adr/0032-operator-held-credentials-as-an-audience-backend.md)):
+the broker reads `secret_file` once at start (a Secret mounted read-only, as the STS key
+is; missing or empty refuses the start) and hands it to the proxy from `POST /v1/token`
+with the header it goes in. `secret_header` defaults to `authorization`, a bearer; a name
+such as `x-api-key` sends the bare value, and the proxy then recognises the phantom in that
+header too, so a tool reading `ANTHROPIC_API_KEY` works unchanged. `secret_extra_headers`
+(`{ name, value }`) travel beside it, for an API that wants a beta or version header with
+the credential. `max_ttl` is how long a proxy keeps its copy before asking again, so a
+rotated Secret (edit it, restart the broker) is everywhere within that bound. The upstream
+sees one key for every subject; who acted is in the broker's log, so use a key the upstream
+lets you scope and cap, and keep the `rules` to the calls the agent needs.
 
 `egress` is where the workload reaches the audience's API from the jail ([ADR-0020](../adr/0020-jail-network-nftables-keyed-by-sandbox-uid.md)): the
 guest admits those `host:port` pairs for the sandbox uid and nothing else beyond the

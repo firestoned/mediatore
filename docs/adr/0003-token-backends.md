@@ -3,7 +3,7 @@
 
 # ADR-0003: Two token backends, chosen per audience
 
-**Status:** Proposed · **Date:** 2026-09-26
+**Status:** Proposed · **Date:** 2026-09-26 · **Amended:** 2026-11-08 (a third backend, `secret`, an operator-held credential placed by the proxy: [ADR-0032](0032-operator-held-credentials-as-an-audience-backend.md), accepted)
 
 ## Context
 

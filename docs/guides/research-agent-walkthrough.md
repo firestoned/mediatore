@@ -52,14 +52,24 @@ platform, and all three are absences.
   ([ADR-0021](../adr/0021-sandbox-filesystem-tmpfs-and-rootfs-from-the-registry.md)).
 
 ```dockerfile
-# research-agent/Dockerfile
-FROM python:3.13-slim
-RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
+# examples/research-agent/Dockerfile (abridged; the file in the repository is the one built)
+FROM docker.io/library/python:3.13-slim@sha256:…
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir anthropic==1.17.0
 COPY research_agent.py /usr/local/bin/research-agent
 RUN chmod 0755 /usr/local/bin/research-agent
 # No ENTRYPOINT: the claim's workload.args is the argv, in full.
 ```
+
+This image exists: `examples/research-agent/` in the repository is the Dockerfile and the
+agent, `make example-image` builds it, and it is published as
+`ghcr.io/firestoned/research-agent` for the live proofs ([testing](testing.md)). The agent
+reads a repository through the proxy with the GitHub audience and asks Claude about it
+through an `anthropic` audience the operator serves from their own key
+([ADR-0032](../adr/0032-operator-held-credentials-as-an-audience-backend.md)); the SDK
+reads `ANTHROPIC_BASE_URL` and `ANTHROPIC_API_KEY`, which the agent points at the proxy and
+the phantom. `research-agent --hello` makes one call to Claude and nothing else.
 
 The agent's loop is short. It reads what it needs from the git host through the egress
 proxy, writes its findings, and pushes. It holds no token: every request carries the

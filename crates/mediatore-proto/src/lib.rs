@@ -300,6 +300,12 @@ pub struct Route {
     /// What replaces the phantom on this route (ADR-0025 decision 8); `token` when absent.
     #[serde(default)]
     pub credential: Credential,
+    /// The request header the credential goes in, when it is not `Authorization`
+    /// (ADR-0032 decision 2, an audience `via: secret` with `secret_header`): the proxy
+    /// recognises the phantom there too and owns that header on every route (decision 3).
+    /// Absent, `Authorization: Bearer`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_header: Option<String>,
 }
 
 impl Route {
@@ -475,9 +481,10 @@ pub struct TokenRequest {
 /// `POST /v1/token` response. Never contains a refresh token.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenResponse {
-    /// The bearer token for `audience`.
+    /// The credential for `audience`: a bearer token, or with `header` set the bare value
+    /// for that header (ADR-0032).
     pub access_token: String,
-    /// Always `Bearer`.
+    /// `Bearer`, or `Header` when `header` names one (ADR-0032 decision 2).
     pub token_type: String,
     /// Absolute expiry; the workload must not cache past this.
     pub expires_at: DateTime<Utc>,
@@ -485,6 +492,23 @@ pub struct TokenResponse {
     pub audience: String,
     /// Who the token acts for.
     pub subject: Subject,
+    /// The request header the proxy sets to `access_token` (ADR-0032 decision 2). Absent:
+    /// `Authorization: Bearer <access_token>`, the shape every backend had before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header: Option<String>,
+    /// Headers the proxy adds beside the credential on every credentialed request
+    /// (`audiences[].secret_extra_headers`); public material, empty for the minted backends.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_headers: Vec<HeaderPair>,
+}
+
+/// One request header by name and value, as the configuration spells it (ADR-0032).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeaderPair {
+    /// The header name, lowercase.
+    pub name: String,
+    /// The value, as sent.
+    pub value: String,
 }
 
 /// Error body for every non-2xx response.
@@ -600,6 +624,7 @@ mod tests {
             rules: vec![],
             ca_pem: None,
             credential: Credential::Token,
+            credential_header: None,
         };
         assert!(open.admits("DELETE", "/anything/at/all"));
         let narrow = Route {
@@ -677,6 +702,38 @@ mod tests {
         .unwrap();
         assert_eq!(named.audience.as_deref(), Some("api.example.com"));
         assert!(!named.injects());
+        assert_eq!(
+            named.credential_header, None,
+            "no header named: Authorization, as every route before ADR-0032"
+        );
+    }
+
+    #[test]
+    fn a_token_response_without_a_header_is_a_bearer_and_one_with_names_where_it_goes() {
+        let bearer: TokenResponse = serde_json::from_value(serde_json::json!({
+            "access_token": "t", "token_type": "Bearer", "expires_at": "2026-01-01T00:00:00Z",
+            "audience": "a", "subject": { "issuer": "https://idp.example", "id": "octocat" }
+        }))
+        .unwrap();
+        assert_eq!(bearer.header, None);
+        assert_eq!(bearer.extra_headers.len(), 0);
+        let json = serde_json::to_value(&bearer).unwrap();
+        assert!(
+            json.get("header").is_none() && json.get("extra_headers").is_none(),
+            "{json}"
+        );
+        let keyed = TokenResponse {
+            header: Some("x-api-key".into()),
+            token_type: "Header".into(),
+            extra_headers: vec![HeaderPair {
+                name: "anthropic-beta".into(),
+                value: "oauth-2025-04-20".into(),
+            }],
+            ..bearer
+        };
+        let json = serde_json::to_value(&keyed).unwrap();
+        assert_eq!(json["header"], "x-api-key");
+        assert_eq!(json["extra_headers"][0]["name"], "anthropic-beta");
     }
 
     #[test]

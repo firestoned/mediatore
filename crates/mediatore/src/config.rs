@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use mediatore_entra::{Backend, IssuerConfig};
 use mediatore_proto::image::canonical_registry;
-use mediatore_proto::{Endpoint, EndpointRule};
+use mediatore_proto::{Endpoint, EndpointRule, HeaderPair};
 use mediatore_store::seal::TransitConfig;
 use serde::Deserialize;
 
@@ -39,6 +39,25 @@ pub struct AudienceConfig {
     /// at start, refused if it holds no certificate, carried to the guest on the route.
     #[serde(default)]
     pub ca_file: Option<PathBuf>,
+    /// `via: secret` (ADR-0032): the file holding the operator's credential for this
+    /// audience and nothing else, a mounted Secret. Read once at start; missing or empty
+    /// refuses the start. Required with `via: secret`, refused with any other backend.
+    #[serde(default)]
+    pub secret_file: Option<PathBuf>,
+    /// `via: secret`: the request header the proxy sets, lowercase. `authorization` (the
+    /// default) sends `Bearer <credential>`; any other name (`x-api-key`) sends the bare
+    /// credential, and the proxy recognises the phantom in that header too.
+    #[serde(default = "default_secret_header")]
+    pub secret_header: String,
+    /// `via: secret`: headers the proxy adds beside the credential on every credentialed
+    /// request (Anthropic's `anthropic-beta: oauth-2025-04-20` for an OAuth token). Public
+    /// material, carried to the proxy with the token.
+    #[serde(default)]
+    pub secret_extra_headers: Vec<HeaderPair>,
+}
+
+fn default_secret_header() -> String {
+    "authorization".to_owned()
 }
 
 fn default_max_ttl() -> i64 {
@@ -418,6 +437,39 @@ impl Config {
                     );
                 }
             }
+            if a.via == Backend::Secret && a.secret_file.is_none() {
+                anyhow::bail!(
+                    "audience {:?}: via: secret needs `secret_file`, the mounted Secret holding the credential (ADR-0032)",
+                    a.name
+                );
+            }
+            if a.via != Backend::Secret && a.secret_file.is_some() {
+                anyhow::bail!(
+                    "audience {:?}: `secret_file` goes with via: secret only (ADR-0032)",
+                    a.name
+                );
+            }
+            let header_ok = |h: &str| {
+                !h.is_empty()
+                    && h.chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+            };
+            if !header_ok(&a.secret_header) {
+                anyhow::bail!(
+                    "audience {:?}: secret_header {:?} must be a lowercase header name (ADR-0032)",
+                    a.name,
+                    a.secret_header
+                );
+            }
+            for h in &a.secret_extra_headers {
+                if !header_ok(&h.name) || h.name == "authorization" || h.name == a.secret_header {
+                    anyhow::bail!(
+                        "audience {:?}: secret_extra_headers {:?} must be lowercase names other than the credential's (ADR-0032)",
+                        a.name,
+                        h.name
+                    );
+                }
+            }
             for r in &a.rules {
                 let method_ok = r.method == "*"
                     || (!r.method.is_empty() && r.method.chars().all(|c| c.is_ascii_alphabetic()));
@@ -678,6 +730,10 @@ impl Config {
                     "issuer {}: backend none is an audience's (a route without a credential, ADR-0025 decision 8), never an issuer's",
                     issuer.url
                 ),
+                (Backend::Secret, _) => anyhow::bail!(
+                    "issuer {}: backend secret is an audience's (an operator-held credential, ADR-0032), never an issuer's",
+                    issuer.url
+                ),
                 _ => {}
             }
             let Some(entra) = &issuer.entra else {
@@ -843,6 +899,54 @@ listen: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }
         );
         let err = Config::parse(
             "trust_domain: sandbox.test\nlisten: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }\ndev_mode: true\naudiences: []\nissuers:\n  - url: https://idp.example.com\n    backend: none\n    client_id: mediatore\n    subject_claim: email\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("never an issuer's"), "{err}");
+    }
+
+    #[test]
+    fn an_audience_via_secret_names_its_file_and_header_and_nothing_else_may() {
+        let cfg = Config::parse(
+            "trust_domain: sandbox.test\nissuers: []\nlisten: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }\ndev_mode: true\naudiences:\n  - name: anthropic\n    via: secret\n    secret_file: /etc/mediatore-audience-secrets/anthropic\n    secret_header: x-api-key\n    secret_extra_headers:\n      - { name: anthropic-beta, value: oauth-2025-04-20 }\n    egress: [\"api.anthropic.com:443\"]\n    rules:\n      - { method: POST, path: \"/v1/messages\" }\n  - name: bearer-api\n    via: secret\n    secret_file: /etc/mediatore-audience-secrets/bearer-api\n    egress: [\"api.example.com:443\"]\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.audiences[0].via, Backend::Secret);
+        assert_eq!(cfg.audiences[0].secret_header, "x-api-key");
+        assert_eq!(
+            cfg.audiences[0].secret_extra_headers[0].name,
+            "anthropic-beta"
+        );
+        assert_eq!(
+            cfg.audiences[1].secret_header, "authorization",
+            "the default header: a bearer"
+        );
+        let base = "trust_domain: sandbox.test\nissuers: []\nlisten: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }\ndev_mode: true\nsts: { issuer: https://mediatore.test, kid: k, signing_key_file: /k }\naudiences:\n";
+        for (bad, needle) in [
+            (
+                "  - { name: a, via: secret, egress: [\"a.example.com:443\"] }\n",
+                "needs `secret_file`",
+            ),
+            (
+                "  - { name: a, via: sts, secret_file: /s, egress: [\"a.example.com:443\"] }\n",
+                "via: secret only",
+            ),
+            (
+                "  - { name: a, via: secret, secret_file: /s, secret_header: \"X-Api-Key\" }\n",
+                "lowercase header name",
+            ),
+            (
+                "  - { name: a, via: secret, secret_file: /s, secret_header: x-api-key, secret_extra_headers: [{ name: x-api-key, value: v }] }\n",
+                "other than the credential's",
+            ),
+        ] {
+            let err = Config::parse(&format!("{base}{bad}"))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(needle), "{bad}: {err}");
+        }
+        let err = Config::parse(
+            "trust_domain: sandbox.test\nlisten: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }\ndev_mode: true\naudiences: []\nissuers:\n  - url: https://idp.example.com\n    backend: secret\n    client_id: mediatore\n    subject_claim: email\n",
         )
         .unwrap_err()
         .to_string();

@@ -116,6 +116,7 @@ impl Harness {
             rules: std::collections::BTreeMap::new(),
             cas: std::collections::BTreeMap::new(),
             no_credential: std::collections::BTreeSet::new(),
+            secrets: std::collections::BTreeMap::new(),
             registries: std::collections::BTreeMap::new(),
             reachable_registries: None,
             policy_egress: None,

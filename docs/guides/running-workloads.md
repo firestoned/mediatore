@@ -263,6 +263,10 @@ an audience with none gives nowhere to go, which is the default until the operat
 where. A public API your tools reach as themselves, with no token of mediatore's, is an
 audience the operator declares `via: none`: same `egress`, same rules, the phantom dropped
 on the way out. Tools that take a base URL and a bearer from the environment work unchanged:
+`ANTHROPIC_BASE_URL=$MEDIATORE_EGRESS_PROXY/api.anthropic.com ANTHROPIC_AUTH_TOKEN=$MEDIATORE_TOKEN`
+for the Anthropic SDKs and Claude Code (or `ANTHROPIC_API_KEY=$MEDIATORE_TOKEN`: the proxy
+recognises the phantom in `x-api-key` when the operator declared that audience `via: secret`
+with that header, [ADR-0032](../adr/0032-operator-held-credentials-as-an-audience-backend.md));
 `OPENAI_BASE_URL=$MEDIATORE_EGRESS_PROXY/api.openai.com/v1 OPENAI_API_KEY=$MEDIATORE_TOKEN`;
 `git clone -c http.extraheader="Authorization: Bearer $MEDIATORE_TOKEN" $MEDIATORE_EGRESS_PROXY/git.home.example/platform/services.git`.
 Nothing in the jail mints, refreshes or caches a token: the proxy does, over the claim's

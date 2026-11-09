@@ -45,6 +45,10 @@ const TRUST_DOMAIN: &str = "sandbox.test";
 const AUDIENCE: &str = "internal-api";
 /// An audience reached without a credential (`via: none`, ADR-0025 decision 8).
 const PUBLIC: &str = "api.example.com";
+/// An audience served from an operator-held credential in `x-api-key` (`via: secret`,
+/// ADR-0032), the shape Anthropic's API takes.
+const KEYED: &str = "anthropic";
+const KEYED_SECRET: &str = "sk-test-operator-key-0001";
 const REQUIRED_GROUP: &str = "firestoned:sandbox-users";
 const PEER_HEADER: &str = "x-mediatore-peer-spiffe-id";
 const EK_HASH: &str = "72c566555391e835a15c522680b51ec3b840561ed70af5605a5ae4835f040ee8";
@@ -56,6 +60,10 @@ struct Seen {
     path_and_query: String,
     authorization: Option<String>,
     host: Option<String>,
+    /// `x-api-key`, where a `via: secret` audience's credential goes (ADR-0032).
+    api_key: Option<String>,
+    /// `anthropic-beta`, an extra header the audience names.
+    beta: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -79,6 +87,14 @@ async fn record(
             .map(ToOwned::to_owned),
         host: headers
             .get(axum::http::header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .map(ToOwned::to_owned),
+        api_key: headers
+            .get("x-api-key")
+            .and_then(|v| v.to_str().ok())
+            .map(ToOwned::to_owned),
+        beta: headers
+            .get("anthropic-beta")
             .and_then(|v| v.to_str().ok())
             .map(ToOwned::to_owned),
     };
@@ -116,6 +132,108 @@ impl TokenSource for DevTokens {
     }
 }
 
+/// The broker's state for the proxy's proof: three audiences on one trust domain, the
+/// first on a private PKI with rules, the second `via: none`, the third `via: secret` with
+/// the operator's key in `x-api-key` (ADR-0032).
+fn state(idp: &FakeIdp, upstream: &TlsUpstream, keyed_upstream: &TlsUpstream) -> Arc<AppState> {
+    let sts = Sts::new(
+        "https://mediatore.test",
+        "e2e-1",
+        STS_TEST_KEY.as_bytes(),
+        Duration::minutes(15),
+    )
+    .expect("sts");
+    Arc::new(AppState {
+        store: MemoryStore::shared(),
+        spire: Arc::new(mediatore_spire::MemoryEntries::default()),
+        naming: Naming {
+            trust_domain: TRUST_DOMAIN.into(),
+        },
+        validator: Validator::new(vec![IssuerConfig {
+            url: idp.issuer.clone(),
+            backend: Backend::Sts,
+            client_id: "mediatore".into(),
+            subject_claim: "preferred_username".into(),
+            required_group: Some(REQUIRED_GROUP.into()),
+            session: None,
+            ca_file: None,
+            entra: None,
+            groups_claim: None,
+        }]),
+        sts: Some(sts),
+        audiences: vec![AUDIENCE.into(), PUBLIC.into(), KEYED.into()],
+        obo_audiences: vec![],
+        egress: [
+            (AUDIENCE.to_owned(), vec![upstream.endpoint()]),
+            (
+                PUBLIC.to_owned(),
+                vec!["api.example.com:443".parse().unwrap()],
+            ),
+            (KEYED.to_owned(), vec![keyed_upstream.endpoint()]),
+        ]
+        .into_iter()
+        .collect(),
+        rules: [
+            (
+                AUDIENCE.to_owned(),
+                vec![
+                    EndpointRule {
+                        method: "GET".into(),
+                        path: "/api/**".into(),
+                    },
+                    EndpointRule {
+                        method: "POST".into(),
+                        path: "/api/things/*/notes".into(),
+                    },
+                ],
+            ),
+            (
+                KEYED.to_owned(),
+                vec![EndpointRule {
+                    method: "POST".into(),
+                    path: "/v1/messages".into(),
+                }],
+            ),
+        ]
+        .into_iter()
+        .collect(),
+        // The upstream is on a private PKI, as the homelab's are: its CA is the
+        // audience's `ca_file`, carried to the proxy on the route (ADR-0025 amended).
+        cas: [
+            (AUDIENCE.to_owned(), upstream.ca_pem()),
+            (KEYED.to_owned(), keyed_upstream.ca_pem()),
+        ]
+        .into_iter()
+        .collect(),
+        no_credential: [PUBLIC.to_owned()].into_iter().collect(),
+        // The operator's credential for the keyed audience (ADR-0032): in the broker's
+        // memory alone, placed by the proxy in x-api-key with the beta header beside it.
+        secrets: [(
+            KEYED.to_owned(),
+            mediatore_api::AudienceSecret {
+                value: mediatore_proto::Secret(KEYED_SECRET.into()),
+                header: "x-api-key".into(),
+                extra_headers: vec![mediatore_proto::HeaderPair {
+                    name: "anthropic-beta".into(),
+                    value: "oauth-2025-04-20".into(),
+                }],
+                ttl: Duration::minutes(15),
+            },
+        )]
+        .into_iter()
+        .collect(),
+        registries: std::collections::BTreeMap::new(),
+        reachable_registries: None,
+        policy_egress: None,
+        sandboxes: None,
+        sandbox_namespace: "sandboxes".into(),
+        sealer: None,
+        limiter: Limiter::new(10),
+        dev_mode: true,
+        gateways: vec![],
+    })
+}
+
 struct Harness {
     #[allow(dead_code)] // dropped last: aborts the issuer
     idp: FakeIdp,
@@ -123,6 +241,8 @@ struct Harness {
     sandbox_url: String,
     http: reqwest::Client,
     upstream: TlsUpstream,
+    /// The upstream behind the `via: secret` audience, on its own CA, the same recorder.
+    keyed_upstream: TlsUpstream,
     seen: Recorder,
 }
 
@@ -137,74 +257,15 @@ impl Harness {
                 .with_state(seen.clone()),
         )
         .await;
-        let idp = FakeIdp::start().await;
-        let sts = Sts::new(
-            "https://mediatore.test",
-            "e2e-1",
-            STS_TEST_KEY.as_bytes(),
-            Duration::minutes(15),
+        let keyed_upstream = TlsUpstream::start(
+            axum::Router::new()
+                .route("/{*rest}", any(record))
+                .route("/", any(record))
+                .with_state(seen.clone()),
         )
-        .expect("sts");
-        let state = Arc::new(AppState {
-            store: MemoryStore::shared(),
-            spire: Arc::new(mediatore_spire::MemoryEntries::default()),
-            naming: Naming {
-                trust_domain: TRUST_DOMAIN.into(),
-            },
-            validator: Validator::new(vec![IssuerConfig {
-                url: idp.issuer.clone(),
-                backend: Backend::Sts,
-                client_id: "mediatore".into(),
-                subject_claim: "preferred_username".into(),
-                required_group: Some(REQUIRED_GROUP.into()),
-                session: None,
-                ca_file: None,
-                entra: None,
-                groups_claim: None,
-            }]),
-            sts: Some(sts),
-            audiences: vec![AUDIENCE.into(), PUBLIC.into()],
-            obo_audiences: vec![],
-            egress: [
-                (AUDIENCE.to_owned(), vec![upstream.endpoint()]),
-                (
-                    PUBLIC.to_owned(),
-                    vec!["api.example.com:443".parse().unwrap()],
-                ),
-            ]
-            .into_iter()
-            .collect(),
-            rules: [(
-                AUDIENCE.to_owned(),
-                vec![
-                    EndpointRule {
-                        method: "GET".into(),
-                        path: "/api/**".into(),
-                    },
-                    EndpointRule {
-                        method: "POST".into(),
-                        path: "/api/things/*/notes".into(),
-                    },
-                ],
-            )]
-            .into_iter()
-            .collect(),
-            // The upstream is on a private PKI, as the homelab's are: its CA is the
-            // audience's `ca_file`, carried to the proxy on the route (ADR-0025 amended).
-            cas: [(AUDIENCE.to_owned(), upstream.ca_pem())]
-                .into_iter()
-                .collect(),
-            no_credential: [PUBLIC.to_owned()].into_iter().collect(),
-            registries: std::collections::BTreeMap::new(),
-            reachable_registries: None,
-            policy_egress: None,
-            sandboxes: None,
-            sandbox_namespace: "sandboxes".into(),
-            sealer: None,
-            limiter: Limiter::new(10),
-            dev_mode: true,
-            gateways: vec![],
-        });
+        .await;
+        let idp = FakeIdp::start().await;
+        let state = state(&idp, &upstream, &keyed_upstream);
         let user = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind user");
@@ -221,6 +282,7 @@ impl Harness {
             sandbox_url,
             http: reqwest::Client::new(),
             upstream,
+            keyed_upstream,
             seen,
         }
     }
@@ -562,6 +624,124 @@ async fn a_route_without_a_credential_forwards_bare_and_the_phantom_never_leaves
     assert_eq!(resp.status(), 401);
     assert_eq!(h.seen().len(), 2, "nothing reached the upstream");
     assert_eq!(tokens.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn an_operator_held_credential_is_placed_by_the_proxy_and_never_enters_the_jail() {
+    let h = Harness::start().await;
+    h.register_node().await;
+    let claim = h.claim_with(&[AUDIENCE, KEYED]).await;
+    let uid = claim.uid.expect("uid");
+
+    // The route says where the credential goes (ADR-0032 decision 2); not what it is.
+    let me = h.me().await;
+    let keyed = me
+        .routes
+        .iter()
+        .find(|r| r.audience.as_deref() == Some(KEYED))
+        .expect("the keyed audience's route");
+    assert!(keyed.injects());
+    assert_eq!(keyed.credential_header.as_deref(), Some("x-api-key"));
+    assert!(
+        !serde_json::to_string(&me).unwrap().contains(KEYED_SECRET),
+        "the credential is not in the subject the guest fetches"
+    );
+    // The broker hands it with the header, for max_ttl, to the claim SVID.
+    let resp = h
+        .http
+        .post(format!("{}/v1/token", h.sandbox_url))
+        .header(
+            PEER_HEADER,
+            format!("spiffe://{TRUST_DOMAIN}/banlieue/claim/{uid}"),
+        )
+        .json(&TokenRequest {
+            audience: KEYED.into(),
+        })
+        .send()
+        .await
+        .expect("token request");
+    assert_eq!(resp.status(), 200);
+    let token: TokenResponse = resp.json().await.expect("token body");
+    assert_eq!(token.access_token, KEYED_SECRET);
+    assert_eq!(token.token_type, "Header");
+    assert_eq!(token.header.as_deref(), Some("x-api-key"));
+    assert_eq!(token.extra_headers[0].name, "anthropic-beta");
+    let left = token.expires_at - chrono::Utc::now();
+    assert!(
+        left > Duration::minutes(14) && left <= Duration::minutes(15),
+        "expires_at is now plus max_ttl: {left}"
+    );
+
+    let (proxy, phantom, tokens) = h.start_proxy(me.routes.clone(), &uid).await;
+    let host = h.keyed_upstream.endpoint().to_string();
+    let other = h.upstream.endpoint().to_string();
+
+    // The SDK's shape: the phantom in x-api-key. The upstream sees the operator's key
+    // there, the beta header beside it, and no Authorization at all.
+    let resp = h
+        .http
+        .post(format!("{proxy}/{host}/v1/messages"))
+        .header("x-api-key", phantom.expose())
+        .body("{}")
+        .send()
+        .await
+        .expect("through the proxy");
+    assert_eq!(resp.status(), 200);
+    let seen = h.seen();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].method, "POST");
+    assert_eq!(seen[0].api_key.as_deref(), Some(KEYED_SECRET));
+    assert_eq!(seen[0].beta.as_deref(), Some("oauth-2025-04-20"));
+    assert_eq!(seen[0].authorization, None, "nothing in Authorization");
+
+    // The phantom as a bearer works the same on this route.
+    let resp = h
+        .http
+        .post(format!("{proxy}/{host}/v1/messages"))
+        .bearer_auth(phantom.expose())
+        .body("{}")
+        .send()
+        .await
+        .expect("as a bearer");
+    assert_eq!(resp.status(), 200);
+    let seen = h.seen();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[1].api_key.as_deref(), Some(KEYED_SECRET));
+    assert_eq!(seen[1].authorization, None);
+    assert_eq!(
+        tokens.calls.load(Ordering::SeqCst),
+        1,
+        "one fetch for two requests: the credential is cached for max_ttl"
+    );
+
+    // A key the image brought, in the header the proxy owns: refused on this route and on
+    // every other (decision 3), nothing forwarded.
+    // (Each request is within its route's rules, so the refusal is the credential's.)
+    for (method, target) in [
+        (reqwest::Method::POST, format!("{proxy}/{host}/v1/messages")),
+        (reqwest::Method::GET, format!("{proxy}/{other}/api/public")),
+    ] {
+        let resp = h
+            .http
+            .request(method, &target)
+            .header("x-api-key", "sk-baked-into-the-image")
+            .send()
+            .await
+            .expect("foreign key");
+        assert_eq!(resp.status(), 401, "{target}");
+    }
+    assert_eq!(h.seen().len(), 2, "nothing reached either upstream");
+
+    // The rules still bound the audience: only POST /v1/messages.
+    let resp = h
+        .http
+        .get(format!("{proxy}/{host}/v1/messages"))
+        .header("x-api-key", phantom.expose())
+        .send()
+        .await
+        .expect("outside the rules");
+    assert_eq!(resp.status(), 403);
+    assert_eq!(tokens.calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

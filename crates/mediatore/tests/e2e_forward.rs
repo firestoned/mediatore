@@ -198,6 +198,7 @@ impl Harness {
                 .into_iter()
                 .collect(),
             no_credential: std::collections::BTreeSet::new(),
+            secrets: std::collections::BTreeMap::new(),
             registries: std::collections::BTreeMap::new(),
             reachable_registries,
             policy_egress: None,
