@@ -263,6 +263,7 @@ mediatore login --issuer https://dex.home.example
 mediatore sandbox create --mediatore https://mediatore.home.example \
   --pool research --ttl 3600 \
   --audience internal-git \
+  --restart on-failure \
   --image ghcr.io/octocat/research-agent@sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08 \
   --arg /usr/local/bin/research-agent \
   --arg "which services still call the v1 ledger API?"

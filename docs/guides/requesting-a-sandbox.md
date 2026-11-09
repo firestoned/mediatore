@@ -93,6 +93,15 @@ compare with. A sandbox naming a policy with no verified bundle (no such policy,
 the broker trusts) is admitted exactly like one naming none, with nothing recorded. Like
 the rest of the spec, the field is immutable.
 
+`spec.workload.restart` (`restart` in `workload` on `POST /v1/claims`, `--restart` on
+`mediatore sandbox create`; [ADR-0033](../adr/0033-a-one-shot-workload-the-restart-policy-and-the-claim-released-when-it-is-done.md))
+says what the guest does when the workload exits before the deadline: `always` (the
+default) restarts it whatever the status, `on-failure` restarts a non-zero exit and ends the
+claim on `0`, `never` ends the claim on any exit. When the policy ends the claim, the guest
+tells the broker, the exit (code or signal, restarts) goes on the record and `sandbox get`
+shows it, and the claim is released as a delete releases it: the member recycled, the
+tokens cut off. A one-shot agent is `--restart on-failure`.
+
 ### What the comparison reports
 
 With a `policy` section configured, every sandbox carries a `PolicyConformant` condition:

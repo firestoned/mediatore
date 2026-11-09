@@ -726,6 +726,7 @@ mod tests {
             workload: Workload {
                 image: "ghcr.io/example/workload:1".into(),
                 args: vec!["sh".into()],
+                restart: mediatore_proto::RestartPolicy::Always,
             },
             ttl_seconds: 600,
             refresh: None,
@@ -736,6 +737,7 @@ mod tests {
             policy_uid: None,
             bundle_version: None,
             report: None,
+            exit: None,
         }
     }
 

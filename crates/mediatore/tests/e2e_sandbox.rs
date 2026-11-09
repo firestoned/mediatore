@@ -100,6 +100,7 @@ impl Harness {
                 workload: Workload {
                     image: "registry.internal:5000/sandbox:latest".into(),
                     args: vec!["sh".into()],
+                    restart: mediatore_proto::RestartPolicy::Always,
                 },
                 refresh_token: None,
                 policy_ref: Some("agent".into()),

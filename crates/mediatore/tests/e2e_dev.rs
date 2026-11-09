@@ -212,6 +212,7 @@ impl Harness {
                 workload: Workload {
                     image: image.into(),
                     args: vec![],
+                    restart: mediatore_proto::RestartPolicy::Always,
                 },
                 refresh_token: None,
                 policy_ref: None,
@@ -233,6 +234,7 @@ impl Harness {
                 workload: Workload {
                     image: "registry.internal:5000/sandbox:latest".into(),
                     args: vec![],
+                    restart: mediatore_proto::RestartPolicy::Always,
                 },
                 refresh_token: None,
                 policy_ref: None,
@@ -261,6 +263,119 @@ impl Harness {
 /// The guest's report (ADR-0029 decision 5): the node identity reports for its claim, the
 /// shapes are checked, the report is kept on the record and shown to the subject; a claim
 /// identity cannot report and a malformed report is refused.
+/// ADR-0033: a claim created `restart: never`; the node posts the workload's exit, the
+/// broker records it and releases the claim as a delete does; a claim identity cannot
+/// post it, and a late post after the release is `204` with nothing done.
+#[tokio::test]
+async fn a_one_shot_workload_ends_its_claim_at_the_broker() {
+    let h = Harness::start().await;
+    h.register_node().await;
+    let user_token = h.login("octocat");
+    let resp = h
+        .http
+        .post(format!("{}/v1/claims", h.user_url))
+        .bearer_auth(&user_token)
+        .json(&ClaimRequest {
+            pool_ref: "pool-a".into(),
+            ttl_seconds: 3600,
+            audiences: vec![AUDIENCE.into()],
+            workload: Workload {
+                image: "registry.internal:5000/sandbox:latest".into(),
+                args: vec!["/usr/local/bin/agent".into(), "--once".into()],
+                restart: mediatore_proto::RestartPolicy::Never,
+            },
+            refresh_token: None,
+            policy_ref: None,
+        })
+        .send()
+        .await
+        .expect("create claim");
+    assert_eq!(resp.status(), 201);
+    let claim: ClaimResponse = resp.json().await.expect("claim body");
+    let uid = claim.uid.expect("uid");
+    assert_eq!(claim.phase, mediatore_proto::ClaimPhase::Bound);
+
+    // The guest reads the policy with the subject.
+    let me: Me = h
+        .http
+        .get(format!("{}/v1/me", h.sandbox_url))
+        .header(PEER_HEADER, node_svid())
+        .send()
+        .await
+        .expect("me")
+        .json()
+        .await
+        .expect("me body");
+    assert_eq!(me.workload.restart, mediatore_proto::RestartPolicy::Never);
+
+    let exit = mediatore_proto::GuestExit {
+        code: Some(0),
+        signal: None,
+        restarts: 0,
+    };
+    // Not the node: refused, nothing ends.
+    let resp = h
+        .http
+        .post(format!("{}/v1/me/exit", h.sandbox_url))
+        .header(PEER_HEADER, claim_svid(&uid))
+        .json(&exit)
+        .send()
+        .await
+        .expect("exit as the claim");
+    assert_eq!(resp.status(), 403, "a claim identity is not the node");
+    let still: ClaimResponse = h
+        .http
+        .get(format!("{}/v1/claims/{}", h.user_url, claim.name))
+        .bearer_auth(&user_token)
+        .send()
+        .await
+        .expect("get claim")
+        .json()
+        .await
+        .expect("get body");
+    assert_eq!(still.phase, mediatore_proto::ClaimPhase::Bound);
+    assert!(still.exit.is_none());
+
+    // The node: the exit on the record, the claim released, the tokens cut off.
+    let resp = h
+        .http
+        .post(format!("{}/v1/me/exit", h.sandbox_url))
+        .header(PEER_HEADER, node_svid())
+        .json(&exit)
+        .send()
+        .await
+        .expect("exit as the node");
+    assert_eq!(resp.status(), 204);
+    let ended: ClaimResponse = h
+        .http
+        .get(format!("{}/v1/claims/{}", h.user_url, claim.name))
+        .bearer_auth(&user_token)
+        .send()
+        .await
+        .expect("get claim")
+        .json()
+        .await
+        .expect("get body");
+    assert_ne!(ended.phase, mediatore_proto::ClaimPhase::Bound, "released");
+    assert!(!ended.ready);
+    let recorded = ended.exit.expect("the exit is on the record");
+    assert_eq!(recorded.exit, exit);
+    assert!(recorded.exited_at <= chrono::Utc::now());
+    let resp = h.token_for(&claim_svid(&uid), AUDIENCE).await;
+    assert_eq!(resp.status(), 403, "no token for a released claim");
+
+    // Late: the node says it again; nothing to end, and no error for the guest.
+    let resp = h
+        .http
+        .post(format!("{}/v1/me/exit", h.sandbox_url))
+        .header(PEER_HEADER, node_svid())
+        .json(&exit)
+        .send()
+        .await
+        .expect("late exit");
+    assert_eq!(resp.status(), 204);
+}
+
 async fn report_round_trip(h: &Harness, claim: &ClaimResponse, uid: uuid::Uuid, user_token: &str) {
     let report = mediatore_proto::GuestReport {
         image_digest: format!("sha256:{}", "ab".repeat(32)),
@@ -839,6 +954,7 @@ async fn an_issuer_without_a_session_refuses_a_delegated_refresh_token() {
             workload: Workload {
                 image: "registry.internal:5000/sandbox:latest".into(),
                 args: vec![],
+                restart: mediatore_proto::RestartPolicy::Always,
             },
             refresh_token: Some(mediatore_proto::Secret("rt-unwanted".into())),
             policy_ref: None,

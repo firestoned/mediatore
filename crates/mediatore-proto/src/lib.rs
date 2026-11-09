@@ -169,6 +169,74 @@ pub struct Workload {
     /// Command and arguments to exec inside the jail.
     #[serde(default)]
     pub args: Vec<String>,
+    /// What the guest does when the workload exits before the deadline (ADR-0033
+    /// decision 1); `always` when absent, which is what every guest did before.
+    #[serde(default, skip_serializing_if = "RestartPolicy::is_always")]
+    pub restart: RestartPolicy,
+}
+
+/// What the guest does when the workload exits before the claim's deadline (ADR-0033
+/// decision 1), the systemd shape. The confinement refusal and the egress proxy's exit end
+/// the claim whatever the policy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RestartPolicy {
+    /// Restart whatever the status, until the deadline: the agent that runs until told.
+    #[default]
+    Always,
+    /// Restart a non-zero exit; an exit `0` ends the claim: the agent that runs once.
+    OnFailure,
+    /// Any exit ends the claim.
+    Never,
+}
+
+impl RestartPolicy {
+    /// As the configuration spells it.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Always => "always",
+            Self::OnFailure => "on-failure",
+            Self::Never => "never",
+        }
+    }
+
+    /// The default, left off the wire.
+    #[must_use]
+    pub const fn is_always(&self) -> bool {
+        matches!(self, Self::Always)
+    }
+}
+
+impl std::fmt::Display for RestartPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// How the workload ended when its restart policy ended the claim (ADR-0033 decision 2):
+/// the guest's `POST /v1/me/exit`, kept on the record and the audit row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuestExit {
+    /// The exit code, when the workload exited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<i32>,
+    /// The signal, when it was killed by one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal: Option<i32>,
+    /// How many times the supervisor had restarted it before this exit.
+    #[serde(default)]
+    pub restarts: u32,
+}
+
+/// [`GuestExit`] as the broker recorded it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkloadExit {
+    /// When the broker received it.
+    pub exited_at: DateTime<Utc>,
+    /// What the guest said.
+    #[serde(flatten)]
+    pub exit: GuestExit,
 }
 
 /// A destination the jailed workload may reach: a host (a name or an address) and a TCP
@@ -402,6 +470,9 @@ pub struct ClaimResponse {
     /// (ADR-0029 decision 5); absent until then.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub report: Option<ClaimReport>,
+    /// How the workload ended, when its restart policy ended the claim (ADR-0033).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit: Option<WorkloadExit>,
 }
 
 /// `GET /v1/me`, answered to the in-guest agent over the node SVID.
@@ -773,6 +844,7 @@ mod tests {
             workload: Workload {
                 image: "registry/sandbox:latest".into(),
                 args: vec![],
+                restart: RestartPolicy::Always,
             },
             refresh_token: None,
             policy_ref: None,

@@ -265,6 +265,7 @@ impl Harness {
                 workload: Workload {
                     image: "registry.internal:5000/sandbox:latest".into(),
                     args: vec!["/usr/bin/agent".into()],
+                    restart: mediatore_proto::RestartPolicy::Always,
                 },
                 refresh_token: None,
                 policy_ref: None,
@@ -562,6 +563,7 @@ async fn a_claim_naming_a_registry_the_pool_cannot_reach_is_refused_and_the_mirr
         workload: Workload {
             image: image.into(),
             args: vec!["/usr/bin/agent".into()],
+            restart: mediatore_proto::RestartPolicy::Always,
         },
         refresh_token: None,
         policy_ref: None,

@@ -3,7 +3,7 @@
 
 # ADR-0014: One binary, the roles as subcommands
 
-**Status:** Accepted · **Date:** 2026-10-15
+**Status:** Accepted · **Date:** 2026-10-15 · **Amended:** 2026-11-09 (decision 3, what the guest does when the jail exits: the workload's restart policy, [ADR-0033](0033-a-one-shot-workload-the-restart-policy-and-the-claim-released-when-it-is-done.md))
 
 Consolidates the four executables that [ADR-0002](0002-separate-project-from-banlieue.md)
 and [ADR-0013](0013-dex-session-delegation.md) accumulated into the one `mediatore`

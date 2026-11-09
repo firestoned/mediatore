@@ -148,9 +148,35 @@ pub struct CreateArgs {
     /// The notaio policy the sandbox is under, by name (optional; read in shadow)
     #[arg(long)]
     pub policy: Option<String>,
+    /// What the guest does when the workload exits before the deadline (ADR-0033):
+    /// always (restart until the deadline), on-failure (an exit 0 ends the claim), never
+    /// (any exit ends the claim)
+    #[arg(long, value_enum, default_value_t = RestartArg::Always)]
+    pub restart: RestartArg,
     /// Print the response as JSON
     #[arg(long)]
     pub json: bool,
+}
+
+/// `--restart`, as clap takes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum RestartArg {
+    /// Restart whatever the status, until the deadline (the default)
+    Always,
+    /// Restart a non-zero exit; an exit 0 ends the claim
+    OnFailure,
+    /// Any exit ends the claim
+    Never,
+}
+
+impl From<RestartArg> for mediatore_proto::RestartPolicy {
+    fn from(r: RestartArg) -> Self {
+        match r {
+            RestartArg::Always => Self::Always,
+            RestartArg::OnFailure => Self::OnFailure,
+            RestartArg::Never => Self::Never,
+        }
+    }
 }
 
 fn open_browser(url: &str) {
@@ -265,6 +291,7 @@ async fn create(args: CreateArgs) -> anyhow::Result<()> {
         workload: Workload {
             image: args.image,
             args: args.args,
+            restart: args.restart.into(),
         },
         refresh_token: None,
         policy_ref: args.policy,
@@ -285,6 +312,19 @@ async fn create(args: CreateArgs) -> anyhow::Result<()> {
 /// The guest's report, when the claim has one (ADR-0029 decision 5): which image digest
 /// and which rules ran, as the broker recorded them.
 fn print_report(claim: &mediatore_proto::ClaimResponse) {
+    if let Some(x) = &claim.exit {
+        println!(
+            "exited_at={}\tcode={}\tsignal={}\trestarts={}",
+            x.exited_at,
+            x.exit
+                .code
+                .map_or_else(|| "-".to_owned(), |c| c.to_string()),
+            x.exit
+                .signal
+                .map_or_else(|| "-".to_owned(), |s| s.to_string()),
+            x.exit.restarts
+        );
+    }
     let Some(r) = &claim.report else {
         return;
     };

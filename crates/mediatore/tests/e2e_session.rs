@@ -175,6 +175,7 @@ impl Harness {
                 workload: Workload {
                     image: "registry.internal:5000/sandbox:latest".into(),
                     args: vec![],
+                    restart: mediatore_proto::RestartPolicy::Always,
                 },
                 refresh_token: refresh_token.map(|t| Secret(t.to_owned())),
                 policy_ref: None,

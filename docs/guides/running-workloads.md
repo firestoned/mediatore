@@ -276,6 +276,11 @@ The jail sets no `PATH` and reads nothing of the image's configuration (`ENTRYPO
 `ENV`, `WORKDIR`): `workload.args` is the whole argv, so name the interpreter and the
 program by absolute path (`/usr/local/bin/python3 /usr/local/bin/research-agent …`), and
 expect a `127` from the supervisor when a bare name is not under `/bin` or `/usr/bin`.
+What happens when your command exits before the deadline is the claim's `workload.restart`
+([ADR-0033](../adr/0033-a-one-shot-workload-the-restart-policy-and-the-claim-released-when-it-is-done.md)):
+`always` restarts it (the default: an agent that runs until told), `on-failure` restarts a
+non-zero exit and ends the claim on `0` (an agent that runs once), `never` ends the claim
+on any exit. The exit goes on the claim's record and the member is recycled.
 
 ## Interaction patterns
 

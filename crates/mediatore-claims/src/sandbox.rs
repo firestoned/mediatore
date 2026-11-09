@@ -26,7 +26,7 @@ use kube::api::{DeleteParams, ObjectMeta, PostParams};
 use kube::runtime::controller::Action;
 use kube::{Api, Client, CustomResource, CustomResourceExt, Resource, ResourceExt};
 use mediatore_policy::BundlePayload;
-use mediatore_proto::{ClaimPhase, Subject, Workload};
+use mediatore_proto::{ClaimPhase, RestartPolicy, Subject, Workload};
 use mediatore_spire::{MANAGED_BY, MANAGED_BY_LABEL};
 use mediatore_store::{ClaimRecord, StoreError};
 use schemars::JsonSchema;
@@ -74,6 +74,43 @@ pub struct SandboxWorkload {
     /// Command and arguments to exec inside the jail.
     #[serde(default)]
     pub args: Vec<String>,
+    /// What the guest does when the workload exits before the deadline (ADR-0033 decision
+    /// 1): `always` (the default, restarted until the deadline), `on-failure` (an exit 0
+    /// ends the claim), `never` (any exit ends the claim).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart: Option<SandboxRestart>,
+}
+
+/// [`mediatore_proto::RestartPolicy`] as the resource spells it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum SandboxRestart {
+    /// Restart whatever the status, until the deadline.
+    Always,
+    /// Restart a non-zero exit; an exit 0 ends the claim.
+    OnFailure,
+    /// Any exit ends the claim.
+    Never,
+}
+
+impl From<SandboxRestart> for RestartPolicy {
+    fn from(r: SandboxRestart) -> Self {
+        match r {
+            SandboxRestart::Always => Self::Always,
+            SandboxRestart::OnFailure => Self::OnFailure,
+            SandboxRestart::Never => Self::Never,
+        }
+    }
+}
+
+impl From<RestartPolicy> for SandboxRestart {
+    fn from(r: RestartPolicy) -> Self {
+        match r {
+            RestartPolicy::Always => Self::Always,
+            RestartPolicy::OnFailure => Self::OnFailure,
+            RestartPolicy::Never => Self::Never,
+        }
+    }
 }
 
 /// The request mediatore already accepts on `POST /v1/claims`, as a resource (decision 7).
@@ -217,6 +254,7 @@ impl From<&SandboxWorkload> for Workload {
         Self {
             image: w.image.clone(),
             args: w.args.clone(),
+            restart: w.restart.map(RestartPolicy::from).unwrap_or_default(),
         }
     }
 }
@@ -226,6 +264,7 @@ impl From<&Workload> for SandboxWorkload {
         Self {
             image: w.image.clone(),
             args: w.args.clone(),
+            restart: (!w.restart.is_always()).then(|| SandboxRestart::from(w.restart)),
         }
     }
 }
@@ -336,6 +375,7 @@ pub fn record_for(
         policy_uid: bundle.map(|b| b.content.policy.uid.clone()),
         bundle_version: bundle.map(|b| b.meta.version),
         report: None,
+        exit: None,
     }
 }
 
@@ -889,6 +929,7 @@ mod tests {
                 workload: SandboxWorkload {
                     image: "ghcr.io/example/workload:1".into(),
                     args: vec!["sh".into()],
+                    restart: None,
                 },
                 policy_ref: None,
             },

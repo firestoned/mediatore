@@ -248,6 +248,7 @@ impl Harness {
                 workload: Workload {
                     image: "registry.internal:5000/sandbox:latest".into(),
                     args: vec![],
+                    restart: mediatore_proto::RestartPolicy::Always,
                 },
                 refresh_token: None,
                 policy_ref: None,
@@ -477,6 +478,7 @@ async fn the_dev_header_transport_reaches_a_dev_mode_broker() {
             workload: Workload {
                 image: "registry.internal:5000/sandbox:latest".into(),
                 args: vec![],
+                restart: mediatore_proto::RestartPolicy::Always,
             },
             refresh_token: None,
             policy_ref: None,

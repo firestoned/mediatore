@@ -192,6 +192,7 @@ mod tests {
             policy_uid: None,
             bundle_version: None,
             report: None,
+            exit: None,
         }
     }
 

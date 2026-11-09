@@ -36,8 +36,8 @@ use mediatore_proto::ek::is_ek_hash;
 use mediatore_proto::image::ImageReference;
 use mediatore_proto::{
     ClaimEgress, ClaimPhase, ClaimReport, ClaimRequest, ClaimResponse, Credential, Endpoint,
-    EndpointRule, ErrorBody, GuestReport, HeaderPair, HostTable, Me, NodeRegistered,
-    NodeRegistration, RegistryCredential, Route, Secret, TokenRequest, TokenResponse,
+    EndpointRule, ErrorBody, GuestExit, GuestReport, HeaderPair, HostTable, Me, NodeRegistered,
+    NodeRegistration, RegistryCredential, Route, Secret, TokenRequest, TokenResponse, WorkloadExit,
 };
 use mediatore_spire::{EntryManager, Naming};
 use mediatore_store::seal::{SealError, Sealer};
@@ -446,6 +446,7 @@ async fn create_claim(
             policy_uid: None,
             bundle_version: None,
             report: None,
+            exit: None,
         })
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
@@ -465,18 +466,22 @@ async fn create_claim(
         .get_claim(uid)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
-    Ok((
-        StatusCode::CREATED,
-        Json(ClaimResponse {
-            name,
-            uid: Some(uid),
-            phase: phase_of(&rec),
-            ready: rec.entry_id.is_some() && rec.revoked_at.is_none(),
-            expires_at: rec.expires_at,
-            addresses: vec![],
-            report: None,
-        }),
-    ))
+    Ok((StatusCode::CREATED, Json(record_response(&rec))))
+}
+
+/// The response for a claim the store alone describes (`dev_mode`): no addresses, since
+/// no pool binds a member there; the report and the exit as the record holds them.
+fn record_response(rec: &ClaimRecord) -> ClaimResponse {
+    ClaimResponse {
+        name: rec.name.clone(),
+        uid: Some(rec.uid),
+        phase: phase_of(rec),
+        ready: rec.entry_id.is_some() && rec.revoked_at.is_none(),
+        expires_at: rec.expires_at,
+        addresses: vec![],
+        report: rec.report.clone(),
+        exit: rec.exit.clone(),
+    }
 }
 
 /// The session a claim is created with (ADR-0013 decision 1, ADR-0016 decision 1): a
@@ -624,6 +629,7 @@ fn response_of(sb: &AgentSandbox) -> ClaimResponse {
         expires_at: st.expires_at.as_ref().and_then(chrono_of),
         addresses: st.addresses,
         report: None,
+        exit: None,
     }
 }
 
@@ -681,24 +687,14 @@ async fn get_claim(
         let mut resp = response_of(&sb);
         // The guest's report lives on the record (ADR-0029 decision 5), not on the
         // resource; a record not yet written is simply no report.
-        resp.report = st
-            .store
-            .get_claim_by_name(&name)
-            .await
-            .ok()
-            .and_then(|r| r.report);
+        if let Ok(rec) = st.store.get_claim_by_name(&name).await {
+            resp.report = rec.report;
+            resp.exit = rec.exit;
+        }
         return Ok(Json(resp));
     }
     let rec = owned_claim(&st, &headers, &name).await?;
-    Ok(Json(ClaimResponse {
-        name: rec.name.clone(),
-        uid: Some(rec.uid),
-        phase: phase_of(&rec),
-        ready: rec.entry_id.is_some() && rec.revoked_at.is_none(),
-        expires_at: rec.expires_at,
-        addresses: vec![],
-        report: rec.report.clone(),
-    }))
+    Ok(Json(record_response(&rec)))
 }
 
 async fn delete_claim(
@@ -820,6 +816,57 @@ async fn claim_of_node_peer(
                 Some("no live claim bound to this node".into()),
             )
         })
+}
+
+/// `POST /v1/me/exit` (ADR-0033 decision 2): the guest, over the node SVID, says the
+/// workload exited and its restart policy ends the claim. The exit goes on the record (and
+/// the audit row with it), and the claim is released as `DELETE /v1/claims/{name}` releases
+/// it: through the `AgentSandbox` with a cluster, directly in `dev_mode`. A node with no
+/// live claim (the guest late, the claim already released) is `204` all the same.
+async fn exit(
+    State(st): State<Shared>,
+    headers: HeaderMap,
+    peer: Option<Extension<PeerSpiffeId>>,
+    Json(body): Json<GuestExit>,
+) -> Result<StatusCode, ApiError> {
+    let mut rec = match claim_of_node_peer(&st, &headers, peer.as_ref().map(|e| &e.0)).await {
+        Ok(rec) => rec,
+        Err(e) if e.status == StatusCode::NOT_FOUND => {
+            tracing::debug!("a node reported an exit with no live claim bound; nothing to end");
+            return Ok(StatusCode::NO_CONTENT);
+        }
+        Err(e) => return Err(e),
+    };
+    tracing::info!(
+        claim_uid = %rec.uid,
+        subject = %rec.subject.id,
+        code = ?body.code,
+        signal = ?body.signal,
+        restarts = body.restarts,
+        restart = %rec.workload.restart,
+        "workload exited and its restart policy ends the claim (ADR-0033)"
+    );
+    rec.exit = Some(WorkloadExit {
+        exited_at: Utc::now(),
+        exit: body,
+    });
+    st.store
+        .update_claim(rec.clone())
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    if st.dev_mode {
+        reconciler(&st)
+            .release(rec.uid)
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))?;
+    } else {
+        st.sandboxes
+            .as_ref()
+            .ok_or_else(|| ApiError::not_implemented("claim release via the kubernetes api"))?
+            .delete(&st.sandbox_namespace, &rec.name)
+            .await?;
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// `POST /v1/me/report` (ADR-0029 decision 5): the guest, over the node SVID, says what it
@@ -1367,6 +1414,7 @@ pub fn sandbox_router(state: Shared) -> Router {
         .route("/v1/nodes", post(register_node))
         .route("/v1/me", get(me))
         .route("/v1/me/report", post(report))
+        .route("/v1/me/exit", post(exit))
         .route("/v1/token", post(token))
         .route("/v1/gateway/claims/{uid}", get(claim_egress))
         .layer(tower_http::trace::TraceLayer::new_for_http())
