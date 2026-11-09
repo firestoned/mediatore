@@ -7,7 +7,7 @@
 
 Roadmap 06 (the guest). Amends [ADR-0014](0014-one-binary-roles-as-subcommands.md)
 decision 3 (what the guest does when the jail exits) and
-[ADR-0008](0008-agentsandbox-crd.md) decision 8 (the shape of `workload`), and adds one
+[ADR-0008](0008-agentsandbox-crd-owned-by-mediatore.md) decision 8 (the shape of `workload`), and adds one
 route to the sandbox API beside `POST /v1/me/report`
 ([ADR-0029](0029-the-pull-on-a-routeless-segment-and-the-pool-vms-root-rules.md) decision
 5). Changes no identity, no token, no trust boundary: the node tells the broker one more
