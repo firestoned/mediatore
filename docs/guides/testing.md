@@ -854,9 +854,10 @@ Two lessons from this run went into the guides. The jail sets no `PATH` and appl
 nothing of the image's `ENTRYPOINT` or `ENV`, so a bare `research-agent` in
 `workload.args` was exit `127` and the supervisor restarted it until the claim was
 released; the interpreter and the program are named by absolute path. And a workload that
-exits `0` before the deadline is restarted too, so a one-shot agent that is not meant to
-run again should end by waiting for its deadline, or the claim should be released as soon
-as its output is read, as this one was after its first answer.
+exited `0` before the deadline was restarted too, so a one-shot agent re-ran until the
+claim was released by hand, as this one was after its first answer; that became
+ADR-0033 the same day (`workload.restart`, the exit recorded and the claim released by the
+broker), proven in `e2e_dev.rs` and awaiting its live run with the next release.
 
 The `claude-agent` bundle reached the cluster afterwards (the ceiling signed by Security,
 admitted by Flux, the bundle published by notaio and admitted by the broker at 01:31 UTC),

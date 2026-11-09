@@ -78,6 +78,7 @@ pub(crate) fn claim(uid: Uuid) -> ClaimRecord {
         workload: Workload {
             image: "registry.internal:5000/sandbox/claude:latest".into(),
             args: vec!["/usr/bin/claude".into(), "-p".into(), "hello".into()],
+            restart: mediatore_proto::RestartPolicy::OnFailure,
         },
         ttl_seconds: 3600,
         refresh: None,
@@ -88,6 +89,7 @@ pub(crate) fn claim(uid: Uuid) -> ClaimRecord {
         policy_uid: None,
         bundle_version: None,
         report: None,
+        exit: None,
     }
 }
 
@@ -128,6 +130,14 @@ pub(crate) async fn a_claim_round_trips_every_field(s: &dyn ClaimStore) {
             },
         },
     });
+    rec.exit = Some(mediatore_proto::WorkloadExit {
+        exited_at: at(90),
+        exit: mediatore_proto::GuestExit {
+            code: Some(0),
+            signal: None,
+            restarts: 2,
+        },
+    });
     s.put_claim(rec.clone()).await.unwrap();
 
     for got in [
@@ -142,6 +152,11 @@ pub(crate) async fn a_claim_round_trips_every_field(s: &dyn ClaimStore) {
         assert_eq!(got.audiences, rec.audiences);
         assert_eq!(got.workload.image, rec.workload.image);
         assert_eq!(got.workload.args, rec.workload.args);
+        assert_eq!(
+            got.workload.restart,
+            mediatore_proto::RestartPolicy::OnFailure,
+            "the restart policy rides in the workload JSON (ADR-0033)"
+        );
         assert_eq!(got.ttl_seconds, 3600);
         assert_eq!(got.created_at, rec.created_at);
         assert_eq!(got.expires_at, rec.expires_at);
@@ -153,6 +168,10 @@ pub(crate) async fn a_claim_round_trips_every_field(s: &dyn ClaimStore) {
         assert_eq!(
             got.report, rec.report,
             "the guest's report round-trips (ADR-0029)"
+        );
+        assert_eq!(
+            got.exit, rec.exit,
+            "the workload's exit round-trips (ADR-0033)"
         );
         let env = got.refresh.as_ref().expect("envelope survives");
         assert_eq!(env, rec.refresh.as_ref().unwrap());

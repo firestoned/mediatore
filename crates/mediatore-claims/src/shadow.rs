@@ -295,6 +295,7 @@ mod tests {
             workload: SandboxWorkload {
                 image: "ghcr.io/example/workload:1".into(),
                 args: vec![],
+                restart: None,
             },
             policy_ref: policy.map(|name| LocalObjectReference { name: name.into() }),
         }

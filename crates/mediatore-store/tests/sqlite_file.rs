@@ -25,6 +25,7 @@ fn claim(uid: Uuid) -> ClaimRecord {
         workload: Workload {
             image: "registry.internal:5000/sandbox:e2e".into(),
             args: vec!["sh".into()],
+            restart: mediatore_proto::RestartPolicy::Always,
         },
         ttl_seconds: 600,
         refresh: None,
@@ -35,6 +36,7 @@ fn claim(uid: Uuid) -> ClaimRecord {
         policy_uid: None,
         bundle_version: None,
         report: None,
+        exit: None,
     }
 }
 

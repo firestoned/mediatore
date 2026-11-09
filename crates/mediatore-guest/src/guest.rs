@@ -436,13 +436,31 @@ async fn serve_claim(
         gateways_from = ?source,
         "egress proxy ready"
     );
-    let result = supervise::run(&spec, me.expires_at, &mut proxy).await;
+    let result = supervise::run(&spec, me.expires_at, &mut proxy, me.workload.restart).await;
     // The proxy ends with the claim, whichever way it ended.
     if let Err(e) = proxy.start_kill() {
         tracing::debug!(error = %e, "egress proxy already gone");
     }
     let _ = proxy.wait().await;
-    result
+    // A workload done by its restart policy: the broker ends the claim (ADR-0033
+    // decision 2). Said once, bounded; the deadline still bounds the claim if unheard.
+    if let Ok(supervise::Outcome::WorkloadDone { status, restarts }) = &result {
+        use std::os::unix::process::ExitStatusExt as _;
+        let exit = mediatore_proto::GuestExit {
+            code: status.code(),
+            signal: status.signal(),
+            restarts: *restarts,
+        };
+        match report::send_exit(client, &exit).await {
+            Ok(()) => {
+                tracing::info!(claim_uid = %me.claim_uid, code = ?exit.code, signal = ?exit.signal, restarts = exit.restarts, "workload exit recorded at the broker; the claim is released");
+            }
+            Err(e) => {
+                tracing::warn!(claim_uid = %me.claim_uid, error = %e, "the exit did not reach the broker; the claim ends at its deadline");
+            }
+        }
+    }
+    result.map(|_| ())
 }
 
 #[cfg(test)]

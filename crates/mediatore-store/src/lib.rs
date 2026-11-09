@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use mediatore_proto::{ClaimReport, Provider, Subject, Workload};
+use mediatore_proto::{ClaimReport, Provider, Subject, Workload, WorkloadExit};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use uuid::Uuid;
@@ -86,6 +86,10 @@ pub struct ClaimRecord {
     /// (ADR-0029 decision 5): the image digest, the two tables' hashes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub report: Option<ClaimReport>,
+    /// How the workload ended, when its restart policy ended the claim (ADR-0033
+    /// decision 2); `None` for a claim that ran to its deadline or was released by hand.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit: Option<WorkloadExit>,
 }
 
 impl ClaimRecord {
@@ -148,6 +152,8 @@ pub struct ClaimAudit {
     pub revoked_at: Option<DateTime<Utc>>,
     /// The guest's report, if it made one: which bytes and which rules ran.
     pub report: Option<ClaimReport>,
+    /// How the workload ended, if its restart policy ended the claim (ADR-0033).
+    pub exit: Option<WorkloadExit>,
     /// When the row was swept.
     pub swept_at: DateTime<Utc>,
 }
@@ -417,6 +423,7 @@ impl ClaimStore for MemoryStore {
                 expires_at: c.expires_at,
                 revoked_at: c.revoked_at,
                 report: c.report,
+                exit: c.exit,
                 swept_at,
             });
         }

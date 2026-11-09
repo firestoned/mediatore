@@ -12,7 +12,7 @@
 
 use std::time::Duration;
 
-use mediatore_proto::{GuestReport, HostTable};
+use mediatore_proto::{GuestExit, GuestReport, HostTable};
 use reqwest::Method;
 use sha2::{Digest, Sha256};
 
@@ -60,6 +60,27 @@ pub async fn send(client: &SandboxClient, report: &GuestReport) -> anyhow::Resul
     anyhow::ensure!(
         resp.status().is_success(),
         "the broker refused the report: {} {}",
+        resp.status(),
+        resp.text().await.unwrap_or_default()
+    );
+    Ok(())
+}
+
+/// `POST /v1/me/exit` (ADR-0033 decision 2), once: the workload exited and its restart
+/// policy ends the claim. The broker releases the claim; the guest tears down either way.
+///
+/// # Errors
+/// The broker unreachable within the bound, or refusing.
+pub async fn send_exit(client: &SandboxClient, exit: &GuestExit) -> anyhow::Result<()> {
+    let resp = tokio::time::timeout(
+        SEND_TIMEOUT,
+        client.send(Method::POST, "/v1/me/exit", Some(exit)),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("no answer within {}s", SEND_TIMEOUT.as_secs()))??;
+    anyhow::ensure!(
+        resp.status().is_success(),
+        "the broker refused the exit: {} {}",
         resp.status(),
         resp.text().await.unwrap_or_default()
     );
