@@ -16,11 +16,19 @@ RESEARCH_AGENT_GITHUB (api.github.com), RESEARCH_AGENT_ANTHROPIC (api.anthropic.
 
 import json
 import os
+import re
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 
 PROXY = os.environ.get("MEDIATORE_EGRESS_PROXY", "http://127.0.0.1:3128").rstrip("/")
+# Only http(s) leaves this process, and only through the proxy: the opener below has no
+# file, ftp or data handler, and the proxy URL and the repository name are checked.
+if urllib.parse.urlsplit(PROXY).scheme not in ("http", "https"):
+    sys.exit(f"MEDIATORE_EGRESS_PROXY must be an http(s) URL, got {PROXY!r}")
+OPENER = urllib.request.build_opener(urllib.request.HTTPHandler, urllib.request.HTTPSHandler)
+REPO_NAME = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 PHANTOM = os.environ.get("MEDIATORE_TOKEN", "")
 MODEL = os.environ.get("RESEARCH_AGENT_MODEL", "claude-opus-5-5")
 GITHUB = os.environ.get("RESEARCH_AGENT_GITHUB", "api.github.com")
@@ -35,8 +43,9 @@ def say(line: str) -> None:
 def github(path: str, accept: str = "application/vnd.github+json") -> tuple[int, str]:
     """One GET at GitHub's API through the proxy: the host is the first path segment, the
     phantom in Authorization (dropped by the proxy for a `via: none` audience)."""
+    url = f"{PROXY}/{GITHUB}{path}"
     req = urllib.request.Request(
-        f"{PROXY}/{GITHUB}{path}",
+        url,
         headers={
             "Authorization": f"Bearer {PHANTOM}",
             "Accept": accept,
@@ -44,7 +53,7 @@ def github(path: str, accept: str = "application/vnd.github+json") -> tuple[int,
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
+        with OPENER.open(req, timeout=20) as resp:
             return resp.status, resp.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as e:
         return e.code, e.read().decode("utf-8", "replace")
@@ -97,6 +106,9 @@ def main(argv: list[str]) -> int:
         say(__doc__)
         return 2
     repo = argv[0]
+    if not REPO_NAME.match(repo):
+        say(f"not a repository name (owner/name): {repo!r}")
+        return 2
     question = " ".join(argv[1:]) or "What is this project, and what would you look at first as a new contributor?"
 
     status, body = github(f"/repos/{repo}")

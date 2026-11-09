@@ -14,3 +14,7 @@
 
 # make release-assets output
 /release/
+
+# Python bytecode (examples/research-agent, py_compile checks)
+__pycache__/
+*.pyc
