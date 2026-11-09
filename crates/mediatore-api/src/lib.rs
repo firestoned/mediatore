@@ -820,7 +820,7 @@ async fn claim_of_node_peer(
 
 /// `POST /v1/me/exit` (ADR-0033 decision 2): the guest, over the node SVID, says the
 /// workload exited and its restart policy ends the claim. The exit goes on the record (and
-/// the audit row with it), and the claim is released as `DELETE /v1/claims/{name}` releases
+/// the audit line with it), and the claim is released as `DELETE /v1/claims/{name}` releases
 /// it: through the `AgentSandbox` with a cluster, directly in `dev_mode`. A node with no
 /// live claim (the guest late, the claim already released) is `204` all the same.
 async fn exit(
@@ -871,7 +871,7 @@ async fn exit(
 
 /// `POST /v1/me/report` (ADR-0029 decision 5): the guest, over the node SVID, says what it
 /// pulled and loaded before the workload started; kept on the claim's record, shown to the
-/// subject on `GET /v1/claims/{name}`, swept into the audit row with the claim. One line
+/// subject on `GET /v1/claims/{name}`, logged in the audit line when the claim is swept. One line
 /// per report; a host table missing where gateways exist is said at `warn`.
 async fn report(
     State(st): State<Shared>,

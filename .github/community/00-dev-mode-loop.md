@@ -11,7 +11,7 @@ real thing behind an existing trait.
 - [x] Upstream token validation: JWKS discovery, cache, kid rotation, `aud`/group gates (`mediatore-entra`)
 - [x] STS: ES256, RFC 8693 `act`, JWKS derived from the signing key (`mediatore-sts`)
 - [x] Claim lifecycle: create / dev-bind (either order) / mirror / release (`mediatore-api`, `mediatore-claims`)
-- [x] Node registry with cloned-EK 409 (`mediatore-store` in-memory)
+- [x] Node registry with cloned-EK 409 (`mediatore-store`'s in-memory store)
 - [x] Guest agent lifecycle: register → poll `/v1/me` → user → nsjail supervision → teardown (`mediatore-guest`; jail path needs a Linux host)
 - [x] `sandbox-token` CLI (dev header transport)
 - [x] 10-test e2e over real HTTP + `make e2e` demo with real binaries (`fake-idp`)

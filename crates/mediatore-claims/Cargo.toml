@@ -33,6 +33,10 @@ serde_json.workspace = true
 serde-saphyr.workspace = true
 schemars.workspace = true
 clap.workspace = true
+# The Kubernetes store (ADR-0034): the node label digest and the Secret's base64.
+sha2.workspace = true
+hex.workspace = true
+base64.workspace = true
 
 [dev-dependencies]
 mediatore-testkit.workspace = true

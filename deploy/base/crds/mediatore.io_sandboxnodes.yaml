@@ -1,0 +1,78 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+#
+# Generated from crates/mediatore-claims/src/kubestore.rs by `make crds` (ADR-0034
+# decision 3). Do not edit: the unit test `the_crds_in_deploy_are_what_the_types_render`
+# fails on a stale file.
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: sandboxnodes.mediatore.io
+spec:
+  group: mediatore.io
+  names:
+    kind: SandboxNode
+    plural: sandboxnodes
+    shortNames:
+    - sbn
+    singular: sandboxnode
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.hostname
+      name: Hostname
+      type: string
+    - jsonPath: .spec.provider
+      name: Provider
+      type: string
+    - jsonPath: .spec.banned
+      name: Banned
+      type: boolean
+    - jsonPath: .spec.registeredAt
+      name: Registered
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: "SandboxNode is one attested node mediatore knows (ADR-0034 decision 3): named by its EK hash, with its SPIRE agent identity, DMI UUID, hostname and whether it is banned."
+        properties:
+          spec:
+            description: An attested node mediatore knows (ADR-0034 decision 3), named by its EK hash.
+            properties:
+              banned:
+                default: false
+                description: A banned node is never bound again, even if still Ready.
+                type: boolean
+              dmiUuid:
+                description: The guest's DMI UUID, matched against banlieue's `providerID`; also a label.
+                type: string
+              ekHash:
+                description: The EK public-key hash, also the resource's name.
+                type: string
+              hostname:
+                description: Informational.
+                type: string
+              nodeId:
+                description: The SPIRE agent's SPIFFE ID.
+                type: string
+              provider:
+                description: Informational.
+                nullable: true
+                type: string
+              registeredAt:
+                description: First registration time.
+                format: date-time
+                type: string
+            required:
+            - dmiUuid
+            - ekHash
+            - hostname
+            - nodeId
+            - registeredAt
+            type: object
+        required:
+        - spec
+        title: SandboxNode
+        type: object
+    served: true
+    storage: true

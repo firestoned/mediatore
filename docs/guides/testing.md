@@ -120,37 +120,30 @@ Suites today:
 | `make kind-e2e-entries` | 0006 | the live entries round trip above |
 | `make kind-e2e-mtls` | 0007 | the broker image on the CSI socket, agent-issued client SVIDs over SPIFFE mTLS, below |
 | `make kind-e2e-watcher` | 0011 | the watcher Lease, a member's certificate becoming a node entry, a claim without a record binding nothing, below |
-| `make kind-e2e-sandbox` | 0008, 0012 | the `AgentSandbox` CRD and its subject policy, a sandbox becoming an owned claim and a record, the claim bound end to end to a claim entry and the guest fetching the subject, a broker restart on the store with the sandbox staying `Ready`, deletion through the finalizer, the released row swept into the audit table, below |
-| `make kind-e2e-store` | 0012 | the broker on PostgreSQL over `verify-full`, the store conformance suite against that database, below |
+| `make kind-e2e-sandbox` | 0008, 0034 | the `AgentSandbox` CRD and its subject policy, a sandbox becoming an owned claim and a record on its own status, the claim bound end to end to a claim entry and the guest fetching the subject, a broker restart on the Kubernetes store with the sandbox staying `Ready`, deletion through the finalizer, the released sandbox held and then swept at resync, below |
 | `make kind-e2e-dex` | 0013 | the real CLI logging in at a real Dex from inside the cluster and delegating the session, a refresh at Dex before every issue, the claim released when the user leaves the gated group in the directory and when the refresh token is deleted at Dex, below |
 | `make kind-e2e-policy` | 0026 | notaio installed from its release manifests and signing with the kind OpenBao, its bundle admitted by the broker and recorded on each claim, the `PolicyConformant` verdicts and codes on four sandboxes, a newer bundle followed, the earlier one delivered again refused by the version floor before and after a broker restart, nothing refused on the bundle's account, below |
 | `make kind-e2e-gateway` | 0028 | the real egress proxy tunnelling a claim's requests through a real Envoy on the gateway SVID to its one destination and nothing else, the authorizer's cache through a broker outage, the cut-off on release, below |
 | `make kind-e2e-gateway-policy` | 0030 | the gateway tier under a notaio bundle: a direct egress entry refused under `policy.egress: shadow` and opened at the real Envoy under `enforce`, an entry with rules never served, below |
 | `make kind-e2e-tpm` | 0018 | an agent attesting with a vTPM behind the kind node through the `tpm` plugin, on `image/spire/agent.conf`, refused under a CA that never signed its EK and listed under the EK's hash under the right one, the member's certificate becoming the node entry under that agent, the guest registering over the SVID it issues and only then announcing `GuestReady` (ADR-0019), a fresh pod re-attesting as the same agent; since ADR-0031 the agent's bundle is the OpenBao PKI root alone and the server's `bundle show` is asserted to be that root and nothing self-signed of its own; not part of `make kind-e2e` and not in CI (it needs `sudo`, swtpm and the kernel's vtpm proxy on the host), below |
 
-### The store: PostgreSQL over TLS the client verifies
+### The store: the Kubernetes API, proven by every tier
 
-Every kind tier runs the broker on the store it would run on in production.
-`make kind-postgres` (a dependency of `make kind-broker`) mints a CA and a server
-certificate for `mediatore-postgres.banlieue-system.svc` and `localhost`
-(`tls-fixture`, a testkit binary), puts them in a Secret, applies
-`dev/kind/postgres/postgres.yaml` (PostgreSQL 18, one pod, no persistence, TLS 1.3
-only) and waits for it. The broker overlay generates Secret `mediatore-store` with a
-`postgres://...?sslmode=verify-full&sslrootcert=/etc/mediatore-pg/ca.pem` URL and
-mounts the CA; the base Deployment reads the URL from that Secret as shipped.
-
-`make kind-e2e-store` (`dev/kind/store-e2e.sh`) then checks the broker log says it
-migrated and connected to PostgreSQL and that the password is nowhere in it,
-port-forwards the database and runs the store conformance suite (the one `make check`
-runs over `MemoryStore` and over SQLite in memory) against it as the `#[ignore]`
-`sql::tests::postgres` cases, with `MEDIATORE_LIVE_STORE_URL` pointing through the
-port-forward and `--test-threads=1`, since the cases share one database and each empties
-it first. The same suite on three backends is what makes the one query set of
-ADR-0012 a tested claim rather than a hope. The sandbox tier adds the restart: with a
-sandbox `Ready`, the broker is restarted and must come back finding the record, the
-entry id and the node in the store, with no second record and no second entry; after
-the deletion, the kind config's zero retention and 15 s resync let the tier see the
-released row archived.
+Every kind tier runs the broker on the store it runs on in production, which since
+[ADR-0034](../adr/0034-the-kubernetes-api-as-the-brokers-store.md) is the cluster itself:
+the claim record on the `AgentSandbox`'s status, the sealed session in a Secret the sandbox
+owns, the attested nodes and the policy floors as `SandboxNode` and `PolicyFloor`
+resources. There is no database to deploy and no store Secret; `kubectl get
+agentsandboxes,sandboxnodes,policyfloors -A` in the cluster the tier left behind shows the
+store. The sandbox tier is the one that proves it on purpose: with a sandbox `Ready`, the
+broker is restarted and must come back finding the record, the entry id and the node on
+the resources, with no second record and no second entry; after the deletion, the kind
+config's zero retention and 15 s resync let the tier see the finalizer hold the sandbox
+and the sweep release it. The dex tier parks a real session Secret and the broker claims
+it; the policy tier moves a `PolicyFloor` and refuses a replay against it across a restart.
+The conformance suite over the in-memory store runs in `make check`; the pure mappings
+between records and resources (status, Secret, the two CRDs) have their units in
+`crates/mediatore-claims/src/kubestore.rs`.
 
 Every kind tier also runs the broker on the transit sealer
 ([ADR-0015](../adr/0015-transit-sealer.md)). `make kind-openbao` (a dependency of
@@ -168,7 +161,7 @@ reopened there on every issue.
 
 ### The Dex path against a real Dex
 
-`make kind-dex` (a dependency of `make kind-broker`, like the PostgreSQL) runs a Dex
+`make kind-dex` (a dependency of `make kind-broker`) runs a Dex
 (`dev/kind/dex/dex.yaml`, storage in its own CRDs) over TLS with a certificate the
 target mints for `mediatore-dex.banlieue-system.svc`, and a glauth LDAP directory
 behind it (`dev/kind/dex/glauth.yaml`, the users and groups in `dev/kind/dex/glauth.cfg`:
@@ -558,7 +551,7 @@ one asking for an audience the bundle does not list (`False`, `P001`), one witho
 and stays `Pending`, which is the point of shadow mode. The policy is then changed, the
 newer bundle is admitted and every verdict names it; the earlier envelope is delivered
 again under another ConfigMap name and refused as a downgrade, its deletion leaves the
-cache alone, and after a broker restart on the kind PostgreSQL the same replay is refused
+cache alone, and after a broker restart on the Kubernetes store the same replay is refused
 again, because the floor came back from the store.
 
 ### TPM attestation with a vTPM behind the node

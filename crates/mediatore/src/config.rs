@@ -302,24 +302,15 @@ pub struct SealingSection {
     pub transit: Option<TransitConfig>,
 }
 
-/// The claim store (ADR-0012). Outside `dev_mode` a URL is required; `MEDIATORE_STORE_URL`
-/// in the environment overrides `url` so the PostgreSQL password can live in a Secret.
-// The `_secs` suffix is the unit, part of the config file's contract (as in `EntriesSection`).
-#[allow(clippy::struct_field_names)]
+/// The claim store (ADR-0012, ADR-0034): the Kubernetes API outside `dev_mode`, in memory
+/// under it; nothing to point at. What remains to configure is how long an ended claim is
+/// kept, and the sealer.
 #[derive(Debug, Clone, Deserialize)]
 pub struct StoreSection {
-    /// `sqlite:///path/to/store.db?mode=rwc` (one replica only) or
-    /// `postgres://user:password@host:5432/db?sslmode=verify-full`. Unset under `dev_mode`
-    /// means the in-memory store.
-    #[serde(default)]
-    pub url: Option<String>,
-    /// Seconds a claim row outlives its claim before the resync sweeps it into the audit
-    /// table (default 3600).
+    /// Seconds an ended claim stays on its `AgentSandbox` before the resync sweeps it,
+    /// logging the audit line (default 3600; ADR-0034 decision 4).
     #[serde(default = "default_retention_secs")]
     pub retention_secs: u64,
-    /// Connection pool size (default 8; a memory SQLite always gets 1).
-    #[serde(default = "default_max_connections")]
-    pub max_connections: u32,
     /// The local sealer's key. Unset means refresh material cannot be persisted, which
     /// fails the claim that needs it rather than storing plaintext.
     #[serde(default)]
@@ -329,16 +320,11 @@ pub struct StoreSection {
 fn default_retention_secs() -> u64 {
     3600
 }
-fn default_max_connections() -> u32 {
-    8
-}
 
 impl Default for StoreSection {
     fn default() -> Self {
         Self {
-            url: None,
             retention_secs: default_retention_secs(),
-            max_connections: default_max_connections(),
             sealing: None,
         }
     }
@@ -553,24 +539,15 @@ impl Config {
         )
     }
 
-    /// Load and sanity-check. `MEDIATORE_STORE_URL` in the environment overrides `store.url`.
+    /// Load and sanity-check.
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let text = std::fs::read_to_string(path)?;
-        Self::parse_with_store_url(&text, std::env::var("MEDIATORE_STORE_URL").ok())
+        Self::parse(&text)
     }
 
-    /// Parse YAML and enforce the cross-field rules, with nothing from the environment.
-    #[cfg(test)]
+    /// Parse YAML and enforce the cross-field rules.
     pub fn parse(text: &str) -> anyhow::Result<Self> {
-        Self::parse_with_store_url(text, None)
-    }
-
-    /// [`Self::parse`] with `store_url` taking precedence over the file's `store.url`.
-    pub fn parse_with_store_url(text: &str, store_url: Option<String>) -> anyhow::Result<Self> {
         let mut cfg: Self = serde_saphyr::from_str(text)?;
-        if let Some(url) = store_url.filter(|u| !u.trim().is_empty()) {
-            cfg.store.url = Some(url);
-        }
         if cfg.audiences.iter().any(|a| a.via == Backend::Sts) && cfg.sts.is_none() {
             anyhow::bail!("an audience uses the sts backend but no `sts` section is configured");
         }
@@ -606,7 +583,9 @@ impl Config {
             }
             e.claim_svid_ttl()?;
         }
-        cfg.check_store()?;
+        // The store needs no URL since ADR-0034 (the Kubernetes API, or memory under
+        // dev_mode), and any retention is valid: zero means an ended claim is swept at the
+        // next resync, which is how the kind tiers run.
         cfg.check_policy()?;
         cfg.check_gateways()?;
         if cfg.token.rate_per_minute == 0 {
@@ -672,40 +651,6 @@ impl Config {
             if !seen.insert(ns.as_str()) {
                 anyhow::bail!("policy.namespaces: {ns} is listed twice");
             }
-        }
-        Ok(())
-    }
-
-    /// ADR-0012 decision 2: a real store outside `dev_mode`, PostgreSQL only over TLS the
-    /// client verifies, and no memory SQLite (as lossy as the in-memory store).
-    fn check_store(&self) -> anyhow::Result<()> {
-        use mediatore_store::sql::{Engine, is_memory_sqlite};
-        if self.store.max_connections == 0 {
-            anyhow::bail!("store.max_connections must be positive");
-        }
-        let Some(url) = self.store.url.as_deref() else {
-            if self.dev_mode {
-                return Ok(());
-            }
-            anyhow::bail!(
-                "store.url (or MEDIATORE_STORE_URL) is required outside dev_mode: the in-memory store does not survive a restart (ADR-0012)"
-            );
-        };
-        let Some(engine) = Engine::of(url) else {
-            anyhow::bail!("store.url: unsupported scheme; use sqlite: or postgres:");
-        };
-        if self.dev_mode {
-            return Ok(());
-        }
-        if is_memory_sqlite(url) {
-            anyhow::bail!(
-                "store.url: a memory SQLite is as lossy as the in-memory store; give it a file"
-            );
-        }
-        if engine == Engine::Postgres && !url.contains("sslmode=verify-full") {
-            anyhow::bail!(
-                "store.url: PostgreSQL is reached only over TLS the client verifies; the URL must carry sslmode=verify-full (ADR-0012)"
-            );
         }
         Ok(())
     }
@@ -1018,7 +963,7 @@ listen: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }
     #[test]
     fn production_may_listen_anywhere() {
         Config::parse(
-            "trust_domain: sandbox.test\nissuers: []\naudiences: []\nlisten: { user: 0.0.0.0:8080, sandbox: 0.0.0.0:8443 }\nspire:\n  workload_api_socket: unix:///run/spire/sockets/spire-agent.sock\n  entries:\n    class_name: spire-server-spire\nstore: { url: \"sqlite:///var/lib/mediatore/store.db\" }\n",
+            "trust_domain: sandbox.test\nissuers: []\naudiences: []\nlisten: { user: 0.0.0.0:8080, sandbox: 0.0.0.0:8443 }\nspire:\n  workload_api_socket: unix:///run/spire/sockets/spire-agent.sock\n  entries:\n    class_name: spire-server-spire\n",
         )
         .unwrap();
     }
@@ -1036,7 +981,6 @@ listen: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }
   workload_api_socket: unix:///run/spire/sockets/spire-agent.sock
   entries:
     class_name: spire-server-spire
-store: {{ url: \"sqlite:///var/lib/mediatore/store.db\" }}
 "
         ))
         .unwrap();
@@ -1059,7 +1003,6 @@ store: {{ url: \"sqlite:///var/lib/mediatore/store.db\" }}
   entries:
     class_name: spire-server-spire
     claim_svid_ttl: {ttl:?}
-store: {{ url: \"sqlite:///var/lib/mediatore/store.db\" }}
 "
             ))
         };
@@ -1124,76 +1067,17 @@ store: {{ url: \"sqlite:///var/lib/mediatore/store.db\" }}
 ";
 
     #[test]
-    fn the_store_defaults_to_memory_only_under_dev_mode() {
+    fn the_store_has_nothing_to_point_at_and_any_retention_is_valid() {
+        // ADR-0034: the Kubernetes API outside dev_mode, memory under it; no URL anywhere.
         let cfg = Config::parse(&format!("{BASE}dev_mode: true\n")).unwrap();
-        assert_eq!(cfg.store.url, None);
         assert_eq!(cfg.store.retention_secs, 3600);
-        assert_eq!(cfg.store.max_connections, 8);
         assert!(cfg.store.sealing.is_none());
-        let err = Config::parse(&format!("{BASE}{SPIRE}")).unwrap_err();
-        assert!(err.to_string().contains("store.url"), "{err}");
-    }
-
-    #[test]
-    fn the_environment_overrides_the_store_url() {
-        let cfg = Config::parse_with_store_url(
-            &format!("{BASE}{SPIRE}store: {{ url: \"sqlite:///var/lib/mediatore/a.db\" }}\n"),
-            Some("sqlite:///var/lib/mediatore/b.db".into()),
-        )
-        .unwrap();
-        assert_eq!(
-            cfg.store.url.as_deref(),
-            Some("sqlite:///var/lib/mediatore/b.db")
-        );
-        let cfg = Config::parse_with_store_url(
-            &format!("{BASE}{SPIRE}store: {{ url: \"sqlite:///var/lib/mediatore/a.db\" }}\n"),
-            Some(String::new()),
-        )
-        .unwrap();
-        assert_eq!(
-            cfg.store.url.as_deref(),
-            Some("sqlite:///var/lib/mediatore/a.db")
-        );
-    }
-
-    #[test]
-    fn a_production_store_is_a_file_or_tls_verified_postgres() {
-        for (url, why) in [
-            ("sqlite::memory:", "memory"),
-            ("sqlite:file:x?mode=memory&cache=shared", "memory"),
-            ("postgres://u:p@db.home.example/mediatore", "verify-full"),
-            (
-                "postgres://u:p@db.home.example/mediatore?sslmode=require",
-                "verify-full",
-            ),
-            ("mysql://u:p@db/mediatore", "unsupported"),
-        ] {
-            let err =
-                Config::parse(&format!("{BASE}{SPIRE}store: {{ url: \"{url}\" }}\n")).unwrap_err();
-            assert!(err.to_string().contains(why), "{url}: {err}");
-        }
-        for url in [
-            "sqlite:///var/lib/mediatore/store.db?mode=rwc",
-            "postgres://u:p@db.home.example:5432/mediatore?sslmode=verify-full&sslrootcert=/etc/mediatore-pg/ca.pem",
-        ] {
-            Config::parse(&format!("{BASE}{SPIRE}store: {{ url: \"{url}\" }}\n"))
-                .unwrap_or_else(|e| panic!("{url}: {e}"));
-        }
-        // dev_mode may point at any supported engine, memory included, but not an unknown one.
-        Config::parse(&format!(
-            "{BASE}dev_mode: true\nstore: {{ url: \"sqlite::memory:\" }}\n"
-        ))
-        .unwrap();
-        let err = Config::parse(&format!(
-            "{BASE}dev_mode: true\nstore: {{ url: \"mysql://x\" }}\n"
-        ))
-        .unwrap_err();
-        assert!(err.to_string().contains("unsupported"), "{err}");
-        let err = Config::parse(&format!(
-            "{BASE}dev_mode: true\nstore: {{ max_connections: 0 }}\n"
-        ))
-        .unwrap_err();
-        assert!(err.to_string().contains("max_connections"), "{err}");
+        let cfg =
+            Config::parse(&format!("{BASE}{SPIRE}store: {{ retention_secs: 120 }}\n")).unwrap();
+        assert_eq!(cfg.store.retention_secs, 120);
+        // Zero: swept at the next resync, the kind tiers' setting.
+        let cfg = Config::parse(&format!("{BASE}{SPIRE}store: {{ retention_secs: 0 }}\n")).unwrap();
+        assert_eq!(cfg.store.retention_secs, 0);
     }
 
     #[test]
@@ -1241,9 +1125,10 @@ store: {{ url: \"sqlite:///var/lib/mediatore/store.db\" }}
             assert!(err.to_string().contains(want), "{err}");
         }
         // http reaches OpenBao only under dev_mode.
-        let plain = "store:\n  url: \"sqlite::memory:\"\n  sealing:\n    transit: { url: http://127.0.0.1:8200, key: k, role: r }\n";
+        let plain =
+            "store:\n  sealing:\n    transit: { url: http://127.0.0.1:8200, key: k, role: r }\n";
         assert!(Config::parse(&format!("{BASE}dev_mode: true\n{plain}")).is_ok());
-        let prod = "trust_domain: sandbox.test\nissuers: []\naudiences: []\nlisten: { user: 0.0.0.0:8080, sandbox: 0.0.0.0:8443 }\nspire:\n  workload_api_socket: unix:///run/spire/sockets/spire-agent.sock\n  entries:\n    class_name: spire-server-spire\nstore:\n  url: \"sqlite:///var/lib/mediatore/store.db\"\n  sealing:\n    transit: { url: http://openbao.home.example:8200, key: k, role: r }\n";
+        let prod = "trust_domain: sandbox.test\nissuers: []\naudiences: []\nlisten: { user: 0.0.0.0:8080, sandbox: 0.0.0.0:8443 }\nspire:\n  workload_api_socket: unix:///run/spire/sockets/spire-agent.sock\n  entries:\n    class_name: spire-server-spire\nstore:\n  sealing:\n    transit: { url: http://openbao.home.example:8200, key: k, role: r }\n";
         let err = Config::parse(prod).unwrap_err();
         assert!(err.to_string().contains("must be https"), "{err}");
     }
@@ -1340,7 +1225,7 @@ store: {{ url: \"sqlite:///var/lib/mediatore/store.db\" }}
         assert!(err.to_string().contains("entra-obo backend"), "{err}");
         // transit signs over https outside dev_mode, as the sealer does.
         let prod = format!(
-            "trust_domain: sandbox.test\naudiences: []\nlisten: {{ user: 0.0.0.0:8080, sandbox: 0.0.0.0:8443 }}\nspire:\n  workload_api_socket: unix:///run/spire/sockets/spire-agent.sock\n  entries:\n    class_name: spire-server-spire\nstore:\n  url: \"sqlite:///var/lib/mediatore/store.db\"\n  sealing: {{ key_file: /k }}\n{}",
+            "trust_domain: sandbox.test\naudiences: []\nlisten: {{ user: 0.0.0.0:8080, sandbox: 0.0.0.0:8443 }}\nspire:\n  workload_api_socket: unix:///run/spire/sockets/spire-agent.sock\n  entries:\n    class_name: spire-server-spire\nstore:\n  sealing: {{ key_file: /k }}\n{}",
             entra(
                 "    entra: { certificate_file: /c, transit: { url: http://openbao.home.example:8200, key: entra, role: mediatore } }\n"
             )

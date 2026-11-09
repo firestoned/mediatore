@@ -215,7 +215,7 @@ impl std::fmt::Display for RestartPolicy {
 }
 
 /// How the workload ended when its restart policy ended the claim (ADR-0033 decision 2):
-/// the guest's `POST /v1/me/exit`, kept on the record and the audit row.
+/// the guest's `POST /v1/me/exit`, kept on the record until it is swept.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GuestExit {
     /// The exit code, when the workload exited.

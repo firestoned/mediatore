@@ -31,6 +31,10 @@ rules:
   - apiGroups: ["mediatore.io"]
     resources: ["agentsandboxes/finalizers"]
     verbs: ["update"]
+  # The store resources (ADR-0034 decision 3): attested nodes and the policy version floors.
+  - apiGroups: ["mediatore.io"]
+    resources: ["sandboxnodes", "policyfloors"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   - apiGroups: ["banlieue.io"]
     resources: ["virtualmachineclaims"]
     verbs: ["get", "list", "watch", "create", "delete"]
@@ -81,6 +85,35 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
   name: mediatore-watcher-lease
+subjects:
+  - kind: ServiceAccount
+    name: mediatore
+    namespace: banlieue-system
+---
+# The sealed sessions (ADR-0034 decision 2): one Secret per sandbox in the broker's own
+# namespace, created by the API, claimed and rotated by the reconciler and the token
+# endpoint, garbage-collected with the AgentSandbox that owns it when the sandboxes live
+# here too, deleted by the retention sweep otherwise. Namespace-scoped on purpose: the
+# broker reads no Secret elsewhere.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: mediatore-sessions
+  namespace: banlieue-system
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: mediatore-sessions
+  namespace: banlieue-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: mediatore-sessions
 subjects:
   - kind: ServiceAccount
     name: mediatore

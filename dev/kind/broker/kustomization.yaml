@@ -18,13 +18,6 @@ configMapGenerator:
   - name: mediatore-config
     files:
       - mediatore.yaml
-# The store URL the base Deployment reads from Secret mediatore-store (ADR-0012): the
-# PostgreSQL `make kind-postgres` runs, over verify-full against the CA it minted
-# (ConfigMap mediatore-pg-ca, mounted below). The password is the tier's fixture.
-secretGenerator:
-  - name: mediatore-store
-    literals:
-      - url=postgres://mediatore:e2e@mediatore-postgres.banlieue-system.svc:5432/mediatore?sslmode=verify-full&sslrootcert=/etc/mediatore-pg/ca.pem
 generatorOptions:
   disableNameSuffixHash: true
 patches:
@@ -64,13 +57,10 @@ patches:
                   - name: RUST_LOG
                     value: info,mediatore_tls=debug
                 volumeMounts:
-                  - { name: pg-ca, mountPath: /etc/mediatore-pg, readOnly: true }
                   - { name: dex-ca, mountPath: /etc/mediatore-dex, readOnly: true }
                   - { name: sts, mountPath: /etc/mediatore-sts, readOnly: true }
                   - { name: openbao-ca, mountPath: /etc/mediatore-openbao, readOnly: true }
             volumes:
-              - name: pg-ca
-                configMap: { name: mediatore-pg-ca }
               # The Dex CA and the STS signing key: `make kind-dex`. The OpenBao CA:
               # `make kind-openbao`.
               - name: dex-ca

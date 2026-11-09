@@ -52,14 +52,8 @@
     {
       "unique-id": "data-asset-claim-store",
       "node-type": "data-asset",
-      "name": "Claim Store",
-      "description": "Per-claim rows keyed by the claim's UID: a copy of the AgentSandbox request fields (subject, audiences, workload, TTL), the SPIRE entry id, the node id, the sealed refresh envelope (key id, nonce, AES-256-GCM ciphertext bound to the claim UID; ADR-0012 decision 3), the bind deadline and the revocation timestamp; node rows keyed by EK hash; audit rows written when a claim row is swept; sessions rows (a delegated refresh token, sealed, keyed by the AgentSandbox UID) between the API call and the record (ADR-0013). One sqlx implementation over SQLite or PostgreSQL (ADR-0012, built: roadmap 05), the engine chosen by store.url; in-memory only under dev_mode. The resource is the source of truth for the request fields; the store is where revocation and the node registry survive a restart. crates/mediatore-store."
-    },
-    {
-      "unique-id": "database-store",
-      "node-type": "database",
-      "name": "Store Database (PostgreSQL / SQLite)",
-      "description": "The engine behind the claim store, chosen by configuration (ADR-0012): PostgreSQL at work, reached only over TLS with sslmode=verify-full on rustls (aws-lc-rs, post-quantum-first key exchange) with the URL in a Secret; SQLite in WAL mode on a volume for a single-replica homelab. Migrations are embedded in the broker and applied at startup under sqlx's lock. Refresh material reaches it sealed; the wrapping key is a Secret volume (local sealer) or stays in OpenBao (transit sealer, ADR-0015)."
+      "name": "Claim Store (the Kubernetes API)",
+      "description": "What the broker remembers, in the Kubernetes API (ADR-0034, superseding the database of ADR-0012): the claim record on the AgentSandbox status (status.record, the store's alone: the SPIRE entry id, the node, the bind deadline, the revocation, the policy incarnation and bundle version, the guest's report, the workload's exit; the claim UID and the node as labels), the sealed refresh envelope in a Secret owned by the sandbox (key id, nonce, AES-256-GCM ciphertext bound to the sandbox UID; parked by the API, claimed by the reconciler, rotated at every mint, emptied on revocation), attested nodes as SandboxNode resources (EK hash, agent SPIFFE ID, DMI UUID, banned), notaio's version floors as PolicyFloor resources moved by compare-and-set on resourceVersion. An ended claim is held by its finalizer for store.retention_secs and then swept, the audit line in the log. In memory under dev_mode only."
     },
     {
       "unique-id": "service-openbao",
@@ -281,8 +275,7 @@
             "service-spire-server",
             "service-spire-controller-manager",
             "service-spire-agent-k8s",
-            "data-asset-cluster-static-entries",
-            "database-store"
+            "data-asset-cluster-static-entries"
           ]
         }
       }
@@ -563,7 +556,7 @@
     },
     {
       "unique-id": "rel-guest-agent-mediatore",
-      "description": "POST /v1/nodes (EK hash + DMI UUID + hostname) over the node SVID at boot; then polls GET /v1/me until a claim is bound and the subject comes back. Since ADR-0022 the answer to GET /v1/me includes the pull credential for the claim's image registry when the operator configured one. Since ADR-0025 it carries the proxy's routes, and since ADR-0025 decision 8 (2026-11-08) a route may carry credential none: one per served direct egress entry of the claim's bundle under policy.egress enforce, with no audience, and the routes of an audience via: none. Since ADR-0028 decision 6 the answer also carries gateways, the environment's egress gateways in the broker's order, for the forwarder and the ruleset; empty until the gateways exist. With egress gateways the connection itself runs through a gateway's control relay (ADR-0027 decision 3), the node SVID's mutual TLS end to end inside it, and the guest falls back to the pool's bootstrap list /etc/mediatore/gateways when the answer lists none (decision 4). Once the image is pulled and the tables are loaded, before the jail, the guest POSTs /v1/me/report over the same identity: the manifest digest, the sandbox ruleset's hash and the host table as nft lists it, hashed, or its absence (ADR-0029 decision 5); the broker keeps it on the claim's record and in the audit row, and GET /v1/claims/{name} shows it.",
+      "description": "POST /v1/nodes (EK hash + DMI UUID + hostname) over the node SVID at boot; then polls GET /v1/me until a claim is bound and the subject comes back. Since ADR-0022 the answer to GET /v1/me includes the pull credential for the claim's image registry when the operator configured one. Since ADR-0025 it carries the proxy's routes, and since ADR-0025 decision 8 (2026-11-08) a route may carry credential none: one per served direct egress entry of the claim's bundle under policy.egress enforce, with no audience, and the routes of an audience via: none. Since ADR-0028 decision 6 the answer also carries gateways, the environment's egress gateways in the broker's order, for the forwarder and the ruleset; empty until the gateways exist. With egress gateways the connection itself runs through a gateway's control relay (ADR-0027 decision 3), the node SVID's mutual TLS end to end inside it, and the guest falls back to the pool's bootstrap list /etc/mediatore/gateways when the answer lists none (decision 4). Once the image is pulled and the tables are loaded, before the jail, the guest POSTs /v1/me/report over the same identity: the manifest digest, the sandbox ruleset's hash and the host table as nft lists it, hashed, or its absence (ADR-0029 decision 5); the broker keeps it on the claim's record (logged when the claim is swept), and GET /v1/claims/{name} shows it.",
       "relationship-type": {
         "connects": {
           "source": {
@@ -742,7 +735,7 @@
     },
     {
       "unique-id": "rel-user-claim-data",
-      "description": "The subject a claim is issued for; the user only ever sees their own claims. The row outlives nothing: a claim that ended is swept into the audit table after store.retention_secs (ADR-0012).",
+      "description": "The subject a claim is issued for; the user only ever sees their own claims. An ended claim stays on its AgentSandbox for store.retention_secs, then is swept with the audit line in the log (ADR-0034).",
       "relationship-type": {
         "interacts": {
           "actor": "actor-sandbox-user",
@@ -751,21 +744,6 @@
           ]
         }
       }
-    },
-    {
-      "unique-id": "rel-mediatore-store-db",
-      "description": "Every store read and write from both API surfaces and the reconcilers: the record on create, the entry id and deadline on bind, revocation on release, the node registry on registration, the sweep into the audit table at resync; the version floor of each notaio policy read and moved by a compare and set, so two replicas cannot move a floor down (ADR-0012, amended by ADR-0026). TLS verify-full to PostgreSQL; a file for SQLite.",
-      "relationship-type": {
-        "connects": {
-          "source": {
-            "node": "system-mediatore"
-          },
-          "destination": {
-            "node": "database-store"
-          }
-        }
-      },
-      "protocol": "TLS"
     },
     {
       "unique-id": "rel-mediatore-openbao-transit",
@@ -954,8 +932,8 @@
         },
         {
           "sequence-number": 3,
-          "relationship-unique-id": "rel-mediatore-store-db",
-          "description": "notaio's floor rule decides from the held floor (the same uid never goes down; a new uid only if issued after the held one); the store writes the next floor only if the held one is still what was read, and a replica that lost the race reads and decides again."
+          "relationship-unique-id": "rel-mediatore-kube-api",
+          "description": "notaio's floor rule decides from the held floor (the same uid never goes down; a new uid only if issued after the held one); the store writes the next floor to its PolicyFloor resource only if the held one is still what was read, a compare-and-set on resourceVersion (ADR-0034), and a replica that lost the race reads and decides again."
         },
         {
           "sequence-number": 4,

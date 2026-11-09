@@ -229,6 +229,64 @@ spec:
                 description: Why the sandbox is `Failed`, when it is.
                 nullable: true
                 type: string
+              record:
+                description: |-
+                  The claim record (ADR-0034 decision 1): the store's part of the status, written by
+                  `KubeStore` alone and never by the reconciler's mirroring, which leaves it out of
+                  its patches.
+                nullable: true
+                properties:
+                  bundleVersion:
+                    description: The bundle version then.
+                    format: uint64
+                    minimum: 0.0
+                    nullable: true
+                    type: integer
+                  claimUid:
+                    description: The claim's UID (banlieue's `VirtualMachineClaim`), the key of the record.
+                    type: string
+                  createdAt:
+                    description: When the record was created.
+                    format: date-time
+                    type: string
+                  entryId:
+                    description: The SPIRE registration entry, once created.
+                    nullable: true
+                    type: string
+                  exit:
+                    description: The workload's exit (ADR-0033 decision 2), as `WorkloadExit` serialises.
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true
+                  expiresAt:
+                    description: The bind deadline, once bound.
+                    format: date-time
+                    nullable: true
+                    type: string
+                  nodeId:
+                    description: The bound node's SPIFFE ID, once known.
+                    nullable: true
+                    type: string
+                  policyUid:
+                    description: The notaio policy's incarnation the record was created under (ADR-0026 decision 6).
+                    nullable: true
+                    type: string
+                  refresh:
+                    default: false
+                    description: Whether a sealed refresh envelope is held for the claim (in the sandbox's Secret).
+                    type: boolean
+                  report:
+                    description: The guest's report (ADR-0029 decision 5), as `ClaimReport` serialises.
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true
+                  revokedAt:
+                    description: Set on release or revocation; a revoked claim never issues again.
+                    format: date-time
+                    nullable: true
+                    type: string
+                required:
+                - claimUid
+                - createdAt
+                type: object
               virtualMachineRef:
                 description: The bound member, from the claim.
                 nullable: true
