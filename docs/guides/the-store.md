@@ -15,9 +15,9 @@ a restart.
 | What | Where | Found by |
 | --- | --- | --- |
 | The claim record: the SPIRE entry id, the bound node, the bind deadline, the revocation, the policy incarnation and bundle version the claim was created under, the guest's report, the workload's exit | `AgentSandbox.status.record`, written by the store alone (the reconciler's mirroring leaves it out of its patches) | the label `mediatore.io/claim-uid` (the claim's UID, the record's key) and `mediatore.io/node` (a digest of the bound node's SPIFFE ID) |
-| The sealed session: the delegated refresh token, sealed with the sandbox's UID | Secret `mediatore-session-<sandbox uid>` in the sandboxes' namespace, owned by the `AgentSandbox` so it goes with it; parked by `POST /v1/claims`, claimed by the reconciler when it writes the record, rotated in place at every mint, emptied on revocation | its name; the labels `mediatore.io/sandbox-uid` and `mediatore.io/session` (`parked` or `claimed`) |
-| The attested nodes: EK hash, the agent's SPIFFE ID, DMI UUID, hostname, provider, banned | `SandboxNode`, named by the EK hash | its name; the label `mediatore.io/dmi-uuid` for the clone check |
-| The version floor of each notaio policy ([ADR-0026](../adr/0026-notaio-bundles-verified-in-shadow.md) decision 5) | `PolicyFloor`, named `<policy namespace>.<policy name>` | its name; moved by compare-and-set on `resourceVersion`, so two replicas cannot move a floor down |
+| The sealed session: the delegated refresh token, sealed with the sandbox's UID | Secret `mediatore-session-<sandbox uid>` in the broker's own namespace, owned by the `AgentSandbox` when the sandboxes live there too (an owner reference cannot cross a namespace), deleted by the retention sweep otherwise; parked by `POST /v1/claims`, claimed by the reconciler when it writes the record, rotated in place at every mint, emptied on revocation | its name; the labels `mediatore.io/sandbox-uid` and `mediatore.io/session` (`parked` or `claimed`) |
+| The attested nodes: EK hash, the agent's SPIFFE ID, DMI UUID, hostname, provider, banned | `SandboxNode` in the broker's namespace, named by the EK hash | its name; the label `mediatore.io/dmi-uuid` for the clone check |
+| The version floor of each notaio policy ([ADR-0026](../adr/0026-notaio-bundles-verified-in-shadow.md) decision 5) | `PolicyFloor` in the broker's namespace, named `<policy namespace>.<policy name>` | its name; moved by compare-and-set on `resourceVersion`, so two replicas cannot move a floor down |
 
 The request fields (subject, audiences, workload, TTL, policy) are the `AgentSandbox`'s
 spec, frozen at admission; the record keeps no copy. `kubectl get agentsandboxes
@@ -52,8 +52,11 @@ ciphertext either way (below).
 The broker's ServiceAccount patches `agentsandboxes/status` and the resource's labels and
 finalizers (as before), has every verb on `sandboxnodes` and `policyfloors` (a
 ClusterRole), and `get`, `list`, `create`, `update`, `patch` and `delete` on Secrets in
-the sandboxes' namespace alone (a Role): `deploy/base/rbac.yaml`. The broker reads no
-Secret elsewhere.
+its own namespace alone (a Role): `deploy/base/rbac.yaml`. The broker reads no Secret
+elsewhere. The broker's namespace is the client's default, the ServiceAccount's in a
+pod, so nothing names it in the configuration. The sandboxes may live anywhere the
+controller watches: `sandboxes.namespace` is where `POST /v1/claims` creates them, and a
+sandbox applied in another namespace gets its record where it is.
 
 ## Refresh material
 

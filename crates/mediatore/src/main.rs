@@ -351,20 +351,19 @@ async fn broker_identity(
     Ok(configs)
 }
 
-/// The claim store: the Kubernetes API with a cluster client (ADR-0034, the `AgentSandbox`
-/// the record, Secrets, `SandboxNode` and `PolicyFloor` in the sandboxes' namespace); in
-/// memory under `dev_mode`, where there is no cluster and nothing survives a restart.
+/// The claim store: the Kubernetes API with a cluster client (ADR-0034: the `AgentSandbox`
+/// the record, wherever the sandbox lives; the Secrets, `SandboxNode` and `PolicyFloor` in
+/// the broker's own namespace); in memory under `dev_mode`, where there is no cluster and
+/// nothing survives a restart.
 fn store(cfg: &Config, client: Option<&kube::Client>) -> anyhow::Result<Arc<dyn ClaimStore>> {
     if let Some(client) = client {
+        let store = KubeStore::new(client.clone());
         tracing::info!(
-            namespace = %cfg.sandboxes.namespace,
+            namespace = store.namespace(),
             retention_secs = cfg.store.retention_secs,
             "store: the Kubernetes API (ADR-0034)"
         );
-        return Ok(Arc::new(KubeStore::new(
-            client.clone(),
-            cfg.sandboxes.namespace.clone(),
-        )));
+        return Ok(Arc::new(store));
     }
     anyhow::ensure!(
         cfg.dev_mode,

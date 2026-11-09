@@ -4,7 +4,8 @@
 //! The Kubernetes API as the broker's store (ADR-0034): the `AgentSandbox` is the claim
 //! record (its `status.record`, written here and nowhere else), the sealed session is a
 //! Secret owned by the sandbox, attested nodes are `SandboxNode` resources and the notaio
-//! version floors `PolicyFloor` resources, all in the broker's namespace. No database.
+//! version floors `PolicyFloor` resources. The record is where the sandbox is; the Secrets,
+//! nodes and floors are in the broker's own namespace. No database.
 //!
 //! What the store finds, it finds by label: the claim's UID (`mediatore.io/claim-uid`) and
 //! a digest of the bound node's SPIFFE ID (`mediatore.io/node`, a label value being too
@@ -165,41 +166,77 @@ pub struct PolicyFloorSpec {
     pub issued_at: String,
 }
 
-/// The store over the API server, as the broker's `ServiceAccount`, in one namespace.
+/// The store over the API server, as the broker's `ServiceAccount`: the record on the
+/// `AgentSandbox` wherever the sandbox lives (the controller watches every namespace),
+/// everything else in the broker's own namespace.
 pub struct KubeStore {
     client: Client,
-    namespace: String,
+    /// The broker's own namespace, the client's default (the `ServiceAccount`'s in a pod):
+    /// the session Secrets, `SandboxNode` and `PolicyFloor` live here, where the RBAC of
+    /// `deploy/base` reaches and which exists before any sandbox does.
+    home: String,
 }
 
 impl KubeStore {
-    /// Over `client`, keeping everything in `namespace` (the sandboxes' namespace).
-    pub fn new(client: Client, namespace: impl Into<String>) -> Self {
-        Self {
-            client,
-            namespace: namespace.into(),
+    /// Over `client`, keeping what is not a sandbox in the client's default namespace.
+    pub fn new(client: Client) -> Self {
+        let home = client.default_namespace().to_owned();
+        Self { client, home }
+    }
+
+    /// The broker's own namespace, where the Secrets, nodes and floors are kept.
+    #[must_use]
+    pub fn namespace(&self) -> &str {
+        &self.home
+    }
+
+    /// Every namespace: the lookups are by label and by UID, the controller's scope.
+    fn all_sandboxes(&self) -> Api<AgentSandbox> {
+        Api::all(self.client.clone())
+    }
+
+    /// The namespace `sb` lives in, for the writes to it.
+    fn sandboxes_of(&self, sb: &AgentSandbox) -> Api<AgentSandbox> {
+        match sb.namespace() {
+            Some(ns) => Api::namespaced(self.client.clone(), &ns),
+            None => Api::all(self.client.clone()),
         }
     }
 
-    fn sandboxes(&self) -> Api<AgentSandbox> {
-        Api::namespaced(self.client.clone(), &self.namespace)
+    /// The sandbox a new record is for: by its UID when the record carries one, else by
+    /// name, in whichever namespace it lives.
+    async fn sandbox_for(&self, rec: &ClaimRecord) -> Result<AgentSandbox, StoreError> {
+        let list = self
+            .all_sandboxes()
+            .list(&ListParams::default())
+            .await
+            .map_err(|e| backend(&e))?;
+        let uid = rec.sandbox_uid.map(|u| u.to_string());
+        list.items
+            .into_iter()
+            .find(|sb| match &uid {
+                Some(uid) => sb.metadata.uid.as_deref() == Some(uid.as_str()),
+                None => sb.name_any() == rec.name,
+            })
+            .ok_or_else(|| StoreError::NotFound(rec.name.clone()))
     }
 
     fn secrets(&self) -> Api<Secret> {
-        Api::namespaced(self.client.clone(), &self.namespace)
+        Api::namespaced(self.client.clone(), &self.home)
     }
 
     fn nodes(&self) -> Api<SandboxNode> {
-        Api::namespaced(self.client.clone(), &self.namespace)
+        Api::namespaced(self.client.clone(), &self.home)
     }
 
     fn floors(&self) -> Api<PolicyFloor> {
-        Api::namespaced(self.client.clone(), &self.namespace)
+        Api::namespaced(self.client.clone(), &self.home)
     }
 
     /// The sandbox carrying the record of claim `uid`, by its label.
     async fn sandbox_of_claim(&self, uid: Uuid) -> Result<AgentSandbox, StoreError> {
         let list = self
-            .sandboxes()
+            .all_sandboxes()
             .list(&ListParams::default().labels(&format!("{CLAIM_UID_LABEL}={uid}")))
             .await
             .map_err(|e| backend(&e))?;
@@ -229,13 +266,15 @@ impl KubeStore {
     }
 
     /// Write `status.record` for `sb` from `rec`, and the labels the lookups need.
-    async fn write_record(&self, name: &str, rec: &ClaimRecord) -> Result<(), StoreError> {
+    async fn write_record(&self, sb: &AgentSandbox, rec: &ClaimRecord) -> Result<(), StoreError> {
+        let name = sb.name_any();
+        let name = name.as_str();
         let mut labels = serde_json::Map::new();
         labels.insert(CLAIM_UID_LABEL.into(), rec.uid.to_string().into());
         if let Some(node) = &rec.node_id {
             labels.insert(NODE_LABEL.into(), node_label(node).into());
         }
-        self.sandboxes()
+        self.sandboxes_of(sb)
             .patch(
                 name,
                 &PatchParams::default(),
@@ -244,7 +283,7 @@ impl KubeStore {
             .await
             .map_err(|e| backend(&e))?;
         let record = record_status_from(rec);
-        self.sandboxes()
+        self.sandboxes_of(sb)
             .patch_status(
                 name,
                 &PatchParams::default(),
@@ -268,8 +307,12 @@ impl KubeStore {
             api.get_opt(&name).await.map_err(|e| backend(&e))?,
         ) {
             (Some(sealed), Some(_)) => {
+                let mut metadata = serde_json::json!({ "labels": { SESSION_LABEL: "claimed" } });
+                if let Some(owners) = owner_refs(&self.home, sb) {
+                    metadata["ownerReferences"] = serde_json::json!(owners);
+                }
                 let patch = serde_json::json!({
-                    "metadata": { "labels": { SESSION_LABEL: "claimed" }, "ownerReferences": [owner_of(sb)] },
+                    "metadata": metadata,
                     "data": envelope_data(sealed),
                 });
                 api.patch(&name, &PatchParams::default(), &Patch::Merge(patch))
@@ -285,7 +328,7 @@ impl KubeStore {
                     rec.created_at,
                     "claimed",
                 );
-                secret.metadata.owner_references = Some(vec![owner_of(sb)]);
+                secret.metadata.owner_references = owner_refs(&self.home, sb);
                 api.create(&PostParams::default(), &secret)
                     .await
                     .map_err(|e| backend(&e))?;
@@ -307,7 +350,7 @@ impl KubeStore {
     /// Every sandbox carrying a record.
     async fn sandboxes_with_records(&self) -> Result<Vec<AgentSandbox>, StoreError> {
         Ok(self
-            .sandboxes()
+            .all_sandboxes()
             .list(&ListParams::default().labels(CLAIM_UID_LABEL))
             .await
             .map_err(|e| backend(&e))?
@@ -404,6 +447,14 @@ fn record_from(sb: &AgentSandbox, status: &RecordStatus) -> Result<ClaimRecord, 
             .clone()
             .and_then(|v| serde_json::from_value::<WorkloadExit>(v).ok()),
     })
+}
+
+/// The owner reference a session Secret in `home` carries: its sandbox, when the sandbox
+/// is in `home` too. An owner reference cannot cross a namespace (the API server treats
+/// it as absent and collects the dependent), so a sandbox elsewhere owns nothing and the
+/// retention sweep deletes the Secret with it.
+fn owner_refs(home: &str, sb: &AgentSandbox) -> Option<Vec<OwnerReference>> {
+    (sb.namespace().as_deref() == Some(home)).then(|| vec![owner_of(sb)])
 }
 
 fn owner_of(sb: &AgentSandbox) -> OwnerReference {
@@ -572,12 +623,7 @@ fn floor_spec_of(f: &mediatore_store::PolicyFloor) -> PolicyFloorSpec {
 #[async_trait]
 impl ClaimStore for KubeStore {
     async fn put_claim(&self, rec: ClaimRecord) -> Result<(), StoreError> {
-        let sb = self
-            .sandboxes()
-            .get_opt(&rec.name)
-            .await
-            .map_err(|e| backend(&e))?
-            .ok_or_else(|| StoreError::NotFound(rec.name.clone()))?;
+        let sb = self.sandbox_for(&rec).await?;
         if record_status_of(&sb).is_some() {
             return Err(StoreError::Conflict(rec.uid.to_string()));
         }
@@ -585,7 +631,7 @@ impl ClaimStore for KubeStore {
             return Err(StoreError::Conflict(rec.uid.to_string()));
         }
         self.write_envelope(&sb, &rec).await?;
-        self.write_record(&rec.name, &rec).await
+        self.write_record(&sb, &rec).await
     }
 
     async fn get_claim(&self, uid: Uuid) -> Result<ClaimRecord, StoreError> {
@@ -594,11 +640,13 @@ impl ClaimStore for KubeStore {
     }
 
     async fn get_claim_by_name(&self, name: &str) -> Result<ClaimRecord, StoreError> {
+        // By name across namespaces: the newest sandbox of that name carrying a record.
         let sb = self
-            .sandboxes()
-            .get_opt(name)
-            .await
-            .map_err(|e| backend(&e))?
+            .sandboxes_with_records()
+            .await?
+            .into_iter()
+            .filter(|sb| sb.name_any() == name)
+            .max_by_key(|sb| sb.metadata.creation_timestamp.clone().map(|t| t.0))
             .ok_or_else(|| StoreError::NotFound(name.to_owned()))?;
         self.record_of(&sb).await
     }
@@ -606,7 +654,7 @@ impl ClaimStore for KubeStore {
     async fn update_claim(&self, rec: ClaimRecord) -> Result<(), StoreError> {
         let sb = self.sandbox_of_claim(rec.uid).await?;
         self.write_envelope(&sb, &rec).await?;
-        self.write_record(&sb.name_any(), &rec).await
+        self.write_record(&sb, &rec).await
     }
 
     async fn revoke_claim(&self, uid: Uuid, at: DateTime<Utc>) -> Result<(), StoreError> {
@@ -615,13 +663,13 @@ impl ClaimStore for KubeStore {
         rec.revoked_at.get_or_insert(at);
         rec.refresh = None;
         self.write_envelope(&sb, &rec).await?;
-        self.write_record(&sb.name_any(), &rec).await
+        self.write_record(&sb, &rec).await
     }
 
     async fn get_claim_by_node(&self, node_id: &str) -> Result<ClaimRecord, StoreError> {
         let now = Utc::now();
         let list = self
-            .sandboxes()
+            .all_sandboxes()
             .list(&ListParams::default().labels(&format!("{NODE_LABEL}={}", node_label(node_id))))
             .await
             .map_err(|e| backend(&e))?;
@@ -754,9 +802,20 @@ impl ClaimStore for KubeStore {
                 exit = ?rec.exit.as_ref().map(|x| (x.exit.code, x.exit.signal, x.exit.restarts)),
                 "claim swept after its retention (ADR-0034 decision 4): the audit line"
             );
+            // The session goes with the sandbox: by owner reference when they share the
+            // namespace, by this delete otherwise.
+            if let Some(sandbox_uid) = rec.sandbox_uid
+                && let Err(e) = self
+                    .secrets()
+                    .delete(&session_name(sandbox_uid), &DeleteParams::default())
+                    .await
+                && !is_not_found(&e)
+            {
+                return Err(backend(&e));
+            }
             if sb.metadata.deletion_timestamp.is_none()
                 && let Err(e) = self
-                    .sandboxes()
+                    .sandboxes_of(&sb)
                     .delete(&name, &DeleteParams::default())
                     .await
                 && !is_not_found(&e)
@@ -770,7 +829,7 @@ impl ClaimStore for KubeStore {
                 .cloned()
                 .collect();
             match self
-                .sandboxes()
+                .sandboxes_of(&sb)
                 .patch(
                     &name,
                     &PatchParams::default(),
@@ -950,7 +1009,7 @@ impl ClaimStore for KubeStore {
     }
 
     async fn ping(&self) -> Result<(), StoreError> {
-        self.sandboxes()
+        self.all_sandboxes()
             .list(&ListParams::default().limit(1))
             .await
             .map(|_| ())
@@ -961,6 +1020,40 @@ impl ClaimStore for KubeStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_session_is_owned_by_its_sandbox_only_within_the_brokers_namespace() {
+        let mut sb = AgentSandbox::new(
+            "sb",
+            crate::sandbox::AgentSandboxSpec {
+                subject: crate::sandbox::SandboxSubject {
+                    issuer: "https://idp.example".into(),
+                    id: "octocat".into(),
+                    display: None,
+                },
+                pool_ref: banlieue_api::common::LocalObjectReference {
+                    name: "pool-a".into(),
+                },
+                ttl_seconds: 600,
+                audiences: vec![],
+                workload: crate::sandbox::SandboxWorkload {
+                    image: "registry.internal:5000/x:1".into(),
+                    args: vec!["/bin/x".into()],
+                    restart: None,
+                },
+                policy_ref: None,
+            },
+        );
+        sb.metadata.uid = Some("u-1".into());
+        sb.metadata.namespace = Some("banlieue-system".into());
+        let owners = owner_refs("banlieue-system", &sb).expect("same namespace: owned");
+        assert_eq!(owners[0].kind, "AgentSandbox");
+        assert_eq!(owners[0].uid, "u-1");
+        assert!(
+            owner_refs("sandboxes", &sb).is_none(),
+            "a reference across namespaces would be collected"
+        );
+    }
 
     #[test]
     fn the_node_label_fits_a_label_value_and_differs_per_node() {

@@ -63,6 +63,10 @@ It need not. Every table of ADR-0012 has a natural home in the API:
    it. etcd holds ciphertext; the sealing key is where it was (the local key or OpenBao
    transit). An operator who wants Secrets encrypted at rest as well enables it on the
    API server; the guide says so and says it is a second layer, not the first.
+   (Clarified at implementation, 2026-11-09: an owner reference cannot cross a namespace,
+   the API server treats one that does as absent and collects the dependent. The Secret
+   carries the reference when the sandboxes live in the broker's namespace, and the
+   retention sweep of decision 4 deletes it with the sandbox either way.)
 
 3. **`SandboxNode` and `PolicyFloor`, two CRDs in the broker's namespace.** `SandboxNode`
    is named by the EK hash and holds what `nodes` held: the node's SPIFFE ID, the DMI UUID

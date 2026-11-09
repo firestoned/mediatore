@@ -90,10 +90,11 @@ subjects:
     name: mediatore
     namespace: banlieue-system
 ---
-# The sealed sessions (ADR-0034 decision 2): one Secret per sandbox in the sandboxes'
+# The sealed sessions (ADR-0034 decision 2): one Secret per sandbox in the broker's own
 # namespace, created by the API, claimed and rotated by the reconciler and the token
-# endpoint, garbage-collected with the AgentSandbox that owns it. Namespace-scoped on
-# purpose: the broker reads no Secret elsewhere.
+# endpoint, garbage-collected with the AgentSandbox that owns it when the sandboxes live
+# here too, deleted by the retention sweep otherwise. Namespace-scoped on purpose: the
+# broker reads no Secret elsewhere.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:

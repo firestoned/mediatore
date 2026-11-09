@@ -70,7 +70,7 @@ sandboxes:
 #     - { id: "notaio:v1", public_key: "<base64 Ed25519 public key>" }
 #   namespaces: [sandboxes]   # default: sandboxes.namespace
 store:
-  # No URL since ADR-0034: the AgentSandbox status, Secrets, SandboxNode and PolicyFloor
-  # resources in the sandboxes' namespace are the store.
+  # No URL since ADR-0034: the AgentSandbox status (in sandboxes.namespace) and the
+  # Secrets, SandboxNode and PolicyFloor resources in the broker's namespace are the store.
   sealing:
     key_file: /etc/mediatore-sealing/key
