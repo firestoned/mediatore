@@ -3,7 +3,7 @@
 #
 # The broker's config for the homelab overlay. Placeholders throughout: your trust
 # domain, your issuer (docs/guides/issuers.md has Dex with GitHub, Google, Auth0 and
-# Entra), your audiences. The store URL comes from Secret mediatore-store (ADR-0012).
+# Entra), your audiences. The store is the Kubernetes API (ADR-0034): nothing to point at.
 trust_domain: sandbox.home.example
 listen:
   user: 0.0.0.0:8080
@@ -70,8 +70,7 @@ sandboxes:
 #     - { id: "notaio:v1", public_key: "<base64 Ed25519 public key>" }
 #   namespaces: [sandboxes]   # default: sandboxes.namespace
 store:
-  # One replica only (kustomization.yaml): a file on the PVC. Secret mediatore-store
-  # overrides this with MEDIATORE_STORE_URL when present.
-  url: sqlite:///var/lib/mediatore/store.db?mode=rwc
+  # No URL since ADR-0034: the AgentSandbox status, Secrets, SandboxNode and PolicyFloor
+  # resources in the sandboxes' namespace are the store.
   sealing:
     key_file: /etc/mediatore-sealing/key

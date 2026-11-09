@@ -50,8 +50,8 @@ sts:
   signing_key_file: /etc/mediatore-sts/sts.pem
 sandboxes:
   namespace: mediatore-e2e-sandbox
-# The store URL comes from the environment (Secret mediatore-store). Ended rows are kept
-# for 0 s and the resync runs every 15 s so the sandbox tier sees the audit sweep.
+# The store is the Kubernetes API (ADR-0034). An ended claim is kept for 0 s and the
+# resync runs every 15 s, so the sandbox tier sees the sweep release the sandbox.
 store:
   retention_secs: 0
   sealing:

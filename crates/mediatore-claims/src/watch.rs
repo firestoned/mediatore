@@ -457,7 +457,7 @@ impl Watcher {
 
     /// Decision 4's backstop: release every bound record whose claim no longer exists,
     /// then sweep orphan entries, then sweep the rows of claims that ended before the
-    /// retention window into the audit table (ADR-0012). Returns (records released,
+    /// retention window, the audit line logged (ADR-0034). Returns (records released,
     /// entries swept, rows archived).
     pub async fn resync(&self) -> Result<(usize, usize, usize), WatchError> {
         let existing = self.claims.list_claim_uids().await?;
@@ -1076,9 +1076,5 @@ mod tests {
             Err(mediatore_store::StoreError::NotFound(_))
         ));
         assert!(r.store.get_claim(live).await.is_ok());
-        let audit = r.store.list_audit().await.unwrap();
-        assert_eq!(audit.len(), 1);
-        assert_eq!(audit[0].uid, ended);
-        assert!(audit[0].revoked_at.is_some());
     }
 }

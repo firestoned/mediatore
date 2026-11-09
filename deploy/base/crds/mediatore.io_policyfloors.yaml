@@ -1,0 +1,75 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+#
+# Generated from crates/mediatore-claims/src/kubestore.rs by `make crds` (ADR-0034
+# decision 3). Do not edit: the unit test `the_crds_in_deploy_are_what_the_types_render`
+# fails on a stale file.
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: policyfloors.mediatore.io
+spec:
+  group: mediatore.io
+  names:
+    kind: PolicyFloor
+    plural: policyfloors
+    shortNames:
+    - pfl
+    singular: policyfloor
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.policyName
+      name: Policy
+      type: string
+    - jsonPath: .spec.policyNamespace
+      name: Namespace
+      type: string
+    - jsonPath: .spec.version
+      name: Version
+      type: integer
+    - jsonPath: .spec.issuedAt
+      name: Issued
+      type: string
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: "PolicyFloor is the version floor of one notaio policy (ADR-0026 decision 5, ADR-0034 decision 3): the incarnation, the highest bundle version accepted for it and that bundle's issuedAt; moved by compare-and-set on resourceVersion."
+        properties:
+          spec:
+            description: |-
+              The version floor of one notaio policy (ADR-0026 decision 5, ADR-0034 decision 3),
+              named `<policy namespace>.<policy name>`; moved by compare-and-set on `resourceVersion`.
+            properties:
+              issuedAt:
+                description: |-
+                  `issuedAt` of the bundle the floor was last moved by, RFC 3339 to the nanosecond
+                  (a Kubernetes `Time` keeps seconds only).
+                type: string
+              policyName:
+                description: The policy's name.
+                type: string
+              policyNamespace:
+                description: The policy's namespace.
+                type: string
+              uid:
+                description: "The incarnation: the `SandboxPolicy`'s `uid`."
+                type: string
+              version:
+                description: The highest bundle version accepted for that incarnation.
+                format: uint64
+                minimum: 0.0
+                type: integer
+            required:
+            - issuedAt
+            - policyName
+            - policyNamespace
+            - uid
+            - version
+            type: object
+        required:
+        - spec
+        title: PolicyFloor
+        type: object
+    served: true
+    storage: true

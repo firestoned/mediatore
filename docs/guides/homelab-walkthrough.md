@@ -277,8 +277,6 @@ openssl ecparam -name prime256v1 -genkey -noout | openssl pkcs8 -topk8 -nocrypt 
 kubectl -n banlieue-system create secret generic mediatore-sts --from-file=sts.pem
 openssl rand -hex 32 > sealing.key
 kubectl -n banlieue-system create secret generic mediatore-sealing --from-file=key=sealing.key
-kubectl -n banlieue-system create secret generic mediatore-store \
-  --from-literal=url='sqlite:///var/lib/mediatore/store.db?mode=rwc'
 kubectl apply -k ~/.config/mediatore/core
 kubectl -n banlieue-system rollout status deploy/mediatore
 kubectl -n banlieue-system logs deploy/mediatore | head -40
@@ -286,8 +284,8 @@ kubectl -n banlieue-system logs deploy/mediatore | head -40
 
 The overlay's `mediatore.yaml` names the Dex of step 3 as the one issuer (`backend:
 sts`, `subject_claim: preferred_username`, a `session` block, `required_group` the
-GitHub team Dex reports), the audiences the STS mints for, the SQLite store on the PVC
-and the local sealer. The `NetworkPolicy` opens 8443 to the sandbox segment, 8080 to
+GitHub team Dex reports), the audiences the STS mints for and the local sealer; the
+store is the cluster itself ([the store](the-store.md)). The `NetworkPolicy` opens 8443 to the sandbox segment, 8080 to
 the Tailscale operator's namespace, and egress to DNS, the API server and `dex`.
 
 ## 7. The first login and request

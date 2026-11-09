@@ -42,7 +42,6 @@ gh attestation verify mediatore-0.1.0.yaml --repo firestoned/mediatore
 | banlieue's claim subject policy listing mediatore as a broker | ConfigMap `banlieue-claim-subject-policy`, `brokers:` line `system:serviceaccount:banlieue-system:mediatore`, `issuers:` listing yours | every claim mediatore creates names someone else's subject ([requesting a sandbox](requesting-a-sandbox.md)) |
 | An issuer with a public client for mediatore | Dex, Google, Auth0 or Entra ([issuers](issuers.md)) | `mediatore login` and the refresh before every issue |
 | An ingress for the user API, a LoadBalancer for the sandbox listener | the Tailscale operator's ingress class and MetalLB in the example | `:8080` to people; `:443` on the LoadBalancer (the pod's 8443) to pool VMs, so `MEDIATORE_URL` in the members' env file names the address alone |
-| A ReadWriteOnce storage class | `local-path` on k0s | the SQLite file of a one-replica broker, or nothing with PostgreSQL |
 
 None of those are this repository's to install. What follows is.
 
@@ -97,8 +96,8 @@ URL, your CIDRs. Edit:
 
 ## 2. Create the Secrets the overlay expects
 
-The overlay generates no secret. Three Secrets in `banlieue-system`, each a file the
-broker reads at startup:
+The overlay generates no secret. Two Secrets in `banlieue-system`, each a file the
+broker reads at startup (the store needs none: it is the cluster's API, [the store](the-store.md)):
 
 ```sh
 # The STS signing key (ES256), whose public half becomes the broker's JWKS.
@@ -108,11 +107,6 @@ kubectl -n banlieue-system create secret generic mediatore-sts --from-file=sts.p
 # The sealing key for refresh material (ADR-0012 decision 3), the local sealer.
 openssl rand -hex 32 > sealing.key
 kubectl -n banlieue-system create secret generic mediatore-sealing --from-file=key=sealing.key
-
-# The store URL (ADR-0012). SQLite on the PVC for one replica, as the example
-# config says; or PostgreSQL over verify-full, in which case this overrides it.
-kubectl -n banlieue-system create secret generic mediatore-store \
-  --from-literal=url='sqlite:///var/lib/mediatore/store.db?mode=rwc'
 ```
 
 Delete the local files afterwards. With the transit sealer ([the store](the-store.md))
@@ -143,14 +137,14 @@ kubectl -n banlieue-system logs deploy/mediatore | head -40
 ```
 
 The broker fails the start on anything it cannot use, and says which: a key file that
-does not parse, a store it cannot migrate, an issuer whose discovery document it cannot
-fetch, a class name the controller manager does not serve. What a healthy start logs,
-in order: the store migrated, the sealing key loaded, each issuer (and `issuer pinned
+does not parse, an issuer whose discovery document it cannot fetch, a class name the
+controller manager does not serve. What a healthy start logs, in order: the store (the
+Kubernetes API, ADR-0034), the sealing key loaded, each issuer (and `issuer pinned
 to a private CA` when `ca_file` is set), `broker SVID` from the Workload API, the
 listeners, `claim watcher running` on the replica that holds the Lease.
 
-`/healthz` on the user API answers true only once the store is reachable; the Ingress
-routes to it.
+`/healthz` on the user API answers true only while the API server answers the store;
+the Ingress routes to it.
 
 ## 4. Prove the cluster side as the broker's ServiceAccount
 

@@ -24,15 +24,16 @@ struct Cli {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
-    let rendered = sandbox::crd_yaml()?;
-    match cli.out_dir {
-        Some(dir) => {
-            std::fs::create_dir_all(&dir)?;
-            let path = dir.join(sandbox::CRD_FILE_NAME);
-            std::fs::write(&path, rendered)?;
-            eprintln!("wrote {}", path.display());
+    for (file, rendered) in sandbox::crd_yamls()? {
+        match &cli.out_dir {
+            Some(dir) => {
+                std::fs::create_dir_all(dir)?;
+                let path = dir.join(file);
+                std::fs::write(&path, rendered)?;
+                eprintln!("wrote {}", path.display());
+            }
+            None => println!("{rendered}---"),
         }
-        None => print!("{rendered}"),
     }
     Ok(())
 }

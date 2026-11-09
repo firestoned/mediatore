@@ -13,6 +13,7 @@ use std::sync::Arc;
 use clap::{Parser, Subcommand};
 use mediatore_api::{AppState, Limiter};
 use mediatore_claims::Reconciler;
+use mediatore_claims::kubestore::KubeStore;
 use mediatore_claims::lease::LeaseConfig;
 use mediatore_claims::policy::{BundleCache, BundleReflector};
 use mediatore_claims::sandbox::{KubeSandboxes, SandboxFrontDoor};
@@ -21,7 +22,6 @@ use mediatore_claims::watch::{KubeClaimsApi, Watcher, WatcherConfig};
 use mediatore_entra::{Backend, ClientAssertion, Validator};
 use mediatore_spire::{EntryManager, KubeEntryManager, MemoryEntries, Naming};
 use mediatore_store::seal::{LocalKeySealer, Sealer, TransitSealer};
-use mediatore_store::sql::{SqlStore, redacted};
 use mediatore_store::{ClaimStore, MemoryStore};
 use mediatore_sts::Sts;
 use mediatore_tls::MaterialSource;
@@ -116,7 +116,7 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
     if cfg.dev_mode {
         tracing::warn!("dev_mode: peer identity from header, in-memory entries, no mTLS");
     }
-    let store = store(&cfg).await?;
+    let store = store(&cfg, client.as_ref())?;
     let sealer = sealer(&cfg).await?;
     let sandboxes: Option<Arc<dyn SandboxFrontDoor>> = client
         .as_ref()
@@ -351,21 +351,27 @@ async fn broker_identity(
     Ok(configs)
 }
 
-/// The claim store (ADR-0012): sqlx over the configured URL, migrated at startup; in
-/// memory only under `dev_mode` with no URL (`Config::parse` refuses that elsewhere).
-async fn store(cfg: &Config) -> anyhow::Result<Arc<dyn ClaimStore>> {
-    let Some(url) = cfg.store.url.as_deref() else {
-        tracing::warn!("store: in-memory (dev_mode); nothing survives a restart");
-        return Ok(MemoryStore::shared());
-    };
-    let store = SqlStore::connect(url, cfg.store.max_connections).await?;
-    tracing::info!(
-        store = %redacted(url),
-        engine = ?store.engine(),
-        retention_secs = cfg.store.retention_secs,
-        "store: migrated and connected"
+/// The claim store: the Kubernetes API with a cluster client (ADR-0034, the `AgentSandbox`
+/// the record, Secrets, `SandboxNode` and `PolicyFloor` in the sandboxes' namespace); in
+/// memory under `dev_mode`, where there is no cluster and nothing survives a restart.
+fn store(cfg: &Config, client: Option<&kube::Client>) -> anyhow::Result<Arc<dyn ClaimStore>> {
+    if let Some(client) = client {
+        tracing::info!(
+            namespace = %cfg.sandboxes.namespace,
+            retention_secs = cfg.store.retention_secs,
+            "store: the Kubernetes API (ADR-0034)"
+        );
+        return Ok(Arc::new(KubeStore::new(
+            client.clone(),
+            cfg.sandboxes.namespace.clone(),
+        )));
+    }
+    anyhow::ensure!(
+        cfg.dev_mode,
+        "no cluster client outside dev_mode: the store is the Kubernetes API (ADR-0034)"
     );
-    Ok(Arc::new(store))
+    tracing::warn!("store: in-memory (dev_mode); nothing survives a restart");
+    Ok(MemoryStore::shared())
 }
 
 /// One value per audience, by name.

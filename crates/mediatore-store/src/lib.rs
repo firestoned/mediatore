@@ -1,12 +1,13 @@
 // Copyright (c) 2026 Erick Bourgeois, mediatore
 // SPDX-License-Identifier: Apache-2.0
 
-//! Persistence boundary for mediatore (ADR-0012).
+//! Persistence boundary for mediatore (ADR-0012, the store's shape; ADR-0034, where it
+//! lives).
 //!
-//! The server only ever talks to [`ClaimStore`]. [`sql::SqlStore`] is the shipped
-//! implementation, one query set over SQLite or PostgreSQL chosen by the URL; `MemoryStore`
-//! is for `dev_mode` and tests, and the conformance suite holds it to the SQL store's
-//! behaviour. Refresh material enters the store only as a [`seal::Sealed`] envelope.
+//! The server only ever talks to [`ClaimStore`]. The shipped implementation is `KubeStore`
+//! in `mediatore-claims` (the Kubernetes API: the record on the `AgentSandbox`, the
+//! session in a Secret, the nodes and floors as resources); `MemoryStore` is for `dev_mode`
+//! and tests, and the conformance suite pins the behaviour both must share. Refresh material enters the store only as a [`seal::Sealed`] envelope.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -21,7 +22,6 @@ use uuid::Uuid;
 #[cfg(test)]
 mod conformance;
 pub mod seal;
-pub mod sql;
 
 pub use seal::Sealed;
 
@@ -132,32 +132,6 @@ pub struct NodeRecord {
     pub registered_at: DateTime<Utc>,
 }
 
-/// What survives a claim row: written when [`ClaimStore::sweep`] removes it (ADR-0012
-/// decision 4). mediatore never deletes these.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ClaimAudit {
-    /// The claim's UID.
-    pub uid: Uuid,
-    /// The claim's name.
-    pub name: String,
-    /// Who it was for.
-    pub subject: Subject,
-    /// The node it was bound to, if it ever was.
-    pub node_id: Option<String>,
-    /// When the record was created.
-    pub created_at: DateTime<Utc>,
-    /// The bind deadline, if it was bound.
-    pub expires_at: Option<DateTime<Utc>>,
-    /// When it was revoked, if it was.
-    pub revoked_at: Option<DateTime<Utc>>,
-    /// The guest's report, if it made one: which bytes and which rules ran.
-    pub report: Option<ClaimReport>,
-    /// How the workload ended, if its restart policy ended the claim (ADR-0033).
-    pub exit: Option<WorkloadExit>,
-    /// When the row was swept.
-    pub swept_at: DateTime<Utc>,
-}
-
 /// A delegated upstream session between the API call that received it and the record
 /// it ends up in (ADR-0013 decision 2). Keyed by the `AgentSandbox` UID, which is also the
 /// envelope's associated data.
@@ -222,11 +196,10 @@ pub trait ClaimStore: Send + Sync + 'static {
     /// All registered nodes.
     async fn list_nodes(&self) -> Result<Vec<NodeRecord>, StoreError>;
 
-    /// Remove every claim row that ended ([`ClaimRecord::ended_at`]) before `before`,
-    /// writing a [`ClaimAudit`] row for each in the same transaction. Returns how many.
+    /// Remove every claim record that ended ([`ClaimRecord::ended_at`]) before `before`,
+    /// after the retention window (ADR-0034 decision 4: the audit is the log line the
+    /// store writes as it does so). Returns how many.
     async fn sweep(&self, before: DateTime<Utc>) -> Result<usize, StoreError>;
-    /// Every audit row, oldest sweep first.
-    async fn list_audit(&self) -> Result<Vec<ClaimAudit>, StoreError>;
     /// Park a delegated session until the reconciler creates the record. `Conflict` if
     /// the sandbox already has one.
     async fn put_session(&self, rec: SessionRecord) -> Result<(), StoreError>;
@@ -277,7 +250,6 @@ fn same_policy(held: Option<&PolicyFloor>, next: &PolicyFloor) -> Result<(), Sto
 pub struct MemoryStore {
     claims: RwLock<HashMap<Uuid, ClaimRecord>>,
     nodes: RwLock<HashMap<String, NodeRecord>>,
-    audit: RwLock<Vec<ClaimAudit>>,
     sessions: RwLock<HashMap<Uuid, SessionRecord>>,
     floors: RwLock<HashMap<(String, String), PolicyFloor>>,
 }
@@ -405,8 +377,6 @@ impl ClaimStore for MemoryStore {
 
     async fn sweep(&self, before: DateTime<Utc>) -> Result<usize, StoreError> {
         let mut claims = self.claims.write().await;
-        let mut audit = self.audit.write().await;
-        let swept_at = Utc::now();
         let gone: Vec<Uuid> = claims
             .values()
             .filter(|c| c.ended_at().is_some_and(|e| e < before))
@@ -414,24 +384,9 @@ impl ClaimStore for MemoryStore {
             .collect();
         for uid in &gone {
             let c = claims.remove(uid).expect("selected above");
-            audit.push(ClaimAudit {
-                uid: c.uid,
-                name: c.name,
-                subject: c.subject,
-                node_id: c.node_id,
-                created_at: c.created_at,
-                expires_at: c.expires_at,
-                revoked_at: c.revoked_at,
-                report: c.report,
-                exit: c.exit,
-                swept_at,
-            });
+            tracing::info!(claim_uid = %c.uid, name = %c.name, subject = %c.subject.id, "claim swept after its retention");
         }
         Ok(gone.len())
-    }
-
-    async fn list_audit(&self) -> Result<Vec<ClaimAudit>, StoreError> {
-        Ok(self.audit.read().await.clone())
     }
 
     async fn put_session(&self, rec: SessionRecord) -> Result<(), StoreError> {

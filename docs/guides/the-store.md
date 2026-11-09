@@ -3,83 +3,68 @@
 
 # The store
 
-mediatore keeps what cannot sit on an `AgentSandbox` resource in a database
-([ADR-0012](../adr/0012-persistent-store.md)): the record of each claim it brokered (a
-copy of the request fields, the SPIRE entry id, the node, the bind deadline, the
-revocation), the registry of attested nodes, sealed refresh material once a token backend
-produces some, and an audit row for every claim row that has been swept. One
-implementation serves two engines; which one is a URL.
+mediatore keeps what it remembers about a claim in the Kubernetes API, and nowhere else
+([ADR-0034](../adr/0034-the-kubernetes-api-as-the-brokers-store.md), superseding the
+database of [ADR-0012](../adr/0012-persistent-store.md)): the resource is the record.
+There is no database to run, no URL to configure and no SQLite in the binary. Under
+`dev_mode`, where there is no cluster, an in-memory store stands in and nothing survives
+a restart.
 
-## Choosing an engine
+## Where each thing lives
+
+| What | Where | Found by |
+| --- | --- | --- |
+| The claim record: the SPIRE entry id, the bound node, the bind deadline, the revocation, the policy incarnation and bundle version the claim was created under, the guest's report, the workload's exit | `AgentSandbox.status.record`, written by the store alone (the reconciler's mirroring leaves it out of its patches) | the label `mediatore.io/claim-uid` (the claim's UID, the record's key) and `mediatore.io/node` (a digest of the bound node's SPIFFE ID) |
+| The sealed session: the delegated refresh token, sealed with the sandbox's UID | Secret `mediatore-session-<sandbox uid>` in the sandboxes' namespace, owned by the `AgentSandbox` so it goes with it; parked by `POST /v1/claims`, claimed by the reconciler when it writes the record, rotated in place at every mint, emptied on revocation | its name; the labels `mediatore.io/sandbox-uid` and `mediatore.io/session` (`parked` or `claimed`) |
+| The attested nodes: EK hash, the agent's SPIFFE ID, DMI UUID, hostname, provider, banned | `SandboxNode`, named by the EK hash | its name; the label `mediatore.io/dmi-uuid` for the clone check |
+| The version floor of each notaio policy ([ADR-0026](../adr/0026-notaio-bundles-verified-in-shadow.md) decision 5) | `PolicyFloor`, named `<policy namespace>.<policy name>` | its name; moved by compare-and-set on `resourceVersion`, so two replicas cannot move a floor down |
+
+The request fields (subject, audiences, workload, TTL, policy) are the `AgentSandbox`'s
+spec, frozen at admission; the record keeps no copy. `kubectl get agentsandboxes
+-o yaml` shows a sandbox's whole record; `kubectl get sandboxnodes` and `kubectl get
+policyfloors` the other two.
 
 ```yaml
 store:
-  url: sqlite:///var/lib/mediatore/store.db?mode=rwc   # one replica
-  # url: postgres://mediatore:...@db.home.example:5432/mediatore?sslmode=verify-full
-  retention_secs: 3600
-  max_connections: 8
+  retention_secs: 3600   # how long an ended claim stays on its AgentSandbox
+  sealing:               # the sealer for refresh material, below
+    key_file: /etc/mediatore-sealing/key
 ```
-
-`MEDIATORE_STORE_URL` in the environment overrides `url`, which is how the PostgreSQL
-password stays in a Secret: `deploy/base/deployment.yaml` reads it from Secret
-`mediatore-store`, key `url`, which the operator creates:
-
-```sh
-kubectl -n banlieue-system create secret generic mediatore-store \
-  --from-literal=url='postgres://mediatore:<password>@db.home.example:5432/mediatore?sslmode=verify-full&sslrootcert=/etc/mediatore-pg/ca.pem'
-```
-
-The broker never logs the URL, only its scheme and host.
-
-**PostgreSQL** is for anything with more than one replica, which is what `deploy/base`
-ships. Outside `dev_mode` the URL must say `sslmode=verify-full`; the broker refuses to
-start otherwise. The client is rustls on aws-lc-rs and offers the post-quantum hybrid
-first, as every other client in the binary does, so a server that accepts only
-X25519MLKEM768 works. Mount the CA that signed the server's certificate (a ConfigMap is
-fine; it is public) and name it with `sslrootcert`.
-
-**SQLite** is for one replica: a file on a volume, WAL mode, a busy timeout. Two pods
-with two files are two stores, and the API on one would not see what the watcher wrote
-on the other. Set `replicas: 1` in an overlay and give the pod a writable volume for
-the file; the base Deployment's root filesystem is read-only. A memory SQLite
-(`sqlite::memory:`) is refused outside `dev_mode`: it is as lossy as the in-memory
-store.
-
-**Under `dev_mode`** no URL means the in-memory store, as before. Any supported URL is
-accepted there too, memory included.
-
-## Migrations
-
-The schema ships inside the binary, one migration set per engine, and is applied at
-startup under sqlx's migration lock. Each migration is checksummed; a migration whose
-text changed after it ran fails the start, which is the point. There is nothing to run
-by hand before upgrading, and no downgrade path: back up before you upgrade.
-
-The database role mediatore connects as needs `SELECT`, `INSERT`, `UPDATE` and `DELETE`
-on `claims` and `nodes`; `SELECT`, `INSERT` and `DELETE` on `sessions`; `SELECT`, `INSERT`
-and `UPDATE` on `policy_floors`; `SELECT` and `INSERT` on `claim_audit`; and DDL for the
-migrations. Do not grant `DELETE` on `claim_audit`: mediatore never issues it, and the
-grant is what would let a compromised broker erase a trail.
 
 ## What survives a restart
 
-Everything in the store. A revoked claim stays revoked and `/v1/token` keeps refusing
-it. A bound claim keeps its entry id, so the reconciler declares nothing twice. A node
-that registered is still known, so its claim rebinds without the guest registering
-again. The version floor of each notaio policy (ADR-0026) stays where it was, so a bundle
-older than one already accepted is still refused. The `make kind-e2e-sandbox` tier restarts the broker on PostgreSQL with a sandbox
-`Ready` and asserts exactly that: still `Ready`, no second record, no second entry.
+Everything: it is the cluster's state. A revoked claim stays revoked and `/v1/token`
+keeps refusing it. A bound claim keeps its entry id, so the reconciler declares nothing
+twice. A node that registered is still known, so its claim rebinds without the guest
+registering again. The version floor of each notaio policy stays where it was, so a bundle
+older than one already accepted is still refused. The `make kind-e2e-sandbox` tier
+restarts the broker with a sandbox `Ready` and asserts exactly that: still `Ready`, no
+second record, no second entry. Two replicas need no shared database for any of it; the
+watcher Lease stays the one leader election.
+
+Backups are the cluster's: the etcd (or kine) backup that holds every other resource holds
+these. An operator who wants the session Secrets encrypted at rest as well enables
+encryption at rest on the API server; it is a second layer, since the Secret holds
+ciphertext either way (below).
+
+## RBAC
+
+The broker's ServiceAccount patches `agentsandboxes/status` and the resource's labels and
+finalizers (as before), has every verb on `sandboxnodes` and `policyfloors` (a
+ClusterRole), and `get`, `list`, `create`, `update`, `patch` and `delete` on Secrets in
+the sandboxes' namespace alone (a Role): `deploy/base/rbac.yaml`. The broker reads no
+Secret elsewhere.
 
 ## Refresh material
 
-A claim row holds refresh material only as a sealed envelope: the id of the key that
-sealed it, a fresh nonce, and the AES-256-GCM ciphertext with the claim's UID as
-associated data, so an envelope copied onto another claim's row does not open. The
-record type has no plaintext field. Revocation drops the envelope.
+A claim holds refresh material only as a sealed envelope: the id of the key that sealed
+it, a fresh nonce, and the AES-256-GCM ciphertext with the sandbox's UID as associated
+data, so an envelope copied onto another sandbox's Secret does not open. The record type
+has no plaintext field. Revocation empties the envelope.
 
 There are two sealers, and `store.sealing` names exactly one of them.
 
-The local sealer takes its key from a file (the homelab shape, one replica):
+The local sealer takes its key from a file (the homelab shape):
 
 ```yaml
 store:
@@ -108,8 +93,8 @@ store:
 ```
 
 Sealing is `transit/encrypt/<key>` and unsealing `transit/decrypt/<key>`, with the
-binding UID as the derivation `context`, so the envelope opens only for its claim exactly
-as the local sealer's associated data arranges. The envelope's `key_id` is
+binding UID as the derivation `context`, so the envelope opens only for its sandbox
+exactly as the local sealer's associated data arranges. The envelope's `key_id` is
 `transit:<mount>/<key>`, its ciphertext the `vault:vN:...` string OpenBao returned, so a
 key rotated at OpenBao (`bao write -f transit/keys/mediatore/rotate`) keeps old
 envelopes readable until the administrator raises `min_decryption_version`; the broker
@@ -129,15 +114,15 @@ refresh material fails that claim rather than store plaintext.
 A session issuer ([ADR-0013](../adr/0013-dex-session-delegation.md)) is where envelopes
 come from today: the refresh token `POST /v1/claims` receives is sealed with the
 `AgentSandbox` UID (the associated data, so the envelope opens only for that sandbox's
-record) and parked in `sessions` until the reconciler creates the record and moves it
-there; `claims.sandbox_uid` records which UID opens it. (Two columns beside it,
-`policy_uid` and `bundle_version`, hold the notaio policy a sandbox named and the verified
-bundle current when its claim was created, [ADR-0026](../adr/0026-notaio-bundles-verified-in-shadow.md)
-decision 6; both empty for a sandbox naming none.) Every `POST /v1/token` opens the
+record) and parked in the sandbox's Secret until the reconciler creates the record and
+claims it; from then on the Secret is the claim's envelope. (`status.record.policyUid` and
+`bundleVersion` beside it hold the notaio policy a sandbox named and the verified bundle
+current when its claim was created, [ADR-0026](../adr/0026-notaio-bundles-verified-in-shadow.md)
+decision 6; both absent for a sandbox naming none.) Every `POST /v1/token` opens the
 envelope, refreshes upstream, and re-seals the rotated token. A session no record ever
-took (a refused or deleted sandbox) is removed by the reconciler, and anything older than
-an hour is swept at resync. An issuer with a `session` block and no `sealing` section refuses
-to start.
+claimed (a refused or deleted sandbox) is removed by the reconciler, and a parked one older
+than an hour is swept at resync. An issuer with a `session` block and no `sealing` section
+refuses to start.
 
 An Entra issuer ([ADR-0016](../adr/0016-entra-on-behalf-of.md), [the Entra
 path](the-entra-path.md)) fills the same envelope from the other direction: nothing is
@@ -146,23 +131,25 @@ refresh token Entra issues to mediatore is what gets sealed. Every issue refresh
 the audience's resource and re-seals what comes back. An issuer with an `entra` block
 needs a `sealing` section for the same reason.
 
-## Retention and the audit table
+## Retention and the audit
 
-A claim row outlives its claim by `retention_secs` (default one hour). At every resync
-the leader sweeps the rows whose claim ended (revoked, or past its deadline) before that
-window into `claim_audit`: the UID, name, subject, node, the created, bound-until and
-revoked timestamps, and when it was swept. The envelope is not copied. Node rows are
-never swept: a node that registered is known until an operator removes it.
+An ended claim (released, expired, failed, deleted by its subject or by the workload's
+exit) stays on its `AgentSandbox` for `retention_secs` (default one hour): the
+reconciler's finalizer holds the resource with its final status, so `kubectl get
+agentsandboxes` shows what ran recently, exit and report included. At every resync the
+leader sweeps the sandboxes whose claim ended before that window: one log line per
+sandbox with what an audit row used to hold (the claim UID, name, subject, node, the
+created, bound-until and revoked timestamps, whether a report and an exit were recorded),
+then the resource is deleted if nobody had, and the finalizer released. The envelope is
+never logged. The cluster's log pipeline keeps the lines; there is no audit table and
+nothing for mediatore to delete from. Nodes are never swept: a node that registered is
+known until an operator deletes its `SandboxNode`.
 
-mediatore never deletes from `claim_audit`. Retention there is yours, by SQL:
-
-```sql
-DELETE FROM claim_audit WHERE swept_at < (EXTRACT(EPOCH FROM now() - INTERVAL '1 year') * 1000000)::bigint;
-```
-
-Timestamps are microseconds since the epoch in every table.
+`retention_secs: 0` means an ended claim is swept at the next resync, which is how the
+kind tiers run.
 
 ## Health
 
-`GET /healthz` on the user listener pings the store and answers `503 store_unavailable`
-when it cannot, so a broker that lost its database leaves the Service until it is back.
+`GET /healthz` on the user listener lists one `AgentSandbox` and answers
+`503 store_unavailable` when the API server does not answer, so a broker cut off from the
+cluster leaves the Service until it is back.

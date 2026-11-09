@@ -22,6 +22,7 @@ use uuid::Uuid;
 
 #[cfg(test)]
 pub(crate) mod fakes;
+pub mod kubestore;
 pub mod lease;
 pub mod policy;
 pub mod sandbox;

@@ -28,8 +28,7 @@ flowchart LR
     service-mediatore-watcher["Claim Watcher and AgentSandbox Reconciler"]
     service-mediatore-sts["STS"]
     data-asset-agentsandbox-cr["AgentSandbox resources"]
-    data-asset-claim-store["Claim Store"]
-    database-store["Store Database (PostgreSQL / SQLite)"]
+    data-asset-claim-store["Claim Store (the Kubernetes API)"]
     service-openbao["OpenBao (transit, PKI)"]
     data-asset-sts-signing-key["STS Signing Key"]
     data-asset-sealing-key["Sealing Key"]
@@ -83,7 +82,6 @@ flowchart LR
         service-spire-controller-manager
         service-spire-agent-k8s
         data-asset-cluster-static-entries
-        database-store
     end
     subgraph sg_network-identity-cluster [Network Identity Cluster]
         service-spire-root
@@ -121,7 +119,6 @@ flowchart LR
     service-control-relay -->|TCP| service-mediatore-sandbox-api
     service-egress-proxy -->|HTTPS| ecosystem-downstream-api
     actor-sandbox-user --> data-asset-claim-store
-    system-mediatore -->|TLS| database-store
     system-mediatore -->|TLS| service-openbao
     actor-sandbox-user --> data-asset-cluster-static-entries
     service-spire-server -->|HTTPS| service-openbao

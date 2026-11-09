@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Erick Bourgeois, mediatore
 // SPDX-License-Identifier: Apache-2.0
 
-//! A throwaway CA and a server certificate for a kind fixture (the tier's PostgreSQL,
+//! A throwaway CA and a server certificate for a kind fixture (the tier's Dex and `OpenBao`,
 //! ADR-0012; its Dex, ADR-0013): the broker verifies the fixture against this CA, so the
 //! live tiers run the same TLS path as the real deployment. Writes `ca.pem`, `server.pem` and
 //! `server-key.pem` (PKCS#8) into `--out-dir`, valid for a day.

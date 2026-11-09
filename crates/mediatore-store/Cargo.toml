@@ -1,6 +1,6 @@
 [package]
 name = "mediatore-store"
-description = "Claim, node and audit records: the ClaimStore trait, the sqlx store over SQLite or PostgreSQL, the sealed refresh envelope, and the in-memory store for dev_mode (ADR-0012)"
+description = "Claim, node, session and floor records: the ClaimStore trait, the sealed refresh envelope, and the in-memory store for dev_mode (ADR-0012, ADR-0034: the Kubernetes store lives in mediatore-claims)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -17,7 +17,7 @@ uuid.workspace = true
 chrono.workspace = true
 thiserror.workspace = true
 serde_json.workspace = true
-sqlx.workspace = true
+tracing.workspace = true
 aws-lc-rs.workspace = true
 sha2.workspace = true
 hex.workspace = true

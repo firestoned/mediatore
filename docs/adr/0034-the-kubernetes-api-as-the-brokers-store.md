@@ -3,7 +3,7 @@
 
 # ADR-0034: The Kubernetes API as the broker's store: the resource is the record, no database
 
-**Status:** Proposed · **Date:** 2026-11-09
+**Status:** Accepted · **Date:** 2026-11-09 (accepted the same day)
 
 Roadmap 05 reopened (the store). Supersedes the engine decisions of
 [ADR-0012](0012-persistent-store.md) (one sqlx query set over SQLite or PostgreSQL, the
@@ -101,11 +101,13 @@ It need not. Every table of ADR-0012 has a natural home in the API:
 
 ## Consequences
 
-- `crates/mediatore-store`: `ClaimStore` unchanged in shape, `KubeStore` beside
-  `MemoryStore`, `sql.rs`, the migrations and `sqlite_file.rs` removed, the conformance
-  suite run against `KubeStore` in the kind sandbox tier; `ClaimAudit` and `list_audit`
-  removed. `crates/mediatore-claims`: `AgentSandboxStatus` gains the record fields,
-  `SandboxNode` and `PolicyFloor` beside `AgentSandbox`, `crdgen` renders three files, the
+- `crates/mediatore-store`: `ClaimStore` unchanged in shape, `sql.rs`, the migrations and
+  `sqlite_file.rs` removed, the conformance suite kept for `MemoryStore`; `ClaimAudit` and
+  `list_audit` removed. `crates/mediatore-claims`, where the `AgentSandbox` type lives:
+  `KubeStore` implementing `ClaimStore` (unit tests pin the mappings record to status,
+  envelope to Secret, node and floor to resource; the kind tiers prove it on a real API
+  server, since a record needs an `AgentSandbox` to live on), `AgentSandboxStatus` gains
+  `record`, `SandboxNode` and `PolicyFloor` beside `AgentSandbox`, `crdgen` renders three files, the
   finalizer's release waits for the retention, the resync sweeps by removing finalizers.
   `deploy/base`: RBAC for the two resources and for Secrets in the namespace; no store
   Secret, no `MEDIATORE_STORE_URL`. The Makefile loses `kind-postgres` and `kind-e2e-store`;

@@ -232,7 +232,7 @@ wait_for "$TIMEOUT" "'subject fetched' with claim $CLAIM_UID in the node pod log
 node_logs | grep -F "subject fetched" | grep -qF "subject=octocat" || fail "the guest did not get octocat as the subject"
 echo "entry declared through the admission policy; sandbox Bound, entry set, Ready; the guest fetched octocat's claim $CLAIM_UID"
 
-say "restart: the broker comes back on the store; the record, the node and the entry survive (ADR-0012)"
+say "restart: the broker comes back on the store, the Kubernetes API; the record, the node and the entry survive (ADR-0034)"
 "${K[@]}" -n "$BROKER_NS" rollout restart deploy/mediatore >/dev/null
 "${K[@]}" -n "$BROKER_NS" rollout status deploy/mediatore --timeout=120s >/dev/null
 BROKER_POD=$(broker_pod)
@@ -269,10 +269,10 @@ n=$(entries | grep -c '/banlieue/claim/' || true)
 [ "$n" -eq 0 ] || fail "claim entries left behind: $n"
 echo "entry retracted, claim deleted, sandbox gone"
 
-say "audit: the released record is swept into the audit table at the next resync (ADR-0012)"
-# The kind config keeps ended rows for 0 s and resyncs every 15 s.
+say "retention: the released sandbox, held by its finalizer, is swept at the next resync with the audit line (ADR-0034 decision 4)"
+# The kind config keeps ended claims for 0 s and resyncs every 15 s.
 archived() { broker_logs | grep -F "resync" | grep -qE 'archived=[1-9]'; }
 wait_for "$TIMEOUT" "a resync archiving at least one row" archived
 echo "archived at resync"
 
-say "PASS: ADR-0008 holds against a real cluster (subject policy, owned claim and record, bind to Ready, a restart on the store, fail-closed audience, finalizer, the audit sweep)"
+say "PASS: ADR-0008 and ADR-0034 hold against a real cluster (subject policy, owned claim and record on the resource, bind to Ready, a restart on the Kubernetes store, fail-closed audience, finalizer, the retention sweep)"

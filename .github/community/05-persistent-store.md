@@ -45,17 +45,18 @@ Why: RUSTSEC-2026-0459 in the C SQLite that `libsqlite3-sys` bundles, unreachabl
 sqlx without a waiver or a fork; and a Kubernetes-native broker never needed a second
 datastore.
 
-- [ ] ADR-0034 accepted; CALM: the database node and relation gone, the API server's relation
-      widened
-- [ ] `KubeStore` behind `ClaimStore`: claims on the `AgentSandbox` status with the claim-uid
+- [x] ADR-0034 accepted (2026-11-09); CALM: the database node and relation gone, the claim
+      store described as the API's
+- [x] `KubeStore` behind `ClaimStore`: claims on the `AgentSandbox` status with the claim-uid
       and node labels, sessions as Secrets owned by the sandbox, nodes and floors as
       resources; `Conflict` from `resourceVersion` on the floors
-- [ ] `SandboxNode` and `PolicyFloor` CRDs from `crdgen`, RBAC for them and for Secrets
-- [ ] Retention by the finalizer, the sweep logging the audit line; `list_audit` and the
+- [x] `SandboxNode` and `PolicyFloor` CRDs from `crdgen`, RBAC for them and for Secrets
+- [x] Retention by the finalizer, the sweep logging the audit line; `list_audit` and the
       audit table gone
-- [ ] sqlx, both migration sets, the SQLite file test, `store.url`, the `mediatore-store`
-      Secret, `kind-postgres` and `kind-e2e-store` removed; the conformance suite against
-      `KubeStore` in the kind sandbox tier
+- [x] sqlx, both migration sets, the SQLite file test, `store.url`, the `mediatore-store`
+      Secret, `kind-postgres` and `kind-e2e-store` removed; the store proven on a real API
+      server by the kind tiers (the mappings unit-tested, the conformance suite over the
+      in-memory store)
 - [ ] The store guide rewritten, the deploying guide, README, the threat model (TB-9 as the
       API server, etcd at rest; full pass)
 - [ ] The homelab cutover: drain, upgrade, recycle; the one-shot live run (ADR-0033); then

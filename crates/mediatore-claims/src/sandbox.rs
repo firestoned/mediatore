@@ -212,6 +212,11 @@ pub struct AgentSandboxStatus {
     /// `phase == Bound && entry_set` (decision 11).
     #[serde(default)]
     pub ready: bool,
+    /// The claim record (ADR-0034 decision 1): the store's part of the status, written by
+    /// `KubeStore` alone and never by the reconciler's mirroring, which leaves it out of
+    /// its patches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record: Option<crate::kubestore::RecordStatus>,
     /// Why the sandbox is `Failed`, when it is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
@@ -276,6 +281,53 @@ pub fn chrono_of(t: &Time) -> Option<DateTime<Utc>> {
         t.0.as_second(),
         u32::try_from(t.0.subsec_nanosecond()).ok()?,
     )
+}
+
+/// Every CRD `deploy/base/crds/` carries, by file name (ADR-0008; ADR-0034 for the two
+/// store resources).
+///
+/// # Errors
+/// A serialisation failure, which a type change would make a unit test find first.
+pub fn crd_yamls() -> Result<Vec<(&'static str, String)>, serde_saphyr::ser::Error> {
+    Ok(vec![
+        (CRD_FILE_NAME, crd_yaml()?),
+        (
+            crate::kubestore::NODE_CRD_FILE_NAME,
+            render_crd(
+                crate::kubestore::SandboxNode::crd(),
+                "SandboxNode is one attested node mediatore knows (ADR-0034 decision 3): named by its EK hash, with its SPIRE agent identity, DMI UUID, hostname and whether it is banned.",
+            )?,
+        ),
+        (
+            crate::kubestore::FLOOR_CRD_FILE_NAME,
+            render_crd(
+                crate::kubestore::PolicyFloor::crd(),
+                "PolicyFloor is the version floor of one notaio policy (ADR-0026 decision 5, ADR-0034 decision 3): the incarnation, the highest bundle version accepted for it and that bundle's issuedAt; moved by compare-and-set on resourceVersion.",
+            )?,
+        ),
+    ])
+}
+
+/// One CRD as YAML, its schema's description set to `description`.
+fn render_crd(
+    mut crd: k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition,
+    description: &str,
+) -> Result<String, serde_saphyr::ser::Error> {
+    let mut options = serde_saphyr::SerializerOptions::default();
+    options.folded_wrap_chars = 1 << 20;
+    if let Some(schema) = crd
+        .spec
+        .versions
+        .iter_mut()
+        .filter_map(|v| v.schema.as_mut())
+        .find_map(|s| s.open_api_v3_schema.as_mut())
+    {
+        schema.description = Some(description.into());
+    }
+    let body = serde_saphyr::to_string_with_options(&crd, options)?;
+    Ok(format!(
+        "# Copyright (c) 2026 Erick Bourgeois, mediatore\n# SPDX-License-Identifier: Apache-2.0\n#\n# Generated from crates/mediatore-claims/src/kubestore.rs by `make crds` (ADR-0034\n# decision 3). Do not edit: the unit test `the_crds_in_deploy_are_what_the_types_render`\n# fails on a stale file.\n{body}"
+    ))
 }
 
 /// The CRD as `deploy/base/crds/` carries it.
@@ -428,6 +480,7 @@ pub fn mirror_status(
         reason: None,
         observed_generation: sb.metadata.generation,
         conditions: Vec::new(),
+        record: None,
     }
 }
 
@@ -475,7 +528,14 @@ impl Watcher {
         sb: &AgentSandbox,
         status: AgentSandboxStatus,
     ) -> Result<(), WatchError> {
-        if sb.status.as_ref() == Some(&status) {
+        // The record is the store's (ADR-0034): compared and patched without it.
+        let mut status = status;
+        status.record = None;
+        let current = sb.status.clone().map(|mut s| {
+            s.record = None;
+            s
+        });
+        if current.as_ref() == Some(&status) {
             return Ok(());
         }
         let name = sb.name_any();
@@ -753,6 +813,13 @@ impl Watcher {
                     .and_then(|u| Uuid::parse_str(u).ok())
                 {
                     self.reconciler.release(uid).await?;
+                    // ADR-0034 decision 4: a sandbox that had a record keeps its finalizer
+                    // for the retention window; the store's sweep releases it, with the
+                    // audit line. One that was never bound goes now.
+                    if crate::kubestore::record_status_of(sb).is_some() {
+                        tracing::info!(sandbox = %name, %namespace, "sandbox released; held for the retention window");
+                        return Ok(Action::await_change());
+                    }
                 }
                 self.drop_session(sb).await?;
                 self.claims.set_sandbox_finalizer(sb, false).await?;
@@ -1033,18 +1100,18 @@ mod tests {
     }
 
     #[test]
-    fn the_crd_in_deploy_is_what_the_type_renders() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../deploy/base/crds/",
-            "mediatore.io_agentsandboxes.yaml"
-        );
-        let on_disk = std::fs::read_to_string(path).unwrap_or_default();
-        assert_eq!(
-            on_disk,
-            crd_yaml().unwrap(),
-            "deploy/base/crds is stale: run `make crds`"
-        );
+    fn the_crds_in_deploy_are_what_the_types_render() {
+        for (file, rendered) in crd_yamls().unwrap() {
+            let path = format!(
+                "{}/../../deploy/base/crds/{file}",
+                env!("CARGO_MANIFEST_DIR")
+            );
+            let on_disk = std::fs::read_to_string(&path).unwrap_or_default();
+            assert_eq!(
+                on_disk, rendered,
+                "deploy/base/crds/{file} is stale: run `make crds`"
+            );
+        }
     }
 
     #[test]

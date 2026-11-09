@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The storage contract as tests, run over every implementation (ADR-0012 decision 5):
-//! `MemoryStore`, `SqlStore` on SQLite in memory, and `SqlStore` on a live PostgreSQL. A
+//! `MemoryStore`; the Kubernetes store (ADR-0034) is proven by the kind tiers on a real API
+//! server, since a record there needs an `AgentSandbox` to live on. A
 //! behaviour one backend has and another lacks is a bug in the one that lacks it.
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
@@ -41,7 +42,7 @@ macro_rules! suite {
                 a_node_round_trips_and_registers_once,
                 duplicate_ek_with_another_dmi_is_a_conflict,
                 ban_marks_the_node_and_needs_an_existing_row,
-                a_sweep_moves_ended_claims_into_the_audit_table,
+                a_sweep_removes_claims_that_ended_before_the_retention,
                 a_session_is_taken_once_deleted_on_demand_and_swept_when_stale,
                 a_policy_floor_round_trips_to_the_nanosecond,
                 a_policy_floor_moves_only_from_what_is_held,
@@ -335,7 +336,7 @@ pub(crate) async fn ban_marks_the_node_and_needs_an_existing_row(s: &dyn ClaimSt
     assert!(matches!(err, StoreError::NotFound(_)), "{err}");
 }
 
-pub(crate) async fn a_sweep_moves_ended_claims_into_the_audit_table(s: &dyn ClaimStore) {
+pub(crate) async fn a_sweep_removes_claims_that_ended_before_the_retention(s: &dyn ClaimStore) {
     let revoked = Uuid::new_v4();
     let mut rec = claim(revoked);
     rec.node_id = Some("node-a".into());
@@ -359,7 +360,6 @@ pub(crate) async fn a_sweep_moves_ended_claims_into_the_audit_table(s: &dyn Clai
     // Nothing ended before this instant.
     assert_eq!(s.sweep(at(50)).await.unwrap(), 0);
     assert_eq!(s.list_claims().await.unwrap().len(), 4);
-    assert_eq!(s.list_audit().await.unwrap().len(), 0);
 
     assert_eq!(s.sweep(at(1000)).await.unwrap(), 2);
     let left: Vec<Uuid> = s
@@ -371,24 +371,6 @@ pub(crate) async fn a_sweep_moves_ended_claims_into_the_audit_table(s: &dyn Clai
         .collect();
     assert_eq!(left.len(), 2);
     assert!(left.contains(&live) && left.contains(&pending));
-
-    let audit = s.list_audit().await.unwrap();
-    assert_eq!(audit.len(), 2);
-    let a = audit.iter().find(|a| a.uid == revoked).expect("audit row");
-    assert_eq!(a.name, claim(revoked).name);
-    assert_eq!(a.subject, subject());
-    assert_eq!(a.node_id.as_deref(), Some("node-a"));
-    assert_eq!(a.created_at, at(0));
-    assert_eq!(a.expires_at, Some(at(3600)));
-    assert_eq!(a.revoked_at, Some(at(100)));
-    assert!(a.swept_at > at(0));
-    let e = audit.iter().find(|a| a.uid == expired).expect("audit row");
-    assert_eq!(e.revoked_at, None);
-    assert_eq!(e.expires_at, Some(at(200)));
-
-    // A second sweep finds nothing and the audit rows stay.
-    assert_eq!(s.sweep(at(1000)).await.unwrap(), 0);
-    assert_eq!(s.list_audit().await.unwrap().len(), 2);
 }
 
 pub(crate) async fn a_session_is_taken_once_deleted_on_demand_and_swept_when_stale(

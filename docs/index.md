@@ -34,8 +34,8 @@ the component that finishes the story.
   what enforces each line of it today.
 - [Requesting a sandbox](guides/requesting-a-sandbox.md): the `AgentSandbox` resource,
   through the API or declaratively, who may name which subject, and what its status says.
-- [The store](guides/the-store.md): SQLite or PostgreSQL by URL, what survives a restart,
-  sealed refresh material, retention and the audit table.
+- [The store](guides/the-store.md): the Kubernetes API as the store, what survives a restart,
+  sealed refresh material, retention and the audit line.
 - [The policy bundle, in shadow](guides/the-policy-bundle.md): notaio beside the broker, the
   keys it trusts, naming a policy on a sandbox, and reading the `PolicyConformant` verdict.
 - [System architecture](architecture/diagrams/system.md) and
