@@ -196,14 +196,14 @@ sequenceDiagram
   B->>K: VirtualMachineClaim: Bound, status.tpmEndorsementCertificates
   K-->>W: watch event
   W->>W: ek = sha256(DER SPKI of EK cert)<br/>node = store.node(ek)  (409 on clone)
-  W->>K: create ClusterStaticEntry mediatore-claim-&lt;uid&gt;<br/>parent /spire/agent/tpm/&lt;ek&gt;, selector unix:user:sb-…
+  W->>K: create ClusterStaticEntry mediatore-claim-#lt;uid#gt;<br/>parent /spire/agent/tpm/#lt;ek#gt;, selector unix:user:sb-…
   K->>K: VAP: shape, prefix, same-hash, selectors, no admin
   K-->>C: watch event
   C->>S: CreateEntry over private socket
   S-->>C: entry id
   C->>K: status.rendered = status.set = true
   K-->>W: watch event: set
-  W->>W: store: entry ready; claim live
+  W->>W: store: entry ready, claim live
   A->>S: sync (TCP 8081)
   S-->>A: entries for this agent
   G->>W: GET /v1/me over node SVID (ADR-0007)

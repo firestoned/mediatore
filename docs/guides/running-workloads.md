@@ -110,7 +110,7 @@ sequenceDiagram
     M->>K: create VirtualMachineClaim (spec.subject)
     K-->>M: claim Bound to VM (banlieue picked a Ready member)
     M->>K: declare ClusterStaticEntry spiffe://td/banlieue/claim/(uid),<br/>parent = VM node, selector unix:user:sb-hash
-    K-->>S: controller manager renders the entry; status.set observed
+    K-->>S: controller manager renders the entry, status.set observed
     G->>M: GET /v1/me (mTLS, node SVID)
     M-->>G: subject, expires_at, workload {image, args}, egress, routes, gateways
     G->>G: useradd sb-hash, tmpfs at /mnt/sandbox, pull image into rootfs (digests checked),<br/>nft ruleset keyed by its uid, phantom token

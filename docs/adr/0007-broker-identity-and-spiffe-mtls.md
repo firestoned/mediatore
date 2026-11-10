@@ -169,11 +169,11 @@ sequenceDiagram
   K-->>M: spiffe://td/mediatore + bundle
   J->>M: TLS 1.3 ClientHello
   M-->>J: Certificate: broker SVID
-  J->>J: chain to bundle; URI SAN == spiffe://td/mediatore
+  J->>J: chain to bundle, URI SAN == spiffe://td/mediatore
   J->>M: Certificate: claim SVID
-  M->>M: chain to bundle; URI SAN under /banlieue/claim/
+  M->>M: chain to bundle, URI SAN under /banlieue/claim/
   J->>M: POST /v1/token {audience}
-  M->>M: claim_uid_from(peer); claim live; audience allowed
+  M->>M: claim_uid_from(peer), claim live, audience allowed
   M-->>J: short-lived token (never a refresh token)
 ```
 
