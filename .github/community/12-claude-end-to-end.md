@@ -48,6 +48,11 @@ document tracks what is still open on the path.
       and the README through the proxy bare, one Messages call with the key placed, the
       report in `/work`, exit 0 ending the claim; recorded as run 8 in
       `docs/guides/testing.md` with the broker's and the proxy's lines
+- [ ] **The person's own session (ADR-0035, proposed 2026-11-10).** Claude Code in the jail under the
+      requester's subscription: the session delegated at claim time (`--delegate anthropic=claude-code`),
+      sealed per audience, placed by the proxy, never in the jail; sealed on the desktop with
+      OpenBao transit once the broker is on the transit sealer (the two-step claim); refresh
+      once Anthropic's endpoint is configured; the Claude Code example image; the live runs
 - [ ] **The key's bound.** A workspace of its own at Anthropic with a spend limit, the key
       in `mediatore-audience-secrets`, the rotation rehearsed once (edit, restart, a claim
       minting again within `max_ttl`)
