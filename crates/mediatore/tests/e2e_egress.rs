@@ -222,6 +222,7 @@ fn state(idp: &FakeIdp, upstream: &TlsUpstream, keyed_upstream: &TlsUpstream) ->
         )]
         .into_iter()
         .collect(),
+        delegated: std::collections::BTreeMap::new(),
         registries: std::collections::BTreeMap::new(),
         reachable_registries: None,
         policy_egress: None,
@@ -336,6 +337,7 @@ impl Harness {
                 },
                 refresh_token: None,
                 policy_ref: None,
+                delegations: vec![],
             })
             .send()
             .await

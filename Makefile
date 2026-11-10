@@ -129,6 +129,15 @@ example-image: ## Build the example research-agent workload image (examples/rese
 	$(CONTAINER_CLI) run --rm $(EXAMPLE_IMAGE) python3 -c 'import anthropic; print("anthropic", anthropic.__version__)'
 	$(CONTAINER_CLI) run --rm $(EXAMPLE_IMAGE) sh -c 'test ! -e /usr/bin/mediatore && ! find / -xdev -perm -4000 -type f 2>/dev/null | grep -q . && echo "no mediatore binary, no setuid file"'
 
+# Claude Code as a workload (ADR-0035, examples/claude-code): the requester's own session,
+# placed by the proxy; the image carries Claude Code and the one script that points it at
+# the proxy. Published beside the research agent for the live proofs.
+CLAUDE_CODE_IMAGE ?= ghcr.io/firestoned/claude-code:dev
+claude-code-image: ## Build the example Claude Code workload image (examples/claude-code)
+	$(CONTAINER_CLI) build --platform linux/amd64 -t $(CLAUDE_CODE_IMAGE) examples/claude-code
+	$(CONTAINER_CLI) run --rm $(CLAUDE_CODE_IMAGE) claude --version
+	$(CONTAINER_CLI) run --rm $(CLAUDE_CODE_IMAGE) sh -c 'test ! -e /usr/bin/mediatore && ! find / -xdev -perm -4000 -type f 2>/dev/null | grep -q . && echo "no mediatore binary, no setuid file"'
+
 # The sandbox VM image (ADR-0023): a Kairos derivative with the guest software in the
 # immutable rootfs. The base, the SPIRE agent and the plugin are pinned by digest in
 # image/Dockerfile; BINARY_FROM=host reuses dist/mediatore (make dist) as the kind tier does.

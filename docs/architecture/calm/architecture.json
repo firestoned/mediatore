@@ -324,7 +324,7 @@
     },
     {
       "unique-id": "rel-user-mediatore-claims",
-      "description": "POST /v1/claims with the IdP bearer token creates an AgentSandbox with the token's subject (ADR-0008); GET answers from its status, DELETE deletes it. Subject equality is enforced on read and delete. For a session issuer the request also carries the caller's refresh token (mediatore login, PKCE as client mediatore; ADR-0013), which is sealed with the AgentSandbox UID into a sessions row before the response and follows the claim into its record; it never touches the resource.",
+      "description": "POST /v1/claims with the IdP bearer token creates an AgentSandbox with the token's subject (ADR-0008); GET answers from its status, DELETE deletes it. Subject equality is enforced on read and delete. For a via: delegated audience (ADR-0035) the request carries the caller's own credential for it (the CLI reads Claude Code's session, a variable or a file), sealed with the AgentSandbox UID into a Secret of its own beside the session's and opened only at POST /v1/token for the proxy; a claim naming such an audience without it is refused. For a session issuer the request also carries the caller's refresh token (mediatore login, PKCE as client mediatore; ADR-0013), which is sealed with the AgentSandbox UID into a sessions row before the response and follows the claim into its record; it never touches the resource.",
       "relationship-type": {
         "connects": {
           "source": {

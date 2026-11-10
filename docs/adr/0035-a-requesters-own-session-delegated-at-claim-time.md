@@ -3,7 +3,7 @@
 
 # ADR-0035: A requester's own upstream session, delegated at claim time and placed by the proxy
 
-**Status:** Proposed · **Date:** 2026-11-10
+**Status:** Accepted · **Date:** 2026-11-10 (accepted the same day)
 
 Roadmap 12 (the path to the Anthropic API) and roadmap 04 (the backends). Adds a fourth
 backend to [ADR-0003](0003-token-backends.md), beside `entra-obo`, `sts` and `secret`,

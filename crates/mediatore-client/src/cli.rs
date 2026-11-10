@@ -153,6 +153,12 @@ pub struct CreateArgs {
     /// (any exit ends the claim)
     #[arg(long, value_enum, default_value_t = RestartArg::Always)]
     pub restart: RestartArg,
+    /// Your own credential for a `via: delegated` audience (ADR-0035), as
+    /// <audience>=<source>: claude-code (Claude Code's own session), env:<NAME> (a token
+    /// in that variable, a `claude setup-token`), file:<path> (a file holding the token).
+    /// Read now, sent once with the claim, never kept (repeatable)
+    #[arg(long = "delegate", value_name = "AUDIENCE=SOURCE")]
+    pub delegate: Vec<String>,
     /// Print the response as JSON
     #[arg(long)]
     pub json: bool,
@@ -284,6 +290,17 @@ async fn login(args: LoginArgs) -> anyhow::Result<()> {
 async fn create(args: CreateArgs) -> anyhow::Result<()> {
     let path = args.target.session.path()?;
     let session = Session::load(&path)?;
+    let mut delegations = Vec::new();
+    for arg in &args.delegate {
+        let (audience, source) = crate::delegate::parse_delegate(arg)?;
+        let cred = crate::delegate::read(&source)?;
+        eprintln!(
+            "delegating your {audience} credential to the broker for this claim ({})",
+            cred.expires_at
+                .map_or_else(|| "no expiry known".to_owned(), |e| format!("expires {e}"))
+        );
+        delegations.push(cred.delegation(&audience));
+    }
     let request = ClaimRequest {
         pool_ref: args.pool,
         ttl_seconds: args.ttl,
@@ -295,6 +312,7 @@ async fn create(args: CreateArgs) -> anyhow::Result<()> {
         },
         refresh_token: None,
         policy_ref: args.policy,
+        delegations,
     };
     let (claim, spent) = Api::new(&args.target.mediatore)?
         .claim(&session, &request)

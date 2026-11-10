@@ -101,6 +101,7 @@ fn state(idp: &FakeIdp, policy_egress: Option<mediatore_api::PolicyEgress>) -> A
         cas: std::collections::BTreeMap::new(),
         no_credential: std::collections::BTreeSet::new(),
         secrets: std::collections::BTreeMap::new(),
+        delegated: std::collections::BTreeMap::new(),
         registries: std::collections::BTreeMap::new(),
         reachable_registries: None,
         policy_egress,
@@ -252,6 +253,7 @@ impl Harness {
                 },
                 refresh_token: None,
                 policy_ref: None,
+                delegations: vec![],
             })
             .send()
             .await
@@ -482,6 +484,7 @@ async fn the_dev_header_transport_reaches_a_dev_mode_broker() {
             },
             refresh_token: None,
             policy_ref: None,
+            delegations: vec![],
         })
         .send()
         .await

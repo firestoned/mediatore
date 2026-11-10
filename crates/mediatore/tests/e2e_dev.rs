@@ -18,11 +18,12 @@ use chrono::Duration;
 use mediatore_api::{AppState, Limiter};
 use mediatore_entra::{Backend, IssuerConfig, Validator};
 use mediatore_proto::{
-    ClaimEgress, ClaimRequest, ClaimResponse, Endpoint, ErrorBody, Me, NodeRegistered,
+    ClaimEgress, ClaimRequest, ClaimResponse, Delegation, Endpoint, ErrorBody, Me, NodeRegistered,
     NodeRegistration, TokenResponse, Workload,
 };
 use mediatore_spire::Naming;
 use mediatore_store::MemoryStore;
+use mediatore_store::seal::LocalKeySealer;
 use mediatore_sts::Sts;
 use mediatore_testkit::FakeIdp;
 
@@ -36,6 +37,8 @@ bVIP4yKaVz1Zp2QNVZJ0t2NIXK0K55dfgdM/B4JF09EKDd/q/nHoAfis
 
 const TRUST_DOMAIN: &str = "sandbox.test";
 const AUDIENCE: &str = "grafana.test";
+/// An audience served from the caller's own credential (`via: delegated`, ADR-0035).
+const DELEGATED: &str = "anthropic.test";
 const REQUIRED_GROUP: &str = "firestoned:sandbox-users";
 const PEER_HEADER: &str = "x-mediatore-peer-spiffe-id";
 const EK_HASH: &str = "72c566555391e835a15c522680b51ec3b840561ed70af5605a5ae4835f040ee8";
@@ -56,6 +59,61 @@ fn claim_svid(uid: &uuid::Uuid) -> String {
 
 fn gateway_svid() -> String {
     format!("spiffe://{TRUST_DOMAIN}/gateway")
+}
+
+/// The two audiences' egress: the ordinary one with two endpoints, the delegated one with
+/// Anthropic's.
+fn egress_map() -> std::collections::BTreeMap<String, Vec<Endpoint>> {
+    [
+        (
+            AUDIENCE.to_owned(),
+            vec![
+                "api.home.example:443".parse().unwrap(),
+                "192.0.2.10:8443".parse().unwrap(),
+            ],
+        ),
+        (
+            DELEGATED.to_owned(),
+            vec!["api.anthropic.test:443".parse().unwrap()],
+        ),
+    ]
+    .into_iter()
+    .collect()
+}
+
+fn rules_map() -> std::collections::BTreeMap<String, Vec<mediatore_proto::EndpointRule>> {
+    [(
+        AUDIENCE.to_owned(),
+        vec![
+            mediatore_proto::EndpointRule {
+                method: "GET".into(),
+                path: "/api/**".into(),
+            },
+            mediatore_proto::EndpointRule {
+                method: "POST".into(),
+                path: "/api/things/*/notes".into(),
+            },
+        ],
+    )]
+    .into_iter()
+    .collect()
+}
+
+/// ADR-0035: the caller's own session, a bearer with Anthropic's beta header beside it.
+fn delegated_map() -> std::collections::BTreeMap<String, mediatore_api::DelegatedAudience> {
+    [(
+        DELEGATED.to_owned(),
+        mediatore_api::DelegatedAudience {
+            header: "authorization".into(),
+            extra_headers: vec![mediatore_proto::HeaderPair {
+                name: "anthropic-beta".into(),
+                value: "oauth-2025-04-20".into(),
+            }],
+            ttl: Duration::minutes(15),
+        },
+    )]
+    .into_iter()
+    .collect()
 }
 
 struct Harness {
@@ -93,35 +151,14 @@ impl Harness {
                 groups_claim: None,
             }]),
             sts: Some(sts),
-            audiences: vec![AUDIENCE.into()],
+            audiences: vec![AUDIENCE.into(), DELEGATED.into()],
             obo_audiences: vec![],
-            egress: [(
-                AUDIENCE.to_owned(),
-                vec![
-                    "api.home.example:443".parse().unwrap(),
-                    "192.0.2.10:8443".parse().unwrap(),
-                ],
-            )]
-            .into_iter()
-            .collect(),
-            rules: [(
-                AUDIENCE.to_owned(),
-                vec![
-                    mediatore_proto::EndpointRule {
-                        method: "GET".into(),
-                        path: "/api/**".into(),
-                    },
-                    mediatore_proto::EndpointRule {
-                        method: "POST".into(),
-                        path: "/api/things/*/notes".into(),
-                    },
-                ],
-            )]
-            .into_iter()
-            .collect(),
+            egress: egress_map(),
+            rules: rules_map(),
             cas: std::collections::BTreeMap::new(),
             no_credential: std::collections::BTreeSet::new(),
             secrets: std::collections::BTreeMap::new(),
+            delegated: delegated_map(),
             registries: [(
                 "registry.internal:5000".to_owned(),
                 mediatore_proto::RegistryCredential {
@@ -136,7 +173,7 @@ impl Harness {
             policy_egress: None,
             sandboxes: None,
             sandbox_namespace: "sandboxes".into(),
-            sealer: None,
+            sealer: Some(Arc::new(LocalKeySealer::new([9u8; 32]))),
             limiter: Limiter::new(10),
             dev_mode: true,
             gateways: GATEWAYS.iter().map(|g| g.parse().unwrap()).collect(),
@@ -216,6 +253,7 @@ impl Harness {
                 },
                 refresh_token: None,
                 policy_ref: None,
+                delegations: vec![],
             })
             .send()
             .await
@@ -238,6 +276,7 @@ impl Harness {
                 },
                 refresh_token: None,
                 policy_ref: None,
+                delegations: vec![],
             })
             .send()
             .await
@@ -286,6 +325,7 @@ async fn a_one_shot_workload_ends_its_claim_at_the_broker() {
             },
             refresh_token: None,
             policy_ref: None,
+            delegations: vec![],
         })
         .send()
         .await
@@ -761,6 +801,7 @@ async fn a_token_for_another_audience_client_is_unauthorized() {
             workload: Workload::default(),
             refresh_token: None,
             policy_ref: None,
+            delegations: vec![],
         })
         .send()
         .await
@@ -787,6 +828,7 @@ async fn a_login_outside_the_required_group_is_forbidden() {
             workload: Workload::default(),
             refresh_token: None,
             policy_ref: None,
+            delegations: vec![],
         })
         .send()
         .await
@@ -958,6 +1000,7 @@ async fn an_issuer_without_a_session_refuses_a_delegated_refresh_token() {
             },
             refresh_token: Some(mediatore_proto::Secret("rt-unwanted".into())),
             policy_ref: None,
+            delegations: vec![],
         })
         .send()
         .await
@@ -965,4 +1008,207 @@ async fn an_issuer_without_a_session_refuses_a_delegated_refresh_token() {
     assert_eq!(resp.status(), 400);
     let body: ErrorBody = resp.json().await.expect("error body");
     assert_eq!(body.error, "session_unexpected");
+}
+
+/// A claim request naming the delegated audience beside the ordinary one.
+fn delegated_request(delegations: Vec<Delegation>, ttl_seconds: u32) -> ClaimRequest {
+    ClaimRequest {
+        pool_ref: "pool-a".into(),
+        ttl_seconds,
+        audiences: vec![AUDIENCE.into(), DELEGATED.into()],
+        workload: Workload {
+            image: "registry.internal:5000/sandbox:latest".into(),
+            args: vec![],
+            restart: mediatore_proto::RestartPolicy::Always,
+        },
+        refresh_token: None,
+        policy_ref: None,
+        delegations,
+    }
+}
+
+fn delegation(
+    audience: &str,
+    token: &str,
+    expires_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> Delegation {
+    Delegation {
+        audience: audience.into(),
+        token: Some(mediatore_proto::Secret(token.into())),
+        refresh_token: None,
+        expires_at,
+        pending: false,
+    }
+}
+
+/// ADR-0035: the caller's own credential for a `via: delegated` audience is sealed with the
+/// claim, handed to the proxy from `POST /v1/token` with the audience's headers and an
+/// expiry bounded by the credential's own, and gone once the claim is released.
+#[tokio::test]
+async fn a_delegated_credential_is_sealed_at_the_claim_and_handed_to_the_proxy_with_its_headers() {
+    let h = Harness::start().await;
+    h.register_node().await;
+    let user_token = h.login("octocat");
+    let dies_at = chrono::Utc::now() + Duration::hours(2);
+    let resp = h
+        .http
+        .post(format!("{}/v1/claims", h.user_url))
+        .bearer_auth(&user_token)
+        .json(&delegated_request(
+            vec![delegation(DELEGATED, "sess-octocat-abc", Some(dies_at))],
+            3600,
+        ))
+        .send()
+        .await
+        .expect("create claim");
+    assert_eq!(
+        resp.status(),
+        201,
+        "{}",
+        resp.text().await.unwrap_or_default()
+    );
+    let claim: ClaimResponse = resp.json().await.expect("claim body");
+    let uid = claim.uid.expect("uid");
+    assert_eq!(claim.phase, mediatore_proto::ClaimPhase::Bound);
+
+    // The route the proxy gets carries no special header: a bearer, the proxy's default.
+    let me: Me = h
+        .http
+        .get(format!("{}/v1/me", h.sandbox_url))
+        .header(PEER_HEADER, node_svid())
+        .send()
+        .await
+        .expect("me")
+        .json()
+        .await
+        .expect("me body");
+    let route = me
+        .routes
+        .iter()
+        .find(|r| r.audience.as_deref() == Some(DELEGATED))
+        .expect("a route for the delegated audience");
+    assert_eq!(route.credential, mediatore_proto::Credential::Token);
+    assert!(route.credential_header.is_none());
+
+    let before = chrono::Utc::now();
+    let tok_resp = h.token_for(&claim_svid(&uid), DELEGATED).await;
+    assert_eq!(
+        tok_resp.status(),
+        200,
+        "{}",
+        tok_resp.text().await.unwrap_or_default()
+    );
+    let tok: TokenResponse = tok_resp.json().await.expect("token body");
+    assert_eq!(
+        tok.access_token, "sess-octocat-abc",
+        "the delegated bearer, as it was"
+    );
+    assert_eq!(tok.token_type, "Bearer");
+    assert!(tok.header.is_none());
+    assert_eq!(tok.extra_headers[0].name, "anthropic-beta");
+    assert_eq!(tok.extra_headers[0].value, "oauth-2025-04-20");
+    assert!(
+        tok.expires_at <= before + Duration::minutes(15) + Duration::seconds(1),
+        "the proxy asks again within max_ttl"
+    );
+    assert!(tok.expires_at <= dies_at);
+    assert_eq!(tok.subject.id, "octocat");
+
+    // The ordinary audience still mints an STS token beside it.
+    assert_eq!(h.token_for(&claim_svid(&uid), AUDIENCE).await.status(), 200);
+
+    // Released: the envelope is gone with the claim and nothing is handed out any more.
+    let del = h
+        .http
+        .delete(format!("{}/v1/claims/{}", h.user_url, claim.name))
+        .bearer_auth(&user_token)
+        .send()
+        .await
+        .expect("delete");
+    assert!(del.status().is_success(), "{}", del.status());
+    let after = h.token_for(&claim_svid(&uid), DELEGATED).await;
+    assert_eq!(after.status(), 403);
+}
+
+/// The refusals of ADR-0035 decision 2, each a `400` before anything is created.
+#[tokio::test]
+async fn a_delegation_is_required_where_the_audience_wants_one_and_refused_anywhere_else() {
+    let h = Harness::start().await;
+    let user_token = h.login("octocat");
+    let code = |resp: reqwest::Response| async move {
+        let status = resp.status().as_u16();
+        let body: ErrorBody = resp.json().await.expect("error body");
+        (status, body.error)
+    };
+    // Named but not delegated.
+    let resp = h
+        .http
+        .post(format!("{}/v1/claims", h.user_url))
+        .bearer_auth(&user_token)
+        .json(&delegated_request(vec![], 3600))
+        .send()
+        .await
+        .expect("create");
+    assert_eq!(code(resp).await, (400, "delegation_required".to_owned()));
+    // Delegated for an audience that is not served that way.
+    let resp = h
+        .http
+        .post(format!("{}/v1/claims", h.user_url))
+        .bearer_auth(&user_token)
+        .json(&delegated_request(
+            vec![
+                delegation(DELEGATED, "sess", None),
+                delegation(AUDIENCE, "sess-too", None),
+            ],
+            3600,
+        ))
+        .send()
+        .await
+        .expect("create");
+    assert_eq!(code(resp).await, (400, "delegation_refused".to_owned()));
+    // A credential that dies before the claim would.
+    let resp = h
+        .http
+        .post(format!("{}/v1/claims", h.user_url))
+        .bearer_auth(&user_token)
+        .json(&delegated_request(
+            vec![delegation(
+                DELEGATED,
+                "sess",
+                Some(chrono::Utc::now() + Duration::seconds(30)),
+            )],
+            3600,
+        ))
+        .send()
+        .await
+        .expect("create");
+    assert_eq!(
+        code(resp).await,
+        (400, "delegation_expires_first".to_owned())
+    );
+    // A pending one: the transit shape, not served yet.
+    let mut pending = delegation(DELEGATED, "", None);
+    pending.token = None;
+    pending.pending = true;
+    let resp = h
+        .http
+        .post(format!("{}/v1/claims", h.user_url))
+        .bearer_auth(&user_token)
+        .json(&delegated_request(vec![pending], 3600))
+        .send()
+        .await
+        .expect("create");
+    assert_eq!(resp.status(), 501);
+    // A delegation with no token at all.
+    let mut empty = delegation(DELEGATED, "", None);
+    empty.token = None;
+    let resp = h
+        .http
+        .post(format!("{}/v1/claims", h.user_url))
+        .bearer_auth(&user_token)
+        .json(&delegated_request(vec![empty], 3600))
+        .send()
+        .await
+        .expect("create");
+    assert_eq!(code(resp).await, (400, "delegation_required".to_owned()));
 }

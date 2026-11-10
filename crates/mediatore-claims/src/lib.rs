@@ -194,6 +194,7 @@ mod tests {
             bundle_version: None,
             report: None,
             exit: None,
+            delegations: std::collections::BTreeMap::new(),
         }
     }
 

@@ -28,6 +28,13 @@ curl -sS https://mediatore.sandbox.example/v1/claims \
 # {"name":"sandbox-3f9a1c2e","phase":"Pending","ready":false,"addresses":[]}
 ```
 
+An audience served from your own credential (`via: delegated`,
+[ADR-0035](../adr/0035-a-requesters-own-session-delegated-at-claim-time.md)) takes it in
+the same request, `"delegations": [{ "audience": "anthropic", "token": "...", "expires_at":
+"..." }]`, sealed by the broker and never returned; the CLI fills it from a source you name
+(`--delegate anthropic=claude-code`, `env:CLAUDE_CODE_OAUTH_TOKEN`, `file:<path>`) and
+prints one line saying so. A claim naming such an audience without it is refused.
+
 `workload.image` is your agent as an ordinary OCI container image, the runtime and your
 code, not the VM: the guest on the pool member pulls it at bind and runs `workload.args`
 inside it under `nsjail` as your sandbox user ([what "the workload"

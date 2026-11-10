@@ -6,12 +6,16 @@
 //! server, since a record there needs an `AgentSandbox` to live on. A
 //! behaviour one backend has and another lacks is a bug in the one that lacks it.
 
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use mediatore_proto::{Provider, Subject, Workload};
 use uuid::Uuid;
 
 use crate::seal::{LocalKeySealer, Sealer};
-use crate::{ClaimRecord, ClaimStore, NodeRecord, PolicyFloor, SessionRecord, StoreError};
+use crate::{
+    ClaimRecord, ClaimStore, DelegatedSession, NodeRecord, PolicyFloor, SessionRecord, StoreError,
+};
 
 /// One `#[tokio::test]` per listed case, each over a fresh store from `$make`.
 macro_rules! cases {
@@ -44,6 +48,7 @@ macro_rules! suite {
                 ban_marks_the_node_and_needs_an_existing_row,
                 a_sweep_removes_claims_that_ended_before_the_retention,
                 a_session_is_taken_once_deleted_on_demand_and_swept_when_stale,
+                delegations_are_parked_per_audience_and_revocation_empties_them,
                 a_policy_floor_round_trips_to_the_nanosecond,
                 a_policy_floor_moves_only_from_what_is_held,
                 a_floor_written_under_another_policy_is_refused,
@@ -91,6 +96,7 @@ pub(crate) fn claim(uid: Uuid) -> ClaimRecord {
         bundle_version: None,
         report: None,
         exit: None,
+        delegations: BTreeMap::new(),
     }
 }
 
@@ -383,6 +389,8 @@ pub(crate) async fn a_session_is_taken_once_deleted_on_demand_and_swept_when_sta
         issuer: "https://issuer.example.com".into(),
         refresh: sealer().seal(sandbox_uid, b"dex-refresh").await.unwrap(),
         created_at: at(0),
+        audience: None,
+        expires_at: None,
     };
     s.put_session(session.clone()).await.unwrap();
     let err = s.put_session(session.clone()).await.unwrap_err();
@@ -415,6 +423,101 @@ pub(crate) async fn a_session_is_taken_once_deleted_on_demand_and_swept_when_sta
     assert_eq!(s.sweep_sessions(at(50)).await.unwrap(), 1);
     assert!(s.take_session(old.sandbox_uid).await.unwrap().is_none());
     assert!(s.take_session(fresh.sandbox_uid).await.unwrap().is_some());
+}
+
+/// ADR-0035: a delegated credential is a session for one audience, parked beside the
+/// issuer's, taken once per audience, kept on the record as an envelope, and emptied with
+/// the record's refresh material on revocation.
+pub(crate) async fn delegations_are_parked_per_audience_and_revocation_empties_them(
+    s: &dyn ClaimStore,
+) {
+    let sandbox_uid = Uuid::new_v4();
+    let issuer = parked(sandbox_uid, None, b"dex-refresh", None).await;
+    let github = parked(sandbox_uid, Some("github"), b"{\"token\":\"gh\"}", None).await;
+    let anthropic = parked(
+        sandbox_uid,
+        Some("anthropic"),
+        b"{\"token\":\"sess\"}",
+        Some(at(900)),
+    )
+    .await;
+    s.put_session(issuer.clone()).await.unwrap();
+    s.put_session(github.clone()).await.unwrap();
+    s.put_session(anthropic.clone()).await.unwrap();
+    let err = s.put_session(anthropic.clone()).await.unwrap_err();
+    assert!(matches!(err, StoreError::Conflict(_)), "{err}");
+
+    let taken = s.take_delegations(sandbox_uid).await.unwrap();
+    assert_eq!(
+        taken,
+        vec![anthropic.clone(), github.clone()],
+        "audience order"
+    );
+    assert_eq!(
+        s.take_delegations(sandbox_uid).await.unwrap(),
+        Vec::new(),
+        "taken once"
+    );
+    assert_eq!(
+        s.take_session(sandbox_uid).await.unwrap().as_ref(),
+        Some(&issuer),
+        "the issuer's session is untouched by the delegations"
+    );
+
+    let uid = Uuid::new_v4();
+    let mut rec = claim(uid);
+    rec.sandbox_uid = Some(sandbox_uid);
+    rec.refresh = Some(issuer.refresh.clone());
+    for d in &taken {
+        rec.delegations.insert(
+            d.audience.clone().unwrap(),
+            DelegatedSession {
+                envelope: d.refresh.clone(),
+                expires_at: d.expires_at,
+            },
+        );
+    }
+    s.put_claim(rec.clone()).await.unwrap();
+    let got = s.get_claim(uid).await.unwrap();
+    assert_eq!(got.delegations, rec.delegations);
+    assert_eq!(
+        sealer()
+            .unseal(sandbox_uid, &got.delegations["anthropic"].envelope)
+            .await
+            .unwrap(),
+        b"{\"token\":\"sess\"}"
+    );
+    s.revoke_claim(uid, at(5)).await.unwrap();
+    let got = s.get_claim(uid).await.unwrap();
+    assert!(
+        got.delegations.is_empty(),
+        "revocation empties every envelope"
+    );
+    assert!(got.refresh.is_none());
+
+    s.put_session(github.clone()).await.unwrap();
+    s.put_session(issuer.clone()).await.unwrap();
+    s.delete_session(sandbox_uid).await.unwrap();
+    assert!(s.take_session(sandbox_uid).await.unwrap().is_none());
+    assert_eq!(s.take_delegations(sandbox_uid).await.unwrap(), Vec::new());
+}
+
+/// A session parked for `sandbox_uid`: the issuer's (`audience` `None`) or a delegation's.
+async fn parked(
+    sandbox_uid: Uuid,
+    audience: Option<&str>,
+    plain: &[u8],
+    expires_at: Option<DateTime<Utc>>,
+) -> SessionRecord {
+    SessionRecord {
+        sandbox_uid,
+        subject: subject(),
+        issuer: String::new(),
+        refresh: sealer().seal(sandbox_uid, plain).await.unwrap(),
+        created_at: at(0),
+        audience: audience.map(str::to_owned),
+        expires_at,
+    }
 }
 
 fn floor(name: &str, uid: &str, version: u64, issued_at: DateTime<Utc>) -> PolicyFloor {

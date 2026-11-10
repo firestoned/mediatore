@@ -199,6 +199,7 @@ impl Harness {
                 .collect(),
             no_credential: std::collections::BTreeSet::new(),
             secrets: std::collections::BTreeMap::new(),
+            delegated: std::collections::BTreeMap::new(),
             registries: std::collections::BTreeMap::new(),
             reachable_registries,
             policy_egress: None,
@@ -269,6 +270,7 @@ impl Harness {
                 },
                 refresh_token: None,
                 policy_ref: None,
+                delegations: vec![],
             })
             .send()
             .await
@@ -567,6 +569,7 @@ async fn a_claim_naming_a_registry_the_pool_cannot_reach_is_refused_and_the_mirr
         },
         refresh_token: None,
         policy_ref: None,
+        delegations: vec![],
     };
     let resp = h
         .http

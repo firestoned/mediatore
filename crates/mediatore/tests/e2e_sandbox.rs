@@ -57,6 +57,7 @@ impl Harness {
             cas: std::collections::BTreeMap::new(),
             no_credential: std::collections::BTreeSet::new(),
             secrets: std::collections::BTreeMap::new(),
+            delegated: std::collections::BTreeMap::new(),
             registries: std::collections::BTreeMap::new(),
             reachable_registries: None,
             policy_egress: None,
@@ -104,6 +105,7 @@ impl Harness {
                 },
                 refresh_token: None,
                 policy_ref: Some("agent".into()),
+                delegations: vec![],
             })
             .send()
             .await
