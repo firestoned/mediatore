@@ -21,6 +21,8 @@ board is [`ROADMAPS.md`](../../ROADMAPS.md) at the repo root.
 | 08 | [08-agentsandbox-crd.md](08-agentsandbox-crd.md) | `AgentSandbox` as mediatore's CRD; the declarative way to ask for a sandbox |
 | 09 | [09-notaio-bundles-in-shadow.md](09-notaio-bundles-in-shadow.md) | notaio's signed policy bundles, verified and compared with each sandbox, enforcing nothing yet |
 | 10 | [10-egress-gateway.md](10-egress-gateway.md) | Envoy gateway on banlieue's proxy VMs, authorizing each tunnel by claim SPIFFE ID |
+| 11 | [11-policy-egress-at-the-gateway.md](11-policy-egress-at-the-gateway.md) | A verified bundle's direct egress served at the gateway, behind `policy.egress` |
+| 12 | [12-claude-end-to-end.md](12-claude-end-to-end.md) | Every configuration the path to the Anthropic API depends on: Dex, SPIRE, notaio, the policies, the broker, the gateways |
 
 Dependency shape: 01 unblocks 02 (the agents need something to present SVIDs
 to) and 03–05 build on both; 06 needs 02; 07 is design-only until 04 exists; 08 builds on 03 and narrows 05; 09 builds on 05 and 08; 10 needs 02 and 06's image work, and 07 builds on 10.
