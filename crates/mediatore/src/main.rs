@@ -161,6 +161,7 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
         cas: audience_cas(&cfg)?,
         no_credential: no_credential_audiences(&cfg),
         secrets: audience_secrets(&cfg)?,
+        delegated: delegated_audiences(&cfg),
         registries,
         sandboxes,
         sandbox_namespace: cfg.sandboxes.namespace.clone(),
@@ -421,6 +422,28 @@ fn audience_secrets(
         );
     }
     Ok(out)
+}
+
+/// The audiences served from the caller's own credential (`via: delegated`, ADR-0035): the
+/// header it goes in, what travels beside it, and how long a proxy keeps its copy.
+fn delegated_audiences(
+    cfg: &Config,
+) -> std::collections::BTreeMap<String, mediatore_api::DelegatedAudience> {
+    cfg.audiences
+        .iter()
+        .filter(|a| a.via == Backend::Delegated)
+        .map(|a| {
+            tracing::info!(audience = %a.name, header = %a.header, refresh = a.refresh.is_some(), "audience served from the caller's delegated credential (ADR-0035)");
+            (
+                a.name.clone(),
+                mediatore_api::DelegatedAudience {
+                    header: a.header.clone(),
+                    extra_headers: a.extra_headers.clone(),
+                    ttl: chrono::Duration::seconds(a.max_ttl),
+                },
+            )
+        })
+        .collect()
 }
 
 /// The audiences declared `via: none` (ADR-0025 decision 8): a route without a credential,

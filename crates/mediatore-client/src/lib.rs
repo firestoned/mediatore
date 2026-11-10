@@ -11,6 +11,7 @@
 //! refresh the copy here would be dead anyway. A second claim is a second login.
 
 pub mod cli;
+pub mod delegate;
 
 use std::path::{Path, PathBuf};
 

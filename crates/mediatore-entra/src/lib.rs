@@ -45,6 +45,10 @@ pub enum Backend {
     /// a credential, its endpoints, rules and CA still the route's (ADR-0025 decision 8).
     /// Never an issuer's backend; the configuration refuses it there.
     None,
+    /// The caller's own credential for the audience, delegated with the claim, sealed per
+    /// audience and placed by the proxy (ADR-0035). Never an issuer's backend; the
+    /// configuration refuses it there.
+    Delegated,
     /// An operator-held credential for the audience, read from `secret_file` at start and
     /// placed by the proxy in the header the audience names (ADR-0032). Never an issuer's.
     Secret,

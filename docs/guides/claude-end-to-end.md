@@ -335,3 +335,27 @@ header=x-api-key`, then for a one-shot workload `workload exited and its restart
 ends the claim code=Some(0)`, `entry retracted`, `claim released`. Argv is absolute: the
 jail sets no `PATH` and applies nothing of the image's `ENTRYPOINT` or `ENV`.
 
+## H. The person's own session instead of the operator's key
+
+[ADR-0035](../adr/0035-a-requesters-own-session-delegated-at-claim-time.md): Claude Code in
+the jail under the requester's subscription. The audience becomes `via: delegated` (no
+`secret_file`, no key on the broker), the policy's rules stay the two Messages calls, and the
+claim carries the session:
+
+```sh
+mediatore sandbox create --mediatore https://mediatore.<tailnet> --pool sandbox-pool \
+  --audience anthropic --policy claude-agent --ttl 900 --restart never \
+  --delegate anthropic=claude-code \
+  --image registry.internal:5000/firestoned/claude-code@sha256:<digest> \
+  --arg /usr/local/bin/claude-sandbox --arg=-p --arg "Summarise what /work holds"
+```
+
+| Piece | Value |
+| --- | --- |
+| The source | `claude-code`: Claude Code's own store (the Keychain item `Claude Code-credentials` on macOS, `~/.claude/.credentials.json` elsewhere), read at that moment, never kept; `env:CLAUDE_CODE_OAUTH_TOKEN` for a `claude setup-token`; `file:<path>` |
+| In the broker | sealed with the sandbox UID into `mediatore-session-<sandbox uid>-<audience hash>`, labelled `mediatore.io/audience=anthropic`, beside the issuer's session Secret; emptied at release, deleted by the sweep; the record lists it under `status.record.delegations` with its expiry |
+| At `POST /v1/token` | the bearer as delegated, `Authorization: Bearer`, `expires_at` the earliest of the credential's own expiry, the claim's deadline and `max_ttl`; `extra_headers` as configured |
+| In the jail | `claude-sandbox` (`examples/claude-code`) sets `CLAUDE_CODE_OAUTH_TOKEN=$MEDIATORE_TOKEN` and `ANTHROPIC_BASE_URL` to the proxy's route; Claude Code sends the phantom as its bearer with its own `anthropic-beta` header, the proxy swaps it |
+| Bounds | a login session lives hours, so `--ttl` beyond its expiry is refused (`delegation_expires_first`) until the broker can refresh (phase 3, a configured `refresh` block); a setup-token lives long; the upstream attributes usage to the person |
+| Sealed on the desktop | phase 2: with the broker on the transit sealer, the CLI seals the envelope itself under an encrypt-only OpenBao door and completes a two-step claim; the broker never holds the plaintext |
+

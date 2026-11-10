@@ -1,0 +1,16 @@
+#!/bin/sh
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+#
+# Claude Code inside the jail, under the requester's own session (ADR-0035 decision 7): the
+# phantom the guest put in MEDIATORE_TOKEN is what Claude Code sends as its bearer, and
+# the proxy outside the jail swaps it for the delegated session on the way to Anthropic.
+# The jail sets no PATH and applies nothing of the image's ENV, so everything is here.
+set -eu
+export PATH=/usr/local/bin:/usr/bin:/bin
+: "${MEDIATORE_TOKEN:?not in a sandbox: MEDIATORE_TOKEN is unset}"
+export CLAUDE_CODE_OAUTH_TOKEN="$MEDIATORE_TOKEN"
+export ANTHROPIC_BASE_URL="${MEDIATORE_EGRESS_PROXY:-http://127.0.0.1:3128}/api.anthropic.com"
+export HOME="${HOME:-/work}"
+cd /work
+exec claude "$@"

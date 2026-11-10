@@ -249,6 +249,25 @@ spec:
                     description: When the record was created.
                     format: date-time
                     type: string
+                  delegations:
+                    description: |-
+                      The caller's delegated credentials (ADR-0035), one Secret each: the audience and
+                      when the bearer dies; the envelopes are the Secrets'.
+                    items:
+                      description: "One delegated credential on the record (ADR-0035): which audience, until when."
+                      properties:
+                        audience:
+                          description: The audience the credential is for.
+                          type: string
+                        expiresAt:
+                          description: When the bearer dies, if the caller said.
+                          format: date-time
+                          nullable: true
+                          type: string
+                      required:
+                      - audience
+                      type: object
+                    type: array
                   entryId:
                     description: The SPIRE registration entry, once created.
                     nullable: true

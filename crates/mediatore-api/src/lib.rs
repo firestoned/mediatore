@@ -35,13 +35,16 @@ use mediatore_entra::{IdpError, Validated, Validator};
 use mediatore_proto::ek::is_ek_hash;
 use mediatore_proto::image::ImageReference;
 use mediatore_proto::{
-    ClaimEgress, ClaimPhase, ClaimReport, ClaimRequest, ClaimResponse, Credential, Endpoint,
-    EndpointRule, ErrorBody, GuestExit, GuestReport, HeaderPair, HostTable, Me, NodeRegistered,
-    NodeRegistration, RegistryCredential, Route, Secret, TokenRequest, TokenResponse, WorkloadExit,
+    ClaimEgress, ClaimPhase, ClaimReport, ClaimRequest, ClaimResponse, Credential, Delegation,
+    DelegationPlain, Endpoint, EndpointRule, ErrorBody, GuestExit, GuestReport, HeaderPair,
+    HostTable, Me, NodeRegistered, NodeRegistration, RegistryCredential, Route, Secret,
+    TokenRequest, TokenResponse, WorkloadExit,
 };
 use mediatore_spire::{EntryManager, Naming};
-use mediatore_store::seal::{SealError, Sealer};
-use mediatore_store::{ClaimRecord, ClaimStore, NodeRecord, SessionRecord, StoreError};
+use mediatore_store::seal::{SealError, Sealed, Sealer};
+use mediatore_store::{
+    ClaimRecord, ClaimStore, DelegatedSession, NodeRecord, SessionRecord, StoreError,
+};
 use mediatore_sts::{MintRequest, Sts};
 use mediatore_tls::PeerSpiffeId;
 use uuid::Uuid;
@@ -83,6 +86,9 @@ pub struct AppState {
     /// the mounted Secret at start, handed to the proxy by `POST /v1/token` with the header
     /// it goes in. Prints redacted; never written anywhere.
     pub secrets: BTreeMap<String, AudienceSecret>,
+    /// The audiences served from the caller's own credential, delegated with the claim
+    /// (`via: delegated`, ADR-0035): the header it goes in and what travels beside it.
+    pub delegated: BTreeMap<String, DelegatedAudience>,
     /// Per registry host (as the API reaches it), the operator's pull credential
     /// (`registries[]`); `GET /v1/me` hands the guest the one its claim's image names
     /// (ADR-0022).
@@ -390,7 +396,11 @@ async fn create_claim(
         return Err(ApiError::bad_request("unreachable_registry", reason));
     }
     let session = session_for(&st, &validated, &req, &bearer_token).await?;
-    let sealer = match (session.is_some(), st.sealer.as_ref()) {
+    let delegations = delegations_for(&st, &req)?;
+    let sealer = match (
+        session.is_some() || !delegations.is_empty(),
+        st.sealer.as_ref(),
+    ) {
         (true, None) => return Err(ApiError::not_implemented("sealing")),
         (true, Some(s)) => Some(s.clone()),
         (false, _) => None,
@@ -413,13 +423,37 @@ async fn create_claim(
             &req,
             sealer.as_deref(),
             session.as_ref(),
+            &delegations,
         )
         .await;
     }
 
+    dev_claim(
+        &st,
+        &validated,
+        &req,
+        name,
+        sealer.as_deref(),
+        session.as_ref(),
+        &delegations,
+    )
+    .await
+}
+
+/// `dev_mode`: the record written by the API itself and bound by the dev binder, no
+/// resource; the envelopes bind to the record's UID.
+async fn dev_claim(
+    st: &AppState,
+    validated: &Validated,
+    req: &ClaimRequest,
+    name: String,
+    sealer: Option<&dyn Sealer>,
+    session: Option<&Secret>,
+    delegations: &[Delegation],
+) -> Result<(StatusCode, Json<ClaimResponse>), ApiError> {
     let uid = Uuid::new_v4();
     // The dev binder writes the record itself, so the envelope binds to the record's UID.
-    let refresh = match (sealer.as_deref(), &session) {
+    let refresh = match (sealer, session) {
         (Some(sealer), Some(token)) => Some(
             sealer
                 .seal(uid, token.0.as_bytes())
@@ -428,6 +462,18 @@ async fn create_claim(
         ),
         _ => None,
     };
+    let mut dev_delegations = BTreeMap::new();
+    if let Some(sealer) = sealer {
+        for d in delegations {
+            dev_delegations.insert(
+                d.audience.clone(),
+                DelegatedSession {
+                    envelope: seal_delegation(sealer, uid, d).await?,
+                    expires_at: d.expires_at,
+                },
+            );
+        }
+    }
     st.store
         .put_claim(ClaimRecord {
             uid,
@@ -447,6 +493,7 @@ async fn create_claim(
             bundle_version: None,
             report: None,
             exit: None,
+            delegations: dev_delegations,
         })
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
@@ -454,8 +501,8 @@ async fn create_claim(
 
     // Dev binder: stands in for banlieue's claim controller and pool. A registered free
     // node is "Ready pool member"; binding is immediate.
-    if let Some(node) = free_node(&st).await? {
-        reconciler(&st)
+    if let Some(node) = free_node(st).await? {
+        reconciler(st)
             .bind(uid, &node.ek_hash)
             .await
             .map_err(|e| ApiError::internal(e.to_string()))?;
@@ -481,6 +528,7 @@ fn record_response(rec: &ClaimRecord) -> ClaimResponse {
         addresses: vec![],
         report: rec.report.clone(),
         exit: rec.exit.clone(),
+        sandbox_uid: rec.sandbox_uid,
     }
 }
 
@@ -534,6 +582,81 @@ async fn session_for(
     Ok(Some(refresh))
 }
 
+/// The delegations a claim carries, checked against the audiences it names (ADR-0035
+/// decision 2): a `delegated` audience needs exactly one with a bearer, nothing else may
+/// carry one, a bearer the caller says dies before the claim's deadline is refused, and a
+/// pending one (the transit shape) is not served yet.
+fn delegations_for(st: &AppState, req: &ClaimRequest) -> Result<Vec<Delegation>, ApiError> {
+    let mut out = Vec::new();
+    for d in &req.delegations {
+        if !st.delegated.contains_key(&d.audience) || !req.audiences.contains(&d.audience) {
+            return Err(ApiError::bad_request(
+                "delegation_refused",
+                format!(
+                    "audience {} takes no delegation: it is not a via: delegated audience of this claim",
+                    d.audience
+                ),
+            ));
+        }
+        if out.iter().any(|o: &Delegation| o.audience == d.audience) {
+            return Err(ApiError::bad_request(
+                "delegation_refused",
+                format!("audience {} is delegated twice", d.audience),
+            ));
+        }
+        if d.pending {
+            return Err(ApiError::not_implemented(
+                "a pending delegation (the envelope sealed on the caller's machine)",
+            ));
+        }
+        if d.token.as_ref().is_none_or(|t| t.0.is_empty()) {
+            return Err(ApiError::bad_request(
+                "delegation_required",
+                format!("audience {} is delegated without a token", d.audience),
+            ));
+        }
+        if let Some(expires_at) = d.expires_at
+            && expires_at < Utc::now() + Duration::seconds(i64::from(req.ttl_seconds))
+        {
+            return Err(ApiError::bad_request(
+                "delegation_expires_first",
+                format!(
+                    "the credential delegated for {} expires at {expires_at}, before a claim of {} s would",
+                    d.audience, req.ttl_seconds
+                ),
+            ));
+        }
+        out.push(d.clone());
+    }
+    if let Some(missing) = req
+        .audiences
+        .iter()
+        .find(|a| st.delegated.contains_key(*a) && !out.iter().any(|d| &d.audience == *a))
+    {
+        return Err(ApiError::bad_request(
+            "delegation_required",
+            format!(
+                "audience {missing} is served from your own credential: delegate it with the claim"
+            ),
+        ));
+    }
+    Ok(out)
+}
+
+/// Seal a delegation's plaintext for `binding` (ADR-0035 decision 3).
+async fn seal_delegation(
+    sealer: &dyn Sealer,
+    binding: Uuid,
+    d: &Delegation,
+) -> Result<Sealed, ApiError> {
+    let plain = DelegationPlain {
+        token: d.token.clone().unwrap_or_else(|| Secret(String::new())),
+        refresh_token: d.refresh_token.clone(),
+    };
+    let bytes = serde_json::to_vec(&plain).map_err(|e| ApiError::internal(e.to_string()))?;
+    sealer.seal(binding, &bytes).await.map_err(seal_error)
+}
+
 /// The production front door (ADR-0008 decision 4): the request becomes an `AgentSandbox`
 /// in the configured namespace, `spec.subject` from the validated token. mediatore's
 /// `ServiceAccount` is exempt from the subject admission check for exactly this, so the
@@ -545,6 +668,7 @@ async fn create_sandbox(
     req: &ClaimRequest,
     sealer: Option<&dyn Sealer>,
     session: Option<&Secret>,
+    delegations: &[Delegation],
 ) -> Result<(StatusCode, Json<ClaimResponse>), ApiError> {
     let Some(front) = st.sandboxes.as_ref() else {
         return Err(ApiError::not_implemented(
@@ -571,10 +695,19 @@ async fn create_sandbox(
     let created = front.create(sandbox).await?;
     tracing::info!(subject = %validated.subject.id, pool = %req.pool_ref, sandbox = %name, namespace = %st.sandbox_namespace, "sandbox created");
     // ADR-0013 decision 2: the session is parked under the sandbox's UID, sealed with it,
-    // before the caller hears back; a failure here undoes the resource.
-    if let (Some(sealer), Some(token)) = (sealer, session)
-        && let Err(e) = park_session(st, sealer, &created, validated, token).await
-    {
+    // before the caller hears back; a failure here undoes the resource. ADR-0035: each
+    // delegation the same way, one Secret per audience.
+    let parked = match (sealer, session) {
+        (Some(sealer), Some(token)) => park_session(st, sealer, &created, validated, token).await,
+        _ => Ok(()),
+    };
+    let parked = match (parked, sealer) {
+        (Ok(()), Some(sealer)) => {
+            park_delegations(st, sealer, &created, validated, delegations).await
+        }
+        (r, _) => r,
+    };
+    if let Err(e) = parked {
         tracing::warn!(sandbox = %name, error = %e, "session not parked; sandbox withdrawn");
         if let Err(d) = front.delete(&st.sandbox_namespace, name).await {
             tracing::warn!(sandbox = %name, error = %d, "sandbox withdrawal failed");
@@ -585,6 +718,41 @@ async fn create_sandbox(
         });
     }
     Ok((StatusCode::CREATED, Json(response_of(&created))))
+}
+
+/// Seal each delegation with the sandbox's UID and park it, one Secret per audience, until
+/// the reconciler creates the record (ADR-0035 decision 3).
+async fn park_delegations(
+    st: &AppState,
+    sealer: &dyn Sealer,
+    created: &AgentSandbox,
+    validated: &Validated,
+    delegations: &[Delegation],
+) -> anyhow::Result<()> {
+    let sandbox_uid = created
+        .metadata
+        .uid
+        .as_deref()
+        .and_then(|u| Uuid::parse_str(u).ok())
+        .ok_or_else(|| anyhow::anyhow!("the created sandbox has no UUID uid"))?;
+    for d in delegations {
+        let refresh = seal_delegation(sealer, sandbox_uid, d)
+            .await
+            .map_err(|e| anyhow::anyhow!("sealing the delegation failed: {}", e.body.error))?;
+        st.store
+            .put_session(SessionRecord {
+                sandbox_uid,
+                subject: validated.subject.clone(),
+                issuer: String::new(),
+                refresh,
+                created_at: Utc::now(),
+                audience: Some(d.audience.clone()),
+                expires_at: d.expires_at,
+            })
+            .await?;
+        tracing::info!(%sandbox_uid, subject = %validated.subject.id, audience = %d.audience, expires_at = ?d.expires_at, "delegation parked");
+    }
+    Ok(())
 }
 
 /// Seal `token` with the sandbox's UID and park it until the reconciler creates the record.
@@ -609,6 +777,8 @@ async fn park_session(
             issuer: validated.issuer.url.clone(),
             refresh,
             created_at: Utc::now(),
+            audience: None,
+            expires_at: None,
         })
         .await?;
     tracing::info!(%sandbox_uid, subject = %validated.subject.id, "session parked");
@@ -630,6 +800,11 @@ fn response_of(sb: &AgentSandbox) -> ClaimResponse {
         addresses: st.addresses,
         report: None,
         exit: None,
+        sandbox_uid: sb
+            .metadata
+            .uid
+            .as_deref()
+            .and_then(|u| Uuid::parse_str(u).ok()),
     }
 }
 
@@ -940,13 +1115,20 @@ async fn me(
                 } else {
                     Credential::Token
                 },
-                // ADR-0032 decision 2: where a `via: secret` credential goes, when not
-                // `Authorization`; the proxy owns that header on every route (decision 3).
+                // ADR-0032 decision 2 and ADR-0035: where a `via: secret` or a delegated
+                // credential goes, when not `Authorization`; the proxy owns that header on
+                // every route (ADR-0025 decision 3).
                 credential_header: st
                     .secrets
                     .get(a)
                     .filter(|sec| sec.header != "authorization")
-                    .map(|sec| sec.header.clone()),
+                    .map(|sec| sec.header.clone())
+                    .or_else(|| {
+                        st.delegated
+                            .get(a)
+                            .filter(|d| d.header != "authorization")
+                            .map(|d| d.header.clone())
+                    }),
             })
         })
         .chain(direct.into_iter().map(|e| Route {
@@ -999,6 +1181,18 @@ pub struct AudienceSecret {
     /// Headers the proxy adds beside the credential; public material.
     pub extra_headers: Vec<HeaderPair>,
     /// How long the proxy may keep its copy before asking again (decision 4).
+    pub ttl: Duration,
+}
+
+/// How a `via: delegated` audience's credential is handed to the proxy (ADR-0035 decision 4).
+#[derive(Clone, Debug)]
+pub struct DelegatedAudience {
+    /// The request header, lowercase: `authorization` sends `Bearer <value>`, any other
+    /// name the bare value.
+    pub header: String,
+    /// Headers the proxy adds beside the credential; public material.
+    pub extra_headers: Vec<HeaderPair>,
+    /// How long the proxy may keep its copy before asking again.
     pub ttl: Duration,
 }
 
@@ -1301,38 +1495,13 @@ async fn token(
     peer: Option<Extension<PeerSpiffeId>>,
     Json(req): Json<TokenRequest>,
 ) -> Result<Json<TokenResponse>, ApiError> {
-    let peer = peer_spiffe_id(&st, peer.as_ref().map(|e| &e.0), &headers)?;
-    let claim_uid = st
-        .naming
-        .claim_uid_from(&peer)
-        .ok_or_else(|| ApiError::forbidden("peer is not a claim identity"))?;
-    let rec = st
-        .store
-        .get_claim(claim_uid)
-        .await
-        .map_err(|_| ApiError::forbidden("unknown claim"))?;
-    if !rec.is_live(Utc::now()) {
-        return Err(ApiError::forbidden("claim revoked or expired"));
-    }
-    if !rec.audiences.iter().any(|a| a == &req.audience) {
-        return Err(ApiError::bad_request("unknown_audience", req.audience));
-    }
-    // ADR-0025 decision 8: an audience reached without a credential has no token to give;
-    // the proxy never asks, and nothing else holding the claim SVID gets one either.
-    if st.no_credential.contains(&req.audience) {
-        tracing::debug!(%claim_uid, audience = %req.audience, "token refused: the audience is served without a credential");
-        return Err(ApiError::new(
-            StatusCode::FORBIDDEN,
-            "no_credential",
-            Some("the audience is reached without a credential (via: none)".to_owned()),
-        ));
-    }
-    if !st.limiter.allow(claim_uid) {
-        return Err(ApiError::new(
-            StatusCode::TOO_MANY_REQUESTS,
-            "rate_limited",
-            Some("too many token requests for this claim".to_owned()),
-        ));
+    let (peer, claim_uid, rec) =
+        token_claim(&st, peer.as_ref().map(|e| &e.0), &headers, &req.audience).await?;
+    // ADR-0035: the caller's own credential, opened from the record's envelope for this
+    // audience, handed with the header it goes in; it dies with the credential, the claim or
+    // `max_ttl`, whichever is first.
+    if let Some(d) = st.delegated.get(&req.audience) {
+        return delegated_token(&st, &rec, d, req.audience, claim_uid).await;
     }
     // ADR-0032: an operator-held credential is handed as it is, with the header it goes in;
     // the proxy keeps it for `max_ttl` and asks again, through this same gate.
@@ -1404,6 +1573,100 @@ async fn token(
         subject: rec.subject,
         header: None,
         extra_headers: vec![],
+    }))
+}
+
+/// What every token request establishes first: the peer is a claim identity, the claim is
+/// live, it names the audience, the audience is served with a credential, and the claim
+/// is under its rate limit.
+async fn token_claim(
+    st: &AppState,
+    peer: Option<&PeerSpiffeId>,
+    headers: &HeaderMap,
+    audience: &str,
+) -> Result<(String, Uuid, ClaimRecord), ApiError> {
+    let peer = peer_spiffe_id(st, peer, headers)?;
+    let claim_uid = st
+        .naming
+        .claim_uid_from(&peer)
+        .ok_or_else(|| ApiError::forbidden("peer is not a claim identity"))?;
+    let rec = st
+        .store
+        .get_claim(claim_uid)
+        .await
+        .map_err(|_| ApiError::forbidden("unknown claim"))?;
+    if !rec.is_live(Utc::now()) {
+        return Err(ApiError::forbidden("claim revoked or expired"));
+    }
+    if !rec.audiences.iter().any(|a| a == audience) {
+        return Err(ApiError::bad_request(
+            "unknown_audience",
+            audience.to_owned(),
+        ));
+    }
+    // ADR-0025 decision 8: an audience reached without a credential has no token to give;
+    // the proxy never asks, and nothing else holding the claim SVID gets one either.
+    if st.no_credential.contains(audience) {
+        tracing::debug!(%claim_uid, audience = %audience.to_owned(), "token refused: the audience is served without a credential");
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "no_credential",
+            Some("the audience is reached without a credential (via: none)".to_owned()),
+        ));
+    }
+    if !st.limiter.allow(claim_uid) {
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limited",
+            Some("too many token requests for this claim".to_owned()),
+        ));
+    }
+    Ok((peer, claim_uid, rec))
+}
+
+/// `POST /v1/token` for a `via: delegated` audience (ADR-0035 decision 4).
+async fn delegated_token(
+    st: &AppState,
+    rec: &ClaimRecord,
+    d: &DelegatedAudience,
+    audience: String,
+    claim_uid: Uuid,
+) -> Result<Json<TokenResponse>, ApiError> {
+    let Some(sealer) = st.sealer.as_ref() else {
+        return Err(ApiError::not_implemented("sealing"));
+    };
+    let Some(held) = rec.delegations.get(&audience) else {
+        return Err(ApiError::forbidden(
+            "no credential was delegated for this audience, or it was revoked",
+        ));
+    };
+    let now = Utc::now();
+    let mut expires_at = now + d.ttl;
+    if let Some(e) = held.expires_at {
+        expires_at = expires_at.min(e);
+    }
+    if let Some(e) = rec.expires_at {
+        expires_at = expires_at.min(e);
+    }
+    if expires_at <= now {
+        return Err(ApiError::forbidden("the delegated credential has expired"));
+    }
+    let plain = sealer
+        .unseal(rec.seal_binding(), &held.envelope)
+        .await
+        .map_err(seal_error)?;
+    let plain: DelegationPlain = serde_json::from_slice(&plain)
+        .map_err(|_| ApiError::internal("the delegation envelope is not what was sealed"))?;
+    let bearer = d.header == "authorization";
+    tracing::info!(%claim_uid, %audience, subject = %rec.subject.id, backend = "delegated", header = %d.header, %expires_at, "token issued");
+    Ok(Json(TokenResponse {
+        access_token: plain.token.0,
+        token_type: if bearer { "Bearer" } else { "Header" }.into(),
+        expires_at,
+        audience,
+        subject: rec.subject.clone(),
+        header: (!bearer).then(|| d.header.clone()),
+        extra_headers: d.extra_headers.clone(),
     }))
 }
 

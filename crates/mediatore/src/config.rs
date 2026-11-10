@@ -54,6 +54,31 @@ pub struct AudienceConfig {
     /// material, carried to the proxy with the token.
     #[serde(default)]
     pub secret_extra_headers: Vec<HeaderPair>,
+    /// `via: delegated` (ADR-0035): the request header the proxy sets for the caller's
+    /// delegated credential, lowercase; `authorization` (the default) sends a bearer.
+    #[serde(default = "default_secret_header")]
+    pub header: String,
+    /// `via: delegated`: headers the proxy adds beside the delegated credential (Anthropic's
+    /// `anthropic-beta: oauth-2025-04-20` for a session token). Public material.
+    #[serde(default)]
+    pub extra_headers: Vec<HeaderPair>,
+    /// `via: delegated`: how the broker renews the delegated bearer from its refresh token
+    /// (ADR-0035 decision 5). Absent, the claim cannot outlast the bearer.
+    #[serde(default)]
+    pub refresh: Option<DelegationRefresh>,
+}
+
+/// Where a delegated credential is refreshed (ADR-0035 decision 5): the operator's values,
+/// never a default of the broker's.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct DelegationRefresh {
+    /// The OAuth token endpoint; `https` outside `dev_mode`.
+    pub token_endpoint: String,
+    /// The public client the refresh token was issued to.
+    pub client_id: String,
+    /// The scope to ask for, if the endpoint wants one.
+    #[serde(default)]
+    pub scope: Option<String>,
 }
 
 fn default_secret_header() -> String {
@@ -440,6 +465,32 @@ impl Config {
                     && h.chars()
                         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
             };
+            if a.via != Backend::Delegated
+                && (a.header != "authorization"
+                    || !a.extra_headers.is_empty()
+                    || a.refresh.is_some())
+            {
+                anyhow::bail!(
+                    "audience {:?}: `header`, `extra_headers` and `refresh` go with via: delegated only (ADR-0035)",
+                    a.name
+                );
+            }
+            if !header_ok(&a.header) {
+                anyhow::bail!(
+                    "audience {:?}: header {:?} must be a lowercase header name (ADR-0035)",
+                    a.name,
+                    a.header
+                );
+            }
+            if let Some(r) = &a.refresh
+                && !self.dev_mode
+                && !r.token_endpoint.starts_with("https://")
+            {
+                anyhow::bail!(
+                    "audience {:?}: refresh.token_endpoint must be https outside dev_mode (ADR-0035 decision 5)",
+                    a.name
+                );
+            }
             if !header_ok(&a.secret_header) {
                 anyhow::bail!(
                     "audience {:?}: secret_header {:?} must be a lowercase header name (ADR-0032)",
@@ -679,6 +730,10 @@ impl Config {
                     "issuer {}: backend secret is an audience's (an operator-held credential, ADR-0032), never an issuer's",
                     issuer.url
                 ),
+                (Backend::Delegated, _) => anyhow::bail!(
+                    "issuer {}: backend delegated is an audience's (the caller's own credential, ADR-0035), never an issuer's",
+                    issuer.url
+                ),
                 _ => {}
             }
             let Some(entra) = &issuer.entra else {
@@ -844,6 +899,51 @@ listen: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }
         );
         let err = Config::parse(
             "trust_domain: sandbox.test\nlisten: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }\ndev_mode: true\naudiences: []\nissuers:\n  - url: https://idp.example.com\n    backend: none\n    client_id: mediatore\n    subject_claim: email\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("never an issuer's"), "{err}");
+    }
+
+    #[test]
+    fn an_audience_via_delegated_names_its_header_and_refresh_and_an_issuer_refuses_it() {
+        let base = "trust_domain: sandbox.test\nissuers: []\nlisten: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }\ndev_mode: true\nstore: { sealing: { key_file: /k } }\n";
+        let cfg = Config::parse(&format!(
+            "{base}audiences:\n  - name: anthropic\n    via: delegated\n    max_ttl: 900\n    egress: [\"api.anthropic.com:443\"]\n    extra_headers:\n      - {{ name: anthropic-beta, value: oauth-2025-04-20 }}\n    refresh: {{ token_endpoint: \"https://oauth.example/token\", client_id: cli }}\n  - name: plain\n    via: delegated\n    egress: [\"plain.example:443\"]\n"
+        ))
+        .unwrap();
+        assert_eq!(cfg.audiences[0].via, Backend::Delegated);
+        assert_eq!(
+            cfg.audiences[0].header, "authorization",
+            "a bearer by default"
+        );
+        assert_eq!(cfg.audiences[0].extra_headers[0].name, "anthropic-beta");
+        assert_eq!(cfg.audiences[0].refresh.as_ref().unwrap().client_id, "cli");
+        assert!(cfg.audiences[1].refresh.is_none());
+
+        for (bad, needle) in [
+            (
+                "audiences:\n  - { name: a, via: sts, egress: [\"a.example.com:443\"], header: x-api-key }\nsts: { issuer: https://m, kid: k, signing_key_file: /s }\n",
+                "via: delegated only",
+            ),
+            (
+                "audiences:\n  - { name: a, via: delegated, egress: [\"a.example.com:443\"], header: \"X-Api-Key\" }\n",
+                "lowercase header name",
+            ),
+        ] {
+            let err = Config::parse(&format!("{base}{bad}"))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(needle), "{bad}: {err}");
+        }
+        let err = Config::parse(
+            "trust_domain: sandbox.test\nissuers: []\nlisten: { user: 0.0.0.0:8080, sandbox: 0.0.0.0:8443 }\nspire:\n  workload_api_socket: unix:///run/spire/sockets/spire-agent.sock\n  entries:\n    class_name: spire-server-spire\nstore: { sealing: { key_file: /k } }\naudiences:\n  - { name: a, via: delegated, egress: [\"a.example.com:443\"], refresh: { token_endpoint: \"http://oauth.example/token\", client_id: cli } }\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("must be https"), "{err}");
+        let err = Config::parse(
+            "trust_domain: sandbox.test\nlisten: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }\ndev_mode: true\naudiences: []\nissuers:\n  - { url: https://idp.example, backend: delegated, client_id: m }\n",
         )
         .unwrap_err()
         .to_string();

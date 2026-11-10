@@ -431,6 +431,43 @@ pub struct ClaimRequest {
     /// bundle is read in shadow; naming one grants and refuses nothing yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy_ref: Option<String>,
+    /// The caller's own credentials for `via: delegated` audiences (ADR-0035): one per such
+    /// audience the claim names, sealed before they are stored, never returned. A
+    /// `delegated` audience without one refuses the claim; one for any other audience too.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub delegations: Vec<Delegation>,
+}
+
+/// A credential the caller delegates for one audience (ADR-0035 decision 2): the bearer the
+/// proxy will place, what renews it, when it dies. `pending` promises it for a later
+/// `PUT /v1/claims/{name}/delegations/{audience}` (the transit shape), carrying nothing now.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Delegation {
+    /// The audience it is for; must be one the broker serves `via: delegated`.
+    pub audience: String,
+    /// The bearer itself. Absent only with `pending`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<Secret>,
+    /// What renews it, when the audience declares a `refresh` endpoint (decision 5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_token: Option<Secret>,
+    /// When the bearer dies, if the caller knows: a claim that would outlast it is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
+    /// The envelope follows, sealed on the caller's machine (decision 3, transit shape).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pending: bool,
+}
+
+/// What a sealed delegation holds once opened (ADR-0035 decision 3): the envelope's
+/// plaintext is this, serialised, so the shape can grow without re-sealing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DelegationPlain {
+    /// The bearer.
+    pub token: Secret,
+    /// What renews it, if anything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_token: Option<Secret>,
 }
 
 /// Claim lifecycle as mirrored from banlieue.
@@ -454,6 +491,10 @@ pub struct ClaimResponse {
     /// The claim's UID, once the claim exists: the key of the claim's SPIFFE identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uid: Option<Uuid>,
+    /// The `AgentSandbox` UID: what a delegation sealed on the caller's machine binds to
+    /// (ADR-0035 decision 2). Absent in `dev_mode`, where there is no resource.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_uid: Option<Uuid>,
     /// Current phase.
     pub phase: ClaimPhase,
     /// `Bound` and the claim's registration entry is set: the sandbox can fetch its SVID
@@ -848,6 +889,7 @@ mod tests {
             },
             refresh_token: None,
             policy_ref: None,
+            delegations: vec![],
         };
         let json = serde_json::to_string(&req).unwrap();
         let back: ClaimRequest = serde_json::from_str(&json).unwrap();

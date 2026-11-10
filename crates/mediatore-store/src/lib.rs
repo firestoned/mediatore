@@ -9,7 +9,7 @@
 //! session in a Secret, the nodes and floors as resources); `MemoryStore` is for `dev_mode`
 //! and tests, and the conformance suite pins the behaviour both must share. Refresh material enters the store only as a [`seal::Sealed`] envelope.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -90,6 +90,21 @@ pub struct ClaimRecord {
     /// decision 2); `None` for a claim that ran to its deadline or was released by hand.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit: Option<WorkloadExit>,
+    /// The caller's delegated credentials, by audience (ADR-0035): sealed envelopes with the
+    /// sandbox UID as associated data, like `refresh`. Emptied on release and revocation.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub delegations: BTreeMap<String, DelegatedSession>,
+}
+
+/// One delegated credential on a record (ADR-0035 decision 3): its envelope, and when the
+/// bearer inside dies, which bounds every issue from it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegatedSession {
+    /// The `DelegationPlain` of the claim request, sealed.
+    pub envelope: Sealed,
+    /// When the bearer dies, if the caller said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
 }
 
 impl ClaimRecord {
@@ -147,6 +162,13 @@ pub struct SessionRecord {
     pub refresh: Sealed,
     /// When it was delegated; stale sessions are swept.
     pub created_at: DateTime<Utc>,
+    /// The audience this is for (ADR-0035): `None` is the issuer's session, `Some` a
+    /// delegated credential for that audience, one Secret each.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audience: Option<String>,
+    /// When a delegated bearer dies, if the caller said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
 }
 
 /// The version floor of one notaio policy (ADR-0026 decision 5): which incarnation it holds
@@ -203,9 +225,13 @@ pub trait ClaimStore: Send + Sync + 'static {
     /// Park a delegated session until the reconciler creates the record. `Conflict` if
     /// the sandbox already has one.
     async fn put_session(&self, rec: SessionRecord) -> Result<(), StoreError>;
-    /// Remove and return the session for `sandbox_uid`, if any (one transaction).
+    /// Remove and return the issuer's session for `sandbox_uid`, if any (one transaction).
     async fn take_session(&self, sandbox_uid: Uuid) -> Result<Option<SessionRecord>, StoreError>;
-    /// Remove the session for `sandbox_uid`; nothing to remove is fine.
+    /// Remove and return every delegated credential parked for `sandbox_uid` (ADR-0035),
+    /// each taken once, in audience order.
+    async fn take_delegations(&self, sandbox_uid: Uuid) -> Result<Vec<SessionRecord>, StoreError>;
+    /// Remove every session parked for `sandbox_uid`, the issuer's and the delegations;
+    /// nothing to remove is fine.
     async fn delete_session(&self, sandbox_uid: Uuid) -> Result<(), StoreError>;
     /// Remove every session delegated before `before`. Returns how many.
     async fn sweep_sessions(&self, before: DateTime<Utc>) -> Result<usize, StoreError>;
@@ -250,7 +276,7 @@ fn same_policy(held: Option<&PolicyFloor>, next: &PolicyFloor) -> Result<(), Sto
 pub struct MemoryStore {
     claims: RwLock<HashMap<Uuid, ClaimRecord>>,
     nodes: RwLock<HashMap<String, NodeRecord>>,
-    sessions: RwLock<HashMap<Uuid, SessionRecord>>,
+    sessions: RwLock<HashMap<(Uuid, Option<String>), SessionRecord>>,
     floors: RwLock<HashMap<(String, String), PolicyFloor>>,
 }
 
@@ -308,6 +334,7 @@ impl ClaimStore for MemoryStore {
             .ok_or_else(|| StoreError::NotFound(uid.to_string()))?;
         rec.revoked_at.get_or_insert(at);
         rec.refresh = None;
+        rec.delegations.clear();
         Ok(())
     }
 
@@ -391,19 +418,35 @@ impl ClaimStore for MemoryStore {
 
     async fn put_session(&self, rec: SessionRecord) -> Result<(), StoreError> {
         let mut m = self.sessions.write().await;
-        if m.contains_key(&rec.sandbox_uid) {
+        let key = (rec.sandbox_uid, rec.audience.clone());
+        if m.contains_key(&key) {
             return Err(StoreError::Conflict(rec.sandbox_uid.to_string()));
         }
-        m.insert(rec.sandbox_uid, rec);
+        m.insert(key, rec);
         Ok(())
     }
 
     async fn take_session(&self, sandbox_uid: Uuid) -> Result<Option<SessionRecord>, StoreError> {
-        Ok(self.sessions.write().await.remove(&sandbox_uid))
+        Ok(self.sessions.write().await.remove(&(sandbox_uid, None)))
+    }
+
+    async fn take_delegations(&self, sandbox_uid: Uuid) -> Result<Vec<SessionRecord>, StoreError> {
+        let mut m = self.sessions.write().await;
+        let keys: Vec<(Uuid, Option<String>)> = m
+            .keys()
+            .filter(|(uid, audience)| *uid == sandbox_uid && audience.is_some())
+            .cloned()
+            .collect();
+        let mut out: Vec<SessionRecord> = keys.iter().filter_map(|k| m.remove(k)).collect();
+        out.sort_by(|a, b| a.audience.cmp(&b.audience));
+        Ok(out)
     }
 
     async fn delete_session(&self, sandbox_uid: Uuid) -> Result<(), StoreError> {
-        self.sessions.write().await.remove(&sandbox_uid);
+        self.sessions
+            .write()
+            .await
+            .retain(|(uid, _), _| *uid != sandbox_uid);
         Ok(())
     }
 

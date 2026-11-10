@@ -428,6 +428,7 @@ pub fn record_for(
         bundle_version: bundle.map(|b| b.meta.version),
         report: None,
         exit: None,
+        delegations: std::collections::BTreeMap::new(),
     }
 }
 
@@ -752,18 +753,32 @@ impl Watcher {
             Err(StoreError::NotFound(_)) => {
                 let bundle = self.bundle_of(sb);
                 let mut r = record_for(sb, uid, bundle.as_deref());
-                if let Some(sandbox_uid) = r.sandbox_uid
-                    && let Some(session) = self.reconciler.store.take_session(sandbox_uid).await?
-                {
-                    r.refresh = Some(session.refresh);
+                if let Some(sandbox_uid) = r.sandbox_uid {
+                    if let Some(session) = self.reconciler.store.take_session(sandbox_uid).await? {
+                        r.refresh = Some(session.refresh);
+                    }
+                    // ADR-0035: the caller's delegated credentials, one per audience.
+                    for d in self.reconciler.store.take_delegations(sandbox_uid).await? {
+                        if let Some(audience) = d.audience {
+                            r.delegations.insert(
+                                audience,
+                                mediatore_store::DelegatedSession {
+                                    envelope: d.refresh,
+                                    expires_at: d.expires_at,
+                                },
+                            );
+                        }
+                    }
                 }
                 let delegated = r.refresh.is_some();
+                let delegations = r.delegations.len();
                 self.reconciler.store.put_claim(r.clone()).await?;
                 tracing::info!(
                     sandbox = %sb.name_any(),
                     namespace = %sb.namespace().unwrap_or_default(),
                     claim_uid = %uid,
                     delegated,
+                    delegations,
                     policy = sb.spec.policy_ref.as_ref().map_or("none", |p| p.name.as_str()),
                     bundle_version = ?r.bundle_version,
                     "record created"
@@ -1047,6 +1062,8 @@ mod tests {
                 ciphertext: vec![1, 2, 3],
             },
             created_at: Utc::now(),
+            audience: None,
+            expires_at: None,
         }
     }
 

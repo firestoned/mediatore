@@ -16,6 +16,7 @@ reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
+chrono.workspace = true
 base64.workspace = true
 sha2.workspace = true
 aws-lc-rs.workspace = true

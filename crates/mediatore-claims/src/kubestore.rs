@@ -28,7 +28,9 @@ use kube::api::{DeleteParams, ListParams, Patch, PatchParams, PostParams};
 use kube::{Api, Client, CustomResource, ResourceExt};
 use mediatore_proto::{ClaimReport, Provider, Subject, Workload, WorkloadExit};
 use mediatore_store::seal::Sealed;
-use mediatore_store::{ClaimRecord, ClaimStore, NodeRecord, SessionRecord, StoreError};
+use mediatore_store::{
+    ClaimRecord, ClaimStore, DelegatedSession, NodeRecord, SessionRecord, StoreError,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -44,6 +46,9 @@ pub const NODE_LABEL: &str = "mediatore.io/node";
 pub const SANDBOX_UID_LABEL: &str = "mediatore.io/sandbox-uid";
 /// The label saying whether a session Secret is still parked or has become the record's.
 pub const SESSION_LABEL: &str = "mediatore.io/session";
+/// The label naming the audience a delegated credential's Secret is for (ADR-0035); absent
+/// on the issuer's session Secret.
+pub const AUDIENCE_LABEL: &str = "mediatore.io/audience";
 /// The label carrying a node's DMI UUID on its `SandboxNode`.
 pub const DMI_LABEL: &str = "mediatore.io/dmi-uuid";
 /// The rendered CRD files (`make crds`).
@@ -82,6 +87,10 @@ pub struct RecordStatus {
     /// Whether a sealed refresh envelope is held for the claim (in the sandbox's Secret).
     #[serde(default)]
     pub refresh: bool,
+    /// The caller's delegated credentials (ADR-0035), one Secret each: the audience and
+    /// when the bearer dies; the envelopes are the Secrets'.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub delegations: Vec<DelegationStatus>,
     /// The guest's report (ADR-0029 decision 5), as `ClaimReport` serialises.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(schema_with = "preserve_arbitrary")]
@@ -90,6 +99,17 @@ pub struct RecordStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(schema_with = "preserve_arbitrary")]
     pub exit: Option<serde_json::Value>,
+}
+
+/// One delegated credential on the record (ADR-0035): which audience, until when.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DelegationStatus {
+    /// The audience the credential is for.
+    pub audience: String,
+    /// When the bearer dies, if the caller said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<Time>,
 }
 
 /// A free-form object in the CRD schema: the wire types own their shape.
@@ -262,6 +282,27 @@ impl KubeStore {
         {
             rec.refresh = envelope_of(&secret);
         }
+        if let Some(sandbox_uid) = rec.sandbox_uid {
+            for d in &status.delegations {
+                let Some(secret) = self
+                    .secrets()
+                    .get_opt(&delegation_name(sandbox_uid, &d.audience))
+                    .await
+                    .map_err(|e| backend(&e))?
+                else {
+                    continue;
+                };
+                if let Some(envelope) = envelope_of(&secret) {
+                    rec.delegations.insert(
+                        d.audience.clone(),
+                        DelegatedSession {
+                            envelope,
+                            expires_at: d.expires_at.as_ref().and_then(chrono_of),
+                        },
+                    );
+                }
+            }
+        }
         Ok(rec)
     }
 
@@ -294,18 +335,68 @@ impl KubeStore {
         Ok(())
     }
 
-    /// Put `rec.refresh` where the record keeps it: the sandbox's session Secret, written
-    /// as the record's own (`claimed`) and owned by the sandbox; `None` empties it.
+    /// Put `rec.refresh` and every delegation where the record keeps them: the sandbox's
+    /// session Secrets, written as the record's own (`claimed`) and owned by the sandbox;
+    /// an envelope gone from the record (revoked) empties its Secret.
     async fn write_envelope(&self, sb: &AgentSandbox, rec: &ClaimRecord) -> Result<(), StoreError> {
         let Some(sandbox_uid) = rec.sandbox_uid else {
             return Ok(());
         };
-        let name = session_name(sandbox_uid);
+        self.write_one_envelope(sb, rec, sandbox_uid, None, rec.refresh.as_ref(), None)
+            .await?;
+        // The delegations the record carries, then the Secrets of any it no longer does.
+        for (audience, d) in &rec.delegations {
+            self.write_one_envelope(
+                sb,
+                rec,
+                sandbox_uid,
+                Some(audience),
+                Some(&d.envelope),
+                d.expires_at,
+            )
+            .await?;
+        }
+        let held = self
+            .secrets()
+            .list(&ListParams::default().labels(&format!(
+                "{SANDBOX_UID_LABEL}={sandbox_uid},{AUDIENCE_LABEL}"
+            )))
+            .await
+            .map_err(|e| backend(&e))?;
+        for secret in &held.items {
+            let Some(audience) = secret
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|l| l.get(AUDIENCE_LABEL))
+                .cloned()
+            else {
+                continue;
+            };
+            if !rec.delegations.contains_key(&audience) {
+                self.write_one_envelope(sb, rec, sandbox_uid, Some(&audience), None, None)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// One Secret: the issuer's session (`audience` `None`) or a delegation's.
+    async fn write_one_envelope(
+        &self,
+        sb: &AgentSandbox,
+        rec: &ClaimRecord,
+        sandbox_uid: Uuid,
+        audience: Option<&str>,
+        sealed: Option<&Sealed>,
+        expires_at: Option<DateTime<Utc>>,
+    ) -> Result<(), StoreError> {
+        let name = match audience {
+            Some(a) => delegation_name(sandbox_uid, a),
+            None => session_name(sandbox_uid),
+        };
         let api = self.secrets();
-        match (
-            &rec.refresh,
-            api.get_opt(&name).await.map_err(|e| backend(&e))?,
-        ) {
+        match (sealed, api.get_opt(&name).await.map_err(|e| backend(&e))?) {
             (Some(sealed), Some(_)) => {
                 let mut metadata = serde_json::json!({ "labels": { SESSION_LABEL: "claimed" } });
                 if let Some(owners) = owner_refs(&self.home, sb) {
@@ -321,11 +412,15 @@ impl KubeStore {
             }
             (Some(sealed), None) => {
                 let mut secret = session_secret(
-                    sandbox_uid,
-                    &rec.subject,
-                    "",
-                    sealed,
-                    rec.created_at,
+                    &SessionRecord {
+                        sandbox_uid,
+                        subject: rec.subject.clone(),
+                        issuer: String::new(),
+                        refresh: sealed.clone(),
+                        created_at: rec.created_at,
+                        audience: audience.map(str::to_owned),
+                        expires_at,
+                    },
                     "claimed",
                 );
                 secret.metadata.owner_references = owner_refs(&self.home, sb);
@@ -371,10 +466,19 @@ pub fn node_label(node_id: &str) -> String {
     hex::encode(Sha256::digest(node_id.as_bytes()))[..32].to_owned()
 }
 
-/// The session Secret's name for a sandbox.
+/// The issuer's session Secret's name for a sandbox.
 #[must_use]
 pub fn session_name(sandbox_uid: Uuid) -> String {
     format!("mediatore-session-{sandbox_uid}")
+}
+
+/// A delegated credential's Secret name for a sandbox (ADR-0035): the audience as the
+/// first 16 hex characters of its SHA-256, since an audience name need not be a valid
+/// object name; the label carries the name itself.
+#[must_use]
+pub fn delegation_name(sandbox_uid: Uuid, audience: &str) -> String {
+    let digest = hex::encode(Sha256::digest(audience.as_bytes()));
+    format!("mediatore-session-{sandbox_uid}-{}", &digest[..16])
 }
 
 fn backend(e: &kube::Error) -> StoreError {
@@ -408,6 +512,14 @@ fn record_status_from(rec: &ClaimRecord) -> RecordStatus {
         policy_uid: rec.policy_uid.clone(),
         bundle_version: rec.bundle_version,
         refresh: rec.refresh.is_some(),
+        delegations: rec
+            .delegations
+            .iter()
+            .map(|(audience, d)| DelegationStatus {
+                audience: audience.clone(),
+                expires_at: d.expires_at.map(time_of),
+            })
+            .collect(),
         report: rec
             .report
             .as_ref()
@@ -446,6 +558,7 @@ fn record_from(sb: &AgentSandbox, status: &RecordStatus) -> Result<ClaimRecord, 
             .exit
             .clone()
             .and_then(|v| serde_json::from_value::<WorkloadExit>(v).ok()),
+        delegations: BTreeMap::new(),
     })
 }
 
@@ -488,15 +601,24 @@ fn envelope_of(secret: &Secret) -> Option<Sealed> {
     })
 }
 
-fn session_secret(
-    sandbox_uid: Uuid,
-    subject: &Subject,
-    issuer: &str,
-    sealed: &Sealed,
-    created_at: DateTime<Utc>,
-    state: &str,
-) -> Secret {
+/// The Secret a parked or claimed session is kept in: the issuer's (`rec.audience` `None`)
+/// or a delegation's, in the `state` its label says.
+fn session_secret(rec: &SessionRecord, state: &str) -> Secret {
+    let sandbox_uid = rec.sandbox_uid;
+    let (subject, issuer, sealed, created_at) = (
+        &rec.subject,
+        rec.issuer.as_str(),
+        &rec.refresh,
+        rec.created_at,
+    );
+    let (audience, expires_at) = (rec.audience.as_deref(), rec.expires_at);
     let mut data = BTreeMap::new();
+    if let Some(e) = expires_at {
+        data.insert(
+            "expires_at".to_owned(),
+            ByteString(e.to_rfc3339().into_bytes()),
+        );
+    }
     data.insert(
         "subject".to_owned(),
         ByteString(serde_json::to_vec(subject).unwrap_or_default()),
@@ -516,11 +638,18 @@ fn session_secret(
         ByteString(sealed.ciphertext.clone()),
     );
     let mut secret = Secret::default();
-    secret.metadata.name = Some(session_name(sandbox_uid));
-    secret.metadata.labels = Some(BTreeMap::from([
+    let mut labels = BTreeMap::from([
         (SANDBOX_UID_LABEL.to_owned(), sandbox_uid.to_string()),
         (SESSION_LABEL.to_owned(), state.to_owned()),
-    ]));
+    ]);
+    secret.metadata.name = Some(match audience {
+        Some(a) => {
+            labels.insert(AUDIENCE_LABEL.to_owned(), a.to_owned());
+            delegation_name(sandbox_uid, a)
+        }
+        None => session_name(sandbox_uid),
+    });
+    secret.metadata.labels = Some(labels);
     secret.type_ = Some("Opaque".into());
     secret.data = Some(data);
     secret
@@ -546,6 +675,15 @@ fn session_of(secret: &Secret) -> Option<SessionRecord> {
         created_at: DateTime::parse_from_rfc3339(&text("created_at")?)
             .ok()?
             .with_timezone(&Utc),
+        audience: secret
+            .metadata
+            .labels
+            .as_ref()
+            .and_then(|l| l.get(AUDIENCE_LABEL))
+            .cloned(),
+        expires_at: text("expires_at")
+            .and_then(|t| DateTime::parse_from_rfc3339(&t).ok())
+            .map(|t| t.with_timezone(&Utc)),
     })
 }
 
@@ -662,6 +800,7 @@ impl ClaimStore for KubeStore {
         let mut rec = self.record_of(&sb).await?;
         rec.revoked_at.get_or_insert(at);
         rec.refresh = None;
+        rec.delegations.clear();
         self.write_envelope(&sb, &rec).await?;
         self.write_record(&sb, &rec).await
     }
@@ -847,14 +986,7 @@ impl ClaimStore for KubeStore {
     }
 
     async fn put_session(&self, rec: SessionRecord) -> Result<(), StoreError> {
-        let secret = session_secret(
-            rec.sandbox_uid,
-            &rec.subject,
-            &rec.issuer,
-            &rec.refresh,
-            rec.created_at,
-            "parked",
-        );
+        let secret = session_secret(&rec, "parked");
         match self.secrets().create(&PostParams::default(), &secret).await {
             Ok(_) => Ok(()),
             Err(e) if is_conflict(&e) => Err(StoreError::Conflict(rec.sandbox_uid.to_string())),
@@ -898,31 +1030,57 @@ impl ClaimStore for KubeStore {
         Ok(Some(session))
     }
 
-    async fn delete_session(&self, sandbox_uid: Uuid) -> Result<(), StoreError> {
-        let name = session_name(sandbox_uid);
-        let Some(secret) = self
+    async fn take_delegations(&self, sandbox_uid: Uuid) -> Result<Vec<SessionRecord>, StoreError> {
+        let list = self
             .secrets()
-            .get_opt(&name)
+            .list(&ListParams::default().labels(&format!(
+                "{SANDBOX_UID_LABEL}={sandbox_uid},{SESSION_LABEL}=parked,{AUDIENCE_LABEL}"
+            )))
             .await
-            .map_err(|e| backend(&e))?
-        else {
-            return Ok(());
-        };
-        let parked = secret
-            .metadata
-            .labels
-            .as_ref()
-            .and_then(|l| l.get(SESSION_LABEL))
-            .is_some_and(|s| s == "parked");
-        if !parked {
-            // The record's envelope now; it goes with the record, not here.
-            return Ok(());
+            .map_err(|e| backend(&e))?;
+        let mut out = Vec::new();
+        for secret in &list.items {
+            let Some(session) = session_of(secret) else {
+                continue;
+            };
+            self.secrets()
+                .patch(
+                    &secret.name_any(),
+                    &PatchParams::default(),
+                    &Patch::Merge(
+                        serde_json::json!({ "metadata": { "labels": { SESSION_LABEL: "claimed" } } }),
+                    ),
+                )
+                .await
+                .map_err(|e| backend(&e))?;
+            out.push(session);
         }
-        match self.secrets().delete(&name, &DeleteParams::default()).await {
-            Ok(_) => Ok(()),
-            Err(e) if is_not_found(&e) => Ok(()),
-            Err(e) => Err(backend(&e)),
+        out.sort_by(|a, b| a.audience.cmp(&b.audience));
+        Ok(out)
+    }
+
+    async fn delete_session(&self, sandbox_uid: Uuid) -> Result<(), StoreError> {
+        // Every parked Secret of the sandbox, the issuer's and the delegations; a claimed
+        // one is the record's and goes with the record, not here.
+        let list = self
+            .secrets()
+            .list(&ListParams::default().labels(&format!(
+                "{SANDBOX_UID_LABEL}={sandbox_uid},{SESSION_LABEL}=parked"
+            )))
+            .await
+            .map_err(|e| backend(&e))?;
+        for secret in &list.items {
+            match self
+                .secrets()
+                .delete(&secret.name_any(), &DeleteParams::default())
+                .await
+            {
+                Ok(_) => {}
+                Err(e) if is_not_found(&e) => {}
+                Err(e) => return Err(backend(&e)),
+            }
         }
+        Ok(())
     }
 
     async fn sweep_sessions(&self, before: DateTime<Utc>) -> Result<usize, StoreError> {
@@ -1120,6 +1278,7 @@ mod tests {
                     restarts: 1,
                 },
             }),
+            delegations: BTreeMap::new(),
         };
         let status = record_status_from(&rec);
         assert_eq!(status.claim_uid, uid.to_string());
@@ -1139,11 +1298,15 @@ mod tests {
         );
 
         let secret = session_secret(
-            sandbox_uid,
-            &rec.subject,
-            "https://idp.example",
-            &sealed,
-            rec.created_at,
+            &SessionRecord {
+                sandbox_uid,
+                subject: rec.subject.clone(),
+                issuer: "https://idp.example".into(),
+                refresh: sealed.clone(),
+                created_at: rec.created_at,
+                audience: None,
+                expires_at: None,
+            },
             "parked",
         );
         assert_eq!(

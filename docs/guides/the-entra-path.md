@@ -130,6 +130,35 @@ rotated Secret (edit it, restart the broker) is everywhere within that bound. Th
 sees one key for every subject; who acted is in the broker's log, so use a key the upstream
 lets you scope and cap, and keep the `rules` to the calls the agent needs.
 
+`via: delegated` is the requester's own credential for the audience
+([ADR-0035](../adr/0035-a-requesters-own-session-delegated-at-claim-time.md)): nothing is
+held between claims; the caller sends it with the claim (`mediatore sandbox create
+--delegate anthropic=claude-code`, which reads Claude Code's own session; `env:<NAME>` for a
+`claude setup-token`; `file:<path>`), the broker seals it with the sandbox's UID into a
+Secret of its own beside the issuer's session, and `POST /v1/token` opens it for the proxy
+with `header` (default `authorization`, a bearer) and `extra_headers` beside it. A claim
+naming such an audience without its delegation is refused (`400 delegation_required`), a
+delegation for any other audience too (`400 delegation_refused`), and a credential the
+caller says dies before the claim's deadline (`400 delegation_expires_first`): without a
+`refresh` block the claim cannot outlast the bearer. `refresh: { token_endpoint, client_id,
+scope? }` names where the broker renews it from the delegated refresh token (`https` outside
+`dev_mode`; nothing is defaulted, Anthropic's endpoint being undocumented) and is not served
+yet. Release and revocation empty the envelope; the retention sweep deletes it. The upstream
+sees the requester's own session, so attribution is the upstream's too; the session is for
+the requester's own Claude Code in the jail (`examples/claude-code`), which Anthropic's terms
+bind it to.
+
+```yaml
+audiences:
+  - name: anthropic
+    via: delegated
+    max_ttl: 900
+    egress: ["api.anthropic.com:443"]
+    rules:
+      - { method: POST, path: "/v1/messages" }
+      - { method: POST, path: "/v1/messages/count_tokens" }
+```
+
 `egress` is where the workload reaches the audience's API from the jail ([ADR-0020](../adr/0020-jail-network-nftables-keyed-by-sandbox-uid.md)): the
 guest admits those `host:port` pairs for the sandbox uid and nothing else beyond the
 broker and DNS. Without it the jail reaches the broker only.
