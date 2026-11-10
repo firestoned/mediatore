@@ -184,5 +184,9 @@ nav:
       - "ADR-0029: The image pull on a routeless segment, and the pool VM's root rules": adr/0029-the-pull-on-a-routeless-segment-and-the-pool-vms-root-rules.md
       - "ADR-0030: A policy's direct egress, enforced at the gateway behind a switch": adr/0030-policy-egress-enforced-at-the-gateway.md
       - "ADR-0031: The agent's trust anchor outlives the server's CA": adr/0031-a-trust-anchor-that-outlives-the-servers-ca.md
+      - "ADR-0032: An operator-held credential as an audience backend": adr/0032-operator-held-credentials-as-an-audience-backend.md
+      - "ADR-0033: A one-shot workload and its restart policy": adr/0033-a-one-shot-workload-the-restart-policy-and-the-claim-released-when-it-is-done.md
+      - "ADR-0034: The Kubernetes API as the broker's store": adr/0034-the-kubernetes-api-as-the-brokers-store.md
+      - "ADR-0035: A requester's own session, delegated at claim time": adr/0035-a-requesters-own-session-delegated-at-claim-time.md
   - Security:
       - Threat model: security/threat-model.md
