@@ -32,6 +32,8 @@ the component that finishes the story.
 - [The research agent, front to back](guides/research-agent-walkthrough.md): one agent
   image from publication to the report it pushes, under a policy notaio certifies, with
   what enforces each line of it today.
+- [Claude from the sandbox, end to end](guides/claude-end-to-end.md): every configuration
+  the path to the Anthropic API depends on, Dex to the key, with the values that must agree
 - [Requesting a sandbox](guides/requesting-a-sandbox.md): the `AgentSandbox` resource,
   through the API or declaratively, who may name which subject, and what its status says.
 - [The store](guides/the-store.md): the Kubernetes API as the store, what survives a restart,

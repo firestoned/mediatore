@@ -141,6 +141,7 @@ nav:
       - Deploying on a homelab cluster: guides/deploying.md
       - Homelab walkthrough: guides/homelab-walkthrough.md
       - The research agent, front to back: guides/research-agent-walkthrough.md
+      - Claude from the sandbox, end to end: guides/claude-end-to-end.md
       - Requesting a sandbox: guides/requesting-a-sandbox.md
       - The policy bundle, in shadow: guides/the-policy-bundle.md
       - Issuers: guides/issuers.md
