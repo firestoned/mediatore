@@ -32,8 +32,11 @@ data:
             # seed, so `networkOverrides` below reaches it only through this stage; banlieue
             # renders ${IP}, ${PREFIX}, ${GATEWAY} and ${DNS} from the first static
             # interface. Name= is the first NIC's name on your machine type (`ens2` on a
-            # libvirt pc-i440fx machine, `enp1s0` on q35); the sandbox NIC is SANDBOX_IF in
-            # the deployment layer's env, so the two never match the same file.
+            # libvirt pc-i440fx machine, `enp1s0` on q35, `ens4` on Cloud Hypervisor); the
+            # sandbox NIC is SANDBOX_IF in the deployment layer's env (`ens3` on pc-i440fx,
+            # `ens5` on Cloud Hypervisor), so the two never match the same file. A gateway
+            # moved to another backend needs both names changed: Kairos's DHCP catch-all takes
+            # an unmatched NIC, and the nftables rules key on SANDBOX_IF.
             - path: /etc/systemd/network/10-egress.network
               permissions: 0644
               owner: 0
@@ -89,8 +92,11 @@ data:
             # seed, so `networkOverrides` below reaches it only through this stage; banlieue
             # renders ${IP}, ${PREFIX}, ${GATEWAY} and ${DNS} from the first static
             # interface. Name= is the first NIC's name on your machine type (`ens2` on a
-            # libvirt pc-i440fx machine, `enp1s0` on q35); the sandbox NIC is SANDBOX_IF in
-            # the deployment layer's env, so the two never match the same file.
+            # libvirt pc-i440fx machine, `enp1s0` on q35, `ens4` on Cloud Hypervisor); the
+            # sandbox NIC is SANDBOX_IF in the deployment layer's env (`ens3` on pc-i440fx,
+            # `ens5` on Cloud Hypervisor), so the two never match the same file. A gateway
+            # moved to another backend needs both names changed: Kairos's DHCP catch-all takes
+            # an unmatched NIC, and the nftables rules key on SANDBOX_IF.
             - path: /etc/systemd/network/10-egress.network
               permissions: 0644
               owner: 0
@@ -146,8 +152,11 @@ data:
             # seed, so `networkOverrides` below reaches it only through this stage; banlieue
             # renders ${IP}, ${PREFIX}, ${GATEWAY} and ${DNS} from the first static
             # interface. Name= is the first NIC's name on your machine type (`ens2` on a
-            # libvirt pc-i440fx machine, `enp1s0` on q35); the sandbox NIC is SANDBOX_IF in
-            # the deployment layer's env, so the two never match the same file.
+            # libvirt pc-i440fx machine, `enp1s0` on q35, `ens4` on Cloud Hypervisor); the
+            # sandbox NIC is SANDBOX_IF in the deployment layer's env (`ens3` on pc-i440fx,
+            # `ens5` on Cloud Hypervisor), so the two never match the same file. A gateway
+            # moved to another backend needs both names changed: Kairos's DHCP catch-all takes
+            # an unmatched NIC, and the nftables rules key on SANDBOX_IF.
             - path: /etc/systemd/network/10-egress.network
               permissions: 0644
               owner: 0
