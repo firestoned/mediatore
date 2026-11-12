@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use clap::{Args, Subcommand};
 use mediatore_proto::{ClaimRequest, Workload};
 
-use crate::{Api, LoginOptions, Session};
+use crate::{Api, LoginOptions, Redirect, Session};
 
 /// Where the session file lives.
 #[derive(Debug, Args)]
@@ -88,6 +88,19 @@ pub struct LoginArgs {
     /// public client (Google's installed-app clients)
     #[arg(long)]
     pub client_secret_file: Option<PathBuf>,
+    /// A loopback port for the redirect, tried in order (repeatable). The default is
+    /// kubelogin's, 8000 then 18000, which is what the login hub registers for mediatore's
+    /// client: Dex matches redirect URIs exactly, so a random port cannot log in there.
+    /// Pass `--redirect-port 0` for a port the OS chooses (an issuer that accepts any
+    /// loopback port)
+    #[arg(long = "redirect-port", default_values_t = [8000u16, 18000])]
+    pub redirect_ports: Vec<u16>,
+    /// The host in the redirect URI (the listener binds 127.0.0.1 either way)
+    #[arg(long, default_value = "localhost")]
+    pub redirect_host: String,
+    /// What follows the port in the redirect URI, for an issuer that registered a path
+    #[arg(long, default_value = "")]
+    pub redirect_path: String,
     /// The session file.
     #[command(flatten)]
     pub session: SessionFile,
@@ -264,6 +277,16 @@ async fn login(args: LoginArgs) -> anyhow::Result<()> {
         client_secret,
         login_hint: args.login_hint,
         ca_pem,
+        redirect: Redirect {
+            host: args.redirect_host,
+            // `--redirect-port 0` is the OS-chosen port: no fixed list.
+            ports: args
+                .redirect_ports
+                .into_iter()
+                .filter(|p| *p != 0)
+                .collect(),
+            path: args.redirect_path,
+        },
     };
     let open = |url: &str| {
         if args.no_browser {
@@ -355,4 +378,47 @@ fn print_report(claim: &mediatore_proto::ClaimResponse) {
         "reported_at={}\timage_digest={}\tsandbox_ruleset_sha256={}\thost_table={host}",
         r.reported_at, r.report.image_digest, r.report.sandbox_ruleset_sha256
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::*;
+
+    #[derive(Parser)]
+    struct W {
+        #[command(flatten)]
+        login: LoginArgs,
+    }
+
+    fn parse(extra: &[&str]) -> LoginArgs {
+        let mut argv = vec!["w", "--issuer", "https://dex.example"];
+        argv.extend_from_slice(extra);
+        W::try_parse_from(argv).unwrap().login
+    }
+
+    #[test]
+    fn login_defaults_to_kubelogins_fixed_redirect() {
+        let a = parse(&[]);
+        assert_eq!(a.redirect_ports, vec![8000, 18000]);
+        assert_eq!(a.redirect_host, "localhost");
+        assert_eq!(a.redirect_path, "");
+    }
+
+    #[test]
+    fn the_redirect_can_be_set_and_zero_means_an_os_chosen_port() {
+        let a = parse(&[
+            "--redirect-port",
+            "9000",
+            "--redirect-host",
+            "127.0.0.1",
+            "--redirect-path",
+            "/callback",
+        ]);
+        assert_eq!(a.redirect_ports, vec![9000]);
+        assert_eq!(a.redirect_host, "127.0.0.1");
+        assert_eq!(a.redirect_path, "/callback");
+        assert_eq!(parse(&["--redirect-port", "0"]).redirect_ports, vec![0]);
+    }
 }

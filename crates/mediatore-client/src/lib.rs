@@ -121,6 +121,59 @@ pub struct LoginOptions {
     /// CA certificates (PEM) that sign the issuer's TLS certificate, for an issuer on a
     /// private PKI; when set, exactly those are trusted and not the public roots.
     pub ca_pem: Option<Vec<u8>>,
+    /// Where the loopback listener the issuer redirects back to lives.
+    pub redirect: Redirect,
+}
+
+/// The loopback redirect of a login.
+///
+/// Some issuers match a public client's redirect URIs exactly (Dex does), so a port the OS
+/// picks at random cannot be registered. `ports` names the ones to try, in order; empty
+/// means a port the OS chooses, which suits an issuer that accepts any loopback port. The
+/// listener always binds `127.0.0.1`; `host` is only what the redirect URI says (`localhost`
+/// when that is what the issuer has registered).
+#[derive(Debug, Clone)]
+pub struct Redirect {
+    /// The host in the redirect URI.
+    pub host: String,
+    /// Fixed ports, tried in order; empty means one the OS chooses.
+    pub ports: Vec<u16>,
+    /// What follows the port in the redirect URI, `/callback` or empty. The listener
+    /// answers any path.
+    pub path: String,
+}
+
+impl Default for Redirect {
+    /// A port the OS chooses at `http://127.0.0.1:<port>/callback`.
+    fn default() -> Self {
+        Self {
+            host: "127.0.0.1".into(),
+            ports: vec![],
+            path: "/callback".into(),
+        }
+    }
+}
+
+/// Bind the loopback listener for `redirect` and return it with the redirect URI to send.
+async fn bind_loopback(redirect: &Redirect) -> anyhow::Result<(tokio::net::TcpListener, String)> {
+    let uri = |port: u16| format!("http://{}:{port}{}", redirect.host, redirect.path);
+    if redirect.ports.is_empty() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+        return Ok((listener, uri(port)));
+    }
+    for &port in &redirect.ports {
+        match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+            Ok(listener) => return Ok((listener, uri(port))),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {}
+            Err(e) => return Err(anyhow::anyhow!("binding 127.0.0.1:{port}: {e}")),
+        }
+    }
+    let ports: Vec<String> = redirect.ports.iter().map(ToString::to_string).collect();
+    anyhow::bail!(
+        "none of the redirect ports ({}) is free on 127.0.0.1: is another login running?",
+        ports.join(", ")
+    )
 }
 
 impl LoginOptions {
@@ -291,11 +344,7 @@ pub async fn login(opts: &LoginOptions, open_url: impl FnOnce(&str)) -> anyhow::
     let verifier = random_token()?;
     let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
     let state = random_token()?;
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    let redirect_uri = format!(
-        "http://127.0.0.1:{}/callback",
-        listener.local_addr()?.port()
-    );
+    let (listener, redirect_uri) = bind_loopback(&opts.redirect).await?;
 
     let mut url = format!(
         "{}?response_type=code&client_id={}&redirect_uri={}&scope={}&state={}&code_challenge={}&code_challenge_method=S256",
@@ -458,6 +507,7 @@ mod tests {
             client_secret: None,
             login_hint: Some("hexley".into()),
             ca_pem: None,
+            redirect: Redirect::default(),
         }
     }
 
@@ -539,6 +589,83 @@ mod tests {
             .await
             .is_err(),
             "offline_access is not a Google scope"
+        );
+    }
+
+    /// A port nothing listens on right now.
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    fn fixed(ports: Vec<u16>) -> Redirect {
+        Redirect {
+            host: "localhost".into(),
+            ports,
+            path: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_fixed_redirect_uses_the_first_free_port_and_names_it_without_a_path() {
+        let (busy, free) = (free_port(), free_port());
+        let _hold = tokio::net::TcpListener::bind(("127.0.0.1", busy))
+            .await
+            .unwrap();
+        let (_listener, uri) = bind_loopback(&fixed(vec![busy, free])).await.unwrap();
+        assert_eq!(uri, format!("http://localhost:{free}"));
+    }
+
+    #[tokio::test]
+    async fn a_fixed_redirect_with_every_port_busy_says_which() {
+        let (a, b) = (free_port(), free_port());
+        let _ha = tokio::net::TcpListener::bind(("127.0.0.1", a))
+            .await
+            .unwrap();
+        let _hb = tokio::net::TcpListener::bind(("127.0.0.1", b))
+            .await
+            .unwrap();
+        let err = bind_loopback(&fixed(vec![a, b])).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&a.to_string()) && msg.contains(&b.to_string()),
+            "{msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_default_redirect_keeps_a_port_the_os_chooses_and_the_callback_path() {
+        let (_listener, uri) = bind_loopback(&Redirect::default()).await.unwrap();
+        assert!(uri.starts_with("http://127.0.0.1:"), "{uri}");
+        assert!(uri.ends_with("/callback"), "{uri}");
+    }
+
+    #[tokio::test]
+    async fn login_on_a_fixed_redirect_sends_exactly_that_uri_and_completes() {
+        let idp = FakeIdp::start().await;
+        let port = free_port();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let seen_in = seen.clone();
+        let session = login(
+            &LoginOptions {
+                redirect: fixed(vec![port]),
+                ..opts(&idp)
+            },
+            move |url: &str| {
+                *seen_in.lock().unwrap() = url.to_owned();
+                browser(url);
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(session.login, "hexley");
+        let url = seen.lock().unwrap().clone();
+        assert!(
+            url.contains(&format!("redirect_uri=http%3A%2F%2Flocalhost%3A{port}&")),
+            "{url}"
         );
     }
 
