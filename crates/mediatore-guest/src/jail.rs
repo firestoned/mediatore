@@ -22,6 +22,11 @@ pub const JAIL_BINARY: &str = mediatore_proto::AGENT_BINARY_PATH;
 /// What the workload may write inside the jail, and nothing else (ADR-0024 decision 2):
 /// its work dir, a tmpfs `/tmp` and a tmpfs home.
 pub const WRITABLE_IN_JAIL: [&str; 3] = ["/work", "/tmp", "/home/sandbox"];
+/// The jail's `/proc` (ADR-0036): a procfs showing nothing but the process directories
+/// (`subset=pid`), and of those only the ones the workload may ptrace (`hidepid=invisible`).
+/// nsjail's `--mount` carries filesystem options, not mount flags: writes are denied by the
+/// inner layer's Landlock set, which grants read on `/` and write on the three directories.
+pub const JAIL_PROC_MOUNT: &str = "none:/proc:proc:subset=pid,hidepid=invisible";
 
 /// Inputs to the jail.
 #[derive(Debug, Clone)]
@@ -77,7 +82,11 @@ impl JailSpec {
             "/tmp".into(),
             "--tmpfsmount".into(),
             "/home/sandbox".into(),
+            // nsjail's own full `/proc` stays off; the one the workload gets shows the
+            // jail's processes alone (ADR-0036). Landlock makes it read-only (decision 2).
             "--disable_proc".into(),
+            "--mount".into(),
+            JAIL_PROC_MOUNT.into(),
             // The VM's network namespace, not a fresh one: the workload's sockets carry the
             // sb- uid, which the guest's nftables ruleset keys on (ADR-0020 decision 1).
             "--disable_clone_newnet".into(),
@@ -151,6 +160,29 @@ mod tests {
         let sep = a.iter().rposition(|x| x == "--").unwrap();
         assert_eq!(&a[sep + 1..], &["/bin/sh", "-c", "id"]);
         assert!(a.iter().any(|x| x == "--disable_proc"));
+    }
+
+    #[test]
+    fn proc_is_mounted_with_the_jails_own_processes_only() {
+        let a = spec().to_args();
+        let mounts: Vec<&str> = a
+            .windows(2)
+            .filter(|w| w[0] == "--mount")
+            .map(|w| w[1].as_str())
+            .collect();
+        assert_eq!(
+            mounts,
+            ["none:/proc:proc:subset=pid,hidepid=invisible"],
+            "one procfs, the process directories alone (ADR-0036)"
+        );
+        assert!(
+            a.iter().any(|x| x == "--disable_proc"),
+            "nsjail's own full /proc stays off"
+        );
+        assert!(
+            !a.iter().any(|x| x == "/dev" || x.ends_with(":/dev")),
+            "no /dev: nothing the workload has needed"
+        );
     }
 
     #[test]

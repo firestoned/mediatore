@@ -70,6 +70,10 @@ pub struct WatcherConfig {
     /// `policy.egress` (ADR-0030): decides whether a bundle's direct egress is `P006` or,
     /// as the broker serves it, only its unservable entries are `P007`.
     pub egress_mode: crate::policy::EgressMode,
+    /// The audiences served from the requester's own credential (`via: delegated`,
+    /// ADR-0035). A sandbox naming one whose delegation did not reach its record is
+    /// refused before the claim binds a VM.
+    pub delegated_audiences: std::collections::BTreeSet<String>,
 }
 
 impl Default for WatcherConfig {
@@ -83,6 +87,7 @@ impl Default for WatcherConfig {
             reachable_registries: None,
             retention: Duration::from_hours(1),
             egress_mode: crate::policy::EgressMode::default(),
+            delegated_audiences: std::collections::BTreeSet::new(),
         }
     }
 }

@@ -612,7 +612,7 @@ impl Watcher {
                         phase: SandboxPhase::Failed,
                         entry_set: false,
                         ready: false,
-                        reason: Some("claim gone".into()),
+                        reason: current.reason.clone().or_else(|| Some("claim gone".into())),
                         observed_generation: sb.metadata.generation,
                         conditions: self.conditions(sb, &current.conditions),
                         ..current
@@ -632,6 +632,12 @@ impl Watcher {
             return Ok(Action::await_change());
         };
         let record = self.record_of(sb, uid).await?;
+        if let Some(refused) = self
+            .refuse_without_delegation(sb, &claim, &record, &current)
+            .await?
+        {
+            return Ok(refused);
+        }
         let mut status = mirror_status(sb, &claim, &record);
         status.conditions = self.conditions(sb, &current.conditions);
         // The entry is set (on Bound) or retracted (on Releasing / Failed) by the claim
@@ -787,6 +793,50 @@ impl Watcher {
             }
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// ADR-0035: a sandbox under a delegated audience runs on the requester's own
+    /// credential and nothing else. One whose delegation never reached the record (swept
+    /// after its hour, or never sent) would bind a VM to run with nothing to place: refused
+    /// here, the claim deleted before a member is consumed, never recreated.
+    async fn refuse_without_delegation(
+        &self,
+        sb: &AgentSandbox,
+        claim: &VirtualMachineClaim,
+        record: &ClaimRecord,
+        current: &AgentSandboxStatus,
+    ) -> Result<Option<Action>, WatchError> {
+        let Some(audience) = self.delegation_missing(sb, record) else {
+            return Ok(None);
+        };
+        let name = sb.name_any();
+        let namespace = sb.namespace().unwrap_or_default();
+        let reason = format!(
+            "delegation_required: no delegated credential for {audience} reached the record (parked for over an hour before the claim could bind, or never sent)"
+        );
+        tracing::warn!(sandbox = %name, %namespace, claim_uid = %record.uid, %audience, "sandbox refused: its delegated credential is gone; claim deleted");
+        self.reconciler.release(record.uid).await?;
+        self.claims.delete_claim(&namespace, &name).await?;
+        let mut status = mirror_status(sb, claim, record);
+        status.phase = SandboxPhase::Failed;
+        status.entry_set = false;
+        status.ready = false;
+        status.reason = Some(reason);
+        status.conditions = self.conditions(sb, &current.conditions);
+        self.mirror(sb, status).await?;
+        Ok(Some(Action::await_change()))
+    }
+
+    /// The first audience of the sandbox served from a delegated credential (ADR-0035)
+    /// that the record holds no delegation for.
+    fn delegation_missing(&self, sb: &AgentSandbox, record: &ClaimRecord) -> Option<String> {
+        sb.spec
+            .audiences
+            .iter()
+            .find(|a| {
+                self.cfg.delegated_audiences.contains(*a) && !record.delegations.contains_key(*a)
+            })
+            .cloned()
     }
 
     /// A parked session the sandbox will never consume (refused, or going away).
@@ -1114,6 +1164,59 @@ mod tests {
                 .len(),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn a_sandbox_whose_delegated_credential_never_reached_its_record_is_failed_and_its_claim_deleted()
+     {
+        let delegated = || WatcherConfig {
+            delegated_audiences: ["api.example".to_owned()].into_iter().collect(),
+            ..cfg()
+        };
+        // Nothing parked: the delegation was swept after its hour, or never sent.
+        let r = rig(delegated());
+        let cur = settle(&r, &sandbox(false, false)).await;
+        let status = cur.status.clone().unwrap();
+        assert_eq!(status.phase, SandboxPhase::Failed);
+        assert!(
+            status
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("delegation_required"),
+            "{:?}",
+            status.reason
+        );
+        assert!(
+            r.claims.claim("sandboxes", "sb-1").is_none(),
+            "the claim is deleted before a member is consumed"
+        );
+        // Settled: a later pass keeps the refusal and creates no second claim.
+        r.watcher.reconcile_sandbox(&cur).await.unwrap();
+        let again = r.claims.sandbox("sandboxes", "sb-1").unwrap();
+        let status = again.status.unwrap();
+        assert_eq!(status.phase, SandboxPhase::Failed);
+        assert!(status.reason.unwrap().starts_with("delegation_required"));
+        assert!(r.claims.claim("sandboxes", "sb-1").is_none());
+
+        // The delegation parked: the record takes it and the sandbox goes on.
+        let r = rig(delegated());
+        r.store
+            .put_session(mediatore_store::SessionRecord {
+                audience: Some("api.example".into()),
+                ..parked_session()
+            })
+            .await
+            .unwrap();
+        let cur = settle(&r, &sandbox(false, false)).await;
+        assert_ne!(cur.status.unwrap().phase, SandboxPhase::Failed);
+        let claim = r.claims.claim("sandboxes", "sb-1").expect("claim created");
+        let rec = r
+            .store
+            .get_claim(claim_uid_of(&claim).unwrap())
+            .await
+            .unwrap();
+        assert!(rec.delegations.contains_key("api.example"));
     }
 
     #[test]

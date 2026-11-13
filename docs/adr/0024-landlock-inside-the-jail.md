@@ -60,7 +60,8 @@ of this workspace (ADR-0007, `deny.toml`).
 
 1. **nsjail stays the outer jail; Landlock is the inner layer, applied by the workload's
    own process.** nsjail keeps doing what only a privileged parent can: the rootfs as
-   root, the user and group, the mounts, the rlimits, no `/proc`, the VM's namespace.
+   root, the user and group, the mounts, the rlimits, no `/proc` (since ADR-0036, a
+   `/proc` showing the jail's own processes alone), the VM's namespace.
    What nsjail execs is no longer the workload but the one binary, mounted read-only at
    the pinned path already (ADR-0014 decision 4): `/usr/bin/mediatore jail-exec`, which
    builds the capability set, applies it to itself and execs the workload's argv. The
@@ -130,7 +131,8 @@ of this workspace (ADR-0007, `deny.toml`).
   packet filter.
 - Rejected: a seccomp allowlist per image (unwritable in general, blind to paths and
   ports); running the `nono` CLI inside the jail as the supervisor (it wants `/proc` for
-  its connect mediation and a delegated cgroup, both deliberately absent, and the guest
+  its connect mediation and a delegated cgroup, both deliberately absent then, the
+  `/proc` of ADR-0036 being the process directories alone, and the guest
   is already the supervisor); the raw `landlock` crate (it would mean re-implementing
   the ABI and scope handling nono maintains, for no gain in dependencies); applying
   Landlock from the guest before `nsjail` (the guest is root and must stay unconfined
