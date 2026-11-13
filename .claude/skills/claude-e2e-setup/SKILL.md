@@ -87,7 +87,14 @@ registered, the mirror reachable from the segment.
 kubectl -n banlieue-system get virtualmachines
 kubectl -n banlieue-system get sandboxnodes            # PROVIDER filled, BANNED false
 kubectl -n banlieue-system logs deploy/mediatore | grep 'node registered'
+kubectl -n banlieue-system get configmap banlieue-claim-subject-policy -o jsonpath='{.data.brokers}{.data.issuers}'
+# system:serviceaccount:banlieue-system:mediatore and the issuer URL: without them every claim is forbidden
 ```
+
+A sandbox that stays `Pending` while the broker logs `virtualmachineclaims ... is forbidden:
+ValidatingAdmissionPolicy 'banlieue-virtualmachineclaim-subject-authorization'` is that
+ConfigMap, not the pool. A member that binds and whose workload exits within a second with
+`Can't access working directory` is a guest older than ADR-0036 (no `/proc` in the jail).
 
 A member logging `mediatore unreachable` is the relay or the listener (step 4), not the
 member.

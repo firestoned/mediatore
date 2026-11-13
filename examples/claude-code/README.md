@@ -24,6 +24,21 @@ claim; `env:CLAUDE_CODE_OAUTH_TOKEN` takes a `claude setup-token` instead. The a
 among its `extra_headers` if the policy's rules let a bare SDK through; Claude Code sends
 that header itself.
 
+Two things the live run taught (`docs/guides/testing.md`, run 8):
+
+- **The guest must be at ADR-0036 or later** (mediatore v0.2.2). Claude Code, like most
+  Node programs, reads `/proc/self` on start; a jail without `/proc` fails it within a
+  second with `Can't access working directory /work: Path "/work" does not exist`, the
+  directory being there all along. The jail's `/proc` shows the workload's own processes
+  and nothing else.
+- **The Keychain session is fresh for eight hours after `claude auth login`.** Claude Code
+  refreshes its access token in memory and does not write the refreshed one back to the
+  Keychain item the `claude-code` source reads, so a session logged in yesterday is refused
+  by the CLI ("the credential expired at ...") although `claude` itself still works. Run
+  `claude auth login` again, or use `env:CLAUDE_CODE_OAUTH_TOKEN` with a `claude setup-token`.
+  ADR-0035 phase 3, the CLI refreshing with the refresh token it already reads, removes
+  this step.
+
 The script `claude-sandbox` is the whole of the sandbox machinery in the image: it sets
 `PATH` (the jail sets none), `CLAUDE_CODE_OAUTH_TOKEN` from the phantom and
 `ANTHROPIC_BASE_URL` to the proxy's route for `api.anthropic.com`, then runs `claude` with

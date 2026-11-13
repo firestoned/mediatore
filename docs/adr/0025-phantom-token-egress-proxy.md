@@ -211,7 +211,8 @@ audience, and the audience chooses the token.
   TTL bound it, and per-request approval is the next instrument. R-12 is unchanged.
 - The proxy shares the sandbox uid with the workload. What keeps the workload out of
   the proxy's memory is not the uid: the jail is a PID namespace of its own with no
-  `/proc` (`nsjail`, ADR-0020), so the proxy's process has no pid the workload can name
+  `/proc` (`nsjail`, ADR-0020; since ADR-0036 a `/proc` of the jail's own processes,
+  which changes nothing here), so the proxy's process has no pid the workload can name
   for `ptrace` or `process_vm_readv`, and Landlock scopes its signals and abstract Unix
   sockets to the jail (ADR-0024). Yama's `ptrace_scope` is 0 on Debian 13 and is not
   relied on; setting it to 1 on the image is a cheap second line and a roadmap 06 item.

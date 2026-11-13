@@ -297,6 +297,12 @@ async fn claim_watcher(
             reachable_registries: cfg.reachable_registries(),
             retention: std::time::Duration::from_secs(cfg.store.retention_secs),
             egress_mode: cfg.policy.as_ref().map(|p| p.egress).unwrap_or_default(),
+            delegated_audiences: cfg
+                .audiences
+                .iter()
+                .filter(|a| a.via == mediatore_entra::Backend::Delegated)
+                .map(|a| a.name.clone())
+                .collect(),
             ..WatcherConfig::default()
         },
     );

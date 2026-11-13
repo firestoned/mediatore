@@ -47,8 +47,11 @@ platform, and all three are absences.
   token file and nothing at `/usr/bin/mediatore`, where the guest mounts the one binary.
 - **No listener.** Nothing inbound ever reaches a sandbox ([ADR-0010](../adr/0010-no-inbound-to-sandboxes.md)). The agent
   takes its question from its arguments and delivers its answer by writing to the audience.
-- **No reliance on `/proc`, devices or setuid.** The jail mounts none of them; the rootfs is
-  root-owned and read-only, `/work` is the writable directory and `$HOME` a tmpfs
+- **No reliance on devices or setuid.** The jail mounts no `/dev` and strips setuid; its
+  `/proc` shows the workload's own processes and nothing else
+  ([ADR-0036](../adr/0036-proc-inside-the-jail-the-workloads-own-processes-only.md)), enough
+  for Node, Go and the JVM to find their own cwd and limits. The rootfs is root-owned and
+  read-only, `/work` is the writable directory and `$HOME` a tmpfs
   ([ADR-0021](../adr/0021-sandbox-filesystem-tmpfs-and-rootfs-from-the-registry.md)).
 
 ```dockerfile

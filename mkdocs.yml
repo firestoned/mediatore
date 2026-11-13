@@ -188,5 +188,6 @@ nav:
       - "ADR-0033: A one-shot workload and its restart policy": adr/0033-a-one-shot-workload-the-restart-policy-and-the-claim-released-when-it-is-done.md
       - "ADR-0034: The Kubernetes API as the broker's store": adr/0034-the-kubernetes-api-as-the-brokers-store.md
       - "ADR-0035: A requester's own session, delegated at claim time": adr/0035-a-requesters-own-session-delegated-at-claim-time.md
+      - "ADR-0036: /proc inside the jail, the workload's own processes only": adr/0036-proc-inside-the-jail-the-workloads-own-processes-only.md
   - Security:
       - Threat model: security/threat-model.md

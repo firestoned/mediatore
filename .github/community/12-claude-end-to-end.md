@@ -53,9 +53,18 @@ document tracks what is still open on the path.
       with the claim (`--delegate anthropic=claude-code`, `env:`, `file:`), sealed per
       audience in its own Secret, placed by the proxy, never in the jail, the four refusals,
       `examples/claude-code` and `make claude-code-image`, `e2e_dev.rs` and the conformance
-      suite. Open: the live run with Claude Code in the jail (run 8); phase 2, the envelope
-      sealed on the desktop under OpenBao transit with the two-step claim, once the homelab
-      broker is on the transit sealer; phase 3, refresh behind a configured endpoint
+      suite. The live run (run 8, 2026-11-12) found two things on the way: the jail had no
+      `/proc` and Node refuses to start without one, fixed by ADR-0036 (`subset=pid,
+      hidepid=invisible`, the workload's own processes alone); and a delegation parked for
+      over an hour before the claim could bind is swept, after which the sandbox ran with
+      nothing to place, now refused before a member binds (`delegation_required` on the
+      sandbox, the claim deleted). Open: run 8 itself, on the guest at ADR-0036; phase 2,
+      the envelope sealed on the desktop under OpenBao transit with the two-step claim, once
+      the homelab broker is on the transit sealer; phase 3, refresh, now required rather
+      than optional: Claude Code keeps its refreshed access token in memory and never
+      writes it back to the Keychain item the `claude-code` source reads, so the source is
+      fresh for eight hours after `claude auth login` and stale after; the CLI holds the
+      refresh token already and must use it
 - [ ] **The key's bound.** A workspace of its own at Anthropic with a spend limit, the key
       in `mediatore-audience-secrets`, the rotation rehearsed once (edit, restart, a claim
       minting again within `max_ttl`)
