@@ -189,6 +189,7 @@ impl Harness {
             client_secret: Some(GOOGLE_SECRET.into()),
             login_hint: None,
             ca_pem: None,
+            redirect: mediatore_client::Redirect::default(),
         }
     }
 
@@ -202,6 +203,7 @@ impl Harness {
             client_secret: None,
             login_hint: None,
             ca_pem: None,
+            redirect: mediatore_client::Redirect::default(),
         }
     }
 

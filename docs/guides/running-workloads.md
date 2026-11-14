@@ -44,6 +44,15 @@ need interactivity, the workload dials **out** (see
    mediatore login --issuer https://dex.home.example --ca-file ~/.config/mediatore/dex-ca.pem
    ```
 
+   `mediatore login` redirects back to a loopback listener on a fixed port: `http://localhost:8000`,
+   or `http://localhost:18000` when 8000 is busy (kubelogin's own pair). An issuer that matches a
+   public client's redirect URIs exactly, as Dex does, cannot register a port chosen at random, so
+   register these two for the `mediatore` client. `--redirect-port` (repeatable), `--redirect-host`
+   and `--redirect-path` change them for an issuer that registered something else, and
+   `--redirect-port 0` asks the OS for a port, for an issuer that accepts any loopback one. Where
+   the CLI is not installed, kubelogin with `--oidc-client-id=mediatore` does the same login and
+   its ID token is the bearer for the API.
+
    The token's `aud` is mediatore and (on Entra) `scp` contains `sandbox.access`.
    A kubectl/kubelogin token for the Kubernetes API does **not** work here: wrong
    audience, rejected with 401 by design.
