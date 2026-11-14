@@ -2231,7 +2231,7 @@ dependencies = [
  "chrono",
  "mediatore-store",
  "sandboxpolicy-bundle",
- "sandboxpolicy-types",
+ "sandboxpolicy-types 0.3.4 (git+https://github.com/firestoned/notaio?tag=v0.3.5)",
  "serde",
  "thiserror",
  "tokio",
@@ -3176,7 +3176,7 @@ dependencies = [
  "base64 0.23.1",
  "chrono",
  "ed25519-dalek",
- "sandboxpolicy-types",
+ "sandboxpolicy-types 0.3.4 (git+https://github.com/firestoned/notaio?tag=v0.3.4)",
  "serde",
  "serde_json",
  "sha2",
@@ -3187,6 +3187,16 @@ dependencies = [
 name = "sandboxpolicy-types"
 version = "0.3.4"
 source = "git+https://github.com/firestoned/notaio?tag=v0.3.4#2f6081703c268ce291df5b856478ded83fd1fa4e"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "sandboxpolicy-types"
+version = "0.3.4"
+source = "git+https://github.com/firestoned/notaio?tag=v0.3.5#987cc4af22af3d2d13803d3565d598ca61fdf172"
 dependencies = [
  "chrono",
  "serde",
@@ -3326,7 +3336,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d43fb82d550b07e6f929a58d7d0935182602f48ddead875f5ee313c41c8f07fe"
 dependencies = [
  "annotate-snippets",
- "base64 0.23.1",
+ "base64 0.22.1",
  "encoding_rs_io",
  "granit-parser",
  "nohash-hasher",
@@ -3849,7 +3859,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
