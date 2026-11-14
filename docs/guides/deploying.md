@@ -492,7 +492,15 @@ ports from the segment, or `nft list table inet mediatore_gateway` on its consol
 is a gateway's sandbox address with port `3129`, `MEDIATORE_URL` is
 `https://<the same address>:3130`, `/etc/mediatore/gateways` lists the three sandbox
 addresses with the data port, the list the guest uses until the broker's `gateways` arrives
-(ADR-0027 decision 4), and `/etc/mediatore/registries` lists the mirror below. The broker's
+(ADR-0027 decision 4), and `/etc/mediatore/registries` lists the mirror below. Where the
+SPIRE servers publish a bundle endpoint with a certificate from a CA the image trusts, a fifth
+place replaces the baked bundle ([ADR-0037](../adr/0037-the-pool-fetches-its-spire-bundle-at-boot-through-the-relay.md)):
+the gateways' env names the endpoint (`RELAY_BUNDLE_PORT=3131`, `SPIRE_BUNDLE_ADDRESS`,
+`SPIRE_BUNDLE_PORT=8443`), the pool's `/etc/mediatore-guest/env` names `SPIRE_BUNDLE_HOST` (the
+endpoint's hostname, as its certificate names it), `SPIRE_BUNDLE_PORT=3131`,
+`SPIRE_BUNDLE_GATEWAY` (a gateway's sandbox address) and optionally `SPIRE_BUNDLE_CA`, and the
+agent reads `/run/spire/bundle.json` in the `spiffe` format. The bundle is fetched at every boot
+by `spire-bundle-fetch.service`, which the agent requires, so it cannot go stale. The broker's
 `gateways` lists the same three. The agent holds one server address, so it fails over
 between gateways only when it restarts; the forwarder fails over per connection. The
 pool's members take their addresses from the pool's `addressing` (banlieue ADR-0056: the
@@ -523,12 +531,35 @@ names it for a plain-HTTP mirror (pin by digest; no credential crosses plain HTT
 ADR-0022) or `MEDIATORE_REGISTRY_CA` points at the PEM of the CA your mirror's certificate
 chains to, trusted beside the Mozilla roots for the pull.
 
+**The registry through the relay** ([ADR-0038](../adr/0038-the-pull-reaches-the-operators-registry-through-a-fourth-relay-leg.md)).
+Where a host cannot be placed on the segment, the pool pulls through a fourth leg of the
+gateway's control relay: `RELAY_REGISTRY_PORT` (3132) to `REGISTRY_ADDRESS:REGISTRY_PORT`
+(the registry, 443), a fixed upstream by address like the other three. Declare it twice. On
+the broker, `- { host: registry.example.com, reach: relay }` (a credential is allowed: the
+TLS is the registry's, end to end). On the pool, in `/etc/mediatore-guest/env`,
+`MEDIATORE_RELAY_REGISTRIES=registry.example.com=3132`, the registry's own name and the leg's
+port; the gateway is the one `MEDIATORE_URL` names, by address. The image reference carries
+no port: the guest dials the gateway at 3132 for that name and keeps the name for the TLS
+server name, the certificate check and the `Host` header, so the image reference is the one
+the registry knows. Three things to know. The pull is root's: the host table admits the leg
+to uid 0 alone (`meta skuid 0`) and the jail's ruleset never lists it, so the sandbox
+reaches the registry's content only through the egress proxy, under its claim's policy.
+The leg is L4 and cannot restrict paths, so the registry must: point the leg at a repository
+dedicated to the pool's images, read-only (anonymous, or the broker-supplied credential),
+and have claims name images by digest. And only a registry that serves its blobs itself
+fits: one that redirects layers to a cloud-storage host fails the claim before the jail
+(the log names the host), because the puller refuses a redirect off the declared names; set
+the registry to proxy the download, or declare the content host as a second leg. A gateway
+running the static allowlist (no authorizer yet) lets every claim reach the hosts on it
+through the egress proxy; this leg does not change that.
+
 With `/etc/mediatore/gateways` present the image loads a second table at boot,
 `inet mediatore_host`, before the agent and the guest may start (ADR-0029 decision 3;
 `image/host-table`, `mediatore-host-nft.service`): input default drop but loopback and
 established traffic, output default drop but loopback, established traffic and TCP to the
 three gateways' data port, the relay's two ports (read from `MEDIATORE_URL` and the agent's
-`server_address`) and the registries file, forward dropped, every entry an IPv4 address
+`server_address`), the bundle leg and, for root alone, the registry legs
+(`MEDIATORE_RELAY_REGISTRIES`), and the registries file, forward dropped, every entry an IPv4 address
 and a port or the table refuses to load and the VM stays down. That is the bound on root
 and every other uid; the sandbox uid's per-claim table sits beside it. Without the
 gateways file the unit is skipped and the pool runs as before. `nft list table inet

@@ -68,6 +68,16 @@ pub struct GuestArgs {
         value_delimiter = ','
     )]
     pub plain_http_registries: Vec<String>,
+    /// A registry reached through a gateway's registry leg (ADR-0038): `host=port`, the
+    /// registry's own name and the leg's port; the gateway is the one `MEDIATORE_URL` names.
+    /// Repeatable, or comma-separated in the environment
+    #[arg(
+        long = "relay-registry",
+        env = "MEDIATORE_RELAY_REGISTRIES",
+        value_name = "HOST=PORT",
+        value_delimiter = ','
+    )]
+    pub relay_registries: Vec<String>,
     /// A PEM of CA certificates trusted beside the Mozilla roots for the pull: the
     /// registry mirror on the segment, on the operator's PKI (ADR-0029 decision 1)
     #[arg(long, env = "MEDIATORE_REGISTRY_CA", value_name = "PEM")]
@@ -104,6 +114,44 @@ pub struct GuestArgs {
     /// Dev only: stop after fetching the subject; no user, no jail
     #[arg(long, hide = true)]
     pub dev_skip_setup: bool,
+}
+
+/// The gateway the registry legs are on (ADR-0038 decision 2): the one `MEDIATORE_URL` names,
+/// by IPv4 address, as the host table does (ADR-0029: the segment has no resolver).
+fn relay_gateway(mediatore_url: &str) -> anyhow::Result<std::net::IpAddr> {
+    let bad = || {
+        anyhow::anyhow!(
+            "MEDIATORE_RELAY_REGISTRIES needs MEDIATORE_URL to name a gateway by IPv4 address, got {mediatore_url:?} (the segment has no resolver)"
+        )
+    };
+    let url = reqwest::Url::parse(mediatore_url).map_err(|_| bad())?;
+    url.host_str()
+        .and_then(|h| h.parse::<std::net::Ipv4Addr>().ok())
+        .map(std::net::IpAddr::V4)
+        .ok_or_else(bad)
+}
+
+/// The pull client for this guest: plain-HTTP registries, the operator's CA, and the
+/// registries reached through a gateway's registry leg (ADR-0038).
+fn puller(
+    plain_http: &[String],
+    registry_ca: Option<&std::path::Path>,
+    relay_registries: &[String],
+    mediatore_url: &str,
+) -> anyhow::Result<image::Puller> {
+    let mut client = image::Puller::new(plain_http)?;
+    if let Some(ca) = registry_ca {
+        let pem =
+            std::fs::read(ca).map_err(|e| anyhow::anyhow!("registry CA {}: {e}", ca.display()))?;
+        client = client
+            .with_registry_ca(&pem)
+            .map_err(|e| anyhow::anyhow!("registry CA {}: {e}", ca.display()))?;
+    }
+    let entries = image::parse_relay_registries(&relay_registries.join(","))?;
+    if !entries.is_empty() {
+        client = client.with_relay_registries(relay_gateway(mediatore_url)?, &entries)?;
+    }
+    Ok(client)
 }
 
 fn tmpfs_size(s: &str) -> Result<String, String> {
@@ -301,14 +349,12 @@ async fn serve_claim(
     };
     tmpfs.mount().await?;
     let layout = sandboxfs::prepare(&args.sandbox_root, uid, gid)?;
-    let mut registry_client = image::Puller::new(&args.plain_http_registries)?;
-    if let Some(ca) = &args.registry_ca {
-        let pem =
-            std::fs::read(ca).map_err(|e| anyhow::anyhow!("registry CA {}: {e}", ca.display()))?;
-        registry_client = registry_client
-            .with_registry_ca(&pem)
-            .map_err(|e| anyhow::anyhow!("registry CA {}: {e}", ca.display()))?;
-    }
+    let registry_client = puller(
+        &args.plain_http_registries,
+        args.registry_ca.as_deref(),
+        &args.relay_registries,
+        &args.mediatore_url,
+    )?;
     let pulled = registry_client
         .pull(
             reference,
@@ -467,6 +513,66 @@ async fn serve_claim(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_registry_legs_gateway_is_the_one_mediatore_url_names_by_address() {
+        let g = |u: &str| super::relay_gateway(u);
+        assert_eq!(
+            g("https://192.0.2.1:3130").unwrap(),
+            "192.0.2.1".parse::<std::net::IpAddr>().unwrap()
+        );
+        assert_eq!(
+            g("https://192.0.2.1").unwrap(),
+            "192.0.2.1".parse::<std::net::IpAddr>().unwrap()
+        );
+        for bad in [
+            "https://broker.example:3130",
+            "https://localhost",
+            "not a url",
+            "https://[2001:db8::1]:3130",
+        ] {
+            let err = g(bad).unwrap_err().to_string();
+            assert!(
+                err.contains("MEDIATORE_RELAY_REGISTRIES") && err.contains("MEDIATORE_URL"),
+                "{bad}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_puller_is_built_with_the_relay_registries_when_declared() {
+        let plain = Vec::new();
+        let none = super::puller(&plain, None, &[], "https://broker.example").unwrap();
+        drop(none);
+        let with = super::puller(
+            &plain,
+            None,
+            &[
+                "registry.example=3132".to_string(),
+                "mirror.example=3133".to_string(),
+            ],
+            "https://192.0.2.1:3130",
+        );
+        assert!(with.is_ok());
+        let err = super::puller(
+            &plain,
+            None,
+            &["registry.example=3132".to_string()],
+            "https://broker.example:3130",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("MEDIATORE_URL"), "{err}");
+        let err = super::puller(
+            &plain,
+            None,
+            &["registry.example".to_string()],
+            "https://192.0.2.1",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("host=port"), "{err}");
+    }
+
     #[test]
     fn the_proxys_readiness_wait_outlasts_its_wait_for_the_claim_svid() {
         assert!(

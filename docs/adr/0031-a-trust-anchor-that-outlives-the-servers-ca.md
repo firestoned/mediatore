@@ -3,7 +3,7 @@
 
 # ADR-0031: The agent's trust anchor outlives the server's CA: OpenBao's PKI as the upstream authority
 
-**Status:** Implemented · **Date:** 2026-11-07 (the homelab cluster's switch is roadmap 02's open item)
+**Status:** Implemented · **Date:** 2026-11-07 (the homelab cluster's switch is roadmap 02's open item) · **Amended:** 2026-11-14 by [ADR-0037](0037-the-pool-fetches-its-spire-bundle-at-boot-through-the-relay.md) (decision 4: where the SPIRE bundle endpoint serves a web PKI certificate, the first-boot bundle is fetched through the relay, not baked; this ADR's upstream root stays the stronger option and the two coexist)
 
 Roadmap 02 (the server) and roadmap 06 (the layer that carries the bundle). Amends
 [ADR-0027](0027-control-plane-relay-on-the-egress-gateway.md) decision 3 (what the bundle the

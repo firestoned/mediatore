@@ -29,15 +29,10 @@ stages:
     # /etc is an ephemeral overlay on Kairos: written at every boot, from this layer.
     - name: spire-agent-config
       files:
-        - path: /etc/spire/bundle.pem
-          permissions: 0644
-          owner: 0
-          group: 0
-          # `spire-server bundle show` on your SPIRE server (deploying guide, step 6).
-          content: |
-            -----BEGIN CERTIFICATE-----
-            ...your trust bundle...
-            -----END CERTIFICATE-----
+        # No bundle file: the agent's first-contact bundle is fetched at every boot through the
+        # gateway's bundle leg (ADR-0037; the SPIRE_BUNDLE_* lines of /etc/mediatore-guest/env
+        # below). A deployment with no bundle endpoint writes /etc/spire/bundle.pem here instead
+        # (`spire-server bundle show`, deploying guide step 6) and sets trust_bundle_path to it.
         - path: /etc/spire/agent.conf
           permissions: 0644
           owner: 0
@@ -53,7 +48,8 @@ stages:
               trust_domain = "sandbox.home.example"
               server_address = "198.51.100.1"
               server_port = "3129"
-              trust_bundle_path = "/etc/spire/bundle.pem"
+              trust_bundle_path = "/run/spire/bundle.json"
+              trust_bundle_format = "spiffe"
               socket_path = "/run/spire/sockets/agent.sock"
               data_dir = "/var/lib/spire/agent"
               log_level = "INFO"
@@ -92,7 +88,13 @@ stages:
           content: |
             MEDIATORE_URL=https://198.51.100.1:3130
             SPIFFE_ENDPOINT_SOCKET=/run/spire/sockets/agent.sock
+            SPIRE_BUNDLE_HOST=spire.sandbox.example
+            SPIRE_BUNDLE_PORT=3131
+            SPIRE_BUNDLE_GATEWAY=198.51.100.1
+            SPIRE_BUNDLE_CA=/etc/mediatore/bundle-ca.pem
             MEDIATORE_REGISTRY_CA=/etc/mediatore/registry-ca.pem
+            # Registries reached through a gateway's registry leg (ADR-0038): name=port, comma separated.
+            # MEDIATORE_RELAY_REGISTRIES=registry.example.com=3132
             RUST_LOG=info
     - name: mediatore-gateways
       files:
@@ -127,4 +129,15 @@ stages:
           content: |
             -----BEGIN CERTIFICATE-----
             ...your registry CA...
+            -----END CERTIFICATE-----
+        # The roots the bundle endpoint's certificate chains to (SPIRE_BUNDLE_CA in the env
+        # above), public material; leave it out, and the line, when the image's own trust
+        # store already holds them (ADR-0037).
+        - path: /etc/mediatore/bundle-ca.pem
+          permissions: 0644
+          owner: 0
+          group: 0
+          content: |
+            -----BEGIN CERTIFICATE-----
+            ...the CA the bundle endpoint's certificate chains to...
             -----END CERTIFICATE-----

@@ -53,10 +53,11 @@ ARG TPM_PLUGIN_AGENT_SHA
 # tpm2-tools: the EK certificate export banlieue's layer runs (its examples/21).
 # qemu-guest-agent: the libvirt provider reads /run/banlieue through it (ADR-0019).
 # nftables: the jail's ruleset (ADR-0020); the base has it, named so a base without it fails.
+# curl, ca-certificates: the boot-time fetch of the SPIRE bundle through the gateway (ADR-0037).
 # libprotobuf32t64, libnl-route-3-200: what the nsjail binary built above links against.
 # Removed: every listener the base ships. Nothing inbound (ADR-0010 decision 2).
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends tpm2-tools qemu-guest-agent nftables libprotobuf32t64 libnl-route-3-200 \
+    && apt-get install -y --no-install-recommends tpm2-tools qemu-guest-agent nftables curl ca-certificates libprotobuf32t64 libnl-route-3-200 \
     && apt-get purge -y --auto-remove openssh-server openssh-sftp-server snmpd lldpd fail2ban rpcbind nfs-common \
     && rm -rf /var/lib/apt/lists/* \
     && ! command -v sshd
@@ -67,8 +68,8 @@ RUN useradd --system --user-group --home-dir /var/lib/spire --no-create-home --s
 
 # The pool VM's host table (ADR-0029): the bound on every uid in an environment with
 # gateways, rendered from the pool's own files and loaded before the agent and the guest.
-COPY image/host-table /usr/libexec/mediatore/host-table
-RUN chmod 0755 /usr/libexec/mediatore/host-table
+COPY image/host-table image/spire-bundle-fetch /usr/libexec/mediatore/
+RUN chmod 0755 /usr/libexec/mediatore/host-table /usr/libexec/mediatore/spire-bundle-fetch
 
 # Two directories the immutable root must already have, since nothing can create them at
 # boot: the sandbox root the guest mounts its per-claim tmpfs on (ADR-0021; the base has
@@ -84,11 +85,11 @@ COPY --from=nsjail /nsjail/nsjail /usr/bin/nsjail
 RUN chmod 0755 /usr/bin/mediatore /usr/bin/spire-agent /usr/lib/spire/tpm_attestor_agent /usr/bin/nsjail \
     && echo "${TPM_PLUGIN_AGENT_SHA}  /usr/lib/spire/tpm_attestor_agent" | sha256sum -c -
 
-COPY image/systemd/spire-agent.service image/systemd/mediatore-guest.service image/systemd/mediatore-host-nft.service /etc/systemd/system/
+COPY image/systemd/spire-agent.service image/systemd/mediatore-guest.service image/systemd/mediatore-host-nft.service image/systemd/spire-bundle-fetch.service /etc/systemd/system/
 # Yama's ptrace scope raised to 1: the second line behind the jail's PID namespace between
 # the workload and the egress proxy, both the sandbox uid (ADR-0025, roadmap 06).
 COPY image/sysctl/99-mediatore.conf /etc/sysctl.d/99-mediatore.conf
 COPY image/spire/agent.conf /usr/share/mediatore/agent.conf.example
 RUN grep -q "plugin_checksum = \"${TPM_PLUGIN_AGENT_SHA}\"" /usr/share/mediatore/agent.conf.example \
-    && systemctl enable spire-agent.service mediatore-guest.service mediatore-host-nft.service qemu-guest-agent.service \
+    && systemctl enable spire-agent.service mediatore-guest.service mediatore-host-nft.service spire-bundle-fetch.service qemu-guest-agent.service \
     && systemctl mask ssh.service ssh.socket sshd.service nftables.service

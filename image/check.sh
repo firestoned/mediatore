@@ -37,10 +37,12 @@ check "the sandbox root and the agent's configuration directory, 0755, in the im
 check "tpm2-tools, for the EK certificate export (banlieue examples/21)" 'command -v tpm2_nvread'
 check "qemu-guest-agent, the libvirt channel for GuestReady (ADR-0019)" 'command -v qemu-ga'
 check "the spire user, in the TPM device group" 'id -nG spire | tr " " "\n" | grep -qx tss'
-check "the three units installed" \
-  'test -f /etc/systemd/system/spire-agent.service && test -f /etc/systemd/system/mediatore-guest.service && test -f /etc/systemd/system/mediatore-host-nft.service'
-check "the three units enabled" \
-  'for u in spire-agent mediatore-guest mediatore-host-nft; do test -L /etc/systemd/system/multi-user.target.wants/$u.service || exit 1; done'
+check "the four units installed" \
+  'test -f /etc/systemd/system/spire-agent.service && test -f /etc/systemd/system/mediatore-guest.service && test -f /etc/systemd/system/mediatore-host-nft.service && test -f /etc/systemd/system/spire-bundle-fetch.service'
+check "the four units enabled" \
+  'for u in spire-agent mediatore-guest mediatore-host-nft spire-bundle-fetch; do test -L /etc/systemd/system/multi-user.target.wants/$u.service || exit 1; done'
+check "the bundle fetch (ADR-0037): curl and the system CAs, the script, its unit before the agent, which requires it" \
+  'command -v curl && test -f /etc/ssl/certs/ca-certificates.crt && test -x /usr/libexec/mediatore/spire-bundle-fetch && grep -q "^Before=spire-agent.service" /etc/systemd/system/spire-bundle-fetch.service && grep -q "^Requires=.*spire-bundle-fetch.service" /etc/systemd/system/spire-agent.service && grep -q "^After=.*mediatore-host-nft.service" /etc/systemd/system/spire-bundle-fetch.service'
 check "the host table script, rendering from the pool's files and refusing a name (ADR-0029)" \
   'test -x /usr/libexec/mediatore/host-table && d=$(mktemp -d) && printf "198.51.100.1:8443\n" > $d/g && printf "198.51.100.10:5000\n" > $d/r && printf "MEDIATORE_URL=https://198.51.100.1:3130\n" > $d/e && printf "agent {\n  server_address = \"198.51.100.1\"\n  server_port = \"3129\"\n}\n" > $d/a && /usr/libexec/mediatore/host-table --render $d/g $d/r $d/e $d/a | grep -q "policy drop" && printf "mirror.home.example:5000\n" > $d/r && ! /usr/libexec/mediatore/host-table --render $d/g $d/r $d/e $d/a >/dev/null 2>&1'
 check "the host table unit runs only with a gateway list, before the agent and the guest, which require it" \

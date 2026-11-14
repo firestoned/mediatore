@@ -9,8 +9,9 @@
 //! audit records. Layers are applied in order with whiteouts, and an entry that would land
 //! outside the rootfs refuses the image.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Component, Path, PathBuf};
 
 use mediatore_proto::image::{ImageReference, is_sha256_digest as is_digest};
@@ -118,10 +119,81 @@ pub struct Pulled {
     pub bytes: u64,
 }
 
+/// One registry the pool reaches through a gateway's registry leg (ADR-0038 decision 2):
+/// its name, as its certificate and its `Host` header know it, and the leg's port.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayRegistry {
+    /// The registry's name without a port, lower case: what its certificate carries.
+    pub host: String,
+    /// The relay's registry leg port on the gateway.
+    pub port: u16,
+}
+
+/// `MEDIATORE_RELAY_REGISTRIES`: `host=port`, comma separated. A host has no port of its own
+/// here (the name the certificate carries) and appears once; an entry half-read is an error.
+///
+/// # Errors
+/// An entry that is not `name=port`, a name with a port, a space or no characters, a port
+/// outside 1 to 65535, or a name listed twice.
+pub fn parse_relay_registries(value: &str) -> anyhow::Result<Vec<RelayRegistry>> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut out: Vec<RelayRegistry> = Vec::new();
+    for entry in value.split(',') {
+        let entry = entry.trim();
+        let (host, port) = entry.split_once('=').ok_or_else(|| {
+            anyhow::anyhow!("MEDIATORE_RELAY_REGISTRIES: {entry:?} is not host=port")
+        })?;
+        let host = host.trim().to_ascii_lowercase();
+        anyhow::ensure!(
+            !host.is_empty()
+                && host
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-'),
+            "MEDIATORE_RELAY_REGISTRIES: {host:?} is not a registry host name (no port, no space)"
+        );
+        let port: u16 = port.trim().parse().map_err(|_| {
+            anyhow::anyhow!("MEDIATORE_RELAY_REGISTRIES: {entry:?} has no valid port")
+        })?;
+        anyhow::ensure!(
+            port != 0,
+            "MEDIATORE_RELAY_REGISTRIES: {entry:?} has port 0"
+        );
+        anyhow::ensure!(
+            !out.iter().any(|e| e.host == host),
+            "MEDIATORE_RELAY_REGISTRIES: {host} is listed twice"
+        );
+        out.push(RelayRegistry { host, port });
+    }
+    Ok(out)
+}
+
+/// The gateway the registry legs are on, and each declared host's leg port.
+#[derive(Debug, Clone)]
+struct Relay {
+    gateway: IpAddr,
+    ports: BTreeMap<String, u16>,
+}
+
+/// Where a request goes: the URL to dial, the `Host` header to send in place of the URL's
+/// authority, and whether it went through a registry leg.
+#[derive(Debug)]
+struct Routed {
+    url: String,
+    host_header: Option<String>,
+    via_relay: bool,
+}
+
 /// The pull client: one per guest, anonymous, HTTPS unless the registry is listed as plain.
 #[derive(Debug, Clone)]
 pub struct Puller {
     http: reqwest::Client,
+    /// The extra roots a registry on the operator's PKI chains to (`MEDIATORE_REGISTRY_CA`).
+    registry_ca: Option<Vec<u8>>,
+    /// The registries reached through a gateway's registry leg (ADR-0038), when any.
+    relay: Option<Relay>,
     plain_http: BTreeSet<String>,
     platform: Platform,
     /// Never set outside tests: the fake registry speaks plain HTTP.
@@ -150,6 +222,8 @@ impl Puller {
             .build()?;
         Ok(Self {
             http,
+            registry_ca: None,
+            relay: None,
             plain_http: plain_http.iter().cloned().collect(),
             platform: Platform::this(),
             plain_http_credentials: false,
@@ -164,12 +238,34 @@ impl Puller {
     /// # Errors
     /// `pem` holds no certificate, or the client cannot be built.
     pub fn with_registry_ca(mut self, pem: &[u8]) -> anyhow::Result<Self> {
-        self.http = reqwest::Client::builder()
-            .tls_backend_preconfigured(mediatore_proto::tls::https_client_config_with_extra_roots(
-                pem,
-            )?)
-            .user_agent(concat!("mediatore-guest/", env!("CARGO_PKG_VERSION")))
-            .build()?;
+        // Parsed once here so an unusable PEM is an error now, whatever order the builders run in.
+        mediatore_proto::tls::https_client_config_with_extra_roots(pem)?;
+        self.registry_ca = Some(pem.to_vec());
+        self.http = build_client(self.registry_ca.as_deref(), self.relay.as_ref())?;
+        Ok(self)
+    }
+
+    /// Reach the declared registries through the gateway's registry legs (ADR-0038
+    /// decision 2): each declared name is dialled at `gateway` and its leg's port, and keeps
+    /// its own TLS server name, certificate check and `Host` header. Redirects are then
+    /// followed here, not by the client: one to a host that is not declared is refused.
+    ///
+    /// # Errors
+    /// The client cannot be built.
+    pub fn with_relay_registries(
+        mut self,
+        gateway: IpAddr,
+        entries: &[RelayRegistry],
+    ) -> anyhow::Result<Self> {
+        self.relay = if entries.is_empty() {
+            None
+        } else {
+            Some(Relay {
+                gateway,
+                ports: entries.iter().map(|e| (e.host.clone(), e.port)).collect(),
+            })
+        };
+        self.http = build_client(self.registry_ca.as_deref(), self.relay.as_ref())?;
         Ok(self)
     }
 
@@ -186,6 +282,83 @@ impl Puller {
     fn credentials_over_plain_http_for_tests(mut self) -> Self {
         self.plain_http_credentials = true;
         self
+    }
+
+    /// Where `url` is dialled: a declared registry goes to its leg's port (the name stays,
+    /// for the TLS server name and the certificate), everything else as written.
+    fn route(&self, url: &str) -> anyhow::Result<Routed> {
+        let direct = || Routed {
+            url: url.to_string(),
+            host_header: None,
+            via_relay: false,
+        };
+        let Some(relay) = &self.relay else {
+            return Ok(direct());
+        };
+        let mut parsed = reqwest::Url::parse(url)?;
+        let Some(host) = parsed.host_str().map(str::to_ascii_lowercase) else {
+            return Ok(direct());
+        };
+        let Some(port) = relay.ports.get(&host) else {
+            return Ok(direct());
+        };
+        let host_header = match parsed.port() {
+            Some(p) => format!("{host}:{p}"),
+            None => host,
+        };
+        parsed
+            .set_port(Some(*port))
+            .map_err(|()| anyhow::anyhow!("{url}: cannot set the leg's port"))?;
+        Ok(Routed {
+            url: parsed.to_string(),
+            host_header: Some(host_header),
+            via_relay: true,
+        })
+    }
+
+    /// GET `url`. Without declared registries the client follows redirects as it always did.
+    /// With them, redirects are followed here so each hop is routed again, and one that
+    /// leaves a declared registry for a host that is not declared is refused (ADR-0038
+    /// decision 2). `add` decorates each request; its flag says the hop is still on the
+    /// original host, which is the only place a credential goes.
+    async fn send_following(
+        &self,
+        url: &str,
+        add: impl Fn(reqwest::RequestBuilder, bool) -> reqwest::RequestBuilder,
+    ) -> anyhow::Result<reqwest::Response> {
+        let Some(relay) = &self.relay else {
+            return Ok(add(self.http.get(url), true).send().await?);
+        };
+        let origin = reqwest::Url::parse(url)?;
+        let mut current = origin.clone();
+        for _ in 0..10 {
+            let routed = self.route(current.as_str())?;
+            let mut req = self.http.get(&routed.url);
+            if let Some(h) = &routed.host_header {
+                req = req.header(reqwest::header::HOST, h);
+            }
+            let resp = add(req, current.host_str() == origin.host_str())
+                .send()
+                .await?;
+            if !resp.status().is_redirection() {
+                return Ok(resp);
+            }
+            let Some(location) = resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+            else {
+                return Ok(resp);
+            };
+            let next = current.join(location)?;
+            let next_host = next.host_str().unwrap_or_default().to_ascii_lowercase();
+            anyhow::ensure!(
+                !routed.via_relay || relay.ports.contains_key(&next_host),
+                "{url}: redirected to {next_host}, which is not declared in MEDIATORE_RELAY_REGISTRIES; refused (ADR-0038 decision 2)"
+            );
+            current = next;
+        }
+        anyhow::bail!("{url}: more than 10 redirects")
     }
 
     fn base(&self, reference: &ImageReference) -> String {
@@ -210,18 +383,24 @@ impl Puller {
         accept: Option<&str>,
     ) -> anyhow::Result<reqwest::Response> {
         for attempt in 0..2 {
-            let mut req = self.http.get(url);
-            if let Some(a) = accept {
-                req = req.header(reqwest::header::ACCEPT, a);
-            }
-            if let Some(t) = &session.token {
-                req = req.bearer_auth(t);
-            } else if session.send_basic
-                && let Some((user, password)) = &session.basic
-            {
-                req = req.basic_auth(user, Some(&password.0));
-            }
-            let resp = req.send().await?;
+            let resp = self
+                .send_following(url, |mut req, same_host| {
+                    if let Some(a) = accept {
+                        req = req.header(reqwest::header::ACCEPT, a);
+                    }
+                    if !same_host {
+                        return req;
+                    }
+                    if let Some(t) = &session.token {
+                        req = req.bearer_auth(t);
+                    } else if session.send_basic
+                        && let Some((user, password)) = &session.basic
+                    {
+                        req = req.basic_auth(user, Some(&password.0));
+                    }
+                    req
+                })
+                .await?;
             if resp.status() != reqwest::StatusCode::UNAUTHORIZED || attempt == 1 {
                 return Ok(resp);
             }
@@ -267,11 +446,16 @@ impl Puller {
         if let Some(s) = &c.scope {
             query.push(("scope", s.as_str()));
         }
-        let mut req = self.http.get(&c.realm).query(&query);
-        if let Some((user, password)) = basic {
-            req = req.basic_auth(user, Some(&password.0));
-        }
-        let resp = req.send().await?;
+        let mut realm = reqwest::Url::parse(&c.realm)?;
+        realm.query_pairs_mut().extend_pairs(&query);
+        let resp = self
+            .send_following(realm.as_str(), |mut req, same_host| {
+                if same_host && let Some((user, password)) = basic {
+                    req = req.basic_auth(user, Some(&password.0));
+                }
+                req
+            })
+            .await?;
         anyhow::ensure!(
             resp.status().is_success(),
             "token endpoint {} refused: {}{}",
@@ -503,6 +687,30 @@ struct BearerChallenge {
     realm: String,
     service: Option<String>,
     scope: Option<String>,
+}
+
+/// The one client the puller uses: TLS 1.3 over the Mozilla roots (and the operator's CA
+/// when given, ADR-0029), each declared relay registry pinned to its gateway, and redirects
+/// left to the puller when there are any (ADR-0038).
+fn build_client(pem: Option<&[u8]>, relay: Option<&Relay>) -> anyhow::Result<reqwest::Client> {
+    let tls = match pem {
+        Some(pem) => mediatore_proto::tls::https_client_config_with_extra_roots(pem)?,
+        None => mediatore_proto::tls::https_client_config(),
+    };
+    let mut builder = reqwest::Client::builder()
+        .tls_backend_preconfigured(tls)
+        .user_agent(concat!("mediatore-guest/", env!("CARGO_PKG_VERSION")));
+    if let Some(relay) = relay {
+        // Never an ambient proxy: a declared registry is dialled at its gateway by address, and a
+        // proxy in the environment would carry the request somewhere else without saying so.
+        builder = builder
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none());
+        for host in relay.ports.keys() {
+            builder = builder.resolve(host, SocketAddr::new(relay.gateway, 0));
+        }
+    }
+    Ok(builder.build()?)
 }
 
 fn parse_challenge(header: &str) -> Option<Challenge> {
@@ -1408,6 +1616,224 @@ mod tests {
         eprintln!(
             "pulled {image} as {} ({} layers, {} bytes)",
             got.digest, got.layers, got.bytes
+        );
+    }
+
+    // ----- the relay reach (ADR-0038): a declared registry is dialled at the gateway ---------------------------------
+
+    const GATEWAY: &str = "127.0.0.1";
+
+    fn relay_entry(host: &str, port: u16) -> RelayRegistry {
+        RelayRegistry {
+            host: host.into(),
+            port,
+        }
+    }
+
+    fn port_of(reg: &FakeRegistry) -> u16 {
+        reg.host().rsplit(':').next().unwrap().parse().unwrap()
+    }
+
+    fn relay_puller(plain: &[&str], entries: &[RelayRegistry]) -> Puller {
+        let plain: Vec<String> = plain.iter().map(|s| (*s).to_string()).collect();
+        Puller::new(&plain)
+            .unwrap()
+            .with_relay_registries(GATEWAY.parse().unwrap(), entries)
+            .unwrap()
+    }
+
+    fn one_layer_image() -> mediatore_testkit::registry::Built {
+        Image::new()
+            .layer(Layer::new().file("a", 0o644, b"a"), Compression::None)
+            .build()
+    }
+
+    #[test]
+    fn the_relay_registries_variable_is_host_equals_port_pairs() {
+        let got = parse_relay_registries("registry.example=3132, Mirror.Example=3133").unwrap();
+        assert_eq!(
+            got,
+            vec![
+                relay_entry("registry.example", 3132),
+                relay_entry("mirror.example", 3133)
+            ],
+            "hosts are lower-cased, whitespace around a pair is dropped"
+        );
+        assert_eq!(parse_relay_registries("").unwrap(), Vec::new());
+        for bad in [
+            "registry.example",
+            "registry.example=",
+            "=3132",
+            "registry.example=0",
+            "registry.example=70000",
+            "registry.example=x",
+            "registry.example:443=3132",
+            "registry.example=3132,registry.example=3133",
+            "a b=3132",
+        ] {
+            assert!(
+                parse_relay_registries(bad).is_err(),
+                "{bad:?} is refused, never half-read"
+            );
+        }
+    }
+
+    #[test]
+    fn a_declared_host_is_routed_to_its_leg_port_and_keeps_its_own_name() {
+        let p = relay_puller(&[], &[relay_entry("registry.example", 3132)]);
+        let r = p
+            .route("https://registry.example/v2/team/tool/manifests/v1?a=b")
+            .unwrap();
+        assert_eq!(
+            r.url, "https://registry.example:3132/v2/team/tool/manifests/v1?a=b",
+            "same name (the SNI and the certificate check), the leg's port"
+        );
+        assert_eq!(r.host_header.as_deref(), Some("registry.example"));
+        assert!(r.via_relay);
+        let r = p.route("https://Registry.Example:443/token").unwrap();
+        assert_eq!(r.url, "https://registry.example:3132/token");
+        assert_eq!(r.host_header.as_deref(), Some("registry.example"));
+        let other = p.route("https://other.example/v2/").unwrap();
+        assert_eq!(
+            other.url, "https://other.example/v2/",
+            "an undeclared host is dialled as before"
+        );
+        assert!(other.host_header.is_none() && !other.via_relay);
+    }
+
+    #[tokio::test]
+    async fn a_declared_registry_is_pulled_through_the_gateway_with_its_own_host_header() {
+        let reg = FakeRegistry::start().await;
+        reg.require_token(true);
+        reg.push("team/tool", "v1", &one_layer_image());
+        let s = scratch();
+        let puller = relay_puller(
+            &["registry.relay.test"],
+            &[relay_entry("registry.relay.test", port_of(&reg))],
+        );
+        puller
+            .pull(
+                &r("registry.relay.test/team/tool:v1"),
+                None,
+                &s.rootfs,
+                &s.scratch,
+            )
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(s.rootfs.join("a")).unwrap(), "a");
+        let seen = reg.hosts_seen();
+        let by_name = seen.iter().filter(|h| *h == "registry.relay.test").count();
+        assert!(
+            by_name >= 3,
+            "the manifest (twice, around the challenge) and the blobs carry the registry's own name: {seen:?}"
+        );
+        assert!(
+            seen.iter()
+                .all(|h| h == "registry.relay.test" || *h == reg.host()),
+            "the one other request is the fake's token realm, which names itself: {seen:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_redirect_from_a_declared_host_to_an_undeclared_one_fails_the_pull() {
+        let reg = FakeRegistry::start().await;
+        reg.push("team/tool", "v1", &one_layer_image());
+        reg.redirect_blobs_to("http://content.elsewhere.test");
+        let s = scratch();
+        let puller = relay_puller(
+            &["registry.relay.test"],
+            &[relay_entry("registry.relay.test", port_of(&reg))],
+        );
+        let err = puller
+            .pull(
+                &r("registry.relay.test/team/tool:v1"),
+                None,
+                &s.rootfs,
+                &s.scratch,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("content.elsewhere.test")
+                && err.contains("not declared")
+                && err.contains("MEDIATORE_RELAY_REGISTRIES"),
+            "the refusal names the host and the setting: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_redirect_to_another_declared_host_is_followed_through_the_gateway_and_drops_the_token()
+     {
+        let reg = FakeRegistry::start().await;
+        reg.require_token(true);
+        let content = FakeRegistry::start().await;
+        let img = one_layer_image();
+        reg.push("team/tool", "v1", &img);
+        content.push("team/tool", "v1", &img);
+        reg.redirect_blobs_to("http://content.relay.test");
+        let s = scratch();
+        let puller = relay_puller(
+            &["registry.relay.test", "content.relay.test"],
+            &[
+                relay_entry("registry.relay.test", port_of(&reg)),
+                relay_entry("content.relay.test", port_of(&content)),
+            ],
+        );
+        puller
+            .pull(
+                &r("registry.relay.test/team/tool:v1"),
+                None,
+                &s.rootfs,
+                &s.scratch,
+            )
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(s.rootfs.join("a")).unwrap(), "a");
+        assert!(
+            content.blob_requests() >= 1,
+            "the layer came from the content host"
+        );
+        assert_eq!(
+            content.bearer_seen(),
+            0,
+            "the registry's token does not follow a redirect to another host"
+        );
+        assert!(
+            content
+                .hosts_seen()
+                .iter()
+                .all(|h| h == "content.relay.test"),
+            "{:?}",
+            content.hosts_seen()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_registry_that_is_not_declared_is_pulled_as_before_redirects_included() {
+        let reg = FakeRegistry::start().await;
+        let content = FakeRegistry::start().await;
+        let img = one_layer_image();
+        reg.push("team/tool", "v1", &img);
+        content.push("team/tool", "v1", &img);
+        reg.redirect_blobs_to(&format!("http://{}", content.host()));
+        let s = scratch();
+        let puller = relay_puller(
+            &[&reg.host(), &content.host()],
+            &[relay_entry("registry.relay.test", 3132)],
+        );
+        puller
+            .pull(
+                &reference(&reg, "team/tool:v1"),
+                None,
+                &s.rootfs,
+                &s.scratch,
+            )
+            .await
+            .unwrap();
+        assert!(
+            content.blob_requests() >= 1,
+            "the redirect was followed directly"
         );
     }
 }

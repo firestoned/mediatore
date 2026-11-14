@@ -101,7 +101,8 @@ fn endpoints<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Endpoint>, D:
 /// (ADR-0022): handed by `GET /v1/me` to the guest whose claim names that registry. Since
 /// ADR-0029 also where the pool reaches it from: with `gateways` set every entry needs a
 /// `reach`, and an entry may carry no credential at all (an anonymous mirror on the
-/// segment), declared by its host and its reach alone.
+/// segment or behind a gateway's registry leg, ADR-0038), declared by its host and its reach
+/// alone.
 #[derive(Debug, Clone, Deserialize)]
 pub struct RegistryConfig {
     /// The registry as a reference names it (`ghcr.io`, `registry.internal:5000`,
@@ -126,6 +127,11 @@ pub enum RegistryReach {
     /// A registry or pull-through mirror with an address on the segment, reached at layer
     /// 2; the pool's host table admits its address (`/etc/mediatore/registries`).
     Segment,
+    /// A registry behind a gateway's registry leg (ADR-0038): the guest dials the gateway at
+    /// the leg's port with the registry's own name, `MEDIATORE_RELAY_REGISTRIES`, and the
+    /// host table admits that destination to root alone. A credential may be carried: the TLS
+    /// is the registry's, end to end.
+    Relay,
 }
 
 impl RegistryConfig {
@@ -561,7 +567,7 @@ impl Config {
             }
             if !self.gateways.is_empty() && r.reach.is_none() {
                 anyhow::bail!(
-                    "registries[{host}].reach is required once gateways are set: a gateway-era pool reaches a registry only where the environment put it, `segment` for a mirror on the sandbox segment (ADR-0029 decision 2)"
+                    "registries[{host}].reach is required once gateways are set: a gateway-era pool reaches a registry only where the environment put it, `segment` for a mirror on the sandbox segment (ADR-0029 decision 2) or `relay` for one behind a gateway's registry leg (ADR-0038)"
                 );
             }
             if !seen.insert(canonical_registry(host)) {
@@ -1422,15 +1428,31 @@ listen: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }
             ],
             "canonical hosts, as a reference's registry is canonicalised"
         );
+        // ADR-0038: `relay` is the second reach, a registry behind a gateway's registry leg; it is
+        // reachable like a segment one, may carry a credential (the TLS is the registry's, end to
+        // end) and is told apart from a typo.
+        let both = Config::parse(&format!(
+            "{base}registries:\n  - {{ host: \"registry.internal:5000\", reach: segment }}\n  - {{ host: artifactory.example, username: octocat, password_file: /x, reach: relay }}\n"
+        ))
+        .unwrap();
+        assert_eq!(both.registries[1].reach, Some(RegistryReach::Relay));
+        assert_eq!(
+            both.reachable_registries()
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![
+                "artifactory.example".to_string(),
+                "registry.internal:5000".to_string()
+            ],
+            "a relay registry is a reachable one"
+        );
         let err = Config::parse(&format!(
-            "{base}registries:\n  - {{ host: ghcr.io, reach: relay }}\n"
+            "{base}registries:\n  - {{ host: ghcr.io, reach: tunnel }}\n"
         ))
         .unwrap_err()
         .to_string();
-        assert!(
-            err.contains("relay") || err.contains("unknown variant"),
-            "{err}"
-        );
+        assert!(err.contains("unknown variant"), "{err}");
         assert_eq!(
             Config::parse(&base).unwrap().reachable_registries(),
             Some(std::collections::BTreeSet::new()),

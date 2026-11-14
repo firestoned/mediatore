@@ -8,8 +8,10 @@
 # listens for nobody). Output is default drop but for loopback, established traffic and
 # TCP to the addresses the pool's own files name: the gateways' data port
 # (/etc/mediatore/gateways), the control relay's broker and SPIRE ports (MEDIATORE_URL in
-# the guest's env, server_address and server_port in the agent's configuration) and the
-# registries on the segment (/etc/mediatore/registries). Forward is dropped. Every entry
+# the guest's env, server_address and server_port in the agent's configuration, and the bundle leg's
+# SPIRE_BUNDLE_GATEWAY and SPIRE_BUNDLE_PORT when the pool fetches its bundle, ADR-0037) and the
+# registries on the segment (/etc/mediatore/registries), and, for root alone, the gateway's registry
+# legs (MEDIATORE_RELAY_REGISTRIES, ADR-0038). Forward is dropped. Every entry
 # must be an IPv4 address and a port: the segment has no resolver, and a name here would be
 # a rule that admits nothing while looking like one. Loaded in one transaction by
 # mediatore-host-nft.service before the agent and the guest start; the sandbox uid's
@@ -73,13 +75,55 @@ sp=$(sed -n 's/^[[:space:]]*server_port[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1
 [ -n "$sa" ] && [ -n "$sp" ] || die "$agent_conf: server_address and server_port are required"
 add "agent.conf server_address" "$sa:$sp"
 
+# The bundle leg (ADR-0037): a pool that fetches its SPIRE bundle at boot names the gateway and the
+# relay's bundle port in the guest's env; one that carries the bundle as a file names neither.
+bg=$(sed -n 's/^SPIRE_BUNDLE_GATEWAY=//p' "$guest_env" | tail -1)
+if [ -n "$bg" ]; then
+  bp=$(sed -n 's/^SPIRE_BUNDLE_PORT=//p' "$guest_env" | tail -1)
+  [ -n "$bp" ] || die "$guest_env: SPIRE_BUNDLE_GATEWAY is set without SPIRE_BUNDLE_PORT"
+  add "SPIRE_BUNDLE_GATEWAY" "$bg:$bp"
+fi
+
+# The registry legs (ADR-0038): a pool that pulls through a gateway's registry leg names the registries in
+# the guest's env, `MEDIATORE_RELAY_REGISTRIES=host=port,host=port`, and the gateway is the one MEDIATORE_URL
+# names. The pull is root's, so these destinations are a set of their own, admitted to uid 0 alone: no other
+# uid, the sandbox users included, reaches a leg through this table (and the sandbox uid's own table never
+# lists one). Names are the guest's to map; the table carries the address and the port only.
+registry_set=''
+registry_rule=''
+rr=$(sed -n 's/^MEDIATORE_RELAY_REGISTRIES=//p' "$guest_env" | tail -1)
+if [ -n "$rr" ]; then
+  rgw=$(printf '%s' "$hostport" | sed 's/:[^:]*$//')
+  registry_elements=''
+  old_ifs=$IFS; IFS=,
+  for entry in $rr; do
+    IFS=$old_ifs
+    entry=$(printf '%s' "$entry" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+    case $entry in *=*) ;; *) die "$guest_env: MEDIATORE_RELAY_REGISTRIES entry '$entry' is not host=port" ;; esac
+    rname=$(printf '%s' "$entry" | sed 's/=.*//')
+    rport=$(printf '%s' "$entry" | sed 's/^[^=]*=//')
+    printf '%s' "$rname" | grep -Eq '^[A-Za-z0-9.-]+$' || die "$guest_env: MEDIATORE_RELAY_REGISTRIES '$rname' is not a registry host name (no port, no space)"
+    printf '%s' "$rport" | grep -Eq '^[1-9][0-9]{0,4}$' && [ "$rport" -le 65535 ] || die "$guest_env: MEDIATORE_RELAY_REGISTRIES '$entry' has no valid port"
+    is_addr_port "$rgw:$rport" || die "MEDIATORE_RELAY_REGISTRIES: $rgw:$rport is not an IPv4 address and a port (the gateway is MEDIATORE_URL's host; the segment has no resolver)"
+    rel="$rgw . $rport"
+    case " $registry_elements " in *" $rel,"*|*" $rel "*) IFS=, ; continue ;; esac
+    if [ -n "$registry_elements" ]; then registry_elements="$registry_elements, $rel"; else registry_elements=$rel; fi
+    IFS=,
+  done
+  IFS=$old_ifs
+  registry_set="  set registry4 { type ipv4_addr . inet_service; elements = { $registry_elements } }
+"
+  registry_rule="    meta skuid 0 ip daddr . tcp dport @registry4 accept
+"
+fi
+
 table=$(cat <<NFT
 # mediatore host table (ADR-0029): every uid reaches the gateways' two planes and the segment's registries; nothing else leaves, nothing comes in
 table inet mediatore_host
 delete table inet mediatore_host
 table inet mediatore_host {
   set allow4 { type ipv4_addr . inet_service; elements = { $elements } }
-  chain input {
+$registry_set  chain input {
     type filter hook input priority filter; policy drop;
     iif "lo" accept
     ct state established,related accept
@@ -95,7 +139,7 @@ table inet mediatore_host {
     oif "lo" accept
     ct state established,related accept
     ip daddr . tcp dport @allow4 accept
-    log prefix "mediatore-host drop: " counter drop
+$registry_rule    log prefix "mediatore-host drop: " counter drop
   }
 }
 NFT

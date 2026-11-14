@@ -116,6 +116,8 @@ flowchart LR
     service-egress-gateway -->|TCP| ecosystem-downstream-api
     system-sandbox-vm -->|TCP| service-control-relay
     service-control-relay -->|TCP| service-spire-server
+    service-control-relay -->|TCP| service-spire-server
+    service-control-relay -->|TCP| ecosystem-oci-registry
     service-control-relay -->|TCP| service-mediatore-sandbox-api
     service-egress-proxy -->|HTTPS| ecosystem-downstream-api
     actor-sandbox-user --> data-asset-claim-store

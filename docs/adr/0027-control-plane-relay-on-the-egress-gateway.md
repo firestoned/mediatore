@@ -7,7 +7,10 @@
 9 in the gateway image) · **Date:** 2026-10-30 · **Amended:** 2026-11-07 by
 [ADR-0031](0031-a-trust-anchor-that-outlives-the-servers-ca.md) (decision 3: the bundle the
 agent starts with is the PKI root the server's CA chains to, good for years, not the
-server's CA of the day)
+server's CA of the day);
+2026-11-14 by [ADR-0037](0037-the-pool-fetches-its-spire-bundle-at-boot-through-the-relay.md)
+(decisions 2 and 3: a third fixed leg, the SPIRE bundle endpoint on `RELAY_BUNDLE_PORT`, so a
+pool member fetches its bundle at boot instead of carrying one)
 
 Roadmap 10. Amends [ADR-0028](0028-egress-gateway-envoy-with-spiffe-identity.md) decisions 4
 and 6 (what the gateway carries, and whether the sandbox reaches the broker directly),

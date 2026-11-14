@@ -107,6 +107,8 @@ ADR-0028, ADR-0031.
 | Upstream authority | the `deploy/spire-upstream` component (ADR-0031): OpenBao's PKI mount `spire`, Kubernetes auth role `spire-server`, the CA the server chains to in ConfigMap `spire-upstream-ca`; the guests' bundle is the root alone |
 | CA TTL | 24 h: a bundle baked into an image admits a first boot for a day; refresh the bundle layer before a pool scale-up, or ship the root (ADR-0031) |
 | Server reach for VMs | a LoadBalancer address on the LAN for port 8081, reached by pool members only through a gateway's relay (`3129`) |
+| Bundle endpoint | the SPIRE server's `bundle_endpoint` (https_web, a certificate from a CA the image trusts), reached by pool members only through the relay's bundle leg (`3131`, ADR-0037) |
+| Registry for the image pull | on a gateway-era pool without a registry on the segment, the operator's registry behind the relay's registry leg (`3132`, ADR-0038): `reach: relay` on the broker, `MEDIATORE_RELAY_REGISTRIES=<registry>=3132` in the pool's env; a dedicated read-only repository of digest-pinned images |
 
 Agent configuration in the pool image's deployment layer (and the gateways', with their own
 addresses):
@@ -116,7 +118,8 @@ agent {
   trust_domain      = "sandbox.home.example"
   server_address    = "198.51.100.1"      # a gateway's sandbox address: the relay (ADR-0027)
   server_port       = "3129"
-  trust_bundle_path = "/etc/spire/bundle.pem"
+  trust_bundle_path   = "/run/spire/bundle.json"   # fetched at boot through the relay's bundle leg (ADR-0037)
+  trust_bundle_format = "spiffe"
   socket_path       = "/run/spire/sockets/agent.sock"
   data_dir          = "/var/lib/spire/agent"
 }
@@ -290,7 +293,7 @@ pod to a node since ADR-0034.
 | Piece | Value |
 | --- | --- |
 | Gateway VMs | three, from `ghcr.io/firestoned/mediatore-gateway` at the release's digest, two NICs (`egress` routable with the default route, `sandbox` on the routeless segment), anti-affinity across hosts |
-| Gateway env | `TRUST_DOMAIN`, `SANDBOX_IF`, `DATA_PORT=8443`, `RELAY_SPIRE_PORT=3129`, `RELAY_BROKER_PORT=3130`, `SPIRE_SERVER_ADDRESS:PORT` (the LoadBalancer, 8081), `BROKER_ADDRESS:PORT` (the sandbox listener, 443), `MEDIATORE_URL` for the authorizer |
+| Gateway env | `TRUST_DOMAIN`, `SANDBOX_IF`, `DATA_PORT=8443`, `RELAY_SPIRE_PORT=3129`, `RELAY_BROKER_PORT=3130`, `RELAY_BUNDLE_PORT=3131`, `SPIRE_BUNDLE_ADDRESS:PORT` (the bundle endpoint, 8443), `SPIRE_SERVER_ADDRESS:PORT` (the LoadBalancer, 8081), `BROKER_ADDRESS:PORT` (the sandbox listener, 443), `MEDIATORE_URL` for the authorizer |
 | What a gateway allows | a tunnel only for a claim SVID of the trust domain, to an endpoint the broker lists for that claim (`GET /v1/gateway/claims/{uid}`): the audiences' `egress` plus, under `enforce`, the bundle's direct egress |
 | Admission | banlieue's `ValidatingAdmissionPolicy` on `VirtualMachineClaim` lets a claim name a subject other than its creator only for a listed broker: ConfigMap `banlieue-claim-subject-policy` in banlieue's namespace carries `brokers:` with `system:serviceaccount:banlieue-system:mediatore` and `issuers:` with the Dex issuer URL. Without both, every claim the broker creates is forbidden and the sandbox retries every five seconds, never binding |
 | Pool | `VirtualMachinePool` `sandbox-pool`: `readiness: GuestReady`, `recycleOnImageChange: true`, one warm member, `VMClass` with one NIC on the segment, addresses from the pool's `addressing` and a `userData` stage writing the static network file |

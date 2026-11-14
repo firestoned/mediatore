@@ -146,8 +146,11 @@ BINARY_FROM ?= container
 guest-image: ## Build the sandbox VM image, a Kairos derivative (ADR-0023); BINARY_FROM=host copies dist/mediatore
 	$(CONTAINER_CLI) build -f image/Dockerfile --build-arg BINARY_FROM=$(BINARY_FROM) -t $(GUEST_IMAGE) .
 
-guest-image-check: host-table-test ## Check the built VM image carries what ADR-0023 says, and no listener
+guest-image-check: host-table-test bundle-fetch-test ## Check the built VM image carries what ADR-0023 says, and no listener
 	CONTAINER_CLI=$(CONTAINER_CLI) ./image/check.sh $(GUEST_IMAGE)
+
+bundle-fetch-test: ## Pin the pool VM's boot-time bundle fetch (ADR-0037): the exact curl against the gateway's bundle leg, the atomic write, what it refuses
+	@./image/spire-bundle-fetch-test.sh
 
 host-table-test: ## Pin the pool VM's host table (ADR-0029): the exact render from a pool's files, names and missing inputs refused
 	@./image/host-table-test.sh
@@ -173,7 +176,13 @@ gateway-render-check: ## Fail when dev/kind/gateway/envoy.yaml drifted from the 
 	@for t in envoy/gateway.yaml.in envoy/relay.yaml.in nftables.conf.in network.in; do \
 	  ./image/gateway/render image/gateway/$$t - image/gateway/env.example image/gateway/vm.env.example > /dev/null || exit 1; \
 	done
-	@echo "✓ the kind bootstrap is the image's template, and the example env files fill every template"
+	@r=$$(./image/gateway/render image/gateway/envoy/relay.yaml.in - image/gateway/env.example image/gateway/vm.env.example); \
+	  test "$$(printf '%s\n' "$$r" | grep -c 'stat_prefix: relay_')" = 4 \
+	  && printf '%s\n' "$$r" | grep -q 'upstream=bundle' && printf '%s\n' "$$r" | grep -q 'name: spire_bundle' \
+	  && printf '%s\n' "$$r" | grep -q 'upstream=registry' && printf '%s\n' "$$r" | grep -q 'name: registry' \
+	  && ./image/gateway/render image/gateway/nftables.conf.in - image/gateway/env.example image/gateway/vm.env.example | grep -q 'elements = { 3129, 3130, 3131, 3132 }' \
+	  || { echo "the relay must render four listeners (SPIRE, broker, bundle: ADR-0037, registry: ADR-0038) and the host table admit 3129, 3130, 3131 and 3132"; exit 1; }
+	@echo "✓ the kind bootstrap is the image's template, the example env files fill every template, the relay has its four legs"
 
 crds: ## Render mediatore's CRDs from their Rust types into deploy/base/crds/ (ADR-0008; never hand-edited, a unit test fails on a stale file)
 	cargo run -q -p mediatore-claims --bin crdgen -- --out-dir deploy/base/crds
