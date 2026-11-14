@@ -74,6 +74,9 @@ need interactivity, the workload dials **out** (see
      --image registry.internal:5000/sandbox/claude:latest \
      --arg /usr/bin/claude --arg=-p --arg "reconcile the ledgers"
 
+   # A broker behind a private PKI: `create`, `get` and `delete` take the CA as `login` does
+   # (--ca-file, or MEDIATORE_CA_FILE), and then trust nothing else.
+
    # Entra, or any issuer without a session: the same call by hand
    curl -sS https://mediatore.sandbox.example/v1/claims \
      -H "Authorization: Bearer $TOKEN" \

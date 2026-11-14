@@ -39,9 +39,27 @@ pub struct Target {
     /// mediatore's user API base URL
     #[arg(long, env = "MEDIATORE_URL")]
     pub mediatore: String,
+    /// A PEM file with the CA that signs mediatore's certificate (private PKI); when
+    /// given, nothing else is trusted
+    #[arg(long, env = "MEDIATORE_CA_FILE")]
+    pub ca_file: Option<PathBuf>,
     /// The session file.
     #[command(flatten)]
     pub session: SessionFile,
+}
+
+impl Target {
+    /// The user API client for this target, with `--ca-file` as its only trust when given.
+    pub fn api(&self) -> anyhow::Result<Api> {
+        match &self.ca_file {
+            Some(p) => {
+                let pem = std::fs::read(p)
+                    .map_err(|e| anyhow::anyhow!("--ca-file {}: {e}", p.display()))?;
+                Api::with_ca(&self.mediatore, &pem)
+            }
+            None => Api::new(&self.mediatore),
+        }
+    }
 }
 
 /// The user's subcommands, flattened into the binary's tree.
@@ -216,13 +234,13 @@ pub async fn run(cmd: UserCmd) -> anyhow::Result<()> {
         UserCmd::Sandbox(SandboxCmd::Create(args)) => create(args).await,
         UserCmd::Sandbox(SandboxCmd::Get { target, name }) => {
             let session = Session::load(&target.session.path()?)?;
-            let claim = Api::new(&target.mediatore)?.get(&session, &name).await?;
+            let claim = target.api()?.get(&session, &name).await?;
             println!("{}", serde_json::to_string_pretty(&claim)?);
             Ok(())
         }
         UserCmd::Sandbox(SandboxCmd::Delete { target, name }) => {
             let session = Session::load(&target.session.path()?)?;
-            Api::new(&target.mediatore)?.delete(&session, &name).await?;
+            target.api()?.delete(&session, &name).await?;
             println!("{name} deleted");
             Ok(())
         }
@@ -337,9 +355,7 @@ async fn create(args: CreateArgs) -> anyhow::Result<()> {
         policy_ref: args.policy,
         delegations,
     };
-    let (claim, spent) = Api::new(&args.target.mediatore)?
-        .claim(&session, &request)
-        .await?;
+    let (claim, spent) = args.target.api()?.claim(&session, &request).await?;
     spent.save(&path)?;
     if args.json {
         println!("{}", serde_json::to_string_pretty(&claim)?);
@@ -420,5 +436,53 @@ mod tests {
         assert_eq!(a.redirect_host, "127.0.0.1");
         assert_eq!(a.redirect_path, "/callback");
         assert_eq!(parse(&["--redirect-port", "0"]).redirect_ports, vec![0]);
+    }
+
+    #[derive(Parser)]
+    struct T {
+        #[command(flatten)]
+        target: Target,
+    }
+
+    fn target(extra: &[&str]) -> Target {
+        let mut argv = vec!["t", "--mediatore", "https://mediatore.example"];
+        argv.extend_from_slice(extra);
+        T::try_parse_from(argv).unwrap().target
+    }
+
+    #[test]
+    fn the_user_api_commands_take_a_ca_file() {
+        assert!(target(&[]).ca_file.is_none());
+        let t = target(&["--ca-file", "/etc/ca.pem"]);
+        assert_eq!(
+            t.ca_file.as_deref(),
+            Some(std::path::Path::new("/etc/ca.pem"))
+        );
+    }
+
+    #[test]
+    fn an_unreadable_ca_file_is_named_in_the_error() {
+        let err = target(&["--ca-file", "/nonexistent/ca.pem"])
+            .api()
+            .err()
+            .expect("a missing CA file is an error")
+            .to_string();
+        assert!(err.contains("--ca-file"), "{err}");
+        assert!(err.contains("/nonexistent/ca.pem"), "{err}");
+    }
+
+    #[test]
+    fn a_ca_file_without_a_certificate_is_refused() {
+        let dir = std::env::temp_dir().join(format!("mediatore-ca-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("empty.pem");
+        std::fs::write(&f, "not a certificate\n").unwrap();
+        let err = target(&["--ca-file", f.to_str().unwrap()])
+            .api()
+            .err()
+            .expect("a CA file with no certificate is an error")
+            .to_string();
+        assert!(err.contains("no certificate"), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

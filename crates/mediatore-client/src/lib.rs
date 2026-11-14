@@ -425,6 +425,15 @@ impl Api {
         })
     }
 
+    /// A client for the user API at `base` that trusts exactly the CA certificates in
+    /// `pem` (a broker behind a private PKI).
+    pub fn with_ca(base: &str, pem: &[u8]) -> anyhow::Result<Self> {
+        Ok(Self {
+            base: base.trim_end_matches('/').to_owned(),
+            http: http_with_ca(pem)?,
+        })
+    }
+
     /// `POST /v1/claims` with the session's ID token as bearer and its refresh token
     /// delegated in the body. On success the refresh token is spent: the session comes
     /// back without it.
