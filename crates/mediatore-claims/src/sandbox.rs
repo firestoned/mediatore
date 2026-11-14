@@ -324,6 +324,7 @@ fn render_crd(
     {
         schema.description = Some(description.into());
     }
+    crate::crd_formats::strip_unsupported_formats(&mut crd);
     let body = serde_saphyr::to_string_with_options(&crd, options)?;
     Ok(format!(
         "# Copyright (c) 2026 Erick Bourgeois, mediatore\n# SPDX-License-Identifier: Apache-2.0\n#\n# Generated from crates/mediatore-claims/src/kubestore.rs by `make crds` (ADR-0034\n# decision 3). Do not edit: the unit test `the_crds_in_deploy_are_what_the_types_render`\n# fails on a stale file.\n{body}"
@@ -349,6 +350,7 @@ pub fn crd_yaml() -> Result<String, serde_saphyr::ser::Error> {
                 .into(),
         );
     }
+    crate::crd_formats::strip_unsupported_formats(&mut crd);
     let body = serde_saphyr::to_string_with_options(&crd, options)?;
     Ok(format!(
         "# Copyright (c) 2026 Erick Bourgeois, mediatore\n# SPDX-License-Identifier: Apache-2.0\n#\n# Generated from crates/mediatore-claims/src/sandbox.rs by `make crds` (ADR-0008\n# decision 1). Do not edit: the unit test `the_crd_in_deploy_is_what_the_type_renders`\n# fails on a stale file.\n{body}"
@@ -1217,6 +1219,43 @@ mod tests {
             .await
             .unwrap();
         assert!(rec.delegations.contains_key("api.example"));
+    }
+
+    /// Every `format` in `v` (and under it) the apiserver would drop, as a path.
+    fn unsupported_formats(v: &serde_json::Value, path: &str, out: &mut Vec<String>) {
+        match v {
+            serde_json::Value::Object(m) => {
+                if let Some(format) = m.get("format").and_then(serde_json::Value::as_str) {
+                    let type_ = m.get("type").and_then(serde_json::Value::as_str);
+                    if !crate::crd_formats::is_supported_format(type_, format) {
+                        out.push(format!("{path}: {format}"));
+                    }
+                }
+                for (k, child) in m {
+                    unsupported_formats(child, &format!("{path}.{k}"), out);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for (i, child) in items.iter().enumerate() {
+                    unsupported_formats(child, &format!("{path}[{i}]"), out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn no_shipped_crd_carries_an_unsupported_format() {
+        // The apiserver drops an unknown format and warns on apply (`unrecognized format
+        // "uint64"`); schemars emits uint8..uint64 for Rust's unsigned integers.
+        let mut found = Vec::new();
+        for (file, rendered) in crd_yamls().unwrap() {
+            let crd: k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition =
+                serde_saphyr::from_str(&rendered).unwrap();
+            let json = serde_json::to_value(&crd).unwrap();
+            unsupported_formats(&json["spec"]["versions"], file, &mut found);
+        }
+        assert!(found.is_empty(), "unsupported formats: {found:#?}");
     }
 
     #[test]

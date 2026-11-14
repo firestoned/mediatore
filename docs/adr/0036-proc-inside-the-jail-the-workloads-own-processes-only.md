@@ -7,7 +7,7 @@
 
 Roadmap 12, the live run of Claude Code in the jail (run 8). Amends
 [ADR-0020](0020-jail-network-nftables-keyed-by-sandbox-uid.md) and
-[ADR-0024](0024-landlock-inside-the-jail-applied-by-the-one-binary.md) decision 1 on one
+[ADR-0024](0024-landlock-inside-the-jail.md) decision 1 on one
 point: the jail mounts a `/proc`. Everything else those ADRs say about the jail stands.
 
 ## Context

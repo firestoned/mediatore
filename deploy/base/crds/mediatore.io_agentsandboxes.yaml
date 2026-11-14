@@ -101,7 +101,6 @@ spec:
                 description: |-
                   Lifetime in seconds, counted from bind; copied to the claim, which enforces it
                   (decision 9).
-                format: uint32
                 minimum: 1.0
                 type: integer
               workload:
@@ -238,7 +237,6 @@ spec:
                 properties:
                   bundleVersion:
                     description: The bundle version then.
-                    format: uint64
                     minimum: 0.0
                     nullable: true
                     type: integer
