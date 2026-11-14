@@ -240,6 +240,10 @@ spec:
 YAML
   wait_for_end "$name"
   pod_logs "$name" | grep -F "probe " || true
+  # The identity first: a proxy on the wrong SVID fails every check for a reason that is
+  # not the one under test (dev/kind/spire/fallback-patch.yaml).
+  proxy_logs "$name" | grep -F "SVID from the Workload API" | grep -qF "spiffe_id=spiffe://$TD/banlieue/$role/" \
+    || fail "$name: the proxy did not start on a $role SVID ($(proxy_logs "$name" | grep -F "SVID from the Workload API" | grep -o 'spiffe_id=[^ ]*' || echo 'none logged'))"
   [ "$(pod_phase "$name")" = Succeeded ] || fail "$name did not end as expected"
 }
 

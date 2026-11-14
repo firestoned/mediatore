@@ -24,3 +24,11 @@ components:
 patches:
   - path: server-conf-patch.yaml
   - path: hardening-patch.yaml
+  # fallback-patch.yaml keeps the chart's ns/sa fallback identity out of the namespaces
+  # whose pods get fixture identities, so no pod starts on the fallback by a race.
+  - path: fallback-patch.yaml
+    target:
+      group: spire.spiffe.io
+      version: v1alpha1
+      kind: ClusterSPIFFEID
+      name: spire-server-spire-default

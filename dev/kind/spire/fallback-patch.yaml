@@ -1,0 +1,22 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+#
+# The chart's fallback ClusterSPIFFEID (spiffe://<td>/ns/<ns>/sa/<sa>) kept out of the
+# namespaces where the live suites give pods a fixture identity (a claim, a node, the
+# broker, an intruder) through their own ClusterSPIFFEIDs. A fallback applies only when
+# no other ClusterSPIFFEID matches, but the controller manager can reconcile a new pod
+# before it sees that match: it wrote the fallback entry first and replaced it with the
+# claim entry 0.4 s later, and the egress proxy, starting in between, kept the fallback
+# SVID for its life (gateway e2e, CI 2026-11-14: probe-released refused at the handshake,
+# 502 gateway_unreachable where gateway_refused was the check). With no fallback here a
+# pod gets no SVID until its fixture entry reaches the agent, which the Workload API
+# wait in the guest already covers. Nothing in these namespaces uses an ns/sa identity.
+- op: add
+  path: /spec/namespaceSelector/matchExpressions/0/values/-
+  value: mediatore-e2e
+- op: add
+  path: /spec/namespaceSelector/matchExpressions/0/values/-
+  value: mediatore-e2e-sandbox
+- op: add
+  path: /spec/namespaceSelector/matchExpressions/0/values/-
+  value: mediatore-e2e-gateway
