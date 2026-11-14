@@ -57,7 +57,6 @@ spec:
                 type: string
               version:
                 description: The highest bundle version accepted for that incarnation.
-                format: uint64
                 minimum: 0.0
                 type: integer
             required:
