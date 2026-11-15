@@ -24,7 +24,13 @@ claim; `env:CLAUDE_CODE_OAUTH_TOKEN` takes a `claude setup-token` instead. The a
 among its `extra_headers` if the policy's rules let a bare SDK through; Claude Code sends
 that header itself.
 
-Two things the live run taught (`docs/guides/testing.md`, run 8):
+Proven live on 2026-11-15 (`docs/guides/testing.md`, run 8): the delegated session placed by
+the proxy, one Messages call through a gateway, Claude's answer printed from the jail, exit
+`0` ending the claim. Three things the run taught:
+
+- **Claude Code probes `HEAD <base URL>/api/hello` on start.** The proxy refuses it as
+  outside the rules (`403 outside_rules`) and Claude Code carries on; the policy need not
+  allow it, and the refusal in the proxy's log is not a fault.
 
 - **The guest must be at ADR-0036 or later** (mediatore v0.2.2). Claude Code, like most
   Node programs, reads `/proc/self` on start; a jail without `/proc` fails it within a

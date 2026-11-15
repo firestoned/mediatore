@@ -38,11 +38,16 @@ Check: the server runs, the broker's pod holds `spiffe://<td>/mediatore`, VMs at
 kubectl -n spire-server exec spire-server-0 -c spire-server -- spire-server agent list
 kubectl -n banlieue-system logs deploy/mediatore | grep 'broker identity from the Workload API'
 kubectl get clusterstaticentries | grep -E 'banlieue/(node|claim)|gateway'
+kubectl -n spire-server logs -l app.kubernetes.io/name=server -c spire-server --since=10m | grep 'could not verify cert'
+# nothing: every VM's EK chains to a CA in ConfigMap spire-tpm-ek-cas (one PEM per swtpm local CA:
+# libvirt's per host, the Cloud Hypervisor provider's own beside it); a line here names the VM that does not
 MEDIATORE_LIVE_KUBECONFIG=<kubeconfig> MEDIATORE_LIVE_TRUST_DOMAIN=<td> MEDIATORE_LIVE_CLASS_NAME=spire-server-spire make live-admission-test
 ```
 
-A change to the TPM path is proven with `make kind-e2e-tpm` on the build host before it
-merges (`.claude/rules/testing.md`).
+The ConfigMap is copied into the server pod at start, so a CA added to it needs
+`kubectl -n spire-server rollout restart statefulset/spire-server`. A change to the TPM
+path is proven with `make kind-e2e-tpm` on the build host before it merges
+(`.claude/rules/testing.md`).
 
 ## 3. notaio and the policies
 
@@ -98,6 +103,15 @@ ConfigMap, not the pool. A member that binds and whose workload exits within a s
 
 A member logging `mediatore unreachable` is the relay or the listener (step 4), not the
 member.
+
+A workload whose requests time out while the proxy logs `upstream unreachable` or `the
+gateway refused the tunnel`, with the relay ports steady and a gateway's `8443` open for
+about half a minute then refused for a quarter, is the gateway's SPIRE agent failing
+attestation and Envoy restarting with it (`Requires=spire-agent.service`): the server log
+check of step 2 names it. Either the CA that issued the gateway's EK is missing from
+`spire-tpm-ek-cas` (a gateway moved to another hypervisor has another swtpm CA), or the
+gateway VM was recreated and its two `ClusterStaticEntry` name the old agent ID:
+regenerate them from the first RSA certificate in `.status.tpmEndorsementCertificates`.
 
 ## 6. The Anthropic key
 

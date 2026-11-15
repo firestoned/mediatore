@@ -241,15 +241,19 @@ into the server pod together with the EK trust anchors it copies out of a Config
 and `server.conf` gains the attestor block with the binary's checksum.
 
 ```sh
-# One PEM per hypervisor host: the issuing certificate of its swtpm local CA, the one
-# that signs every vTPM's EK certificate libvirt creates (CN=swtpm-localca). Not the
-# root beside it: the attestor verifies an EK against these files with no intermediates,
-# so the root alone refuses every VM. Repeat for each host that runs pool VMs.
+# One PEM per swtpm local CA: the issuing certificate (CN=swtpm-localca) that signs every
+# vTPM's EK certificate the hypervisor creates. libvirt's lives at
+# /var/lib/swtpm-localca/issuercert.pem; banlieue's Cloud Hypervisor provider runs its own
+# swtpm with its own CA, /var/lib/banlieue/swtpm-localca/issuercert.pem (the statedir in
+# /etc/banlieue/swtpm/swtpm-localca.conf), same CN, a different key. A host that runs both
+# providers contributes both. Not the root beside either: the attestor verifies an EK
+# against these files with no intermediates, so the root alone refuses every VM.
 cp -r deploy/spire-tpm ~/.config/mediatore/spire-tpm
 for h in hv-01 hv-02; do
-  ssh $h sudo cat /var/lib/swtpm-localca/issuercert.pem > $h.pem
+  ssh $h sudo cat /var/lib/swtpm-localca/issuercert.pem > $h.pem               # libvirt
+  ssh $h sudo cat /var/lib/banlieue/swtpm-localca/issuercert.pem > $h-ch.pem   # Cloud Hypervisor, where it runs
 done
-# Put them under data: of ~/.config/mediatore/spire-tpm/ek-cas.yaml (one key per host),
+# Put them under data: of ~/.config/mediatore/spire-tpm/ek-cas.yaml (one key per CA),
 # add the component to your SPIRE kustomization and the block of
 # server.conf.fragment.hcl to your rendered server.conf, then:
 kubectl apply -k ~/.config/mediatore/spire
@@ -258,6 +262,15 @@ kubectl -n spire-server rollout status statefulset/spire-server
 kubectl -n spire-server exec spire-server-0 -c spire-server -- \
   spire-server bundle show > bundle.pem        # the trust bundle for the VM image
 ```
+
+A VM whose EK was signed by a CA the ConfigMap lacks is refused at every attempt, and the
+server says so: `Nodeattestor(tpm): could not verify cert: x509: certificate signed by
+unknown authority (... candidate authority certificate "swtpm-localca")`. Its agent exits
+and restarts every few seconds, and so does every unit that `Requires=` it. On a gateway
+that is the data plane: `8443` open for half a minute and refused for a quarter, over and
+over, while the relay ports hold. Add the CA, restart the servers, and check that the
+certificate you added is the one that issued the VM's EK (`VirtualMachine`
+`.status.tpmEndorsementCertificates`, `openssl verify -CAfile`).
 
 The trust domain's root lives in OpenBao's PKI engine, not on the server
 ([ADR-0031](../adr/0031-a-trust-anchor-that-outlives-the-servers-ca.md)): the second
@@ -496,7 +509,14 @@ entry's selectors are a conjunction. You apply them, not the broker: its admissi
 constrains only its own ServiceAccount. The relay gets no entry. The data plane refuses
 every peer that is not a claim of the trust domain before any check runs, so a sandbox
 cannot reach the relay's upstreams through it, and the authorizer asks the broker over
-`GET /v1/gateway/claims/{uid}` with the gateway SVID, on the egress side.
+`GET /v1/gateway/claims/{uid}` with the gateway SVID, on the egress side. The agent ID is
+the vTPM's, not the VM's name: a gateway recreated (a provider change, a host move, a
+deleted VM) comes back with a new vTPM, a new EK and a new agent ID, and its two entries
+name a parent that no longer attests until you regenerate them from the new hash
+(`openssl x509 -pubkey -noout < ek.pem | openssl pkey -pubin -outform der | sha256sum` on
+the first RSA certificate in `.status.tpmEndorsementCertificates` gives it without the
+server). Its Envoy then has no SVID to serve and `8443` stays closed, or flaps if the
+attestation itself fails (above).
 
 A gateway drops ICMP, so `ping` proves nothing about one; a TCP connect to its relay
 ports from the segment, or `nft list table inet mediatore_gateway` on its console, does.
