@@ -8,9 +8,12 @@
 # run; the one mediatore binary (its gateway role is the authorizer, ADR-0028 decision 4);
 # the SPIRE agent and its TPM attestor plugin (the gateway attests like a sandbox, decision
 # 2); nftables for the host table (ADR-0027 decision 5); the templates the units render at
-# every start, the units themselves, and the three service users: envoy (the data plane),
+# every start, the units themselves, and the four service users: envoy (the data plane),
 # envoy-relay (the control relay, ADR-0027 decision 1, never in the agent's group and
-# kept out of /run/spire by its unit) and mediatore-gateway (the authorizer). Nothing
+# kept out of /run/spire by its unit), envoy-inject (the inject listener, ADR-0040: it
+# originates TLS to a fixed upstream and holds a credential only for one request; its
+# unit is installed and NOT enabled, a deployment turns it on) and mediatore-gateway
+# (the authorizer). Nothing
 # deployment-specific (trust domain, upstream addresses, bundle) and nothing per VM (the
 # sandbox address, keys) is here: those are the cloud-config layers
 # (image/gateway/cloud-config.yaml, cloud-config-deployment.example.yaml), the VM's
@@ -60,11 +63,12 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && ! command -v sshd
 
-# The agent in the TPM device group (image/systemd/spire-agent.service); the three service
-# users with no group in common and no login. Only the agent touches the TPM.
+# The agent in the TPM device group (image/systemd/spire-agent.service); the four service
+# users with no group in common and no login (a socket group is what lets an Envoy reach the
+# authorizer: ADR-0040 decision 6). Only the agent touches the TPM.
 RUN useradd --system --user-group --home-dir /var/lib/spire --no-create-home --shell /usr/sbin/nologin spire \
     && usermod -aG tss spire \
-    && for u in envoy envoy-relay mediatore-gateway; do \
+    && for u in envoy envoy-relay envoy-inject mediatore-gateway; do \
          useradd --system --user-group --home-dir /nonexistent --no-create-home --shell /usr/sbin/nologin "$u"; \
        done
 
@@ -79,20 +83,21 @@ RUN chmod 0755 /usr/bin/mediatore /usr/bin/envoy /usr/bin/spire-agent /usr/lib/s
     && /usr/bin/envoy --version | grep -q "1.40.2"
 
 COPY image/gateway/render /usr/libexec/mediatore-gateway/render
-COPY image/gateway/envoy/gateway.yaml.in image/gateway/envoy/relay.yaml.in /usr/share/mediatore-gateway/envoy/
-COPY image/gateway/nftables.conf.in image/gateway/network.in image/gateway/env.example image/gateway/vm.env.example /usr/share/mediatore-gateway/
+COPY image/gateway/envoy/gateway.yaml.in image/gateway/envoy/relay.yaml.in image/gateway/envoy/inject.yaml.in /usr/share/mediatore-gateway/envoy/
+COPY image/gateway/nftables.conf.in image/gateway/network.in image/gateway/env.example image/gateway/env.inject.example image/gateway/vm.env.example /usr/share/mediatore-gateway/
 COPY image/gateway/systemd/spire-agent.service \
      image/gateway/systemd/mediatore-gateway-network.service \
      image/gateway/systemd/mediatore-gateway-nft.service \
      image/gateway/systemd/envoy-gateway.service \
      image/gateway/systemd/envoy-relay.service \
+     image/gateway/systemd/envoy-inject.service \
      image/gateway/systemd/mediatore-gateway.service \
      /etc/systemd/system/
 COPY image/gateway/sysctl/99-mediatore-gateway.conf /etc/sysctl.d/99-mediatore-gateway.conf
 COPY image/spire/agent.conf /usr/share/mediatore/agent.conf.example
 # The examples render every template completely: a placeholder nobody documents fails the build.
 RUN chmod 0755 /usr/libexec/mediatore-gateway/render \
-    && for t in envoy/gateway.yaml.in envoy/relay.yaml.in nftables.conf.in network.in; do \
+    && for t in envoy/gateway.yaml.in envoy/relay.yaml.in envoy/inject.yaml.in nftables.conf.in network.in; do \
          /usr/libexec/mediatore-gateway/render "/usr/share/mediatore-gateway/$t" - /usr/share/mediatore-gateway/env.example /usr/share/mediatore-gateway/vm.env.example > /dev/null; \
        done \
     && grep -q "plugin_checksum = \"${TPM_PLUGIN_AGENT_SHA}\"" /usr/share/mediatore/agent.conf.example \

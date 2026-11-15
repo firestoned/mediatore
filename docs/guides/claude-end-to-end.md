@@ -363,3 +363,19 @@ mediatore sandbox create --mediatore https://mediatore.<tailnet> --pool sandbox-
 | Bounds | a login session lives hours, so `--ttl` beyond its expiry is refused (`delegation_expires_first`) until the broker can refresh (phase 3, a configured `refresh` block); a setup-token lives long; the upstream attributes usage to the person |
 | Sealed on the desktop | phase 2: with the broker on the transit sealer, the CLI seals the envelope itself under an encrypt-only OpenBao door and completes a two-step claim; the broker never holds the plaintext |
 
+## I. The credential placed at the gateway instead of the pool VM
+
+[ADR-0040](../adr/0040-the-gateway-places-an-audiences-credential-the-pool-never-holds-it.md): section H puts the requester's session in the proxy, on the pool VM. For an audience that must not put it there, the broker keeps `via: delegated` and adds `inject: gateway`, with `max_ttl: 300`. The proxy sends `api.anthropic.com` requests to a gateway's inject port with no credential; the gateway's third Envoy, `envoy-inject`, terminates the claim's mutual TLS and originates TLS to the host, and the authorizer sets the bearer header from the credential it asked the broker for. Root on the pool VM then yields no credential for this audience.
+
+```yaml
+  - name: anthropic
+    via: delegated
+    inject: gateway
+    max_ttl: 300
+    egress: ["api.anthropic.com:443"]
+    rules:
+      - { method: POST, path: "/v1/messages" }
+      - { method: POST, path: "/v1/messages/count_tokens" }
+```
+
+Beyond sections A to H it needs `gateways` and `gateway_inject_port` on the broker, the third Envoy running on each gateway, and the three operator prerequisites, all in the deploying guide ("Placing an audience's credential at the gateway"). The jail sees no credential for this audience. A refusal by the gateway reaches the workload as `502 gateway_refused` and no reachable gateway as `502 gateway_unreachable`. Whether Anthropic accepts a subscription session placed from a gateway address, and whether refreshing it invalidates the person's own login, is the operator's to answer before this is used (ADR-0035, ADR-0040 open question 1). It is not proven live: see the testing guide.

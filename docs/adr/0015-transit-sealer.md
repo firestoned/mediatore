@@ -46,7 +46,7 @@ drops the binding.
 **3. The broker authenticates as its ServiceAccount, with a token meant for OpenBao.**
 `store.sealing.transit.token_file` is a projected ServiceAccount token with audience
 `openbao` (the base Deployment mounts it at `/var/run/secrets/openbao/token`), which the
-broker exchanges at `auth/kubernetes/login` for role `store.sealing.transit.role`. The
+broker exchanges at `auth/<auth_mount>/login` (`auth_mount` defaults to `kubernetes`; a platform that mounts the Kubernetes auth method per cluster names its mount, added 2026-11-15 when the environment's mount turned out to be `computefabric-<cluster>`) for role `store.sealing.transit.role`. The
 OpenBao client token is kept in memory with its lease and exchanged again before it
 expires, or at once when OpenBao answers 403. No OpenBao token, no shared secret and no
 key material is ever in a Secret or on disk: what the broker holds is a short-lived
@@ -94,7 +94,8 @@ one issue. Nothing in the broker needs to know a rotation happened.
 - `crates/mediatore-testkit`: `FakeTransit`, the fake OpenBao (Kubernetes login, encrypt,
   decrypt, derived-context check, token revocation, outage).
 - Config: `store.sealing.transit { url, ca_file, mount (default `transit`), key, role,
-  token_file (default `/var/run/secrets/openbao/token`) }`; `store.sealing` is a choice.
+  auth_mount (default `kubernetes`), token_file (default `/var/run/secrets/openbao/token`) }`; `store.sealing` is a
+  choice. OpenBao namespaces are not supported: the key and the auth method are in the root namespace.
 - `deploy/base/deployment.yaml` mounts a projected ServiceAccount token with audience
   `openbao`; a deployment on the local sealer can leave it unused.
 - Kind: `make kind-openbao` (OpenBao 2.7.1 by digest, TLS from `tls-fixture`, initialised

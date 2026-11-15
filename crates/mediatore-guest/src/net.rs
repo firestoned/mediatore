@@ -169,6 +169,52 @@ impl Ruleset {
         })
     }
 
+    /// The same list with each gateway's inject port added (ADR-0040 decision 7): a claim with
+    /// a gateway-placed route has its proxy send the request to `gateway:INJECT_PORT` over the
+    /// claim's mutual TLS, and the proxy's sockets carry the sandbox uid, so the uid's table
+    /// names that destination. `ports` is the set of those routes' ports; empty (a claim with
+    /// no gateway-placed route) returns the list unchanged, exactly as it was.
+    ///
+    /// # Errors
+    /// Ports given without the gateways shape (the proxy would have no gateway to send to), port
+    /// `0`, the egress proxy's own port (the workload's one allowed port must name one
+    /// destination, ADR-0025), or a gateway given by name (the sandbox has no resolver).
+    pub fn with_inject_ports(
+        mut self,
+        gateways: &[Endpoint],
+        ports: &BTreeSet<u16>,
+    ) -> anyhow::Result<Self> {
+        if ports.is_empty() {
+            return Ok(self);
+        }
+        anyhow::ensure!(
+            self.shape == Shape::Gateways,
+            "a gateway-placed route needs the environment's egress gateways, and this claim has none (ADR-0040 decision 1)"
+        );
+        for &port in ports {
+            anyhow::ensure!(
+                port != 0,
+                "a gateway-placed route names inject port 0 (ADR-0040 decision 7)"
+            );
+            anyhow::ensure!(
+                port != self.proxy_port,
+                "inject port {port} is the egress proxy's port {}: the workload's one allowed port would name two destinations (ADR-0025)",
+                self.proxy_port
+            );
+        }
+        for g in gateways {
+            let ip: IpAddr = g.host.parse().map_err(|_| {
+                anyhow::anyhow!(
+                    "a gateway is given by name, {g}: the sandbox has no resolver, so the gateways are given by address (ADR-0028 decision 6)"
+                )
+            })?;
+            for &port in ports {
+                self.allow.insert((ip, port));
+            }
+        }
+        Ok(self)
+    }
+
     /// The `nft -f` script: creates the table if absent, deletes it, defines it again, so
     /// a stale table from an earlier claim is replaced in the same transaction.
     #[must_use]
@@ -481,6 +527,160 @@ table inet mediatore_sandbox {
         assert_eq!(text, expected);
         assert!(!text.contains("53"), "no DNS rule of any kind");
         assert!(!text.contains("dns"), "no DNS set either");
+    }
+
+    fn gateway_list() -> Vec<Endpoint> {
+        vec![
+            ep("198.51.100.1:8443"),
+            ep("198.51.100.2:8443"),
+            ep("[2001:db8::3]:8443"),
+        ]
+    }
+
+    #[test]
+    fn a_claim_with_a_gateway_placed_route_admits_each_gateways_inject_port_and_only_then() {
+        // ADR-0040 decision 7: the proxy's sockets carry the sandbox uid, so the uid's table gains
+        // gateway:INJECT_PORT for each gateway, and only for a claim that has such a route.
+        let without = gateways();
+        let none = BTreeSet::new();
+        assert_eq!(
+            without
+                .clone()
+                .with_inject_ports(&gateway_list(), &none)
+                .unwrap()
+                .render(),
+            without.render(),
+            "no gateway-placed route: exactly the ruleset the claim always had"
+        );
+        let with = without
+            .clone()
+            .with_inject_ports(&gateway_list(), &BTreeSet::from([3133]))
+            .unwrap();
+        let expected = "\
+# mediatore guest (ADR-0020, ADR-0025, ADR-0028 decision 6): uid 1234 reaches the broker through the control relay, the egress gateways and the egress proxy; no DNS, nothing else, and nobody else reaches the proxy
+table inet mediatore_sandbox
+delete table inet mediatore_sandbox
+table inet mediatore_sandbox {
+  set allow4 { type ipv4_addr . inet_service; elements = { 127.0.0.1 . 3128, 198.51.100.1 . 3130, 198.51.100.1 . 3133, 198.51.100.1 . 8443, 198.51.100.2 . 3133, 198.51.100.2 . 8443 } }
+  set allow6 { type ipv6_addr . inet_service; elements = { 2001:db8::3 . 3133, 2001:db8::3 . 8443 } }
+  chain output {
+    type filter hook output priority filter; policy accept;
+    oifname \"lo\" tcp dport 3128 meta skuid != 1234 drop
+    meta skuid 1234 jump sandbox
+  }
+  chain sandbox {
+    ct state established,related accept
+    ip daddr . tcp dport @allow4 accept
+    ip6 daddr . tcp dport @allow6 accept
+    log prefix \"mediatore-sandbox drop: \" counter drop
+  }
+}
+";
+        assert_eq!(with.render(), expected);
+        assert_ne!(
+            with.sha256(),
+            without.sha256(),
+            "a change is visible in the log"
+        );
+        // Nothing else moved: the data ports, the relay port and the proxy are as before.
+        assert!(
+            without.allow.is_subset(&with.allow),
+            "the inject ports are added, nothing is taken away"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_claims_routes_decide_whether_the_inject_port_is_admitted() {
+        // The guest's own sequence: resolve the list, then add the inject ports its routes name.
+        use mediatore_proto::{Credential, Route};
+        let route = |credential: Credential, inject_port: Option<u16>| Route {
+            audience: Some("anthropic".into()),
+            endpoint: ep("api.anthropic.example:443"),
+            rules: vec![],
+            ca_pem: None,
+            credential,
+            credential_header: None,
+            inject_port,
+        };
+        let dir = mediatore_testkit::tempdir();
+        let resolv = dir.join("resolv.conf");
+        std::fs::write(&resolv, "").unwrap();
+        let list = vec![ep("198.51.100.1:3128"), ep("198.51.100.2:3128")];
+        let ruleset = |routes: &[Route]| {
+            let ports = crate::egress::inject_ports(routes);
+            let list = list.clone();
+            let resolv = resolv.clone();
+            async move {
+                Ruleset::resolve(
+                    1234,
+                    "https://198.51.100.1:3130",
+                    &[],
+                    &list,
+                    &resolv,
+                    18128,
+                )
+                .await
+                .unwrap()
+                .with_inject_ports(&list, &ports)
+                .unwrap()
+            }
+        };
+        let plain = ruleset(&[
+            route(Credential::Token, None),
+            route(Credential::None, None),
+        ])
+        .await;
+        assert!(
+            !plain.render().contains(". 3133"),
+            "a token or no-credential route admits no inject port"
+        );
+        let placed = ruleset(&[route(Credential::Gateway, Some(3133))]).await;
+        let text = placed.render();
+        assert!(
+            text.contains("198.51.100.1 . 3133") && text.contains("198.51.100.2 . 3133"),
+            "{text}"
+        );
+        assert_eq!(
+            plain.allow.len() + 2,
+            placed.allow.len(),
+            "one added destination per gateway, nothing else"
+        );
+    }
+
+    #[test]
+    fn an_inject_port_that_cannot_be_admitted_refuses_the_claim_before_it_starts() {
+        let list = gateway_list();
+        let one = |p: u16| BTreeSet::from([p]);
+        let direct = Ruleset {
+            shape: Shape::Direct,
+            ..gateways()
+        };
+        let err = direct
+            .with_inject_ports(&list, &one(3133))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("gateways") && err.contains("ADR-0040"),
+            "{err}"
+        );
+        let err = gateways()
+            .with_inject_ports(&list, &one(0))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("port 0"), "{err}");
+        let err = gateways()
+            .with_inject_ports(&list, &one(3128))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("3128") && err.contains("proxy"),
+            "the workload's one allowed port must name one destination: {err}"
+        );
+        let err = gateways()
+            .with_inject_ports(&[ep("gateway-1.home.example:8443")], &one(3133))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("by name"), "{err}");
     }
 
     #[test]

@@ -126,6 +126,30 @@ impl Dialer {
             Self::Gateways(f) => f.tunnel(authority).await,
         }
     }
+
+    /// Open a connection to a gateway's inject port (ADR-0040 decision 7): the claim's mutual
+    /// TLS and nothing inside it yet, no `CONNECT`; the proxy speaks HTTP/1.1 on it, and the
+    /// gateway terminates the audience's TLS itself.
+    ///
+    /// # Errors
+    /// [`DialError::Unreachable`] when no gateway took the connection, and always without
+    /// gateways: there is nothing to send a gateway-placed request to, and no other way to
+    /// place its credential.
+    pub async fn inject(&self, port: u16) -> Result<Dialed, DialError> {
+        match self {
+            Self::Direct => Err(DialError::Unreachable {
+                tried: 0,
+                last: "no gateway is listed for this claim (ADR-0040 decision 1)".to_owned(),
+            }),
+            Self::Gateways(f) => f.inject(port).await,
+        }
+    }
+
+    /// Whether upstreams are dialled directly, with no gateway to send anything through.
+    #[must_use]
+    pub fn is_direct(&self) -> bool {
+        matches!(self, Self::Direct)
+    }
 }
 
 impl fmt::Display for Dialer {
@@ -213,6 +237,43 @@ impl Forwarder {
         .await
     }
 
+    /// A connection to the inject port of the first gateway that takes it, starting at a
+    /// random position in the list like [`Self::tunnel`]. Failover is at the connection only
+    /// (no connect, no handshake, no answer in time): once a gateway holds the connection the
+    /// request goes to it, because the body is streamed and cannot be replayed, and whatever
+    /// answers is the answer.
+    ///
+    /// # Errors
+    /// [`DialError::Unreachable`] when none took the connection.
+    pub async fn inject(&self, port: u16) -> Result<Dialed, DialError> {
+        let start = random_start(self.gateways.len());
+        let mut dialed = failover(&self.gateways, start, |gateway| {
+            let to = Endpoint {
+                host: gateway.host.clone(),
+                port,
+            };
+            async move { self.attempt_inject(&to).await }
+        })
+        .await?;
+        // The gateway as it was reached: its inject port, not the data port it is listed with.
+        if let Some(via) = &mut dialed.via {
+            via.port = port;
+        }
+        Ok(dialed)
+    }
+
+    /// One attempt at one gateway's inject port, bounded.
+    async fn attempt_inject(&self, to: &Endpoint) -> Result<Conn, Attempt> {
+        match tokio::time::timeout(self.attempt_timeout, self.tls_to(to)).await {
+            Ok(Ok(tls)) => Ok(Box::new(tls)),
+            Ok(Err(e)) => Err(e),
+            Err(_elapsed) => Err(Attempt::Failed(format!(
+                "no answer within {}s",
+                self.attempt_timeout.as_secs_f32()
+            ))),
+        }
+    }
+
     /// One attempt at one gateway, bounded.
     async fn attempt(&self, gateway: &Endpoint, authority: &Endpoint) -> Result<Conn, Attempt> {
         match tokio::time::timeout(self.attempt_timeout, self.connect(gateway, authority)).await {
@@ -224,25 +285,35 @@ impl Forwarder {
         }
     }
 
-    /// TCP to the gateway, TLS 1.3 presenting the claim SVID and verifying the gateway's,
-    /// `CONNECT authority`, the answer read; on `200` the stream is the tunnel.
-    async fn connect(&self, gateway: &Endpoint, authority: &Endpoint) -> Result<Conn, Attempt> {
+    /// TCP to `to`, TLS 1.3 presenting the claim SVID and verifying the gateway's: the mutual
+    /// TLS both legs of the proxy-to-gateway path start with (the data port's `CONNECT`, the
+    /// inject port's HTTP).
+    async fn tls_to(
+        &self,
+        to: &Endpoint,
+    ) -> Result<tokio_rustls::client::TlsStream<TcpStream>, Attempt> {
         let material = self
             .material
             .current()
             .map_err(|e| Attempt::Failed(format!("no claim SVID: {e}")))?;
         let cfg = mediatore_tls::client_config(&material, &self.gateway_id)
             .map_err(|e| Attempt::Failed(format!("client config: {e}")))?;
-        let tcp = TcpStream::connect((gateway.host.as_str(), gateway.port))
+        let tcp = TcpStream::connect((to.host.as_str(), to.port))
             .await
             .map_err(|e| Attempt::Failed(format!("connect: {e}")))?;
         // SNI carries no trust (ADR-0007 decision 5): the gateway is verified by its
         // SPIFFE ID, so the name is a placeholder.
         let name = ServerName::try_from("gateway").map_err(|e| Attempt::Failed(e.to_string()))?;
-        let mut tls = tokio_rustls::TlsConnector::from(Arc::new(cfg))
+        tokio_rustls::TlsConnector::from(Arc::new(cfg))
             .connect(name, tcp)
             .await
-            .map_err(|e| Attempt::Failed(format!("handshake: {e}")))?;
+            .map_err(|e| Attempt::Failed(format!("handshake: {e}")))
+    }
+
+    /// `CONNECT authority` over [`Self::tls_to`] the gateway, the answer read; on `200` the
+    /// stream is the tunnel.
+    async fn connect(&self, gateway: &Endpoint, authority: &Endpoint) -> Result<Conn, Attempt> {
+        let mut tls = self.tls_to(gateway).await?;
         tls.write_all(connect_request(authority).as_bytes())
             .await
             .map_err(|e| Attempt::Failed(format!("write: {e}")))?;

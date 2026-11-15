@@ -29,7 +29,7 @@
       "unique-id": "service-mediatore-sandbox-api",
       "node-type": "service",
       "name": "Sandbox API (SPIFFE mTLS)",
-      "description": "POST /v1/nodes, GET /v1/me, POST /v1/me/report, POST /v1/me/exit (ADR-0033: the workload's exit recorded, the claim released as a delete releases it), POST /v1/token over SPIFFE mTLS: client certificate required, chain verified against the trust-domain bundle, peer SPIFFE ID taken from the verified URI SAN and restricted to /banlieue/node/* and /banlieue/claim/*. Node identities may register and fetch their subject, claim identities may request audience-scoped tokens (minted by the STS or Entra, or since ADR-0032 the operator's own credential for an audience via: secret, handed with the header it goes in). The dev header exists only under dev_mode on a loopback listener (ADR-0007). crates/mediatore-api. GET /v1/me also carries the operator's pull credential for the registry the claim's image names, and no other (ADR-0022)."
+      "description": "POST /v1/nodes, GET /v1/me, POST /v1/me/report, POST /v1/me/exit (ADR-0033: the workload's exit recorded, the claim released as a delete releases it), POST /v1/token over SPIFFE mTLS: client certificate required, chain verified against the trust-domain bundle, peer SPIFFE ID taken from the verified URI SAN and restricted to /banlieue/node/* and /banlieue/claim/*. Node identities may register and fetch their subject, claim identities may request audience-scoped tokens (minted by the STS or Entra, or since ADR-0032 the operator's own credential for an audience via: secret, handed with the header it goes in). The dev header exists only under dev_mode on a loopback listener (ADR-0007). crates/mediatore-api. GET /v1/me also carries the operator's pull credential for the registry the claim's image names, and no other (ADR-0022). ADR-0040: POST /v1/gateway/claims/{uid}/credential, accepted only from the gateway identity, returns an audience's credential for the gateway to place when the audience is inject: gateway; POST /v1/token refuses such an audience with 403 placed_at_gateway; GET /v1/gateway/claims/{uid} carries the gateway-placed routes (endpoint, rules, header names, non-secret extra headers) and GET /v1/me carries credential: gateway and the inject port on those routes."
     },
     {
       "unique-id": "service-mediatore-watcher",
@@ -149,7 +149,7 @@
       "unique-id": "system-sandbox-vm",
       "node-type": "system",
       "name": "Sandbox VM (pool member)",
-      "description": "A banlieue pool member with a fresh vTPM, attested at boot before any claim exists. Boots the sandbox VM image, a Kairos Debian derivative built from this repository (image/Dockerfile, published as ghcr.io/firestoned/mediatore-guest, signed and attested; ADR-0023): the one mediatore binary at /usr/bin/mediatore, the SPIRE agent and its TPM attestor plugin in the immutable rootfs, nftables, tpm2-tools, qemu-guest-agent, no sshd or other listener; the agent's configuration and the trust bundle from the deployment's cloud-config layer at every boot, the agent's key on the sealed persistent partition, never in the image. Carries the in-guest agent and, once bound, the jailed workload. Its units start only on the installed disk, and its GuestReady is announced by the in-guest agent after registration (ADR-0019), not by a boot stage. With egress gateways, the pool's cloud-config layer points the agent's server_address and MEDIATORE_URL at a gateway's sandbox address and the control relay's ports, by address, and writes the bootstrap list /etc/mediatore/gateways the guest uses until the broker's gateways arrive (ADR-0027 decisions 3 and 4). With gateways the image also loads inet mediatore_host from the pool's own files before the agent and the guest (image/host-table, mediatore-host-nft.service, ADR-0029): the bound on root and every uid, names refused; /etc/mediatore/registries names the mirror and MEDIATORE_REGISTRY_CA its CA."
+      "description": "A banlieue pool member with a fresh vTPM, attested at boot before any claim exists. Boots the sandbox VM image, a Kairos Debian derivative built from this repository (image/Dockerfile, published as ghcr.io/firestoned/mediatore-guest, signed and attested; ADR-0023): the one mediatore binary at /usr/bin/mediatore, the SPIRE agent and its TPM attestor plugin in the immutable rootfs, nftables, tpm2-tools, qemu-guest-agent, no sshd or other listener; the agent's configuration and the trust bundle from the deployment's cloud-config layer at every boot, the agent's key on the sealed persistent partition, never in the image. Carries the in-guest agent and, once bound, the jailed workload. Its units start only on the installed disk, and its GuestReady is announced by the in-guest agent after registration (ADR-0019), not by a boot stage. With egress gateways, the pool's cloud-config layer points the agent's server_address and MEDIATORE_URL at a gateway's sandbox address and the control relay's ports, by address, and writes the bootstrap list /etc/mediatore/gateways the guest uses until the broker's gateways arrive (ADR-0027 decisions 3 and 4). With gateways the image also loads inet mediatore_host from the pool's own files (which, for a pool with a gateway-placed audience, include MEDIATORE_INJECT_PORT: each gateway admitted at it for every uid, ADR-0040 decision 13) before the agent and the guest (image/host-table, mediatore-host-nft.service, ADR-0029): the bound on root and every uid, names refused; /etc/mediatore/registries names the mirror and MEDIATORE_REGISTRY_CA its CA."
     },
     {
       "unique-id": "service-spire-agent",
@@ -173,13 +173,13 @@
       "unique-id": "service-egress-proxy",
       "node-type": "service",
       "name": "mediatore egress-proxy",
-      "description": "The egress-proxy role of the one binary (ADR-0025), one process per claim started by the guest as the sandbox user outside the jail, in the VM's namespace and filesystem. A reverse proxy on 127.0.0.1:3128: the workload calls /<host>[:<port>]/<path> with the phantom token, the proxy checks the host against the claim's routes (one per audience and egress endpoint, and under policy.egress enforce one per direct egress entry of the claim's bundle the gateway serves, from GET /v1/me) and the method and path against the route's rules (nono's endpoint_rules shape: method or *, a path glob with * one segment and ** any), swaps the phantom for a token for the route's audience fetched over the claim SVID at POST /v1/token and cached until shortly before its expiry, or on a route with credential none (a bundle's direct entry, an audience via: none; ADR-0025 decision 8) drops the phantom and forwards bare; for an audience via: secret (ADR-0032) the credential is the operator's, placed in the header the broker named (Authorization as a bearer, or x-api-key and the like) with the extra headers beside it, the phantom recognised in that header too and every owned header stripped on every route; and forwards over TLS 1.3 to the Mozilla roots, or to the CA the route carries for an audience on a private PKI (audiences[].ca_file, ADR-0025 decision 7). No TLS interception. A request with no Authorization header is forwarded bare, one with a foreign bearer is 401 on every route, one outside the rules 403, one to a host not in the routes 404. In an environment with egress gateways (the gateways list on GET /v1/me, ADR-0028 decision 6) the upstream is not dialled directly: the proxy's dialer is the forwarder of ADR-0028 decision 3, placed in this process by ADR-0027 decision 8 (crates/mediatore-guest/src/forward.rs): TLS 1.3 to a gateway on the sandbox leg's configuration presenting the claim SVID and verifying spiffe://<td>/gateway, CONNECT host:port, the upstream's TLS inside the tunnel; the list walked from a random start per connection, a connect or handshake failure moving to the next (decision 7), a gateway's refusal final (502 gateway_refused at the workload, the authorizer's code in the log; 502 gateway_unreachable when none carried it). The only process that ever holds a downstream token or the claim SVID; the uid-keyed table drops packets to its port from any other uid, and a proxy that exits ends the claim. crates/mediatore-guest/src/egress.rs."
+      "description": "The egress-proxy role of the one binary (ADR-0025), one process per claim started by the guest as the sandbox user outside the jail, in the VM's namespace and filesystem. A reverse proxy on 127.0.0.1:3128: the workload calls /<host>[:<port>]/<path> with the phantom token, the proxy checks the host against the claim's routes (one per audience and egress endpoint, and under policy.egress enforce one per direct egress entry of the claim's bundle the gateway serves, from GET /v1/me) and the method and path against the route's rules (nono's endpoint_rules shape: method or *, a path glob with * one segment and ** any), swaps the phantom for a token for the route's audience fetched over the claim SVID at POST /v1/token and cached until shortly before its expiry, or on a route with credential none (a bundle's direct entry, an audience via: none; ADR-0025 decision 8) drops the phantom and forwards bare; for an audience via: secret (ADR-0032) the credential is the operator's, placed in the header the broker named (Authorization as a bearer, or x-api-key and the like) with the extra headers beside it, the phantom recognised in that header too and every owned header stripped on every route; and forwards over TLS 1.3 to the Mozilla roots, or to the CA the route carries for an audience on a private PKI (audiences[].ca_file, ADR-0025 decision 7). No TLS interception. A request with no Authorization header is forwarded bare, one with a foreign bearer is 401 on every route, one outside the rules 403, one to a host not in the routes 404. In an environment with egress gateways (the gateways list on GET /v1/me, ADR-0028 decision 6) the upstream is not dialled directly: the proxy's dialer is the forwarder of ADR-0028 decision 3, placed in this process by ADR-0027 decision 8 (crates/mediatore-guest/src/forward.rs): TLS 1.3 to a gateway on the sandbox leg's configuration presenting the claim SVID and verifying spiffe://<td>/gateway, CONNECT host:port, the upstream's TLS inside the tunnel; the list walked from a random start per connection, a connect or handshake failure moving to the next (decision 7), a gateway's refusal final (502 gateway_refused at the workload, the authorizer's code in the log; 502 gateway_unreachable when none carried it). The only process that ever holds a downstream token or the claim SVID; the uid-keyed table drops packets to its port from any other uid, and a proxy that exits ends the claim. crates/mediatore-guest/src/egress.rs. ADR-0040: on a route with credential: gateway the proxy never fetches a token; it sends the request in origin form to the gateway's inject port over the claim-SVID mutual TLS and the gateway places the credential."
     },
     {
       "unique-id": "service-egress-gateway",
       "node-type": "service",
       "name": "Egress gateway (Envoy + mediatore gateway, with the control relay beside them)",
-      "description": "The egress gateway of ADR-0028 on each of banlieue's three proxy VMs per environment (banlieue ADR-0109), built as image content (image/gateway/, published as ghcr.io/firestoned/mediatore-gateway, signed and attested; the VMs, the two-interface class and the entries in deploy/gateway/). The data plane: Envoy on the sandbox address, mutual TLS 1.3 with X25519MLKEM768 offered first, its own identity spiffe://<td>/gateway over SDS from the local SPIRE agent (the VM attests with its vTPM like a pool member, two ClusterStaticEntry objects per VM, unix:user:envoy and unix:user:mediatore-gateway, applied by the platform team), every peer required to be a claim of the trust domain before any filter runs, CONNECT the only route, each tunnel checked with the authorizer beside it, mediatore gateway (crates/mediatore-gateway: Envoy's own Check call over gRPC on loopback; the peer from the verified certificate, the method and the authority; OK or PERMISSION_DENIED with a stable code from a bounded cache of one allowlist per claim, fresh 30 s, stale for 300 s more while the broker is unreachable, never past the claim's deadline, dropped on the broker's 404, least recently used evicted past 4096 claims, one ask per claim at a time, deny on no answer), the authority resolved and dialled by Envoy from the egress address, one access-log line per tunnel keyed by the peer's SPIFFE ID, no admin interface, no interception. The host: forwarding off, an nftables table with default-drop input admitting the data port and the relay ports on the sandbox interface only, nothing new on egress, both Envoys as their own users with no capability and a read-only root (ADR-0028 decision 8, ADR-0027 decision 5). The bootstrap the kind tier proves is the image's template rendered with the tier's values (make kind-e2e-gateway, make gateway-render-check). The image is built and checked (image/gateway/check.sh), not booted: the live run on gateway VMs is roadmap 06's proof.",
+      "description": "The egress gateway of ADR-0028 on each of banlieue's three proxy VMs per environment (banlieue ADR-0109), built as image content (image/gateway/, published as ghcr.io/firestoned/mediatore-gateway, signed and attested; the VMs, the two-interface class and the entries in deploy/gateway/). The data plane: Envoy on the sandbox address, mutual TLS 1.3 with X25519MLKEM768 offered first, its own identity spiffe://<td>/gateway over SDS from the local SPIRE agent (the VM attests with its vTPM like a pool member, two ClusterStaticEntry objects per VM, unix:user:envoy and unix:user:mediatore-gateway, applied by the platform team), every peer required to be a claim of the trust domain before any filter runs, CONNECT the only route, each tunnel checked with the authorizer beside it, mediatore gateway (crates/mediatore-gateway: Envoy's own Check call over gRPC on loopback; the peer from the verified certificate, the method and the authority; OK or PERMISSION_DENIED with a stable code from a bounded cache of one allowlist per claim, fresh 30 s, stale for 300 s more while the broker is unreachable, never past the claim's deadline, dropped on the broker's 404, least recently used evicted past 4096 claims, one ask per claim at a time, deny on no answer), the authority resolved and dialled by Envoy from the egress address, one access-log line per tunnel keyed by the peer's SPIFFE ID, no admin interface, no interception. The host: forwarding off, an nftables table with default-drop input admitting the data port and the relay ports on the sandbox interface only, nothing new on egress, both Envoys as their own users with no capability and a read-only root (ADR-0028 decision 8, ADR-0027 decision 5). The bootstrap the kind tier proves is the image's template rendered with the tier's values (make kind-e2e-gateway, make gateway-render-check). The image is built and checked (image/gateway/check.sh), not booted: the live run on gateway VMs is roadmap 06's proof. ADR-0040 (accepted): where an audience is declared inject: gateway the authorizer also answers a second question on a second unix socket, for envoy-inject (a third Envoy process beside the data plane and the relay), obtains the credential from the broker (POST /v1/gateway/claims/{uid}/credential) and returns it only to that Envoy in the check response; the data-plane socket never returns one.",
       "metadata": {
         "status": "implemented"
       }
@@ -210,6 +210,15 @@
       "node-type": "network",
       "name": "Sandbox Network Segment",
       "description": "Pool members' network, layer 2 only (banlieue ADR-0109): no route anywhere and no resolver. A member reaches exactly the three gateways' sandbox addresses: the data plane (TCP 8443, mutual TLS with the claim SVID, CONNECT to the claim's allowlist) and the control relay (TCP 3129 to the SPIRE server, 3130 to the broker, the TLS inside end to end). The SPIRE server, the broker's sandbox listener, the workload image registry and the downstream APIs are reached through the gateways and never directly; from inside the jail the sandbox uid reaches the egress proxy on loopback alone, and the proxy's own sockets the relay and the gateways by address (ADR-0020 as amended by ADR-0028 decision 6 and ADR-0027 decision 6). Nothing inbound to a VM. In an environment without gateways yet, the older shape: the broker, the audiences' egress endpoints and the resolvers. The workload image registry a gateway-era pool pulls from is on this segment too, a registry or pull-through mirror at layer 2 (ADR-0029 decision 1): a public registry is unreachable by construction. Every uid on a member is bounded by the image's host table, input and forward dropped, output to the gateways' two planes and the segment's registries alone (ADR-0029 decision 3)."
+    },
+    {
+      "unique-id": "service-envoy-inject",
+      "node-type": "service",
+      "name": "envoy-inject (credential placement Envoy, ADR-0040)",
+      "description": "ADR-0040's third Envoy on each gateway VM, only where an audience is declared inject: gateway: its own systemd unit and static user (envoy-inject), no admin interface, its own SPIRE entry for the gateway SPIFFE ID (unix:user:envoy-inject, one entry per user). One listener on the sandbox address and its own port (INJECT_PORT, admitted by the gateway's nftables table to the sandbox range under the per-source cap): mutual TLS 1.3 with the claim SAN prefix required, HTTP/1.1, no CONNECT route, no dynamic forward proxy. A route matches the request's :authority exactly against the operator's fixed list (INJECT_ENDPOINTS, a reviewed change like a relay leg) and goes to a static cluster per upstream with TLS origination (SNI the host; system roots, or a PEM for a private PKI); a host not in the list has no route (404). ext_authz on the listener asks the authorizer on inject/inject.sock (group envoy-inject) with context_extensions mode inject; the authorizer alone writes the credential header (OVERWRITE_IF_EXISTS_OR_ADD) and removes any a client sent, so no route, virtual-host or listener-level header rule may name the credential header (Envoy applies those after ext_authz; shown on 1.40.2, TESTING.md T-61). Paths are normalised before the authorizer's rules see them (normalize_path, merge_slashes, an escaped slash rejected). The per-claim limit of ADR-0040 decision 5 is not built (a marked placeholder in the template): until it is, the host table's per-source connection cap bounds a sandbox's connections to the port. The credential is in a request's headers for at most the 300 second cap and is never logged (access log without headers, info level, suppress_envoy_headers). The data-plane Envoy and the relay never hold a credential: this is the only Envoy that does. Without a gateway-placed audience it is not started.",
+      "metadata": {
+        "status": "planned"
+      }
     }
   ],
   "relationships": [
@@ -660,7 +669,7 @@
     },
     {
       "unique-id": "rel-egress-proxy-gateway",
-      "description": "The forwarder's tunnel (ADR-0028 decisions 3 and 7, a dialer inside the egress proxy by ADR-0027 decision 8): TCP to a gateway's sandbox address and data port, TLS 1.3 on the sandbox leg's configuration (X25519MLKEM768 only) presenting the claim SVID and verifying the gateway as exactly spiffe://<td>/gateway, CONNECT host:port for the upstream the request names, the upstream's own TLS inside the tunnel end to end. The list from GET /v1/me walked from a random start per connection, a connect or handshake failure or the gateway's own 5xx moving to the next (decision 7 as amended 2026-11-09), a 4xx the verdict and final (502 gateway_refused at the workload, the authorizer's code in the log; gateway_unreachable when none carried it). Proven against a stand-in gateway in crates/mediatore/tests/e2e_forward.rs and against the real Envoy in kind.",
+      "description": "The forwarder's tunnel (ADR-0028 decisions 3 and 7, a dialer inside the egress proxy by ADR-0027 decision 8): TCP to a gateway's sandbox address and data port, TLS 1.3 on the sandbox leg's configuration (X25519MLKEM768 only) presenting the claim SVID and verifying the gateway as exactly spiffe://<td>/gateway, CONNECT host:port for the upstream the request names, the upstream's own TLS inside the tunnel end to end. The list from GET /v1/me walked from a random start per connection, a connect or handshake failure or the gateway's own 5xx moving to the next (decision 7 as amended 2026-11-09), a 4xx the verdict and final (502 gateway_refused at the workload, the authorizer's code in the log; gateway_unreachable when none carried it). The lists the forwarder is given leave out the host of a gateway-placed audience (ADR-0040 decision 11): the only path to such a host is the inject listener, where the rules are enforced and the credential placed. Proven against a stand-in gateway in crates/mediatore/tests/e2e_forward.rs and against the real Envoy in kind.",
       "relationship-type": {
         "connects": {
           "source": {
@@ -831,6 +840,66 @@
         }
       },
       "protocol": "HTTPS"
+    },
+    {
+      "unique-id": "rel-egress-proxy-envoy-inject",
+      "description": "For a route with credential: gateway (ADR-0040 decision 7) the guest's egress proxy does not tunnel and never calls POST /v1/token: it checks the phantom and the rules as before, strips the phantom, and sends the request in origin form with Host: <audience host> (no port) and no credential, over the claim-SVID mutual TLS 1.3 dialler the forwarder already has, to a gateway's INJECT_PORT (carried on the route by GET /v1/me), streaming the body and returning the response unchanged, failing over to the next gateway on a connection failure only; a response carrying x-mediatore-refusal is the gateway's own refusal and becomes 502 gateway_refused (ADR-0040 decision 12). The workload and the jail are untouched; the sandbox uid's table gains gateway:INJECT_PORT for a claim with such a route and only then, and the pool VM's host table (MEDIATORE_INJECT_PORT in the guest env) admits each gateway at that port for every uid (decision 13).",
+      "relationship-type": {
+        "connects": {
+          "source": {
+            "node": "service-egress-proxy"
+          },
+          "destination": {
+            "node": "service-envoy-inject"
+          }
+        }
+      },
+      "protocol": "mTLS"
+    },
+    {
+      "unique-id": "rel-envoy-inject-downstream",
+      "description": "The gateway originates TLS to the audience (ADR-0040 decision 3), only for an exact authority in the fixed INJECT_ENDPOINTS list and only after the authorizer's OK: the request leaves with the credential header the authorizer wrote. No certificate authority is minted or trusted for the workload's traffic anywhere: this is origination to a fixed list for an opt-in audience, not interception of a tunnel (ADR-0028 decision 9 stays). The gateway's routable interface must be allowed to reach the host by the datacenter's firewall (an external control).",
+      "relationship-type": {
+        "connects": {
+          "source": {
+            "node": "service-envoy-inject"
+          },
+          "destination": {
+            "node": "ecosystem-downstream-api"
+          }
+        }
+      },
+      "protocol": "HTTPS"
+    },
+    {
+      "unique-id": "rel-envoy-inject-authorizer",
+      "description": "envoy-inject's ext_authz call (ADR-0040 decisions 4 and 6): gRPC over a unix socket, inject/inject.sock (a directory of its own, setgid 2750 owned by mediatore-gateway and the group envoy-inject so the socket inherits that group, socket 0660; the authorizer's flags are --check-socket, --inject-socket and --socket-dir-mode 2750, and the two sockets never share a directory), the only channel on which the authorizer answers an inject question. The check carries what Envoy fills from the verified connection and the request (source.principal, method, host, path), never read from the client; the answer is OK with the credential header and extra headers, or the same 403 and stable code as for a tunnel, every refusal carrying x-mediatore-refusal: <code> (ADR-0040 decision 12) so the guest can tell the gateway's own refusal from the upstream's 403. The data-plane Envoy's own socket (check/check.sock, group envoy) can only get OK or 403, never a credential, so a compromised tunnel Envoy cannot obtain one even holding the gateway SVID.",
+      "relationship-type": {
+        "connects": {
+          "source": {
+            "node": "service-envoy-inject"
+          },
+          "destination": {
+            "node": "service-egress-gateway"
+          }
+        }
+      },
+      "protocol": "TCP"
+    },
+    {
+      "unique-id": "rel-gateway-mediatore-credential",
+      "description": "POST /v1/gateway/claims/{uid}/credential over SPIFFE mTLS with the gateway SVID (ADR-0040 decision 2), body { audience }. Accepted only from spiffe://<td>/gateway, runs the checks of POST /v1/token (the claim is live and names the audience, the same per-claim rate limit), requires the audience to be inject: gateway, and adds the policy admission /v1/token does not have (under policy.egress enforce the claim must name a policy whose verified bundle lists the audience, failing closed; shadow logs and allows), and calls the same per-backend code (secret, delegated opened from its sealed envelope, or sts); the answer carries the credential header and value (a Secret, never printed or logged), the non-secret extra headers and an expires_at at most 300 seconds ahead. POST /v1/token for such an audience is 403 placed_at_gateway, so the claim SVID on the pool VM cannot obtain the credential either. One log line per issue: claim UID, audience, subject, backend, expires_at, never the credential. The authorizer holds the answer in memory for at most min(60 s, expires_at minus 30 s).",
+      "relationship-type": {
+        "connects": {
+          "source": {
+            "node": "service-egress-gateway"
+          },
+          "destination": {
+            "node": "service-mediatore-sandbox-api"
+          }
+        }
+      },
+      "protocol": "mTLS"
     }
   ],
   "flows": [
@@ -1034,6 +1103,7 @@
     "docs/adr/0031-a-trust-anchor-that-outlives-the-servers-ca.md",
     "docs/adr/0037-the-pool-fetches-its-spire-bundle-at-boot-through-the-relay.md",
     "docs/adr/0038-the-pull-reaches-the-operators-registry-through-a-fourth-relay-leg.md",
-    "docs/adr/0039-a-node-leaves-the-register-when-its-vm-is-gone.md"
+    "docs/adr/0039-a-node-leaves-the-register-when-its-vm-is-gone.md",
+    "docs/adr/0040-the-gateway-places-an-audiences-credential-the-pool-never-holds-it.md"
   ]
 }

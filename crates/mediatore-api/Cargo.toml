@@ -27,5 +27,13 @@ uuid.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
 
+[dev-dependencies]
+# The handler tests drive the real routers in process (`oneshot`), build a verified bundle for the
+# policy cases, and capture the audit line to prove a credential is never logged (ADR-0040).
+mediatore-testkit.workspace = true
+mediatore-policy.workspace = true
+tower = { workspace = true, features = ["util"] }
+tracing-subscriber.workspace = true
+
 [lints]
 workspace = true

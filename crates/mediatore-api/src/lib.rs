@@ -9,7 +9,9 @@
 //!   `POST` creates one with the token's subject, `GET` answers from its status, `DELETE`
 //!   deletes it and the reconciler's finalizer does the rest.
 //! * [`sandbox_router`]: `POST /v1/nodes`, `GET /v1/me`, `POST /v1/token`, authenticated by
-//!   the peer's SPIFFE ID from mTLS.
+//!   the peer's SPIFFE ID from mTLS, and the gateway's two routes, `GET /v1/gateway/claims/{uid}`
+//!   and `POST /v1/gateway/claims/{uid}/credential` (ADR-0028, ADR-0040), which only the
+//!   gateway identity may call.
 //!
 //! The sandbox router takes the peer identity from the [`PeerSpiffeId`] extension that
 //! `mediatore_tls::serve` attaches after verifying the client certificate (ADR-0007). Only a
@@ -36,9 +38,10 @@ use mediatore_proto::ek::is_ek_hash;
 use mediatore_proto::image::ImageReference;
 use mediatore_proto::{
     ClaimEgress, ClaimPhase, ClaimReport, ClaimRequest, ClaimResponse, Credential, Delegation,
-    DelegationPlain, Endpoint, EndpointRule, ErrorBody, GuestExit, GuestReport, HeaderPair,
-    HostTable, Me, NodeRegistered, NodeRegistration, RegistryCredential, Route, Secret,
-    TokenRequest, TokenResponse, WorkloadExit,
+    DelegationPlain, Endpoint, EndpointRule, ErrorBody, GatewayCredential,
+    GatewayCredentialRequest, GuestExit, GuestReport, HeaderPair, HostTable, InjectRoute, Me,
+    NodeRegistered, NodeRegistration, RegistryCredential, Route, Secret, TokenRequest,
+    TokenResponse, WorkloadExit, error_code,
 };
 use mediatore_spire::{EntryManager, Naming};
 use mediatore_store::seal::{SealError, Sealed, Sealer};
@@ -117,6 +120,16 @@ pub struct AppState {
     /// The environment's egress gateways in the broker's order (`gateways`, ADR-0028
     /// decision 6), handed to every guest on `GET /v1/me`.
     pub gateways: Vec<Endpoint>,
+    /// The audiences declared `inject: gateway` (ADR-0040): per audience, the routes the
+    /// gateway places, one per exact upstream authority, with the rules it enforces and the
+    /// header names it writes (`AudienceConfig::inject_routes()`). An audience in this map has
+    /// its credential placed at the gateway: `POST /v1/token` refuses it (`placed_at_gateway`),
+    /// its routes on `GET /v1/me` say `credential: gateway`, and the gateway asks for it on
+    /// `POST /v1/gateway/claims/{uid}/credential`. Empty: every audience is placed in the proxy.
+    pub inject: BTreeMap<String, Vec<InjectRoute>>,
+    /// `gateway_inject_port` (ADR-0040 decision 7): the port of the gateways' inject listener,
+    /// carried on every route of a gateway-placed audience on `GET /v1/me`.
+    pub inject_port: Option<u16>,
 }
 
 /// The per-claim gate on `POST /v1/token`: a token bucket (`per_minute` issues a minute,
@@ -1112,6 +1125,9 @@ async fn me(
                 ca_pem: st.cas.get(a).cloned(),
                 credential: if st.no_credential.contains(a) {
                     Credential::None
+                } else if st.inject.contains_key(a) {
+                    // ADR-0040: the gateway places it; the proxy never asks for a token.
+                    Credential::Gateway
                 } else {
                     Credential::Token
                 },
@@ -1129,6 +1145,13 @@ async fn me(
                             .filter(|d| d.header != "authorization")
                             .map(|d| d.header.clone())
                     }),
+                // ADR-0040: the gateways' inject port, on the routes of an audience placed
+                // there; every other route is placed by the proxy.
+                inject_port: st
+                    .inject
+                    .contains_key(a)
+                    .then_some(st.inject_port)
+                    .flatten(),
             })
         })
         .chain(direct.into_iter().map(|e| Route {
@@ -1138,6 +1161,7 @@ async fn me(
             ca_pem: None,
             credential: Credential::None,
             credential_header: None,
+            inject_port: None,
         }))
         .collect();
     routes.sort_by(|a, b| {
@@ -1233,6 +1257,9 @@ fn egress_of(st: &AppState, rec: &ClaimRecord) -> Vec<Endpoint> {
     let mut egress = audience_egress(st, rec);
     let direct = served_direct_egress(st, rec, &egress);
     egress.extend(direct);
+    // A policy's direct egress must not bring a placed host back into the tunnel list.
+    let placed = placed_endpoints(st, rec);
+    egress.retain(|e| !placed.contains(e));
     egress.sort();
     egress.dedup();
     egress
@@ -1278,13 +1305,29 @@ fn served_direct_egress(st: &AppState, rec: &ClaimRecord, audience: &[Endpoint])
     }
 }
 
-/// The union of the claim's audiences' `egress`, sorted and deduplicated.
+/// The endpoints of the claim's gateway-placed audiences (ADR-0040): reachable through the
+/// inject listener, where the rules are enforced and the credential is placed, and through no
+/// other path.
+fn placed_endpoints(st: &AppState, rec: &ClaimRecord) -> Vec<Endpoint> {
+    rec.audiences
+        .iter()
+        .filter_map(|a| st.inject.get(a))
+        .flatten()
+        .map(|r| r.endpoint.clone())
+        .collect()
+}
+
+/// The union of the claim's audiences' `egress`, sorted and deduplicated, without the hosts a
+/// gateway-placed audience binds to the inject path: a `CONNECT` tunnel to such a host would go
+/// around the rules the inject listener enforces (ADR-0040).
 fn audience_egress(st: &AppState, rec: &ClaimRecord) -> Vec<Endpoint> {
+    let placed = placed_endpoints(st, rec);
     let mut egress: Vec<Endpoint> = rec
         .audiences
         .iter()
         .filter_map(|a| st.egress.get(a))
         .flatten()
+        .filter(|e| !placed.contains(e))
         .cloned()
         .collect();
     egress.sort();
@@ -1325,7 +1368,28 @@ async fn claim_egress(
         claim_uid: uid,
         expires_at,
         egress,
+        inject: inject_of(&st, &rec),
     }))
+}
+
+/// The claim's gateway-placed routes (ADR-0040 decision 2): one per exact upstream authority
+/// of each audience it names that is declared `inject: gateway`, sorted by audience then
+/// endpoint. Empty for a claim with no such audience. Carries no credential.
+fn inject_of(st: &AppState, rec: &ClaimRecord) -> Vec<InjectRoute> {
+    let mut routes: Vec<InjectRoute> = rec
+        .audiences
+        .iter()
+        .filter_map(|a| st.inject.get(a))
+        .flatten()
+        .cloned()
+        .collect();
+    routes.sort_by(|a, b| {
+        a.audience
+            .cmp(&b.audience)
+            .then_with(|| a.endpoint.cmp(&b.endpoint))
+    });
+    routes.dedup();
+    routes
 }
 
 /// What the issuer answered a refresh with: the refresh token to keep, the validated
@@ -1497,23 +1561,65 @@ async fn token(
 ) -> Result<Json<TokenResponse>, ApiError> {
     let (peer, claim_uid, rec) =
         token_claim(&st, peer.as_ref().map(|e| &e.0), &headers, &req.audience).await?;
+    issue_token(&st, &peer, claim_uid, rec, req.audience, Placement::Proxy)
+        .await
+        .map(Json)
+}
+
+/// Where an issued credential is going (ADR-0040): to the proxy on the pool VM, which gets it
+/// as the `POST /v1/token` answer and for which each backend logs its own audit line, or to the
+/// gateway, whose route logs one line of its own once the credential is built.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Placement {
+    Proxy,
+    Gateway,
+}
+
+/// The backend that serves `audience`, for the audit line, in the order `issue_token` tries them.
+fn backend_of(st: &AppState, audience: &str) -> &'static str {
+    if st.delegated.contains_key(audience) {
+        "delegated"
+    } else if st.secrets.contains_key(audience) {
+        "secret"
+    } else if st.obo_audiences.iter().any(|a| a == audience) {
+        "entra-obo"
+    } else {
+        "sts"
+    }
+}
+
+/// A claim's credential for `audience`, once the claim has passed its gate: the one
+/// per-backend code (delegated, secret, Entra On-Behalf-Of, STS) that `POST /v1/token` and the
+/// gateway's credential route both run (ADR-0040 decision 2). `actor` is the SPIFFE ID the
+/// token is minted for: the claim identity on `/v1/token`, and the same claim identity when the
+/// gateway asks, so an STS token carries the same `act` either way.
+async fn issue_token(
+    st: &AppState,
+    actor: &str,
+    claim_uid: Uuid,
+    rec: ClaimRecord,
+    audience: String,
+    placement: Placement,
+) -> Result<TokenResponse, ApiError> {
     // ADR-0035: the caller's own credential, opened from the record's envelope for this
     // audience, handed with the header it goes in; it dies with the credential, the claim or
     // `max_ttl`, whichever is first.
-    if let Some(d) = st.delegated.get(&req.audience) {
-        return delegated_token(&st, &rec, d, req.audience, claim_uid).await;
+    if let Some(d) = st.delegated.get(&audience) {
+        return delegated_token(st, &rec, d, audience, claim_uid, placement).await;
     }
     // ADR-0032: an operator-held credential is handed as it is, with the header it goes in;
     // the proxy keeps it for `max_ttl` and asks again, through this same gate.
-    if let Some(sec) = st.secrets.get(&req.audience) {
-        tracing::info!(%claim_uid, audience = %req.audience, subject = %rec.subject.id, backend = "secret", header = %sec.header, "token issued");
-        return Ok(Json(sec.response(req.audience, rec.subject)));
+    if let Some(sec) = st.secrets.get(&audience) {
+        if placement == Placement::Proxy {
+            tracing::info!(%claim_uid, %audience, subject = %rec.subject.id, backend = "secret", header = %sec.header, "token issued");
+        }
+        return Ok(sec.response(audience, rec.subject));
     }
     // ADR-0013 decision 4, ADR-0016 decision 2: a session issuer's record is refreshed
     // upstream first, for the audience's resource. One refresh at a time per claim, over
     // the record as it is once the lock is held: the previous one may have rotated the
     // envelope, or released the claim.
-    let obo = st.obo_audiences.iter().any(|a| a == &req.audience);
+    let obo = st.obo_audiences.iter().any(|a| a == &audience);
     let issuer = st.validator.issuer_named(&rec.subject.issuer);
     if obo && issuer.is_none_or(|i| i.entra.is_none()) {
         return Err(ApiError::forbidden(
@@ -1532,7 +1638,7 @@ async fn token(
             if !rec.is_live(Utc::now()) {
                 return Err(ApiError::forbidden("claim revoked or expired"));
             }
-            refresh_session(&st, &rec, issuer, &req.audience, obo).await?
+            refresh_session(st, &rec, issuer, &audience, obo).await?
         }
         _ => Fresh {
             groups: vec![],
@@ -1540,16 +1646,18 @@ async fn token(
         },
     };
     if let Some((token, expires_at)) = fresh.obo {
-        tracing::info!(%claim_uid, audience = %req.audience, subject = %rec.subject.id, %expires_at, "token issued on behalf of the subject");
-        return Ok(Json(TokenResponse {
+        if placement == Placement::Proxy {
+            tracing::info!(%claim_uid, %audience, subject = %rec.subject.id, %expires_at, "token issued on behalf of the subject");
+        }
+        return Ok(TokenResponse {
             access_token: token.0,
             token_type: "Bearer".into(),
             expires_at,
-            audience: req.audience,
+            audience,
             subject: rec.subject,
             header: None,
             extra_headers: vec![],
-        }));
+        });
     }
     let Some(sts) = st.sts.as_ref() else {
         return Err(ApiError::not_implemented("sts backend not configured"));
@@ -1557,23 +1665,25 @@ async fn token(
     let minted = sts
         .mint(&MintRequest {
             subject: &rec.subject,
-            actor_spiffe_id: &peer,
+            actor_spiffe_id: actor,
             claim_uid,
-            audience: &req.audience,
+            audience: &audience,
             groups: fresh.groups,
             ttl: Duration::minutes(15).min(sts.max_ttl()),
         })
         .map_err(|e| ApiError::internal(e.to_string()))?;
-    tracing::info!(%claim_uid, audience = %req.audience, subject = %rec.subject.id, "token issued");
-    Ok(Json(TokenResponse {
+    if placement == Placement::Proxy {
+        tracing::info!(%claim_uid, %audience, subject = %rec.subject.id, "token issued");
+    }
+    Ok(TokenResponse {
         access_token: minted.token,
         token_type: "Bearer".into(),
         expires_at: minted.expires_at,
-        audience: req.audience,
+        audience,
         subject: rec.subject,
         header: None,
         extra_headers: vec![],
-    }))
+    })
 }
 
 /// What every token request establishes first: the peer is a claim identity, the claim is
@@ -1614,6 +1724,17 @@ async fn token_claim(
             Some("the audience is reached without a credential (via: none)".to_owned()),
         ));
     }
+    // ADR-0040 decision 2: an audience whose credential the gateway places is not the pool
+    // VM's to hold, so the claim SVID that is asking gets none, however the proxy is built.
+    // Refused before the rate limit: a refusal spends no token.
+    if st.inject.contains_key(audience) {
+        tracing::debug!(%claim_uid, audience = %audience.to_owned(), "token refused: the credential is placed at the gateway");
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            error_code::PLACED_AT_GATEWAY,
+            Some("the credential for this audience is placed at the gateway".to_owned()),
+        ));
+    }
     if !st.limiter.allow(claim_uid) {
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
@@ -1624,14 +1745,16 @@ async fn token_claim(
     Ok((peer, claim_uid, rec))
 }
 
-/// `POST /v1/token` for a `via: delegated` audience (ADR-0035 decision 4).
+/// A `via: delegated` audience's credential (ADR-0035 decision 4), for `POST /v1/token` and,
+/// placed at the gateway, for its credential route (ADR-0040).
 async fn delegated_token(
     st: &AppState,
     rec: &ClaimRecord,
     d: &DelegatedAudience,
     audience: String,
     claim_uid: Uuid,
-) -> Result<Json<TokenResponse>, ApiError> {
+    placement: Placement,
+) -> Result<TokenResponse, ApiError> {
     let Some(sealer) = st.sealer.as_ref() else {
         return Err(ApiError::not_implemented("sealing"));
     };
@@ -1658,8 +1781,10 @@ async fn delegated_token(
     let plain: DelegationPlain = serde_json::from_slice(&plain)
         .map_err(|_| ApiError::internal("the delegation envelope is not what was sealed"))?;
     let bearer = d.header == "authorization";
-    tracing::info!(%claim_uid, %audience, subject = %rec.subject.id, backend = "delegated", header = %d.header, %expires_at, "token issued");
-    Ok(Json(TokenResponse {
+    if placement == Placement::Proxy {
+        tracing::info!(%claim_uid, %audience, subject = %rec.subject.id, backend = "delegated", header = %d.header, %expires_at, "token issued");
+    }
+    Ok(TokenResponse {
         access_token: plain.token.0,
         token_type: if bearer { "Bearer" } else { "Header" }.into(),
         expires_at,
@@ -1667,7 +1792,94 @@ async fn delegated_token(
         subject: rec.subject.clone(),
         header: (!bearer).then(|| d.header.clone()),
         extra_headers: d.extra_headers.clone(),
-    }))
+    })
+}
+
+/// Whether the claim's policy admits `audience` for a gateway-placed credential (ADR-0040
+/// decision 2). Without a `policy` section there is nothing to compare. Under
+/// `policy.egress: enforce` the claim must name a policy whose verified, unexpired bundle
+/// lists the audience, and fails closed otherwise (no policy on the claim, no bundle, or an
+/// audience the bundle omits); under `shadow` the gap is logged and nothing is refused.
+fn policy_admits(st: &AppState, rec: &ClaimRecord, audience: &str) -> Result<(), ApiError> {
+    let Some(pe) = st.policy_egress.as_ref() else {
+        return Ok(());
+    };
+    let admitted = rec
+        .policy_uid
+        .as_deref()
+        .and_then(|uid| pe.bundles.by_uid(uid, Utc::now()))
+        .is_some_and(|b| b.content.audiences.iter().any(|g| g.name == audience));
+    match pe.mode {
+        mediatore_claims::policy::EgressMode::Enforce if !admitted => {
+            tracing::warn!(claim_uid = %rec.uid, %audience, "gateway credential refused: the claim's policy does not admit the audience");
+            Err(ApiError::forbidden(
+                "the claim's policy does not admit this audience",
+            ))
+        }
+        mediatore_claims::policy::EgressMode::Shadow if !admitted => {
+            tracing::info!(claim_uid = %rec.uid, %audience, "policy.egress is shadow: the bundle would not admit this audience for the gateway credential");
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// `POST /v1/gateway/claims/{uid}/credential`: the credential of a gateway-placed audience, for
+/// the gateway's authorizer alone (ADR-0040 decision 2). The peer must be the gateway
+/// identity, as for `GET /v1/gateway/claims/{uid}`: a node, a claim, even the claim asked about,
+/// is `403`. A claim that is unknown, unbound, released or past its deadline is `404`, the answer
+/// the gateway takes as "drop what was cached". The gate then is `POST /v1/token`'s (the claim
+/// names the audience, the per-claim rate limit) plus the policy bundle under `enforce`, the
+/// audience must be gateway-placed, and the credential comes from the same per-backend code.
+/// It is built for this answer and kept nowhere; each issue is one audit line that names the
+/// claim, audience, subject, backend and expiry, never the credential.
+async fn gateway_credential(
+    State(st): State<Shared>,
+    headers: HeaderMap,
+    peer: Option<Extension<PeerSpiffeId>>,
+    Path(uid): Path<String>,
+    Json(req): Json<GatewayCredentialRequest>,
+) -> Result<Json<GatewayCredential>, ApiError> {
+    let peer = peer_spiffe_id(&st, peer.as_ref().map(|e| &e.0), &headers)?;
+    if !st.naming.is_gateway(&peer) {
+        return Err(ApiError::forbidden("peer is not the gateway identity"));
+    }
+    let claim_uid = Uuid::parse_str(&uid)
+        .map_err(|_| ApiError::bad_request("invalid_claim_uid", "claim uid must be a UUID"))?;
+    let unknown = || ApiError::not_found("no live claim with this uid");
+    let rec = st.store.get_claim(claim_uid).await.map_err(|e| match e {
+        StoreError::NotFound(_) => unknown(),
+        other => ApiError::internal(other.to_string()),
+    })?;
+    if rec.expires_at.is_none() || !rec.is_live(Utc::now()) {
+        tracing::debug!(%claim_uid, "gateway asked for a credential of a claim that is not live");
+        return Err(unknown());
+    }
+    let audience = req.audience;
+    if !rec.audiences.iter().any(|a| a == &audience) {
+        return Err(ApiError::bad_request("unknown_audience", audience));
+    }
+    if !st.inject.contains_key(&audience) {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            error_code::NOT_PLACED_AT_GATEWAY,
+            Some("the audience's credential is placed in the proxy, not at the gateway".to_owned()),
+        ));
+    }
+    policy_admits(&st, &rec, &audience)?;
+    if !st.limiter.allow(claim_uid) {
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limited",
+            Some("too many credential requests for this claim".to_owned()),
+        ));
+    }
+    let backend = backend_of(&st, &audience);
+    let actor = st.naming.claim_id(claim_uid);
+    let issued = issue_token(&st, &actor, claim_uid, rec, audience, Placement::Gateway).await?;
+    let credential = GatewayCredential::from_token_response(issued, Utc::now());
+    tracing::info!(%claim_uid, audience = %credential.audience, subject = %credential.subject.id, backend, expires_at = %credential.expires_at, "gateway credential issued");
+    Ok(Json(credential))
 }
 
 /// Router for attested VMs and their jailed workloads.
@@ -1680,6 +1892,10 @@ pub fn sandbox_router(state: Shared) -> Router {
         .route("/v1/me/exit", post(exit))
         .route("/v1/token", post(token))
         .route("/v1/gateway/claims/{uid}", get(claim_egress))
+        .route(
+            "/v1/gateway/claims/{uid}/credential",
+            post(gateway_credential),
+        )
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -1700,5 +1916,913 @@ mod tests {
             Limiter::new(0).allow(a),
             "zero means one a minute, never none"
         );
+    }
+
+    // ---------- ADR-0040: the gateway places an audience's credential ----------
+
+    use axum::body::Body;
+    use axum::http::Request;
+    use mediatore_proto::{
+        GatewayCredential, GatewayCredentialRequest, InjectRoute, Workload, error_code,
+    };
+    use tower::ServiceExt as _;
+
+    const TD: &str = "sandbox.test";
+    const SECRET_VALUE: &str = "sk-ant-SECRETVALUE-0123456789";
+    const SESSION_TOKEN: &str = "claude-session-TOKEN-9876543210";
+
+    fn naming() -> Naming {
+        Naming {
+            trust_domain: TD.into(),
+        }
+    }
+
+    fn pair(name: &str, value: &str) -> HeaderPair {
+        HeaderPair {
+            name: name.into(),
+            value: value.into(),
+        }
+    }
+
+    fn inject_route(audience: &str, host: &str, header: &str) -> InjectRoute {
+        InjectRoute {
+            audience: audience.into(),
+            endpoint: Endpoint {
+                host: host.into(),
+                port: 443,
+            },
+            rules: vec![EndpointRule {
+                method: "POST".into(),
+                path: "/v1/messages".into(),
+            }],
+            header: header.into(),
+            extra_headers: if header == "x-api-key" {
+                vec![pair("anthropic-version", "2023-06-01")]
+            } else {
+                vec![]
+            },
+        }
+    }
+
+    /// A state with nothing configured; `dev_mode` so the tests name the peer in a header.
+    fn base_state() -> AppState {
+        AppState {
+            store: mediatore_store::MemoryStore::shared(),
+            spire: Arc::new(mediatore_spire::MemoryEntries::default()),
+            naming: naming(),
+            validator: Validator::new(vec![]),
+            sts: None,
+            audiences: vec![],
+            obo_audiences: vec![],
+            egress: BTreeMap::new(),
+            rules: BTreeMap::new(),
+            cas: BTreeMap::new(),
+            no_credential: std::collections::BTreeSet::new(),
+            secrets: BTreeMap::new(),
+            delegated: BTreeMap::new(),
+            registries: BTreeMap::new(),
+            reachable_registries: None,
+            policy_egress: None,
+            sandboxes: None,
+            sandbox_namespace: "sandboxes".into(),
+            sealer: None,
+            limiter: Limiter::new(10),
+            dev_mode: true,
+            gateways: vec![],
+            inject: BTreeMap::new(),
+            inject_port: None,
+        }
+    }
+
+    /// The broker as ADR-0040 configures it: `anthropic` (a `via: secret` audience, header
+    /// `x-api-key`) and `claude` (delegated, `authorization`) placed at the gateway, `sts-gw`
+    /// (minted) placed at the gateway, and `grafana` (secret) and `grafana-sts` placed in the
+    /// proxy as before.
+    fn placed_state() -> AppState {
+        let mut st = base_state();
+        st.audiences = ["anthropic", "claude", "sts-gw", "grafana", "grafana-sts"]
+            .map(String::from)
+            .to_vec();
+        for (a, host) in [
+            ("anthropic", "api.anthropic.example"),
+            ("claude", "api.claude.example"),
+            ("sts-gw", "api.sts-gw.example"),
+            ("grafana", "grafana.example"),
+            ("grafana-sts", "grafana-sts.example"),
+        ] {
+            st.egress
+                .insert(a.into(), vec![format!("{host}:443").parse().unwrap()]);
+        }
+        st.secrets.insert(
+            "anthropic".into(),
+            AudienceSecret {
+                value: Secret(SECRET_VALUE.into()),
+                header: "x-api-key".into(),
+                extra_headers: vec![pair("anthropic-version", "2023-06-01")],
+                ttl: Duration::minutes(15),
+            },
+        );
+        st.secrets.insert(
+            "grafana".into(),
+            AudienceSecret {
+                value: Secret("grafana-key".into()),
+                header: "authorization".into(),
+                extra_headers: vec![],
+                ttl: Duration::minutes(15),
+            },
+        );
+        st.delegated.insert(
+            "claude".into(),
+            DelegatedAudience {
+                header: "authorization".into(),
+                extra_headers: vec![],
+                ttl: Duration::minutes(15),
+            },
+        );
+        st.sts = Some(
+            Sts::new(
+                "https://mediatore.test",
+                "t-1",
+                // A key made for this test: no key lives in the source (the testkit's generator).
+                mediatore_testkit::entra::fresh_p256_key_pem().as_bytes(),
+                Duration::minutes(15),
+            )
+            .expect("sts"),
+        );
+        st.inject.insert(
+            "anthropic".into(),
+            vec![inject_route(
+                "anthropic",
+                "api.anthropic.example",
+                "x-api-key",
+            )],
+        );
+        st.inject.insert(
+            "claude".into(),
+            vec![inject_route(
+                "claude",
+                "api.claude.example",
+                "authorization",
+            )],
+        );
+        st.inject.insert(
+            "sts-gw".into(),
+            vec![inject_route(
+                "sts-gw",
+                "api.sts-gw.example",
+                "authorization",
+            )],
+        );
+        st.inject_port = Some(3133);
+        st
+    }
+
+    fn subject() -> mediatore_proto::Subject {
+        mediatore_proto::Subject {
+            issuer: "https://idp.example".into(),
+            id: "octocat".into(),
+            display: None,
+        }
+    }
+
+    fn claim(audiences: &[&str], node_id: Option<String>) -> ClaimRecord {
+        let uid = Uuid::new_v4();
+        ClaimRecord {
+            uid,
+            name: format!("claim-{uid}"),
+            subject: subject(),
+            entry_id: Some("entry-1".into()),
+            node_id,
+            audiences: audiences.iter().map(|a| (*a).to_owned()).collect(),
+            workload: Workload::default(),
+            ttl_seconds: 900,
+            refresh: None,
+            created_at: Utc::now(),
+            expires_at: Some(Utc::now() + Duration::minutes(15)),
+            revoked_at: None,
+            sandbox_uid: None,
+            policy_uid: None,
+            bundle_version: None,
+            report: None,
+            exit: None,
+            delegations: BTreeMap::new(),
+        }
+    }
+
+    async fn stored(st: &Shared, rec: ClaimRecord) -> ClaimRecord {
+        st.store.put_claim(rec.clone()).await.expect("put claim");
+        rec
+    }
+
+    /// One request through the sandbox router; the body as JSON (null when it is not) and as text.
+    async fn call(
+        st: &Shared,
+        method: &str,
+        uri: &str,
+        peer: Option<&str>,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value, String) {
+        let mut req = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json");
+        if let Some(p) = peer {
+            req = req.header("x-mediatore-peer-spiffe-id", p);
+        }
+        let resp = sandbox_router(st.clone())
+            .oneshot(req.body(Body::from(body.to_string())).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        (
+            status,
+            serde_json::from_str(&text).unwrap_or(serde_json::Value::Null),
+            text,
+        )
+    }
+
+    fn gateway_peer() -> String {
+        naming().gateway_id()
+    }
+
+    /// `POST /v1/gateway/claims/{uid}/credential` as `peer`.
+    async fn ask(
+        st: &Shared,
+        uid: impl std::fmt::Display,
+        peer: Option<&str>,
+        audience: &str,
+    ) -> (StatusCode, serde_json::Value, String) {
+        call(
+            st,
+            "POST",
+            &format!("/v1/gateway/claims/{uid}/credential"),
+            peer,
+            serde_json::to_value(GatewayCredentialRequest {
+                audience: audience.into(),
+            })
+            .unwrap(),
+        )
+        .await
+    }
+
+    fn code(body: &serde_json::Value) -> &str {
+        body["error"].as_str().unwrap_or_default()
+    }
+
+    // ----- the route: what it hands the gateway -----
+
+    #[tokio::test]
+    async fn the_gateway_gets_a_secret_audiences_credential_whole_with_its_headers_and_a_capped_expiry()
+     {
+        let st: Shared = Arc::new(placed_state());
+        let rec = stored(&st, claim(&["anthropic"], None)).await;
+        let before = Utc::now();
+        let (status, body, _) = ask(&st, rec.uid, Some(&gateway_peer()), "anthropic").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let c: GatewayCredential = serde_json::from_value(body).unwrap();
+        assert_eq!(c.audience, "anthropic");
+        assert_eq!(c.subject.id, "octocat");
+        assert_eq!(c.header, "x-api-key");
+        assert_eq!(
+            c.value.0, SECRET_VALUE,
+            "a non-authorization header gets the bare value"
+        );
+        assert_eq!(
+            c.extra_headers,
+            vec![pair("anthropic-version", "2023-06-01")]
+        );
+        let cap = mediatore_proto::GATEWAY_CREDENTIAL_MAX_TTL_SECS;
+        assert!(
+            c.expires_at > before && c.expires_at <= Utc::now() + Duration::seconds(cap),
+            "the 15 minute secret ttl is cut to the 300 second cap: {}",
+            c.expires_at
+        );
+    }
+
+    #[tokio::test]
+    async fn a_delegated_credential_is_opened_from_its_envelope_for_the_gateway_with_a_bearer() {
+        let mut st = placed_state();
+        let sealer: Arc<dyn Sealer> = Arc::new(mediatore_store::seal::LocalKeySealer::new([7; 32]));
+        let mut rec = claim(&["claude"], None);
+        let plain = serde_json::to_vec(&DelegationPlain {
+            token: Secret(SESSION_TOKEN.into()),
+            refresh_token: None,
+        })
+        .unwrap();
+        let envelope = sealer.seal(rec.seal_binding(), &plain).await.unwrap();
+        rec.delegations.insert(
+            "claude".into(),
+            DelegatedSession {
+                envelope,
+                expires_at: Some(Utc::now() + Duration::hours(1)),
+            },
+        );
+        st.sealer = Some(sealer);
+        let st: Shared = Arc::new(st);
+        let rec = stored(&st, rec).await;
+        let (status, body, _) = ask(&st, rec.uid, Some(&gateway_peer()), "claude").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let c: GatewayCredential = serde_json::from_value(body).unwrap();
+        assert_eq!(c.header, "authorization");
+        assert_eq!(c.value.0, format!("Bearer {SESSION_TOKEN}"));
+        assert!(c.expires_at <= Utc::now() + Duration::seconds(300));
+    }
+
+    #[tokio::test]
+    async fn an_audience_minted_by_the_sts_is_minted_for_the_claim_and_placed_at_the_gateway() {
+        let st: Shared = Arc::new(placed_state());
+        let rec = stored(&st, claim(&["sts-gw"], None)).await;
+        let (status, body, _) = ask(&st, rec.uid, Some(&gateway_peer()), "sts-gw").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let c: GatewayCredential = serde_json::from_value(body).unwrap();
+        assert_eq!(c.header, "authorization");
+        let jwt = c.value.0.strip_prefix("Bearer ").expect("a bearer");
+        assert_eq!(jwt.split('.').count(), 3, "a compact JWT: {jwt}");
+        assert!(c.expires_at <= Utc::now() + Duration::seconds(300));
+    }
+
+    #[tokio::test]
+    async fn issuing_stores_nothing_the_record_is_unchanged() {
+        let st: Shared = Arc::new(placed_state());
+        let rec = stored(&st, claim(&["anthropic"], None)).await;
+        let (status, ..) = ask(&st, rec.uid, Some(&gateway_peer()), "anthropic").await;
+        assert_eq!(status, StatusCode::OK);
+        let after = st.store.get_claim(rec.uid).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(&after).unwrap(),
+            serde_json::to_value(&rec).unwrap(),
+            "the credential is never cached or stored"
+        );
+    }
+
+    // ----- who may ask, and for what -----
+
+    #[tokio::test]
+    async fn only_the_gateway_identity_may_ask_and_a_refusal_never_carries_the_credential() {
+        let st: Shared = Arc::new(placed_state());
+        let rec = stored(&st, claim(&["anthropic"], None)).await;
+        let n = naming();
+        let not_gateways = [
+            n.claim_id(rec.uid),
+            n.node_id("ekhash"),
+            n.broker_id(),
+            "spiffe://other.test/gateway".to_owned(),
+            format!("spiffe://{TD}/gateway/extra"),
+        ];
+        for peer in &not_gateways {
+            let (status, body, text) = ask(&st, rec.uid, Some(peer), "anthropic").await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{peer}: {text}");
+            assert_eq!(code(&body), "forbidden", "{peer}");
+            assert!(!text.contains(SECRET_VALUE), "{peer}: {text}");
+        }
+        let (status, _, text) = ask(&st, rec.uid, None, "anthropic").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "no peer identity: {text}");
+        assert!(!text.contains(SECRET_VALUE));
+    }
+
+    #[tokio::test]
+    async fn a_claim_that_is_unknown_revoked_expired_or_unbound_is_404_and_a_bad_uid_is_400() {
+        let st: Shared = Arc::new(placed_state());
+        let gw = gateway_peer();
+        let (status, body, _) = ask(&st, Uuid::new_v4(), Some(&gw), "anthropic").await;
+        assert_eq!(
+            (status, code(&body)),
+            (StatusCode::NOT_FOUND, "not_found"),
+            "unknown"
+        );
+        let mut revoked = claim(&["anthropic"], None);
+        revoked.revoked_at = Some(Utc::now());
+        let revoked = stored(&st, revoked).await;
+        let mut expired = claim(&["anthropic"], None);
+        expired.expires_at = Some(Utc::now() - Duration::seconds(1));
+        let expired = stored(&st, expired).await;
+        let mut unbound = claim(&["anthropic"], None);
+        unbound.expires_at = None;
+        let unbound = stored(&st, unbound).await;
+        for (what, uid) in [
+            ("revoked", revoked.uid),
+            ("expired", expired.uid),
+            ("unbound", unbound.uid),
+        ] {
+            let (status, _, text) = ask(&st, uid, Some(&gw), "anthropic").await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{what}: {text}");
+            assert!(!text.contains(SECRET_VALUE), "{what}");
+        }
+        let (status, body, _) = ask(&st, "not-a-uuid", Some(&gw), "anthropic").await;
+        assert_eq!(
+            (status, code(&body)),
+            (StatusCode::BAD_REQUEST, "invalid_claim_uid")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_audience_the_claim_does_not_name_is_unknown_audience() {
+        let st: Shared = Arc::new(placed_state());
+        let rec = stored(&st, claim(&["grafana"], None)).await;
+        let (status, body, text) = ask(&st, rec.uid, Some(&gateway_peer()), "anthropic").await;
+        assert_eq!(
+            (status, code(&body)),
+            (StatusCode::BAD_REQUEST, "unknown_audience")
+        );
+        assert!(!text.contains(SECRET_VALUE));
+    }
+
+    #[tokio::test]
+    async fn an_audience_placed_in_the_proxy_is_not_placed_at_the_gateway() {
+        let st: Shared = Arc::new(placed_state());
+        let rec = stored(&st, claim(&["grafana", "grafana-sts"], None)).await;
+        for a in ["grafana", "grafana-sts"] {
+            let (status, body, _) = ask(&st, rec.uid, Some(&gateway_peer()), a).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{a}");
+            assert_eq!(code(&body), error_code::NOT_PLACED_AT_GATEWAY, "{a}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_claims_rate_limit_applies_and_a_refused_ask_does_not_spend_it() {
+        let mut st = placed_state();
+        st.limiter = Limiter::new(2);
+        let st: Shared = Arc::new(st);
+        let rec = stored(&st, claim(&["anthropic", "grafana"], None)).await;
+        let gw = gateway_peer();
+        for _ in 0..3 {
+            let (status, ..) = ask(&st, rec.uid, Some(&gw), "grafana").await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "not placed: refused before the limit"
+            );
+        }
+        assert_eq!(
+            ask(&st, rec.uid, Some(&gw), "anthropic").await.0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            ask(&st, rec.uid, Some(&gw), "anthropic").await.0,
+            StatusCode::OK
+        );
+        let (status, body, _) = ask(&st, rec.uid, Some(&gw), "anthropic").await;
+        assert_eq!(
+            (status, code(&body)),
+            (StatusCode::TOO_MANY_REQUESTS, "rate_limited")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_delegated_credential_that_expired_or_was_never_delegated_is_refused() {
+        let mut st = placed_state();
+        let sealer: Arc<dyn Sealer> = Arc::new(mediatore_store::seal::LocalKeySealer::new([7; 32]));
+        let mut expired = claim(&["claude"], None);
+        let plain = serde_json::to_vec(&DelegationPlain {
+            token: Secret(SESSION_TOKEN.into()),
+            refresh_token: None,
+        })
+        .unwrap();
+        expired.delegations.insert(
+            "claude".into(),
+            DelegatedSession {
+                envelope: sealer.seal(expired.seal_binding(), &plain).await.unwrap(),
+                expires_at: Some(Utc::now() - Duration::seconds(5)),
+            },
+        );
+        st.sealer = Some(sealer);
+        let st: Shared = Arc::new(st);
+        let expired = stored(&st, expired).await;
+        let none = stored(&st, claim(&["claude"], None)).await;
+        let gw = gateway_peer();
+        for (what, uid) in [("expired", expired.uid), ("never delegated", none.uid)] {
+            let (status, body, text) = ask(&st, uid, Some(&gw), "claude").await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{what}: {text}");
+            assert_eq!(code(&body), "forbidden", "{what}");
+            assert!(!text.contains(SESSION_TOKEN), "{what}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_delegated_audience_without_a_sealer_fails_closed_501() {
+        let st: Shared = Arc::new(placed_state());
+        let rec = stored(&st, claim(&["claude"], None)).await;
+        let (status, ..) = ask(&st, rec.uid, Some(&gateway_peer()), "claude").await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    }
+
+    // ----- the policy bundle under `policy.egress: enforce` -----
+
+    /// An admitted bundle for the conformance policy listing exactly `audiences`, and the policy's uid.
+    async fn bundle_for(
+        audiences: &[&str],
+        mode: mediatore_claims::policy::EgressMode,
+    ) -> (PolicyEgress, String) {
+        let now = Utc::now();
+        let base = mediatore_testkit::policy::fresh_bundle(now, 1).payload;
+        let mut content = base.content.clone();
+        content
+            .audiences
+            .retain(|a| audiences.contains(&a.name.as_str()));
+        let signed = mediatore_testkit::policy::signed_bundle(now, 2, content);
+        let uid = signed.payload.content.policy.uid.clone();
+        let namespace = signed.payload.content.policy.namespace.clone();
+        let reflector = mediatore_claims::policy::BundleReflector::new(
+            mediatore_store::MemoryStore::shared(),
+            signed.keys,
+            vec![namespace.clone()],
+        );
+        let cm = mediatore_testkit::policy::bundle_configmap(
+            &namespace,
+            "agent-bundle",
+            &signed.envelope,
+        );
+        let outcome = reflector.applied_at(&cm, now).await;
+        assert!(
+            matches!(outcome, mediatore_claims::policy::Outcome::Admitted { .. }),
+            "{outcome:?}"
+        );
+        (
+            PolicyEgress {
+                bundles: reflector.cache(),
+                mode,
+            },
+            uid,
+        )
+    }
+
+    /// `internal-git` is the audience the conformance bundle lists; make it a placed secret one.
+    fn placed_internal_git(mut st: AppState) -> AppState {
+        st.audiences.push("internal-git".into());
+        st.egress.insert(
+            "internal-git".into(),
+            vec!["git.example:443".parse().unwrap()],
+        );
+        st.secrets.insert(
+            "internal-git".into(),
+            AudienceSecret {
+                value: Secret(SECRET_VALUE.into()),
+                header: "x-api-key".into(),
+                extra_headers: vec![],
+                ttl: Duration::minutes(5),
+            },
+        );
+        st.inject.insert(
+            "internal-git".into(),
+            vec![inject_route("internal-git", "git.example", "x-api-key")],
+        );
+        st
+    }
+
+    #[tokio::test]
+    async fn under_enforce_the_claims_bundle_must_admit_the_audience() {
+        use mediatore_claims::policy::EgressMode;
+        let gw = gateway_peer();
+        // The bundle lists the audience: allowed.
+        let (pe, uid) = bundle_for(&["internal-git"], EgressMode::Enforce).await;
+        let mut st = placed_internal_git(placed_state());
+        st.policy_egress = Some(pe);
+        let st: Shared = Arc::new(st);
+        let mut rec = claim(&["internal-git"], None);
+        rec.policy_uid = Some(uid.clone());
+        let rec = stored(&st, rec).await;
+        assert_eq!(
+            ask(&st, rec.uid, Some(&gw), "internal-git").await.0,
+            StatusCode::OK,
+            "admitted by the bundle"
+        );
+        // A claim naming no policy, under enforce: refused, fail closed.
+        let nopolicy = stored(&st, claim(&["internal-git"], None)).await;
+        let (status, body, text) = ask(&st, nopolicy.uid, Some(&gw), "internal-git").await;
+        assert_eq!((status, code(&body)), (StatusCode::FORBIDDEN, "forbidden"));
+        assert!(!text.contains(SECRET_VALUE));
+        // A policy whose bundle does not list the audience: refused.
+        let (pe, uid) = bundle_for(&[], EgressMode::Enforce).await;
+        let mut st = placed_internal_git(placed_state());
+        st.policy_egress = Some(pe);
+        let st: Shared = Arc::new(st);
+        let mut rec = claim(&["internal-git"], None);
+        rec.policy_uid = Some(uid);
+        let rec = stored(&st, rec).await;
+        let (status, body, text) = ask(&st, rec.uid, Some(&gw), "internal-git").await;
+        assert_eq!((status, code(&body)), (StatusCode::FORBIDDEN, "forbidden"));
+        assert!(!text.contains(SECRET_VALUE));
+        // A policy uid with no cached bundle (expired, deleted): refused.
+        let mut gone = claim(&["internal-git"], None);
+        gone.policy_uid = Some("no-such-policy-uid".into());
+        let gone = stored(&st, gone).await;
+        assert_eq!(
+            ask(&st, gone.uid, Some(&gw), "internal-git").await.0,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn in_shadow_or_without_a_policy_section_the_bundle_refuses_nothing() {
+        use mediatore_claims::policy::EgressMode;
+        let gw = gateway_peer();
+        let (pe, uid) = bundle_for(&[], EgressMode::Shadow).await;
+        let mut st = placed_internal_git(placed_state());
+        st.policy_egress = Some(pe);
+        let st: Shared = Arc::new(st);
+        let mut rec = claim(&["internal-git"], None);
+        rec.policy_uid = Some(uid);
+        let rec = stored(&st, rec).await;
+        assert_eq!(
+            ask(&st, rec.uid, Some(&gw), "internal-git").await.0,
+            StatusCode::OK,
+            "shadow logs the gap and refuses nothing"
+        );
+        let st: Shared = Arc::new(placed_internal_git(placed_state()));
+        let rec = stored(&st, claim(&["internal-git"], None)).await;
+        assert_eq!(
+            ask(&st, rec.uid, Some(&gw), "internal-git").await.0,
+            StatusCode::OK,
+            "no policy section, nothing to compare"
+        );
+    }
+
+    // ----- POST /v1/token for a placed audience -----
+
+    #[tokio::test]
+    async fn the_pool_vm_cannot_get_a_placed_audiences_credential_from_token_but_a_proxy_audience_is_unchanged()
+     {
+        let mut st = placed_state();
+        st.limiter = Limiter::new(1);
+        let st: Shared = Arc::new(st);
+        let rec = stored(
+            &st,
+            claim(&["anthropic", "claude", "sts-gw", "grafana"], None),
+        )
+        .await;
+        let claim_peer = naming().claim_id(rec.uid);
+        for a in ["anthropic", "claude", "sts-gw"] {
+            let (status, body, text) = call(
+                &st,
+                "POST",
+                "/v1/token",
+                Some(&claim_peer),
+                serde_json::json!({ "audience": a }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{a}: {text}");
+            assert_eq!(code(&body), error_code::PLACED_AT_GATEWAY, "{a}");
+            assert!(!text.contains(SECRET_VALUE), "{a}");
+        }
+        // The three refusals spent no token: the one-a-minute bucket is still full for a proxy audience.
+        let (status, body, _) = call(
+            &st,
+            "POST",
+            "/v1/token",
+            Some(&claim_peer),
+            serde_json::json!({ "audience": "grafana" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["access_token"], "grafana-key");
+    }
+
+    // ----- what the guest and the gateway are told -----
+
+    #[tokio::test]
+    async fn me_carries_credential_gateway_and_the_inject_port_on_a_placed_audiences_routes_only() {
+        let st = Arc::new(placed_state());
+        let node = st.naming.node_id("ek1");
+        st.store
+            .put_node(NodeRecord {
+                ek_hash: "ek1".into(),
+                node_id: node.clone(),
+                dmi_uuid: Uuid::new_v4(),
+                hostname: "pool-1".into(),
+                provider: None,
+                banned: false,
+                registered_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+        let st: Shared = st;
+        let rec = stored(&st, claim(&["anthropic", "grafana"], Some(node))).await;
+        let (status, body, _) = call(
+            &st,
+            "GET",
+            "/v1/me",
+            Some(&st.naming.node_id("ek1")),
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let me: Me = serde_json::from_value(body).unwrap();
+        assert_eq!(me.claim_uid, rec.uid);
+        let anthropic = me
+            .routes
+            .iter()
+            .find(|r| r.audience.as_deref() == Some("anthropic"))
+            .expect("the anthropic route");
+        assert_eq!(anthropic.credential, Credential::Gateway);
+        assert!(anthropic.placed_at_gateway());
+        assert_eq!(anthropic.inject_port, Some(3133));
+        let grafana = me
+            .routes
+            .iter()
+            .find(|r| r.audience.as_deref() == Some("grafana"))
+            .expect("the grafana route");
+        assert_eq!(
+            grafana.credential,
+            Credential::Token,
+            "placed in the proxy, as before"
+        );
+        assert_eq!(grafana.inject_port, None);
+    }
+
+    #[tokio::test]
+    async fn the_gateways_claim_answer_lists_the_inject_routes_of_the_claims_placed_audiences_only()
+    {
+        let st: Shared = Arc::new(placed_state());
+        let both = stored(&st, claim(&["claude", "anthropic", "grafana"], None)).await;
+        let none = stored(&st, claim(&["grafana"], None)).await;
+        let (status, body, _) = call(
+            &st,
+            "GET",
+            &format!("/v1/gateway/claims/{}", both.uid),
+            Some(&gateway_peer()),
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let egress: mediatore_proto::ClaimEgress = serde_json::from_value(body).unwrap();
+        let audiences: Vec<&str> = egress.inject.iter().map(|r| r.audience.as_str()).collect();
+        assert_eq!(
+            audiences,
+            ["anthropic", "claude"],
+            "sorted, only the claim's placed audiences"
+        );
+        let anthropic = &egress.inject[0];
+        assert_eq!(anthropic.endpoint.host, "api.anthropic.example");
+        assert_eq!(anthropic.header, "x-api-key");
+        assert_eq!(
+            anthropic.extra_headers,
+            vec![pair("anthropic-version", "2023-06-01")]
+        );
+        assert!(!anthropic.rules.is_empty(), "a placed route carries rules");
+        let (_, body, text) = call(
+            &st,
+            "GET",
+            &format!("/v1/gateway/claims/{}", none.uid),
+            Some(&gateway_peer()),
+            serde_json::Value::Null,
+        )
+        .await;
+        assert!(
+            body.get("inject").is_none(),
+            "absent on the wire when empty: {text}"
+        );
+        assert!(
+            !text.contains(SECRET_VALUE),
+            "the answer carries no credential"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_placed_audiences_host_is_not_in_the_tunnel_lists_only_the_injecting_path_reaches_it()
+    {
+        // ADR-0040: a host bound to the rule-enforcing inject path must not also be reachable through a CONNECT
+        // tunnel the claim's SVID could open, or the rules and the placement are decorative for that host.
+        let st: Shared = Arc::new(placed_state());
+        let rec = stored(&st, claim(&["anthropic", "grafana"], None)).await;
+        let (status, body, _) = call(
+            &st,
+            "GET",
+            &format!("/v1/gateway/claims/{}", rec.uid),
+            Some(&gateway_peer()),
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let egress: mediatore_proto::ClaimEgress = serde_json::from_value(body).unwrap();
+        let hosts: Vec<&str> = egress.egress.iter().map(|e| e.host.as_str()).collect();
+        assert!(
+            !hosts.contains(&"api.anthropic.example"),
+            "the placed host is not tunnelable: {hosts:?}"
+        );
+        assert!(
+            hosts.contains(&"grafana.example"),
+            "a proxy-placed audience keeps its tunnel entry: {hosts:?}"
+        );
+        assert_eq!(
+            egress
+                .inject
+                .iter()
+                .map(|r| r.audience.as_str())
+                .collect::<Vec<_>>(),
+            ["anthropic"],
+            "and the placed host is reachable through its inject route"
+        );
+    }
+
+    // ----- the audit line, and only the audit line -----
+
+    // One process-wide subscriber, installed once, writing into a buffer per thread: a scoped
+    // `set_default` is not reliable under the parallel test runner, because tracing caches each
+    // callsite's interest and another test's first event, with no subscriber, can disable it. Each
+    // `#[tokio::test]` runs on its own thread, so a thread-local buffer isolates the tests.
+    thread_local! {
+        static LOGS: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    struct ThreadLogs;
+
+    impl std::io::Write for ThreadLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            LOGS.with(|l| l.borrow_mut().extend_from_slice(buf));
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for ThreadLogs {
+        type Writer = ThreadLogs;
+        fn make_writer(&'a self) -> ThreadLogs {
+            ThreadLogs
+        }
+    }
+
+    /// Start capturing this thread's log lines from nothing.
+    fn capture_logs() {
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            let _ = tracing::subscriber::set_global_default(
+                tracing_subscriber::fmt()
+                    .with_writer(|| ThreadLogs)
+                    .with_max_level(tracing::Level::TRACE)
+                    .with_ansi(false)
+                    .finish(),
+            );
+        });
+        LOGS.with(|l| l.borrow_mut().clear());
+    }
+
+    /// What this thread has logged since [`capture_logs`].
+    fn captured() -> String {
+        LOGS.with(|l| String::from_utf8_lossy(&l.borrow()).into_owned())
+    }
+
+    #[tokio::test]
+    async fn each_issue_is_one_audit_line_with_claim_audience_subject_backend_and_expiry_and_never_the_credential()
+     {
+        capture_logs();
+        let mut st = placed_state();
+        let sealer: Arc<dyn Sealer> = Arc::new(mediatore_store::seal::LocalKeySealer::new([7; 32]));
+        let mut delegated = claim(&["claude"], None);
+        let plain = serde_json::to_vec(&DelegationPlain {
+            token: Secret(SESSION_TOKEN.into()),
+            refresh_token: None,
+        })
+        .unwrap();
+        delegated.delegations.insert(
+            "claude".into(),
+            DelegatedSession {
+                envelope: sealer.seal(delegated.seal_binding(), &plain).await.unwrap(),
+                expires_at: Some(Utc::now() + Duration::hours(1)),
+            },
+        );
+        st.sealer = Some(sealer);
+        let st: Shared = Arc::new(st);
+        let secret = stored(&st, claim(&["anthropic"], None)).await;
+        let minted = stored(&st, claim(&["sts-gw"], None)).await;
+        let delegated = stored(&st, delegated).await;
+        let gw = gateway_peer();
+        let mut jwt = String::new();
+        for (rec, audience, backend) in [
+            (&secret, "anthropic", "secret"),
+            (&minted, "sts-gw", "sts"),
+            (&delegated, "claude", "delegated"),
+        ] {
+            let (status, body, _) = ask(&st, rec.uid, Some(&gw), audience).await;
+            assert_eq!(status, StatusCode::OK, "{audience}: {body}");
+            if audience == "sts-gw" {
+                jwt = body["value"].as_str().unwrap().replace("Bearer ", "");
+            }
+            let logs = captured();
+            let issued: Vec<&str> = logs
+                .lines()
+                .filter(|l| {
+                    l.contains("gateway credential issued") && l.contains(&rec.uid.to_string())
+                })
+                .collect();
+            assert_eq!(issued.len(), 1, "one audit line for {audience}: {logs}");
+            let line = issued[0];
+            for needle in [audience, "octocat", backend, "expires_at"] {
+                assert!(line.contains(needle), "{needle} in {line}");
+            }
+        }
+        let logs = captured();
+        assert_ne!(jwt, "", "the minted token was captured for the check");
+        for secret_bytes in [SECRET_VALUE, SESSION_TOKEN, jwt.as_str()] {
+            assert!(
+                !logs.contains(secret_bytes),
+                "the credential must never reach a log line, found {secret_bytes:?} in:\n{logs}"
+            );
+        }
     }
 }

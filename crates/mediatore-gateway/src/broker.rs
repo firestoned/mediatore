@@ -8,7 +8,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use mediatore_proto::ClaimEgress;
+use mediatore_proto::{ClaimEgress, GatewayCredential, GatewayCredentialRequest};
 use mediatore_tls::{MaterialSource, SpiffeId, WorkloadApiSource};
 use uuid::Uuid;
 
@@ -52,6 +52,50 @@ pub enum AskError {
 pub trait Allowlists: Send + Sync {
     /// Ask once; no retry, the cache decides what an outage means.
     async fn ask(&self, claim_uid: Uuid) -> Result<Answer, AskError>;
+}
+
+/// What the broker said about a claim's credential for one audience (ADR-0040 decision 2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CredentialAnswer {
+    /// The credential and when it stops being good. The value prints as `[redacted]`.
+    Found(GatewayCredential),
+    /// `404`: the claim is pending, released, expired or unknown. The gateway forgets it.
+    Gone,
+}
+
+/// A source of gateway-placed credentials, by claim UID and audience.
+#[async_trait::async_trait]
+pub trait Credentials: Send + Sync {
+    /// Ask once; no retry. `401` and `403` are [`AskError::Refused`]: the caller tells the
+    /// gateway's own identity being refused (`401`) from the credential being refused (`403`).
+    async fn credential(
+        &self,
+        claim_uid: Uuid,
+        audience: &str,
+    ) -> Result<CredentialAnswer, AskError>;
+}
+
+/// `POST /v1/gateway/claims/{uid}/credential`'s URL.
+#[must_use]
+pub fn credential_url(base: &str, claim_uid: Uuid) -> String {
+    format!(
+        "{}/v1/gateway/claims/{claim_uid}/credential",
+        base.trim_end_matches('/')
+    )
+}
+
+/// What a status and a body from the credential route mean. The body of a refusal is never
+/// read, and a body that does not parse is reported without its content: a serde error can
+/// quote the value it choked on, and this one may be a credential.
+pub fn interpret_credential(status: u16, body: &[u8]) -> Result<CredentialAnswer, AskError> {
+    match status {
+        200 => serde_json::from_slice::<GatewayCredential>(body)
+            .map(CredentialAnswer::Found)
+            .map_err(|_| AskError::Unreachable("unreadable credential answer".into())),
+        404 => Ok(CredentialAnswer::Gone),
+        s @ (401 | 403) => Err(AskError::Refused(s)),
+        s => Err(AskError::Unreachable(format!("status {s}"))),
+    }
 }
 
 /// The broker over HTTP, with this process's identity as the client.
@@ -168,6 +212,246 @@ impl Allowlists for Broker {
             404 => Ok(Answer::Gone),
             s @ (401 | 403) => Err(AskError::Refused(s)),
             s => Err(AskError::Unreachable(format!("status {s}"))),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Credentials for Broker {
+    async fn credential(
+        &self,
+        claim_uid: Uuid,
+        audience: &str,
+    ) -> Result<CredentialAnswer, AskError> {
+        let req = self
+            .client()?
+            .post(credential_url(&self.base, claim_uid))
+            .json(&GatewayCredentialRequest {
+                audience: audience.to_owned(),
+            });
+        #[cfg(feature = "dev")]
+        let req = match &self.transport {
+            Transport::DevHeader(id) => req.header(DEV_PEER_HEADER, id),
+            Transport::Mtls { .. } => req,
+        };
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| AskError::Unreachable(e.to_string()))?;
+        let status = resp.status().as_u16();
+        let body = if status == 200 {
+            resp.bytes()
+                .await
+                .map_err(|_| AskError::Unreachable("unreadable credential answer".into()))?
+                .to_vec()
+        } else {
+            Vec::new()
+        };
+        interpret_credential(status, &body)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SECRET: &str = "sk-ant-oat01-NEVER-LOG-THIS";
+
+    fn body(audience: &str, value: &str) -> String {
+        serde_json::json!({
+            "audience": audience,
+            "subject": { "issuer": "https://login.example.test", "id": "octocat" },
+            "header": "x-api-key",
+            "value": value,
+            "extra_headers": [ { "name": "anthropic-version", "value": "2023-06-01" } ],
+            "expires_at": (chrono::Utc::now() + chrono::Duration::seconds(200)).to_rfc3339(),
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn the_credential_route_is_the_claims_own_and_a_trailing_slash_is_ignored() {
+        let uid = Uuid::nil();
+        assert_eq!(
+            credential_url("https://mediatore.example.test", uid),
+            "https://mediatore.example.test/v1/gateway/claims/00000000-0000-0000-0000-000000000000/credential"
+        );
+        assert_eq!(
+            credential_url("https://mediatore.example.test/", uid),
+            credential_url("https://mediatore.example.test", uid)
+        );
+    }
+
+    #[test]
+    fn a_200_is_the_credential_and_it_prints_as_redacted() {
+        let Ok(CredentialAnswer::Found(c)) =
+            interpret_credential(200, body("anthropic", SECRET).as_bytes())
+        else {
+            panic!("not a credential")
+        };
+        assert_eq!(c.audience, "anthropic");
+        assert_eq!(c.header, "x-api-key");
+        assert_eq!(c.value.0, SECRET);
+        assert_eq!(c.extra_headers.len(), 1);
+        let printed = format!("{c:?}");
+        assert!(
+            !printed.contains(SECRET) && printed.contains("[redacted]"),
+            "{printed}"
+        );
+    }
+
+    #[test]
+    fn the_other_statuses_map_to_gone_refused_or_unreachable_and_never_read_a_body() {
+        assert!(matches!(
+            interpret_credential(404, SECRET.as_bytes()),
+            Ok(CredentialAnswer::Gone)
+        ));
+        assert!(matches!(
+            interpret_credential(401, SECRET.as_bytes()),
+            Err(AskError::Refused(401))
+        ));
+        assert!(matches!(
+            interpret_credential(403, SECRET.as_bytes()),
+            Err(AskError::Refused(403))
+        ));
+        for status in [400, 429, 500, 502, 503] {
+            match interpret_credential(status, SECRET.as_bytes()) {
+                Err(AskError::Unreachable(why)) => {
+                    assert_eq!(why, format!("status {status}"));
+                    assert!(!why.contains(SECRET));
+                }
+                other => panic!("{status}: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn an_unreadable_200_is_reported_without_a_word_of_its_body() {
+        // A serde error can quote the value it choked on; this one may be a credential.
+        for bad in [
+            format!("{{\"audience\": 5, \"value\": \"{SECRET}\"}}"),
+            format!("not json {SECRET}"),
+            body("anthropic", SECRET).replace("\"expires_at\"", "\"expires\""),
+            String::new(),
+        ] {
+            match interpret_credential(200, bad.as_bytes()) {
+                Err(AskError::Unreachable(why)) => {
+                    assert_eq!(why, "unreadable credential answer");
+                    assert!(!why.contains(SECRET));
+                }
+                other => panic!("{bad:?}: {other:?}"),
+            }
+        }
+    }
+
+    #[cfg(feature = "dev")]
+    mod over_a_socket {
+        use super::*;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        /// One HTTP/1.1 exchange: the request is handed to `check` and `reply` is sent back.
+        async fn serve_once(
+            reply: String,
+            check: impl FnOnce(&str) + Send + 'static,
+        ) -> (String, tokio::task::JoinHandle<()>) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let handle = tokio::spawn(async move {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut raw = Vec::new();
+                let mut buf = [0u8; 4096];
+                loop {
+                    let n = sock.read(&mut buf).await.unwrap();
+                    raw.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&raw).to_string();
+                    if let Some(i) = text.find("\r\n\r\n") {
+                        let len = text[..i]
+                            .lines()
+                            .find_map(|l| {
+                                l.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap_or(0);
+                        if raw.len() >= i + 4 + len {
+                            break;
+                        }
+                    }
+                    assert!(n > 0, "closed before the request was complete");
+                }
+                check(&String::from_utf8_lossy(&raw));
+                sock.write_all(reply.as_bytes()).await.unwrap();
+            });
+            (base, handle)
+        }
+
+        /// This reqwest needs a rustls crypto provider installed before any client is built; the
+        /// mTLS path installs one, the plain-HTTP dev path does not.
+        fn provider() {
+            let _ = mediatore_proto::tls::https_client_config();
+        }
+
+        fn http(status: &str, body: &str) -> String {
+            format!(
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            )
+        }
+
+        #[tokio::test]
+        async fn the_broker_is_asked_with_a_post_of_the_audience_and_answers_a_credential() {
+            provider();
+            let uid = Uuid::new_v4();
+            let (base, server) =
+                serve_once(http("200 OK", &body("anthropic", SECRET)), move |req| {
+                    let first = req.lines().next().unwrap();
+                    assert_eq!(
+                        first,
+                        format!("POST /v1/gateway/claims/{uid}/credential HTTP/1.1")
+                    );
+                    assert!(
+                        req.to_ascii_lowercase()
+                            .contains("x-mediatore-peer-spiffe-id: spiffe://sandbox.test/gateway")
+                    );
+                    let json: serde_json::Value =
+                        serde_json::from_str(req.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+                    assert_eq!(json, serde_json::json!({ "audience": "anthropic" }));
+                })
+                .await;
+            let broker = Broker::dev_header(&base, "spiffe://sandbox.test/gateway");
+            let got = broker.credential(uid, "anthropic").await;
+            server.await.unwrap();
+            let Ok(CredentialAnswer::Found(c)) = got else {
+                panic!("{got:?}")
+            };
+            assert_eq!(c.value.0, SECRET);
+        }
+
+        #[tokio::test]
+        async fn a_403_a_404_and_a_dead_broker_are_refused_gone_and_unreachable() {
+            provider();
+            for (status, want) in [("403 Forbidden", 403u16), ("401 Unauthorized", 401)] {
+                let (base, server) =
+                    serve_once(http(status, "{\"error\":\"forbidden\"}"), |_| {}).await;
+                let broker = Broker::dev_header(&base, "spiffe://sandbox.test/gateway");
+                assert!(matches!(
+                    broker.credential(Uuid::new_v4(), "anthropic").await,
+                    Err(AskError::Refused(s)) if s == want
+                ));
+                server.await.unwrap();
+            }
+            let (base, server) = serve_once(http("404 Not Found", "{}"), |_| {}).await;
+            let broker = Broker::dev_header(&base, "spiffe://sandbox.test/gateway");
+            assert!(matches!(
+                broker.credential(Uuid::new_v4(), "anthropic").await,
+                Ok(CredentialAnswer::Gone)
+            ));
+            server.await.unwrap();
+            let dead = Broker::dev_header("http://127.0.0.1:1", "spiffe://sandbox.test/gateway");
+            assert!(matches!(
+                dead.credential(Uuid::new_v4(), "anthropic").await,
+                Err(AskError::Unreachable(_))
+            ));
         }
     }
 }

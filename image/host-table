@@ -10,7 +10,8 @@
 # (/etc/mediatore/gateways), the control relay's broker and SPIRE ports (MEDIATORE_URL in
 # the guest's env, server_address and server_port in the agent's configuration, and the bundle leg's
 # SPIRE_BUNDLE_GATEWAY and SPIRE_BUNDLE_PORT when the pool fetches its bundle, ADR-0037) and the
-# registries on the segment (/etc/mediatore/registries), and, for root alone, the gateway's registry
+# registries on the segment (/etc/mediatore/registries), each gateway at MEDIATORE_INJECT_PORT when the pool has a
+# gateway-placed audience (ADR-0040), and, for root alone, the gateway's registry
 # legs (MEDIATORE_RELAY_REGISTRIES, ADR-0038). Forward is dropped. Every entry
 # must be an IPv4 address and a port: the segment has no resolver, and a name here would be
 # a rule that admits nothing while looking like one. Loaded in one transaction by
@@ -82,6 +83,20 @@ if [ -n "$bg" ]; then
   bp=$(sed -n 's/^SPIRE_BUNDLE_PORT=//p' "$guest_env" | tail -1)
   [ -n "$bp" ] || die "$guest_env: SPIRE_BUNDLE_GATEWAY is set without SPIRE_BUNDLE_PORT"
   add "SPIRE_BUNDLE_GATEWAY" "$bg:$bp"
+fi
+
+# The gateways' inject port (ADR-0040): a claim with a gateway-placed audience has its egress proxy dial each
+# gateway at this port, as the sandbox uid, to send the request the gateway adds the credential to. Every uid like
+# the data port; the sandbox uid's own per-claim table (mediatore_sandbox) is the second layer and lists the port
+# only for a claim that needs it. Unset on a pool with no gateway-placed audience: nothing is admitted.
+inject_port=$(sed -n 's/^MEDIATORE_INJECT_PORT=//p' "$guest_env" | tail -1)
+if [ -n "$inject_port" ]; then
+  printf '%s' "$inject_port" | grep -Eq '^[1-9][0-9]{0,4}$' && [ "$inject_port" -le 65535 ] || die "$guest_env: MEDIATORE_INJECT_PORT '$inject_port' is not a port"
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=$(printf '%s' "$line" | sed 's/[[:space:]]*$//; s/^[[:space:]]*//')
+    case $line in ''|'#'*) continue ;; esac
+    add "MEDIATORE_INJECT_PORT" "$(printf '%s' "$line" | sed 's/:[^:]*$//'):$inject_port"
+  done < "$gateways"
 fi
 
 # The registry legs (ADR-0038): a pool that pulls through a gateway's registry leg names the registries in

@@ -23,9 +23,16 @@ uuid.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+serde_json.workspace = true
+# The check service on a unix socket: tonic's incoming stream over `tokio::net::UnixListener` (ADR-0040 decision 6).
+tokio-stream = { version = "0.1", features = ["net"] }
 
 [dev-dependencies]
 mediatore-testkit.workspace = true
+# A real gRPC client over the unix socket, and the captured tracing output of a check.
+tower = { workspace = true, features = ["util"] }
+hyper-util.workspace = true
+tracing-subscriber.workspace = true
 
 [features]
 # `--dev-spiffe-id`: the gateway identity as a header against a loopback `dev_mode` broker,

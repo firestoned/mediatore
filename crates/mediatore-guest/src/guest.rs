@@ -421,6 +421,19 @@ async fn serve_claim(
         args.egress_proxy_port,
     )
     .await?;
+    // A gateway-placed route's request goes from the proxy to `gateway:INJECT_PORT`, and the
+    // proxy's sockets carry the sandbox uid (ADR-0040 decision 7): the uid's table names that
+    // port at each gateway for a claim that has such a route, and for no other.
+    let inject_ports = egress::inject_ports(&me.routes);
+    let ruleset = ruleset.with_inject_ports(&gateways, &inject_ports)?;
+    if !inject_ports.is_empty() {
+        tracing::info!(
+            claim_uid = %me.claim_uid,
+            ports = ?inject_ports,
+            gateways = gateways.len(),
+            "gateway-placed routes: the sandbox uid may reach each gateway's inject port (ADR-0040 decision 7)"
+        );
+    }
     // The proxy's inputs (ADR-0025, ADR-0028): the routes, the gateways and a fresh
     // phantom, in files of the sandbox user's outside the jail; the phantom also goes to
     // the jail through nsjail's environment.

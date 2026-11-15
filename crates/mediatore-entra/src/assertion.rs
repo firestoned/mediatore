@@ -69,7 +69,8 @@ enum Signer {
     Local(EncodingKey),
     /// The key in `OpenBao` transit; `sign` with PSS, SHA-256, the salt the hash's length.
     Transit {
-        client: mediatore_openbao::Client,
+        /// Boxed: the client is much larger than a key, and an enum is as big as its largest variant.
+        client: Box<mediatore_openbao::Client>,
         key: String,
     },
 }
@@ -171,7 +172,7 @@ impl ClientAssertion {
             )
         } else if let Some(transit) = &cfg.transit {
             Signer::Transit {
-                client: mediatore_openbao::Client::connect(transit).await?,
+                client: Box::new(mediatore_openbao::Client::connect(transit).await?),
                 key: transit.key.clone(),
             }
         } else {
@@ -432,6 +433,7 @@ mod tests {
             key: key.into(),
             role: "mediatore".into(),
             token_file: token_file.clone(),
+            auth_mount: "kubernetes".into(),
         };
         let assertion = ClientAssertion::build(&EntraConfig {
             certificate_file: Some(cert.clone()),

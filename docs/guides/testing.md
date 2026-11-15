@@ -1005,3 +1005,9 @@ and its Secret were gone (`agentsandboxes.mediatore.io "sandbox-57d995da" not fo
 The full agent reading a repository and asking Claude about it, which needs a policy
 naming both the `github` and the `anthropic` audiences under a profile that allows two.
 Recorded here when it has happened.
+
+## ADR-0040: the gateway places the credential (offline proofs, 2026-11-15)
+
+What ran, all offline: the unit and e2e tests of the crates (the broker's credential route and its refusals, the authorizer's inject check, cache and sockets, a real gRPC client against both sockets, the guest's route and ruleset, the config's refusals), `make host-table-test` (the inject port), `make gateway-render-check` (the inject template on and off, and the committed kind bootstrap unchanged), `envoy --mode validate` on a gateway against the rendered bootstrap, and a loopback spike of Envoy 1.40.2 with an HTTP-service authorizer (filter order, header overwrite, forged headers, authority matching, `request_headers_to_remove` stripping the placed header; the spike's facts shaped the template).
+
+**Not proven, and so not claimed:** a request through the real Envoy and the real authorizer over gRPC (header overwrite and removal, the refusal marker reaching the client, a streamed response through the listener's timeouts), the per-claim limit (a placeholder in the template), and any live claim: the gateways' egress allowance, the OpenBao transit key and a release carrying the ADR are missing. The threat model records the first two as R-28 and the third as R-29. The integration test belongs in `crates/mediatore/tests/e2e_gateway.rs` beside the tunnel's, and `make kind-e2e-gateway` is the tier to extend.

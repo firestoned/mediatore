@@ -103,9 +103,46 @@ stages:
             REGISTRY_PORT=443
             BROKER_ADDRESS=192.0.2.21
             BROKER_PORT=443
-            AUTHORIZER_ADDRESS=127.0.0.1
-            AUTHORIZER_PORT=9001
+            AUTHORIZER_ENDPOINT=socket_address: { address: 127.0.0.1, port_value: 9001 }
             SPIRE_SOCKET=/run/spire/sockets/agent.sock
+            INJECT_PORT=3133
+            INJECT_HOST=api.upstream.example.com
+            INJECT_UPSTREAM_PORT=443
+            INJECT_DOMAIN=api.upstream.example.com
+            INJECT_CA_FILE=/etc/ssl/certs/ca-certificates.crt
+            INJECT_STREAM_IDLE_SECS=300
+            INJECT_MAX_STREAM_SECS=3600
+            INJECT_AUTHORIZER_SOCKET=/run/mediatore-gateway/inject/inject.sock
+            INJECT_PORT_ELEMENT=
             MEDIATORE_URL=https://192.0.2.21
             SPIFFE_ENDPOINT_SOCKET=unix:///run/spire/sockets/agent.sock
             RUST_LOG=info
+    # TURN THE INJECT ENVOY ON (ADR-0040): off by default. The unit is in the image and not enabled. To enable it, (1) in the env above, replace
+    # AUTHORIZER_ENDPOINT and INJECT_PORT_ELEMENT with the two lines of image/gateway/env.inject.example, set INJECT_HOST, INJECT_DOMAIN and
+    # INJECT_UPSTREAM_PORT to the upstream, and keep INJECT_PORT equal to the broker's gateway_inject_port; (2) add the step below, which
+    # moves the authorizer to its two unix sockets (the data plane's group reaches the check socket only, envoy-inject's group the inject
+    # socket only; the setgid directories give each socket its group) and enables the unit; (3) register `unix:user:envoy-inject` on the
+    # gateway's SPIFFE ID (a third entry beside `envoy` and `mediatore-gateway`); (4) open the gateways' path to the upstream. The authorizer's
+    # listen flags are those of the release that serves the two sockets (ADR-0040 stage C): check them with `mediatore gateway --help`.
+    #
+    # stages:
+    #   boot:
+    #     - name: mediatore-gateway-inject
+    #       files:
+    #         - path: /etc/systemd/system/mediatore-gateway.service.d/10-inject.conf
+    #           permissions: 0644
+    #           owner: 0
+    #           group: 0
+    #           content: |
+    #             [Service]
+    #             ExecStart=
+    #             ExecStart=/usr/bin/mediatore gateway --check-socket /run/mediatore-gateway/check/check.sock --inject-socket /run/mediatore-gateway/inject/inject.sock --socket-dir-mode 2750
+    #             ExecStartPre=+/usr/bin/install -d -m 2750 -o mediatore-gateway -g envoy /run/mediatore-gateway/check
+    #             ExecStartPre=+/usr/bin/install -d -m 2750 -o mediatore-gateway -g envoy-inject /run/mediatore-gateway/inject
+    #             ReadWritePaths=/run/mediatore-gateway
+    #       commands:
+    #         - systemctl daemon-reload
+    #         - systemctl restart mediatore-gateway
+    #       systemctl:
+    #         enable:
+    #           - envoy-inject

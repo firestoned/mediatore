@@ -31,6 +31,10 @@ pub struct TransitConfig {
     pub key: String,
     /// The Kubernetes auth role the broker logs in as.
     pub role: String,
+    /// Where the Kubernetes auth method is mounted (default `kubernetes`): the login is
+    /// `POST /v1/auth/<auth_mount>/login`. A platform that mounts it per cluster names that mount.
+    #[serde(default = "default_auth_mount")]
+    pub auth_mount: String,
     /// The projected `ServiceAccount` token (audience `openbao`) presented at login
     /// (default `/var/run/secrets/openbao/token`). Read at every login, since it rotates.
     #[serde(default = "default_token_file")]
@@ -39,6 +43,9 @@ pub struct TransitConfig {
 
 fn default_mount() -> String {
     "transit".to_owned()
+}
+fn default_auth_mount() -> String {
+    "kubernetes".to_owned()
 }
 fn default_token_file() -> PathBuf {
     PathBuf::from("/var/run/secrets/openbao/token")
@@ -78,6 +85,7 @@ pub struct Client {
     base: String,
     mount: String,
     role: String,
+    auth_mount: String,
     token_file: PathBuf,
     token: tokio::sync::Mutex<Option<Token>>,
 }
@@ -130,6 +138,7 @@ impl Client {
             base: cfg.url.trim_end_matches('/').to_owned(),
             mount: cfg.mount.trim_matches('/').to_owned(),
             role: cfg.role.clone(),
+            auth_mount: cfg.auth_mount.trim_matches('/').to_owned(),
             token_file: cfg.token_file.clone(),
             token: tokio::sync::Mutex::new(None),
         };
@@ -143,13 +152,13 @@ impl Client {
         &self.mount
     }
 
-    /// `POST auth/kubernetes/login` with the projected token, read now.
+    /// `POST auth/<auth_mount>/login` with the projected token, read now.
     async fn login(&self) -> Result<Token, Error> {
         let jwt = std::fs::read_to_string(&self.token_file)
             .map_err(|e| Error::Config(format!("token_file {}: {e}", self.token_file.display())))?;
         let resp = self
             .http
-            .post(format!("{}/v1/auth/kubernetes/login", self.base))
+            .post(format!("{}/v1/auth/{}/login", self.base, self.auth_mount))
             .json(&serde_json::json!({ "role": self.role, "jwt": jwt.trim() }))
             .send()
             .await
@@ -264,6 +273,10 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(cfg.mount, "transit");
+        assert_eq!(
+            cfg.auth_mount, "kubernetes",
+            "the Kubernetes auth method is mounted at `kubernetes` unless told otherwise"
+        );
         assert_eq!(
             cfg.token_file,
             PathBuf::from("/var/run/secrets/openbao/token")

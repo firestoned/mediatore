@@ -80,6 +80,17 @@ printf 'MEDIATORE_URL=https://198.51.100.1:3130\nMEDIATORE_RELAY_REGISTRIES=a.ho
   || { echo "✗ two names on one leg are one element"; exit 1; }
 echo "✓ two registry names on one leg are one element"
 
+# the inject port (ADR-0040): a gateway-placed claim's proxy dials each gateway at it, as the sandbox uid, so the host table (every uid, like the data port) admits it; the sandbox uid's own table is the second layer
+printf 'MEDIATORE_URL=https://198.51.100.1:3130\nMEDIATORE_INJECT_PORT=3133\n' > "$d/env-inject"
+inj=$("$here/host-table" --render "$d/gateways" "$d/registries" "$d/env-inject" "$d/agent.conf")
+for gw in 198.51.100.1 198.51.100.2 198.51.100.3; do
+  printf '%s\n' "$inj" | grep 'set allow4' | grep -qF "$gw . 3133" || { echo "✗ the inject port is admitted for gateway $gw"; exit 1; }
+done
+printf '%s\n' "$inj" | grep -q 'registry4' && { echo "✗ the inject port leaked into the root-only registry set"; exit 1; } || true
+echo "✓ MEDIATORE_INJECT_PORT admits every gateway at that port, in the every-uid set"
+printf '%s\n' "$got" | grep -q '3133' && { echo "✗ a pool with no inject port admitted 3133"; exit 1; } || true
+echo "✓ a pool that sets no inject port admits none"
+
 refuse() { # <what> <args...>
   local what=$1; shift
   if "$here/host-table" --render "$@" >/dev/null 2>"$d/err"; then echo "✗ $what was accepted"; exit 1; fi
@@ -98,5 +109,8 @@ printf 'mirror.home.example:5000\n' > "$d/reg-name"; refuse "a registry given by
 printf 'MEDIATORE_URL=https://mediatore.home.example:3130\nMEDIATORE_RELAY_REGISTRIES=registry.home.example=3132\n' > "$d/env-rr-name"; refuse "a registry leg whose gateway (MEDIATORE_URL) is a name" "$d/gateways" "$d/registries" "$d/env-rr-name" "$d/agent.conf"
 for bad in 'registry.home.example' 'registry.home.example=' '=3132' 'registry.home.example=0' 'registry.home.example=70000' 'registry.home.example=x' 'registry.home.example:443=3132' 'a b=3132' 'a.home.example=3132,,b.home.example=3133'; do
   printf 'MEDIATORE_URL=https://198.51.100.1:3130\nMEDIATORE_RELAY_REGISTRIES=%s\n' "$bad" > "$d/env-rr-bad"; refuse "a relay registry entry '$bad'" "$d/gateways" "$d/registries" "$d/env-rr-bad" "$d/agent.conf"
+done
+for bad in 'x' '0' '70000' '33 33' '-1'; do
+  printf 'MEDIATORE_URL=https://198.51.100.1:3130\nMEDIATORE_INJECT_PORT=%s\n' "$bad" > "$d/env-ip-bad"; refuse "an inject port '$bad'" "$d/gateways" "$d/registries" "$d/env-ip-bad" "$d/agent.conf"
 done
 echo "host-table-test: ok"

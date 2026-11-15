@@ -32,34 +32,42 @@ check "the SPIRE agent in the rootfs" \
 check "the TPM attestor plugin at the path agent.conf names, with the checksum it pins" \
   "echo '$PLUGIN_SHA  /usr/lib/spire/tpm_attestor_agent' | sha256sum -c - >/dev/null"
 check "nftables, for the host table (ADR-0027 decision 5)" 'nft --version >/dev/null'
-check "the render script and the five templates" \
-  'test -x /usr/libexec/mediatore-gateway/render && for t in envoy/gateway.yaml.in envoy/relay.yaml.in nftables.conf.in network.in; do test -f /usr/share/mediatore-gateway/$t || exit 1; done'
+check "the render script and the six templates" \
+  'test -x /usr/libexec/mediatore-gateway/render && for t in envoy/gateway.yaml.in envoy/relay.yaml.in envoy/inject.yaml.in nftables.conf.in network.in; do test -f /usr/share/mediatore-gateway/$t || exit 1; done'
 check "the examples render every template, so the documented env is complete" \
-  'cd /usr/share/mediatore-gateway && for t in envoy/gateway.yaml.in envoy/relay.yaml.in nftables.conf.in network.in; do /usr/libexec/mediatore-gateway/render $t - env.example vm.env.example >/dev/null || exit 1; done'
-check "the rendered data plane and relay are bootstraps Envoy accepts" \
-  'cd /usr/share/mediatore-gateway && mkdir -p /tmp/r && for b in gateway relay; do /usr/libexec/mediatore-gateway/render envoy/$b.yaml.in /tmp/r/$b.yaml env.example vm.env.example && /usr/bin/envoy --mode validate -c /tmp/r/$b.yaml >/dev/null 2>&1 || exit 1; done'
-check "no admin block in either bootstrap (ADR-0028 decision 8)" \
-  '! grep -q "^admin:" /usr/share/mediatore-gateway/envoy/gateway.yaml.in /usr/share/mediatore-gateway/envoy/relay.yaml.in'
+  'cd /usr/share/mediatore-gateway && for t in envoy/gateway.yaml.in envoy/relay.yaml.in envoy/inject.yaml.in nftables.conf.in network.in; do /usr/libexec/mediatore-gateway/render $t - env.example vm.env.example >/dev/null || exit 1; done'
+check "the rendered data plane, relay and inject Envoy are bootstraps Envoy accepts" \
+  'cd /usr/share/mediatore-gateway && mkdir -p /tmp/r && for b in gateway relay inject; do /usr/libexec/mediatore-gateway/render envoy/$b.yaml.in /tmp/r/$b.yaml env.example vm.env.example && /usr/bin/envoy --mode validate -c /tmp/r/$b.yaml >/dev/null 2>&1 || exit 1; done'
+check "no admin block in any bootstrap (ADR-0028 decision 8)" \
+  '! grep -q "^admin:" /usr/share/mediatore-gateway/envoy/gateway.yaml.in /usr/share/mediatore-gateway/envoy/relay.yaml.in /usr/share/mediatore-gateway/envoy/inject.yaml.in'
 check "the relay has no SDS and no TLS context (ADR-0027 decision 1: no credential)" \
   '! grep -qiE "sds_config|tls_context|transport_socket" /usr/share/mediatore-gateway/envoy/relay.yaml.in'
 check "the relay has four fixed legs: SPIRE, broker, the SPIRE bundle endpoint (ADR-0037) and the registry (ADR-0038), rendered with their ports and the host table admitting all four" \
   'cd /usr/share/mediatore-gateway && mkdir -p /tmp/r && /usr/libexec/mediatore-gateway/render envoy/relay.yaml.in /tmp/r/relay3.yaml env.example vm.env.example && test "$(grep -c "stat_prefix: relay_" /tmp/r/relay3.yaml)" = 4 && grep -q "upstream=bundle" /tmp/r/relay3.yaml && grep -q "name: spire_bundle" /tmp/r/relay3.yaml && grep -q "upstream=registry" /tmp/r/relay3.yaml && grep -q "name: registry" /tmp/r/relay3.yaml && /usr/libexec/mediatore-gateway/render nftables.conf.in - env.example vm.env.example | grep -q "elements = { 3129, 3130, 3131 }"'
-check "the three service users, none in the TPM group, the agent in it" \
-  'for u in envoy envoy-relay mediatore-gateway; do id "$u" >/dev/null && ! id -nG "$u" | tr " " "\n" | grep -qx tss || exit 1; done && id -nG spire | tr " " "\n" | grep -qx tss'
-check "the six units installed and enabled" \
-  'for u in spire-agent mediatore-gateway-network mediatore-gateway-nft envoy-gateway envoy-relay mediatore-gateway; do test -f /etc/systemd/system/$u.service && test -L /etc/systemd/system/multi-user.target.wants/$u.service || exit 1; done'
+check "the four service users, none in the TPM group, the agent in it" \
+  'for u in envoy envoy-relay envoy-inject mediatore-gateway; do id "$u" >/dev/null && ! id -nG "$u" | tr " " "\n" | grep -qx tss || exit 1; done && id -nG spire | tr " " "\n" | grep -qx tss'
+check "the six units installed and enabled, and the inject Envoy's installed and NOT enabled (it is off until a deployment turns it on, ADR-0040)" \
+  'for u in spire-agent mediatore-gateway-network mediatore-gateway-nft envoy-gateway envoy-relay mediatore-gateway; do test -f /etc/systemd/system/$u.service && test -L /etc/systemd/system/multi-user.target.wants/$u.service || exit 1; done && test -f /etc/systemd/system/envoy-inject.service && ! test -e /etc/systemd/system/multi-user.target.wants/envoy-inject.service'
 check "the units point at the paths the image has" \
   'grep -q "^ExecStart=/usr/bin/envoy -c /run/mediatore-gateway/gateway.yaml" /etc/systemd/system/envoy-gateway.service && grep -q "^ExecStart=/usr/bin/envoy -c /run/mediatore-gateway/relay.yaml" /etc/systemd/system/envoy-relay.service && grep -q "^ExecStart=/usr/bin/mediatore gateway --listen 127.0.0.1:9001" /etc/systemd/system/mediatore-gateway.service && grep -q "^ExecStart=/usr/sbin/nft -f /run/mediatore-gateway/nftables.conf" /etc/systemd/system/mediatore-gateway-nft.service'
-check "both Envoys unprivileged, no capability, read-only root, no new privileges (ADR-0028 decision 8)" \
-  'for u in envoy-gateway envoy-relay; do f=/etc/systemd/system/$u.service; grep -q "^NoNewPrivileges=yes" $f && grep -q "^CapabilityBoundingSet=$" $f && grep -q "^ProtectSystem=strict" $f && grep -q "^PrivateTmp=yes" $f || exit 1; done && grep -q "^User=envoy$" /etc/systemd/system/envoy-gateway.service && grep -q "^User=envoy-relay$" /etc/systemd/system/envoy-relay.service'
+check "all three Envoys unprivileged, no capability, read-only root, no new privileges (ADR-0028 decision 8, ADR-0040 decision 3)" \
+  'for u in envoy-gateway envoy-relay envoy-inject; do f=/etc/systemd/system/$u.service; grep -q "^NoNewPrivileges=yes" $f && grep -q "^CapabilityBoundingSet=$" $f && grep -q "^ProtectSystem=strict" $f && grep -q "^PrivateTmp=yes" $f || exit 1; done && grep -q "^User=envoy$" /etc/systemd/system/envoy-gateway.service && grep -q "^User=envoy-relay$" /etc/systemd/system/envoy-relay.service && grep -q "^User=envoy-inject$" /etc/systemd/system/envoy-inject.service'
 check "the relay is kept out of /run/spire by its unit (ADR-0027 decision 1)" \
   'grep -q "^InaccessiblePaths=/run/spire" /etc/systemd/system/envoy-relay.service'
+check "the inject Envoy (ADR-0040 decision 3) is its own user, reads the agent's socket (unlike the relay), logs at info and is not kept out of /run/spire" \
+  'f=/etc/systemd/system/envoy-inject.service; grep -q "^Group=envoy-inject$" $f && grep -q "^ExecStart=/usr/bin/envoy -c /run/mediatore-gateway/inject.yaml --log-level info" $f && grep -q "^Requires=.*spire-agent.service" $f && grep -q "^ReadOnlyPaths=.*/run/spire/sockets" $f && ! grep -q "^InaccessiblePaths" $f'
+check "the inject bootstrap: claim mutual TLS, a bare-host route, TLS origination with SNI and a DNS SAN, ext_authz to the inject socket in inject mode, and no header mutation, CONNECT, strip_any_host_port or admin block (ADR-0040 decisions 3 and 4)" \
+  'cd /usr/share/mediatore-gateway && r=$(/usr/libexec/mediatore-gateway/render envoy/inject.yaml.in - env.example vm.env.example | grep -v "^[[:space:]]*#") && printf "%s\n" "$r" | grep -q "require_client_certificate: true" && printf "%s\n" "$r" | grep -q "tls_minimum_protocol_version: TLSv1_3" && printf "%s\n" "$r" | grep -q "mode: inject" && printf "%s\n" "$r" | grep -q "failure_mode_allow: false" && printf "%s\n" "$r" | grep -q "suppress_envoy_headers: true" && printf "%s\n" "$r" | grep -q "pipe: { path: /run/mediatore-gateway/inject/inject.sock }" && ! printf "%s\n" "$r" | grep -Eq "request_headers_to_(add|remove)|response_headers_to_add|strip_any_host_port|connect_matcher|upgrade_configs|dynamic_forward_proxy|^admin:" && ! printf "%s\n" "$r" | grep -Eqi "authorization|x-api-key"'
+check "off by default: the example env keeps the authorizer on loopback and the host table at the four relay ports; env.inject.example in front of it moves the data plane to the CHECK socket and admits the inject port" \
+  'cd /usr/share/mediatore-gateway && /usr/libexec/mediatore-gateway/render envoy/gateway.yaml.in - env.example vm.env.example | grep -q "port_value: 9001" && /usr/libexec/mediatore-gateway/render nftables.conf.in - env.example vm.env.example | grep -q "elements = { 3129, 3130, 3131, 3132 } }" && /usr/libexec/mediatore-gateway/render envoy/gateway.yaml.in - env.inject.example env.example vm.env.example | grep -q "pipe: { path: /run/mediatore-gateway/check/check.sock }" && /usr/libexec/mediatore-gateway/render nftables.conf.in - env.inject.example env.example vm.env.example | grep -q "elements = { 3129, 3130, 3131, 3132, 3133 } }"'
+check "the system roots the inject Envoy verifies its upstream against exist in the image" \
+  'test -s /etc/ssl/certs/ca-certificates.crt'
 check "the agent's unit is the gateway's: it requires the gateway's host table, not the pool's" \
   'grep -q "^Requires=mediatore-gateway-nft.service" /etc/systemd/system/spire-agent.service && ! grep -qE "^(Requires|After|Wants)=.*mediatore-host-nft" /etc/systemd/system/spire-agent.service'
 check "the sandbox interface file sorts before the base's DHCP catch-all (10- before 20-dhcp)" \
   'grep -q "^ExecStart=.* /run/systemd/network/10-sandbox.network " /etc/systemd/system/mediatore-gateway-network.service && ! grep -q "^ExecStart=.*/[2-9][0-9]-sandbox.network" /etc/systemd/system/mediatore-gateway-network.service'
 check "the Envoys require the table and the interface first (fail closed)" \
-  'for u in envoy-gateway envoy-relay; do grep -q "^Requires=.*mediatore-gateway-nft.service" /etc/systemd/system/$u.service && grep -q "^Requires=.*mediatore-gateway-network.service" /etc/systemd/system/$u.service || exit 1; done'
+  'for u in envoy-gateway envoy-relay envoy-inject; do grep -q "^Requires=.*mediatore-gateway-nft.service" /etc/systemd/system/$u.service && grep -q "^Requires=.*mediatore-gateway-network.service" /etc/systemd/system/$u.service || exit 1; done'
 check "forwarding off in the image's sysctl (ADR-0028 decision 8)" \
   'grep -qx "net.ipv4.ip_forward = 0" /etc/sysctl.d/99-mediatore-gateway.conf && grep -qx "net.ipv6.conf.all.forwarding = 0" /etc/sysctl.d/99-mediatore-gateway.conf'
 check "the host table drops input and forward by default and admits the sandbox ports alone" \

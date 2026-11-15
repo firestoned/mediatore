@@ -27,6 +27,7 @@ fn config(fake: &FakeTransit, token_file: std::path::PathBuf) -> TransitConfig {
         key: KEY.into(),
         role: ROLE.into(),
         token_file,
+        auth_mount: "kubernetes".into(),
     }
 }
 
@@ -185,4 +186,23 @@ fn tempdir() -> std::path::PathBuf {
     let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(Uuid::new_v4().to_string());
     std::fs::create_dir_all(&dir).unwrap();
     dir
+}
+
+#[tokio::test]
+async fn the_login_goes_to_the_configured_kubernetes_auth_mount() {
+    // A platform that mounts the Kubernetes auth method per cluster (a dotted name, not `kubernetes`) is reachable
+    // by naming the mount; the default stays `kubernetes`.
+    let dir = tempdir();
+    let fake = FakeTransit::spawn(ROLE, "sa-jwt", KEY).await;
+    fake.set_auth_mount("computefabric-cluster.k8s.example");
+    let mut cfg = config(&fake, token_file(&dir, "sa-jwt"));
+    cfg.auth_mount = "computefabric-cluster.k8s.example".into();
+    TransitSealer::connect(&cfg)
+        .await
+        .expect("logs in at the named mount");
+    let wrong = config(&fake, token_file(&dir, "sa-jwt"));
+    assert!(
+        TransitSealer::connect(&wrong).await.is_err(),
+        "the default mount is not where this fake's auth method is"
+    );
 }
