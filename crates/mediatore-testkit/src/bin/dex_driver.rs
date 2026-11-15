@@ -177,9 +177,37 @@ async fn browse(cli: &Cli, auth_url: &str) -> anyhow::Result<()> {
     let status = done.status();
     let body = done.text().await.unwrap_or_default();
     anyhow::ensure!(
-        final_url.host_str() == Some("127.0.0.1") && status.is_success(),
+        reached_the_cli(&final_url, status),
         "the login did not reach the CLI's loopback listener: ended at {final_url} ({status})\n{body}"
     );
     eprintln!("browser: Dex redirected to {final_url}");
     Ok(())
+}
+
+/// Whether the browser's last stop was the CLI's loopback listener answering: a loopback host
+/// by either name (`localhost`, the CLI's default redirect since it took kubelogin's fixed
+/// pair; `127.0.0.1` under `--redirect-host`) and a success status. Dex's own pages and its
+/// error pages are neither.
+fn reached_the_cli(final_url: &reqwest::Url, status: reqwest::StatusCode) -> bool {
+    matches!(final_url.host_str(), Some("localhost" | "127.0.0.1")) && status.is_success()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reached_the_cli;
+    use reqwest::{StatusCode, Url};
+
+    #[test]
+    fn the_clis_callback_counts_under_either_loopback_name_and_nothing_else_does() {
+        let cli = Url::parse("http://localhost:8000/?code=c&state=s").unwrap();
+        assert!(reached_the_cli(&cli, StatusCode::OK));
+        let cli_ip = Url::parse("http://127.0.0.1:18000/callback?code=c&state=s").unwrap();
+        assert!(reached_the_cli(&cli_ip, StatusCode::OK));
+        // The CLI refusing the callback (another state, a second visit) is not a login.
+        assert!(!reached_the_cli(&cli, StatusCode::BAD_REQUEST));
+        // Dex's own pages, success or not, are not the listener.
+        let dex = Url::parse("https://dex.example.com/approval?req=r").unwrap();
+        assert!(!reached_the_cli(&dex, StatusCode::OK));
+        assert!(!reached_the_cli(&dex, StatusCode::INTERNAL_SERVER_ERROR));
+    }
 }
