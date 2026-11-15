@@ -1000,6 +1000,127 @@ and its Secret were gone (`agentsandboxes.mediatore.io "sandbox-57d995da" not fo
 21:55:42  INFO mediatore_claims::watch: resync released=0 swept=0 archived=1
 ```
 
+## Live proofs on the homelab, 2026-11-12 to 2026-11-15
+
+### 8. Claude Code in the jail under the requester's own session (ADR-0035 phase 1, ADR-0036, roadmap 12)
+
+The audience `anthropic` moved from `via: secret` to `via: delegated` on the broker
+(`anthropic-beta: oauth-2025-04-20` among its `extra_headers`, the rules unchanged), the
+policy `claude-agent` as in runs 5 and 7, and the workload the `examples/claude-code` image,
+mirrored by digest. The claim carries the requester's own Claude Code session, read from
+the Keychain at that moment by `--delegate anthropic=claude-code`, after a `claude auth login`
+and a `mediatore login`:
+
+```text
+$ mediatore sandbox create --pool sandbox-pool --audience anthropic --policy claude-agent \
+    --ttl 600 --restart on-failure --delegate anthropic=claude-code \
+    --image registry.internal:5000/firestoned/claude-code@sha256:4488a082… \
+    --arg /usr/local/bin/claude-sandbox --arg=-p --arg "Say hello in one line and name the current working directory."
+delegating your anthropic credential to the broker for this claim (expires 2026-11-16 00:36:32.975 UTC)
+sandbox-25b4321c	Pending	ready=false
+```
+
+Thirteen seconds from the claim to the exit, 2026-11-15 16:36 UTC, in the broker's log:
+
+```text
+16:36:48  sandbox created        subject=octocat pool=sandbox-pool
+16:36:48  delegation parked      sandbox_uid=… subject=octocat audience=anthropic expires_at=Some(2026-11-16T00:36:32.975Z)
+16:36:48  record created         claim_uid=979abce9-… delegated=true delegations=1 policy="claude-agent" bundle_version=Some(1)
+16:36:49  claim bound: entry set claim_uid=979abce9-… ek_hash="cc53fbc7…"
+16:36:59  token issued           claim_uid=979abce9-… audience=anthropic subject=octocat backend="delegated" header=authorization expires_at=2026-11-15 16:46:49 UTC
+16:37:01  workload exited and its restart policy ends the claim (ADR-0033) code=Some(0) signal=None restarts=0 restart=on-failure
+16:37:01  entry retracted; claim released: entry retracted, tokens cut off; sandbox deleting: record released, claim deleted
+```
+
+Exit `0` ends the claim under `on-failure` as under `never`, and the pool recycled the member
+with Claude's answer in its journal. The same claim ten minutes later with the workload
+wrapped as `/bin/sh -c '/usr/local/bin/claude-sandbox -p "…"; echo "[claude exited $?]"; sleep 240'`,
+so the member outlived the answer by four minutes, `sandbox-723de555`, claim
+`03e0baf1-…`, read on the member (`journalctl -u mediatore-guest`):
+
+```text
+guest     subject fetched claim_uid=03e0baf1-… subject=octocat user=sb-eebd588b20ec egress=1 routes=1 gateways=3
+guest     workload image pulled image_digest=sha256:4488a082… layers=9 bytes=306769124
+guest     sandbox ruleset loaded user="sb-eebd588b20ec" uid=101 shape=gateways destinations=5 proxy_port=3128
+guest     report recorded at the broker image_digest=sha256:4488a082… host_table=Loaded { sha256: "df8ff5e3…" }
+proxy     SVID from the Workload API spiffe_id=spiffe://sandbox.home.example/banlieue/claim/03e0baf1-…
+proxy     upstreams are tunnelled through the egress gateways as the claim gateways=["192.0.2.11:8443", "192.0.2.12:8443", "192.0.2.13:8443"] gateway_id=spiffe://sandbox.home.example/gateway
+proxy     egress proxy listening addr=127.0.0.1:3128 routes=1 dial=3 gateway(s)
+nsjail    Mount: 'none' -> '/proc' type:'proc' options:'subset=pid,hidepid=invisible'
+jail      Landlock sandbox fully enforced; confinement applied; exec writable=["/home/sandbox", "/tmp", "/work"] connect_ports=[3128]
+proxy     request refused method=HEAD path=/api.anthropic.com/api/hello status=403 Forbidden code="outside_rules"
+proxy     token fetched for the proxy audience="anthropic" expires_at=2026-11-15 16:56:56 UTC header="authorization"
+broker    token issued claim_uid=03e0baf1-… audience=anthropic subject=octocat backend="delegated" header=authorization
+proxy     forwarded audience="anthropic" host=api.anthropic.com:443 method=POST path=/v1/messages?beta=true status=200 OK credential=true via=192.0.2.13:8443
+workload  Hello! The current working directory is `/work`.
+workload  [claude exited 0]
+broker    workload exited and its restart policy ends the claim (ADR-0033) code=Some(0) restarts=0 restart=on-failure   (16:51:10, after the sleep)
+```
+
+Claude Code started in the jail (the `/proc` of ADR-0036 is the mount nsjail prints), probed
+`HEAD /api/hello` at its base URL and was refused as outside the rules, which it takes in its
+stride, then sent its one Messages call with the phantom as its bearer and its own
+`anthropic-beta` header; the proxy fetched the delegated session from the broker once,
+placed it in `Authorization`, tunnelled through gateway-03, and the body came back with the
+sentence. The session never entered the jail, and the request is attributed to the person
+on the Anthropic side, not to a key of the operator's. The gateway's own tunnel line was not
+read this time: the gateways run on Cloud Hypervisor since 2026-11-11 and expose no guest
+agent to the host; the proxy's `via=` names the gateway.
+
+The record on the resource afterwards names the delegation without its material, as
+ADR-0035 says it should:
+
+```text
+$ kubectl -n banlieue-system get agentsandbox sandbox-723de555 -o jsonpath='{.status.record}'
+{"bundleVersion":1,"claimUid":"03e0baf1-…","createdAt":"2026-11-15T16:46:55Z",
+ "delegations":[{"audience":"anthropic","expiresAt":"2026-11-16T00:36:32Z"}],
+ "entryId":"mediatore-claim-03e0baf1-…","exit":{"code":0,"exited_at":"2026-11-15T16:51:10.298342049Z","restarts":0},
+ "expiresAt":"2026-11-15T16:56:56Z","nodeId":"spiffe://sandbox.home.example/spire/agent/tpm/534e9ed1…",
+ "policyUid":"c18e8d1b-…","refresh":false,"report":{…},"revokedAt":"2026-11-15T16:51:10Z"}
+```
+
+Four claims between 2026-11-12 and 2026-11-14 came before it, each ending at a different
+layer, and each is in the guides now:
+
+1. **Pending forever** (2026-11-12). banlieue's upgrade had added a `ValidatingAdmissionPolicy`
+   on `VirtualMachineClaim`: a claim may name a subject other than its creator only if the
+   creator is listed in ConfigMap `banlieue-claim-subject-policy`. The broker logged
+   `is forbidden ... subject-authorization` every five seconds and the sandbox never bound.
+   The broker's ServiceAccount and the Dex issuer went into the ConfigMap ([deploying](deploying.md),
+   the end-to-end guide section F).
+2. **Nothing to place** (2026-11-12). The delegation parked with that first claim was swept
+   after an hour (`SESSION_GRACE_SECS`), so when the pool finally bound a member the record
+   read `delegated=false delegations=0` and the workload ran with no session behind the
+   phantom. Since v0.2.2 the reconciler refuses such a sandbox before a member binds
+   (`delegation_required`, the claim deleted).
+3. **Exit 1 within a second** (2026-11-12). `Can't access working directory /work: Path
+   "/work" does not exist`, the directory present all along: Node reads `/proc/self` on start
+   and the jail had no `/proc`. [ADR-0036](../adr/0036-proc-inside-the-jail-the-workloads-own-processes-only.md)
+   mounts one showing the workload's own processes alone; v0.2.2 carries it.
+4. **Exit 1 after three minutes** (2026-11-14, on v0.2.2). The delegation was parked and
+   recorded, the token minted `backend="delegated"`, and Claude Code retried for three minutes
+   and gave up: every gateway's `8443` was open for about 27 seconds and refused for about 16,
+   staggered across the three, while the relay ports held. The SPIRE server's log said why,
+   several times a minute: `Nodeattestor(tpm): could not verify cert: x509: certificate
+   signed by unknown authority ... candidate authority certificate "swtpm-localca"`. The
+   gateways had moved from libvirt to Cloud Hypervisor three days earlier, and banlieue's
+   Cloud Hypervisor provider runs its own swtpm with its own local CA, same `CN`, different
+   key; the server's EK CA ConfigMap carried libvirt's issuer alone, so each gateway's agent
+   was refused at every attempt and exited, taking Envoy with it (`envoy-gateway.service`
+   `Requires=spire-agent.service`). Their agent IDs had changed with their vTPMs too, so the
+   six `ClusterStaticEntry` still named the old parents. The second issuer went into the
+   ConfigMap, the servers were restarted, the entries regenerated; the three agents attested
+   and `8443` held. [Deploying](deploying.md) now says one PEM per swtpm local
+   CA, not per host, and that a recreated gateway VM needs its entries regenerated.
+
+Two bounds the run fixed in the guides: Claude Code refreshes its access token in memory
+and never writes it back to the Keychain item the `claude-code` source reads, so the
+source is fresh for eight hours after `claude auth login` and the CLI refuses it after
+(`the credential expired at …`), which makes ADR-0035 phase 3 (the CLI refreshing with the
+refresh token it already reads) required rather than optional; and the Dex session is spent
+by each claim (the refresh token travels with it, ADR-0013), so a second claim without a
+new `mediatore login` is `400 session_required`.
+
 ### What is not proven live yet
 
 The full agent reading a repository and asking Claude about it, which needs a policy
