@@ -29,6 +29,13 @@ on:
   # Reusable: a release pipeline can call the whole gate.
   workflow_call:
 
+# A newer run of the same event on the same ref cancels the older one (a second push to
+# the PR, the next merge to main); a release is never cancelled. Across events, a merge
+# to main cancels the PR runs and a release cancels main's: the preempt job below.
+concurrency:
+  group: build-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'release' }}
+
 # Top-level GITHUB_TOKEN is read-only (OpenSSF Scorecard Token-Permissions).
 # Jobs that push images, sign or attest declare elevated scopes themselves.
 permissions:
@@ -39,6 +46,28 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  # ───────────────────────────────────────────────────────────────────────────
+  # Preempt: a merge to main cancels the PR runs still going, a release cancels
+  # main's, so a hot fix is not queued behind work it supersedes. Nothing waits
+  # on this job; it only frees runners (scripts/ci-preempt.sh).
+  # ───────────────────────────────────────────────────────────────────────────
+  preempt:
+    name: ⏭️ Cancel superseded runs
+    if: github.event_name == 'push' || github.event_name == 'release'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write # cancel the superseded runs
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Cancel superseded runs
+        run: make ci-preempt CI_PREEMPT_EVENT=${{ github.event_name }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+
   # ───────────────────────────────────────────────────────────────────────────
   # License headers — every file type, every PR.
   # ───────────────────────────────────────────────────────────────────────────
