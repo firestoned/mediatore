@@ -310,6 +310,47 @@ mod tests {
             .unwrap();
         assert!(err.contains("not set"), "{err}");
     }
+
+    #[test]
+    fn prompt_and_store_are_sources_and_a_basic_token_joins_a_user_and_a_secret() {
+        assert_eq!("prompt".parse::<Source>().unwrap(), Source::Prompt);
+        assert_eq!("store".parse::<Source>().unwrap(), Source::Store);
+        let (aud, src) = parse_delegate("rbcgithub=prompt").unwrap();
+        assert_eq!((aud.as_str(), src), ("rbcgithub", Source::Prompt));
+        assert_eq!(join_basic("alice", "p:w").unwrap(), "alice:p:w");
+        for (u, p, why) in [
+            ("", "x", "user name is empty"),
+            ("a", "", "secret is empty"),
+            ("a:b", "x", "colon"),
+            ("a", "x\ny", "control"),
+            ("a\r", "x", "control"),
+        ] {
+            let e = join_basic(u, p).unwrap_err().to_string();
+            assert!(e.contains(why), "{u:?}/{p:?}: {e}");
+            assert!(!e.contains("x\ny"), "the message must not echo the value");
+        }
+    }
+
+    #[test]
+    fn a_saved_credential_older_than_six_hours_is_refused_and_a_fresh_one_is_read() {
+        let now = Utc::now();
+        let fresh = stored_json("alice:s3cret", now - chrono::Duration::hours(5)).unwrap();
+        assert_eq!(parse_stored(&fresh, now).unwrap(), "alice:s3cret");
+        let old = stored_json("alice:s3cret", now - chrono::Duration::hours(7)).unwrap();
+        let e = parse_stored(&old, now).unwrap_err().to_string();
+        assert!(e.contains("six hours") && !e.contains("s3cret"), "{e}");
+        let future = stored_json("alice:s3cret", now + chrono::Duration::hours(2)).unwrap();
+        assert!(parse_stored(&future, now).is_err());
+        assert!(parse_stored("not json", now).is_err());
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn without_a_credential_store_the_store_source_says_so_and_logout_is_a_noop() {
+        let e = read("a", &Source::Store).unwrap_err().to_string();
+        assert!(e.contains("no credential store"), "{e}");
+        forget("a");
+    }
 }
 
 // ----- ADR-0041: a user name and a secret ------------------------------------------------------------------------------
@@ -371,6 +412,7 @@ pub fn parse_stored(json: &str, now: DateTime<Utc>) -> anyhow::Result<String> {
 }
 
 /// The Keychain item as JSON for `token`, saved now.
+#[cfg(any(target_os = "macos", test))]
 fn stored_json(token: &str, now: DateTime<Utc>) -> anyhow::Result<String> {
     Ok(serde_json::to_string(&Stored {
         saved_at: now.timestamp(),
@@ -495,45 +537,4 @@ mod store {
     }
 
     pub fn delete(_audience: &str) {}
-
-    #[test]
-    fn prompt_and_store_are_sources_and_a_basic_token_joins_a_user_and_a_secret() {
-        assert_eq!("prompt".parse::<Source>().unwrap(), Source::Prompt);
-        assert_eq!("store".parse::<Source>().unwrap(), Source::Store);
-        let (aud, src) = parse_delegate("rbcgithub=prompt").unwrap();
-        assert_eq!((aud.as_str(), src), ("rbcgithub", Source::Prompt));
-        assert_eq!(join_basic("alice", "p:w").unwrap(), "alice:p:w");
-        for (u, p, why) in [
-            ("", "x", "user name is empty"),
-            ("a", "", "secret is empty"),
-            ("a:b", "x", "colon"),
-            ("a", "x\ny", "control"),
-            ("a\r", "x", "control"),
-        ] {
-            let e = join_basic(u, p).unwrap_err().to_string();
-            assert!(e.contains(why), "{u:?}/{p:?}: {e}");
-            assert!(!e.contains("x\ny"), "the message must not echo the value");
-        }
-    }
-
-    #[test]
-    fn a_saved_credential_older_than_six_hours_is_refused_and_a_fresh_one_is_read() {
-        let now = Utc::now();
-        let fresh = stored_json("alice:s3cret", now - chrono::Duration::hours(5)).unwrap();
-        assert_eq!(parse_stored(&fresh, now).unwrap(), "alice:s3cret");
-        let old = stored_json("alice:s3cret", now - chrono::Duration::hours(7)).unwrap();
-        let e = parse_stored(&old, now).unwrap_err().to_string();
-        assert!(e.contains("six hours") && !e.contains("s3cret"), "{e}");
-        let future = stored_json("alice:s3cret", now + chrono::Duration::hours(2)).unwrap();
-        assert!(parse_stored(&future, now).is_err());
-        assert!(parse_stored("not json", now).is_err());
-    }
-
-    #[test]
-    #[cfg(not(target_os = "macos"))]
-    fn without_a_credential_store_the_store_source_says_so_and_logout_is_a_noop() {
-        let e = read("a", &Source::Store).unwrap_err().to_string();
-        assert!(e.contains("no credential store"), "{e}");
-        forget("a");
-    }
 }

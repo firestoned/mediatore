@@ -4,7 +4,7 @@
 # All CI logic lives here (rules/github-workflows.md): workflows install tools
 # and call these targets, and every target runs identically locally.
 
-.PHONY: all help fmt fmt-check lint test deny audit check sbom dist dist-e2e image guest-image guest-image-check crds e2e live-admission-test release-assets release-assets-test dist-darwin set-version set-version-test \
+.PHONY: all help fmt fmt-check lint test deny audit check ci-preempt sbom dist dist-e2e image guest-image guest-image-check crds e2e live-admission-test release-assets release-assets-test dist-darwin set-version set-version-test \
         kind-install kind-create kind-delete kind-down kind-spire kind-deploy kind-up \
         kind-images kind-dex kind-openbao kind-broker kind-banlieue-crds kind-e2e-entries kind-e2e-mtls kind-e2e-watcher kind-e2e-sandbox \
         kind-e2e-dex kind-e2e kind-e2e-ci kind-e2e-logs \
@@ -91,6 +91,9 @@ audit: ## cargo-audit advisory scan (CI uses the security-scan composite action)
 	cargo audit
 
 check: fmt lint test deny ## The pre-commit gate: fmt + clippy + test + deny
+
+ci-preempt: ## Cancel the CI runs CI_PREEMPT_EVENT supersedes (push: the PR runs; release: main's runs); needs gh and GH_REPO
+	./scripts/ci-preempt.sh $(CI_PREEMPT_EVENT)
 
 # ----- Supply chain ----------------------------------------------------------
 
