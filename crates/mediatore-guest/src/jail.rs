@@ -22,6 +22,14 @@ pub const JAIL_BINARY: &str = mediatore_proto::AGENT_BINARY_PATH;
 /// What the workload may write inside the jail, and nothing else (ADR-0024 decision 2):
 /// its work dir, a tmpfs `/tmp` and a tmpfs home.
 pub const WRITABLE_IN_JAIL: [&str; 3] = ["/work", "/tmp", "/home/sandbox"];
+/// The only device nodes the jail has, bind-mounted from the VM: a sink, zeros and the
+/// kernel's random source. The image's root has no device nodes (ADR-0021), and tools expect
+/// these three: `git` fails with `could not open '/dev/null'` without the first. Nothing
+/// else under `/dev` is there, and no `/dev` tree.
+pub const DEVICES_IN_JAIL: [&str; 3] = ["/dev/null", "/dev/zero", "/dev/urandom"];
+/// The one device the workload may also write (Landlock grants it as a single file, not a
+/// directory): the sink. `/dev/zero` and `/dev/urandom` are read-only to it, like the rest.
+pub const WRITABLE_FILES_IN_JAIL: [&str; 1] = ["/dev/null"];
 /// The jail's `/proc` (ADR-0036): a procfs showing nothing but the process directories
 /// (`subset=pid`), and of those only the ones the workload may ptrace (`hidepid=invisible`).
 /// nsjail's `--mount` carries filesystem options, not mount flags: writes are denied by the
@@ -82,6 +90,14 @@ impl JailSpec {
             "/tmp".into(),
             "--tmpfsmount".into(),
             "/home/sandbox".into(),
+        ];
+        // Read-only mounts: the flag covers files, directories and symlinks, not device nodes,
+        // so `/dev/null` still opens for writing, and the one read-write mount stays `/work`.
+        for dev in DEVICES_IN_JAIL {
+            a.push("--bindmount_ro".into());
+            a.push(format!("{dev}:{dev}"));
+        }
+        a.extend([
             // nsjail's own full `/proc` stays off; the one the workload gets shows the
             // jail's processes alone (ADR-0036). Landlock makes it read-only (decision 2).
             "--disable_proc".into(),
@@ -114,10 +130,14 @@ impl JailSpec {
             // The inner layer (ADR-0024): the binary confines itself, then execs the argv.
             JAIL_BINARY.into(),
             "jail-exec".into(),
-        ];
+        ]);
         for dir in WRITABLE_IN_JAIL {
             a.push("--writable".into());
             a.push(dir.into());
+        }
+        for file in WRITABLE_FILES_IN_JAIL {
+            a.push("--writable-file".into());
+            a.push(file.into());
         }
         a.push("--connect-port".into());
         a.push(self.proxy_port.to_string());
@@ -181,8 +201,35 @@ mod tests {
         );
         assert!(
             !a.iter().any(|x| x == "/dev" || x.ends_with(":/dev")),
-            "no /dev: nothing the workload has needed"
+            "no /dev tree: only the three device nodes below"
         );
+    }
+
+    #[test]
+    fn the_jail_has_exactly_three_device_nodes_and_may_write_only_the_sink() {
+        let a = spec().to_args();
+        let binds: Vec<&str> = a
+            .windows(2)
+            .filter(|w| w[0] == "--bindmount_ro")
+            .map(|w| w[1].as_str())
+            .collect();
+        assert!(binds.contains(&"/dev/null:/dev/null"));
+        assert!(binds.contains(&"/dev/zero:/dev/zero"));
+        assert!(binds.contains(&"/dev/urandom:/dev/urandom"));
+        let devs: Vec<&&str> = binds.iter().filter(|b| b.contains("/dev/")).collect();
+        assert_eq!(devs.len(), 3, "no other device: {binds:?}");
+        assert!(
+            a.windows(2)
+                .filter(|w| w[0] == "--bindmount_ro" || w[0] == "--bindmount")
+                .all(|w| !w[1].starts_with("/dev/tty") && !w[1].starts_with("/dev/mem")),
+            "no terminal, no kernel memory"
+        );
+        let writable_files: Vec<&str> = a
+            .windows(2)
+            .filter(|w| w[0] == "--writable-file")
+            .map(|w| w[1].as_str())
+            .collect();
+        assert_eq!(writable_files, ["/dev/null"], "Landlock grants one file");
     }
 
     #[test]
@@ -200,6 +247,8 @@ mod tests {
                 "/tmp",
                 "--writable",
                 "/home/sandbox",
+                "--writable-file",
+                "/dev/null",
                 "--connect-port",
                 "3128",
                 "--",
@@ -282,10 +331,11 @@ mod tests {
             .filter(|w| w[0] == "--bindmount_ro")
             .map(|w| w[1].as_str())
             .collect();
+        let ro_files: Vec<&&str> = ro.iter().filter(|m| !m.starts_with("/dev/")).collect();
         assert_eq!(
-            ro,
-            ["/opt/mediatore/bin/mediatore:/usr/bin/mediatore"],
-            "the binary alone: the socket left the jail with ADR-0025"
+            ro_files,
+            [&"/opt/mediatore/bin/mediatore:/usr/bin/mediatore"],
+            "the binary alone, beside the three device nodes: the socket left the jail with ADR-0025"
         );
         let rw: Vec<&str> = a
             .windows(2)

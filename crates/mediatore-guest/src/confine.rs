@@ -23,6 +23,10 @@ pub struct JailExecArgs {
     /// A directory the workload may write (repeatable); the rest of the tree is read-only.
     #[arg(long = "writable", value_name = "DIR")]
     pub writable: Vec<PathBuf>,
+    /// A single file the workload may write (repeatable): `/dev/null`, which a directory
+    /// grant cannot name. Granting it adds no directory and no other device.
+    #[arg(long = "writable-file", value_name = "FILE")]
+    pub writable_files: Vec<PathBuf>,
     /// A TCP port the workload may connect to (repeatable); nothing else, and no bind.
     #[arg(long = "connect-port", value_name = "PORT")]
     pub connect_ports: Vec<u16>,
@@ -39,6 +43,8 @@ pub struct Plan {
     pub readable_root: PathBuf,
     /// Readable and writable, sorted, deduplicated.
     pub writable: Vec<PathBuf>,
+    /// Single files that are writable, sorted, deduplicated.
+    pub writable_files: Vec<PathBuf>,
     /// TCP connect ports, sorted, deduplicated, never empty. There is no bind port.
     pub connect_ports: Vec<u16>,
 }
@@ -76,12 +82,22 @@ impl Plan {
         }
         writable.sort();
         writable.dedup();
+        let mut writable_files = Vec::new();
+        for file in &args.writable_files {
+            if !file.is_absolute() {
+                return Err(PlanError::RelativePath(file.display().to_string()));
+            }
+            writable_files.push(file.clone());
+        }
+        writable_files.sort();
+        writable_files.dedup();
         let mut connect_ports = args.connect_ports.clone();
         connect_ports.sort_unstable();
         connect_ports.dedup();
         Ok(Self {
             readable_root: PathBuf::from("/"),
             writable,
+            writable_files,
             connect_ports,
         })
     }
@@ -134,6 +150,11 @@ pub fn capability_set(plan: &Plan) -> anyhow::Result<nono::CapabilitySet> {
         caps = caps
             .allow_path(dir, nono::AccessMode::ReadWrite)
             .with_context(|| format!("granting write on {}", dir.display()))?;
+    }
+    for file in &plan.writable_files {
+        caps = caps
+            .allow_file(file, nono::AccessMode::ReadWrite)
+            .with_context(|| format!("granting write on {}", file.display()))?;
     }
     for port in &plan.connect_ports {
         caps = caps.allow_tcp_connect(*port);
@@ -189,6 +210,7 @@ mod tests {
     fn args(writable: &[&str], ports: &[u16]) -> JailExecArgs {
         JailExecArgs {
             writable: writable.iter().map(PathBuf::from).collect(),
+            writable_files: vec![],
             connect_ports: ports.to_vec(),
             argv: vec!["/bin/sh".into()],
         }
@@ -217,6 +239,20 @@ mod tests {
             Plan::from_args(&args(&["/work"], &[])),
             Err(PlanError::NoPorts),
             "ADR-0024 decision 4: no port, no workload"
+        );
+    }
+
+    #[test]
+    fn single_writable_files_are_planned_apart_from_the_directories_and_must_be_absolute() {
+        let mut a = args(&["/work"], &[443]);
+        a.writable_files = vec![PathBuf::from("/dev/null"), PathBuf::from("/dev/null")];
+        let plan = Plan::from_args(&a).unwrap();
+        assert_eq!(plan.writable_files, [PathBuf::from("/dev/null")]);
+        assert_eq!(plan.writable, [PathBuf::from("/work")]);
+        a.writable_files = vec![PathBuf::from("dev/null")];
+        assert_eq!(
+            Plan::from_args(&a),
+            Err(PlanError::RelativePath("dev/null".into()))
         );
     }
 

@@ -838,9 +838,34 @@ mod tests {
             "https://b",
             "/run/spire/sockets/agent.sock",
             &files,
+            &mediatore_guest::egress::UpstreamArgs::default(),
         ));
         let line: Vec<&str> = line.iter().map(String::as_str).collect();
         assert!(matches!(parse(&line), Ok(Cmd::EgressProxy(_))), "{line:?}");
+        // With the operator's upstream trust set, the line the guest builds is still one the
+        // parser accepts, and carries both settings through.
+        let mut wide = vec!["mediatore".to_owned()];
+        wide.extend(mediatore_guest::egress::command_args(
+            "127.0.0.1:3128".parse().unwrap(),
+            "https://b",
+            "/run/spire/sockets/agent.sock",
+            &files,
+            &mediatore_guest::egress::UpstreamArgs {
+                ca: Some("/etc/ssl/certs/rbc-ca-bundle.crt".into()),
+                min_tls: mediatore_proto::tls::UpstreamTls::Tls12,
+            },
+        ));
+        let wide: Vec<&str> = wide.iter().map(String::as_str).collect();
+        match parse(&wide) {
+            Ok(Cmd::EgressProxy(a)) => {
+                assert_eq!(
+                    a.upstream_ca.as_deref(),
+                    Some(std::path::Path::new("/etc/ssl/certs/rbc-ca-bundle.crt"))
+                );
+                assert_eq!(a.upstream_min_tls, mediatore_proto::tls::UpstreamTls::Tls12);
+            }
+            other => panic!("{wide:?}: {other:?}"),
+        }
         // The routes, the gateways and the phantom are required.
         assert!(parse(&["mediatore", "egress-proxy", "--mediatore-url", "https://b"]).is_err());
         assert!(

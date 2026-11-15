@@ -39,6 +39,7 @@ use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Bytes, Incoming};
 use hyper_util::rt::TokioIo;
+use mediatore_proto::tls::UpstreamTls;
 use mediatore_proto::{Endpoint, Route, TokenRequest, TokenResponse};
 use rustls::pki_types::ServerName;
 use tokio::io::AsyncBufReadExt as _;
@@ -88,6 +89,24 @@ pub struct EgressArgs {
     /// The file holding the phantom token the jail was given
     #[arg(long)]
     pub phantom_file: PathBuf,
+    /// A PEM of CA certificates trusted beside the Mozilla roots for an upstream that has
+    /// no CA of its own: a policy bundle's direct egress, on the operator's private PKI
+    /// (`MEDIATORE_EGRESS_CA` on the guest)
+    #[arg(long, value_name = "PEM")]
+    pub upstream_ca: Option<PathBuf>,
+    /// The lowest TLS version offered to such an upstream: `1.3` (the default) or `1.2`, for
+    /// an upstream that has no 1.3 (`MEDIATORE_EGRESS_MIN_TLS` on the guest)
+    #[arg(long, default_value_t = UpstreamTls::Tls13)]
+    pub upstream_min_tls: UpstreamTls,
+}
+
+/// The trust the guest hands the proxy for upstreams that carry no CA of their own.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UpstreamArgs {
+    /// A PEM of CA certificates trusted beside the Mozilla roots.
+    pub ca: Option<PathBuf>,
+    /// The lowest TLS version offered.
+    pub min_tls: UpstreamTls,
 }
 
 /// The phantom token (decision 3): 256 random bits as hex, handed to the jail, swapped by
@@ -552,6 +571,26 @@ impl Proxy {
         )
     }
 
+    /// As [`Self::with_webpki_roots`], with the operator's own trust for the routes that carry
+    /// no CA (a policy bundle's direct egress): `extra_roots_pem` beside the Mozilla roots,
+    /// and TLS 1.2 accepted below 1.3 when `min` says so. A route with a CA of its own keeps
+    /// exactly that CA at TLS 1.3, whatever this is.
+    ///
+    /// # Errors
+    /// `extra_roots_pem` holds no certificate, or as [`Self::new`].
+    pub fn with_upstream_trust(
+        routes: Routes,
+        phantom: Phantom,
+        tokens: Arc<dyn TokenSource>,
+        dialer: Dialer,
+        extra_roots_pem: Option<&[u8]>,
+        min: UpstreamTls,
+    ) -> anyhow::Result<Self> {
+        let tls = mediatore_proto::tls::egress_upstream_config(extra_roots_pem, min)
+            .map_err(|e| anyhow::anyhow!("the egress proxy's upstream trust: {e}"))?;
+        Self::new(routes, phantom, tokens, tls, dialer)
+    }
+
     /// How upstreams are reached.
     #[must_use]
     pub fn dialer(&self) -> &Dialer {
@@ -825,8 +864,9 @@ pub fn command_args(
     mediatore_url: &str,
     workload_api_socket: &str,
     files: &EgressFiles,
+    upstream: &UpstreamArgs,
 ) -> Vec<String> {
-    vec![
+    let mut args = vec![
         "egress-proxy".into(),
         "--listen".into(),
         listen.to_string(),
@@ -840,7 +880,17 @@ pub fn command_args(
         files.gateways.display().to_string(),
         "--phantom-file".into(),
         files.phantom.display().to_string(),
-    ]
+    ];
+    // Only when set: the default argv is the one the proxy has always had.
+    if let Some(ca) = &upstream.ca {
+        args.push("--upstream-ca".into());
+        args.push(ca.display().to_string());
+    }
+    if upstream.min_tls != UpstreamTls::Tls13 {
+        args.push("--upstream-min-tls".into());
+        args.push(upstream.min_tls.to_string());
+    }
+    args
 }
 
 /// Start the proxy as `uid:gid` and wait for its ready line, at most `timeout`.
@@ -921,11 +971,22 @@ pub async fn run(args: EgressArgs) -> anyhow::Result<()> {
     };
     let listener = TcpListener::bind(args.listen).await?;
     let addr = listener.local_addr()?;
-    let proxy = Arc::new(Proxy::with_webpki_roots(
+    // The CA is read here, by the proxy as the sandbox user: a file it cannot read, or one
+    // with no certificate, ends the claim before the jail starts (fail closed).
+    let upstream_ca = match &args.upstream_ca {
+        Some(path) => Some(
+            std::fs::read(path)
+                .map_err(|e| anyhow::anyhow!("reading --upstream-ca {}: {e}", path.display()))?,
+        ),
+        None => None,
+    };
+    let proxy = Arc::new(Proxy::with_upstream_trust(
         routes,
         phantom,
         Arc::new(BrokerTokens { client }),
         dialer,
+        upstream_ca.as_deref(),
+        args.upstream_min_tls,
     )?);
     tracing::info!(%addr, routes = proxy.routes.len(), dial = %proxy.dialer, "egress proxy listening");
     // The one line on standard output: the guest starts the jail when it reads it.
@@ -1526,6 +1587,7 @@ mod tests {
             "https://mediatore.test:8443",
             "/run/spire/sockets/agent.sock",
             &files,
+            &UpstreamArgs::default(),
         );
         assert_eq!(
             a,
