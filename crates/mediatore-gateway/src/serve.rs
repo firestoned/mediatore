@@ -197,7 +197,18 @@ impl UnixSocket {
         }
         // The owner first, the mode last: a chown can clear the setgid bit on some systems, and the mode has the last word.
         self.chown(dir)?;
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(self.dir_mode))?;
+        // Only when it differs: a unit with `RestrictSUIDSGID=yes` cannot set the setgid bit (EPERM), and its root `ExecStartPre` made the
+        // directory at the mode wanted, so a directory that is already right is left alone and the hardening stays on.
+        if dir_mode_differs(dir, self.dir_mode)? {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(self.dir_mode))
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "setting mode {:o} on {}: {e} (a unit with RestrictSUIDSGID=yes cannot set the setgid bit: make the directory at that mode before the authorizer starts)",
+                        self.dir_mode,
+                        dir.display()
+                    )
+                })?;
+        }
         match std::fs::symlink_metadata(&self.path) {
             Ok(m) if m.file_type().is_socket() => std::fs::remove_file(&self.path)?,
             Ok(_) => anyhow::bail!("{} exists and is not a socket", self.path.display()),
@@ -228,6 +239,11 @@ impl UnixSocket {
         }
         Ok(())
     }
+}
+
+/// Whether `dir`'s permission bits (including setgid) are not already `wanted`.
+fn dir_mode_differs(dir: &Path, wanted: u32) -> std::io::Result<bool> {
+    Ok(std::fs::metadata(dir)?.permissions().mode() & 0o7777 != wanted)
 }
 
 /// The two sockets never share a directory: the directory carries each Envoy's access, so a
@@ -1129,6 +1145,55 @@ mod tests {
             0o2750,
             "the setgid bit survives the bind"
         );
+    }
+
+    #[test]
+    fn a_directory_already_at_the_wanted_mode_is_not_chmodded_again() {
+        // A hardened unit (`RestrictSUIDSGID=yes`) cannot set the setgid bit, and its root `ExecStartPre` already made the directory at
+        // the mode the authorizer wants: the authorizer must leave a directory that is right alone, since any chmod to a setgid mode is
+        // refused there with EPERM (found rolling v0.2.8 on a gateway).
+        let tmp = Tmp::new();
+        let dir = tmp.join("d");
+        std::fs::create_dir(&dir).unwrap();
+        // A group the test user belongs to: setgid on a directory of another group is dropped silently, as the unit's user finds.
+        let (uid, gid) = me();
+        std::os::unix::fs::chown(&dir, Some(uid), Some(gid)).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o750)).unwrap();
+        assert!(
+            !dir_mode_differs(&dir, 0o750).unwrap(),
+            "the same mode is no change"
+        );
+        assert!(
+            dir_mode_differs(&dir, 0o2750).unwrap(),
+            "a setgid bit that is missing is a change"
+        );
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o2750)).unwrap();
+        assert!(!dir_mode_differs(&dir, 0o2750).unwrap());
+        assert!(
+            dir_mode_differs(&dir, 0o750).unwrap(),
+            "a setgid bit that must go is a change"
+        );
+        assert!(
+            dir_mode_differs(&tmp.join("missing"), 0o750).is_err(),
+            "a directory that is not there is an error, not a no-change"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_directory_made_at_the_wanted_setgid_mode_binds_and_keeps_it() {
+        // What the unit's root `ExecStartPre` leaves behind: the directory exists at 2750 before the authorizer starts.
+        let tmp = Tmp::new();
+        let mut s = sock(&tmp, "p");
+        s.dir_mode = 0o2750;
+        let dir = s.path.parent().unwrap();
+        std::fs::create_dir(dir).unwrap();
+        let (uid, gid) = me();
+        std::os::unix::fs::chown(dir, Some(uid), Some(gid)).unwrap();
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o2750)).unwrap();
+        let _l = s
+            .bind()
+            .expect("binds in a directory that is already right");
+        assert_eq!(mode_of(dir), 0o2750, "and it stays setgid");
     }
 
     #[test]
