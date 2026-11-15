@@ -188,6 +188,32 @@ Three questions follow, and this ADR answers each:
   in the local sealer shape; for `basic` the transit shape is required when the broker offers one, so
   the plaintext path is not chosen by the client (the same rule as ADR-0035 decision 2).
 
+## Implementation notes (2026-11-15, branch `feat/basic-credential-adr-0041`)
+
+Built on v0.2.7 for the first platform (macOS) and the two sources the operator needs now. Where the
+code is narrower or different from the decisions above:
+
+- **The delegation's `token` carries `user:secret`.** No new wire field: `Delegation.token` and
+  `DelegationPlain.token` hold it (decision 3 left the shape open), so sealing, the pending handshake
+  and the Secret layout are unchanged. The broker splits at the first colon and refuses an empty part
+  or a control character at claim time (`400 delegation_refused`); the CLI refuses the same before
+  sending (`join_basic`).
+- **Config:** `audiences[].credential: bearer | basic`. `basic` is refused unless `via: delegated`,
+  `inject: gateway`, header `authorization` and no `refresh` (decisions 1, 2, 8).
+- **Placement:** the credential route answers `Authorization: Basic base64(user:secret)` whole, so the
+  gateway places it as it does any non-bearer header value; nothing changes in the authorizer or Envoy.
+- **CLI:** `--delegate <audience>=prompt` (terminal only, echo off through `stty`, no new crate) and
+  `--delegate <audience>=store` (the macOS Keychain, through `security-framework`, a macOS-only
+  dependency already in the lockfile). `env:` and `file:` carry `user:secret` as they carry a token.
+  `prompt` offers to save (default no). The item is service `mediatore`, account `<audience>`, one per
+  audience; the saved time is in the item's value, and an item older than six hours is deleted and
+  refused (`STORE_MAX_AGE_SECS`, a constant). This simplifies decision 5's account name: the user name
+  is inside the value, not in the account.
+- **`mediatore logout --audience <name>`** deletes the item; `--all` is not built (the passwords API
+  cannot list items).
+- **Not built:** Windows and Linux stores (they say so and fall to `prompt`/`env:`/`file:`), the
+  non-macOS `store` source, and the once-per-claim notice of decision 7. Both are small follow-ups.
+
 ## What was proven, and what was not
 
 Proven 2026-11-15 on mediatore 0.2.6, `sandbox-pool-mtest`, with `TESTING.md` T-rows kept in
@@ -197,8 +223,9 @@ Proven 2026-11-15 on mediatore 0.2.6, `sandbox-pool-mtest`, with `TESTING.md` T-
   TLS 1.2 and the host answers `401` to `GET /org-oss/curl-curl.git/info/refs` (exit `4`).
 - A claim under the `ghe` policy needs a bearer; not tested here.
 
-Not proven: the `basic` credential kind, the credential-store source, the `logout` command, the
-header form and the user-id refusal. None is implemented. The ADD cycle (ADR-0040 decision 10) is the
+Not proven live: the `basic` credential kind, the Keychain source, `logout`, the header form and the
+user-id refusal are implemented and unit-tested (see Implementation notes) but not run against a live
+broker, gateway and upstream. The ADD cycle (ADR-0040 decision 10) is the
 order: write the failing tests (a `basic` audience refused with `inject: proxy`; a user name with `:`
 refused; `Basic` header built and the client's `Authorization` overwritten; the store source returns
 nothing on a non-TTY with no store; the cookie path does not exist), then the code.

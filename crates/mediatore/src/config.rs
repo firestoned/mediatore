@@ -28,6 +28,19 @@ pub enum Inject {
     Gateway,
 }
 
+/// What a `via: delegated` audience's credential is (ADR-0041 decision 1).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Credential {
+    /// A bearer, placed as `Authorization: Bearer <token>` (ADR-0035): the default.
+    #[default]
+    Bearer,
+    /// A user name and a secret (a password or a personal access token), placed as
+    /// `Authorization: Basic base64(user:secret)`. Gateway-placed only: a password never reaches a
+    /// pool VM (ADR-0041 decision 2).
+    Basic,
+}
+
 /// One downstream audience and which backend serves it. An unknown key stops the start: the settings here decide where
 /// a credential is placed, and a misspelled `inject` must not fall back to the default silently (ADR-0040).
 #[derive(Debug, Clone, Deserialize)]
@@ -90,6 +103,9 @@ pub struct AudienceConfig {
     /// authorities of this audience's `egress`.
     #[serde(default)]
     pub inject: Inject,
+    /// What the delegated credential is (ADR-0041): `bearer` (default) or `basic`.
+    #[serde(default)]
+    pub credential: Credential,
 }
 
 impl AudienceConfig {
@@ -518,6 +534,39 @@ fn default_listen() -> ListenConfig {
 }
 
 impl Config {
+    /// What `credential: basic` needs (ADR-0041 decisions 1, 2 and 8); nothing for a bearer.
+    fn check_basic(a: &AudienceConfig) -> anyhow::Result<()> {
+        if a.credential != Credential::Basic {
+            return Ok(());
+        }
+        if a.via != Backend::Delegated {
+            anyhow::bail!(
+                "audience {:?}: `credential: basic` goes with via: delegated (ADR-0041 decision 1)",
+                a.name
+            );
+        }
+        if a.inject != Inject::Gateway {
+            anyhow::bail!(
+                "audience {:?}: `credential: basic` is placed at the gateway only, `inject: gateway`: a password never reaches a pool VM (ADR-0041 decision 2)",
+                a.name
+            );
+        }
+        if a.refresh.is_some() {
+            anyhow::bail!(
+                "audience {:?}: `credential: basic` has nothing to renew, so no `refresh` (ADR-0041 decision 1)",
+                a.name
+            );
+        }
+        if a.header != "authorization" {
+            anyhow::bail!(
+                "audience {:?}: `credential: basic` is the `authorization` header (ADR-0041 decision 8)",
+                a.name
+            );
+        }
+
+        Ok(())
+    }
+
     /// The egress proxy chooses the token by the endpoint a request names (ADR-0025
     /// decision 4), so an endpoint may belong to one audience only; and a rule must be
     /// a method or `*` with an absolute path.
@@ -547,6 +596,7 @@ impl Config {
                     a.name
                 );
             }
+            Self::check_basic(a)?;
             let header_ok = |h: &str| {
                 !h.is_empty()
                     && h.chars()
@@ -1746,6 +1796,50 @@ listen: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }
         Config::parse(&format!("{base}audiences:\n{audiences}"))
             .unwrap_err()
             .to_string()
+    }
+
+    // ----- ADR-0041: credential: basic ----------------------------------------------------------------------------------
+
+    #[test]
+    fn a_basic_credential_is_gateway_placed_delegated_authorization_with_no_refresh() {
+        let ok = INJECT_OK.replace("anthropic", "ldap") + "    credential: basic\n";
+        let cfg = Config::parse(&inject_cfg(&ok)).expect("basic, delegated, gateway-placed");
+        assert_eq!(cfg.audiences[0].credential, Credential::Basic);
+        let bearer = Config::parse(&inject_cfg(INJECT_OK)).unwrap();
+        assert_eq!(
+            bearer.audiences[0].credential,
+            Credential::Bearer,
+            "absent is a bearer"
+        );
+        for (extra, why) in [
+            ("    credential: basic\n    inject: proxy\n", "gateway only"),
+            (
+                "    credential: basic\n    header: x-auth\n",
+                "authorization",
+            ),
+            (
+                "    credential: basic\n    refresh: { token_endpoint: \"https://t.example/token\", client_id: c }\n",
+                "nothing to renew",
+            ),
+        ] {
+            let aud = INJECT_OK
+                .replace("anthropic", "ldap")
+                .replace("    inject: gateway\n", "")
+                + "    inject: gateway\n"
+                + extra;
+            let aud = if extra.contains("inject: proxy") {
+                INJECT_OK
+                    .replace("anthropic", "ldap")
+                    .replace("    inject: gateway\n", "")
+                    + extra
+            } else {
+                aud
+            };
+            let err = inject_err(INJECT_BASE, &aud);
+            assert!(err.contains(why), "expected {why:?} in: {err}");
+        }
+        let secret = "  - name: ldap\n    via: secret\n    secret_file: /s\n    credential: basic\n    egress: [\"h.example:443\"]\n";
+        assert!(inject_err(INJECT_BASE, secret).contains("via: delegated"));
     }
 
     #[test]

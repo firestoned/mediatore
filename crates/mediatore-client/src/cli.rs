@@ -72,6 +72,16 @@ pub enum UserCmd {
     Sandbox(SandboxCmd),
     /// Show the session: who is logged in, until when, and whether a delegation is left.
     Session(SessionFile),
+    /// Delete the credential mediatore saved for an audience in the OS credential store (ADR-0041).
+    Logout(LogoutArgs),
+}
+
+/// Arguments of `logout`.
+#[derive(Debug, Args)]
+pub struct LogoutArgs {
+    /// The audience whose saved user name and secret to delete
+    #[arg(long)]
+    pub audience: String,
 }
 
 /// Arguments of `login`.
@@ -231,6 +241,11 @@ fn open_browser(url: &str) {
 pub async fn run(cmd: UserCmd) -> anyhow::Result<()> {
     match cmd {
         UserCmd::Login(args) => login(args).await,
+        UserCmd::Logout(args) => {
+            crate::delegate::forget(&args.audience);
+            eprintln!("no credential saved for {} remains", args.audience);
+            Ok(())
+        }
         UserCmd::Sandbox(SandboxCmd::Create(args)) => create(args).await,
         UserCmd::Sandbox(SandboxCmd::Get { target, name }) => {
             let session = Session::load(&target.session.path()?)?;
@@ -334,7 +349,7 @@ async fn create(args: CreateArgs) -> anyhow::Result<()> {
     let mut delegations = Vec::new();
     for arg in &args.delegate {
         let (audience, source) = crate::delegate::parse_delegate(arg)?;
-        let cred = crate::delegate::read(&source)?;
+        let cred = crate::delegate::read(&audience, &source)?;
         eprintln!(
             "delegating your {audience} credential to the broker for this claim ({})",
             cred.expires_at

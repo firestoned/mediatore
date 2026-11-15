@@ -5,8 +5,11 @@
 //! (ADR-0035 decision 6): `claude-code` reads Claude Code's credential store (the Keychain
 //! item on macOS, the credentials file elsewhere), `env:<NAME>` a token from the
 //! environment (a `claude setup-token` in `CLAUDE_CODE_OAUTH_TOKEN`), `file:<path>` a file
-//! holding the token alone. Nothing read is kept, printed or logged: it is sent once, in
-//! the claim, and forgotten.
+//! holding the token alone. For a `credential: basic` audience (ADR-0041) `prompt` asks for a user
+//! name and a secret (echo off, a terminal only) and `store` reads mediatore's own Keychain item
+//! (macOS), at most six hours old; both give `user:secret`. Nothing read is kept, printed or logged
+//! (the Keychain item is the one thing kept, and only when the person says so): it is sent once, in
+//! the claim.
 
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -28,6 +31,10 @@ pub enum Source {
     Env(String),
     /// A token in this file, trailing whitespace trimmed.
     File(PathBuf),
+    /// A user name and a secret typed at the terminal (ADR-0041 decision 4).
+    Prompt,
+    /// mediatore's own Keychain item for the audience, saved by `prompt` (ADR-0041 decision 5).
+    Store,
 }
 
 impl FromStr for Source {
@@ -37,6 +44,12 @@ impl FromStr for Source {
         if s == "claude-code" {
             return Ok(Self::ClaudeCode);
         }
+        if s == "prompt" {
+            return Ok(Self::Prompt);
+        }
+        if s == "store" {
+            return Ok(Self::Store);
+        }
         if let Some(name) = s.strip_prefix("env:") {
             anyhow::ensure!(!name.is_empty(), "env: needs a variable name");
             return Ok(Self::Env(name.to_owned()));
@@ -45,7 +58,9 @@ impl FromStr for Source {
             anyhow::ensure!(!path.is_empty(), "file: needs a path");
             return Ok(Self::File(PathBuf::from(path)));
         }
-        anyhow::bail!("unknown delegation source {s:?}: claude-code, env:<NAME> or file:<path>")
+        anyhow::bail!(
+            "unknown delegation source {s:?}: claude-code, prompt, store, env:<NAME> or file:<path>"
+        )
     }
 }
 
@@ -100,9 +115,12 @@ impl Credential {
 }
 
 /// Read a source now. A credential the source says has expired is refused here, with the
-/// fix, rather than by the broker later.
-pub fn read(source: &Source) -> anyhow::Result<Credential> {
+/// fix, rather than by the broker later. `audience` names the Keychain item for `store` and the
+/// prompt's question.
+pub fn read(audience: &str, source: &Source) -> anyhow::Result<Credential> {
     let cred = match source {
+        Source::Prompt => prompt_basic(audience)?,
+        Source::Store => store::load(audience)?,
         Source::ClaudeCode => parse_claude_code(&claude_code_store()?)?,
         Source::Env(name) => {
             let token = std::env::var(name)
@@ -267,12 +285,12 @@ mod tests {
         let dir = mediatore_testkit::tempdir();
         let file = dir.join("token");
         std::fs::write(&file, "tok-from-file\n").unwrap();
-        let cred = read(&Source::File(file.clone())).unwrap();
+        let cred = read("a", &Source::File(file.clone())).unwrap();
         assert_eq!(cred.token, "tok-from-file");
         assert!(cred.refresh_token.is_none() && cred.expires_at.is_none());
         std::fs::write(&file, "   \n").unwrap();
         assert!(
-            read(&Source::File(file))
+            read("a", &Source::File(file))
                 .unwrap_err()
                 .to_string()
                 .contains("empty")
@@ -285,11 +303,237 @@ mod tests {
         let err = std::env::var("MEDIATORE_TEST_UNSET_VARIABLE")
             .err()
             .map(|_| {
-                read(&Source::Env("MEDIATORE_TEST_UNSET_VARIABLE".into()))
+                read("a", &Source::Env("MEDIATORE_TEST_UNSET_VARIABLE".into()))
                     .unwrap_err()
                     .to_string()
             })
             .unwrap();
         assert!(err.contains("not set"), "{err}");
+    }
+}
+
+// ----- ADR-0041: a user name and a secret ------------------------------------------------------------------------------
+
+/// How old a Keychain item may be and still be used (ADR-0041 decision 5): a hard ceiling, not a
+/// setting.
+pub const STORE_MAX_AGE_SECS: i64 = 6 * 60 * 60;
+/// The Keychain service mediatore's own items live under.
+pub const STORE_SERVICE: &str = "mediatore";
+
+/// `user:secret`, as a `credential: basic` delegation carries it. The user name ends at the first
+/// colon (RFC 7617), so it has none; neither part is empty and neither holds a control character
+/// (the broker refuses these too; refusing here says so before anything is sent). The error names
+/// the rule, never the value.
+pub fn join_basic(user: &str, secret: &str) -> anyhow::Result<String> {
+    anyhow::ensure!(!user.is_empty(), "the user name is empty");
+    anyhow::ensure!(!secret.is_empty(), "the secret is empty");
+    anyhow::ensure!(
+        !user.contains(':'),
+        "the user name cannot hold a colon (RFC 7617)"
+    );
+    anyhow::ensure!(
+        !user.chars().chain(secret.chars()).any(char::is_control),
+        "the user name and the secret cannot hold a control character"
+    );
+    Ok(format!("{user}:{secret}"))
+}
+
+fn basic(token: String) -> Credential {
+    Credential {
+        token,
+        refresh_token: None,
+        expires_at: None,
+    }
+}
+
+/// What the Keychain item holds: when it was saved and the `user:secret`.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Stored {
+    saved_at: i64,
+    token: String,
+}
+
+/// The `user:secret` of a stored item, or an error when it is older than six hours or unreadable.
+/// `now` is a parameter so the age rule is testable.
+pub fn parse_stored(json: &str, now: DateTime<Utc>) -> anyhow::Result<String> {
+    let s: Stored = serde_json::from_str(json)
+        .map_err(|_| anyhow::anyhow!("the saved credential is not what mediatore wrote"))?;
+    let age = now.timestamp() - s.saved_at;
+    anyhow::ensure!(
+        age <= STORE_MAX_AGE_SECS,
+        "the saved credential is older than six hours; enter it again (--delegate <audience>=prompt)"
+    );
+    anyhow::ensure!(
+        age >= -60,
+        "the saved credential is dated in the future; enter it again"
+    );
+    Ok(s.token)
+}
+
+/// The Keychain item as JSON for `token`, saved now.
+fn stored_json(token: &str, now: DateTime<Utc>) -> anyhow::Result<String> {
+    Ok(serde_json::to_string(&Stored {
+        saved_at: now.timestamp(),
+        token: token.to_owned(),
+    })?)
+}
+
+/// Type a user name and a secret at the terminal: the question on stderr, the secret with echo off,
+/// nothing when stdin is not a terminal (a script uses `env:` or `file:`). On macOS it then offers to
+/// keep them in the Keychain for six hours; the default is no.
+fn prompt_basic(audience: &str) -> anyhow::Result<Credential> {
+    use std::io::{BufRead, IsTerminal, Write};
+    anyhow::ensure!(
+        std::io::stdin().is_terminal(),
+        "no terminal to ask on: use --delegate {audience}=env:<NAME> or file:<path> (user:secret)"
+    );
+    let mut stdin = std::io::stdin().lock();
+    let mut line = String::new();
+    eprint!("{audience} user name: ");
+    std::io::stderr().flush().ok();
+    stdin.read_line(&mut line)?;
+    let user = line.trim_end_matches(['\r', '\n']).to_owned();
+    eprint!("{audience} password or token (not shown): ");
+    std::io::stderr().flush().ok();
+    let secret = {
+        let _echo = EchoOff::new();
+        let mut secret = String::new();
+        stdin.read_line(&mut secret)?;
+        eprintln!();
+        secret.trim_end_matches(['\r', '\n']).to_owned()
+    };
+    let token = join_basic(&user, &secret)?;
+    if cfg!(target_os = "macos") {
+        eprint!("Keep it in the macOS Keychain for 6 hours? [y/N] ");
+        std::io::stderr().flush().ok();
+        let mut yn = String::new();
+        stdin.read_line(&mut yn)?;
+        if matches!(yn.trim(), "y" | "Y" | "yes") {
+            store::save(audience, &token)?;
+            eprintln!("saved; `mediatore logout --audience {audience}` removes it");
+        }
+    }
+    Ok(basic(token))
+}
+
+/// Switches the terminal's echo off with `stty` and back on when dropped (no `unsafe`, no new crate).
+struct EchoOff(bool);
+
+impl EchoOff {
+    fn new() -> Self {
+        let ok = std::process::Command::new("stty")
+            .arg("-echo")
+            .stdin(std::process::Stdio::inherit())
+            .status()
+            .is_ok_and(|s| s.success());
+        Self(ok)
+    }
+}
+
+impl Drop for EchoOff {
+    fn drop(&mut self) {
+        if self.0 {
+            let _ = std::process::Command::new("stty")
+                .arg("echo")
+                .stdin(std::process::Stdio::inherit())
+                .status();
+        }
+    }
+}
+
+/// Delete mediatore's saved credential for `audience` (`mediatore logout --audience`). Idempotent.
+pub fn forget(audience: &str) {
+    store::delete(audience);
+}
+
+#[cfg(target_os = "macos")]
+mod store {
+    use super::{STORE_SERVICE, Utc, parse_stored, stored_json};
+    use security_framework::passwords::{
+        delete_generic_password, get_generic_password, set_generic_password,
+    };
+
+    pub fn load(audience: &str) -> anyhow::Result<super::Credential> {
+        let raw = get_generic_password(STORE_SERVICE, audience).map_err(|_| {
+            anyhow::anyhow!(
+                "no saved credential for {audience}: enter it with --delegate {audience}=prompt"
+            )
+        })?;
+        let json = String::from_utf8(raw)
+            .map_err(|_| anyhow::anyhow!("the saved credential is not what mediatore wrote"))?;
+        match parse_stored(&json, Utc::now()) {
+            Ok(token) => Ok(super::basic(token)),
+            Err(e) => {
+                let _ = delete_generic_password(STORE_SERVICE, audience);
+                Err(e)
+            }
+        }
+    }
+
+    pub fn save(audience: &str, token: &str) -> anyhow::Result<()> {
+        let json = stored_json(token, Utc::now())?;
+        set_generic_password(STORE_SERVICE, audience, json.as_bytes())
+            .map_err(|e| anyhow::anyhow!("saving to the Keychain: {e}"))
+    }
+
+    pub fn delete(audience: &str) {
+        // Not there is not an error: logout is idempotent.
+        let _ = delete_generic_password(STORE_SERVICE, audience);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+mod store {
+    pub fn load(_audience: &str) -> anyhow::Result<super::Credential> {
+        anyhow::bail!(
+            "no credential store on this platform yet (macOS only): use --delegate <audience>=prompt, env:<NAME> or file:<path>"
+        )
+    }
+
+    pub fn save(_audience: &str, _token: &str) -> anyhow::Result<()> {
+        anyhow::bail!("no credential store on this platform yet (macOS only)")
+    }
+
+    pub fn delete(_audience: &str) {}
+
+    #[test]
+    fn prompt_and_store_are_sources_and_a_basic_token_joins_a_user_and_a_secret() {
+        assert_eq!("prompt".parse::<Source>().unwrap(), Source::Prompt);
+        assert_eq!("store".parse::<Source>().unwrap(), Source::Store);
+        let (aud, src) = parse_delegate("rbcgithub=prompt").unwrap();
+        assert_eq!((aud.as_str(), src), ("rbcgithub", Source::Prompt));
+        assert_eq!(join_basic("alice", "p:w").unwrap(), "alice:p:w");
+        for (u, p, why) in [
+            ("", "x", "user name is empty"),
+            ("a", "", "secret is empty"),
+            ("a:b", "x", "colon"),
+            ("a", "x\ny", "control"),
+            ("a\r", "x", "control"),
+        ] {
+            let e = join_basic(u, p).unwrap_err().to_string();
+            assert!(e.contains(why), "{u:?}/{p:?}: {e}");
+            assert!(!e.contains("x\ny"), "the message must not echo the value");
+        }
+    }
+
+    #[test]
+    fn a_saved_credential_older_than_six_hours_is_refused_and_a_fresh_one_is_read() {
+        let now = Utc::now();
+        let fresh = stored_json("alice:s3cret", now - chrono::Duration::hours(5)).unwrap();
+        assert_eq!(parse_stored(&fresh, now).unwrap(), "alice:s3cret");
+        let old = stored_json("alice:s3cret", now - chrono::Duration::hours(7)).unwrap();
+        let e = parse_stored(&old, now).unwrap_err().to_string();
+        assert!(e.contains("six hours") && !e.contains("s3cret"), "{e}");
+        let future = stored_json("alice:s3cret", now + chrono::Duration::hours(2)).unwrap();
+        assert!(parse_stored(&future, now).is_err());
+        assert!(parse_stored("not json", now).is_err());
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn without_a_credential_store_the_store_source_says_so_and_logout_is_a_noop() {
+        let e = read("a", &Source::Store).unwrap_err().to_string();
+        assert!(e.contains("no credential store"), "{e}");
+        forget("a");
     }
 }
