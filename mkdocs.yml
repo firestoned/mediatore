@@ -189,5 +189,7 @@ nav:
       - "ADR-0034: The Kubernetes API as the broker's store": adr/0034-the-kubernetes-api-as-the-brokers-store.md
       - "ADR-0035: A requester's own session, delegated at claim time": adr/0035-a-requesters-own-session-delegated-at-claim-time.md
       - "ADR-0036: /proc inside the jail, the workload's own processes only": adr/0036-proc-inside-the-jail-the-workloads-own-processes-only.md
+      - "ADR-0037: The pool fetches its SPIRE bundle at boot, through the relay": adr/0037-the-pool-fetches-its-spire-bundle-at-boot-through-the-relay.md
+      - "ADR-0038: The pull reaches the operator's registry through a fourth relay leg, for root only": adr/0038-the-pull-reaches-the-operators-registry-through-a-fourth-relay-leg.md
   - Security:
       - Threat model: security/threat-model.md

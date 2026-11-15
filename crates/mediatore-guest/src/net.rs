@@ -614,6 +614,44 @@ table inet mediatore_sandbox {
     }
 
     #[tokio::test]
+    async fn the_registry_leg_on_a_gateways_address_is_never_in_the_sandbox_ruleset() {
+        // ADR-0038 decision 4: the leg is on the same gateway address the jail is admitted to
+        // (the relay's broker port, the data port), but a rule is an address and a port, and
+        // the registry's port is on no list the jail's table is built from.
+        let dir = mediatore_testkit::tempdir();
+        let resolv = dir.join("resolv.conf");
+        std::fs::write(&resolv, "").unwrap();
+        let rs = Ruleset::resolve(
+            4242,
+            "https://198.51.100.1:3130",
+            &[],
+            &[ep("198.51.100.1:8443"), ep("198.51.100.2:8443")],
+            &resolv,
+            3128,
+        )
+        .await
+        .unwrap();
+        let text = rs.render();
+        assert!(
+            text.contains("198.51.100.1 . 3130"),
+            "the broker's relay port is admitted"
+        );
+        for leg in ["3132", "3131", "3129"] {
+            assert!(
+                !text.contains(&format!(" . {leg}")),
+                "no relay leg but the broker's is in the jail's table ({leg}): {text}"
+            );
+        }
+        assert!(
+            rs.allow
+                .iter()
+                .all(|(_, port)| [3130_u16, 3128, 8443].contains(port)),
+            "{:?}",
+            rs.allow
+        );
+    }
+
+    #[tokio::test]
     async fn without_gateways_address_literals_need_no_dns_and_a_name_that_does_not_resolve_is_omitted()
      {
         let dir = mediatore_testkit::tempdir();

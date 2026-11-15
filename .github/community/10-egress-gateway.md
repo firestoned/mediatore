@@ -81,3 +81,27 @@ booted from the published image, a pool VM behind them reaching the SPIRE server
 broker through the relay and its destinations through the data plane, and ADR-0027's open
 items (the agent's failover between gateways, the cap's value, the bundle's age limit)
 measured there.
+
+Added 2026-11-14 ([ADR-0037](../../docs/adr/0037-the-pool-fetches-its-spire-bundle-at-boot-through-the-relay.md)):
+
+- [x] The relay's third leg (the SPIRE bundle endpoint on `RELAY_BUNDLE_PORT`, 3131) and the
+      host table's port; the pool's boot-time fetch (`image/spire-bundle-fetch`,
+      `spire-bundle-fetch.service`) and the host table's element for it, pinned by
+      `make bundle-fetch-test`, `make host-table-test`, `make gateway-render-check`
+      (2026-11-14)
+
+Left to a live environment, with roadmap 06's libvirt proof: a gateway and a pool member
+booted from images that carry the leg and the fetch, the relay's `upstream=bundle` line and
+the member's `journalctl -u spire-bundle-fetch` recorded.
+
+Added 2026-11-15 ([ADR-0038](../../docs/adr/0038-the-pull-reaches-the-operators-registry-through-a-fourth-relay-leg.md)):
+
+- [x] The relay's fourth leg (the operator's registry on `RELAY_REGISTRY_PORT`, 3132, to
+      `REGISTRY_ADDRESS:REGISTRY_PORT`) and the host table's port; `registries[].reach: relay`;
+      the guest's mapping of a declared registry name to the gateway (`MEDIATORE_RELAY_REGISTRIES`),
+      with manual redirects refused off the declared hosts; the host table's `registry4` set
+      admitted to uid 0 alone; the jail's ruleset pinned not to list a leg, pinned by
+      `make host-table-test`, `make gateway-render-check` and the guest's unit tests (2026-11-15)
+
+Left to a live environment: a gateway and a pool member pulling an image through the leg, the
+relay's `upstream=registry` line and the sandbox uid's refused connection to the leg recorded.

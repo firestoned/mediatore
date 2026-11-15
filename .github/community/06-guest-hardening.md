@@ -47,6 +47,11 @@
       `mediatore-host-nft.service`: input and forward dropped, output to the gateways' two
       planes and the registries alone, names refused; `make host-table-test`, `nft -c` on
       the build host, `image/check.sh`). A pool without gateways loads none (decision 4)
+- [x] The pull through the relay where no registry can sit on the segment. Done 2026-11-15 as
+      [ADR-0038](../../docs/adr/0038-the-pull-reaches-the-operators-registry-through-a-fourth-relay-leg.md):
+      `MEDIATORE_RELAY_REGISTRIES` maps a declared registry name to the gateway's registry leg
+      (`crates/mediatore-guest/src/image.rs`), redirects refused off the declared names, and the host
+      table admits the leg to uid 0 alone (`image/host-table`); the jail's table never lists it
 - [x] The ruleset hashes and the image digest reported to the broker so a flush is
       detected and the record says which bytes ran. Done 2026-11-04 as ADR-0029 decision 5:
       `POST /v1/me/report` over the node SVID once the tables are loaded and before the

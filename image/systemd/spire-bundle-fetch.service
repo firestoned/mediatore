@@ -1,0 +1,31 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+
+[Unit]
+Description=Fetch the SPIRE trust bundle through the gateway's bundle leg (ADR-0037)
+# After the host table, which admits this one destination (the gateway's bundle port) and
+# nothing else, and before the agent, which requires this unit: an agent must never start on
+# a bundle that was meant to be fetched and was not. With SPIRE_BUNDLE_HOST unset the script
+# does nothing and succeeds (the pool carries its bundle as a file).
+After=network-online.target mediatore-host-nft.service
+Wants=network-online.target
+Before=spire-agent.service
+# Only the system booted from the installed disk, as spire-agent.service (banlieue ADR-0043).
+ConditionPathExists=|/run/cos/active_mode
+ConditionPathExists=|/run/cos/passive_mode
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=-/etc/mediatore-guest/env
+ExecStart=/usr/libexec/mediatore/spire-bundle-fetch
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/run/spire
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

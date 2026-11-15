@@ -1,0 +1,64 @@
+#!/bin/sh
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+#
+# The pool VM's first-contact trust anchor, fetched at every boot (ADR-0037): the SPIRE
+# servers' bundle endpoint (https_web profile, a certificate from a web PKI) through the egress
+# gateway's control relay, the bundle leg. The segment has no route and no resolver, so curl is
+# told the endpoint's own hostname, which the certificate must name and which is the pin, and
+# the gateway's sandbox address to reach it at (--resolve); the relay carries the TLS end to end
+# and sees ciphertext. The reply is the SPIFFE-format bundle, written atomically for the
+# agent's `trust_bundle_path` with `trust_bundle_format = "spiffe"`. A reply that is not one
+# (a proxy's error page, an empty body) is refused and the previous file stays. Run by
+# spire-bundle-fetch.service before spire-agent.service, which requires it.
+#
+# The guest's env (/etc/mediatore-guest/env), all by address or name as the segment sees them:
+#   SPIRE_BUNDLE_HOST     the bundle endpoint's hostname, as its certificate names it
+#   SPIRE_BUNDLE_PORT     the relay's bundle port on the gateway (RELAY_BUNDLE_PORT, 3131)
+#   SPIRE_BUNDLE_GATEWAY  a gateway's sandbox address (IPv4)
+#   SPIRE_BUNDLE_CA       optional: a PEM of the CAs the endpoint's certificate chains to; the
+#                         system trust store when unset
+# With SPIRE_BUNDLE_HOST unset this does nothing: the pool carries its bundle as a file.
+# SPIRE_BUNDLE_OUT (default /run/spire/bundle.json) and CURL are for tests and odd layouts.
+set -eu
+
+die() { echo "spire-bundle-fetch: $*" >&2; exit 1; }
+
+host=${SPIRE_BUNDLE_HOST:-}
+if [ -z "$host" ]; then
+  echo "spire-bundle-fetch: SPIRE_BUNDLE_HOST is not set, not fetching (the bundle is a file in the layer)"
+  exit 0
+fi
+port=${SPIRE_BUNDLE_PORT:-}
+gw=${SPIRE_BUNDLE_GATEWAY:-}
+ca=${SPIRE_BUNDLE_CA:-}
+out=${SPIRE_BUNDLE_OUT:-/run/spire/bundle.json}
+curl=${CURL:-curl}
+
+printf '%s' "$host" | grep -Eq '^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$' \
+  || die "SPIRE_BUNDLE_HOST $host is not a bare hostname (no scheme, port or path)"
+printf '%s' "$port" | grep -Eq '^[1-9][0-9]{0,4}$' || die "SPIRE_BUNDLE_PORT is required and must be a port"
+printf '%s' "$gw" | grep -Eq '^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$' \
+  || die "SPIRE_BUNDLE_GATEWAY $gw is not an IPv4 address (the segment has no resolver)"
+[ -z "$ca" ] || [ -f "$ca" ] || die "SPIRE_BUNDLE_CA $ca: no such file"
+
+dir=$(dirname "$out")
+[ -d "$dir" ] || install -d -m 0755 "$dir"
+tmp="$out.tmp.$$"
+trap 'rm -f "$tmp"' EXIT
+
+if [ -n "$ca" ]; then
+  "$curl" --fail --silent --show-error --proto =https --tlsv1.2 --connect-timeout 5 --max-time 20 \
+    --retry 10 --retry-delay 3 --retry-all-errors --resolve "$host:$port:$gw" --cacert "$ca" \
+    --output "$tmp" "https://$host:$port/" || die "fetching the bundle from https://$host:$port/ through $gw failed"
+else
+  "$curl" --fail --silent --show-error --proto =https --tlsv1.2 --connect-timeout 5 --max-time 20 \
+    --retry 10 --retry-delay 3 --retry-all-errors --resolve "$host:$port:$gw" \
+    --output "$tmp" "https://$host:$port/" || die "fetching the bundle from https://$host:$port/ through $gw failed"
+fi
+
+grep -q '"keys"' "$tmp" && grep -q '"x509-svid"' "$tmp" \
+  || die "the reply from https://$host:$port/ is not a SPIFFE bundle (no x509-svid key); keeping the previous file"
+chmod 0644 "$tmp"
+mv "$tmp" "$out"
+echo "spire-bundle-fetch: wrote $out from https://$host:$port/ through $gw"

@@ -2231,7 +2231,7 @@ dependencies = [
  "chrono",
  "mediatore-store",
  "sandboxpolicy-bundle",
- "sandboxpolicy-types 0.3.4 (git+https://github.com/firestoned/notaio?tag=v0.3.5)",
+ "sandboxpolicy-types",
  "serde",
  "thiserror",
  "tokio",
@@ -3176,7 +3176,7 @@ dependencies = [
  "base64 0.23.1",
  "chrono",
  "ed25519-dalek",
- "sandboxpolicy-types 0.3.4 (git+https://github.com/firestoned/notaio?tag=v0.3.4)",
+ "sandboxpolicy-types",
  "serde",
  "serde_json",
  "sha2",
@@ -3187,16 +3187,6 @@ dependencies = [
 name = "sandboxpolicy-types"
 version = "0.3.4"
 source = "git+https://github.com/firestoned/notaio?tag=v0.3.4#2f6081703c268ce291df5b856478ded83fd1fa4e"
-dependencies = [
- "chrono",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "sandboxpolicy-types"
-version = "0.3.4"
-source = "git+https://github.com/firestoned/notaio?tag=v0.3.5#987cc4af22af3d2d13803d3565d598ca61fdf172"
 dependencies = [
  "chrono",
  "serde",

@@ -42,6 +42,8 @@ check "no admin block in either bootstrap (ADR-0028 decision 8)" \
   '! grep -q "^admin:" /usr/share/mediatore-gateway/envoy/gateway.yaml.in /usr/share/mediatore-gateway/envoy/relay.yaml.in'
 check "the relay has no SDS and no TLS context (ADR-0027 decision 1: no credential)" \
   '! grep -qiE "sds_config|tls_context|transport_socket" /usr/share/mediatore-gateway/envoy/relay.yaml.in'
+check "the relay has four fixed legs: SPIRE, broker, the SPIRE bundle endpoint (ADR-0037) and the registry (ADR-0038), rendered with their ports and the host table admitting all four" \
+  'cd /usr/share/mediatore-gateway && mkdir -p /tmp/r && /usr/libexec/mediatore-gateway/render envoy/relay.yaml.in /tmp/r/relay3.yaml env.example vm.env.example && test "$(grep -c "stat_prefix: relay_" /tmp/r/relay3.yaml)" = 4 && grep -q "upstream=bundle" /tmp/r/relay3.yaml && grep -q "name: spire_bundle" /tmp/r/relay3.yaml && grep -q "upstream=registry" /tmp/r/relay3.yaml && grep -q "name: registry" /tmp/r/relay3.yaml && /usr/libexec/mediatore-gateway/render nftables.conf.in - env.example vm.env.example | grep -q "elements = { 3129, 3130, 3131 }"'
 check "the three service users, none in the TPM group, the agent in it" \
   'for u in envoy envoy-relay mediatore-gateway; do id "$u" >/dev/null && ! id -nG "$u" | tr " " "\n" | grep -qx tss || exit 1; done && id -nG spire | tr " " "\n" | grep -qx tss'
 check "the six units installed and enabled" \

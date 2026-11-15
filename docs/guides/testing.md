@@ -247,6 +247,21 @@ make host-table-test
 ./image/host-table --render gateways registries env agent.conf | sudo /usr/sbin/nft -c -f -
 ```
 
+The boot-time bundle fetch ([ADR-0037](../adr/0037-the-pool-fetches-its-spire-bundle-at-boot-through-the-relay.md),
+`image/spire-bundle-fetch`) is pinned the same way by `make bundle-fetch-test`, with a stub for
+curl: the exact request to the gateway's bundle leg, the atomic write, a gateway given by name,
+a missing CA and a reply that is not a SPIFFE bundle refused. The live proof is a pool member's
+boot: `journalctl -u spire-bundle-fetch` shows the write, the relay's access log the
+`upstream=bundle` line.
+
+The registry leg ([ADR-0038](../adr/0038-the-pull-reaches-the-operators-registry-through-a-fourth-relay-leg.md))
+is pinned in three places: `make host-table-test` (the `registry4` set, the `meta skuid 0` rule, its order, no
+leak into the every-uid set, the refusals), `make gateway-render-check` (the fourth listener and port) and the
+guest's unit tests (the name mapping, the manual redirects, the refusal off the declared hosts, the token not
+following a redirect, the jail's ruleset never listing a leg: `crates/mediatore-guest/src/image.rs` and `net.rs`).
+The live proof is a pool member pulling an image through the leg: the relay's `upstream=registry` line, the
+guest's `workload image pulled` line with the digest, and a connection to the leg from the sandbox uid refused.
+
 The kind tiers run the guest with `--dev-skip-setup` and load no ruleset; the live proof is
 a libvirt member (roadmap 06).
 

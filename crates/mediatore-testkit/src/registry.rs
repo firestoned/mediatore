@@ -421,6 +421,12 @@ struct Inner {
     basic_on_content: AtomicUsize,
     requests: AtomicUsize,
     host: Mutex<String>,
+    /// The `Host` header of every request, in order (a relay mapping keeps the registry's own name).
+    hosts_seen: Mutex<Vec<String>>,
+    /// Requests that carried `Authorization: Bearer`.
+    bearer_seen: AtomicUsize,
+    /// When set, a blob request is answered with a redirect to `<this>/v2/<name>/blobs/<digest>`.
+    redirect_blobs: Mutex<Option<String>>,
 }
 
 /// The registry, serving on a loopback listener until dropped.
@@ -592,6 +598,30 @@ impl FakeRegistry {
         self.inner.requests.load(Ordering::SeqCst)
     }
 
+    /// How many requests carried a bearer token (a token must not follow a redirect to another host).
+    #[must_use]
+    pub fn bearer_seen(&self) -> usize {
+        self.inner.bearer_seen.load(Ordering::SeqCst)
+    }
+
+    /// The `Host` header of every request so far, in order.
+    ///
+    /// # Panics
+    /// When the registry's state lock is poisoned.
+    #[must_use]
+    pub fn hosts_seen(&self) -> Vec<String> {
+        self.inner.hosts_seen.lock().unwrap().clone()
+    }
+
+    /// Answer every blob request with a redirect to `base` (`http://host:port`), the way a
+    /// registry hands a layer to a content host.
+    ///
+    /// # Panics
+    /// When the registry's state lock is poisoned.
+    pub fn redirect_blobs_to(&self, base: &str) {
+        *self.inner.redirect_blobs.lock().unwrap() = Some(base.to_string());
+    }
+
     /// Serve the blob at `digest` with its first byte flipped.
     ///
     /// # Panics
@@ -645,8 +675,22 @@ fn unauthorized(inner: &Inner, name: &str) -> Response {
         .into_response()
 }
 
+fn note_host(inner: &Inner, headers: &HeaderMap) {
+    if let Some(h) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) {
+        inner.hosts_seen.lock().unwrap().push(h.to_string());
+    }
+    if headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("Bearer "))
+    {
+        inner.bearer_seen.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
 fn authorized(inner: &Inner, headers: &HeaderMap) -> bool {
     inner.requests.fetch_add(1, Ordering::SeqCst);
+    note_host(inner, headers);
     if headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -679,6 +723,7 @@ async fn token(
     headers: HeaderMap,
 ) -> Response {
     inner.requests.fetch_add(1, Ordering::SeqCst);
+    note_host(&inner, &headers);
     inner.token_requests.fetch_add(1, Ordering::SeqCst);
     if inner.credential.lock().unwrap().is_some() && !basic_matches(&inner, &headers) {
         return (
@@ -736,6 +781,13 @@ async fn v2(
             return unauthorized(&inner, name);
         }
         inner.blob_requests.fetch_add(1, Ordering::SeqCst);
+        if let Some(base) = inner.redirect_blobs.lock().unwrap().clone() {
+            return (
+                StatusCode::TEMPORARY_REDIRECT,
+                [(header::LOCATION, format!("{base}/v2/{name}/blobs/{digest}"))],
+            )
+                .into_response();
+        }
         let found = inner.blobs.lock().unwrap().get(digest).cloned();
         return match found {
             Some(mut bytes) => {
