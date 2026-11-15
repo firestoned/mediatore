@@ -93,6 +93,102 @@ pub fn https_client_config_with_extra_roots(
     )
 }
 
+/// The lowest TLS version the guest's egress proxy offers an upstream: a host a policy
+/// bundle lists, a system we do not operate. TLS 1.3 unless the operator opts in to 1.2
+/// (`MEDIATORE_EGRESS_MIN_TLS=1.2`), for an upstream that has no 1.3, such as an older
+/// GitHub Enterprise Server. With 1.2 allowed the proxy still offers 1.3 first, so any
+/// upstream that has it gets it; only an upstream that refuses 1.3 falls back.
+///
+/// It reaches nothing else: the broker, the identity provider, the registry pull and the
+/// sandbox leg stay TLS 1.3 only whatever this is set to.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum UpstreamTls {
+    /// TLS 1.3 only (the default).
+    #[default]
+    Tls13,
+    /// TLS 1.3 preferred, TLS 1.2 accepted.
+    Tls12,
+}
+
+impl UpstreamTls {
+    fn versions(self) -> &'static [&'static rustls::SupportedProtocolVersion] {
+        static TLS13_ONLY: [&rustls::SupportedProtocolVersion; 1] = [&rustls::version::TLS13];
+        static TLS13_THEN_12: [&rustls::SupportedProtocolVersion; 2] =
+            [&rustls::version::TLS13, &rustls::version::TLS12];
+        match self {
+            Self::Tls13 => &TLS13_ONLY,
+            Self::Tls12 => &TLS13_THEN_12,
+        }
+    }
+
+    /// The setting as it is written in the environment: `1.3` or `1.2`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Tls13 => "1.3",
+            Self::Tls12 => "1.2",
+        }
+    }
+}
+
+impl std::fmt::Display for UpstreamTls {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for UpstreamTls {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim() {
+            "1.3" => Ok(Self::Tls13),
+            "1.2" => Ok(Self::Tls12),
+            other => Err(format!(
+                "{other:?} is not a TLS version setting: write 1.3 or 1.2"
+            )),
+        }
+    }
+}
+
+/// The egress proxy's client config for an upstream that carries no CA of its own (a policy
+/// bundle's direct egress): the Mozilla roots, plus the CA certificates in `extra_roots_pem`
+/// when given (an operator's private PKI, `MEDIATORE_EGRESS_CA`), at the TLS versions `min`
+/// allows. With no extra roots and [`UpstreamTls::Tls13`] it is [`https_client_config`].
+///
+/// # Errors
+/// `extra_roots_pem` is given and holds no certificate: the proxy must not start with a CA
+/// setting that did nothing.
+pub fn egress_upstream_config(
+    extra_roots_pem: Option<&[u8]>,
+    min: UpstreamTls,
+) -> Result<rustls::ClientConfig, std::io::Error> {
+    use rustls::pki_types::CertificateDer;
+    use rustls::pki_types::pem::PemObject as _;
+
+    ensure_provider();
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    if let Some(pem) = extra_roots_pem {
+        let mut added = 0;
+        for cert in CertificateDer::pem_slice_iter(pem) {
+            let cert = cert.map_err(|e| std::io::Error::other(format!("egress CA: {e}")))?;
+            roots
+                .add(cert)
+                .map_err(|e| std::io::Error::other(format!("egress CA: {e}")))?;
+            added += 1;
+        }
+        if added == 0 {
+            return Err(std::io::Error::other("egress CA holds no certificate"));
+        }
+    }
+    Ok(
+        rustls::ClientConfig::builder_with_protocol_versions(min.versions())
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,6 +239,37 @@ mod tests {
             Some(rustls::NamedGroup::X25519MLKEM768),
             "expected X25519MLKEM768 to be preferred"
         );
+    }
+
+    #[test]
+    fn the_upstream_setting_defaults_to_tls13() {
+        assert_eq!(UpstreamTls::default(), UpstreamTls::Tls13);
+        assert!(egress_upstream_config(None, UpstreamTls::Tls13).is_ok());
+        assert!(egress_upstream_config(None, UpstreamTls::Tls12).is_ok());
+    }
+
+    #[test]
+    fn the_upstream_setting_parses_1_3_and_1_2_and_refuses_anything_else() {
+        assert_eq!("1.3".parse::<UpstreamTls>(), Ok(UpstreamTls::Tls13));
+        assert_eq!(" 1.2 ".parse::<UpstreamTls>(), Ok(UpstreamTls::Tls12));
+        for bad in ["", "1.1", "1.0", "tls1.2", "3", "TLS12"] {
+            assert!(bad.parse::<UpstreamTls>().is_err(), "{bad:?}");
+        }
+        assert_eq!(UpstreamTls::Tls12.to_string(), "1.2");
+    }
+
+    #[test]
+    fn upstream_extra_roots_must_hold_a_certificate_and_keep_the_public_roots() {
+        let err = egress_upstream_config(Some(b""), UpstreamTls::Tls13).unwrap_err();
+        assert!(err.to_string().contains("no certificate"), "{err}");
+        assert!(
+            egress_upstream_config(
+                Some(b"-----BEGIN CERTIFICATE-----\nnope\n-----END CERTIFICATE-----\n"),
+                UpstreamTls::Tls13
+            )
+            .is_err()
+        );
+        assert!(egress_upstream_config(Some(&ca_pem()), UpstreamTls::Tls12).is_ok());
     }
 
     #[test]

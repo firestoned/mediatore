@@ -82,6 +82,21 @@ pub struct GuestArgs {
     /// registry mirror on the segment, on the operator's PKI (ADR-0029 decision 1)
     #[arg(long, env = "MEDIATORE_REGISTRY_CA", value_name = "PEM")]
     pub registry_ca: Option<PathBuf>,
+    /// A PEM of CA certificates the egress proxy trusts beside the Mozilla roots for the hosts a
+    /// policy bundle lists (direct egress): the operator's private PKI, such as the RBC bundle
+    /// the image already carries. Without it only publicly trusted hosts verify
+    #[arg(long, env = "MEDIATORE_EGRESS_CA", value_name = "PEM")]
+    pub egress_ca: Option<PathBuf>,
+    /// The lowest TLS version the egress proxy offers those hosts: `1.3` (the default) or
+    /// `1.2`, which still offers 1.3 first and falls back only for a host that has no 1.3.
+    /// It reaches nothing else: the broker, the registry pull and the identity provider
+    /// stay TLS 1.3 only
+    #[arg(
+        long,
+        env = "MEDIATORE_EGRESS_MIN_TLS",
+        default_value_t = mediatore_proto::tls::UpstreamTls::Tls13
+    )]
+    pub egress_min_tls: mediatore_proto::tls::UpstreamTls,
     /// The mediatore binary to mount read-only into the jail and to start the egress proxy
     /// from: the path the node entry pins, never the path this process happens to run from
     #[arg(long, default_value = mediatore_proto::AGENT_BINARY_PATH)]
@@ -421,7 +436,18 @@ async fn serve_claim(
         &args.mediatore_url,
         &args.workload_api_socket.to_string_lossy(),
         &files,
+        &egress::UpstreamArgs {
+            ca: args.egress_ca.clone(),
+            min_tls: args.egress_min_tls,
+        },
     );
+    if args.egress_min_tls != mediatore_proto::tls::UpstreamTls::Tls13 {
+        tracing::warn!(
+            min_tls = %args.egress_min_tls,
+            "the egress proxy accepts TLS {} from the hosts a policy lists: a weaker upstream than the default 1.3",
+            args.egress_min_tls
+        );
+    }
     let spec = jail::JailSpec {
         user: username.to_string(),
         rootfs: layout.rootfs,

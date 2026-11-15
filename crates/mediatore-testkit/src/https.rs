@@ -40,6 +40,18 @@ impl TlsUpstream {
     /// # Panics
     /// On key generation, signing, or a bind failure: a broken test environment.
     pub async fn start(router: axum::Router) -> Self {
+        Self::start_with_versions(router, &[&rustls::version::TLS13]).await
+    }
+
+    /// As [`Self::start`], serving only the TLS `versions` given: `&[&rustls::version::TLS12]`
+    /// is an upstream with no TLS 1.3, such as an older GitHub Enterprise Server.
+    ///
+    /// # Panics
+    /// As [`Self::start`].
+    pub async fn start_with_versions(
+        router: axum::Router,
+        versions: &[&'static rustls::SupportedProtocolVersion],
+    ) -> Self {
         mediatore_proto::tls::ensure_provider();
         let ca_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("ca key");
         let mut ca = CertificateParams::default();
@@ -69,14 +81,13 @@ impl TlsUpstream {
         leaf.not_after = now + Duration::hours(1);
         let leaf_cert = leaf.signed_by(&key, &issuer).expect("leaf cert");
 
-        let mut config =
-            rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
-                .with_no_client_auth()
-                .with_single_cert(
-                    vec![leaf_cert.der().clone()],
-                    PrivateKeyDer::Pkcs8(key.serialize_der().into()),
-                )
-                .expect("server config");
+        let mut config = rustls::ServerConfig::builder_with_protocol_versions(versions)
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![leaf_cert.der().clone()],
+                PrivateKeyDer::Pkcs8(key.serialize_der().into()),
+            )
+            .expect("server config");
         config.alpn_protocols = vec![b"http/1.1".to_vec()];
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
 
