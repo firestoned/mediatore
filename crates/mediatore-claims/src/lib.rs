@@ -25,6 +25,7 @@ pub mod crd_formats;
 pub(crate) mod fakes;
 pub mod kubestore;
 pub mod lease;
+pub mod nodegc;
 pub mod policy;
 pub mod sandbox;
 pub mod shadow;

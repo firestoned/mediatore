@@ -342,6 +342,11 @@ pub struct StoreSection {
     /// logging the audit line (default 3600; ADR-0034 decision 4).
     #[serde(default = "default_retention_secs")]
     pub retention_secs: u64,
+    /// Seconds a registered node is protected from collection (default 600; ADR-0039). The
+    /// broker removes a `SandboxNode` once no banlieue VM publishes its EK hash, but never
+    /// one younger than this: a registration may precede its VM's published certificate.
+    #[serde(default = "default_node_grace_secs")]
+    pub node_grace_secs: u64,
     /// The local sealer's key. Unset means refresh material cannot be persisted, which
     /// fails the claim that needs it rather than storing plaintext.
     #[serde(default)]
@@ -352,10 +357,15 @@ fn default_retention_secs() -> u64 {
     3600
 }
 
+fn default_node_grace_secs() -> u64 {
+    600
+}
+
 impl Default for StoreSection {
     fn default() -> Self {
         Self {
             retention_secs: default_retention_secs(),
+            node_grace_secs: default_node_grace_secs(),
             sealing: None,
         }
     }
@@ -645,6 +655,11 @@ impl Config {
         // next resync, which is how the kind tiers run.
         cfg.check_policy()?;
         cfg.check_gateways()?;
+        if cfg.store.node_grace_secs == 0 {
+            anyhow::bail!(
+                "store.node_grace_secs must be positive: a node registered before its VM's certificate is published would be collected at once (ADR-0039)"
+            );
+        }
         if cfg.token.rate_per_minute == 0 {
             anyhow::bail!("token.rate_per_minute must be positive");
         }
@@ -1178,6 +1193,21 @@ listen: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }
         let cfg = Config::parse(&format!("{BASE}dev_mode: true\n")).unwrap();
         assert_eq!(cfg.store.retention_secs, 3600);
         assert!(cfg.store.sealing.is_none());
+        // ADR-0039: a node is collected only ten minutes after its registration, by default.
+        assert_eq!(cfg.store.node_grace_secs, 600);
+        let cfg = Config::parse(&format!(
+            "{BASE}{SPIRE}store: {{ node_grace_secs: 1800 }}\n"
+        ))
+        .unwrap();
+        assert_eq!(cfg.store.node_grace_secs, 1800);
+        // Zero would collect a registration before its VM's certificate is published.
+        let err = Config::parse(&format!("{BASE}{SPIRE}store: {{ node_grace_secs: 0 }}\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("node_grace_secs") && err.contains("ADR-0039"),
+            "{err}"
+        );
         let cfg =
             Config::parse(&format!("{BASE}{SPIRE}store: {{ retention_secs: 120 }}\n")).unwrap();
         assert_eq!(cfg.store.retention_secs, 120);

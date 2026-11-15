@@ -64,3 +64,13 @@ datastore.
       v0.2.0 image, `sandbox-57d995da` run once and released by its exit; the sandbox
       Service's `externalTrafficPolicy: Local` the one lesson, PR #99; `docs/guides/testing.md`
       runs 6 and 7)
+
+## ADR-0039: a node leaves the register when its VM is gone (2026-11-15)
+
+- [x] Finding F-36: `SandboxNode` objects were never deleted (25 records for 3 VMs after five
+      hours of pool churn); ADR-0039 accepted; CALM (`rel-watcher-node-gc`); `delete_node` in
+      the store contract and both backends; `nodegc::nodes_to_delete` and
+      `Watcher::collect_nodes` on the resync ticker; `store.node_grace_secs`; threat model full
+      pass (TB-9, A-11, R-26).
+- [ ] The live proof: a recycled pool with `kubectl get sandboxnodes` settling at the pool's
+      size, after a release that carries it (no RBAC change: the role already has `delete`).

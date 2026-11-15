@@ -283,6 +283,7 @@ async fn claim_watcher(
         WatcherConfig {
             resync: std::time::Duration::from_secs(cfg.watcher.resync_secs),
             resolve_timeout: std::time::Duration::from_secs(cfg.watcher.resolve_timeout_secs),
+            node_grace: std::time::Duration::from_secs(cfg.store.node_grace_secs),
             audiences: cfg
                 .audiences
                 .iter()

@@ -35,6 +35,7 @@ use mediatore_store::StoreError;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
+use crate::nodegc::{self, MAX_DELETIONS_PER_PASS, ek_hashes_of};
 use crate::policy::{BundleCache, PolicyKey};
 use crate::sandbox::{AgentSandbox, AgentSandboxStatus, FINALIZER};
 use crate::shadow::Audience;
@@ -74,6 +75,9 @@ pub struct WatcherConfig {
     /// ADR-0035). A sandbox naming one whose delegation did not reach its record is
     /// refused before the claim binds a VM.
     pub delegated_audiences: std::collections::BTreeSet<String>,
+    /// A node younger than this is never collected (ADR-0039): its registration may
+    /// precede its VM's published endorsement certificate. `store.node_grace_secs`.
+    pub node_grace: Duration,
 }
 
 impl Default for WatcherConfig {
@@ -88,6 +92,7 @@ impl Default for WatcherConfig {
             retention: Duration::from_hours(1),
             egress_mode: crate::policy::EgressMode::default(),
             delegated_audiences: std::collections::BTreeSet::new(),
+            node_grace: Duration::from_mins(10),
         }
     }
 }
@@ -100,6 +105,9 @@ pub trait ClaimsApi: Send + Sync + 'static {
     async fn delete_claim(&self, namespace: &str, name: &str) -> Result<(), WatchError>;
     /// UIDs of every managed claim that exists, for the resync.
     async fn list_claim_uids(&self) -> Result<HashSet<Uuid>, WatchError>;
+    /// Every pool member VM that exists, for collecting the nodes of those that do not
+    /// (ADR-0039). A failed listing is an error, never an empty list.
+    async fn list_machines(&self) -> Result<Vec<VirtualMachine>, WatchError>;
     /// One claim, if it exists.
     async fn get_claim(
         &self,
@@ -157,6 +165,14 @@ impl ClaimsApi for KubeClaimsApi {
             .await
             .map_err(|e| WatchError::Api(e.to_string()))?;
         Ok(list.items.iter().filter_map(claim_uid_of).collect())
+    }
+
+    async fn list_machines(&self) -> Result<Vec<VirtualMachine>, WatchError> {
+        Api::<VirtualMachine>::all(self.client.clone())
+            .list(&ListParams::default().labels(LABEL_POOL))
+            .await
+            .map(|list| list.items)
+            .map_err(|e| WatchError::Api(e.to_string()))
     }
 
     async fn get_claim(
@@ -460,6 +476,57 @@ impl Watcher {
         Ok(Action::await_change())
     }
 
+    /// Remove the nodes whose VM no longer exists in banlieue (ADR-0039), returning how
+    /// many. The decision is [`nodegc::nodes_to_delete`]; this gathers its inputs and acts
+    /// on it, on the replica holding the Lease. A failed listing of the nodes, the VMs or
+    /// the claims removes nothing (the error is the caller's to log); one failed deletion
+    /// is logged and the pass goes on, the next pass retries it.
+    ///
+    /// # Errors
+    /// The nodes, the VMs or the claims could not be listed.
+    pub async fn collect_nodes(&self) -> Result<usize, WatchError> {
+        let store = &self.reconciler.store;
+        let nodes = store.list_nodes().await?;
+        if nodes.is_empty() {
+            return Ok(0);
+        }
+        let live = ek_hashes_of(&self.claims.list_machines().await?);
+        let now = chrono::Utc::now();
+        let busy: HashSet<String> = store
+            .list_claims()
+            .await?
+            .iter()
+            .filter(|c| c.ended_at().is_none_or(|ended| ended > now))
+            .filter_map(|c| c.node_id.clone())
+            .collect();
+        let doomed = nodegc::nodes_to_delete(&nodegc::Inputs {
+            nodes: &nodes,
+            live_ek_hashes: &live,
+            busy_node_ids: &busy,
+            now,
+            grace: chrono::Duration::from_std(self.config().node_grace)
+                .unwrap_or(chrono::Duration::MAX),
+            cap: MAX_DELETIONS_PER_PASS,
+        });
+        let mut removed = 0;
+        for ek_hash in doomed {
+            match store.delete_node(&ek_hash).await {
+                Ok(()) => {
+                    let hostname = nodes
+                        .iter()
+                        .find(|n| n.ek_hash == ek_hash)
+                        .map_or("", |n| n.hostname.as_str());
+                    tracing::info!(%ek_hash, %hostname, "node removed: its VM is gone");
+                    removed += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(%ek_hash, error = %e, "node not removed; the next pass retries");
+                }
+            }
+        }
+        Ok(removed)
+    }
+
     /// Decision 4's backstop: release every bound record whose claim no longer exists,
     /// then sweep orphan entries, then sweep the rows of claims that ended before the
     /// retention window, the audit line logged (ADR-0034). Returns (records released,
@@ -653,6 +720,11 @@ pub async fn run(client: Client, watcher: Arc<Watcher>) -> anyhow::Result<()> {
                     tracing::info!(released, swept, archived, "resync");
                 }
                 Err(e) => tracing::warn!(error = %e, "resync failed"),
+            }
+            match watcher.collect_nodes().await {
+                Ok(0) => {}
+                Ok(removed) => tracing::info!(removed, "nodes of gone VMs collected"),
+                Err(e) => tracing::warn!(error = %e, "node collection failed; nothing removed"),
             }
         }
     };
@@ -1082,5 +1154,106 @@ mod tests {
             Err(mediatore_store::StoreError::NotFound(_))
         ));
         assert!(r.store.get_claim(live).await.is_ok());
+    }
+
+    // ----- collecting the nodes of VMs that are gone (ADR-0039) -------------------------------------------------------
+
+    /// A node registered an hour ago, past the default grace.
+    fn old_node(ek: &str) -> mediatore_store::NodeRecord {
+        let mut n = node(ek, false);
+        n.registered_at = Utc::now() - chrono::Duration::hours(1);
+        n
+    }
+
+    #[tokio::test]
+    async fn a_node_whose_vm_is_gone_is_collected_and_one_whose_vm_exists_is_kept_on_every_pass() {
+        let r = rig(WatcherConfig::default());
+        r.store.put_node(old_node(RSA_EK_HASH)).await.unwrap();
+        r.store.put_node(old_node("gone-ek")).await.unwrap();
+        r.claims.put_machine(machine(&[RSA_EK_PEM]));
+        assert_eq!(r.watcher.collect_nodes().await.unwrap(), 1);
+        assert!(matches!(
+            r.store.get_node("gone-ek").await,
+            Err(StoreError::NotFound(_))
+        ));
+        assert!(r.store.get_node(RSA_EK_HASH).await.is_ok());
+        for _ in 0..3 {
+            assert_eq!(r.watcher.collect_nodes().await.unwrap(), 0);
+        }
+        assert!(
+            r.store.get_node(RSA_EK_HASH).await.is_ok(),
+            "its VM still publishes the hash"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_vm_listing_collects_nothing_and_says_so() {
+        let r = rig(WatcherConfig::default());
+        r.store.put_node(old_node("gone-ek")).await.unwrap();
+        r.claims.put_machine(machine(&[RSA_EK_PEM]));
+        r.claims.fail_machine_listing(true);
+        assert!(r.watcher.collect_nodes().await.is_err());
+        assert!(
+            r.store.get_node("gone-ek").await.is_ok(),
+            "no list, no deletion"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_banned_node_a_node_with_an_active_claim_and_a_young_node_are_kept() {
+        let r = rig(WatcherConfig::default());
+        let mut banned = old_node("banned-ek");
+        banned.banned = true;
+        r.store.put_node(banned).await.unwrap();
+        let busy = old_node("busy-ek");
+        let mut rec = record(uid());
+        rec.node_id = Some(busy.node_id.clone());
+        rec.entry_id = Some("entry".into());
+        rec.expires_at = Some(Utc::now() + chrono::Duration::minutes(10));
+        r.store.put_claim(rec).await.unwrap();
+        r.store.put_node(busy).await.unwrap();
+        r.store.put_node(node("young-ek", false)).await.unwrap();
+        // Another VM is live, so the list is not empty and only the rules decide.
+        r.claims.put_machine(machine(&[RSA_EK_PEM]));
+        assert_eq!(r.watcher.collect_nodes().await.unwrap(), 0);
+        for ek in ["banned-ek", "busy-ek", "young-ek"] {
+            assert!(r.store.get_node(ek).await.is_ok(), "{ek} was kept");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_claim_that_ended_no_longer_protects_its_node() {
+        let r = rig(WatcherConfig::default());
+        let n = old_node("ended-ek");
+        let mut rec = record(uid());
+        rec.node_id = Some(n.node_id.clone());
+        rec.entry_id = Some("entry".into());
+        rec.revoked_at = Some(Utc::now() - chrono::Duration::minutes(5));
+        r.store.put_claim(rec).await.unwrap();
+        r.store.put_node(n).await.unwrap();
+        r.claims.put_machine(machine(&[RSA_EK_PEM]));
+        assert_eq!(r.watcher.collect_nodes().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_grace_is_the_configured_one() {
+        let r = rig(WatcherConfig {
+            node_grace: Duration::from_hours(2),
+            ..WatcherConfig::default()
+        });
+        r.store.put_node(old_node("gone-ek")).await.unwrap();
+        r.claims.put_machine(machine(&[RSA_EK_PEM]));
+        assert_eq!(
+            r.watcher.collect_nodes().await.unwrap(),
+            0,
+            "registered an hour ago, inside two hours of grace"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_nodes_means_no_listing_of_vms() {
+        let r = rig(WatcherConfig::default());
+        r.claims.fail_machine_listing(true);
+        assert_eq!(r.watcher.collect_nodes().await.unwrap(), 0);
     }
 }

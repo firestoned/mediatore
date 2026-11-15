@@ -919,6 +919,14 @@ impl ClaimStore for KubeStore {
             .collect()
     }
 
+    async fn delete_node(&self, ek_hash: &str) -> Result<(), StoreError> {
+        match self.nodes().delete(ek_hash, &DeleteParams::default()).await {
+            Ok(_) => Ok(()),
+            Err(e) if is_not_found(&e) => Ok(()),
+            Err(e) => Err(backend(&e)),
+        }
+    }
+
     async fn sweep(&self, before: DateTime<Utc>) -> Result<usize, StoreError> {
         let mut swept = 0;
         for sb in self.sandboxes_with_records().await? {

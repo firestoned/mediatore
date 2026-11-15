@@ -422,6 +422,20 @@ volumes:
     secret: { secretName: mediatore-registry, defaultMode: 0440 }
 ```
 
+### Nodes of VMs that are gone
+
+Every VM that registers leaves a `SandboxNode`, and a pool that recycles its members (one-shot
+claims end their VM) would add one per VM for ever. The broker removes the node of a VM that no
+longer exists ([ADR-0039](../adr/0039-a-node-leaves-the-register-when-its-vm-is-gone.md)): at
+each resync, on the replica holding the watcher's Lease, when no pool member `VirtualMachine`
+publishes its EK hash. Two settings matter. `watcher.resync_secs` (five minutes) is how often it
+looks; `store.node_grace_secs` (ten minutes, zero refused) is how old a registration must be
+before it can go, so a registration that precedes its VM's published certificate is never
+collected. The ClusterRole in `deploy/base/rbac.yaml` already grants `delete` on `sandboxnodes`
+and `list` on `virtualmachines`; check a role you maintain yourself has both. A banned node stays
+until you delete it. `kubectl get sandboxnodes` should settle at
+about the size of the pool plus the grace's worth of churn.
+
 ## 7. The egress gateways
 
 With the pool attesting, the environment's egress goes through the three gateway VMs of

@@ -217,6 +217,9 @@ pub trait ClaimStore: Send + Sync + 'static {
     async fn ban_node(&self, ek_hash: &str) -> Result<(), StoreError>;
     /// All registered nodes.
     async fn list_nodes(&self) -> Result<Vec<NodeRecord>, StoreError>;
+    /// Remove a node by EK hash (ADR-0039: its VM is gone). A node that is not there is
+    /// success, so a retried or racing collection is harmless; no other row is touched.
+    async fn delete_node(&self, ek_hash: &str) -> Result<(), StoreError>;
 
     /// Remove every claim record that ended ([`ClaimRecord::ended_at`]) before `before`,
     /// after the retention window (ADR-0034 decision 4: the audit is the log line the
@@ -400,6 +403,11 @@ impl ClaimStore for MemoryStore {
 
     async fn list_nodes(&self) -> Result<Vec<NodeRecord>, StoreError> {
         Ok(self.nodes.read().await.values().cloned().collect())
+    }
+
+    async fn delete_node(&self, ek_hash: &str) -> Result<(), StoreError> {
+        self.nodes.write().await.remove(ek_hash);
+        Ok(())
     }
 
     async fn sweep(&self, before: DateTime<Utc>) -> Result<usize, StoreError> {

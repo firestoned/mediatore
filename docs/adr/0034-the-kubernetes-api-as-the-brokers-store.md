@@ -76,7 +76,8 @@ It need not. Every table of ADR-0012 has a natural home in the API:
    that ADR-0026 needs is the resource's own `resourceVersion`: a write decided from a
    floor another replica has since moved is a `409`, which the store reports as `Conflict`
    as it does today. Both are rendered by `crdgen` beside the `AgentSandbox`, both print
-   their columns, both are readable with `kubectl`.
+   their columns, both are readable with `kubectl`. A node's removal once its VM is gone is
+   [ADR-0039](0039-a-node-leaves-the-register-when-its-vm-is-gone.md).
 
 4. **Retention is the finalizer; the audit is the resource and the log.** Today a row
    outlives its claim by `store.retention_secs` and is then copied to `claim_audit`. Now the

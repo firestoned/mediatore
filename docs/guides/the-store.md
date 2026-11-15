@@ -27,6 +27,7 @@ policyfloors` the other two.
 ```yaml
 store:
   retention_secs: 3600   # how long an ended claim stays on its AgentSandbox
+  node_grace_secs: 600   # a registered node is never collected before this (ADR-0039)
   sealing:               # the sealer for refresh material, below
     key_file: /etc/mediatore-sealing/key
 ```
@@ -145,8 +146,22 @@ sandbox with what an audit row used to hold (the claim UID, name, subject, node,
 created, bound-until and revoked timestamps, whether a report and an exit were recorded),
 then the resource is deleted if nobody had, and the finalizer released. The envelope is
 never logged. The cluster's log pipeline keeps the lines; there is no audit table and
-nothing for mediatore to delete from. Nodes are never swept: a node that registered is
-known until an operator deletes its `SandboxNode`.
+nothing for mediatore to delete from.
+
+## Nodes
+
+A node registers once, when its guest starts, as a `SandboxNode` named by the EK hash. Since
+[ADR-0039](../adr/0039-a-node-leaves-the-register-when-its-vm-is-gone.md) the leader
+removes it when its VM is gone: at each resync it lists the pool member `VirtualMachine`s,
+computes the EK hash each publishes the way the claim binding does, and deletes a
+`SandboxNode` no VM publishes. It never deletes a banned node (an operator removes a ban),
+a node younger than `store.node_grace_secs` (default 600; zero is refused), a node a claim
+that has not ended is bound to, or more than twenty in one pass, and it removes nothing when
+the VM list cannot be read or is empty while a node is young or a claim is active. A node
+removed too early comes back when its guest registers again; a guest waiting for a claim
+restarts and does that within seconds. One log line per removal:
+`node removed: its VM is gone`. Nothing to configure beyond the grace; the broker's role
+already holds `delete` on `sandboxnodes`.
 
 `retention_secs: 0` means an ended claim is swept at the next resync, which is how the
 kind tiers run.
