@@ -110,6 +110,7 @@ fn delegated_map() -> std::collections::BTreeMap<String, mediatore_api::Delegate
                 value: "oauth-2025-04-20".into(),
             }],
             ttl: Duration::minutes(15),
+            basic: false,
         },
     )]
     .into_iter()

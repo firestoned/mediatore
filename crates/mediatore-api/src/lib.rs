@@ -27,6 +27,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use banlieue_api::common::LocalObjectReference;
+use base64::Engine as _;
 use chrono::{DateTime, Duration, Utc};
 use mediatore_claims::Reconciler;
 use mediatore_claims::sandbox::{
@@ -628,6 +629,18 @@ fn delegations_for(st: &AppState, req: &ClaimRequest) -> Result<Vec<Delegation>,
                 format!("audience {} is delegated without a token", d.audience),
             ));
         }
+        if st.delegated.get(&d.audience).is_some_and(|a| a.basic)
+            && let Some(t) = d.token.as_ref()
+            && let Err(why) = basic_parts(&t.0)
+        {
+            return Err(ApiError::bad_request(
+                "delegation_refused",
+                format!(
+                    "audience {} takes a user name and a secret: {why}",
+                    d.audience
+                ),
+            ));
+        }
         if let Some(expires_at) = d.expires_at
             && expires_at < Utc::now() + Duration::seconds(i64::from(req.ttl_seconds))
         {
@@ -654,6 +667,23 @@ fn delegations_for(st: &AppState, req: &ClaimRequest) -> Result<Vec<Delegation>,
         ));
     }
     Ok(out)
+}
+
+/// The user name and secret of a `credential: basic` delegation, which carries them as
+/// `user:secret` (ADR-0041 decision 3). The user name has no `:` (RFC 7617: it ends at the first),
+/// neither part is empty and neither holds a control character, so a value that could split the
+/// header or be dropped by Envoy never leaves here. The message names the rule, never the value.
+fn basic_parts(token: &str) -> Result<(&str, &str), &'static str> {
+    let Some((user, secret)) = token.split_once(':') else {
+        return Err("the token must be user:secret");
+    };
+    if user.is_empty() || secret.is_empty() {
+        return Err("the user name and the secret must not be empty");
+    }
+    if token.chars().any(char::is_control) {
+        return Err("the user name and the secret must not hold a control character");
+    }
+    Ok((user, secret))
 }
 
 /// Seal a delegation's plaintext for `binding` (ADR-0035 decision 3).
@@ -1218,6 +1248,9 @@ pub struct DelegatedAudience {
     pub extra_headers: Vec<HeaderPair>,
     /// How long the proxy may keep its copy before asking again.
     pub ttl: Duration,
+    /// The credential is a user name and a secret (`user:secret` in the delegation's token), placed
+    /// as `Authorization: Basic` at the gateway (ADR-0041); false for a bearer.
+    pub basic: bool,
 }
 
 impl AudienceSecret {
@@ -1780,6 +1813,26 @@ async fn delegated_token(
         .map_err(seal_error)?;
     let plain: DelegationPlain = serde_json::from_slice(&plain)
         .map_err(|_| ApiError::internal("the delegation envelope is not what was sealed"))?;
+    if d.basic {
+        // ADR-0041 decision 8: `Authorization: Basic base64(user:secret)`, whole, so the gateway places
+        // it as it is (a response with a header carries the value bare).
+        basic_parts(&plain.token.0).map_err(|_| {
+            ApiError::internal("the delegation envelope is not a user name and a secret")
+        })?;
+        let value = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(plain.token.0.as_bytes())
+        );
+        return Ok(TokenResponse {
+            access_token: value,
+            token_type: "Header".into(),
+            expires_at,
+            audience,
+            subject: rec.subject.clone(),
+            header: Some("authorization".into()),
+            extra_headers: d.extra_headers.clone(),
+        });
+    }
     let bearer = d.header == "authorization";
     if placement == Placement::Proxy {
         tracing::info!(%claim_uid, %audience, subject = %rec.subject.id, backend = "delegated", header = %d.header, %expires_at, "token issued");
@@ -2037,6 +2090,7 @@ mod tests {
                 header: "authorization".into(),
                 extra_headers: vec![],
                 ttl: Duration::minutes(15),
+                basic: false,
             },
         );
         st.sts = Some(
@@ -2230,6 +2284,68 @@ mod tests {
         assert_eq!(c.header, "authorization");
         assert_eq!(c.value.0, format!("Bearer {SESSION_TOKEN}"));
         assert!(c.expires_at <= Utc::now() + Duration::seconds(300));
+    }
+
+    #[tokio::test]
+    async fn a_basic_delegation_is_placed_as_authorization_basic_of_user_colon_secret() {
+        use base64::Engine as _;
+        let mut st = placed_state();
+        st.delegated.insert(
+            "claude".into(),
+            DelegatedAudience {
+                header: "authorization".into(),
+                extra_headers: vec![],
+                ttl: Duration::minutes(15),
+                basic: true,
+            },
+        );
+        let sealer: Arc<dyn Sealer> = Arc::new(mediatore_store::seal::LocalKeySealer::new([7; 32]));
+        let mut rec = claim(&["claude"], None);
+        let plain = serde_json::to_vec(&DelegationPlain {
+            token: Secret("alice:p@ss:word".into()),
+            refresh_token: None,
+        })
+        .unwrap();
+        let envelope = sealer.seal(rec.seal_binding(), &plain).await.unwrap();
+        rec.delegations.insert(
+            "claude".into(),
+            DelegatedSession {
+                envelope,
+                expires_at: None,
+            },
+        );
+        st.sealer = Some(sealer);
+        let st: Shared = Arc::new(st);
+        let rec = stored(&st, rec).await;
+        let (status, body, _) = ask(&st, rec.uid, Some(&gateway_peer()), "claude").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let c: GatewayCredential = serde_json::from_value(body).unwrap();
+        assert_eq!(c.header, "authorization");
+        let want = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode("alice:p@ss:word")
+        );
+        assert_eq!(
+            c.value.0, want,
+            "the user ends at the first colon; the secret may hold more"
+        );
+        assert!(c.expires_at <= Utc::now() + Duration::seconds(300));
+    }
+
+    #[test]
+    fn a_basic_token_is_a_user_a_colon_and_a_secret_with_no_control_character() {
+        assert_eq!(basic_parts("alice:s3cret"), Ok(("alice", "s3cret")));
+        assert_eq!(basic_parts("alice:a:b"), Ok(("alice", "a:b")));
+        for bad in [
+            "nocolon",
+            ":secret",
+            "user:",
+            "us\ner:secret",
+            "user:sec\r\nret",
+            "user:sec\0ret",
+        ] {
+            assert!(basic_parts(bad).is_err(), "{bad:?} must be refused");
+        }
     }
 
     #[tokio::test]

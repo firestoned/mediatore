@@ -455,6 +455,7 @@ fn delegated_audiences(
                     header: a.header.clone(),
                     extra_headers: a.extra_headers.clone(),
                     ttl: chrono::Duration::seconds(a.max_ttl),
+                    basic: a.credential == config::Credential::Basic,
                 },
             )
         })
