@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use banlieue_api::banlieue::VirtualMachineClaim;
+use banlieue_api::banlieue::{VirtualMachine, VirtualMachineClaim};
 use chrono::Utc;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use kube::ResourceExt;
@@ -37,6 +37,10 @@ pub(crate) struct FakeClaims {
     deleted: Mutex<Vec<Key>>,
     hold_deleted: Mutex<bool>,
     patches: Mutex<usize>,
+    /// The pool member VMs `list_machines` reports.
+    machines: Mutex<Vec<VirtualMachine>>,
+    /// Make `list_machines` fail, as an unreachable API server does.
+    fail_machines: Mutex<bool>,
 }
 
 fn key(namespace: &str, name: &str) -> Key {
@@ -50,6 +54,14 @@ impl FakeClaims {
             .unwrap()
             .get(&key(namespace, name))
             .cloned()
+    }
+
+    pub(crate) fn put_machine(&self, vm: VirtualMachine) {
+        self.machines.lock().unwrap().push(vm);
+    }
+
+    pub(crate) fn fail_machine_listing(&self, fail: bool) {
+        *self.fail_machines.lock().unwrap() = fail;
     }
 
     pub(crate) fn put_sandbox(&self, sb: AgentSandbox) {
@@ -130,6 +142,13 @@ impl ClaimsApi for FakeClaims {
             claims.remove(&key(namespace, name));
         }
         Ok(())
+    }
+
+    async fn list_machines(&self) -> Result<Vec<VirtualMachine>, WatchError> {
+        if *self.fail_machines.lock().unwrap() {
+            return Err(WatchError::Api("the API server is unreachable".into()));
+        }
+        Ok(self.machines.lock().unwrap().clone())
     }
 
     async fn list_claim_uids(&self) -> Result<HashSet<Uuid>, WatchError> {

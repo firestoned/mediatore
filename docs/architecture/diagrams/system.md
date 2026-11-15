@@ -93,6 +93,7 @@ flowchart LR
     service-mediatore-user-api -->|HTTPS| service-kubernetes-api
     service-mediatore-watcher -->|HTTPS| service-kubernetes-api
     service-mediatore-watcher -->|HTTPS| service-kubernetes-api
+    service-mediatore-watcher -->|HTTPS| service-kubernetes-api
     actor-sandbox-user --> data-asset-agentsandbox-cr
     system-banlieue -->|HTTPS| service-kubernetes-api
     service-mediatore-watcher -->|HTTPS| service-kubernetes-api

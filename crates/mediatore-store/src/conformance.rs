@@ -46,6 +46,7 @@ macro_rules! suite {
                 a_node_round_trips_and_registers_once,
                 duplicate_ek_with_another_dmi_is_a_conflict,
                 ban_marks_the_node_and_needs_an_existing_row,
+                delete_node_removes_the_row_and_is_idempotent,
                 a_sweep_removes_claims_that_ended_before_the_retention,
                 a_session_is_taken_once_deleted_on_demand_and_swept_when_stale,
                 delegations_are_parked_per_audience_and_revocation_empties_them,
@@ -340,6 +341,32 @@ pub(crate) async fn ban_marks_the_node_and_needs_an_existing_row(s: &dyn ClaimSt
     assert!(s.get_node("ek1").await.unwrap().banned);
     let err = s.ban_node("ek9").await.unwrap_err();
     assert!(matches!(err, StoreError::NotFound(_)), "{err}");
+}
+
+/// ADR-0039: a node leaves the register when its VM is gone. Deleting is idempotent (a row
+/// already gone is success), touches no other row, and frees the DMI UUID and the EK hash
+/// for a machine that registers again.
+pub(crate) async fn delete_node_removes_the_row_and_is_idempotent(s: &dyn ClaimStore) {
+    let dmi1 = Uuid::new_v4();
+    s.put_node(node("ek1", dmi1)).await.unwrap();
+    s.put_node(node("ek2", Uuid::new_v4())).await.unwrap();
+    s.delete_node("ek1").await.unwrap();
+    assert!(matches!(
+        s.get_node("ek1").await,
+        Err(StoreError::NotFound(_))
+    ));
+    assert!(matches!(
+        s.get_node_by_dmi(dmi1).await,
+        Err(StoreError::NotFound(_))
+    ));
+    assert_eq!(s.list_nodes().await.unwrap().len(), 1);
+    assert!(s.get_node("ek2").await.is_ok(), "no other row is touched");
+    // Already gone, never there: success both times.
+    s.delete_node("ek1").await.unwrap();
+    s.delete_node("never-registered").await.unwrap();
+    // The hash is free again, with another DMI UUID (no `Conflict`).
+    s.put_node(node("ek1", Uuid::new_v4())).await.unwrap();
+    assert_eq!(s.list_nodes().await.unwrap().len(), 2);
 }
 
 pub(crate) async fn a_sweep_removes_claims_that_ended_before_the_retention(s: &dyn ClaimStore) {
