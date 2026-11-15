@@ -7,12 +7,31 @@ use std::path::{Path, PathBuf};
 
 use mediatore_entra::{Backend, IssuerConfig};
 use mediatore_proto::image::canonical_registry;
-use mediatore_proto::{Endpoint, EndpointRule, HeaderPair};
+use mediatore_proto::{
+    Endpoint, EndpointRule, GATEWAY_CREDENTIAL_MAX_TTL_SECS, HeaderPair, InjectRoute,
+};
 use mediatore_store::seal::TransitConfig;
 use serde::Deserialize;
 
-/// One downstream audience and which backend serves it.
+/// Where an audience's credential is placed on the request (ADR-0040 decision 1).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Inject {
+    /// The guest's egress proxy places it, outside the jail (ADR-0025): today's behaviour, byte
+    /// for byte, and the default.
+    #[default]
+    Proxy,
+    /// The gateway places it (ADR-0040): `POST /v1/token` refuses the audience, the gateway's
+    /// authorizer asks the broker for the credential and `envoy-inject` writes it, so the pool VM
+    /// never holds it. Needs `gateways` and `gateway_inject_port`, `max_ttl` at most 300, exact
+    /// `host:port` egress of one upstream and `rules`.
+    Gateway,
+}
+
+/// One downstream audience and which backend serves it. An unknown key stops the start: the settings here decide where
+/// a credential is placed, and a misspelled `inject` must not fall back to the default silently (ADR-0040).
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AudienceConfig {
     /// Audience value as written into `aud`.
     pub name: String,
@@ -66,6 +85,53 @@ pub struct AudienceConfig {
     /// (ADR-0035 decision 5). Absent, the claim cannot outlast the bearer.
     #[serde(default)]
     pub refresh: Option<DelegationRefresh>,
+    /// Where the credential is placed (ADR-0040): `proxy` (default) or `gateway`. For `gateway`
+    /// the broker checks at start what decision 1 requires; the credential is bound to the exact
+    /// authorities of this audience's `egress`.
+    #[serde(default)]
+    pub inject: Inject,
+}
+
+impl AudienceConfig {
+    /// The request header this audience's credential goes in, lowercase: `secret_header` for
+    /// `via: secret`, `header` for `via: delegated`, `authorization` (a bearer) otherwise.
+    fn credential_header(&self) -> &str {
+        match self.via {
+            Backend::Secret => &self.secret_header,
+            Backend::Delegated => &self.header,
+            _ => "authorization",
+        }
+    }
+
+    /// The public headers placed beside the credential (`secret_extra_headers`, `extra_headers`).
+    fn public_extra_headers(&self) -> &[HeaderPair] {
+        match self.via {
+            Backend::Secret => &self.secret_extra_headers,
+            Backend::Delegated => &self.extra_headers,
+            _ => &[],
+        }
+    }
+
+    /// What the gateway places for this audience (ADR-0040 decisions 2 and 4): one route per
+    /// exact authority of `egress`, with the rules, the credential header and the public extra
+    /// headers. Empty unless the audience is `inject: gateway`. A credential is added only for a
+    /// request whose authority is one of these and that one of the rules admits.
+    #[must_use]
+    pub fn inject_routes(&self) -> Vec<InjectRoute> {
+        if self.inject != Inject::Gateway {
+            return Vec::new();
+        }
+        self.egress
+            .iter()
+            .map(|e| InjectRoute {
+                audience: self.name.clone(),
+                endpoint: e.clone(),
+                rules: self.rules.clone(),
+                header: self.credential_header().to_owned(),
+                extra_headers: self.public_extra_headers().to_vec(),
+            })
+            .collect()
+    }
 }
 
 /// Where a delegated credential is refreshed (ADR-0035 decision 5): the operator's values,
@@ -437,6 +503,11 @@ pub struct Config {
     /// Empty until the gateways exist; the jail then reaches `audiences[].egress` directly.
     #[serde(default, deserialize_with = "endpoints")]
     pub gateways: Vec<Endpoint>,
+    /// The port of each gateway's `envoy-inject` listener, on the same addresses as `gateways`
+    /// (ADR-0040 decision 3, `INJECT_PORT` on the gateway). Required by `inject: gateway`; its
+    /// own port, never a gateway's data-plane port.
+    #[serde(default)]
+    pub gateway_inject_port: Option<u16>,
 }
 
 fn default_listen() -> ListenConfig {
@@ -539,6 +610,96 @@ impl Config {
         Ok(())
     }
 
+    /// The audiences declared `inject: gateway` (ADR-0040), in file order.
+    #[must_use]
+    pub fn gateway_placed(&self) -> Vec<&AudienceConfig> {
+        self.audiences
+            .iter()
+            .filter(|a| a.inject == Inject::Gateway)
+            .collect()
+    }
+
+    /// ADR-0040 decision 1, refused at start: the inject port is a real port of its own, and a
+    /// gateway-placed audience has a credential to place, the gateways to place it at, a life
+    /// of at most 300 seconds, exact `host:port` entries of one upstream and rules (under
+    /// `proxy` no rules means every method and path; a placed credential does not get that).
+    fn check_inject(&self) -> anyhow::Result<()> {
+        if let Some(port) = self.gateway_inject_port {
+            if port == 0 {
+                anyhow::bail!("gateway_inject_port must be 1 to 65535 (ADR-0040 decision 3)");
+            }
+            if let Some(g) = self.gateways.iter().find(|g| g.port == port) {
+                anyhow::bail!(
+                    "gateway_inject_port {port} is the data-plane port of gateway {g}: the inject listener has a port of its own (ADR-0040 decision 3)"
+                );
+            }
+        }
+        for a in self.gateway_placed() {
+            let name = &a.name;
+            match a.via {
+                Backend::Secret | Backend::Delegated | Backend::Sts => {}
+                Backend::None | Backend::EntraObo => {
+                    let via = if a.via == Backend::None {
+                        "none"
+                    } else {
+                        "entra-obo"
+                    };
+                    anyhow::bail!(
+                        "audience {name:?}: `inject: gateway` places a credential and via: {via} has none to place; it goes with via: secret, delegated or sts (ADR-0040 decision 1)"
+                    );
+                }
+            }
+            if self.gateways.is_empty() {
+                anyhow::bail!(
+                    "audience {name:?}: `inject: gateway` needs `gateways`, the addresses the gateways' inject listeners are on (ADR-0040 decision 1)"
+                );
+            }
+            if self.gateway_inject_port.is_none() {
+                anyhow::bail!(
+                    "audience {name:?}: `inject: gateway` needs `gateway_inject_port`, the port of the gateways' inject listener (ADR-0040 decision 1)"
+                );
+            }
+            if a.max_ttl > GATEWAY_CREDENTIAL_MAX_TTL_SECS {
+                anyhow::bail!(
+                    "audience {name:?}: max_ttl {} exceeds the {GATEWAY_CREDENTIAL_MAX_TTL_SECS} second cap on a credential the gateway places; set `max_ttl: {GATEWAY_CREDENTIAL_MAX_TTL_SECS}` or lower (ADR-0040 decision 1)",
+                    a.max_ttl
+                );
+            }
+            if a.egress.is_empty() {
+                anyhow::bail!(
+                    "audience {name:?}: `inject: gateway` needs `egress`, the exact host:port the credential is placed for (ADR-0040 decision 1)"
+                );
+            }
+            if let Some(e) = a.egress.iter().find(|e| e.host.contains('*')) {
+                anyhow::bail!(
+                    "audience {name:?}: egress {e} is a wildcard; a placed credential is bound to exact host:port entries (ADR-0040 decision 1)"
+                );
+            }
+            if let Some(e) = a.egress.iter().find(|e| {
+                e.host
+                    .trim_matches(['[', ']'])
+                    .parse::<std::net::IpAddr>()
+                    .is_ok()
+            }) {
+                anyhow::bail!(
+                    "audience {name:?}: egress {e} is an IP address; the gateway verifies the upstream's certificate by name, so a gateway-placed audience needs a host name (ADR-0040 decision 1)"
+                );
+            }
+            let first = &a.egress[0].host;
+            if a.egress.iter().any(|e| !e.host.eq_ignore_ascii_case(first)) {
+                anyhow::bail!(
+                    "audience {name:?}: egress names more than one upstream host; a gateway-placed audience has one upstream, and a credential is bound to the authority that needs it (ADR-0040 decision 1)"
+                );
+            }
+            if a.rules.is_empty() {
+                anyhow::bail!(
+                    "audience {name:?}: `inject: gateway` needs `rules`; under proxy no rules means every method and path, and a placed credential does not get that default (ADR-0040 decision 1)"
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Each gateway listed once: a repeated entry is a copy-paste, not a second gateway,
     /// and the forwarder's failover would retry the same one.
     fn check_gateways(&self) -> anyhow::Result<()> {
@@ -620,6 +781,7 @@ impl Config {
         }
         cfg.check_registries()?;
         cfg.check_routes()?;
+        cfg.check_inject()?;
         cfg.check_entra()?;
         if !cfg.dev_mode && cfg.spire.is_none() {
             anyhow::bail!("`spire` (workload_api_socket, entries) is required outside dev_mode");
@@ -1569,5 +1731,263 @@ listen: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }
             let err = with_policy(&policy).unwrap_err().to_string();
             assert!(err.contains(why), "expected {why:?} in: {err}");
         }
+    }
+
+    // ----- ADR-0040: inject: gateway ------------------------------------------------------------------------------------
+
+    const INJECT_BASE: &str = "trust_domain: sandbox.test\nissuers: []\nlisten: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }\ndev_mode: true\nstore: { sealing: { key_file: /k } }\nsts: { issuer: https://mediatore.test, kid: k, signing_key_file: /k }\ngateways: [\"198.51.100.1:3128\", \"198.51.100.2:3128\"]\ngateway_inject_port: 3133\n";
+    const INJECT_OK: &str = "  - name: anthropic\n    via: delegated\n    inject: gateway\n    max_ttl: 300\n    egress: [\"api.anthropic.example:443\"]\n    rules:\n      - { method: POST, path: \"/v1/messages\" }\n";
+
+    fn inject_cfg(audiences: &str) -> String {
+        format!("{INJECT_BASE}audiences:\n{audiences}")
+    }
+
+    fn inject_err(base: &str, audiences: &str) -> String {
+        Config::parse(&format!("{base}audiences:\n{audiences}"))
+            .unwrap_err()
+            .to_string()
+    }
+
+    #[test]
+    fn inject_defaults_to_proxy_and_a_proxy_audience_is_unchanged() {
+        let cfg = Config::parse(
+            "trust_domain: sandbox.test\nissuers: []\nlisten: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }\ndev_mode: true\naudiences:\n  - name: a\n    via: secret\n    secret_file: /s\n    egress: [\"*.wild.example:443\", \"b.example:443\"]\n  - name: b\n    via: none\n    inject: proxy\n    egress: [\"c.example:443\"]\n"
+        )
+        .unwrap();
+        assert_eq!(cfg.audiences[0].inject, Inject::Proxy, "absent means proxy");
+        assert_eq!(cfg.audiences[1].inject, Inject::Proxy);
+        assert!(cfg.audiences.iter().all(|a| a.inject_routes().is_empty()));
+        assert_eq!(cfg.gateway_inject_port, None);
+    }
+
+    #[test]
+    fn a_gateway_placed_audience_is_accepted_and_hands_the_gateway_its_exact_routes() {
+        let cfg = Config::parse(&inject_cfg(INJECT_OK)).unwrap();
+        assert_eq!(cfg.gateway_inject_port, Some(3133));
+        let a = &cfg.audiences[0];
+        assert_eq!(a.inject, Inject::Gateway);
+        let routes = a.inject_routes();
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].audience, "anthropic");
+        assert_eq!(routes[0].endpoint.to_string(), "api.anthropic.example:443");
+        assert_eq!(routes[0].rules.len(), 1);
+        assert_eq!(
+            routes[0].header, "authorization",
+            "delegated: the audience's `header`"
+        );
+        assert_eq!(routes[0].extra_headers, Vec::<HeaderPair>::new());
+        assert!(routes[0].matches_authority("api.anthropic.example", None));
+        assert!(!routes[0].matches_authority("api.anthropic.example", Some(8443)));
+        assert_eq!(cfg.gateway_placed().len(), 1);
+    }
+
+    #[test]
+    fn each_credential_source_names_its_own_header_and_public_extras_on_the_route() {
+        let cfg = Config::parse(&inject_cfg(
+            "  - name: keyed\n    via: secret\n    secret_file: /s\n    secret_header: x-api-key\n    secret_extra_headers:\n      - { name: anthropic-version, value: \"2023-06-01\" }\n    inject: gateway\n    max_ttl: 300\n    egress: [\"keyed.example:443\"]\n    rules: [ { method: POST, path: \"/v1/**\" } ]\n  - name: signed\n    via: sts\n    inject: gateway\n    max_ttl: 120\n    egress: [\"signed.example:443\"]\n    rules: [ { method: GET, path: \"/**\" } ]\n  - name: session\n    via: delegated\n    header: x-session\n    extra_headers:\n      - { name: anthropic-beta, value: oauth-2025-04-20 }\n    inject: gateway\n    egress: [\"session.example:443\"]\n    max_ttl: 300\n    rules: [ { method: POST, path: \"/v1/messages\" } ]\n",
+        ))
+        .unwrap();
+        let keyed = cfg.audiences[0].inject_routes();
+        assert_eq!(keyed[0].header, "x-api-key");
+        assert_eq!(keyed[0].extra_headers.len(), 1);
+        assert_eq!(keyed[0].extra_headers[0].name, "anthropic-version");
+        let signed = cfg.audiences[1].inject_routes();
+        assert_eq!(signed[0].header, "authorization");
+        assert_eq!(signed[0].extra_headers, Vec::<HeaderPair>::new());
+        let session = cfg.audiences[2].inject_routes();
+        assert_eq!(session[0].header, "x-session");
+        assert_eq!(session[0].extra_headers[0].name, "anthropic-beta");
+    }
+
+    #[test]
+    fn a_via_none_audience_has_no_credential_to_place() {
+        let err = inject_err(
+            INJECT_BASE,
+            "  - name: open\n    via: none\n    inject: gateway\n    max_ttl: 300\n    egress: [\"open.example:443\"]\n    rules: [ { method: GET, path: \"/**\" } ]\n",
+        );
+        assert!(
+            err.contains("\"open\"") && err.contains("via: none") && err.contains("ADR-0040"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn gateway_placement_needs_gateways_and_the_inject_port() {
+        let no_gateways = INJECT_BASE.replace(
+            "gateways: [\"198.51.100.1:3128\", \"198.51.100.2:3128\"]\n",
+            "",
+        );
+        let err = inject_err(&no_gateways, INJECT_OK);
+        assert!(
+            err.contains("\"anthropic\"") && err.contains("`gateways`") && err.contains("ADR-0040"),
+            "{err}"
+        );
+        let no_port = INJECT_BASE.replace("gateway_inject_port: 3133\n", "");
+        let err = inject_err(&no_port, INJECT_OK);
+        assert!(
+            err.contains("`gateway_inject_port`") && err.contains("ADR-0040"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn the_inject_port_is_a_real_port_and_not_a_gateways_data_port() {
+        let zero = INJECT_BASE.replace("gateway_inject_port: 3133", "gateway_inject_port: 0");
+        let err = Config::parse(&format!("{zero}audiences: []\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("gateway_inject_port") && err.contains("1 to 65535"),
+            "{err}"
+        );
+        let clash = INJECT_BASE.replace("gateway_inject_port: 3133", "gateway_inject_port: 3128");
+        let err = Config::parse(&format!("{clash}audiences: []\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("gateway_inject_port") && err.contains("198.51.100.1:3128"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn max_ttl_is_capped_at_300_for_a_placed_credential() {
+        // The default (900) is refused too: the cap is not a default to override quietly.
+        let default_ttl = INJECT_OK.replace("    max_ttl: 300\n", "");
+        let err = inject_err(INJECT_BASE, &default_ttl);
+        assert!(
+            err.contains("\"anthropic\"") && err.contains("max_ttl") && err.contains("300"),
+            "{err}"
+        );
+        let over = INJECT_OK.replace("max_ttl: 300", "max_ttl: 301");
+        assert!(inject_err(INJECT_BASE, &over).contains("300"));
+        assert!(
+            Config::parse(&inject_cfg(
+                &INJECT_OK.replace("max_ttl: 300", "max_ttl: 60")
+            ))
+            .is_ok()
+        );
+        assert!(
+            Config::parse(&inject_cfg(INJECT_OK)).is_ok(),
+            "exactly 300 is the cap, allowed"
+        );
+    }
+
+    #[test]
+    fn an_unknown_audience_key_stops_the_start_so_a_typo_cannot_leave_a_credential_in_the_proxy() {
+        // `injct: gateway` is `inject: gateway` misspelled. Ignored, the audience would be placed in the proxy, the
+        // default, and the credential would reach the pool VM the operator meant to keep it from.
+        let typo = INJECT_OK.replace("inject: gateway", "injct: gateway");
+        assert!(typo != INJECT_OK, "the fixture has the key to misspell");
+        let err = inject_err(INJECT_BASE, &typo);
+        assert!(
+            err.contains("unknown field") && err.contains("injct"),
+            "{err}"
+        );
+        assert!(
+            Config::parse(&inject_cfg(INJECT_OK)).is_ok(),
+            "the spelled key stays fine"
+        );
+    }
+
+    #[test]
+    fn a_placed_credential_needs_a_host_name_to_verify_not_an_ip_literal() {
+        // The gateway originates TLS to the upstream and verifies it by name; an address has no name to verify.
+        for lit in ["192.0.2.10:443", "[2001:db8::1]:443"] {
+            let ip = INJECT_OK.replace("api.anthropic.example:443", lit);
+            let err = inject_err(INJECT_BASE, &ip);
+            assert!(
+                err.contains("\"anthropic\"")
+                    && err.contains("IP address")
+                    && err.contains("ADR-0040"),
+                "{lit}: {err}"
+            );
+        }
+        assert!(
+            Config::parse(&inject_cfg(INJECT_OK)).is_ok(),
+            "a host name stays fine"
+        );
+    }
+
+    #[test]
+    fn a_placed_credential_is_bound_to_exact_host_and_port_entries() {
+        let wild = INJECT_OK.replace("api.anthropic.example:443", "*.anthropic.example:443");
+        let err = inject_err(INJECT_BASE, &wild);
+        assert!(
+            err.contains("\"anthropic\"") && err.contains("wildcard") && err.contains("ADR-0040"),
+            "{err}"
+        );
+        let partial = INJECT_OK.replace("api.anthropic.example:443", "api.*.example:443");
+        assert!(inject_err(INJECT_BASE, &partial).contains("wildcard"));
+        let none = INJECT_OK.replace("    egress: [\"api.anthropic.example:443\"]\n", "");
+        let err = inject_err(INJECT_BASE, &none);
+        assert!(
+            err.contains("`egress`") && err.contains("ADR-0040"),
+            "{err}"
+        );
+        // A bare host (no port) or a hostless entry cannot even be an endpoint.
+        let bare = INJECT_OK.replace("api.anthropic.example:443", "api.anthropic.example");
+        assert!(Config::parse(&inject_cfg(&bare)).is_err());
+        let hostless = INJECT_OK.replace("api.anthropic.example:443", ":443");
+        assert!(Config::parse(&inject_cfg(&hostless)).is_err());
+    }
+
+    #[test]
+    fn a_placed_audience_has_one_upstream_though_it_may_name_several_ports_of_it() {
+        let two_hosts = INJECT_OK.replace(
+            "[\"api.anthropic.example:443\"]",
+            "[\"api.anthropic.example:443\", \"other.example:443\"]",
+        );
+        let err = inject_err(INJECT_BASE, &two_hosts);
+        assert!(
+            err.contains("\"anthropic\"")
+                && err.contains("one upstream")
+                && err.contains("ADR-0040"),
+            "{err}"
+        );
+        let two_ports = INJECT_OK.replace(
+            "[\"api.anthropic.example:443\"]",
+            "[\"api.anthropic.example:443\", \"API.Anthropic.Example:8443\"]",
+        );
+        let cfg = Config::parse(&inject_cfg(&two_ports)).unwrap();
+        assert_eq!(
+            cfg.audiences[0].inject_routes().len(),
+            2,
+            "one route per exact authority"
+        );
+    }
+
+    #[test]
+    fn a_placed_credential_does_not_get_the_proxys_empty_rules_default() {
+        let no_rules = INJECT_OK.replace(
+            "    rules:\n      - { method: POST, path: \"/v1/messages\" }\n",
+            "",
+        );
+        let err = inject_err(INJECT_BASE, &no_rules);
+        assert!(
+            err.contains("\"anthropic\"") && err.contains("`rules`") && err.contains("ADR-0040"),
+            "{err}"
+        );
+        // Under proxy the same audience, with no rules, still means every method and path.
+        let proxy = no_rules.replace("inject: gateway", "inject: proxy");
+        assert!(Config::parse(&inject_cfg(&proxy)).is_ok());
+    }
+
+    #[test]
+    fn an_unknown_inject_value_is_refused_and_the_helpers_are_empty_without_gateway_placement() {
+        let err = inject_err(
+            INJECT_BASE,
+            &INJECT_OK.replace("inject: gateway", "inject: sidecar"),
+        );
+        assert!(
+            err.contains("unknown variant") && err.contains("sidecar"),
+            "{err}"
+        );
+        let cfg = Config::parse(&inject_cfg(
+            &INJECT_OK.replace("inject: gateway", "inject: proxy"),
+        ))
+        .unwrap();
+        assert_eq!(cfg.audiences[0].inject_routes(), Vec::<InjectRoute>::new());
+        assert_eq!(cfg.gateway_placed().len(), 0);
     }
 }

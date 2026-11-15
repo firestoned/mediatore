@@ -1,0 +1,53 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+
+[Unit]
+Description=Envoy, the egress gateway's inject listener (ADR-0040)
+# The third process: the one that terminates a claim's mutual TLS and originates TLS to a
+# fixed upstream, so an audience's credential is placed here and never in the pool. Shipped,
+# not enabled: a deployment turns it on with env.inject.example and `systemctl enable`.
+# It needs the table and the interface (fail closed), the agent's socket for the gateway SVID
+# (the claim's mutual TLS, like the data plane and unlike the relay), and the authorizer, whose
+# INJECT socket it asks on every request (the authorizer answers it, and only it, with a
+# credential: ADR-0040 decision 6).
+Requires=mediatore-gateway-nft.service mediatore-gateway-network.service spire-agent.service mediatore-gateway.service
+After=mediatore-gateway-nft.service mediatore-gateway-network.service spire-agent.service network-online.target mediatore-gateway.service
+Wants=network-online.target
+ConditionPathExists=|/run/cos/active_mode
+ConditionPathExists=|/run/cos/passive_mode
+
+[Service]
+User=envoy-inject
+Group=envoy-inject
+# The bootstrap is rendered by root from the env files at every start, as the others are.
+ExecStartPre=+/usr/libexec/mediatore-gateway/render /usr/share/mediatore-gateway/envoy/inject.yaml.in /run/mediatore-gateway/inject.yaml /etc/mediatore-gateway/env /etc/mediatore-gateway/vm.env
+ExecStartPre=/usr/bin/envoy --mode validate -c /run/mediatore-gateway/inject.yaml
+# At info: Envoy's debug and trace levels log request headers, and here a header can be a credential.
+ExecStart=/usr/bin/envoy -c /run/mediatore-gateway/inject.yaml --log-level info --disable-hot-restart
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# The agent's socket (its SVID) and the runtime directory, which holds its bootstrap and the
+# authorizer's sockets; a connect to a socket needs no write access to the mount.
+ReadOnlyPaths=/run/mediatore-gateway /run/spire/sockets
+
+[Install]
+WantedBy=multi-user.target

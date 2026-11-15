@@ -340,6 +340,11 @@ pub enum Credential {
     /// Nothing: the phantom is dropped and the request leaves bare. A policy bundle's
     /// direct egress (ADR-0030), or an audience declared `via: none`.
     None,
+    /// The gateway places the audience's credential (ADR-0040): the proxy never asks for a
+    /// token. It still refuses a non-phantom credential and checks the rules, strips the phantom
+    /// and sends the request in origin form to the route's `inject_port` on a gateway instead
+    /// of tunnelling. An audience declared `inject: gateway`.
+    Gateway,
 }
 
 /// One route of the egress proxy (ADR-0025): one `host:port` the proxy forwards to, the
@@ -374,6 +379,11 @@ pub struct Route {
     /// Absent, `Authorization: Bearer`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_header: Option<String>,
+    /// The gateway's inject port (`gateway_inject_port`, ADR-0040 decision 7) that a
+    /// `credential: gateway` route's request is sent to, on the gateway addresses of
+    /// `Me.gateways`. Absent on every other route, and on a route from an older broker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inject_port: Option<u16>,
 }
 
 impl Route {
@@ -388,6 +398,13 @@ impl Route {
     #[must_use]
     pub fn injects(&self) -> bool {
         self.credential == Credential::Token
+    }
+
+    /// Whether the gateway, not the proxy, places the credential here (ADR-0040): the proxy
+    /// sends the request to the gateway's inject port and never fetches a token.
+    #[must_use]
+    pub fn placed_at_gateway(&self) -> bool {
+        self.credential == Credential::Gateway
     }
 
     /// The audience for a log line: the name, or `-` on a route without one.
@@ -569,6 +586,132 @@ pub struct ClaimEgress {
     /// sorted and deduplicated, exactly what `GET /v1/me` hands the guest.
     #[serde(default)]
     pub egress: Vec<Endpoint>,
+    /// The claim's gateway-placed routes (ADR-0040 decision 2): one per audience declared
+    /// `inject: gateway` and exact endpoint of it, with the rules the gateway enforces, the
+    /// header the credential goes in and the public extra headers. Empty (and absent on the
+    /// wire) for a claim with no such audience, and from an older broker.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inject: Vec<InjectRoute>,
+}
+
+/// What the gateway places for one claim at one upstream (ADR-0040 decisions 2 and 4): the
+/// authority the request must name, what it may ask there, and the headers the authorizer
+/// writes. Carries no credential: the credential comes from
+/// `POST /v1/gateway/claims/{uid}/credential`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InjectRoute {
+    /// The audience the credential is for.
+    pub audience: String,
+    /// The one exact upstream authority; the credential is added for this authority and no
+    /// other (a credential is bound to the authority that needs it).
+    pub endpoint: Endpoint,
+    /// What a request may ask of the upstream. Never empty on a valid route: a placed
+    /// credential does not get the proxy's empty-rules-admit-all default.
+    pub rules: Vec<EndpointRule>,
+    /// The request header the credential goes in, lowercase (`authorization`, `x-api-key`).
+    pub header: String,
+    /// Public headers the authorizer adds beside the credential (`anthropic-version`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_headers: Vec<HeaderPair>,
+}
+
+impl InjectRoute {
+    /// Whether a request for `method` and `path` (no query) is admitted: by a rule, and by
+    /// nothing else. No rules admit nothing.
+    #[must_use]
+    pub fn admits(&self, method: &str, path: &str) -> bool {
+        self.rules.iter().any(|r| r.matches(method, path))
+    }
+
+    /// Whether the request's authority is this route's, exactly: the host compared without
+    /// regard to case, the port equal, and an absent port taken as 443 (the guest proxy sends
+    /// `Host` without a port, ADR-0040 decision 4).
+    #[must_use]
+    pub fn matches_authority(&self, host: &str, port: Option<u16>) -> bool {
+        self.endpoint.host.eq_ignore_ascii_case(host) && self.endpoint.port == port.unwrap_or(443)
+    }
+
+    /// The request headers a client could use to carry a credential of its own, which the
+    /// authorizer removes (ADR-0040 decision 4): `authorization`, `x-api-key` and this
+    /// route's header, lowercase, sorted, once each. Not the public extra headers.
+    #[must_use]
+    pub fn client_headers_to_strip(&self) -> Vec<String> {
+        let mut names: std::collections::BTreeSet<String> =
+            ["authorization".to_owned(), "x-api-key".to_owned()].into();
+        names.insert(self.header.to_ascii_lowercase());
+        names.into_iter().collect()
+    }
+}
+
+/// The hard cap, in seconds, on a gateway-placed credential's life (ADR-0040 decision 1): a
+/// constant, not a setting. `inject: gateway` refuses a larger `max_ttl` at start, and the
+/// broker never answers a credential that expires later than this from now.
+pub const GATEWAY_CREDENTIAL_MAX_TTL_SECS: i64 = 300;
+
+/// Stable error codes of ADR-0040, in the `error` field of [`ErrorBody`].
+pub mod error_code {
+    /// `POST /v1/token` for an audience declared `inject: gateway` (`403`): the credential is
+    /// the gateway's to place, so the claim SVID on the pool VM cannot obtain it.
+    pub const PLACED_AT_GATEWAY: &str = "placed_at_gateway";
+    /// `POST /v1/gateway/claims/{uid}/credential` for an audience that is not declared
+    /// `inject: gateway` (`403`): the route answers nothing for an audience placed in the proxy.
+    pub const NOT_PLACED_AT_GATEWAY: &str = "not_placed_at_gateway";
+}
+
+/// `POST /v1/gateway/claims/{uid}/credential` body (ADR-0040 decision 2), sent by the gateway
+/// identity only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GatewayCredentialRequest {
+    /// Exactly one audience, declared `inject: gateway`.
+    pub audience: String,
+}
+
+/// `POST /v1/gateway/claims/{uid}/credential` response (ADR-0040 decision 2): the header the
+/// authorizer writes, whole, and when it stops being good. The value prints as `[redacted]`
+/// and is never logged; it travels only to the authorizer, over SPIFFE mutual TLS.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GatewayCredential {
+    /// Echo of the audience.
+    pub audience: String,
+    /// Who the credential acts for (the audit line's subject).
+    pub subject: Subject,
+    /// The request header the credential goes in, lowercase.
+    pub header: String,
+    /// The complete header value: `Bearer <token>` for `authorization`, the bare value for
+    /// another header (as the proxy would have placed it).
+    pub value: Secret,
+    /// Public headers added beside it (`anthropic-version`); empty for the minted backends.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_headers: Vec<HeaderPair>,
+    /// Absolute expiry, at most [`GATEWAY_CREDENTIAL_MAX_TTL_SECS`] after the broker's clock
+    /// when it answered. The gateway holds nothing past it.
+    pub expires_at: DateTime<Utc>,
+}
+
+impl GatewayCredential {
+    /// The gateway's answer from the token the same per-backend code produced for
+    /// `POST /v1/token`: the header and the whole value as the proxy would have placed them,
+    /// and an expiry never later than `now` plus the cap (and never extended: an earlier one
+    /// is kept).
+    #[must_use]
+    pub fn from_token_response(resp: TokenResponse, now: DateTime<Utc>) -> Self {
+        let cap = now + chrono::TimeDelta::seconds(GATEWAY_CREDENTIAL_MAX_TTL_SECS);
+        let (header, value) = match resp.header {
+            Some(h) => (h, resp.access_token),
+            None => (
+                "authorization".to_owned(),
+                format!("Bearer {}", resp.access_token),
+            ),
+        };
+        Self {
+            audience: resp.audience,
+            subject: resp.subject,
+            header,
+            value: Secret(value),
+            extra_headers: resp.extra_headers,
+            expires_at: resp.expires_at.min(cap),
+        }
+    }
 }
 
 /// The operator's pull credential for one registry, handed to the guest for the registry
@@ -688,6 +831,7 @@ mod tests {
             claim_uid: Uuid::nil(),
             expires_at: "2026-01-01T00:00:00Z".parse().unwrap(),
             egress: vec!["api.home.example:443".parse().unwrap()],
+            inject: Vec::new(),
         };
         let json = serde_json::to_value(&full).unwrap();
         assert_eq!(json["egress"][0]["host"], "api.home.example");
@@ -737,6 +881,7 @@ mod tests {
             ca_pem: None,
             credential: Credential::Token,
             credential_header: None,
+            inject_port: None,
         };
         assert!(open.admits("DELETE", "/anything/at/all"));
         let narrow = Route {
@@ -894,5 +1039,258 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         let back: ClaimRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(back.pool_ref, "pool-a");
+    }
+
+    // ----- ADR-0040: the gateway places an audience's credential -----------------------------------------------------
+
+    fn rule(method: &str, path: &str) -> EndpointRule {
+        EndpointRule {
+            method: method.into(),
+            path: path.into(),
+        }
+    }
+
+    fn inject_route(rules: Vec<EndpointRule>) -> InjectRoute {
+        InjectRoute {
+            audience: "anthropic".into(),
+            endpoint: "api.anthropic.example:443".parse().unwrap(),
+            rules,
+            header: "x-api-key".into(),
+            extra_headers: vec![HeaderPair {
+                name: "anthropic-version".into(),
+                value: "2023-06-01".into(),
+            }],
+        }
+    }
+
+    fn token_response(header: Option<&str>, expires_at: &str) -> TokenResponse {
+        TokenResponse {
+            access_token: "sk-ant-not-a-real-credential".into(),
+            token_type: if header.is_some() { "Header" } else { "Bearer" }.into(),
+            expires_at: expires_at.parse().unwrap(),
+            audience: "anthropic".into(),
+            subject: Subject {
+                issuer: "https://idp.example".into(),
+                id: "octocat".into(),
+                display: None,
+            },
+            header: header.map(ToOwned::to_owned),
+            extra_headers: vec![HeaderPair {
+                name: "anthropic-version".into(),
+                value: "2023-06-01".into(),
+            }],
+        }
+    }
+
+    #[test]
+    fn a_gateway_route_says_gateway_on_the_wire_carries_the_inject_port_and_the_proxy_never_swaps_there()
+     {
+        let route = Route {
+            audience: Some("anthropic".into()),
+            endpoint: "api.anthropic.example:443".parse().unwrap(),
+            rules: vec![rule("POST", "/v1/messages")],
+            ca_pem: None,
+            credential: Credential::Gateway,
+            credential_header: Some("x-api-key".into()),
+            inject_port: Some(3133),
+        };
+        let json = serde_json::to_value(&route).unwrap();
+        assert_eq!(json["credential"], "gateway");
+        assert_eq!(json["inject_port"], 3133);
+        assert_eq!(serde_json::from_value::<Route>(json).unwrap(), route);
+        assert!(route.placed_at_gateway());
+        assert!(
+            !route.injects(),
+            "the proxy never swaps the phantom for a token on a gateway route"
+        );
+    }
+
+    #[test]
+    fn a_route_written_before_the_inject_port_still_parses_and_a_route_without_one_does_not_print_it()
+     {
+        let old: Route = serde_json::from_value(serde_json::json!({
+            "endpoint": { "host": "api.example.com", "port": 443 },
+            "credential": "token"
+        }))
+        .unwrap();
+        assert_eq!(old.inject_port, None);
+        assert!(!old.placed_at_gateway());
+        let json = serde_json::to_value(&old).unwrap();
+        assert!(
+            json.get("inject_port").is_none(),
+            "an old guest reads exactly the JSON it always did: {json}"
+        );
+    }
+
+    #[test]
+    fn a_claims_egress_carries_its_inject_routes_and_an_answer_without_them_still_parses() {
+        let with = ClaimEgress {
+            claim_uid: Uuid::nil(),
+            expires_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+            egress: vec!["api.anthropic.example:443".parse().unwrap()],
+            inject: vec![inject_route(vec![rule("POST", "/v1/messages")])],
+        };
+        let json = serde_json::to_value(&with).unwrap();
+        assert_eq!(json["inject"][0]["audience"], "anthropic");
+        assert_eq!(json["inject"][0]["header"], "x-api-key");
+        assert_eq!(serde_json::from_value::<ClaimEgress>(json).unwrap(), with);
+        let none = ClaimEgress {
+            inject: Vec::new(),
+            ..with
+        };
+        assert!(
+            serde_json::to_value(&none).unwrap().get("inject").is_none(),
+            "a claim with no gateway-placed audience answers byte for byte as before"
+        );
+        let old: ClaimEgress = serde_json::from_value(serde_json::json!({
+            "claim_uid": "00000000-0000-0000-0000-000000000001",
+            "expires_at": "2026-01-01T00:00:00Z",
+            "egress": []
+        }))
+        .unwrap();
+        assert_eq!(old.inject, Vec::<InjectRoute>::new());
+    }
+
+    #[test]
+    fn an_inject_route_admits_only_what_a_rule_names_and_never_by_default() {
+        let none = inject_route(Vec::new());
+        assert!(
+            !none.admits("GET", "/"),
+            "a placed credential does not get the proxy's empty-rules-admit-all default (ADR-0040 decision 1)"
+        );
+        let r = inject_route(vec![
+            rule("POST", "/v1/messages"),
+            rule("GET", "/v1/models/*"),
+        ]);
+        assert!(r.admits("post", "/v1/messages"));
+        assert!(r.admits("GET", "/v1/models/claude"));
+        assert!(!r.admits("GET", "/v1/messages"));
+        assert!(!r.admits("POST", "/v1/messages/batches"));
+    }
+
+    #[test]
+    fn an_inject_route_matches_its_authority_exactly_and_a_missing_port_is_443() {
+        let r = inject_route(Vec::new());
+        assert!(r.matches_authority("api.anthropic.example", None));
+        assert!(r.matches_authority("api.anthropic.example", Some(443)));
+        assert!(
+            r.matches_authority("API.Anthropic.Example", None),
+            "host names compare case-insensitively"
+        );
+        assert!(!r.matches_authority("api.anthropic.example", Some(8443)));
+        assert!(!r.matches_authority("api.anthropic.example.evil.example", None));
+        assert!(!r.matches_authority("xapi.anthropic.example", None));
+        assert!(!r.matches_authority("other.example", None));
+    }
+
+    #[test]
+    fn the_headers_a_client_may_not_send_on_a_gateway_route_are_the_standard_pair_and_the_routes_own()
+     {
+        let mut r = inject_route(Vec::new());
+        assert_eq!(
+            r.client_headers_to_strip(),
+            vec!["authorization", "x-api-key"]
+        );
+        r.header = "authorization".into();
+        assert_eq!(
+            r.client_headers_to_strip(),
+            vec!["authorization", "x-api-key"]
+        );
+        r.header = "x-custom-key".into();
+        assert_eq!(
+            r.client_headers_to_strip(),
+            vec!["authorization", "x-api-key", "x-custom-key"]
+        );
+        assert!(
+            !r.client_headers_to_strip()
+                .contains(&"anthropic-version".to_owned()),
+            "the public extra headers are the authorizer's to add, not to strip"
+        );
+    }
+
+    #[test]
+    fn a_gateway_credential_never_prints_its_value_and_round_trips() {
+        let c = GatewayCredential::from_token_response(
+            token_response(Some("x-api-key"), "2026-01-01T00:04:00Z"),
+            "2026-01-01T00:00:00Z".parse().unwrap(),
+        );
+        let debug = format!("{c:?}");
+        assert!(
+            !debug.contains("sk-ant"),
+            "Debug leaked the credential: {debug}"
+        );
+        assert!(debug.contains("[redacted]"), "{debug}");
+        let json = serde_json::to_value(&c).unwrap();
+        assert_eq!(
+            json["value"], "sk-ant-not-a-real-credential",
+            "on the wire it is the plain string"
+        );
+        assert_eq!(json["header"], "x-api-key");
+        assert_eq!(
+            serde_json::from_value::<GatewayCredential>(json).unwrap(),
+            c
+        );
+    }
+
+    #[test]
+    fn a_gateway_credential_is_a_bearer_unless_the_token_names_a_header() {
+        let now: DateTime<Utc> = "2026-01-01T00:00:00Z".parse().unwrap();
+        let bearer = GatewayCredential::from_token_response(
+            token_response(None, "2026-01-01T00:04:00Z"),
+            now,
+        );
+        assert_eq!(bearer.header, "authorization");
+        assert_eq!(
+            bearer.value,
+            Secret("Bearer sk-ant-not-a-real-credential".into())
+        );
+        let bare = GatewayCredential::from_token_response(
+            token_response(Some("x-api-key"), "2026-01-01T00:04:00Z"),
+            now,
+        );
+        assert_eq!(bare.header, "x-api-key");
+        assert_eq!(bare.value, Secret("sk-ant-not-a-real-credential".into()));
+        assert_eq!(bare.extra_headers.len(), 1);
+        assert_eq!(bare.audience, "anthropic");
+        assert_eq!(bare.subject.id, "octocat");
+    }
+
+    #[test]
+    fn a_gateway_credential_never_outlives_the_cap_and_is_never_extended() {
+        assert_eq!(GATEWAY_CREDENTIAL_MAX_TTL_SECS, 300);
+        let now: DateTime<Utc> = "2026-01-01T00:00:00Z".parse().unwrap();
+        let long = GatewayCredential::from_token_response(
+            token_response(None, "2026-01-01T00:15:00Z"),
+            now,
+        );
+        assert_eq!(
+            long.expires_at,
+            "2026-01-01T00:05:00Z".parse::<DateTime<Utc>>().unwrap()
+        );
+        let short = GatewayCredential::from_token_response(
+            token_response(None, "2026-01-01T00:01:40Z"),
+            now,
+        );
+        assert_eq!(
+            short.expires_at,
+            "2026-01-01T00:01:40Z".parse::<DateTime<Utc>>().unwrap()
+        );
+        let past = GatewayCredential::from_token_response(
+            token_response(None, "2025-12-31T23:59:50Z"),
+            now,
+        );
+        assert_eq!(
+            past.expires_at,
+            "2025-12-31T23:59:50Z".parse::<DateTime<Utc>>().unwrap()
+        );
+    }
+
+    #[test]
+    fn the_gateway_placement_error_codes_are_stable_strings() {
+        assert_eq!(error_code::PLACED_AT_GATEWAY, "placed_at_gateway");
+        assert_eq!(error_code::NOT_PLACED_AT_GATEWAY, "not_placed_at_gateway");
+        let req: GatewayCredentialRequest =
+            serde_json::from_value(serde_json::json!({ "audience": "anthropic" })).unwrap();
+        assert_eq!(req.audience, "anthropic");
     }
 }

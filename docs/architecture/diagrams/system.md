@@ -52,6 +52,7 @@ flowchart LR
     service-egress-gateway["Egress gateway (Envoy + mediatore gateway, with the control relay beside them)"]
     service-control-relay["Control relay (Envoy, no identity)"]
     network-sandbox-segment["Sandbox Network Segment"]
+    service-envoy-inject["envoy-inject (credential placement Envoy, ADR-0040)"]
     subgraph sg_system-mediatore [System Mediatore]
         service-mediatore-user-api
         service-mediatore-sandbox-api
@@ -125,6 +126,10 @@ flowchart LR
     system-mediatore -->|TLS| service-openbao
     actor-sandbox-user --> data-asset-cluster-static-entries
     service-spire-server -->|HTTPS| service-openbao
+    service-egress-proxy -->|mTLS| service-envoy-inject
+    service-envoy-inject -->|HTTPS| ecosystem-downstream-api
+    service-envoy-inject -->|TCP| service-egress-gateway
+    service-egress-gateway -->|mTLS| service-mediatore-sandbox-api
 ```
 
 <sub>Source: nodes and relationships in `architecture.json`.</sub>

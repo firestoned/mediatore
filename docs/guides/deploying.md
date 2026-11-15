@@ -596,6 +596,33 @@ them, roadmap 06's libvirt proof extended with the gateways, happened on 2026-11
 against v0.2.0-rc.4: the whole path held, and what it found (the three image defects,
 the mirror behind a port mapping, the Kairos stages above) is fixed or written here.
 
+### Placing an audience's credential at the gateway (ADR-0040)
+
+By default the pool VM's proxy fetches an audience's credential and swaps it in as the request leaves (`inject: proxy`, the default). For an audience that must never put its credential on a pool VM, set `inject: gateway`: the proxy then sends the request, with no credential, to a gateway's inject listener over the claim's mutual TLS, and the gateway's third Envoy originates TLS to the audience's host with the credential the authorizer obtained from the broker.
+
+```yaml
+gateways: ["192.0.2.10", "192.0.2.11", "192.0.2.12"]   # the gateways' sandbox addresses
+gateway_inject_port: 3133                              # the inject listener's own port, never a data-plane port
+audiences:
+  - name: anthropic
+    via: delegated                  # or secret, or sts: something to place
+    inject: gateway
+    max_ttl: 300                    # the cap for a placed credential is 300 seconds
+    egress: ["api.example.com:443"] # exactly one host name and port, never an IP literal
+    rules:                          # required: a placed credential is never granted to every path
+      - { method: POST, path: "/v1/messages" }
+```
+
+The broker refuses at start an audience with `inject: gateway` that has no `gateways`, no `gateway_inject_port`, no `egress`, no `rules`, an IP-literal host, a `max_ttl` above 300 or no credential to place. A placed audience's host is removed from the claim's tunnel lists, so the only path to it is the injecting one. `POST /v1/token` for it answers `403 placed_at_gateway`.
+
+**On each gateway**, nothing changes until a deployment turns the third process on: write the two lines of `image/gateway/env.inject.example` into `/etc/mediatore-gateway/env` above the rest (the authorizer endpoint moves to the check socket, and the host table admits the inject port), start the authorizer with `--check-socket`, `--inject-socket` and `--socket-dir-mode 2750` (two setgid directories, one Envoy's group each; there are no owner or group flags), register the third SPIRE entry for `unix:user:envoy-inject` under the gateway's SPIFFE ID, then `systemctl enable --now envoy-inject.service`. The unit validates its bootstrap before every start. This repository's template renders one upstream; a deployment that places several audiences renders its own from the same shape.
+
+**On each pool VM**, `MEDIATORE_INJECT_PORT` in the guest's env admits the inject port in the host table; the sandbox uid's per-claim table lists it only for a claim with a placed route.
+
+**Operator prerequisites, none of them in this repository** (threat model R-29): the datacenter firewall's allowance for the gateways to reach the audience's host, an OpenBao transit key for `store.sealing.transit` with a policy limited to encrypt and decrypt on it, and the upstream's answer on terms and refresh-token rotation for a delegated session placed from a gateway address. Without the allowance the path fails closed.
+
+**Rollout order and rollback.** Release the broker and authorizer first and confirm the running broker is the new one before editing the config: the configuration does not reject unknown fields, so a broker that predates ADR-0040 ignores `inject: gateway` without a word and keeps the audience in the proxy, which would put the credential on the pool VM. Then roll the gateways, then the pool image, then set `inject: gateway`. To roll back, set the audience back to `inject: proxy` (or remove the line) and restart the broker; the proxy then fetches the credential as before. Stopping `envoy-inject.service` alone fails the placed path closed.
+
 ## What the NetworkPolicy allows
 
 | Direction | Peer | Port | Why |

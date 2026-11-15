@@ -42,6 +42,7 @@ async fn through_proxy(upstream: &TlsUpstream, ca: Option<&str>, min: UpstreamTl
         ca_pem: None,
         credential: Credential::None,
         credential_header: None,
+        inject_port: None,
     };
     let proxy = Arc::new(
         Proxy::with_upstream_trust(
@@ -118,6 +119,7 @@ async fn an_egress_ca_with_no_certificate_refuses_the_proxy_rather_than_doing_no
         ca_pem: None,
         credential: Credential::None,
         credential_header: None,
+        inject_port: None,
     };
     let err = Proxy::with_upstream_trust(
         Routes::new(vec![route]).unwrap(),

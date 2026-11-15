@@ -140,7 +140,7 @@ static_resources:
           - lb_endpoints:
               - endpoint:
                   address:
-                    socket_address: { address: @AUTHORIZER_ADDRESS@, port_value: @AUTHORIZER_PORT@ }
+                    @AUTHORIZER_ENDPOINT@
     # The destinations: whatever authority an admitted CONNECT names, resolved by Envoy.
     - name: destinations
       connect_timeout: 5s

@@ -37,6 +37,8 @@ struct TransitState {
     role: String,
     jwt: String,
     mount: String,
+    /// Where the Kubernetes auth method answers (`kubernetes` unless a test moves it).
+    auth_mount: String,
     lease_secs: u64,
     tokens: HashMap<String, Instant>,
     keys: HashMap<String, Key>,
@@ -88,14 +90,18 @@ fn subkey(secret: &[u8; 32], context: &[u8]) -> LessSafeKey {
     LessSafeKey::new(UnboundKey::from(okm))
 }
 
-/// `POST /v1/auth/kubernetes/login`.
+/// `POST /v1/auth/<auth_mount>/login`: a login at any other mount is the 404 `OpenBao` gives a path nothing serves.
 async fn login(
     State(st): State<Shared>,
+    Path(auth_mount): Path<String>,
     axum::Json(body): axum::Json<serde_json::Value>,
 ) -> Response {
     let mut s = st.lock().expect("transit state");
     if s.down {
         return errors(StatusCode::SERVICE_UNAVAILABLE, "down");
+    }
+    if auth_mount != s.auth_mount {
+        return errors(StatusCode::NOT_FOUND, "no handler for route");
     }
     s.logins += 1;
     let (Some(role), Some(jwt)) = (
@@ -376,6 +382,7 @@ impl FakeTransit {
             role: role.to_owned(),
             jwt: jwt.to_owned(),
             mount: "transit".to_owned(),
+            auth_mount: "kubernetes".to_owned(),
             lease_secs: 3600,
             tokens: HashMap::new(),
             keys: HashMap::new(),
@@ -392,7 +399,7 @@ impl FakeTransit {
 
     async fn serve(state: Shared) -> Self {
         let app = axum::Router::new()
-            .route("/v1/auth/kubernetes/login", axum::routing::post(login))
+            .route("/v1/auth/{auth_mount}/login", axum::routing::post(login))
             .route("/v1/{mount}/encrypt/{key}", axum::routing::post(encrypt))
             .route("/v1/{mount}/decrypt/{key}", axum::routing::post(decrypt))
             .route("/v1/{mount}/sign/{key}", axum::routing::post(sign))
@@ -409,6 +416,11 @@ impl FakeTransit {
 
     fn lock(&self) -> std::sync::MutexGuard<'_, TransitState> {
         self.state.lock().expect("transit state")
+    }
+
+    /// Move the Kubernetes auth method to `mount`: a login anywhere else is a 404.
+    pub fn set_auth_mount(&self, mount: &str) {
+        mount.clone_into(&mut self.lock().auth_mount);
     }
 
     /// Create (or replace) a key, `derived` or not, at version 1.

@@ -19,6 +19,15 @@
 //! TLS with the claim SVID, and the upstream TLS runs inside it ([`crate::forward`], the
 //! forwarder of ADR-0028 decision 3, a dialer in this process by ADR-0027 decision 8).
 //!
+//! A route the gateway places the credential for (`credential: gateway`, ADR-0040 decision 7) takes
+//! a different path: the proxy never asks for a token and holds none. After the same checks (the
+//! rules, a foreign credential is `401`) it strips the phantom and sends the request in origin
+//! form, `Host` the audience's authority, over the claim's mutual TLS to a gateway's inject port,
+//! where the gateway terminates the audience's TLS and places the credential; the body and the
+//! response are streamed. A gateway's own refusal ([`GATEWAY_REFUSAL_HEADER`]) is `502
+//! gateway_refused`, none reachable `502 gateway_unreachable`; a route with nowhere to be sent
+//! refuses the proxy at start, so it is never tunnelled or given a token instead.
+//!
 //! Refusals: `404` for a host outside the routes, `403` for a request outside the audience's
 //! rules, `401` for an `Authorization` that is not the phantom (the workload has no credential
 //! of its own this layer carries), `502` when the token or the upstream cannot be had. A
@@ -56,6 +65,11 @@ pub const PROXY_URL_ENV: &str = "MEDIATORE_EGRESS_PROXY";
 pub const PHANTOM_ENV: &str = "MEDIATORE_TOKEN";
 /// The one line the proxy prints on standard output once it listens; the guest waits for it.
 pub const READY_LINE: &str = "ready";
+/// The response header with which a gateway marks its own refusal of a gateway-placed request
+/// (the authorizer's `403`, ADR-0028 decision 4 and ADR-0040 decision 4) as opposed to the
+/// upstream's answer, which crosses unchanged: the value is the authorizer's code. A response
+/// that carries it is `502 gateway_refused` to the workload; anything else is relayed as it came.
+pub const GATEWAY_REFUSAL_HEADER: &str = "x-mediatore-refusal";
 /// A cached token is replaced this long before its `expires_at`.
 const REFRESH_MARGIN_SECS: i64 = 30;
 /// File names under the sandbox's `egress/` directory.
@@ -195,6 +209,21 @@ impl Routes {
                 !r.injects() || r.audience.is_some(),
                 "route {e} injects a token but names no audience; the proxy cannot choose one"
             );
+            if r.placed_at_gateway() {
+                // The gateway places the credential, so the proxy must know where to send the
+                // request and for whom; a route that cannot be sent anywhere refuses the
+                // proxy (the claim does not start) rather than falling back to a tunnel or
+                // to asking for a token, which would put the credential where this
+                // placement exists to keep it from.
+                anyhow::ensure!(
+                    r.audience.is_some(),
+                    "route {e} is placed at the gateway but names no audience; the gateway cannot choose a credential (ADR-0040 decision 7)"
+                );
+                anyhow::ensure!(
+                    r.inject_port.is_some_and(|p| p != 0),
+                    "route {e} is placed at the gateway but carries no inject_port: there is nowhere to send it, and it is never tunnelled or given a token in its place (ADR-0040 decision 7)"
+                );
+            }
             if let Some(h) = &r.credential_header {
                 let name = HeaderName::from_bytes(h.as_bytes()).map_err(|_| {
                     anyhow::anyhow!("route {e}: credential_header {h:?} is not a header name")
@@ -223,6 +252,12 @@ impl Routes {
     #[must_use]
     pub fn owned_headers(&self) -> &[HeaderName] {
         &self.owned
+    }
+
+    /// The first route the gateway places the credential for, if any (ADR-0040).
+    #[must_use]
+    pub fn first_gateway_placed(&self) -> Option<&Route> {
+        self.by_endpoint.values().find(|r| r.placed_at_gateway())
     }
 
     /// How many routes.
@@ -254,6 +289,18 @@ impl Routes {
             _ => None,
         }
     }
+}
+
+/// The inject ports of the claim's gateway-placed routes (ADR-0040 decision 7), sorted and
+/// without repeats: what the sandbox uid's table must name at each gateway, and nothing
+/// when the claim has no such route.
+#[must_use]
+pub fn inject_ports(routes: &[Route]) -> std::collections::BTreeSet<u16> {
+    routes
+        .iter()
+        .filter(|r| r.placed_at_gateway())
+        .filter_map(|r| r.inject_port)
+        .collect()
 }
 
 /// Why a request is not forwarded.
@@ -526,6 +573,15 @@ impl Proxy {
         tls: rustls::ClientConfig,
         dialer: Dialer,
     ) -> anyhow::Result<Self> {
+        if dialer.is_direct()
+            && let Some(r) = routes.first_gateway_placed()
+        {
+            anyhow::bail!(
+                "route {} (audience {}) is placed at the gateway but the claim lists no egress gateway: the credential cannot be placed anywhere, and it is never fetched here in its place (ADR-0040 decisions 1 and 7)",
+                r.endpoint,
+                r.audience_label()
+            );
+        }
         let mut tls_by_endpoint = HashMap::new();
         for r in routes.by_endpoint.values() {
             if let Some(pem) = &r.ca_pem {
@@ -649,6 +705,9 @@ impl Proxy {
                 return refuse(&r);
             }
         };
+        if forward.route.placed_at_gateway() {
+            return self.handle_at_gateway(req, &forward).await;
+        }
         let route = forward.route.clone();
         let path_log = forward.path_and_query.clone();
         let placed = match (forward.inject, route.audience.as_deref()) {
@@ -706,6 +765,128 @@ impl Proxy {
             }
         }
     }
+}
+
+impl Proxy {
+    /// A request on a gateway-placed route (ADR-0040 decision 7). It has been judged: the rules
+    /// held, and any credential header it carried was the phantom (a foreign one is `401`).
+    /// It is sent in origin form, with `Host` the audience's authority and no credential, over
+    /// the claim's mutual TLS to a gateway's inject port; the gateway terminates the
+    /// audience's TLS and places the credential, so this process never asks for a token and
+    /// never holds one for the route. The response comes back as it was, streamed, unless the
+    /// gateway marked it as its own refusal ([`GATEWAY_REFUSAL_HEADER`]).
+    async fn handle_at_gateway(
+        &self,
+        req: Request<Incoming>,
+        forward: &Forward<'_>,
+    ) -> Response<Body> {
+        let route = forward.route;
+        let method = req.method().clone();
+        // The path alone is logged (the query can carry what the workload put in it).
+        let path_log = forward
+            .path_and_query
+            .split('?')
+            .next()
+            .unwrap_or("/")
+            .to_owned();
+        let Some(port) = route.inject_port.filter(|p| *p != 0) else {
+            // `Routes::new` refuses this route at start; failing closed here too costs nothing.
+            tracing::error!(audience = route.audience_label(), host = %route.endpoint, "a gateway-placed route has no inject port; nothing is sent");
+            return refuse(&Refusal::new(StatusCode::BAD_GATEWAY, "inject_unavailable"));
+        };
+        let upstream = rewrite_for_gateway(req, forward, self.routes.owned_headers());
+        match send_to_gateway(&self.dialer, port, upstream).await {
+            Ok((resp, via)) => {
+                if let Some(code) = resp.headers().get(GATEWAY_REFUSAL_HEADER) {
+                    // The environment's verdict (the authorizer's code), not the upstream's answer.
+                    tracing::warn!(
+                        audience = route.audience_label(),
+                        host = %route.endpoint,
+                        %method,
+                        path = %path_log,
+                        code = %log_safe(code.as_bytes()),
+                        "the gateway refused the request"
+                    );
+                    return refuse(&Refusal::new(StatusCode::BAD_GATEWAY, "gateway_refused"));
+                }
+                tracing::info!(
+                    audience = route.audience_label(),
+                    host = %route.endpoint,
+                    %method,
+                    path = %path_log,
+                    status = %resp.status(),
+                    credential = "gateway",
+                    via = %via.as_ref().map_or_else(|| "-".to_owned(), ToString::to_string),
+                    "forwarded"
+                );
+                let mut resp = resp.map(BodyExt::boxed);
+                for h in HOP_BY_HOP {
+                    resp.headers_mut().remove(&h);
+                }
+                resp
+            }
+            Err(SendError::Dial(e)) => {
+                tracing::error!(audience = route.audience_label(), host = %route.endpoint, error = %e, "no gateway took the request");
+                refuse(&Refusal::new(StatusCode::BAD_GATEWAY, e.code()))
+            }
+            Err(SendError::Upstream(e)) => {
+                tracing::error!(audience = route.audience_label(), host = %route.endpoint, error = %e, "the gateway's connection failed");
+                refuse(&Refusal::new(
+                    StatusCode::BAD_GATEWAY,
+                    "gateway_unreachable",
+                ))
+            }
+        }
+    }
+}
+
+/// A header value as a log field: the characters of a code, a bounded few.
+fn log_safe(v: &[u8]) -> String {
+    String::from_utf8_lossy(v)
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        .take(64)
+        .collect()
+}
+
+/// The request as a gateway's inject port gets it (ADR-0040 decision 7): what [`rewrite`] makes
+/// with no credential placed (origin-form path, `Host` the audience's authority, hop-by-hop and
+/// every owned header dropped, so the phantom never leaves), and `x-api-key` dropped as well
+/// wherever no route owns it. The gateway's authorizer strips the client credential headers too;
+/// this layer does not wait for it.
+fn rewrite_for_gateway(
+    req: Request<Incoming>,
+    forward: &Forward<'_>,
+    owned: &[HeaderName],
+) -> Request<Incoming> {
+    let mut req = rewrite(req, forward, None, owned);
+    req.headers_mut()
+        .remove(HeaderName::from_static("x-api-key"));
+    req
+}
+
+/// To a gateway's inject port through `dialer`, one HTTP/1.1 connection over the claim's mutual
+/// TLS, one request, the body streamed. No second gateway is tried once one holds the
+/// connection: the body cannot be replayed, and whatever answers is the answer.
+async fn send_to_gateway(
+    dialer: &Dialer,
+    port: u16,
+    req: Request<Incoming>,
+) -> Result<(Response<Incoming>, Option<Endpoint>), SendError> {
+    let opened = dialer.inject(port).await.map_err(SendError::Dial)?;
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(opened.conn))
+        .await
+        .map_err(|e| SendError::Upstream(e.into()))?;
+    tokio::spawn(async move {
+        if let Err(e) = conn.await {
+            tracing::debug!(error = %e, "gateway connection ended with an error");
+        }
+    });
+    let resp = sender
+        .send_request(req)
+        .await
+        .map_err(|e| SendError::Upstream(e.into()))?;
+    Ok((resp, opened.via))
 }
 
 /// The request as the upstream gets it: origin-form path, `Host` set to the endpoint,
@@ -1013,6 +1194,7 @@ mod tests {
             ca_pem: None,
             credential: Credential::Token,
             credential_header: None,
+            inject_port: None,
         }
     }
 
@@ -1638,5 +1820,716 @@ mod tests {
         let gateways: Vec<Endpoint> =
             serde_json::from_slice(&std::fs::read(&files.gateways).unwrap()).unwrap();
         assert_eq!(gateways, ["198.51.100.7:8443".parse().unwrap()]);
+    }
+
+    // ----- gateway-placed routes (ADR-0040 decision 7) ---------------------------------------------------------------
+    //
+    // The proxy under test is the real one on a loopback port, driven the way the jailed workload drives it; the
+    // gateway is a fake inject listener on the production sandbox-leg TLS configuration (mutual TLS 1.3, claim
+    // identities only) that records what it received and answers from a script.
+
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use mediatore_testkit::{MemoryMaterial, TestCa};
+    use mediatore_tls::{Authorizer, SpiffeId, TlsConfigs};
+    use tokio::sync::mpsc;
+
+    const TD: &str = "sandbox.test";
+    const CLAIM_ID: &str =
+        "spiffe://sandbox.test/banlieue/claim/00000000-0000-0000-0000-000000000042";
+    const GATEWAY_ID: &str = "spiffe://sandbox.test/gateway";
+    const UPSTREAM: &str = "api.anthropic.example:443";
+
+    fn gw(s: &str) -> Endpoint {
+        s.parse().unwrap()
+    }
+
+    /// What the fake gateway saw of one request.
+    #[derive(Debug, Clone)]
+    struct Seen {
+        peer: String,
+        method: String,
+        target: String,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    }
+
+    impl Seen {
+        fn header(&self, name: &str) -> Option<&str> {
+            self.headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.as_str())
+        }
+    }
+
+    /// How the fake gateway answers.
+    enum Script {
+        /// `200` with the request's own body back.
+        Echo,
+        /// A fixed answer.
+        Fixed {
+            status: u16,
+            headers: Vec<(&'static str, &'static str)>,
+            body: &'static str,
+        },
+        /// `200 text/event-stream`, the body being what the test sends on the channel.
+        Stream(Mutex<Option<mpsc::Receiver<Bytes>>>),
+    }
+
+    struct ChannelBody(mpsc::Receiver<Bytes>);
+
+    impl hyper::body::Body for ChannelBody {
+        type Data = Bytes;
+        type Error = std::convert::Infallible;
+
+        fn poll_frame(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, std::convert::Infallible>>>
+        {
+            self.0
+                .poll_recv(cx)
+                .map(|o| o.map(|b| Ok(hyper::body::Frame::data(b))))
+        }
+    }
+
+    type FakeBody = BoxBody<Bytes, std::convert::Infallible>;
+
+    fn answer(script: &Script, echo: Bytes) -> Response<FakeBody> {
+        match script {
+            Script::Echo => Response::new(Full::new(echo).boxed()),
+            Script::Fixed {
+                status,
+                headers,
+                body,
+            } => {
+                let mut b = Response::builder().status(*status);
+                for (k, v) in headers {
+                    b = b.header(*k, *v);
+                }
+                b.body(Full::new(Bytes::from_static(body.as_bytes())).boxed())
+                    .unwrap()
+            }
+            Script::Stream(rx) => {
+                let rx = rx.lock().unwrap().take().expect("one stream per fake");
+                Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(ChannelBody(rx).boxed())
+                    .unwrap()
+            }
+        }
+    }
+
+    struct FakeGateway {
+        addr: SocketAddr,
+        seen: Arc<Mutex<Vec<Seen>>>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for FakeGateway {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    impl FakeGateway {
+        async fn start(ca: &TestCa, script: Script) -> Self {
+            mediatore_proto::tls::ensure_provider();
+            let material = ca.svid(GATEWAY_ID);
+            let authorizer: Authorizer = Arc::new(|peer: &SpiffeId| {
+                peer.to_string()
+                    .starts_with("spiffe://sandbox.test/banlieue/claim/")
+            });
+            let config = TlsConfigs::build(&material, &authorizer).expect("gateway config");
+            let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let seen: Arc<Mutex<Vec<Seen>>> = Arc::default();
+            let script = Arc::new(script);
+            let recorder = seen.clone();
+            let task = tokio::spawn(async move {
+                loop {
+                    let Ok((tcp, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let (acceptor, script, seen) =
+                        (acceptor.clone(), script.clone(), recorder.clone());
+                    tokio::spawn(async move {
+                        let Ok(tls) = acceptor.accept(tcp).await else {
+                            return;
+                        };
+                        let peer = tls
+                            .get_ref()
+                            .1
+                            .peer_certificates()
+                            .and_then(|c| c.first())
+                            .and_then(|leaf| mediatore_tls::leaf_spiffe_id(leaf).ok())
+                            .map(|id| id.to_string())
+                            .unwrap_or_default();
+                        let service = hyper::service::service_fn(move |req: Request<Incoming>| {
+                            let (script, seen, peer) = (script.clone(), seen.clone(), peer.clone());
+                            async move {
+                                let (parts, body) = req.into_parts();
+                                let body = body
+                                    .collect()
+                                    .await
+                                    .map(http_body_util::Collected::to_bytes)
+                                    .unwrap_or_default();
+                                seen.lock().unwrap().push(Seen {
+                                    peer,
+                                    method: parts.method.to_string(),
+                                    target: parts.uri.to_string(),
+                                    headers: parts
+                                        .headers
+                                        .iter()
+                                        .map(|(k, v)| {
+                                            (
+                                                k.to_string(),
+                                                String::from_utf8_lossy(v.as_bytes()).into_owned(),
+                                            )
+                                        })
+                                        .collect(),
+                                    body: body.to_vec(),
+                                });
+                                Ok::<_, std::convert::Infallible>(answer(&script, body))
+                            }
+                        });
+                        let _ = hyper::server::conn::http1::Builder::new()
+                            .serve_connection(TokioIo::new(tls), service)
+                            .await;
+                    });
+                }
+            });
+            Self { addr, seen, task }
+        }
+
+        fn seen(&self) -> Vec<Seen> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    /// A token source that must never be asked: it counts the asks and refuses them.
+    struct CountingTokens(AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl TokenSource for CountingTokens {
+        async fn token(&self, _audience: &str) -> anyhow::Result<TokenResponse> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("a gateway-placed route never asks for a token")
+        }
+    }
+
+    fn placed(endpoint: &str, inject_port: Option<u16>, rules: &[(&str, &str)]) -> Route {
+        Route {
+            credential: Credential::Gateway,
+            inject_port,
+            ..route("anthropic", endpoint, rules)
+        }
+    }
+
+    struct Harness {
+        base: String,
+        phantom: Phantom,
+        tokens: Arc<CountingTokens>,
+        _task: tokio::task::JoinHandle<()>,
+    }
+
+    async fn harness(ca: &TestCa, routes: Vec<Route>, gateways: Vec<Endpoint>) -> Harness {
+        let material = MemoryMaterial::new(ca.svid(CLAIM_ID));
+        let forwarder = Forwarder::new(gateways, material).unwrap();
+        let phantom = Phantom::generate().unwrap();
+        let tokens = Arc::new(CountingTokens(AtomicUsize::new(0)));
+        let proxy = Proxy::with_webpki_roots(
+            Routes::new(routes).unwrap(),
+            phantom.clone(),
+            tokens.clone(),
+            Dialer::Gateways(forwarder),
+        )
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let _ = Arc::new(proxy).serve(listener).await;
+        });
+        Harness {
+            base,
+            phantom,
+            tokens,
+            _task: task,
+        }
+    }
+
+    /// The jailed workload: plain HTTP to the loopback proxy, never through an ambient proxy.
+    fn workload() -> reqwest::Client {
+        reqwest::Client::builder().no_proxy().build().unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_gateway_placed_route_goes_to_the_inject_port_in_origin_form_with_no_credential() {
+        let ca = TestCa::new(TD);
+        let fake = FakeGateway::start(&ca, Script::Echo).await;
+        let h = harness(
+            &ca,
+            vec![placed(
+                UPSTREAM,
+                Some(fake.addr.port()),
+                &[("POST", "/v1/messages")],
+            )],
+            vec![gw("127.0.0.1:1")],
+        )
+        .await;
+        let body =
+            serde_json::json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]})
+                .to_string();
+        let resp = workload()
+            .post(format!("{}/{UPSTREAM}/v1/messages?beta=1", h.base))
+            .bearer_auth(h.phantom.expose())
+            .header("content-type", "application/json")
+            .body(body.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.text().await.unwrap(),
+            body,
+            "the response comes back unchanged"
+        );
+        let seen = fake.seen();
+        assert_eq!(seen.len(), 1, "one request, to the inject port");
+        let s = &seen[0];
+        assert_eq!(s.peer, CLAIM_ID, "as the claim, over mutual TLS");
+        assert_eq!(
+            (s.method.as_str(), s.target.as_str()),
+            ("POST", "/v1/messages?beta=1"),
+            "origin form, not a CONNECT and not an absolute URI"
+        );
+        assert_eq!(
+            s.header("host"),
+            Some("api.anthropic.example"),
+            "Host without a port"
+        );
+        assert_eq!(s.body, body.as_bytes(), "the body crossed intact");
+        for (k, v) in &s.headers {
+            assert!(!v.contains(h.phantom.expose()), "{k} carries the phantom");
+        }
+        for name in ["authorization", "x-api-key", "proxy-authorization"] {
+            assert!(s.header(name).is_none(), "{name} must not leave the guest");
+        }
+        assert_eq!(
+            h.tokens.0.load(Ordering::SeqCst),
+            0,
+            "POST /v1/token is never called for a gateway-placed route"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_upstream_on_another_port_keeps_it_in_host_because_a_rule_names_that_authority() {
+        let ca = TestCa::new(TD);
+        let fake = FakeGateway::start(&ca, Script::Echo).await;
+        let h = harness(
+            &ca,
+            vec![placed(
+                "api.anthropic.example:8443",
+                Some(fake.addr.port()),
+                &[("GET", "/v1/**")],
+            )],
+            vec![gw("127.0.0.1:1")],
+        )
+        .await;
+        let resp = workload()
+            .get(format!("{}/api.anthropic.example:8443/v1/models", h.base))
+            .bearer_auth(h.phantom.expose())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            fake.seen()[0].header("host"),
+            Some("api.anthropic.example:8443"),
+            "an absent port means 443 at the gateway, so any other port is explicit"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_outside_the_rules_or_with_a_foreign_credential_never_leaves_the_guest() {
+        let ca = TestCa::new(TD);
+        let fake = FakeGateway::start(&ca, Script::Echo).await;
+        let h = harness(
+            &ca,
+            vec![placed(
+                UPSTREAM,
+                Some(fake.addr.port()),
+                &[("POST", "/v1/messages")],
+            )],
+            vec![gw("127.0.0.1:1")],
+        )
+        .await;
+        let url = |p: &str| format!("{}/{UPSTREAM}{p}", h.base);
+        let c = workload();
+        let wrong_method = c
+            .get(url("/v1/messages"))
+            .bearer_auth(h.phantom.expose())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(wrong_method.status(), 403, "a method no rule names");
+        let wrong_path = c
+            .post(url("/v1/organizations"))
+            .bearer_auth(h.phantom.expose())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(wrong_path.status(), 403, "a path no rule names");
+        let foreign = c
+            .post(url("/v1/messages"))
+            .bearer_auth("not-the-phantom")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            foreign.status(),
+            401,
+            "the workload has no credential of its own to send"
+        );
+        assert!(
+            fake.seen().is_empty(),
+            "none of the three reached the gateway"
+        );
+        assert_eq!(h.tokens.0.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn an_api_key_header_is_never_sent_to_the_gateway_even_where_no_route_owns_it() {
+        // The authorizer strips client credential headers too; the guest does not rely on that.
+        let ca = TestCa::new(TD);
+        let fake = FakeGateway::start(&ca, Script::Echo).await;
+        let h = harness(
+            &ca,
+            vec![placed(
+                UPSTREAM,
+                Some(fake.addr.port()),
+                &[("POST", "/v1/messages")],
+            )],
+            vec![gw("127.0.0.1:1")],
+        )
+        .await;
+        let resp = workload()
+            .post(format!("{}/{UPSTREAM}/v1/messages", h.base))
+            .bearer_auth(h.phantom.expose())
+            .header("x-api-key", "sk-ant-the-workloads-own")
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let seen = fake.seen();
+        assert!(seen[0].header("x-api-key").is_none());
+        assert!(
+            seen[0]
+                .headers
+                .iter()
+                .all(|(_, v)| !v.contains("sk-ant-the-workloads-own")),
+            "the value is nowhere in the request"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_streamed_response_is_relayed_as_it_arrives() {
+        let ca = TestCa::new(TD);
+        let (tx, rx) = mpsc::channel::<Bytes>(4);
+        let fake = FakeGateway::start(&ca, Script::Stream(Mutex::new(Some(rx)))).await;
+        let h = harness(
+            &ca,
+            vec![placed(
+                UPSTREAM,
+                Some(fake.addr.port()),
+                &[("POST", "/v1/messages")],
+            )],
+            vec![gw("127.0.0.1:1")],
+        )
+        .await;
+        tx.send(Bytes::from_static(b"event: one\n\n"))
+            .await
+            .unwrap();
+        let mut resp = workload()
+            .post(format!("{}/{UPSTREAM}/v1/messages", h.base))
+            .bearer_auth(h.phantom.expose())
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.headers()["content-type"], "text/event-stream");
+        // The stream is still open (the sender is alive): this chunk arriving proves the body is
+        // relayed as it comes, not buffered to its end.
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), resp.chunk())
+            .await
+            .expect("the first event arrives while the stream is open")
+            .unwrap()
+            .unwrap();
+        assert_eq!(&first[..], b"event: one\n\n");
+        tx.send(Bytes::from_static(b"event: two\n\n"))
+            .await
+            .unwrap();
+        drop(tx);
+        let mut tail = Vec::new();
+        while let Some(c) = resp.chunk().await.unwrap() {
+            tail.extend_from_slice(&c);
+        }
+        assert_eq!(tail, b"event: two\n\n");
+    }
+
+    #[tokio::test]
+    async fn a_gateway_that_is_down_is_skipped_and_the_next_carries_the_request() {
+        // Same inject port on every gateway, as in production; the hosts differ. Nothing listens on
+        // [::1] at that port (the fake is on 127.0.0.1), so that dial is refused at once on any
+        // machine, and the next gateway is tried.
+        let ca = TestCa::new(TD);
+        let fake = FakeGateway::start(&ca, Script::Echo).await;
+        let h = harness(
+            &ca,
+            vec![placed(
+                UPSTREAM,
+                Some(fake.addr.port()),
+                &[("POST", "/v1/messages")],
+            )],
+            vec![gw("[::1]:1"), gw("127.0.0.1:1")],
+        )
+        .await;
+        for _ in 0..8 {
+            let resp = workload()
+                .post(format!("{}/{UPSTREAM}/v1/messages", h.base))
+                .bearer_auth(h.phantom.expose())
+                .body("{}")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200, "whichever gateway the walk starts at");
+        }
+        assert_eq!(fake.seen().len(), 8);
+    }
+
+    #[tokio::test]
+    async fn no_gateway_reachable_is_502_gateway_unreachable() {
+        let ca = TestCa::new(TD);
+        let closed = mediatore_testkit::dead_endpoint().await.port;
+        let h = harness(
+            &ca,
+            vec![placed(UPSTREAM, Some(closed), &[("POST", "/v1/messages")])],
+            vec![gw("[::1]:1")],
+        )
+        .await;
+        let resp = workload()
+            .post(format!("{}/{UPSTREAM}/v1/messages", h.base))
+            .bearer_auth(h.phantom.expose())
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 502);
+        assert_eq!(
+            resp.text().await.unwrap(),
+            r#"{"error":"gateway_unreachable"}"#
+        );
+        assert_eq!(
+            h.tokens.0.load(Ordering::SeqCst),
+            0,
+            "no fallback to fetching a credential"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_gateways_own_refusal_is_502_gateway_refused_and_an_upstreams_answer_is_passed_on()
+    {
+        let ca = TestCa::new(TD);
+        let call = |base: &str, phantom: &Phantom| {
+            workload()
+                .post(format!("{base}/{UPSTREAM}/v1/messages"))
+                .bearer_auth(phantom.expose())
+                .body("{}")
+                .send()
+        };
+        // The authorizer's verdict, marked as the gateway's own.
+        let refusing = FakeGateway::start(
+            &ca,
+            Script::Fixed {
+                status: 403,
+                headers: vec![(GATEWAY_REFUSAL_HEADER, "not_allowed")],
+                body: "not_allowed",
+            },
+        )
+        .await;
+        let h = harness(
+            &ca,
+            vec![placed(
+                UPSTREAM,
+                Some(refusing.addr.port()),
+                &[("POST", "/v1/messages")],
+            )],
+            vec![gw("127.0.0.1:1")],
+        )
+        .await;
+        let resp = call(&h.base, &h.phantom).await.unwrap();
+        assert_eq!(resp.status(), 502);
+        assert_eq!(resp.text().await.unwrap(), r#"{"error":"gateway_refused"}"#);
+        // The upstream's own 403 and 503 are its answers, relayed unchanged.
+        for (status, body) in [
+            (403u16, r#"{"type":"permission_error"}"#),
+            (503, r#"{"type":"overloaded"}"#),
+        ] {
+            let upstream = FakeGateway::start(
+                &ca,
+                Script::Fixed {
+                    status,
+                    headers: vec![("content-type", "application/json")],
+                    body: body_static(body),
+                },
+            )
+            .await;
+            let h = harness(
+                &ca,
+                vec![placed(
+                    UPSTREAM,
+                    Some(upstream.addr.port()),
+                    &[("POST", "/v1/messages")],
+                )],
+                vec![gw("127.0.0.1:1")],
+            )
+            .await;
+            let resp = call(&h.base, &h.phantom).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                status,
+                "the upstream's status, not a gateway refusal"
+            );
+            assert_eq!(resp.text().await.unwrap(), body);
+        }
+    }
+
+    fn body_static(s: &str) -> &'static str {
+        Box::leak(s.to_owned().into_boxed_str())
+    }
+
+    #[test]
+    fn a_gateway_placed_route_that_cannot_be_sent_anywhere_refuses_the_proxy_at_start() {
+        let missing = Routes::new(vec![placed(UPSTREAM, None, &[("POST", "/v1/messages")])])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            missing.contains("inject_port")
+                && missing.contains(UPSTREAM)
+                && missing.contains("ADR-0040"),
+            "{missing}"
+        );
+        let zero = Routes::new(vec![placed(UPSTREAM, Some(0), &[("POST", "/v1/messages")])])
+            .unwrap_err()
+            .to_string();
+        assert!(zero.contains("inject_port"), "{zero}");
+        let nameless = Routes::new(vec![Route {
+            audience: None,
+            ..placed(UPSTREAM, Some(3133), &[("POST", "/v1/messages")])
+        }])
+        .unwrap_err()
+        .to_string();
+        assert!(nameless.contains("audience"), "{nameless}");
+        assert!(
+            Routes::new(vec![placed(
+                UPSTREAM,
+                Some(3133),
+                &[("POST", "/v1/messages")]
+            )])
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_gateway_placed_route_without_a_gateway_in_the_environment_refuses_the_proxy_at_start() {
+        let routes = || {
+            Routes::new(vec![placed(
+                UPSTREAM,
+                Some(3133),
+                &[("POST", "/v1/messages")],
+            )])
+            .unwrap()
+        };
+        let err = Proxy::with_webpki_roots(routes(), phantom(), Arc::new(NoTokens), Dialer::Direct)
+            .err()
+            .expect("direct dial and a gateway-placed route")
+            .to_string();
+        assert!(
+            err.contains("gateway") && err.contains(UPSTREAM) && err.contains("ADR-0040"),
+            "{err}"
+        );
+        // A claim with no gateway-placed route is not affected by the dialer.
+        assert!(
+            Proxy::with_webpki_roots(
+                Routes::new(vec![route("a", "a.example:443", &[])]).unwrap(),
+                phantom(),
+                Arc::new(NoTokens),
+                Dialer::Direct
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn token_and_no_credential_routes_are_unchanged_beside_a_gateway_placed_one() {
+        let none = Route {
+            audience: None,
+            credential: Credential::None,
+            ..route("x", "bundle.example:443", &[])
+        };
+        let all = vec![
+            route("grafana", "grafana.example:443", &[]),
+            none,
+            placed(UPSTREAM, Some(3133), &[("POST", "/v1/messages")]),
+        ];
+        assert_eq!(inject_ports(&all), std::collections::BTreeSet::from([3133]));
+        assert!(
+            inject_ports(&all[..2]).is_empty(),
+            "no gateway-placed route, no inject port"
+        );
+        let routes = Routes::new(all).unwrap();
+        let p = phantom();
+        let bearer = format!("Bearer {}", p.expose());
+        let token = judge(
+            &routes,
+            &p,
+            &Method::GET,
+            "/grafana.example/x",
+            Some(bearer.as_bytes()),
+        )
+        .unwrap();
+        assert!(
+            token.inject && !token.route.placed_at_gateway(),
+            "a token route still gets a token"
+        );
+        let bare = judge(
+            &routes,
+            &p,
+            &Method::GET,
+            "/bundle.example/x",
+            Some(bearer.as_bytes()),
+        )
+        .unwrap();
+        assert!(
+            !bare.inject && !bare.route.placed_at_gateway(),
+            "a route without a credential still gets none"
+        );
+        let at_gateway = judge(
+            &routes,
+            &p,
+            &Method::POST,
+            "/api.anthropic.example/v1/messages",
+            Some(bearer.as_bytes()),
+        )
+        .unwrap();
+        assert!(
+            at_gateway.route.placed_at_gateway() && !at_gateway.inject,
+            "the proxy places no credential here: the gateway does"
+        );
     }
 }

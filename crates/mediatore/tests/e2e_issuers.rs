@@ -90,6 +90,8 @@ impl Harness {
         .expect("sts");
         let store = MemoryStore::shared();
         let state = Arc::new(AppState {
+            inject: std::collections::BTreeMap::new(),
+            inject_port: None,
             store: store.clone(),
             spire: Arc::new(MemoryEntries::default()),
             naming: Naming {

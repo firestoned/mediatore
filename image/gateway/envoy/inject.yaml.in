@@ -1,0 +1,201 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+#
+# Envoy's bootstrap for the egress gateway's inject listener (ADR-0040 decision 3): the third Envoy on the
+# gateway VM, its own unit and user (envoy-inject.service). It terminates a claim's mutual TLS and ORIGINATES
+# TLS to a fixed upstream host, so the credential an audience needs is added at the gateway and never reaches
+# the pool VM. Three processes divide the gateway, so that the one that carries every tunnel never holds a
+# credential: envoy-relay (ADR-0027: no identity, no credential, no TLS), envoy-gateway (ADR-0028: the gateway
+# SVID, mutual TLS to claims, CONNECT, ext_authz yes or no) and this one (the gateway SVID for the claim's
+# mutual TLS, a credential only transiently, in one request's headers).
+#
+# Off by default: the unit is shipped and not enabled, and the host table does not admit the port until the
+# deployment's env file sets it (INJECT_PORT_ELEMENT, env.example). One upstream, as the env file names it
+# (INJECT_HOST, INJECT_UPSTREAM_PORT, INJECT_DOMAIN); a second upstream is a second virtual host and cluster
+# here, a reviewed change like a relay leg (ADR-0027), never a parameter. image/gateway/render fills the
+# upper-case placeholders between at signs from the env files at every start.
+#
+# - One listener, on the sandbox address and its own unprivileged port. TLS 1.3, a client certificate
+#   required; the server certificate is the gateway's own SVID and the trust bundle comes over SDS from the
+#   local SPIRE agent (rotated without a restart). A peer is accepted only if its URI SAN is under
+#   spiffe://<td>/banlieue/claim/. HTTP/1.1 only. No CONNECT, no upgrade, no dynamic forward proxy.
+# - The virtual host's domain is the bare exact host (INJECT_DOMAIN: the host alone for port 443, host:port
+#   for any other, since the guest proxy sends Host without a port). strip_any_host_port stays OFF: on default
+#   Envoy a Host that carries a port against a bare domain is a 404 (fail closed), with it on a request for
+#   the same host on another port would select the same route (the spike, TESTING.md T-61). Any other host: 404.
+# - ext_authz asks the authorizer's INJECT socket, a unix socket only this Envoy's group reaches (ADR-0040
+#   decision 6), with the check context mode: inject. The authorizer alone writes the credential header and
+#   removes client copies in its response. THIS FILE NEVER ADDS OR REMOVES A REQUEST HEADER at route, virtual
+#   host or listener level: that handling runs in the router AFTER ext_authz and would strip what the
+#   authorizer added (shown on 1.40.2, TESTING.md T-61). make gateway-render-check pins that none appears.
+# - Timeouts for a streamed (SSE) response: the idle limit ends a stream that moves nothing, the duration
+#   ceiling is the longest claim's default lifetime, the route has no overall timeout.
+# - PER-CLAIM LIMIT, NOT RENDERED YET: a limit by request rate and concurrent streams keyed on the claim's
+#   identity (ADR-0040 decision 5). The mechanism (a local rate limit with descriptors from the peer SAN is
+#   the candidate) is not proven (ADR-0040 open question 2); until it is, the host table's per-source
+#   connection cap (nftables.conf.in) bounds a sandbox's connections to this port, as for every other port.
+# - Envoy resolves the upstream name itself, on the egress interface. The access log names the peer, method,
+#   authority, the path WITHOUT its query, status and flags: no header, never a credential. No admin block.
+node:
+  id: inject
+  cluster: egress-gateway-inject
+static_resources:
+  listeners:
+    - name: inject
+      address:
+        socket_address: { address: @SANDBOX_ADDRESS@, port_value: @INJECT_PORT@ }
+      per_connection_buffer_limit_bytes: 1048576
+      filter_chains:
+        - transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              require_client_certificate: true
+              common_tls_context:
+                tls_params:
+                  tls_minimum_protocol_version: TLSv1_3
+                  tls_maximum_protocol_version: TLSv1_3
+                  ecdh_curves: ["X25519MLKEM768", "X25519", "P-256"]
+                alpn_protocols: ["http/1.1"]
+                tls_certificate_sds_secret_configs:
+                  - name: "spiffe://@TRUST_DOMAIN@/gateway"
+                    sds_config:
+                      resource_api_version: V3
+                      api_config_source:
+                        api_type: GRPC
+                        transport_api_version: V3
+                        grpc_services:
+                          - envoy_grpc: { cluster_name: spire_agent }
+                combined_validation_context:
+                  default_validation_context:
+                    match_typed_subject_alt_names:
+                      - san_type: URI
+                        matcher: { prefix: "spiffe://@TRUST_DOMAIN@/banlieue/claim/" }
+                  validation_context_sds_secret_config:
+                    name: "spiffe://@TRUST_DOMAIN@"
+                    sds_config:
+                      resource_api_version: V3
+                      api_config_source:
+                        api_type: GRPC
+                        transport_api_version: V3
+                        grpc_services:
+                          - envoy_grpc: { cluster_name: spire_agent }
+          filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: inject
+                codec_type: HTTP1
+                # The authorizer's rules match the path as Envoy hands it over: normalise it first, so a ../ or a doubled slash cannot
+                # walk out of a rule, and refuse an escaped slash instead of decoding it into a different path (ADR-0040 decision 4).
+                normalize_path: true
+                merge_slashes: true
+                path_with_escaped_slashes_action: REJECT_REQUEST
+                http_protocol_options: {}
+                stream_idle_timeout: @INJECT_STREAM_IDLE_SECS@s
+                request_headers_timeout: 30s
+                common_http_protocol_options:
+                  idle_timeout: 300s
+                access_log:
+                  - name: envoy.access_loggers.stdout
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog
+                      log_format:
+                        text_format_source:
+                          inline_string: "inject peer=%DOWNSTREAM_PEER_URI_SAN% method=%REQ(:METHOD)% authority=%REQ(:AUTHORITY)% path=%REQ_WITHOUT_QUERY(:PATH)% status=%RESPONSE_CODE% flags=%RESPONSE_FLAGS% upstream=%UPSTREAM_HOST% rx=%BYTES_RECEIVED% tx=%BYTES_SENT% ms=%DURATION%\n"
+                        formatters:
+                          - name: envoy.formatter.req_without_query
+                            typed_config:
+                              "@type": type.googleapis.com/envoy.extensions.formatter.req_without_query.v3.ReqWithoutQuery
+                route_config:
+                  name: inject
+                  virtual_hosts:
+                    - name: inject_upstream
+                      domains: ["@INJECT_DOMAIN@"]
+                      typed_per_filter_config:
+                        envoy.filters.http.ext_authz:
+                          "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
+                          check_settings: { context_extensions: { mode: inject } }
+                      routes:
+                        - match: { prefix: "/" }
+                          route:
+                            cluster: inject_upstream
+                            timeout: 0s
+                            idle_timeout: @INJECT_STREAM_IDLE_SECS@s
+                            max_stream_duration: { max_stream_duration: @INJECT_MAX_STREAM_SECS@s }
+                http_filters:
+                  - name: envoy.filters.http.ext_authz
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz
+                      transport_api_version: V3
+                      failure_mode_allow: false
+                      status_on_error: { code: Forbidden }
+                      grpc_service:
+                        envoy_grpc: { cluster_name: authorizer_inject }
+                        timeout: 3s
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                      suppress_envoy_headers: true
+  clusters:
+    # The SPIRE agent's SDS, on the local agent's Workload API socket.
+    - name: spire_agent
+      connect_timeout: 1s
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options: {}
+      load_assignment:
+        cluster_name: spire_agent
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    pipe: { path: @SPIRE_SOCKET@ }
+    # The authorizer's INJECT socket: Envoy's Check call over gRPC, the only caller served an inject answer.
+    - name: authorizer_inject
+      connect_timeout: 1s
+      type: STATIC
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options: {}
+      load_assignment:
+        cluster_name: authorizer_inject
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    pipe: { path: @INJECT_AUTHORIZER_SOCKET@ }
+    # The one fixed upstream: TLS originated here, SNI the host, the certificate must carry that DNS name.
+    - name: inject_upstream
+      type: STRICT_DNS
+      dns_lookup_family: V4_ONLY
+      connect_timeout: 5s
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http_protocol_options: {}
+      load_assignment:
+        cluster_name: inject_upstream
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: @INJECT_HOST@, port_value: @INJECT_UPSTREAM_PORT@ }
+      transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+          sni: @INJECT_HOST@
+          common_tls_context:
+            alpn_protocols: ["http/1.1"]
+            tls_params: { tls_minimum_protocol_version: TLSv1_2 }
+            validation_context:
+              trusted_ca: { filename: "@INJECT_CA_FILE@" }
+              match_typed_subject_alt_names:
+                - san_type: DNS
+                  matcher: { exact: @INJECT_HOST@ }

@@ -105,3 +105,9 @@ Added 2026-11-15 ([ADR-0038](../../docs/adr/0038-the-pull-reaches-the-operators-
 
 Left to a live environment: a gateway and a pool member pulling an image through the leg, the
 relay's `upstream=registry` line and the sandbox uid's refused connection to the leg recorded.
+
+Added 2026-11-15 ([ADR-0040](../../docs/adr/0040-the-gateway-places-an-audiences-credential-the-pool-never-holds-it.md)):
+
+- [x] A third Envoy on the gateway (`envoy-inject`: the claim's mutual TLS in, TLS originated to a fixed host, its own user and SPIRE entry), the authorizer's second socket and the broker's credential route, so an audience's credential is placed at the gateway and never held by a pool VM; the guest's route to the inject port, the host table's `MEDIATORE_INJECT_PORT`, and a placed host removed from the tunnel lists (unit, e2e and render tests; `make gateway-render-check`, `make host-table-test`)
+
+Left to a live environment: the integration proof on a real Envoy with the real authorizer, the per-claim limit, the gateways' egress allowance, the OpenBao transit key and a release (threat model R-28, R-29).

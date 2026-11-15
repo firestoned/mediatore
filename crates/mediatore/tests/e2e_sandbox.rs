@@ -33,6 +33,8 @@ impl Harness {
         let idp = FakeIdp::start().await;
         let sandboxes = Arc::new(MemorySandboxes::default());
         let state = Arc::new(AppState {
+            inject: std::collections::BTreeMap::new(),
+            inject_port: None,
             store: MemoryStore::shared(),
             spire: Arc::new(mediatore_spire::MemoryEntries::default()),
             naming: Naming {

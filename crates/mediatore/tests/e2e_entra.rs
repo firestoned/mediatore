@@ -159,6 +159,8 @@ impl Harness {
         let store = MemoryStore::shared();
         let entries = Arc::new(MemoryEntries::default());
         let state = Arc::new(AppState {
+            inject: std::collections::BTreeMap::new(),
+            inject_port: None,
             store: store.clone(),
             spire: entries.clone(),
             naming: Naming {

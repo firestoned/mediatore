@@ -144,6 +144,8 @@ fn state(idp: &FakeIdp, upstream: &TlsUpstream, keyed_upstream: &TlsUpstream) ->
     )
     .expect("sts");
     Arc::new(AppState {
+        inject: std::collections::BTreeMap::new(),
+        inject_port: None,
         store: MemoryStore::shared(),
         spire: Arc::new(mediatore_spire::MemoryEntries::default()),
         naming: Naming {

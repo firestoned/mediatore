@@ -93,6 +93,8 @@ store:
       mount: transit                           # default
       key: mediatore                           # a key created with derived=true
       role: mediatore                          # the Kubernetes auth role
+      auth_mount: kubernetes                   # default; where the Kubernetes auth method is mounted, the login is
+                                               # `POST /v1/auth/<auth_mount>/login` (a platform that mounts it per cluster names it)
       token_file: /var/run/secrets/openbao/token   # default: the projected token
 ```
 

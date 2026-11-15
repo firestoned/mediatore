@@ -144,6 +144,14 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
     let policy_egress = policy_egress(&cfg, reflector.as_deref());
 
     let state = Arc::new(AppState {
+        // Gateway-placed audiences (ADR-0040): the exact routes the broker hands the gateway's authorizer, and the port of the
+        // gateway's inject listener the guests dial. Empty and `None` unless an audience says `inject: gateway`.
+        inject: cfg
+            .gateway_placed()
+            .into_iter()
+            .map(|a| (a.name.clone(), a.inject_routes()))
+            .collect(),
+        inject_port: cfg.gateway_inject_port,
         store,
         spire,
         naming: naming.clone(),
