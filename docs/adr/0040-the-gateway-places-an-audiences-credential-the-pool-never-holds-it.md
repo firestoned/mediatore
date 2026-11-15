@@ -382,6 +382,14 @@ Proven by tests in this repository (each a pinned unit, integration or shell tes
   matching) and `envoy --mode validate` accepting all four rendered bootstraps (the inject and the
   data-plane one, in each repository).
 
+Found live on a gateway rolling v0.2.8 (2026-11-15), fixed in the next release: the authorizer's unit sets
+`RestrictSUIDSGID=yes`, which makes any `chmod` that sets the setgid bit fail with `EPERM`, and `bind` always
+called `chmod 2750` on its socket directories, so the authorizer restarted forever. The unit's root `ExecStartPre`
+already makes each directory at that mode, so `bind` now changes the mode only when it differs
+(`dir_mode_differs`, tests `a_directory_already_at_the_wanted_mode_is_not_chmodded_again` and
+`a_directory_made_at_the_wanted_setgid_mode_binds_and_keeps_it`) and a failed chmod names the directory and the
+cause. The hardening stays on; the unit tests could not see it because they run outside that restriction.
+
 Not proven, said plainly:
 
 - The gRPC `OkHttpResponse` and `DeniedHttpResponse` header behaviour on a non-`CONNECT` route with a
