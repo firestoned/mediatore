@@ -23,6 +23,8 @@ board is [`ROADMAPS.md`](../../ROADMAPS.md) at the repo root.
 | 10 | [10-egress-gateway.md](10-egress-gateway.md) | Envoy gateway on banlieue's proxy VMs, authorizing each tunnel by claim SPIFFE ID |
 | 11 | [11-policy-egress-at-the-gateway.md](11-policy-egress-at-the-gateway.md) | A verified bundle's direct egress served at the gateway, behind `policy.egress` |
 | 12 | [12-claude-end-to-end.md](12-claude-end-to-end.md) | Every configuration the path to the Anthropic API depends on: Dex, SPIRE, notaio, the policies, the broker, the gateways |
+| 13 | [13-declarative-agentsandbox-credentials.md](13-declarative-agentsandbox-credentials.md) | How a resource a requester applies can carry a person's own credential without it sitting in the cluster in the clear: four options, a recommendation, the questions. Design only |
+| 14 | [14-secret-expiry-at-the-ttl.md](14-secret-expiry-at-the-ttl.md) | A stored secret removed right on its TTL, not up to a poll interval after: the envelope stays in Kubernetes, five ways to drive its deletion, a spike to choose. Spike only |
 
 Dependency shape: 01 unblocks 02 (the agents need something to present SVIDs
 to) and 03–05 build on both; 06 needs 02; 07 is design-only until 04 exists; 08 builds on 03 and narrows 05; 09 builds on 05 and 08; 10 needs 02 and 06's image work, and 07 builds on 10.

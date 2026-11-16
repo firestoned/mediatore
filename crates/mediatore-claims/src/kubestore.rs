@@ -337,7 +337,7 @@ impl KubeStore {
 
     /// Put `rec.refresh` and every delegation where the record keeps them: the sandbox's
     /// session Secrets, written as the record's own (`claimed`) and owned by the sandbox;
-    /// an envelope gone from the record (revoked) empties its Secret.
+    /// an envelope gone from the record (revoked) deletes its Secret (ADR-0043 decision 4).
     async fn write_envelope(&self, sb: &AgentSandbox, rec: &ClaimRecord) -> Result<(), StoreError> {
         let Some(sandbox_uid) = rec.sandbox_uid else {
             return Ok(());
@@ -396,8 +396,9 @@ impl KubeStore {
             None => session_name(sandbox_uid),
         };
         let api = self.secrets();
-        match (sealed, api.get_opt(&name).await.map_err(|e| backend(&e))?) {
-            (Some(sealed), Some(_)) => {
+        let existing = api.get_opt(&name).await.map_err(|e| backend(&e))?;
+        match (envelope_write(sealed.is_some(), existing.is_some()), sealed) {
+            (EnvelopeWrite::Replace, Some(sealed)) => {
                 let mut metadata = serde_json::json!({ "labels": { SESSION_LABEL: "claimed" } });
                 if let Some(owners) = owner_refs(&self.home, sb) {
                     metadata["ownerReferences"] = serde_json::json!(owners);
@@ -410,7 +411,7 @@ impl KubeStore {
                     .await
                     .map_err(|e| backend(&e))?;
             }
-            (Some(sealed), None) => {
+            (EnvelopeWrite::Create, Some(sealed)) => {
                 let mut secret = session_secret(
                     &SessionRecord {
                         sandbox_uid,
@@ -428,16 +429,16 @@ impl KubeStore {
                     .await
                     .map_err(|e| backend(&e))?;
             }
-            (None, Some(_)) => {
-                // Dropped (revoked): the envelope's keys go, the Secret stays as the marker.
-                let patch = serde_json::json!({
-                    "data": { "key_id": null, "nonce": null, "ciphertext": null }
-                });
-                api.patch(&name, &PatchParams::default(), &Patch::Merge(patch))
-                    .await
-                    .map_err(|e| backend(&e))?;
+            (EnvelopeWrite::Delete, _) => {
+                // Deleted, not emptied: the Secret is not a marker (the released claim is on the AgentSandbox's status
+                // record), and a stored envelope must not outlive its claim.
+                match api.delete(&name, &DeleteParams::default()).await {
+                    Ok(_) => {}
+                    Err(e) if is_not_found(&e) => {}
+                    Err(e) => return Err(backend(&e)),
+                }
             }
-            (None, None) => {}
+            _ => {}
         }
         Ok(())
     }
@@ -578,6 +579,30 @@ fn owner_of(sb: &AgentSandbox) -> OwnerReference {
         uid: sb.metadata.uid.clone().unwrap_or_default(),
         controller: Some(true),
         block_owner_deletion: Some(false),
+    }
+}
+
+/// What `write_one_envelope` does with one envelope Secret, from whether the record carries an envelope and whether a
+/// Secret exists (ADR-0043 decision 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnvelopeWrite {
+    /// The record carries it and the Secret exists: replace its data.
+    Replace,
+    /// The record carries it and no Secret exists: create one.
+    Create,
+    /// The record no longer carries it (a released claim) and a Secret exists: delete the object, so no empty
+    /// marker outlives the claim.
+    Delete,
+    /// Neither: nothing to do.
+    Nothing,
+}
+
+fn envelope_write(carried: bool, exists: bool) -> EnvelopeWrite {
+    match (carried, exists) {
+        (true, true) => EnvelopeWrite::Replace,
+        (true, false) => EnvelopeWrite::Create,
+        (false, true) => EnvelopeWrite::Delete,
+        (false, false) => EnvelopeWrite::Nothing,
     }
 }
 
@@ -1092,6 +1117,7 @@ impl ClaimStore for KubeStore {
     }
 
     async fn sweep_sessions(&self, before: DateTime<Utc>) -> Result<usize, StoreError> {
+        let now = Utc::now();
         let list = self
             .secrets()
             .list(&ListParams::default().labels(&format!("{SESSION_LABEL}=parked")))
@@ -1102,7 +1128,34 @@ impl ClaimStore for KubeStore {
             let Some(session) = session_of(secret) else {
                 continue;
             };
-            if session.created_at >= before {
+            // Old (the grace period) or expired (ADR-0043 decision 4); the same rule as the in-memory store.
+            if session.created_at >= before && session.expires_at.is_none_or(|e| e > now) {
+                continue;
+            }
+            match self
+                .secrets()
+                .delete(&secret.name_any(), &DeleteParams::default())
+                .await
+            {
+                Ok(_) => swept += 1,
+                Err(e) if is_not_found(&e) => {}
+                Err(e) => return Err(backend(&e)),
+            }
+        }
+        // A bound claim's envelopes (relabelled `claimed` when the record took them) go when they expire, not at the
+        // claim's end: no secret is stored past its expiry (the operator's rule, ADR-0043 decision 4). The record
+        // reads each envelope by name and skips a missing one, so the delegation is simply gone from it. The
+        // age rule does not apply: a long claim's envelope is old and still wanted.
+        let claimed = self
+            .secrets()
+            .list(&ListParams::default().labels(&format!("{SESSION_LABEL}=claimed")))
+            .await
+            .map_err(|e| backend(&e))?;
+        for secret in &claimed.items {
+            let Some(session) = session_of(secret) else {
+                continue;
+            };
+            if session.expires_at.is_none_or(|e| e > now) {
                 continue;
             }
             match self
@@ -1186,6 +1239,16 @@ impl ClaimStore for KubeStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_released_claims_envelope_secret_is_deleted_not_blanked() {
+        // ADR-0043 decision 4: when the record no longer carries an envelope (the claim was released) its Secret is
+        // deleted, not emptied and left as a marker; the released claim is on the `AgentSandbox` status record.
+        assert_eq!(envelope_write(true, true), EnvelopeWrite::Replace);
+        assert_eq!(envelope_write(true, false), EnvelopeWrite::Create);
+        assert_eq!(envelope_write(false, true), EnvelopeWrite::Delete);
+        assert_eq!(envelope_write(false, false), EnvelopeWrite::Nothing);
+    }
 
     #[test]
     fn a_session_is_owned_by_its_sandbox_only_within_the_brokers_namespace() {

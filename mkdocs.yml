@@ -152,6 +152,20 @@ nav:
   - Architecture:
       - System: architecture/diagrams/system.md
       - Flows: architecture/diagrams/flows.md
+  - Design:
+      - Overview: design/index.md
+      - Broker API: design/broker-api.md
+      - Claims and reconcilers: design/claims-and-reconcilers.md
+      - The store and the sealing: design/store-and-sealing.md
+      - Identity and mTLS: design/identity-and-mtls.md
+      - Issuers and audiences: design/issuers-and-audiences.md
+      - Policy: design/policy.md
+      - The guest: design/guest.md
+      - The egress proxy: design/egress-proxy.md
+      - The gateway: design/gateway.md
+      - The CLI: design/client-cli.md
+      - Configuration: design/configuration.md
+      - Testing and fakes: design/testing-and-fakes.md
   - ADRs:
       - "ADR-0001: Record architecture decisions": adr/0001-record-architecture-decisions.md
       - "ADR-0002: A separate project, not a banlieue crate": adr/0002-separate-project-from-banlieue.md
@@ -195,5 +209,6 @@ nav:
       - "ADR-0040: The gateway places an audience's credential, so the pool VM never holds it": adr/0040-the-gateway-places-an-audiences-credential-the-pool-never-holds-it.md
       - "ADR-0041: A requester's own username and password, or token, from the OS credential store": adr/0041-a-requesters-own-username-and-password-or-token-from-the-os-credential-store.md
       - "ADR-0042: The corporate forward proxy, through a Kerberos holder on the gateway": adr/0042-the-corporate-forward-proxy-through-a-kerberos-holder-on-the-gateway.md
+      - "ADR-0043: A person's registry credential is placed at the gateway, the VM never sees it": adr/0043-a-persons-registry-credential-is-placed-at-the-gateway-the-vm-never-sees-it.md
   - Security:
       - Threat model: security/threat-model.md

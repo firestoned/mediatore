@@ -53,7 +53,7 @@
       "unique-id": "data-asset-claim-store",
       "node-type": "data-asset",
       "name": "Claim Store (the Kubernetes API)",
-      "description": "What the broker remembers, in the Kubernetes API (ADR-0034, superseding the database of ADR-0012): the claim record on the AgentSandbox status (status.record, the store's alone: the SPIRE entry id, the node, the bind deadline, the revocation, the policy incarnation and bundle version, the guest's report, the workload's exit; the claim UID and the node as labels), the sealed refresh envelope in a Secret owned by the sandbox (key id, nonce, AES-256-GCM ciphertext bound to the sandbox UID; parked by the API, claimed by the reconciler, rotated at every mint, emptied on revocation), attested nodes as SandboxNode resources (EK hash, agent SPIFFE ID, DMI UUID, banned), removed by the watcher once no VM publishes their EK hash (ADR-0039), notaio's version floors as PolicyFloor resources moved by compare-and-set on resourceVersion. An ended claim is held by its finalizer for store.retention_secs and then swept, the audit line in the log. In memory under dev_mode only."
+      "description": "What the broker remembers, in the Kubernetes API (ADR-0034, superseding the database of ADR-0012): the claim record on the AgentSandbox status (status.record, the store's alone: the SPIRE entry id, the node, the bind deadline, the revocation, the policy incarnation and bundle version, the guest's report, the workload's exit; the claim UID and the node as labels), the sealed refresh envelope in a Secret owned by the sandbox (key id, nonce, AES-256-GCM ciphertext bound to the sandbox UID; parked by the API, claimed by the reconciler, rotated at every mint, emptied on revocation), attested nodes as SandboxNode resources (EK hash, agent SPIFFE ID, DMI UUID, banned), removed by the watcher once no VM publishes their EK hash (ADR-0039), notaio's version floors as PolicyFloor resources moved by compare-and-set on resourceVersion. An ended claim is held by its finalizer for store.retention_secs and then swept, the audit line in the log. In memory under dev_mode only. ADR-0043 decision 4: the sealed envelope in a claim's Secret is deleted, not blanked, when the claim is released, and an envelope for a claim that never binds is deleted when the claim's ttl_seconds has passed counted from creation; the released-claim marker moves to the AgentSandbox status record."
     },
     {
       "unique-id": "service-openbao",
@@ -216,6 +216,15 @@
       "node-type": "service",
       "name": "envoy-inject (credential placement Envoy, ADR-0040)",
       "description": "ADR-0040's third Envoy on each gateway VM, only where an audience is declared inject: gateway: its own systemd unit and static user (envoy-inject), no admin interface, its own SPIRE entry for the gateway SPIFFE ID (unix:user:envoy-inject, one entry per user). One listener on the sandbox address and its own port (INJECT_PORT, admitted by the gateway's nftables table to the sandbox range under the per-source cap): mutual TLS 1.3 with the claim SAN prefix required, HTTP/1.1, no CONNECT route, no dynamic forward proxy. A route matches the request's :authority exactly against the operator's fixed list (INJECT_ENDPOINTS, a reviewed change like a relay leg) and goes to a static cluster per upstream with TLS origination (SNI the host; system roots, or a PEM for a private PKI); a host not in the list has no route (404). ext_authz on the listener asks the authorizer on inject/inject.sock (group envoy-inject) with context_extensions mode inject; the authorizer alone writes the credential header (OVERWRITE_IF_EXISTS_OR_ADD) and removes any a client sent, so no route, virtual-host or listener-level header rule may name the credential header (Envoy applies those after ext_authz; shown on 1.40.2, TESTING.md T-61). Paths are normalised before the authorizer's rules see them (normalize_path, merge_slashes, an escaped slash rejected). The per-claim limit of ADR-0040 decision 5 is not built (a marked placeholder in the template): until it is, the host table's per-source connection cap bounds a sandbox's connections to the port. The credential is in a request's headers for at most the 300 second cap and is never logged (access log without headers, info level, suppress_envoy_headers). The data-plane Envoy and the relay never hold a credential: this is the only Envoy that does. Without a gateway-placed audience it is not started.",
+      "metadata": {
+        "status": "planned"
+      }
+    },
+    {
+      "unique-id": "data-asset-os-credential-store",
+      "node-type": "data-asset",
+      "name": "The requester's saved credential (OS credential store)",
+      "description": "ADR-0041 decision 5, amended by ADR-0043 decision 5: one item per audience in the requester's own OS credential store (the macOS Keychain; service mediatore, account the audience), holding the user name and secret and the time they were saved, created only on an explicit yes (the default is no). Its age limit is the least of six hours and the claim's TTL: an item older than that is deleted and refused, and mediatore logout --audience deletes it. Read and written by the CLI on the requester's machine; never sent anywhere but in the claim body (ADR-0041 decision 3), and the requester's OS decides which other programs may read it. Other platforms have no store source. Status: the six-hour bound is live; the claim-TTL bound (ADR-0043 decision 5) is built and unit-tested, not yet run live.",
       "metadata": {
         "status": "planned"
       }
@@ -609,7 +618,7 @@
     },
     {
       "unique-id": "rel-guest-agent-registry",
-      "description": "The in-guest agent, as root and before the ruleset is loaded, pulls the claim's workload image: the manifest (an index resolved to linux/<arch>) and the layers, each verified against its digest, applied in order with whiteouts into the rootfs on the per-claim tmpfs; nothing escapes the rootfs, setuid bits are dropped, device nodes skipped (ADR-0021). HTTPS with WebPKI roots; plain HTTP only for a registry named on the command line, and never with a credential. The credential, when GET /v1/me carried one, goes to the registry's token endpoint as HTTP Basic, or on the content when the registry challenges with Basic (ADR-0022). In a gateway-era environment the registry is the mirror on the segment, reached at layer 2 through the host table's allowance (ADR-0029); the broker refused any other registry at the claim.",
+      "description": "The in-guest agent, as root and before the ruleset is loaded, pulls the claim's workload image: the manifest (an index resolved to linux/<arch>) and the layers, each verified against its digest, applied in order with whiteouts into the rootfs on the per-claim tmpfs; nothing escapes the rootfs, setuid bits are dropped, device nodes skipped (ADR-0021). HTTPS with WebPKI roots; plain HTTP only for a registry named on the command line, and never with a credential. The credential, when GET /v1/me carried one, goes to the registry's token endpoint as HTTP Basic, or on the content when the registry challenges with Basic (ADR-0022). In a gateway-era environment the registry is the mirror on the segment, reached at layer 2 through the host table's allowance (ADR-0029); the broker refused any other registry at the claim. For a registry that is a placed audience (ADR-0043) the guest does not hold or present a credential at all: the pull goes through the claim's egress proxy and the gateway places it (rel-guest-pull-egress-proxy, rel-envoy-inject-registry); the operator-held credential of ADR-0022 stays for a deployment that accepts it and is not used in a deployment that stores no credential in a Kubernetes Secret.",
       "relationship-type": {
         "connects": {
           "source": {
@@ -843,7 +852,7 @@
     },
     {
       "unique-id": "rel-egress-proxy-envoy-inject",
-      "description": "For a route with credential: gateway (ADR-0040 decision 7) the guest's egress proxy does not tunnel and never calls POST /v1/token: it checks the phantom and the rules as before, strips the phantom, and sends the request in origin form with Host: <audience host> (no port) and no credential, over the claim-SVID mutual TLS 1.3 dialler the forwarder already has, to a gateway's INJECT_PORT (carried on the route by GET /v1/me), streaming the body and returning the response unchanged, failing over to the next gateway on a connection failure only; a response carrying x-mediatore-refusal is the gateway's own refusal and becomes 502 gateway_refused (ADR-0040 decision 12). The workload and the jail are untouched; the sandbox uid's table gains gateway:INJECT_PORT for a claim with such a route and only then, and the pool VM's host table (MEDIATORE_INJECT_PORT in the guest env) admits each gateway at that port for every uid (decision 13).",
+      "description": "For a route with credential: gateway (ADR-0040 decision 7) the guest's egress proxy does not tunnel and never calls POST /v1/token: it checks the phantom and the rules as before, strips the phantom, and sends the request in origin form with Host: <audience host> (no port) and no credential, over the claim-SVID mutual TLS 1.3 dialler the forwarder already has, to a gateway's INJECT_PORT (carried on the route by GET /v1/me), streaming the body and returning the response unchanged, failing over to the next gateway on a connection failure only; a response carrying x-mediatore-refusal is the gateway's own refusal and becomes 502 gateway_refused (ADR-0040 decision 12). The workload and the jail are untouched; the sandbox uid's table gains gateway:INJECT_PORT for a claim with such a route and only then, and the pool VM's host table (MEDIATORE_INJECT_PORT in the guest env) admits each gateway at that port for every uid (decision 13). ADR-0043 adds one use: the guest's pull of a private image goes by the same route, as a read-only request to the registry's host (rel-guest-pull-egress-proxy).",
       "relationship-type": {
         "connects": {
           "source": {
@@ -900,6 +909,54 @@
         }
       },
       "protocol": "mTLS"
+    },
+    {
+      "unique-id": "rel-user-credential-store",
+      "description": "The CLI reads and writes the saved item (--delegate <audience>=store) and asks for the secret at an echo-off terminal prompt (--delegate <audience>=prompt, terminal only, echo switched off through stty). No flag takes the secret, and no source reads a browser or another application's store (ADR-0041 decisions 4 to 6). TB-18 in the threat model.",
+      "relationship-type": {
+        "interacts": {
+          "actor": "actor-sandbox-user",
+          "nodes": [
+            "data-asset-os-credential-store"
+          ]
+        }
+      }
+    },
+    {
+      "unique-id": "rel-guest-pull-egress-proxy",
+      "description": "ADR-0043 decision 3, for a registry that is a placed audience only: the guest starts the claim's egress proxy (the sandbox user, the claim's SVID) before the pull, and the pull's requests reach a second listener of that proxy: a loopback port of its own (MEDIATORE_EGRESS_PULL_PORT, default 18129) that serves the one registry as /<host>/v2/... and nothing else, for gateway-placed routes only, with no credential, no challenge answered and no redirect followed by the puller. No jail rule lists that port (the sandbox uid's firewall set names the proxy's port and the claim's destinations; Landlock admits the proxy's port alone), and root's puller reaches it because the host table admits the loopback interface; the guest refuses a pull port that is the proxy's or a destination's. The proxy sends each request in origin form to a gateway's inject port with Host the registry's. Every other claim keeps today's order (the pull as root, then the proxy) and rel-guest-agent-registry unchanged.",
+      "relationship-type": {
+        "connects": {
+          "source": {
+            "node": "service-guest-agent"
+          },
+          "destination": {
+            "node": "service-egress-proxy"
+          }
+        }
+      },
+      "protocol": "HTTP",
+      "metadata": {
+        "status": "planned"
+      }
+    },
+    {
+      "unique-id": "rel-envoy-inject-registry",
+      "description": "ADR-0043 decision 2: for a registry that is a placed audience (audiences[]: via delegated, credential basic, inject gateway, the registry as the one egress entry, rules admitting only the registry API's read paths) the inject Envoy originates TLS to the registry's host and the authorizer's answer adds Authorization: Basic, the person's own user name and secret opened from the claim's sealed envelope. No registry token is created and no credential, the secret or anything derived from it, reaches the pool VM; the Bearer a registry would mint can live hours (measured: 9000 seconds), which is why the gateway places Basic itself (the operator's Artifactory accepts Basic on /v2/, measured 2026-11-15). The datacenter firewall must let the gateways reach the registry (an external control).",
+      "relationship-type": {
+        "connects": {
+          "source": {
+            "node": "service-envoy-inject"
+          },
+          "destination": {
+            "node": "ecosystem-oci-registry"
+          }
+        }
+      },
+      "protocol": "HTTPS",
+      "metadata": {
+        "status": "planned"
+      }
     }
   ],
   "flows": [
@@ -1060,6 +1117,48 @@
           "description": "Tokens are minted exactly as before: the comparison changes no admission, no claim and no mint. The enforcing ADR is the one that makes a gap a refusal."
         }
       ]
+    },
+    {
+      "unique-id": "flow-registry-pull-placed",
+      "name": "A private image pulled with the person's own credential, which the VM never sees (ADR-0043)",
+      "description": "From the person's prompt to the first layer, for a registry that is a placed audience: the credential is sealed with OpenBao transit in the broker, placed by the gateway as Basic on each registry request, and the pool VM holds neither it nor any token derived from it.",
+      "transitions": [
+        {
+          "sequence-number": 1,
+          "relationship-unique-id": "rel-user-credential-store",
+          "description": "The CLI asks for the user name and secret at the echo-off prompt (or reads the saved item, whose age limit is the claim's TTL) and sends them in POST /v1/claims delegations, as ADR-0041."
+        },
+        {
+          "sequence-number": 2,
+          "relationship-unique-id": "rel-user-mediatore-claims",
+          "description": "The broker seals the credential with the transit key derived from the claim's UID and stores only the ciphertext in the claim's Secret; the claim names an image on a registry that is a placed audience, so the claim must carry a delegation for it."
+        },
+        {
+          "sequence-number": 3,
+          "relationship-unique-id": "rel-guest-pull-egress-proxy",
+          "description": "The guest starts the claim's egress proxy first, then pulls through it on the route only root can open; the requests carry no credential."
+        },
+        {
+          "sequence-number": 4,
+          "relationship-unique-id": "rel-egress-proxy-envoy-inject",
+          "description": "The proxy sends each request in origin form to a gateway's inject port over the claim's mutual TLS."
+        },
+        {
+          "sequence-number": 5,
+          "relationship-unique-id": "rel-envoy-inject-authorizer",
+          "description": "The inject Envoy asks the authorizer, which obtains the credential from the broker over the gateway SVID (rel-gateway-mediatore-credential) and answers with Authorization: Basic."
+        },
+        {
+          "sequence-number": 6,
+          "relationship-unique-id": "rel-envoy-inject-registry",
+          "description": "The inject Envoy originates TLS to the registry and streams the manifest and the layers back; the guest verifies every digest as ever (ADR-0021)."
+        },
+        {
+          "sequence-number": 7,
+          "relationship-unique-id": "rel-user-claim-data",
+          "description": "When the claim is released the broker deletes the sealed envelope's Secret; the authorizer's copy leaves memory with the claim."
+        }
+      ]
     }
   ],
   "metadata": {
@@ -1067,7 +1166,7 @@
     "repository": "https://github.com/firestoned/mediatore",
     "license": "Apache-2.0",
     "calm-schema-version": "1.2",
-    "phase": "dev-mode loop implemented and e2e-tested; Entra OBO is a fail-closed stub. Roadmap 01 (ADR-0006, ADR-0007) implemented and live-tested in kind: registration entries as ClusterStaticEntry through the Kubernetes API, broker identity from the Workload API over the SPIFFE CSI driver, SPIFFE mTLS terminated in-process (crates/mediatore-tls). Roadmap 03 (ADR-0011): the claim watcher, node resolution by EK, node entries from pool members, leader election by Lease. Roadmap 08 (ADR-0008): the AgentSandbox CRD, its reconciler on the same loop, the subject admission policy and the user API creating the resource; records now exist outside dev_mode. SPIRE topology models the ADR-0005 desired state: root on a dedicated identity cluster, downstream per environment; the homelab collapses to the downstream server alone. Roadmap 05 (ADR-0012): one sqlx store over SQLite or PostgreSQL, the sealed refresh envelope, rows swept into an audit table; every kind tier runs the broker on PostgreSQL over verify-full. Roadmap 04, first slice (ADR-0013): the Dex path, with the upstream session delegated at claim creation, sealed, refreshed before every issue and revoked on refusal; mediatore-cli; per-claim rate limiting. Entra OBO and the transit sealer are the roadmap's next slices. ADR-0014: one binary, the roles as subcommands (serve, guest, token, login, sandbox, session), one musl artifact for every host, the jail mounting it read-only; the node entry pins /usr/local/bin/mediatore. ADR-0015: the transit sealer; the kind tiers run the broker on an OpenBao (make kind-openbao) with Kubernetes auth and a derived key; the local sealer stays the homelab shape. ADR-0016: the Entra path, with the caller's token exchanged On-Behalf-Of at claim creation, the session refreshed per audience before every issue, and the broker's credential a signed assertion (key file, OpenBao transit or a federated ServiceAccount token); proven against the fake issuer, the live run against a tenant is by hand. ADR-0017: issuer profiles, the session path for any OIDC issuer (Google and Auth0 beside Dex), per-issuer login parameters and groups claim. ADR-0018: TPM attestation with the SPIFFE community plugin as a kustomize component, the hypervisors' swtpm CAs as the EK bundle; the agent fragments for the VM image. ADR-0019: GuestReady announced by the guest after attestation and registration, the VM units guarded on the installed disk. ADR-0020: the jail in the VM's network namespace behind an nftables ruleset keyed by the sandbox uid, the destinations from the claim's audiences. ADR-0021 implemented: the sandbox filesystem is a size-bounded tmpfs per claim (nosuid, nodev, 0711 since the amendment of 2026-10-31) and the guest pulls the workload rootfs from the registry itself, every blob digest-verified, the manifest digest logged per claim. ADR-0022 implemented: registry pull credentials are the operator's, in the broker's config, handed per claim over GET /v1/me for the registry the image names and used by the guest for one pull. ADR-0023 implemented: the sandbox VM image is a Kairos derivative built from image/Dockerfile and published signed by this repository; the pinned binary path is /usr/bin/mediatore. ADR-0024 implemented: Landlock inside the jail, applied by the binary's jail-exec role through the nono library before the workload runs; what the workload may write and which TCP ports it may connect to hold in the kernel of its own process, no bind, a refusal ends the claim. ADR-0025 implemented: the egress proxy, a second process of the one binary started per claim by the guest as the sandbox user outside the jail; a reverse proxy on loopback that swaps the jail's phantom token for the audience's real one, fetched over the claim SVID and held only there, under nono's endpoint-rule shape (audiences[].rules, carried as routes on GET /v1/me); the jail loses the Workload API socket and the broker route and reaches the proxy's port alone. ADR-0026 accepted (roadmap 09, in progress): notaio's signed policy bundles read from labelled ConfigMaps in the configured namespaces, verified against keys that are configuration, the per-policy version floor moved in the store by a compare and set, and every gap between the broker's configuration and the bundle reported in shadow by code and as the PolicyConformant condition; built so far the policy section of the configuration, the policy_floors table and the mediatore-policy crate over notaio's verifier at the pinned tag."
+    "phase": "dev-mode loop implemented and e2e-tested; Entra OBO is a fail-closed stub. Roadmap 01 (ADR-0006, ADR-0007) implemented and live-tested in kind: registration entries as ClusterStaticEntry through the Kubernetes API, broker identity from the Workload API over the SPIFFE CSI driver, SPIFFE mTLS terminated in-process (crates/mediatore-tls). Roadmap 03 (ADR-0011): the claim watcher, node resolution by EK, node entries from pool members, leader election by Lease. Roadmap 08 (ADR-0008): the AgentSandbox CRD, its reconciler on the same loop, the subject admission policy and the user API creating the resource; records now exist outside dev_mode. SPIRE topology models the ADR-0005 desired state: root on a dedicated identity cluster, downstream per environment; the homelab collapses to the downstream server alone. Roadmap 05 (ADR-0012): one sqlx store over SQLite or PostgreSQL, the sealed refresh envelope, rows swept into an audit table; every kind tier runs the broker on PostgreSQL over verify-full. Roadmap 04, first slice (ADR-0013): the Dex path, with the upstream session delegated at claim creation, sealed, refreshed before every issue and revoked on refusal; mediatore-cli; per-claim rate limiting. Entra OBO and the transit sealer are the roadmap's next slices. ADR-0014: one binary, the roles as subcommands (serve, guest, token, login, sandbox, session), one musl artifact for every host, the jail mounting it read-only; the node entry pins /usr/local/bin/mediatore. ADR-0015: the transit sealer; the kind tiers run the broker on an OpenBao (make kind-openbao) with Kubernetes auth and a derived key; the local sealer stays the homelab shape. ADR-0016: the Entra path, with the caller's token exchanged On-Behalf-Of at claim creation, the session refreshed per audience before every issue, and the broker's credential a signed assertion (key file, OpenBao transit or a federated ServiceAccount token); proven against the fake issuer, the live run against a tenant is by hand. ADR-0017: issuer profiles, the session path for any OIDC issuer (Google and Auth0 beside Dex), per-issuer login parameters and groups claim. ADR-0018: TPM attestation with the SPIFFE community plugin as a kustomize component, the hypervisors' swtpm CAs as the EK bundle; the agent fragments for the VM image. ADR-0019: GuestReady announced by the guest after attestation and registration, the VM units guarded on the installed disk. ADR-0020: the jail in the VM's network namespace behind an nftables ruleset keyed by the sandbox uid, the destinations from the claim's audiences. ADR-0021 implemented: the sandbox filesystem is a size-bounded tmpfs per claim (nosuid, nodev, 0711 since the amendment of 2026-10-31) and the guest pulls the workload rootfs from the registry itself, every blob digest-verified, the manifest digest logged per claim. ADR-0022 implemented: registry pull credentials are the operator's, in the broker's config, handed per claim over GET /v1/me for the registry the image names and used by the guest for one pull. ADR-0023 implemented: the sandbox VM image is a Kairos derivative built from image/Dockerfile and published signed by this repository; the pinned binary path is /usr/bin/mediatore. ADR-0024 implemented: Landlock inside the jail, applied by the binary's jail-exec role through the nono library before the workload runs; what the workload may write and which TCP ports it may connect to hold in the kernel of its own process, no bind, a refusal ends the claim. ADR-0025 implemented: the egress proxy, a second process of the one binary started per claim by the guest as the sandbox user outside the jail; a reverse proxy on loopback that swaps the jail's phantom token for the audience's real one, fetched over the claim SVID and held only there, under nono's endpoint-rule shape (audiences[].rules, carried as routes on GET /v1/me); the jail loses the Workload API socket and the broker route and reaches the proxy's port alone. ADR-0026 accepted (roadmap 09, in progress): notaio's signed policy bundles read from labelled ConfigMaps in the configured namespaces, verified against keys that are configuration, the per-policy version floor moved in the store by a compare and set, and every gap between the broker's configuration and the bundle reported in shadow by code and as the PolicyConformant condition; built so far the policy section of the configuration, the policy_floors table and the mediatore-policy crate over notaio's verifier at the pinned tag. ADR-0041 implemented and proven live 2026-11-15 on v0.2.9 (a person's own user name and token, delegated per claim, sealed with transit, placed by the gateway as Basic, gone from memory with the claim). ADR-0043 proposed: a person's registry credential placed at the gateway for the image pull, the VM never seeing it, the stored envelope deleted at release."
   },
   "adrs": [
     "docs/adr/0001-record-architecture-decisions.md",
@@ -1104,6 +1203,8 @@
     "docs/adr/0037-the-pool-fetches-its-spire-bundle-at-boot-through-the-relay.md",
     "docs/adr/0038-the-pull-reaches-the-operators-registry-through-a-fourth-relay-leg.md",
     "docs/adr/0039-a-node-leaves-the-register-when-its-vm-is-gone.md",
-    "docs/adr/0040-the-gateway-places-an-audiences-credential-the-pool-never-holds-it.md"
+    "docs/adr/0040-the-gateway-places-an-audiences-credential-the-pool-never-holds-it.md",
+    "docs/adr/0041-a-requesters-own-username-and-password-or-token-from-the-os-credential-store.md",
+    "docs/adr/0043-a-persons-registry-credential-is-placed-at-the-gateway-the-vm-never-sees-it.md"
   ]
 }

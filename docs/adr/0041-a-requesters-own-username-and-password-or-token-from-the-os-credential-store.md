@@ -3,7 +3,7 @@
 
 # ADR-0041: A requester's own username and password, or token, from the OS credential store, for an audience that is not OAuth
 
-**Status:** Accepted 2026-11-15, not yet implemented (the ADD cycle of ADR-0040 decision 10 is the order; open questions 1 and 2 are checked at implementation) · **Date:** 2026-11-15
+**Status:** Accepted 2026-11-15; implemented in v0.2.8; amended 2026-11-15 after the first live run (decision 7: a git host may refuse the password, and then a token is required; a threat-model pass and an SSH decision are still owed) · **Date:** 2026-11-15
 
 Roadmap 04 (the backends) and roadmap 12 (the path to the upstreams). Extends
 [ADR-0035](0035-a-requesters-own-session-delegated-at-claim-time.md) (`via: delegated`, the
@@ -23,7 +23,7 @@ of the kind ADR-0035 delegates:
 | Upstream | How a person authenticates | What the sandbox needs to present |
 | --- | --- | --- |
 | `ghe.example.com` | Entra (the broker's Entra backend, ADR-0016, already exists) | a bearer, or a token minted On-Behalf-Of |
-| `git.home.example` | LDAP: a user name and password; `401` without them | HTTP Basic with a user name and a password or a personal access token |
+| `git.home.example` | LDAP for the web UI; for Git over HTTPS the host refuses the password (`Password authentication is not available for Git operations`, `403`) and wants a personal access token or an SSH key; `401` with no credential | HTTP Basic with a user name and a personal access token (decision 7, amended) |
 
 Measured 2026-11-15 on mediatore 0.2.6 with the `gitserver` policy: a request from the jail reaches
 the host through the gateway over TLS 1.2 and is answered `401`. The transport is proven; there is
@@ -125,17 +125,32 @@ Three questions follow, and this ADR answers each:
    Entra On-Behalf-Of (ADR-0016), where the browser is used to sign in and mediatore receives a token
    it was granted, as `mediatore login` already does for the issuer.
 
-7. **The LDAP password is the accepted shape; a personal access token is allowed and not required.**
-   The operator has decided to delegate the person's own password for `git.home.example`, though
-   the host accepts personal access tokens for Git over HTTPS, and this ADR records that as a
-   decision and an accepted risk, not a recommendation to revisit. The broker cannot tell a password
-   from a token and does not try (decision 1), so a person who has a token may send it with the same
-   command. Because the password is the person's login for other systems, the controls around it
-   carry the weight: it is gateway-placed only (decision 2), sealed to the claim (decision 3), never on
-   a pool VM, in the jail, in a log or in the status, bounded by the claim's TTL, held by the CLI
-   for six hours at most (decision 5), and the route's `rules` allow only the smart-HTTP read paths
-   (decision 8). The CLI says once per claim that it is sending a user name and a secret, and which
-   audience it is for, with no advice attached.
+7. **The secret is a password where the host accepts one, and a personal access token where it does not (amended 2026-11-15).**
+   The first version of this decision chose the person's LDAP password for `git.home.example` and
+   recorded a token as allowed and not required, as an accepted risk. The first live run showed the
+   premise wrong for that host: its web UI signs in through LDAP, but for Git over HTTPS it answers
+   every Basic password with `403 Password authentication is not available for Git operations. You
+   must use a personal access token or SSH key.` The same account called directly with `curl` got the
+   same `403`, so the gateway's placement was correct and the host's rule is the cause. The same claim
+   with a personal access token as the secret got `200` and the ref advertisement (section "What was
+   proven"). The broker still cannot tell a password from a token and does not try (decision 1), so
+   nothing in the mechanism changes: the CLI's `prompt` asks for "password or token", and the header is
+   `Authorization: Basic base64(user:secret)` either way. What changes is the recommendation and the
+   risk, because a token is a different credential from a password:
+   - it is long-lived until it expires or is revoked, and the person, not mediatore, sets that, so the
+     claim's five-minute bound limits where it is *placed*, not how long it stays valid on the host;
+   - it carries its own scope, which can be narrower than the login's (read-only, one repository),
+     and it is not the person's login for any other system, so a leak costs less than a password's;
+   - it is revocable on the host without changing the person's login.
+   So for a host that refuses passwords, a token with the narrowest scope the host offers and the
+   shortest expiry it allows is the shape to use, and the controls around it are the ones this ADR
+   already has: gateway-placed only (decision 2), sealed to the claim (decision 3), never on a pool VM,
+   in the jail, in a log or in the status, bounded by the claim's TTL, held by the CLI for six hours at
+   most (decision 5), and the route's `rules` allow only the smart-HTTP read paths (decision 8). For
+   a host that accepts the password, the original reasoning stands: the password is the person's
+   login for other systems, so it carries more weight, and the operator accepts that risk per host. The
+   CLI says once per claim that it is sending a user name and a secret, and which audience it is for,
+   with no advice attached (not built, see Implementation notes).
 
 8. **The gateway places it as `Authorization: Basic`, over the fixed route, and nothing else.** The
    authorizer's inject answer (ADR-0040 decision 4) gains the `basic` form: it builds the header
@@ -223,9 +238,25 @@ Proven 2026-11-15 on mediatore 0.2.6, `sandbox-pool-mtest`, with `TESTING.md` T-
   TLS 1.2 and the host answers `401` to `GET /org-oss/curl-curl.git/info/refs` (exit `4`).
 - A claim under the `ghe` policy needs a bearer; not tested here.
 
-Not proven live: the `basic` credential kind, the Keychain source, `logout`, the header form and the
-user-id refusal are implemented and unit-tested (see Implementation notes) but not run against a live
-broker, gateway and upstream. The ADD cycle (ADR-0040 decision 10) is the
+Proven 2026-11-15 on mediatore 0.2.9 (broker, three gateways, CLI), `sandbox-pool-mtest`, with the times
+and log lines in the deployment's `TESTING.md`:
+
+- The whole path against the real host with a **token** as the secret: the CLI's `prompt` source, the delegation
+  sealed with OpenBao transit, `gateway credential issued ... backend="delegated"` with a five-minute
+  expiry, the gateway's inject check `verdict="allow"`, the inject Envoy's `GET /<org>/<repo>.git/info/refs`
+  answered `200` with the ref advertisement, workload exit `0`, and `claim released; its routes and
+  credentials are gone from memory` about ten seconds after the workload exited. No credential in
+  any log line, the pool VM or the status.
+- The same claim with the person's **password**: `403`, and a direct `curl -u` with the same account
+  gets the same `403` (decision 7, amended).
+- A policy whose audience is not requested reaches the host by no route: `404 no_route` from the
+  guest's proxy once the direct egress entry is gone.
+
+Not proven live: the macOS Keychain source and `logout` (a save was confirmed on screen, and a
+later `logout --audience` reported `no credential saved ... remains`; why the item was already
+gone is not explained, and whether a successful claim removes it is unchecked), the user-id refusal, and the
+header form against a host that accepts the password. These are implemented and unit-tested (see
+Implementation notes). The ADD cycle (ADR-0040 decision 10) is the
 order: write the failing tests (a `basic` audience refused with `inject: proxy`; a user name with `:`
 refused; `Basic` header built and the client's `Authorization` overwritten; the store source returns
 nothing on a non-TTY with no store; the cookie path does not exist), then the code.
@@ -244,5 +275,15 @@ nothing on a non-TTY with no store; the cookie path does not exist), then the co
 2. **Windows and Linux.** Not built (decision 5). Whether a managed Windows machine lets a CLI write
    to the Credential Manager is for whoever runs one to find out; until then those platforms use
    `prompt`, `env:` and `file:`.
-3. **Kerberos.** `proxy.home.example:8080` wants Kerberos, not Basic. It is a different shape and has
+3. **SSH keys.** The person's own way into this host is an SSH key (`git@git.home.example:<org>/<repo>.git`),
+   and a key-based SSH login is not something a gateway can place in a header. Three directions, each
+   its own decision: short-lived SSH certificates from an OpenBao SSH CA (an ephemeral key in the
+   claim and a certificate valid for minutes, which needs the host to trust that CA and port 22 open
+   from the gateways); a signing proxy at the gateway that terminates SSH and signs with a key it
+   holds (nothing key-shaped in the sandbox, a much larger build); or staying on tokens (this
+   decision). Not decided and not built.
+4. **Threat model.** `docs/security/threat-model.md` has no entry for a delegated Basic credential or for a
+   token as the secret (long-lived, its own scope, a secret the person created on the upstream). The pass
+   that an implemented ADR owes (`.claude/rules/threat-modeling.md`) is owed here, with the stamp bumped.
+5. **Kerberos.** `proxy.home.example:8080` wants Kerberos, not Basic. It is a different shape and has
    its own ADR: [ADR-0042](0042-the-corporate-forward-proxy-through-a-kerberos-holder-on-the-gateway.md).

@@ -459,10 +459,21 @@ impl ClaimStore for MemoryStore {
     }
 
     async fn sweep_sessions(&self, before: DateTime<Utc>) -> Result<usize, StoreError> {
+        let now = Utc::now();
         let mut m = self.sessions.write().await;
         let n = m.len();
-        m.retain(|_, s| s.created_at >= before);
-        Ok(n - m.len())
+        // Old (the grace period) or expired (ADR-0043 decision 4: a credential stops being useful when it expires).
+        m.retain(|_, s| s.created_at >= before && s.expires_at.is_none_or(|e| e > now));
+        let mut swept = n - m.len();
+        // The same rule for an envelope already on a bound claim's record: stored no longer than it is useful
+        // (the operator's rule, ADR-0043 decision 4), which can be before the claim ends.
+        for rec in self.claims.write().await.values_mut() {
+            let held = rec.delegations.len();
+            rec.delegations
+                .retain(|_, d| d.expires_at.is_none_or(|e| e > now));
+            swept += held - rec.delegations.len();
+        }
+        Ok(swept)
     }
 
     async fn get_policy_floor(

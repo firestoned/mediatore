@@ -813,8 +813,31 @@ impl Config {
                 .iter()
                 .filter(|r| r.reach.is_some())
                 .map(|r| canonical_registry(&r.host))
+                // A registry the gateway places a credential for is reached through the gateway (ADR-0043).
+                .chain(self.placed_registries().into_keys())
                 .collect(),
         )
+    }
+
+    /// The registries that are gateway-placed audiences (ADR-0043 decision 1), by the name a reference to an image
+    /// on them carries (the host, with the port only when it is not 443), each with the audience that serves it. A
+    /// claim naming an image there must name that audience and delegate a credential for it.
+    #[must_use]
+    pub fn placed_registries(&self) -> std::collections::BTreeMap<String, String> {
+        self.audiences
+            .iter()
+            .filter(|a| a.inject == Inject::Gateway)
+            .flat_map(|a| {
+                a.egress.iter().map(move |e| {
+                    let host = if e.port == 443 {
+                        e.host.clone()
+                    } else {
+                        format!("{}:{}", e.host, e.port)
+                    };
+                    (host, a.name.clone())
+                })
+            })
+            .collect()
     }
 
     /// Load and sanity-check.
@@ -1796,6 +1819,39 @@ listen: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }
         Config::parse(&format!("{base}audiences:\n{audiences}"))
             .unwrap_err()
             .to_string()
+    }
+
+    #[test]
+    fn a_placed_audiences_host_is_a_reachable_registry_and_names_its_audience() {
+        // ADR-0043 decision 1: a registry the gateway places a credential for is reached through the gateway, so a claim
+        // may name an image on it, and the broker knows which audience serves that registry.
+        let cfg = Config::parse(&inject_cfg(INJECT_OK)).unwrap();
+        assert!(
+            cfg.reachable_registries()
+                .unwrap()
+                .contains("api.anthropic.example"),
+            "the host of a gateway-placed audience is reachable"
+        );
+        assert_eq!(
+            cfg.placed_registries()
+                .get("api.anthropic.example")
+                .map(String::as_str),
+            Some("anthropic")
+        );
+        // A port other than 443 is part of the name, as an image reference carries it.
+        let odd = INJECT_OK.replace("api.anthropic.example:443", "registry.home.example:5443");
+        let cfg = Config::parse(&inject_cfg(&odd)).unwrap();
+        assert!(
+            cfg.reachable_registries()
+                .unwrap()
+                .contains("registry.home.example:5443")
+        );
+        assert_eq!(
+            cfg.placed_registries()
+                .get("registry.home.example:5443")
+                .map(String::as_str),
+            Some("anthropic")
+        );
     }
 
     // ----- ADR-0041: credential: basic ----------------------------------------------------------------------------------
