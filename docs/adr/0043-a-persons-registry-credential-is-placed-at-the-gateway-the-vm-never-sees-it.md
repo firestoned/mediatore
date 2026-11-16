@@ -116,7 +116,7 @@ What the code does today, so the decisions below are about a real starting point
 7. **The interface is the claim body, so a requester with no CLI is served.** `POST /v1/claims` already
    takes `delegations`; this ADR adds no field. A declarative `AgentSandbox` (a resource a requester
    applies) cannot carry a credential, because its `spec` is stored in the cluster in the clear. That
-   case is its own design: [roadmap 13](../../.github/community/13-declarative-agentsandbox-credentials.md).
+   case is its own design: [roadmap 13](https://github.com/firestoned/mediatore/blob/main/.github/community/13-declarative-agentsandbox-credentials.md).
 
 ## Consequences
 
