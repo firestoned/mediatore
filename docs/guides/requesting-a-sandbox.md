@@ -28,6 +28,16 @@ curl -sS https://mediatore.sandbox.example/v1/claims \
 # {"name":"sandbox-3f9a1c2e","phase":"Pending","ready":false,"addresses":[]}
 ```
 
+`pool_ref` names one `VirtualMachinePool` in that namespace. To let banlieue pick among
+several, send `pool_selector` instead, a Kubernetes label selector over the namespace's pools
+([ADR-0044](../adr/0044-a-sandbox-selects-its-pool-by-label.md), banlieue ADR-0132): `{}`
+means every pool in the namespace, and `"pool_selector": { "match_labels": { "sandbox.example.com/image": "agent" } }`
+the pools so labelled. Exactly one of the two: a body with neither or both is refused with
+`400 invalid_pool`, never read as "any pool". The response's `pool` is the pool the member
+came from, once the claim is bound. The CLI (`mediatore sandbox create`) takes `--pool <name>`
+or `--pool-selector key=value`; with neither it sends `pool_selector: {}` and says so, so a
+plain `sandbox create` claims across all the namespace's pools.
+
 An audience served from your own credential (`via: delegated`,
 [ADR-0035](../adr/0035-a-requesters-own-session-delegated-at-claim-time.md)) takes it in
 the same request, `"delegations": [{ "audience": "anthropic", "token": "...", "expires_at":
@@ -60,7 +70,9 @@ does the rest (below). Only the subject the token names can read or delete it.
 
 Anything with `create` on `agentsandboxes` in a namespace can request a sandbox there: a
 GitOps repository, a CI job, an app-only service. The pool must live in the same
-namespace.
+namespace, named with `poolRef` or selected with `poolSelector` (a `LabelSelector` over the
+namespace's pools, `{}` for all of them; exactly one of the two, enforced by CEL on the
+resource).
 
 ```yaml
 apiVersion: mediatore.io/v1alpha1
@@ -86,6 +98,9 @@ $ kubectl -n agents get agentsandboxes
 NAME                  SUBJECT   POOL     PHASE   READY   AGE
 ledgers-2026-10-14    octocat   agents   Bound   true    41s
 ```
+
+The `POOL` column is `status.poolRef.name`, the pool the bound member came from, so it reads
+the same for a named pool and a selected one, and is empty while the sandbox is `Pending`.
 
 ### Naming a policy
 

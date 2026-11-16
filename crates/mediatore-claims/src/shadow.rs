@@ -287,9 +287,10 @@ mod tests {
                 id: "octocat".into(),
                 display: None,
             },
-            pool_ref: LocalObjectReference {
+            pool_ref: Some(LocalObjectReference {
                 name: "pool".into(),
-            },
+            }),
+            pool_selector: None,
             ttl_seconds: 3600,
             audiences: audiences.iter().map(|a| (*a).to_owned()).collect(),
             workload: SandboxWorkload {

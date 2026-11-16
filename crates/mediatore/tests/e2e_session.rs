@@ -173,7 +173,8 @@ impl Harness {
             .post(format!("{}/v1/claims", self.user_url))
             .bearer_auth(id_token)
             .json(&ClaimRequest {
-                pool_ref: "pool-a".into(),
+                pool_ref: Some("pool-a".into()),
+                pool_selector: None,
                 ttl_seconds: 3600,
                 audiences: vec![AUDIENCE.into()],
                 workload: Workload {

@@ -322,7 +322,7 @@ dependencies = [
 [[package]]
 name = "banlieue-api"
 version = "0.5.0"
-source = "git+https://github.com/firestoned/banlieue?tag=v0.5.0#c4dafa751ff39f0f2137a718363bea2d668044a4"
+source = "git+https://github.com/firestoned/banlieue?tag=v0.5.9#069fc7e96439c3f423d068c2193f67ef43793768"
 dependencies = [
  "k8s-openapi",
  "kube",
@@ -3337,7 +3337,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d43fb82d550b07e6f929a58d7d0935182602f48ddead875f5ee313c41c8f07fe"
 dependencies = [
  "annotate-snippets",
- "base64 0.22.1",
+ "base64 0.23.1",
  "encoding_rs_io",
  "granit-parser",
  "nohash-hasher",
@@ -3860,7 +3860,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

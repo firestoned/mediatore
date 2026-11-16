@@ -215,7 +215,8 @@ impl Harness {
             .claim(
                 session,
                 &ClaimRequest {
-                    pool_ref: "pool-a".into(),
+                    pool_ref: Some("pool-a".into()),
+                    pool_selector: None,
                     ttl_seconds: 3600,
                     audiences: vec![AUDIENCE.into()],
                     workload: Workload {

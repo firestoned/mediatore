@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 
 use clap::{Args, Subcommand};
-use mediatore_proto::{ClaimRequest, Workload};
+use mediatore_proto::{ClaimRequest, PoolSelector, Workload};
 
 use crate::{Api, LoginOptions, Redirect, Session};
 
@@ -171,9 +171,18 @@ pub struct CreateArgs {
     /// Where and as whom.
     #[command(flatten)]
     pub target: Target,
-    /// The pool to claim from.
-    #[arg(long, help = "The VirtualMachinePool to claim from")]
-    pub pool: String,
+    /// One pool, by name. Without it and without --pool-selector, the claim is made across
+    /// every pool in the sandbox namespace (ADR-0044 decision 3).
+    #[arg(
+        long,
+        conflicts_with = "pool_selector",
+        help = "The VirtualMachinePool to claim from; default: any pool in the namespace"
+    )]
+    pub pool: Option<String>,
+    /// Any pool whose labels match, as <key>=<value> (repeatable; all must match). Without
+    /// --pool and without this, every pool in the namespace.
+    #[arg(long = "pool-selector", value_name = "KEY=VALUE")]
+    pub pool_selector: Vec<String>,
     /// Lifetime in seconds, counted from bind
     #[arg(long, default_value_t = 3600)]
     pub ttl: u32,
@@ -343,6 +352,32 @@ async fn login(args: LoginArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `--pool` or `--pool-selector`, as the request carries it (ADR-0044 decision 3): a name,
+/// a `match_labels` selector, or, with neither flag, the empty selector that means every
+/// pool in the namespace, written down rather than left for the broker to guess.
+///
+/// # Errors
+/// A selector term that is not `<key>=<value>`, or an empty key.
+pub fn pool_choice(
+    pool: Option<String>,
+    selector: &[String],
+) -> anyhow::Result<(Option<String>, Option<PoolSelector>)> {
+    if let Some(name) = pool {
+        return Ok((Some(name), None));
+    }
+    let mut sel = PoolSelector::default();
+    for term in selector {
+        let (k, v) = term
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("--pool-selector takes <key>=<value>, got {term:?}"))?;
+        if k.is_empty() {
+            anyhow::bail!("--pool-selector takes <key>=<value>, got an empty key in {term:?}");
+        }
+        sel.match_labels.insert(k.to_owned(), v.to_owned());
+    }
+    Ok((None, Some(sel)))
+}
+
 async fn create(args: CreateArgs) -> anyhow::Result<()> {
     let path = args.target.session.path()?;
     let session = Session::load(&path)?;
@@ -357,8 +392,22 @@ async fn create(args: CreateArgs) -> anyhow::Result<()> {
         );
         delegations.push(cred.delegation(&audience));
     }
+    let (pool_ref, pool_selector) = pool_choice(args.pool, &args.pool_selector)?;
+    if let Some(sel) = &pool_selector {
+        eprintln!(
+            "claiming from {} in the sandbox namespace",
+            match mediatore_proto::PoolChoice::Selected(sel)
+                .to_string()
+                .as_str()
+            {
+                "any pool" => "any pool".to_owned(),
+                terms => format!("any pool matching {terms}"),
+            }
+        );
+    }
     let request = ClaimRequest {
-        pool_ref: args.pool,
+        pool_ref,
+        pool_selector,
         ttl_seconds: args.ttl,
         audiences: args.audiences,
         workload: Workload {
@@ -473,6 +522,57 @@ mod tests {
             t.ca_file.as_deref(),
             Some(std::path::Path::new("/etc/ca.pem"))
         );
+    }
+
+    // ----- ADR-0044 decision 3: --pool, --pool-selector, or neither (any pool) -----------------
+
+    #[test]
+    fn a_named_pool_is_sent_as_pool_ref_alone() {
+        assert_eq!(
+            pool_choice(Some("pool-a".into()), &[]).unwrap(),
+            (Some("pool-a".into()), None)
+        );
+    }
+
+    #[test]
+    fn selector_terms_become_match_labels() {
+        let (name, sel) = pool_choice(
+            None,
+            &["sandbox.example.com/image=agent".into(), "zone=a".into()],
+        )
+        .unwrap();
+        assert!(name.is_none());
+        let sel = sel.expect("a selector");
+        assert_eq!(
+            sel.match_labels,
+            std::collections::BTreeMap::from([
+                ("sandbox.example.com/image".to_owned(), "agent".to_owned()),
+                ("zone".to_owned(), "a".to_owned()),
+            ])
+        );
+        assert_eq!(sel.match_expressions, Vec::new());
+    }
+
+    /// Neither flag is "any pool in the namespace", sent as the empty selector so the
+    /// request says so, rather than leaving the broker to read an absence (ADR-0044
+    /// decision 3; banlieue ADR-0132 decision 2).
+    #[test]
+    fn neither_flag_sends_the_empty_selector_not_nothing() {
+        assert_eq!(
+            pool_choice(None, &[]).unwrap(),
+            (None, Some(PoolSelector::default()))
+        );
+    }
+
+    #[test]
+    fn a_selector_term_without_an_equals_sign_or_a_key_is_refused() {
+        for bad in ["agent", "=agent"] {
+            let err = pool_choice(None, &[bad.to_owned()])
+                .expect_err(bad)
+                .to_string();
+            assert!(err.contains("--pool-selector"), "{err}");
+            assert!(err.contains(bad), "{err}");
+        }
     }
 
     #[test]

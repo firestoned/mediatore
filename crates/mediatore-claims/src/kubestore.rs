@@ -1260,9 +1260,10 @@ mod tests {
                     id: "octocat".into(),
                     display: None,
                 },
-                pool_ref: banlieue_api::common::LocalObjectReference {
+                pool_ref: Some(banlieue_api::common::LocalObjectReference {
                     name: "pool-a".into(),
-                },
+                }),
+                pool_selector: None,
                 ttl_seconds: 600,
                 audiences: vec![],
                 workload: crate::sandbox::SandboxWorkload {
@@ -1305,9 +1306,10 @@ mod tests {
                     id: "octocat".into(),
                     display: None,
                 },
-                pool_ref: banlieue_api::common::LocalObjectReference {
+                pool_ref: Some(banlieue_api::common::LocalObjectReference {
                     name: "pool-a".into(),
-                },
+                }),
+                pool_selector: None,
                 ttl_seconds: 600,
                 audiences: vec!["a".into()],
                 workload: crate::sandbox::SandboxWorkload {

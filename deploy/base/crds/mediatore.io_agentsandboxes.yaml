@@ -22,7 +22,7 @@ spec:
     - jsonPath: .spec.subject.id
       name: Subject
       type: string
-    - jsonPath: .spec.poolRef.name
+    - jsonPath: .status.poolRef.name
       name: Pool
       type: string
     - jsonPath: .status.phase
@@ -67,12 +67,48 @@ spec:
                 - name
                 type: object
               poolRef:
-                description: The `VirtualMachinePool` to claim from, in this namespace; copied to the claim.
+                description: |-
+                  The `VirtualMachinePool` to claim from, in this namespace; copied to the claim.
+                  Exactly one of this or `poolSelector` (ADR-0044 decision 1).
+                nullable: true
                 properties:
                   name:
                     type: string
                 required:
                 - name
+                type: object
+              poolSelector:
+                description: |-
+                  Any `VirtualMachinePool` in this namespace whose labels match, `{}` for all of them;
+                  copied to the claim, which picks among their members (banlieue ADR-0132). Exactly one
+                  of this or `poolRef` (ADR-0044 decisions 1 and 2).
+                nullable: true
+                properties:
+                  matchExpressions:
+                    items:
+                      properties:
+                        key:
+                          type: string
+                        operator:
+                          enum:
+                          - In
+                          - NotIn
+                          - Exists
+                          - DoesNotExist
+                          type: string
+                        values:
+                          items:
+                            type: string
+                          type: array
+                      required:
+                      - key
+                      - operator
+                      type: object
+                    type: array
+                  matchLabels:
+                    additionalProperties:
+                      type: string
+                    type: object
                 type: object
               subject:
                 description: Who the sandbox is for.
@@ -128,11 +164,13 @@ spec:
                 - image
                 type: object
             required:
-            - poolRef
             - subject
             - ttlSeconds
             - workload
             type: object
+            x-kubernetes-validations:
+            - message: "a sandbox takes exactly one of poolRef or poolSelector; use poolSelector: {} for any pool in the namespace"
+              rule: has(self.poolRef) != has(self.poolSelector)
           status:
             description: "What the reconciler reports: the claim's status, plus the one fact only mediatore knows."
             nullable: true
@@ -220,6 +258,17 @@ spec:
                 - Releasing
                 - Failed
                 type: string
+              poolRef:
+                description: |-
+                  The pool the bound member came from, from the claim (ADR-0044 decision 5): the one
+                  place a sandbox made with `spec.poolSelector` says which pool supplied its VM.
+                nullable: true
+                properties:
+                  name:
+                    type: string
+                required:
+                - name
+                type: object
               ready:
                 default: false
                 description: "`phase == Bound && entry_set` (decision 11)."

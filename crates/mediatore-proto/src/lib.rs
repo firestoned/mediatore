@@ -15,6 +15,7 @@ pub mod tls;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use uuid::Uuid;
 
 /// Path prefix all endpoints live under.
@@ -425,11 +426,117 @@ impl std::fmt::Debug for Secret {
     }
 }
 
+/// A label selector over `VirtualMachinePool`s, the shape of Kubernetes' `LabelSelector`
+/// (ADR-0044 decision 4): the proto crate's own copy, since it depends on nothing of kube's.
+/// Empty (`{}`) matches every pool in the sandbox's namespace, and is the explicit spelling
+/// of "any pool" (banlieue ADR-0132 decision 2).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PoolSelector {
+    /// Labels the pool must carry, each with this exact value.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub match_labels: BTreeMap<String, String>,
+    /// Requirements on the pool's labels, all of which must hold.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub match_expressions: Vec<PoolSelectorRequirement>,
+}
+
+/// One requirement of a [`PoolSelector`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PoolSelectorRequirement {
+    /// The label key.
+    pub key: String,
+    /// How `values` applies to the key.
+    pub operator: PoolSelectorOperator,
+    /// The values, for `In` and `NotIn`; empty for `Exists` and `DoesNotExist`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub values: Vec<String>,
+}
+
+/// The operators of a [`PoolSelectorRequirement`], as Kubernetes spells them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PoolSelectorOperator {
+    /// The label's value is one of `values`.
+    In,
+    /// The label is absent or its value is none of `values`.
+    NotIn,
+    /// The label is present, whatever its value.
+    Exists,
+    /// The label is absent.
+    DoesNotExist,
+}
+
+/// Which pool a request asks for, once it has been checked to ask for exactly one thing
+/// (ADR-0044 decision 2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PoolChoice<'a> {
+    /// One pool, by name.
+    Named(&'a str),
+    /// Every pool in the namespace whose labels match; `{}` for all of them.
+    Selected(&'a PoolSelector),
+}
+
+impl std::fmt::Display for PoolChoice<'_> {
+    /// The name, or the selector as `kubectl -l` would take it (`any pool` for `{}`): for
+    /// log lines, which name pools and never anything secret.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Named(name) => f.write_str(name),
+            Self::Selected(sel) => {
+                let mut terms: Vec<String> = sel
+                    .match_labels
+                    .iter()
+                    .map(|(k, v)| format!("{k}={v}"))
+                    .collect();
+                for r in &sel.match_expressions {
+                    terms.push(match r.operator {
+                        PoolSelectorOperator::In => {
+                            format!("{} in ({})", r.key, r.values.join(","))
+                        }
+                        PoolSelectorOperator::NotIn => {
+                            format!("{} notin ({})", r.key, r.values.join(","))
+                        }
+                        PoolSelectorOperator::Exists => r.key.clone(),
+                        PoolSelectorOperator::DoesNotExist => format!("!{}", r.key),
+                    });
+                }
+                if terms.is_empty() {
+                    f.write_str("any pool")
+                } else {
+                    f.write_str(&terms.join(","))
+                }
+            }
+        }
+    }
+}
+
+/// A request that asks for no pool, or for a pool two ways at once.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PoolChoiceError {
+    /// Neither `pool_ref` nor `pool_selector`: never read as "any pool".
+    #[error(
+        "a claim takes exactly one of pool_ref or pool_selector; use pool_selector: {{}} for any pool in the namespace"
+    )]
+    Neither,
+    /// Both at once.
+    #[error("a claim takes exactly one of pool_ref or pool_selector, not both")]
+    Both,
+    /// `pool_ref` present but empty: names nothing.
+    #[error("pool_ref must not be empty")]
+    EmptyName,
+}
+
 /// `POST /v1/claims` body, sent by a user or agent with an `IdP` bearer token.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClaimRequest {
-    /// `spec.poolRef` on the banlieue claim.
-    pub pool_ref: String,
+    /// `spec.poolRef` on the banlieue claim: one pool, by name. Exactly one of this or
+    /// `pool_selector` (ADR-0044 decision 2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_ref: Option<String>,
+    /// `spec.poolSelector` on the banlieue claim: any pool in the sandbox's namespace whose
+    /// labels match, `{}` for all of them (ADR-0044 decision 4). Exactly one of this or
+    /// `pool_ref`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_selector: Option<PoolSelector>,
     /// `spec.ttlSeconds` on the banlieue claim; a deadline counted from bind.
     pub ttl_seconds: u32,
     /// Downstream audiences the sandbox may request tokens for. Must be a subset of
@@ -453,6 +560,24 @@ pub struct ClaimRequest {
     /// `delegated` audience without one refuses the claim; one for any other audience too.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub delegations: Vec<Delegation>,
+}
+
+impl ClaimRequest {
+    /// Which pool the request asks for: exactly one of `pool_ref` and `pool_selector`, or
+    /// the reason it asks for nothing usable (ADR-0044 decision 2; fail closed, neither is
+    /// never "any").
+    ///
+    /// # Errors
+    /// Neither field, both fields, or an empty `pool_ref`.
+    pub fn pool(&self) -> Result<PoolChoice<'_>, PoolChoiceError> {
+        match (self.pool_ref.as_deref(), self.pool_selector.as_ref()) {
+            (Some(_), Some(_)) => Err(PoolChoiceError::Both),
+            (None, None) => Err(PoolChoiceError::Neither),
+            (Some(""), None) => Err(PoolChoiceError::EmptyName),
+            (Some(name), None) => Ok(PoolChoice::Named(name)),
+            (None, Some(sel)) => Ok(PoolChoice::Selected(sel)),
+        }
+    }
 }
 
 /// A credential the caller delegates for one audience (ADR-0035 decision 2): the bearer the
@@ -518,6 +643,10 @@ pub struct ClaimResponse {
     /// (ADR-0008 decision 11).
     #[serde(default)]
     pub ready: bool,
+    /// The pool the bound member came from (ADR-0044 decision 5), once the claim is bound:
+    /// the answer, whether the request named a pool or selected among them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool: Option<String>,
     /// Deadline, once bound.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<DateTime<Utc>>,
@@ -1024,7 +1153,8 @@ mod tests {
     #[test]
     fn claim_request_roundtrips() {
         let req = ClaimRequest {
-            pool_ref: "pool-a".into(),
+            pool_ref: Some("pool-a".into()),
+            pool_selector: None,
             ttl_seconds: 3600,
             audiences: vec!["grafana.home.example".into()],
             workload: Workload {
@@ -1038,7 +1168,103 @@ mod tests {
         };
         let json = serde_json::to_string(&req).unwrap();
         let back: ClaimRequest = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.pool_ref, "pool-a");
+        assert_eq!(back.pool_ref.as_deref(), Some("pool-a"));
+        assert_eq!(back.pool(), Ok(PoolChoice::Named("pool-a")));
+    }
+
+    // ----- ADR-0044: a sandbox selects its pool by label, or names it ----------------------------------------------
+
+    fn request_with(pool_ref: Option<&str>, pool_selector: Option<PoolSelector>) -> ClaimRequest {
+        ClaimRequest {
+            pool_ref: pool_ref.map(str::to_owned),
+            pool_selector,
+            ttl_seconds: 3600,
+            audiences: vec![],
+            workload: Workload {
+                image: "registry/sandbox:latest".into(),
+                args: vec![],
+                restart: RestartPolicy::Always,
+            },
+            refresh_token: None,
+            policy_ref: None,
+            delegations: vec![],
+        }
+    }
+
+    /// The body every client has sent so far, `{"pool_ref": "pool-a", ...}`, still parses
+    /// and still names that pool (ADR-0044: wire compatible).
+    #[test]
+    fn a_request_naming_a_pool_as_before_still_parses() {
+        let req: ClaimRequest = serde_json::from_str(
+            r#"{"pool_ref":"pool-a","ttl_seconds":60,"workload":{"image":"r/i:1","args":[]}}"#,
+        )
+        .unwrap();
+        assert_eq!(req.pool(), Ok(PoolChoice::Named("pool-a")));
+    }
+
+    /// `pool_selector: {}` is "any pool in the namespace" and survives a round trip as an
+    /// empty selector, never as an absent one: the two mean opposite things (banlieue
+    /// ADR-0132 decision 2).
+    #[test]
+    fn an_empty_selector_is_any_pool_and_is_kept_on_the_wire() {
+        let req = request_with(None, Some(PoolSelector::default()));
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["pool_selector"], serde_json::json!({}), "got {json}");
+        assert!(json.get("pool_ref").is_none(), "got {json}");
+        let back: ClaimRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            back.pool(),
+            Ok(PoolChoice::Selected(&PoolSelector::default()))
+        );
+    }
+
+    #[test]
+    fn a_selector_with_labels_and_expressions_round_trips_in_kubernetes_spelling() {
+        let sel = PoolSelector {
+            match_labels: BTreeMap::from([(
+                "sandbox.example.com/image".to_owned(),
+                "agent".to_owned(),
+            )]),
+            match_expressions: vec![PoolSelectorRequirement {
+                key: "topology.kubernetes.io/zone".into(),
+                operator: PoolSelectorOperator::In,
+                values: vec!["a".into(), "b".into()],
+            }],
+        };
+        let json = serde_json::to_value(&sel).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "match_labels": { "sandbox.example.com/image": "agent" },
+                "match_expressions": [
+                    { "key": "topology.kubernetes.io/zone", "operator": "In", "values": ["a", "b"] }
+                ]
+            })
+        );
+        let back: PoolSelector = serde_json::from_value(json).unwrap();
+        assert_eq!(back, sel);
+    }
+
+    /// Neither is refused, never read as "any pool"; both is refused; an empty name names
+    /// nothing (ADR-0044 decision 2, fail closed).
+    #[test]
+    fn a_request_takes_exactly_one_of_pool_ref_or_pool_selector() {
+        assert_eq!(
+            request_with(None, None).pool(),
+            Err(PoolChoiceError::Neither)
+        );
+        assert_eq!(
+            request_with(Some("pool-a"), Some(PoolSelector::default())).pool(),
+            Err(PoolChoiceError::Both)
+        );
+        assert_eq!(
+            request_with(Some(""), None).pool(),
+            Err(PoolChoiceError::EmptyName)
+        );
+        let req: ClaimRequest =
+            serde_json::from_str(r#"{"ttl_seconds":60,"workload":{"image":"r/i:1","args":[]}}"#)
+                .unwrap();
+        assert_eq!(req.pool(), Err(PoolChoiceError::Neither));
     }
 
     // ----- ADR-0040: the gateway places an audience's credential -----------------------------------------------------

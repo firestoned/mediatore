@@ -262,7 +262,8 @@ impl Harness {
             .post(format!("{}/v1/claims", self.user_url))
             .bearer_auth(self.login("octocat"))
             .json(&ClaimRequest {
-                pool_ref: "pool-a".into(),
+                pool_ref: Some("pool-a".into()),
+                pool_selector: None,
                 ttl_seconds: 3600,
                 audiences: vec![AUDIENCE.into()],
                 workload: Workload {
@@ -561,7 +562,8 @@ async fn a_claim_naming_a_registry_the_pool_cannot_reach_is_refused_and_the_mirr
     let reachable = ["registry.internal:5000".to_owned()].into_iter().collect();
     let h = Harness::start(ca, upstream, vec![dead], Some(reachable)).await;
     let claim = |image: &str| ClaimRequest {
-        pool_ref: "pool-a".into(),
+        pool_ref: Some("pool-a".into()),
+        pool_selector: None,
         ttl_seconds: 3600,
         audiences: vec![AUDIENCE.into()],
         workload: Workload {

@@ -246,7 +246,8 @@ impl Harness {
             .post(format!("{}/v1/claims", self.user_url))
             .bearer_auth(token)
             .json(&ClaimRequest {
-                pool_ref: "pool-a".into(),
+                pool_ref: Some("pool-a".into()),
+                pool_selector: None,
                 ttl_seconds: 3600,
                 audiences: vec![AUDIENCE.into()],
                 workload: Workload {
@@ -269,7 +270,8 @@ impl Harness {
             .post(format!("{}/v1/claims", self.user_url))
             .bearer_auth(token)
             .json(&ClaimRequest {
-                pool_ref: "pool-a".into(),
+                pool_ref: Some("pool-a".into()),
+                pool_selector: None,
                 ttl_seconds: 3600,
                 audiences: vec![AUDIENCE.into()],
                 workload: Workload {
@@ -318,7 +320,8 @@ async fn a_one_shot_workload_ends_its_claim_at_the_broker() {
         .post(format!("{}/v1/claims", h.user_url))
         .bearer_auth(&user_token)
         .json(&ClaimRequest {
-            pool_ref: "pool-a".into(),
+            pool_ref: Some("pool-a".into()),
+            pool_selector: None,
             ttl_seconds: 3600,
             audiences: vec![AUDIENCE.into()],
             workload: Workload {
@@ -798,7 +801,8 @@ async fn a_token_for_another_audience_client_is_unauthorized() {
         .post(format!("{}/v1/claims", h.user_url))
         .bearer_auth(&token)
         .json(&ClaimRequest {
-            pool_ref: "pool-a".into(),
+            pool_ref: Some("pool-a".into()),
+            pool_selector: None,
             ttl_seconds: 3600,
             audiences: vec![],
             workload: Workload::default(),
@@ -825,7 +829,8 @@ async fn a_login_outside_the_required_group_is_forbidden() {
         .post(format!("{}/v1/claims", h.user_url))
         .bearer_auth(&token)
         .json(&ClaimRequest {
-            pool_ref: "pool-a".into(),
+            pool_ref: Some("pool-a".into()),
+            pool_selector: None,
             ttl_seconds: 3600,
             audiences: vec![],
             workload: Workload::default(),
@@ -993,7 +998,8 @@ async fn an_issuer_without_a_session_refuses_a_delegated_refresh_token() {
         .post(format!("{}/v1/claims", h.user_url))
         .bearer_auth(h.login("octocat"))
         .json(&ClaimRequest {
-            pool_ref: "pool-a".into(),
+            pool_ref: Some("pool-a".into()),
+            pool_selector: None,
             ttl_seconds: 3600,
             audiences: vec![AUDIENCE.into()],
             workload: Workload {
@@ -1016,7 +1022,8 @@ async fn an_issuer_without_a_session_refuses_a_delegated_refresh_token() {
 /// A claim request naming the delegated audience beside the ordinary one.
 fn delegated_request(delegations: Vec<Delegation>, ttl_seconds: u32) -> ClaimRequest {
     ClaimRequest {
-        pool_ref: "pool-a".into(),
+        pool_ref: Some("pool-a".into()),
+        pool_selector: None,
         ttl_seconds,
         audiences: vec![AUDIENCE.into(), DELEGATED.into()],
         workload: Workload {

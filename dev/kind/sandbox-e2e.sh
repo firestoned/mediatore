@@ -10,8 +10,10 @@
 # is declared and the sandbox turns Ready; the guest in the node pod fetches the subject;
 # deleting the sandbox retracts the entry, deletes the claim and lets the object go. A
 # sandbox naming an audience outside the broker's configuration fails without a claim.
-# No banlieue controller runs: the claim's status is patched by hand, as in the watcher
-# tier.
+# ADR-0044: a sandbox with `poolSelector: {}` is admitted and its claim carries the empty
+# selector and no `poolRef`, accepted by banlieue's own CRD rule; a sandbox with neither
+# field, or both, is refused by the API server before the reconciler sees it. No banlieue
+# controller runs: the claim's status is patched by hand, as in the watcher tier.
 #
 #   sandbox-e2e.sh <admin kubeconfig> <broker SA kubeconfig> <trust domain> <ek pem> <ek hash file>
 set -euo pipefail
@@ -65,8 +67,10 @@ wait_for() { # <seconds> <description> <command...>
 }
 log_has() { broker_logs | grep -F "$1" | grep -qF "${2:-}"; }
 
-# An AgentSandbox manifest for <name> with subject id <id> and audiences <json array>.
+# An AgentSandbox manifest for <name> with subject id <id> and audiences <json array>, and
+# optionally the pool line(s) in place of `poolRef: { name: e2e }` (ADR-0044).
 manifest() {
+  local pool=${4-"poolRef: { name: e2e }"}
   cat <<YAML
 apiVersion: mediatore.io/v1alpha1
 kind: AgentSandbox
@@ -75,7 +79,7 @@ metadata:
   namespace: $NS
 spec:
   subject: { issuer: "$ISSUER", id: "$2" }
-  poolRef: { name: e2e }
+  $pool
   ttlSeconds: 600
   audiences: $3
   workload: { image: "registry.internal:5000/sandbox:e2e", args: ["sh"] }
@@ -256,6 +260,41 @@ field sb-bad '.status.reason' | grep -qF "audience nope is not configured" || fa
 "${K[@]}" -n "$NS" get virtualmachineclaim sb-bad >/dev/null 2>&1 && fail "a claim was created for a refused sandbox"
 echo "sb-bad Failed ($(field sb-bad '.status.reason')), no claim"
 
+say "pool (ADR-0044): a sandbox selects its pool, or names it, exactly one; the claim carries the selector as written"
+manifest sb-any octocat '[]' 'poolSelector: {}' | admitted "the broker ServiceAccount selecting any pool" "${KSA[@]}" create -f -
+has_any_claim() { "${K[@]}" -n "$NS" get virtualmachineclaim sb-any >/dev/null 2>&1; }
+wait_for "$TIMEOUT" "claim sb-any" has_any_claim
+ANY=$("${K[@]}" -n "$NS" get virtualmachineclaim sb-any -o json)
+echo "$ANY" | jq -e '.spec.poolSelector == {} and (.spec | has("poolRef") | not)' >/dev/null || fail "the claim does not carry the empty selector alone: $(echo "$ANY" | jq -c .spec)"
+[ -z "$(field sb-any '.status.poolRef.name')" ] || fail "a Pending sandbox shows a pool it was not bound from"
+"${K[@]}" -n "$NS" get agentsandbox sb-any -o custom-columns='POOL:.status.poolRef.name' --no-headers | grep -qE '^<none>$|^$' || fail "the Pool column reads something while Pending"
+rejected() { # <description> <manifest on stdin>: the API server refuses it with the CEL rule's message
+  local what=$1 out
+  if out=$("${KSA[@]}" create -f - 2>&1); then fail "$what: admitted, expected the CEL refusal"; fi
+  echo "$out" | grep -qF 'exactly one of poolRef or poolSelector' || fail "$what: refused, but not by the CEL rule: $out"
+  echo "refused: $what"
+}
+manifest sb-none octocat '[]' '# no pool' | rejected "a sandbox with neither poolRef nor poolSelector"
+manifest sb-both octocat '[]' 'poolRef: { name: e2e }
+  poolSelector: { matchLabels: { tier: e2e } }' | rejected "a sandbox with both poolRef and poolSelector"
+# The same rule guards the claim: a selector claim written by hand with both is refused by
+# banlieue's CRD, so the reconciler could never produce one the API server would take.
+if out=$("${K[@]}" -n "$NS" create -f - 2>&1 <<YAML
+apiVersion: banlieue.io/v1alpha1
+kind: VirtualMachineClaim
+metadata: { name: claim-both, namespace: $NS }
+spec:
+  subject: { issuer: "$ISSUER", id: "octocat" }
+  ttlSeconds: 600
+YAML
+); then fail "a claim with no pool was admitted by banlieue's CRD"; fi
+echo "$out" | grep -qF 'exactly one of poolRef or poolSelector' || fail "the claim was refused, but not by banlieue's CEL rule: $out"
+echo "refused: a claim with neither, by banlieue's own rule"
+"${K[@]}" -n "$NS" delete agentsandbox sb-any --wait=false >/dev/null
+any_gone() { [ -z "$(sandbox sb-any)" ]; }
+wait_for "$TIMEOUT" "agentsandbox sb-any gone" any_gone
+echo "sb-any: claim with poolSelector {} and no poolRef, Pool column blank while Pending; neither and both refused at admission; deleted"
+
 say "delete: the finalizer retracts the entry, deletes the claim, then lets the sandbox go"
 "${K[@]}" -n "$NS" delete agentsandbox sb-e2e --wait=false >/dev/null
 claim_gone() { ! "${K[@]}" -n "$NS" get virtualmachineclaim sb-e2e >/dev/null 2>&1; }
@@ -275,4 +314,4 @@ archived() { broker_logs | grep -F "resync" | grep -qE 'archived=[1-9]'; }
 wait_for "$TIMEOUT" "a resync archiving at least one row" archived
 echo "archived at resync"
 
-say "PASS: ADR-0008 and ADR-0034 hold against a real cluster (subject policy, owned claim and record on the resource, bind to Ready, a restart on the Kubernetes store, fail-closed audience, finalizer, the retention sweep)"
+say "PASS: ADR-0008, ADR-0034 and ADR-0044 hold against a real cluster (subject policy, owned claim and record on the resource, bind to Ready, a restart on the Kubernetes store, fail-closed audience, the pool selector and its exactly-one rule, finalizer, the retention sweep)"

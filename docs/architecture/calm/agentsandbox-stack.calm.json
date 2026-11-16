@@ -190,7 +190,7 @@
       "unique-id": "agentsandbox-agentsandbox-cr",
       "node-type": "data-asset",
       "name": "AgentSandbox",
-      "description": "mediatore.io/v1alpha1, namespaced, reconciled by mediatore (ADR-0008). The request for one sandbox: subject (pinned to the caller at admission), poolRef, ttlSeconds, audiences, workload. Never carries a credential. Owns exactly one VirtualMachineClaim; status mirrors the claim plus whether the claim's registration entry is set. Designed, not built (mediatore roadmap 08).",
+      "description": "mediatore.io/v1alpha1, namespaced, reconciled by mediatore (ADR-0008). The request for one sandbox: subject (pinned to the caller at admission), poolRef or poolSelector (exactly one; the selector picks among the namespace's pools, ADR-0044), ttlSeconds, audiences, workload. Never carries a credential. Owns exactly one VirtualMachineClaim; status mirrors the claim plus whether the claim's registration entry is set. Designed, not built (mediatore roadmap 08).",
       "metadata": {
         "status": "proposed"
       }
@@ -590,7 +590,7 @@
     },
     {
       "unique-id": "agentsandbox-rel-mediatore-creates-claim",
-      "description": "mediatore reconciles the AgentSandbox: creates and owns its one VirtualMachineClaim, passing poolRef, subject and ttlSeconds through, and holds a finalizer until the claim and its SPIFFE entry are gone (ADR-0008).",
+      "description": "mediatore reconciles the AgentSandbox: creates and owns its one VirtualMachineClaim, passing poolRef or poolSelector, subject and ttlSeconds through (ADR-0044), and holds a finalizer until the claim and its SPIFFE entry are gone (ADR-0008).",
       "relationship-type": {
         "connects": {
           "source": {

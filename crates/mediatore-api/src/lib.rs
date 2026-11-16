@@ -32,7 +32,7 @@ use chrono::{DateTime, Duration, Utc};
 use mediatore_claims::Reconciler;
 use mediatore_claims::sandbox::{
     AgentSandbox, AgentSandboxSpec, FrontDoorError, SandboxFrontDoor, SandboxSubject,
-    SandboxWorkload, chrono_of,
+    SandboxWorkload, chrono_of, label_selector_of,
 };
 use mediatore_entra::{IdpError, Validated, Validator};
 use mediatore_proto::ek::is_ek_hash;
@@ -394,6 +394,10 @@ async fn create_claim(
 ) -> Result<(StatusCode, Json<ClaimResponse>), ApiError> {
     let bearer_token = bearer(&headers)?.to_owned();
     let validated = caller(&st, &headers).await?;
+    // Exactly one of pool_ref and pool_selector (ADR-0044 decision 2): the CRD would refuse
+    // the sandbox; say so now, and never read "neither" as "any pool".
+    req.pool()
+        .map_err(|e| ApiError::bad_request("invalid_pool", e.to_string()))?;
     if let Some(bad) = req.audiences.iter().find(|a| !st.audiences.contains(a)) {
         return Err(ApiError::bad_request("unknown_audience", bad.clone()));
     }
@@ -454,6 +458,12 @@ async fn create_claim(
     .await
 }
 
+/// Which pool a validated request asks for, for the log line (ADR-0044 decision 5): a name,
+/// a selector in `kubectl` spelling, or `any pool`. Pools are not secrets.
+fn pool_of(req: &ClaimRequest) -> String {
+    req.pool().map_or_else(|e| e.to_string(), |p| p.to_string())
+}
+
 /// `dev_mode`: the record written by the API itself and bound by the dev binder, no
 /// resource; the envelopes bind to the record's UID.
 async fn dev_claim(
@@ -511,7 +521,7 @@ async fn dev_claim(
         })
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
-    tracing::info!(subject = %validated.subject.id, pool = %req.pool_ref, %uid, "claim created");
+    tracing::info!(subject = %validated.subject.id, pool = %pool_of(req), %uid, "claim created");
 
     // Dev binder: stands in for banlieue's claim controller and pool. A registered free
     // node is "Ready pool member"; binding is immediate.
@@ -538,6 +548,7 @@ fn record_response(rec: &ClaimRecord) -> ClaimResponse {
         uid: Some(rec.uid),
         phase: phase_of(rec),
         ready: rec.entry_id.is_some() && rec.revoked_at.is_none(),
+        pool: None,
         expires_at: rec.expires_at,
         addresses: vec![],
         report: rec.report.clone(),
@@ -722,9 +733,11 @@ async fn create_sandbox(
         name,
         AgentSandboxSpec {
             subject: SandboxSubject::from(&validated.subject),
-            pool_ref: LocalObjectReference {
-                name: req.pool_ref.clone(),
-            },
+            pool_ref: req
+                .pool_ref
+                .clone()
+                .map(|name| LocalObjectReference { name }),
+            pool_selector: req.pool_selector.as_ref().map(label_selector_of),
             ttl_seconds: req.ttl_seconds,
             audiences: req.audiences.clone(),
             workload: SandboxWorkload::from(&req.workload),
@@ -736,7 +749,7 @@ async fn create_sandbox(
     );
     sandbox.metadata.namespace = Some(st.sandbox_namespace.clone());
     let created = front.create(sandbox).await?;
-    tracing::info!(subject = %validated.subject.id, pool = %req.pool_ref, sandbox = %name, namespace = %st.sandbox_namespace, "sandbox created");
+    tracing::info!(subject = %validated.subject.id, pool = %pool_of(req), sandbox = %name, namespace = %st.sandbox_namespace, "sandbox created");
     // ADR-0013 decision 2: the session is parked under the sandbox's UID, sealed with it,
     // before the caller hears back; a failure here undoes the resource. ADR-0035: each
     // delegation the same way, one Secret per audience.
@@ -854,6 +867,7 @@ fn response_of(sb: &AgentSandbox) -> ClaimResponse {
             .and_then(|u| Uuid::parse_str(u).ok()),
         phase: st.phase.into(),
         ready: st.ready,
+        pool: st.pool_ref.map(|p| p.name),
         expires_at: st.expires_at.as_ref().and_then(chrono_of),
         addresses: st.addresses,
         report: None,

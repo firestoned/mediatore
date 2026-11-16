@@ -65,7 +65,9 @@ need interactivity, the workload dials **out** (see
    refresh token once delegated (Dex rotates it); a second claim is a second login.
 
 2. Claim, naming the workload (an argument that starts with a dash goes in the `--arg=-p`
-   form, or the CLI reads it as a flag of its own):
+   form, or the CLI reads it as a flag of its own). `--pool` is optional: with neither it nor
+   `--pool-selector key=value`, the claim is made across every pool in the sandbox namespace
+   ([ADR-0044](../adr/0044-a-sandbox-selects-its-pool-by-label.md)):
 
    ```bash
    # Dex: the CLI posts the claim with the session delegated

@@ -19,14 +19,18 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use banlieue_api::banlieue::{ClaimSubject, VirtualMachineClaim, VirtualMachineClaimSpec};
-use banlieue_api::common::LocalObjectReference;
+use banlieue_api::common::{
+    LabelSelector, LabelSelectorOperator, LabelSelectorRequirement, LocalObjectReference,
+};
 use chrono::{DateTime, Utc};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 use kube::api::{DeleteParams, ObjectMeta, PostParams};
 use kube::runtime::controller::Action;
 use kube::{Api, Client, CustomResource, CustomResourceExt, Resource, ResourceExt};
 use mediatore_policy::BundlePayload;
-use mediatore_proto::{ClaimPhase, RestartPolicy, Subject, Workload};
+use mediatore_proto::{
+    ClaimPhase, PoolChoice, PoolSelector, PoolSelectorOperator, RestartPolicy, Subject, Workload,
+};
 use mediatore_spire::{MANAGED_BY, MANAGED_BY_LABEL};
 use mediatore_store::{ClaimRecord, StoreError};
 use schemars::JsonSchema;
@@ -127,17 +131,32 @@ impl From<RestartPolicy> for SandboxRestart {
     status = "AgentSandboxStatus",
     derive = "PartialEq",
     printcolumn = r#"{"name":"Subject","type":"string","jsonPath":".spec.subject.id"}"#,
-    printcolumn = r#"{"name":"Pool","type":"string","jsonPath":".spec.poolRef.name"}"#,
+    // The pool the bound member came from, not `spec.poolRef`: a sandbox with a
+    // `poolSelector` names no pool in its spec (ADR-0044 decision 5).
+    printcolumn = r#"{"name":"Pool","type":"string","jsonPath":".status.poolRef.name"}"#,
     printcolumn = r#"{"name":"Phase","type":"string","jsonPath":".status.phase"}"#,
     printcolumn = r#"{"name":"Ready","type":"boolean","jsonPath":".status.ready"}"#,
     printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#
 )]
 #[serde(rename_all = "camelCase")]
+// The claim's own rule (banlieue ADR-0132 decision 1), restated here so a sandbox the claim
+// would refuse is refused at its own admission, before a claim exists (ADR-0044 decision 1).
+#[schemars(extend("x-kubernetes-validations" = [{
+    "rule": "has(self.poolRef) != has(self.poolSelector)",
+    "message": "a sandbox takes exactly one of poolRef or poolSelector; use poolSelector: {} for any pool in the namespace",
+}]))]
 pub struct AgentSandboxSpec {
     /// Who the sandbox is for.
     pub subject: SandboxSubject,
     /// The `VirtualMachinePool` to claim from, in this namespace; copied to the claim.
-    pub pool_ref: LocalObjectReference,
+    /// Exactly one of this or `poolSelector` (ADR-0044 decision 1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_ref: Option<LocalObjectReference>,
+    /// Any `VirtualMachinePool` in this namespace whose labels match, `{}` for all of them;
+    /// copied to the claim, which picks among their members (banlieue ADR-0132). Exactly one
+    /// of this or `poolRef` (ADR-0044 decisions 1 and 2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_selector: Option<LabelSelector>,
     /// Lifetime in seconds, counted from bind; copied to the claim, which enforces it
     /// (decision 9).
     #[schemars(range(min = 1))]
@@ -197,6 +216,10 @@ pub struct AgentSandboxStatus {
     /// The bound member, from the claim.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub virtual_machine_ref: Option<LocalObjectReference>,
+    /// The pool the bound member came from, from the claim (ADR-0044 decision 5): the one
+    /// place a sandbox made with `spec.poolSelector` says which pool supplied its VM.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_ref: Option<LocalObjectReference>,
     /// The member's addresses, from the claim.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub addresses: Vec<String>,
@@ -383,6 +406,7 @@ pub fn claim_for(sb: &AgentSandbox) -> Result<VirtualMachineClaim, WatchError> {
         },
         spec: VirtualMachineClaimSpec {
             pool_ref: sb.spec.pool_ref.clone(),
+            pool_selector: sb.spec.pool_selector.clone(),
             subject: ClaimSubject {
                 issuer: sb.spec.subject.issuer.clone(),
                 id: sb.spec.subject.id.clone(),
@@ -400,6 +424,65 @@ pub fn sandbox_uid_of(sb: &AgentSandbox) -> Option<Uuid> {
         .uid
         .as_deref()
         .and_then(|u| Uuid::parse_str(u).ok())
+}
+
+/// Which pool a spec asks for, for a log line (ADR-0044 decision 5): the name, or the
+/// selector in `kubectl` spelling (`any pool` for `{}`). A spec with neither or both, which
+/// the CRD's CEL rule refuses, is printed as such rather than guessed at.
+#[must_use]
+pub fn pool_of(spec: &AgentSandboxSpec) -> String {
+    match (spec.pool_ref.as_ref(), spec.pool_selector.as_ref()) {
+        (Some(r), None) => r.name.clone(),
+        (None, Some(sel)) => PoolChoice::Selected(&pool_selector_of(sel)).to_string(),
+        (None, None) => "<none>".into(),
+        (Some(_), Some(_)) => "<both>".into(),
+    }
+}
+
+/// banlieue's `LabelSelector` from the request's (ADR-0044 decision 4): the same shape, field
+/// by field.
+#[must_use]
+pub fn label_selector_of(sel: &PoolSelector) -> LabelSelector {
+    LabelSelector {
+        match_labels: sel.match_labels.clone(),
+        match_expressions: sel
+            .match_expressions
+            .iter()
+            .map(|r| LabelSelectorRequirement {
+                key: r.key.clone(),
+                operator: match r.operator {
+                    PoolSelectorOperator::In => LabelSelectorOperator::In,
+                    PoolSelectorOperator::NotIn => LabelSelectorOperator::NotIn,
+                    PoolSelectorOperator::Exists => LabelSelectorOperator::Exists,
+                    PoolSelectorOperator::DoesNotExist => LabelSelectorOperator::DoesNotExist,
+                },
+                values: r.values.clone(),
+            })
+            .collect(),
+    }
+}
+
+/// The request's `PoolSelector` from banlieue's, the other way (for the log line and the API
+/// answer).
+#[must_use]
+pub fn pool_selector_of(sel: &LabelSelector) -> PoolSelector {
+    PoolSelector {
+        match_labels: sel.match_labels.clone(),
+        match_expressions: sel
+            .match_expressions
+            .iter()
+            .map(|r| mediatore_proto::PoolSelectorRequirement {
+                key: r.key.clone(),
+                operator: match r.operator {
+                    LabelSelectorOperator::In => PoolSelectorOperator::In,
+                    LabelSelectorOperator::NotIn => PoolSelectorOperator::NotIn,
+                    LabelSelectorOperator::Exists => PoolSelectorOperator::Exists,
+                    LabelSelectorOperator::DoesNotExist => PoolSelectorOperator::DoesNotExist,
+                },
+                values: r.values.clone(),
+            })
+            .collect(),
+    }
 }
 
 /// The store record for a sandbox whose claim has UID `claim_uid` (decision 12): the
@@ -473,6 +556,7 @@ pub fn mirror_status(
         }),
         claim_uid: Some(record.uid.to_string()),
         virtual_machine_ref: st.and_then(|s| s.virtual_machine_ref.clone()),
+        pool_ref: st.and_then(|s| s.pool_ref.clone()),
         addresses: st
             .map(|s| s.addresses.iter().map(|a| a.address.clone()).collect())
             .unwrap_or_default(),
@@ -635,7 +719,7 @@ impl Watcher {
             }
             None => {
                 let created = self.claims.create_claim(claim_for(sb)?).await?;
-                tracing::info!(sandbox = %name, %namespace, subject = %sb.spec.subject.id, pool = %sb.spec.pool_ref.name, "claim created");
+                tracing::info!(sandbox = %name, %namespace, subject = %sb.spec.subject.id, pool = %pool_of(&sb.spec), "claim created");
                 created
             }
         };
@@ -1065,9 +1149,10 @@ mod tests {
                     id: "octocat".into(),
                     display: Some("The Octocat".into()),
                 },
-                pool_ref: LocalObjectReference {
+                pool_ref: Some(LocalObjectReference {
                     name: "pool".into(),
-                },
+                }),
+                pool_selector: None,
                 ttl_seconds: 600,
                 audiences: vec!["api.example".into()],
                 workload: SandboxWorkload {
@@ -1316,9 +1401,38 @@ mod tests {
             .iter()
             .map(|s| s.as_str().unwrap())
             .collect();
-        for f in ["subject", "poolRef", "ttlSeconds", "workload"] {
+        for f in ["subject", "ttlSeconds", "workload"] {
             assert!(required.contains(&f), "{f} required");
         }
+        // ADR-0044 decisions 1 and 2: exactly one of poolRef and poolSelector, by CEL, so
+        // neither is required on its own and neither-nor-both is never read as "any pool".
+        assert!(
+            !required.contains(&"poolRef"),
+            "poolRef is optional beside poolSelector (ADR-0044)"
+        );
+        let rules = spec["x-kubernetes-validations"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no CEL rules on spec: {spec}"));
+        assert!(
+            rules
+                .iter()
+                .any(|r| r["rule"] == "has(self.poolRef) != has(self.poolSelector)"),
+            "got {rules:?}"
+        );
+        assert!(
+            spec["properties"]["poolSelector"]["properties"]["matchLabels"].is_object(),
+            "poolSelector is a LabelSelector: {spec}"
+        );
+        let pool = v["additionalPrinterColumns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "Pool")
+            .expect("a Pool column");
+        assert_eq!(
+            pool["jsonPath"], ".status.poolRef.name",
+            "the pool bound from, not the one asked for (ADR-0044 decision 5)"
+        );
         assert!(
             !required.contains(&"policyRef"),
             "policyRef is optional in shadow (ADR-0026 decision 6)"
@@ -1372,7 +1486,11 @@ mod tests {
             (owner.controller, owner.block_owner_deletion),
             (Some(true), Some(true))
         );
-        assert_eq!(claim.spec.pool_ref.name, "pool");
+        assert_eq!(
+            claim.spec.pool_ref.as_ref().map(|r| r.name.as_str()),
+            Some("pool")
+        );
+        assert!(claim.spec.pool_selector.is_none());
         assert_eq!(
             (
                 claim.spec.subject.issuer.as_str(),
@@ -1391,6 +1509,82 @@ mod tests {
             claim_for(&unsaved).is_err(),
             "no uid, no owner reference, no claim"
         );
+    }
+
+    /// ADR-0044 decision 1: a selector is copied to the claim as it is, `{}` included, and
+    /// the claim then names no pool; banlieue picks among the matched pools' members.
+    #[test]
+    fn a_selector_is_copied_to_the_claim_verbatim_and_the_claim_names_no_pool() {
+        let mut sb = sandbox(true, false);
+        sb.spec.pool_ref = None;
+        sb.spec.pool_selector = Some(LabelSelector {
+            match_labels: BTreeMap::from([(
+                "sandbox.example.com/image".to_owned(),
+                "agent".to_owned(),
+            )]),
+            match_expressions: vec![LabelSelectorRequirement {
+                key: "topology.kubernetes.io/zone".into(),
+                operator: LabelSelectorOperator::NotIn,
+                values: vec!["c".into()],
+            }],
+        });
+        let claim = claim_for(&sb).unwrap();
+        assert!(claim.spec.pool_ref.is_none());
+        assert_eq!(claim.spec.pool_selector, sb.spec.pool_selector);
+        assert_eq!(
+            pool_of(&sb.spec),
+            "sandbox.example.com/image=agent,topology.kubernetes.io/zone notin (c)"
+        );
+
+        sb.spec.pool_selector = Some(LabelSelector::default());
+        let any = claim_for(&sb).unwrap();
+        assert_eq!(any.spec.pool_selector, Some(LabelSelector::default()));
+        assert_eq!(pool_of(&sb.spec), "any pool");
+        let json = serde_json::to_value(&any.spec).unwrap();
+        assert_eq!(
+            json["poolSelector"],
+            json!({}),
+            "kept, never dropped: {json}"
+        );
+        assert!(json.get("poolRef").is_none(), "got {json}");
+    }
+
+    /// The two selector shapes convert both ways without loss (ADR-0044 decision 4).
+    #[test]
+    fn the_request_selector_and_banlieues_are_one_shape() {
+        let req = PoolSelector {
+            match_labels: BTreeMap::from([("a".to_owned(), "b".to_owned())]),
+            match_expressions: vec![
+                mediatore_proto::PoolSelectorRequirement {
+                    key: "k1".into(),
+                    operator: PoolSelectorOperator::In,
+                    values: vec!["x".into(), "y".into()],
+                },
+                mediatore_proto::PoolSelectorRequirement {
+                    key: "k2".into(),
+                    operator: PoolSelectorOperator::Exists,
+                    values: vec![],
+                },
+                mediatore_proto::PoolSelectorRequirement {
+                    key: "k3".into(),
+                    operator: PoolSelectorOperator::DoesNotExist,
+                    values: vec![],
+                },
+            ],
+        };
+        let banlieue = label_selector_of(&req);
+        assert_eq!(
+            serde_json::to_value(&banlieue).unwrap(),
+            json!({
+                "matchLabels": { "a": "b" },
+                "matchExpressions": [
+                    { "key": "k1", "operator": "In", "values": ["x", "y"] },
+                    { "key": "k2", "operator": "Exists" },
+                    { "key": "k3", "operator": "DoesNotExist" }
+                ]
+            })
+        );
+        assert_eq!(pool_selector_of(&banlieue), req);
     }
 
     #[tokio::test]
@@ -1456,7 +1650,7 @@ mod tests {
         r.claims.patch_claim_status(
             "sandboxes",
             "sb-1",
-            &json!({ "phase": "Bound", "virtualMachineRef": { "name": "member-1" }, "tpmEndorsementCertificates": [RSA_EK_PEM],
+            &json!({ "phase": "Bound", "virtualMachineRef": { "name": "member-1" }, "poolRef": { "name": "pool" }, "tpmEndorsementCertificates": [RSA_EK_PEM],
                     "addresses": [{ "type": "InternalIP", "address": "192.0.2.10" }], "boundAt": "2026-10-14T10:00:00Z", "expiresAt": "2026-10-14T10:10:00Z" }),
         );
         // Bound, but the watcher has not declared the entry: not ready, polled.
@@ -1469,6 +1663,8 @@ mod tests {
             st.virtual_machine_ref.as_ref().map(|m| m.name.as_str()),
             Some("member-1")
         );
+        // The pool the member came from, from the claim's status (ADR-0044 decision 5).
+        assert_eq!(st.pool_ref.as_ref().map(|p| p.name.as_str()), Some("pool"));
         assert_eq!(st.addresses, vec!["192.0.2.10".to_owned()]);
         assert!(st.bound_at.is_some() && st.expires_at.is_some());
         assert!(!st.entry_set && !st.ready);

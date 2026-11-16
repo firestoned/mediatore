@@ -46,10 +46,11 @@ mediatore-client = { path = "crates/mediatore-client" }
 mediatore-testkit = { path = "crates/mediatore-testkit" }
 
 # banlieue CRD types (ADR-0002, ADR-0011), pinned to a release tag (banlieue-api on kube's
-# derive feature only, so no `ring` enters this graph). v0.5.0 moves the crate to kube 5 and
+# derive feature only, so no `ring` enters this graph). v0.5.0 moved the crate to kube 5 and
 # k8s-openapi 0.29 (Kubernetes 1.37 types), which is what sets this workspace's kube major;
-# its CRDs are unchanged in shape. cargo deny allows this one git source.
-banlieue-api = { git = "https://github.com/firestoned/banlieue", tag = "v0.5.0", package = "banlieue-api", default-features = false }
+# v0.5.9 (banlieue ADR-0132) makes the claim's `poolRef` optional beside `poolSelector` and
+# adds `status.poolRef`, which ADR-0044 mirrors. cargo deny allows this one git source.
+banlieue-api = { git = "https://github.com/firestoned/banlieue", tag = "v0.5.9", package = "banlieue-api", default-features = false }
 
 # notaio's bundle verifier, version floor and conformance vectors (ADR-0026 decision 1), pinned
 # to a signed release tag (notaio ADR-0014). No kube, no schemars: the `schema` feature stays off.
