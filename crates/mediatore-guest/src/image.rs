@@ -198,6 +198,21 @@ pub struct Puller {
     platform: Platform,
     /// Never set outside tests: the fake registry speaks plain HTTP.
     plain_http_credentials: bool,
+    /// The registry the gateway places a credential for (ADR-0043), pulled through the claim's egress proxy.
+    placed: Option<Placed>,
+}
+
+/// A registry pulled through the claim's egress proxy on a loopback port that no jail rule lists (ADR-0043
+/// decision 3). Requests go there as plain HTTP under `/<registry host>/`, carry no credential, answer no challenge
+/// and follow no redirect: the gateway places what the registry accepts, and anything that would send the VM to
+/// another host is refused.
+#[derive(Debug, Clone)]
+struct Placed {
+    host: String,
+    /// `http://<addr>/<host>`, the prefix of every URL of this registry.
+    base: String,
+    /// A client that follows no redirect and needs no TLS (the proxy is on loopback).
+    http: reqwest::Client,
 }
 
 /// One pull's credentials: the operator's, when the claim carries one (ADR-0022), and the
@@ -227,7 +242,31 @@ impl Puller {
             plain_http: plain_http.iter().cloned().collect(),
             platform: Platform::this(),
             plain_http_credentials: false,
+            placed: None,
         })
+    }
+
+    /// Pull `host` through the claim's egress proxy at `proxy` (ADR-0043 decisions 2 and 3): the proxy sends each request
+    /// to a gateway, which places the credential, so this client holds none, answers no challenge and follows no
+    /// redirect for that registry. Every other registry is reached as before.
+    ///
+    /// # Errors
+    /// The client cannot be built.
+    pub fn with_placed_registry(
+        mut self,
+        host: &str,
+        proxy: std::net::SocketAddr,
+    ) -> anyhow::Result<Self> {
+        let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .user_agent(concat!("mediatore-guest/", env!("CARGO_PKG_VERSION")))
+            .build()?;
+        self.placed = Some(Placed {
+            host: host.to_owned(),
+            base: format!("http://{proxy}/{host}"),
+            http,
+        });
+        Ok(self)
     }
 
     /// Trust the CA certificates in `pem` beside the Mozilla roots, for a registry mirror
@@ -362,6 +401,11 @@ impl Puller {
     }
 
     fn base(&self, reference: &ImageReference) -> String {
+        if let Some(p) = &self.placed
+            && p.host == reference.registry
+        {
+            return format!("{}/v2/{}", p.base, reference.repository);
+        }
         let scheme = if self.plain_http.contains(&reference.registry) {
             "http"
         } else {
@@ -382,6 +426,27 @@ impl Puller {
         url: &str,
         accept: Option<&str>,
     ) -> anyhow::Result<reqwest::Response> {
+        if let Some(p) = &self.placed
+            && url.starts_with(&format!("{}/", p.base))
+        {
+            // A placed registry (ADR-0043): no credential, no challenge, no redirect. The gateway placed what the
+            // registry accepts, so a 401 is its refusal and is never answered from here (a token fetched here would
+            // be a credential on the VM), and a redirect would send the VM to a host with no gateway in between.
+            let mut req = p.http.get(url);
+            if let Some(a) = accept {
+                req = req.header(reqwest::header::ACCEPT, a);
+            }
+            let resp = req.send().await?;
+            anyhow::ensure!(
+                !resp.status().is_redirection(),
+                "{url}: the registry redirected the request; a redirect would leave the gateway, refused (ADR-0043)"
+            );
+            anyhow::ensure!(
+                resp.status() != reqwest::StatusCode::UNAUTHORIZED,
+                "{url}: the registry refused the credential the gateway placed (401)"
+            );
+            return Ok(resp);
+        }
         for attempt in 0..2 {
             let resp = self
                 .send_following(url, |mut req, same_host| {
@@ -940,6 +1005,92 @@ mod tests {
 
     fn mode(p: &Path) -> u32 {
         std::fs::symlink_metadata(p).unwrap().permissions().mode() & 0o7777
+    }
+
+    /// A one-layer image, small enough for the placed-registry tests.
+    fn tiny() -> mediatore_testkit::registry::Built {
+        Image::new()
+            .layer(
+                Layer::new().dir("bin", 0o755).file("bin/sh", 0o755, b"sh"),
+                Compression::None,
+            )
+            .build()
+    }
+
+    fn placed_puller(proxy: &FakeRegistry) -> Puller {
+        Puller::new(&[])
+            .unwrap()
+            .with_placed_registry("registry.home.example", proxy.host().parse().unwrap())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_placed_registry_is_pulled_through_the_proxy_with_no_credential_and_no_token_flow() {
+        // ADR-0043 decision 2: the VM presents nothing and answers no challenge; the gateway places the credential.
+        let proxy = FakeRegistry::start_under("registry.home.example").await;
+        let want = proxy.push("team/tool", "v1", &tiny());
+        let s = scratch();
+        let got = placed_puller(&proxy)
+            .pull(
+                &r("registry.home.example/team/tool:v1"),
+                None,
+                &s.rootfs,
+                &s.scratch,
+            )
+            .await
+            .unwrap();
+        assert_eq!(got.digest, want);
+        assert_eq!(
+            std::fs::read_to_string(s.rootfs.join("bin/sh")).unwrap(),
+            "sh"
+        );
+        assert_eq!(proxy.bearer_seen(), 0, "no bearer");
+        assert_eq!(proxy.basic_on_content(), 0, "no basic");
+        assert_eq!(proxy.token_requests(), 0, "no realm call");
+    }
+
+    #[tokio::test]
+    async fn a_placed_registrys_401_is_an_error_and_never_a_call_to_the_realm() {
+        // The gateway placed what the registry accepts; a 401 means it refused it. The puller must not "fix" that by
+        // fetching a token itself, which would make the VM call the realm and hold a credential.
+        let proxy = FakeRegistry::start_under("registry.home.example").await;
+        proxy.push("team/tool", "v1", &tiny());
+        proxy.require_token(true);
+        let s = scratch();
+        let err = placed_puller(&proxy)
+            .pull(
+                &r("registry.home.example/team/tool:v1"),
+                None,
+                &s.rootfs,
+                &s.scratch,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("refused") && err.contains("gateway"), "{err}");
+        assert_eq!(proxy.token_requests(), 0, "the realm was never called");
+    }
+
+    #[tokio::test]
+    async fn a_placed_registrys_redirect_is_refused_not_followed_off_the_vm() {
+        // A layer redirected to another host would be fetched by the VM itself, with no gateway in between.
+        let proxy = FakeRegistry::start_under("registry.home.example").await;
+        let other = FakeRegistry::start().await;
+        proxy.push("team/tool", "v1", &tiny());
+        proxy.redirect_blobs_to(&format!("http://{}", other.host()));
+        let s = scratch();
+        let err = placed_puller(&proxy)
+            .pull(
+                &r("registry.home.example/team/tool:v1"),
+                None,
+                &s.rootfs,
+                &s.scratch,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("redirect"), "{err}");
+        assert_eq!(other.requests(), 0, "the other host was never contacted");
     }
 
     #[tokio::test]

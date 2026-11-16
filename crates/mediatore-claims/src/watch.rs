@@ -65,6 +65,9 @@ pub struct WatcherConfig {
     /// sandbox whose image names another fails before any claim exists. `None` without
     /// gateways.
     pub reachable_registries: Option<std::collections::BTreeSet<String>>,
+    /// The registries that are gateway-placed audiences (ADR-0043 decision 1), by the name an image reference carries,
+    /// each with its audience: a sandbox whose image is on one must name that audience.
+    pub placed_registries: std::collections::BTreeMap<String, String>,
     /// How long a claim row outlives its claim before the resync sweeps it into the audit
     /// table (ADR-0012 decision 4).
     pub retention: Duration,
@@ -89,6 +92,7 @@ impl Default for WatcherConfig {
             audiences: vec![],
             issuers: vec![],
             reachable_registries: None,
+            placed_registries: std::collections::BTreeMap::new(),
             retention: Duration::from_hours(1),
             egress_mode: crate::policy::EgressMode::default(),
             delegated_audiences: std::collections::BTreeSet::new(),
@@ -527,6 +531,24 @@ impl Watcher {
         Ok(removed)
     }
 
+    /// Remove every sealed envelope that is past its expiry or whose session was parked and never taken for longer than
+    /// the grace period (ADR-0013 decision 2, ADR-0043 decision 4): the parked ones, and those already on a bound claim's
+    /// record. Returns how many went. Run on its own short timer and again by every resync.
+    ///
+    /// # Errors
+    /// The store refused.
+    pub async fn sweep_envelopes(&self) -> Result<usize, WatchError> {
+        let swept = self
+            .reconciler
+            .store
+            .sweep_sessions(chrono::Utc::now() - chrono::Duration::seconds(SESSION_GRACE_SECS))
+            .await?;
+        if swept > 0 {
+            tracing::info!(swept, "expired or stale envelopes swept");
+        }
+        Ok(swept)
+    }
+
     /// Decision 4's backstop: release every bound record whose claim no longer exists,
     /// then sweep orphan entries, then sweep the rows of claims that ended before the
     /// retention window, the audit line logged (ADR-0034). Returns (records released,
@@ -546,15 +568,7 @@ impl Watcher {
         let before = chrono::Utc::now()
             - chrono::Duration::from_std(self.config().retention).unwrap_or(chrono::Duration::MAX);
         let archived = self.reconciler.store.sweep(before).await?;
-        // Sessions parked by the API that no record ever took (ADR-0013 decision 2).
-        let stale = self
-            .reconciler
-            .store
-            .sweep_sessions(chrono::Utc::now() - chrono::Duration::seconds(SESSION_GRACE_SECS))
-            .await?;
-        if stale > 0 {
-            tracing::info!(stale, "stale sessions swept");
-        }
+        self.sweep_envelopes().await?;
         self.declared
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -565,6 +579,11 @@ impl Watcher {
 
 /// How long a parked session may wait for its record before the resync sweeps it.
 const SESSION_GRACE_SECS: i64 = 3600;
+
+/// How often envelopes past their expiry are swept (the operator's rule, 2026-11-15, ADR-0043 decision 4: no secret is
+/// stored longer than its claim's TTL). A timer of its own, because the resync's interval is minutes, and a secret
+/// stored past its expiry until the next resync would be stored longer than the rule allows.
+pub const ENVELOPE_SWEEP_SECS: u64 = 15;
 
 /// The claim UID (ADR-0011 decision 1): the object's `metadata.uid`.
 #[must_use]
@@ -728,12 +747,23 @@ pub async fn run(client: Client, watcher: Arc<Watcher>) -> anyhow::Result<()> {
             }
         }
     };
+    let envelopes = async {
+        let mut tick = tokio::time::interval(Duration::from_secs(ENVELOPE_SWEEP_SECS));
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            if let Err(e) = watcher.sweep_envelopes().await {
+                tracing::warn!(error = %e, "envelope sweep failed; nothing removed");
+            }
+        }
+    };
     tracing::info!("claim watcher running");
     tokio::select! {
         () = claims => {}
         () = machines => {}
         () = sandboxes => {}
         () = resync => {}
+        () = envelopes => {}
     }
     anyhow::bail!("claim watcher stopped")
 }
@@ -1088,6 +1118,66 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.entries.names(), vec![node_entry_name(RSA_EK_HASH)]);
+    }
+
+    #[tokio::test]
+    async fn expired_envelopes_are_swept_on_their_own_and_the_rest_stay() {
+        // The operator's rule (ADR-0043 decision 4): no secret is stored longer than its claim's TTL. The sweep that
+        // enforces it runs on a short timer of its own, not only inside the resync, whose interval is minutes.
+        let r = rig(WatcherConfig::default());
+        let sealed = || mediatore_store::Sealed {
+            key_id: "k".into(),
+            nonce: vec![0; 12],
+            ciphertext: vec![1, 2, 3],
+        };
+        let subject = || Subject {
+            issuer: "https://idp.example".into(),
+            id: "octocat".into(),
+            display: None,
+        };
+        let parked = |expires_at| mediatore_store::SessionRecord {
+            sandbox_uid: Uuid::new_v4(),
+            subject: subject(),
+            issuer: String::new(),
+            refresh: sealed(),
+            created_at: Utc::now(),
+            audience: Some("registry".into()),
+            expires_at,
+        };
+        let gone = parked(Some(Utc::now() - chrono::Duration::seconds(1)));
+        let kept = parked(Some(Utc::now() + chrono::Duration::minutes(10)));
+        r.store.put_session(gone.clone()).await.unwrap();
+        r.store.put_session(kept.clone()).await.unwrap();
+        // And one already on a bound claim's record.
+        let bound = Uuid::new_v4();
+        let mut rec = record(bound);
+        rec.delegations.insert(
+            "registry".into(),
+            mediatore_store::DelegatedSession {
+                envelope: sealed(),
+                expires_at: Some(Utc::now() - chrono::Duration::seconds(1)),
+            },
+        );
+        r.store.put_claim(rec).await.unwrap();
+
+        assert_eq!(r.watcher.sweep_envelopes().await.unwrap(), 2);
+        assert_eq!(
+            r.store.take_delegations(gone.sandbox_uid).await.unwrap(),
+            Vec::new()
+        );
+        assert_eq!(
+            r.store
+                .take_delegations(kept.sandbox_uid)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "an envelope with time left stays"
+        );
+        assert_eq!(
+            r.store.get_claim(bound).await.unwrap().delegations,
+            std::collections::BTreeMap::new()
+        );
     }
 
     #[tokio::test]

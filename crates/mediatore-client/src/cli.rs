@@ -349,7 +349,7 @@ async fn create(args: CreateArgs) -> anyhow::Result<()> {
     let mut delegations = Vec::new();
     for arg in &args.delegate {
         let (audience, source) = crate::delegate::parse_delegate(arg)?;
-        let cred = crate::delegate::read(&audience, &source)?;
+        let cred = crate::delegate::read(&audience, &source, args.ttl)?;
         eprintln!(
             "delegating your {audience} credential to the broker for this claim ({})",
             cred.expires_at

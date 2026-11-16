@@ -40,6 +40,9 @@ the component that finishes the story.
   sealed refresh material, retention and the audit line.
 - [The policy bundle, in shadow](guides/the-policy-bundle.md): notaio beside the broker, the
   keys it trusts, naming a policy on a sandbox, and reading the `PolicyConformant` verdict.
+- [Design](design/index.md): how the code is built, part by part: the broker API, the reconcilers, the
+  store and the sealing, identity, issuers and audiences, policy, the guest, the egress proxy, the gateway, the CLI,
+  the configuration and the tests.
 - [System architecture](architecture/diagrams/system.md) and
   [flows](architecture/diagrams/flows.md), rendered from the
   [CALM](https://calm.finos.org/) architecture-as-code model.

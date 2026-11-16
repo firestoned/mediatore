@@ -520,6 +520,16 @@ impl Watcher {
                 ) {
                     return Some(reason);
                 }
+                // A registry the gateway places a credential for serves a claim that names its audience (ADR-0043
+                // decision 1); without it the pull would be anonymous and fail later, so say so now.
+                if let Some(audience) = self.cfg.placed_registries.get(&image.registry)
+                    && !spec.audiences.contains(audience)
+                {
+                    return Some(format!(
+                        "registry {} is served from your own credential: name audience {audience} and delegate it with the claim (ADR-0043)",
+                        image.registry
+                    ));
+                }
             }
         }
         None
@@ -1545,6 +1555,65 @@ mod tests {
                 "{want}: no record"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn an_image_on_a_placed_registry_needs_its_audience_named() {
+        // ADR-0043 decision 1: a registry the gateway places a credential for serves a claim only when the claim names that
+        // audience (and, being delegated, carries a credential for it): an image there with no audience is refused
+        // before any claim exists, instead of failing the pull later as an anonymous one.
+        let placed = WatcherConfig {
+            audiences: vec![Audience::named("api.example"), Audience::named("registry")],
+            reachable_registries: Some(["registry.home.example".to_owned()].into_iter().collect()),
+            placed_registries: [("registry.home.example".to_owned(), "registry".to_owned())]
+                .into_iter()
+                .collect(),
+            ..cfg()
+        };
+        let r = rig(placed.clone());
+        let mut sb = sandbox(true, false);
+        sb.spec.workload.image = "registry.home.example/team/image:1".into();
+        r.claims.put_sandbox(sb.clone());
+        assert_eq!(
+            r.watcher.reconcile_sandbox(&sb).await.unwrap(),
+            Action::await_change()
+        );
+        let st = r
+            .claims
+            .sandbox("sandboxes", "sb-1")
+            .unwrap()
+            .status
+            .unwrap();
+        assert_eq!(st.phase, SandboxPhase::Failed);
+        let reason = st.reason.unwrap_or_default();
+        assert!(
+            reason.contains("registry.home.example") && reason.contains("name audience registry"),
+            "{reason}"
+        );
+        assert!(
+            r.claims.claim("sandboxes", "sb-1").is_none(),
+            "no claim was created"
+        );
+
+        // Naming the audience clears this check (the delegation is checked where it always was).
+        let r = rig(placed);
+        let mut sb = sandbox(true, false);
+        sb.spec.workload.image = "registry.home.example/team/image:1".into();
+        sb.spec.audiences = vec!["registry".into()];
+        r.claims.put_sandbox(sb.clone());
+        r.watcher.reconcile_sandbox(&sb).await.unwrap();
+        let st = r
+            .claims
+            .sandbox("sandboxes", "sb-1")
+            .unwrap()
+            .status
+            .unwrap();
+        assert!(
+            !st.reason
+                .unwrap_or_default()
+                .contains("name audience registry"),
+            "naming it is enough for this check"
+        );
     }
 
     #[tokio::test]

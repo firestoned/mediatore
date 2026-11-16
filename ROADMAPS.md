@@ -22,6 +22,8 @@ the same commit that changes a roadmap item's state.
 | 10 | Egress gateway (Envoy, SPIFFE identity, ADR-0028) | ✅ done | [10-egress-gateway.md](.github/community/10-egress-gateway.md) |
 | 11 | A policy's direct egress at the gateway (ADR-0030) | 🔶 in progress | [11-policy-egress-at-the-gateway.md](.github/community/11-policy-egress-at-the-gateway.md) |
 | 12 | The end-to-end flow to the Anthropic API (Dex, SPIRE, notaio, the policies, the broker, the gateways) | 🔶 in progress | [12-claude-end-to-end.md](.github/community/12-claude-end-to-end.md) |
+| 13 | Declarative `AgentSandbox` and a person's credential (design; ADR-0043 is its sibling for the registry pull) | ⛔ not started | [13-declarative-agentsandbox-credentials.md](.github/community/13-declarative-agentsandbox-credentials.md) |
+| 14 | A stored secret expires right on its TTL (a spike: the envelope stays in Kubernetes, how its deletion is driven) | ⛔ not started | [14-secret-expiry-at-the-ttl.md](.github/community/14-secret-expiry-at-the-ttl.md) |
 
 Statuses: ✅ done · 🔶 in progress · ⛔ not started · 📄 reference doc.
 ADRs are separate and live in [`docs/adr/`](docs/adr/).

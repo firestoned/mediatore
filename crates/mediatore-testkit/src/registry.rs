@@ -464,6 +464,33 @@ impl FakeRegistry {
         }
     }
 
+    /// The registry served under `/<prefix>` on a loopback listener: what the claim's egress proxy presents to the guest's
+    /// puller for a registry the gateway places a credential for (`/<registry host>/v2/...`, ADR-0043). The returned
+    /// [`Self::host`] is the proxy's address, not a registry name.
+    ///
+    /// # Panics
+    /// When the listener cannot be bound.
+    pub async fn start_under(prefix: &str) -> Self {
+        let inner = Arc::new(Inner::default());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the fake registry");
+        let host = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+        inner.host.lock().unwrap().clone_from(&host);
+        let app = Router::new().nest(&format!("/{prefix}"), Self::router(&inner));
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve the fake registry");
+        });
+        Self {
+            inner,
+            host,
+            _task: task,
+            tls: None,
+        }
+    }
+
     /// The same registry over TLS 1.3 on a CA of its own (`crate::TlsUpstream`), as a
     /// mirror on the operator's PKI is (ADR-0029); [`Self::ca_pem`] is what the puller
     /// must be told to trust.

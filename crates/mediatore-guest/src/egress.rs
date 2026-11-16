@@ -112,6 +112,15 @@ pub struct EgressArgs {
     /// an upstream that has no 1.3 (`MEDIATORE_EGRESS_MIN_TLS` on the guest)
     #[arg(long, default_value_t = UpstreamTls::Tls13)]
     pub upstream_min_tls: UpstreamTls,
+    /// A second loopback listener for the guest's image pull (ADR-0043 decision 3): root's puller reaches the one
+    /// registry named by `--pull-host` through it, as a gateway-placed route and nothing else. A port no jail rule
+    /// lists, so the sandbox cannot reach it.
+    #[arg(long, requires = "pull_host")]
+    pub pull_listen: Option<SocketAddr>,
+    /// The registry the pull listener serves, as an image reference names it (`host`, or `host:port` when the port is
+    /// not 443).
+    #[arg(long, requires = "pull_listen")]
+    pub pull_host: Option<String>,
 }
 
 /// The trust the guest hands the proxy for upstreams that carry no CA of their own.
@@ -768,6 +777,76 @@ impl Proxy {
 }
 
 impl Proxy {
+    /// Serve the pull listener (ADR-0043 decision 3) until the task is dropped: the guest's puller, as root, asks for
+    /// the one registry `host` here, as `/<host>/v2/...` with no credential, and each request goes to a gateway as a
+    /// placed route. Nothing else is served on this port.
+    ///
+    /// # Errors
+    /// When `accept` fails, which ends the proxy and so the claim.
+    pub async fn serve_pull(
+        self: Arc<Self>,
+        listener: TcpListener,
+        host: String,
+    ) -> anyhow::Result<()> {
+        loop {
+            let (stream, _) = listener.accept().await?;
+            let proxy = self.clone();
+            let host = host.clone();
+            tokio::spawn(async move {
+                let service = hyper::service::service_fn(move |req| {
+                    let proxy = proxy.clone();
+                    let host = host.clone();
+                    async move { Ok::<_, std::convert::Infallible>(proxy.handle_pull(req, &host).await) }
+                });
+                if let Err(e) = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await
+                {
+                    tracing::debug!(error = %e, "connection from the puller ended with an error");
+                }
+            });
+        }
+    }
+
+    /// One request from the puller: for `host` only, judged by the route's rules as any request is, and sent to a
+    /// gateway when the route is gateway-placed. A route that is not placed is refused here, so this port never dials an
+    /// upstream and never asks for a token.
+    async fn handle_pull(&self, req: Request<Incoming>, host: &str) -> Response<Body> {
+        let method = req.method().clone();
+        let Some(path_and_query) = req.uri().path_and_query().map(ToString::to_string) else {
+            return refuse(&Refusal::new(StatusCode::BAD_REQUEST, "bad_request"));
+        };
+        let segment = path_and_query
+            .trim_start_matches('/')
+            .split(['/', '?'])
+            .next()
+            .unwrap_or_default();
+        if !segment.eq_ignore_ascii_case(host) {
+            tracing::warn!(%method, "pull request for a host that is not the pull host refused");
+            return refuse(&Refusal::new(StatusCode::NOT_FOUND, "not_the_pull_host"));
+        }
+        let forward = match judge_headers(
+            &self.routes,
+            &self.phantom,
+            &method,
+            &path_and_query,
+            req.headers(),
+        ) {
+            Ok(f) => f,
+            Err(r) => {
+                tracing::warn!(%method, path = %path_and_query, status = %r.status, code = r.code, "pull request refused");
+                return refuse(&r);
+            }
+        };
+        if !forward.route.placed_at_gateway() {
+            tracing::warn!(host, "the pull host's route is not gateway-placed; refused");
+            return refuse(&Refusal::new(StatusCode::FORBIDDEN, "not_placed"));
+        }
+        self.handle_at_gateway(req, &forward).await
+    }
+}
+
+impl Proxy {
     /// A request on a gateway-placed route (ADR-0040 decision 7). It has been judged: the rules
     /// held, and any credential header it carried was the phantom (a foreign one is `401`).
     /// It is sent in origin form, with `Host` the audience's authority and no credential, over
@@ -1074,6 +1153,40 @@ pub fn command_args(
     args
 }
 
+/// The pull listener's loopback port unless the guest is told otherwise (`MEDIATORE_EGRESS_PULL_PORT`): not the
+/// proxy's, and listed by no jail rule.
+pub const DEFAULT_PULL_PORT: u16 = 18129;
+
+/// The registry of an image, by the name its reference carries (the host, with the port only when it is not 443),
+/// when a gateway-placed route of the claim is for it (ADR-0043 decision 2): the pull then goes through the proxy.
+/// `None` for every other registry, which is pulled as it always was.
+#[must_use]
+pub fn placed_registry(routes: &[Route], registry: &str) -> Option<String> {
+    routes
+        .iter()
+        .filter(|r| r.placed_at_gateway())
+        .map(|r| {
+            if r.endpoint.port == 443 {
+                r.endpoint.host.clone()
+            } else {
+                format!("{}:{}", r.endpoint.host, r.endpoint.port)
+            }
+        })
+        .find(|name| name.eq_ignore_ascii_case(registry))
+}
+
+/// The two options that add the pull listener (ADR-0043 decision 3), appended to [`command_args`] only for a claim
+/// whose image is on a registry the gateway places a credential for.
+#[must_use]
+pub fn pull_args(listen: SocketAddr, host: &str) -> Vec<String> {
+    vec![
+        "--pull-listen".into(),
+        listen.to_string(),
+        "--pull-host".into(),
+        host.to_owned(),
+    ]
+}
+
 /// Start the proxy as `uid:gid` and wait for its ready line, at most `timeout`.
 ///
 /// # Errors
@@ -1171,8 +1284,28 @@ pub async fn run(args: EgressArgs) -> anyhow::Result<()> {
     )?);
     tracing::info!(%addr, routes = proxy.routes.len(), dial = %proxy.dialer, "egress proxy listening");
     // The one line on standard output: the guest starts the jail when it reads it.
+    // The pull listener is bound before the ready line, so the guest's puller never meets a closed port.
+    let pull = match (args.pull_listen, args.pull_host.clone()) {
+        (Some(pull_addr), Some(pull_host)) => {
+            anyhow::ensure!(
+                pull_addr.ip().is_loopback() && pull_addr != args.listen,
+                "the pull listener is on loopback and is not the proxy's own port; got {pull_addr}"
+            );
+            let pull = TcpListener::bind(pull_addr).await?;
+            tracing::info!(addr = %pull.local_addr()?, host = %pull_host, "pull listener (a placed registry, for the guest's image pull)");
+            Some((pull, pull_host))
+        }
+        _ => None,
+    };
     println!("{READY_LINE} {addr}");
-    proxy.serve(listener).await
+    let Some((pull, pull_host)) = pull else {
+        return proxy.serve(listener).await;
+    };
+    // Either listener ending ends the proxy, and so the claim.
+    tokio::select! {
+        r = proxy.clone().serve(listener) => r,
+        r = proxy.serve_pull(pull, pull_host) => r,
+    }
 }
 
 #[cfg(test)]
@@ -2061,6 +2194,45 @@ mod tests {
         }
     }
 
+    /// The proxy with a second, pull-only listener for `host` (ADR-0043 decision 3); returns the harness and the pull URL.
+    async fn harness_with_pull(
+        ca: &TestCa,
+        routes: Vec<Route>,
+        gateways: Vec<Endpoint>,
+        host: &str,
+    ) -> (Harness, String) {
+        let material = MemoryMaterial::new(ca.svid(CLAIM_ID));
+        let forwarder = Forwarder::new(gateways, material).unwrap();
+        let phantom = Phantom::generate().unwrap();
+        let tokens = Arc::new(CountingTokens(AtomicUsize::new(0)));
+        let proxy = Arc::new(
+            Proxy::with_webpki_roots(
+                Routes::new(routes).unwrap(),
+                phantom.clone(),
+                tokens.clone(),
+                Dialer::Gateways(forwarder),
+            )
+            .unwrap(),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let pull = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let pull_base = format!("http://{}", pull.local_addr().unwrap());
+        let host = host.to_owned();
+        let task = tokio::spawn(async move {
+            let _ = tokio::join!(proxy.clone().serve(listener), proxy.serve_pull(pull, host));
+        });
+        (
+            Harness {
+                base,
+                phantom,
+                tokens,
+                _task: task,
+            },
+            pull_base,
+        )
+    }
+
     /// The jailed workload: plain HTTP to the loopback proxy, never through an ambient proxy.
     fn workload() -> reqwest::Client {
         reqwest::Client::builder().no_proxy().build().unwrap()
@@ -2122,6 +2294,129 @@ mod tests {
             h.tokens.0.load(Ordering::SeqCst),
             0,
             "POST /v1/token is never called for a gateway-placed route"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_pull_listener_serves_its_registry_host_only_and_only_as_a_placed_route() {
+        // ADR-0043 decision 3: root's puller reaches the registry through this proxy on a port the jail never lists. It
+        // sends no credential; the request goes to the gateway as a placed route; any other host is refused there.
+        let ca = TestCa::new(TD);
+        let fake = FakeGateway::start(&ca, Script::Echo).await;
+        let routes = vec![
+            placed(
+                "registry.home.example:443",
+                Some(fake.addr.port()),
+                &[("GET", "/v2/**")],
+            ),
+            placed(
+                UPSTREAM,
+                Some(fake.addr.port()),
+                &[("POST", "/v1/messages")],
+            ),
+        ];
+        let (h, pull) = harness_with_pull(
+            &ca,
+            routes,
+            vec![gw("127.0.0.1:1")],
+            "registry.home.example",
+        )
+        .await;
+        let ok = workload()
+            .get(format!(
+                "{pull}/registry.home.example/v2/team/tool/manifests/v1"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), 200);
+        let seen = fake.seen();
+        assert_eq!(seen.len(), 1, "one request, to the inject port");
+        assert_eq!(seen[0].peer, CLAIM_ID, "as the claim");
+        assert_eq!(seen[0].target, "/v2/team/tool/manifests/v1", "origin form");
+        assert_eq!(seen[0].header("host"), Some("registry.home.example"));
+        assert!(
+            seen[0].header("authorization").is_none(),
+            "no credential leaves the guest"
+        );
+        // Another host, though it is a placed route of the claim, is not served on the pull port.
+        let other = workload()
+            .post(format!("{pull}/{UPSTREAM}/v1/messages"))
+            .body("x")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(other.status(), 404);
+        assert_eq!(fake.seen().len(), 1, "nothing more reached the gateway");
+        assert_eq!(h.tokens.0.load(Ordering::SeqCst), 0, "no token was asked");
+    }
+
+    #[tokio::test]
+    async fn the_pull_listener_refuses_a_route_that_is_not_gateway_placed() {
+        // A registry route that is not placed (a misconfiguration) must not be served from here: the pull listener never
+        // dials an upstream itself and never asks for a token.
+        let ca = TestCa::new(TD);
+        let fake = FakeGateway::start(&ca, Script::Echo).await;
+        let routes = vec![route("registry", "registry.home.example:443", &[])];
+        let (h, pull) = harness_with_pull(
+            &ca,
+            routes,
+            vec![gw(&format!("127.0.0.1:{}", fake.addr.port()))],
+            "registry.home.example",
+        )
+        .await;
+        let resp = workload()
+            .get(format!("{pull}/registry.home.example/v2/"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403);
+        assert!(fake.seen().is_empty());
+        assert_eq!(h.tokens.0.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_registry_is_pulled_through_the_proxy_only_when_a_gateway_placed_route_names_it() {
+        // ADR-0043: the guest pulls through the proxy when the image's registry is a gateway-placed route of the claim, by
+        // the name an image reference carries (the host, with the port only when it is not 443).
+        let routes = vec![
+            placed(
+                "registry.home.example:443",
+                Some(3133),
+                &[("GET", "/v2/**")],
+            ),
+            placed("odd.home.example:5443", Some(3133), &[]),
+            route("direct", "plain.example:443", &[]),
+        ];
+        assert_eq!(
+            placed_registry(&routes, "registry.home.example").as_deref(),
+            Some("registry.home.example"),
+            "443 is the bare host"
+        );
+        assert_eq!(
+            placed_registry(&routes, "odd.home.example:5443").as_deref(),
+            Some("odd.home.example:5443"),
+            "another port is part of the name"
+        );
+        assert_eq!(
+            placed_registry(&routes, "plain.example"),
+            None,
+            "a route that is not gateway-placed is not a placed registry"
+        );
+        assert_eq!(placed_registry(&routes, "other.example"), None);
+    }
+
+    #[test]
+    fn the_pull_listener_is_on_the_command_line_only_for_a_placed_registry() {
+        let listen = SocketAddr::from(([127, 0, 0, 1], 18129));
+        assert_eq!(
+            pull_args(listen, "registry.home.example"),
+            [
+                "--pull-listen",
+                "127.0.0.1:18129",
+                "--pull-host",
+                "registry.home.example"
+            ]
         );
     }
 

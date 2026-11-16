@@ -95,3 +95,22 @@ flowchart TD
 
 <sub>Source: flow `flow-policy-shadow` in `architecture.json`.</sub>
 
+
+## A private image pulled with the person&#x27;s own credential, which the VM never sees (ADR-0043)
+
+From the person's prompt to the first layer, for a registry that is a placed audience: the credential is sealed with OpenBao transit in the broker, placed by the gateway as Basic on each registry request, and the pool VM holds neither it nor any token derived from it.
+
+```mermaid
+flowchart TD
+    t1["1. The CLI asks for the user name and secret at the echo-off prompt (or reads the saved item, whose age limit is the claim's TTL) and sends them in POST /v1/claims delegations, as ADR-0041."]
+    t2["2. The broker seals the credential with the transit key derived from the claim's UID and stores only the ciphertext in the claim's Secret; the claim names an image on a registry that is a placed audience, so the claim must carry a delegation for it."]
+    t3["3. The guest starts the claim's egress proxy first, then pulls through it on the route only root can open; the requests carry no credential."]
+    t4["4. The proxy sends each request in origin form to a gateway's inject port over the claim's mutual TLS."]
+    t5["5. The inject Envoy asks the authorizer, which obtains the credential from the broker over the gateway SVID (rel-gateway-mediatore-credential) and answers with Authorization: Basic."]
+    t6["6. The inject Envoy originates TLS to the registry and streams the manifest and the layers back; the guest verifies every digest as ever (ADR-0021)."]
+    t7["7. When the claim is released the broker deletes the sealed envelope's Secret; the authorizer's copy leaves memory with the claim."]
+    t1 --> t2 --> t3 --> t4 --> t5 --> t6 --> t7
+```
+
+<sub>Source: flow `flow-registry-pull-placed` in `architecture.json`.</sub>
+

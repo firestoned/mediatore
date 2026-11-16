@@ -108,6 +108,15 @@ pub struct GuestArgs {
         default_value_t = egress::DEFAULT_PORT
     )]
     pub egress_proxy_port: u16,
+    /// The loopback port of the proxy's pull listener (ADR-0043 decision 3), used only for a claim whose image is on a
+    /// registry the gateway places a credential for: root's puller reaches the registry through it. A port no jail
+    /// rule lists.
+    #[arg(
+        long,
+        env = "MEDIATORE_EGRESS_PULL_PORT",
+        default_value_t = egress::DEFAULT_PULL_PORT
+    )]
+    pub egress_pull_port: u16,
     /// The pool's bootstrap list of egress gateways (ADR-0027 decision 4), one host:port
     /// per line, used when the broker lists none; absent on a pool with no gateway
     #[arg(long, env = "MEDIATORE_GATEWAYS_FILE", default_value = net::GATEWAYS_FILE)]
@@ -345,6 +354,29 @@ pub async fn run(args: GuestArgs) -> anyhow::Result<()> {
     result
 }
 
+/// Pull the claim's image and say so. `credential` is the operator's pull credential (ADR-0022), `None` for a
+/// registry the gateway places a credential for (ADR-0043): the VM presents nothing there.
+async fn pull_image(
+    client: &image::Puller,
+    credential: Option<&mediatore_proto::RegistryCredential>,
+    me: &Me,
+    reference: &mediatore_proto::image::ImageReference,
+    layout: &sandboxfs::Layout,
+) -> anyhow::Result<image::Pulled> {
+    let pulled = client
+        .pull(reference, credential, &layout.rootfs, &layout.layers)
+        .await?;
+    tracing::info!(
+        claim_uid = %me.claim_uid,
+        image = %reference,
+        image_digest = %pulled.digest,
+        layers = pulled.layers,
+        bytes = pulled.bytes,
+        "workload image pulled"
+    );
+    Ok(pulled)
+}
+
 /// Tmpfs, rootfs, ruleset, egress proxy, jail (ADR-0021 decision 5, ADR-0025), then
 /// supervise until the deadline. No jail without the ruleset (ADR-0020 decision 5) or
 /// without the proxy (ADR-0025 decision 1), no ruleset without the rootfs.
@@ -370,22 +402,24 @@ async fn serve_claim(
         &args.relay_registries,
         &args.mediatore_url,
     )?;
-    let pulled = registry_client
-        .pull(
-            reference,
-            me.registry_credential.as_ref(),
-            &layout.rootfs,
-            &layout.layers,
+    // A registry the gateway places a credential for (ADR-0043) is pulled later, through the claim's own egress proxy,
+    // once the sandbox uid's ruleset is loaded and the proxy runs: the VM never holds the credential. Every other
+    // registry is pulled here, as it always was.
+    let placed_host = egress::placed_registry(&me.routes, &reference.registry);
+    let early = if placed_host.is_none() {
+        Some(
+            pull_image(
+                &registry_client,
+                me.registry_credential.as_ref(),
+                me,
+                reference,
+                &layout,
+            )
+            .await?,
         )
-        .await?;
-    tracing::info!(
-        claim_uid = %me.claim_uid,
-        image = %reference,
-        image_digest = %pulled.digest,
-        layers = pulled.layers,
-        bytes = pulled.bytes,
-        "workload image pulled"
-    );
+    } else {
+        None
+    };
     // The gateways (ADR-0028 decision 6, ADR-0027 decision 4): the broker's list, or the
     // pool's bootstrap file when the broker has none, or neither and the proxy dials
     // directly. Which one decides the ruleset's shape and the proxy's dialer alike.
@@ -454,6 +488,28 @@ async fn serve_claim(
             min_tls: args.egress_min_tls,
         },
     );
+    let pull_addr = std::net::SocketAddr::from(([127, 0, 0, 1], args.egress_pull_port));
+    let mut proxy_args = proxy_args;
+    if let Some(host) = &placed_host {
+        // The pull port must be one no jail rule lists: not the proxy's, and not a port of any destination the
+        // sandbox uid's table names (Landlock admits a listed port at any address; the table is what pins the address).
+        anyhow::ensure!(
+            args.egress_pull_port != args.egress_proxy_port
+                && !ruleset
+                    .allow
+                    .iter()
+                    .any(|(_, p)| *p == args.egress_pull_port),
+            "the pull port {} is the proxy's or a destination's: choose another (MEDIATORE_EGRESS_PULL_PORT)",
+            args.egress_pull_port
+        );
+        proxy_args.extend(egress::pull_args(pull_addr, host));
+        tracing::info!(
+            claim_uid = %me.claim_uid,
+            registry = %host,
+            %pull_addr,
+            "the image's registry is gateway-placed: pulled through the claim's egress proxy, no credential on this VM (ADR-0043)"
+        );
+    }
     if args.egress_min_tls != mediatore_proto::tls::UpstreamTls::Tls13 {
         tracing::warn!(
             min_tls = %args.egress_min_tls,
@@ -461,16 +517,6 @@ async fn serve_claim(
             args.egress_min_tls
         );
     }
-    let spec = jail::JailSpec {
-        user: username.to_string(),
-        rootfs: layout.rootfs,
-        work: layout.work,
-        agent_binary: args.agent_binary.clone(),
-        argv: me.workload.args.clone(),
-        rlimit_as_mib: jail::DEFAULT_RLIMIT_AS_MIB,
-        proxy_port: args.egress_proxy_port,
-        phantom,
-    };
     let sha256 = net::load(&ruleset).await?;
     tracing::info!(
         claim_uid = %me.claim_uid,
@@ -483,6 +529,48 @@ async fn serve_claim(
         ruleset_sha256 = %sha256,
         "sandbox ruleset loaded"
     );
+    // The proxy before the jail: the workload's only route out must exist when its first
+    // instruction runs (ADR-0025 decision 1). For a gateway-placed registry it is also the pull's route, so it starts
+    // before the pull (ADR-0043 decision 3).
+    let mut proxy = egress::spawn(
+        &args.agent_binary,
+        &proxy_args,
+        uid,
+        gid,
+        std::time::Duration::from_secs(PROXY_READY_SECS),
+    )
+    .await?;
+    tracing::info!(
+        claim_uid = %me.claim_uid,
+        pid = proxy.id(),
+        user = username,
+        %listen,
+        routes = routes.len(),
+        gateways = gateways.len(),
+        gateways_from = ?source,
+        "egress proxy ready"
+    );
+    let pulled = if let Some(pulled) = early {
+        pulled
+    } else {
+        let host = placed_host.as_deref().unwrap_or_default();
+        let pulled = match registry_client
+            .clone()
+            .with_placed_registry(host, pull_addr)
+        {
+            // No credential: the gateway places it. Whatever fails ends the claim, with the proxy.
+            Ok(client) => pull_image(&client, None, me, reference, &layout).await,
+            Err(e) => Err(e),
+        };
+        match pulled {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = proxy.start_kill();
+                let _ = proxy.wait().await;
+                return Err(e);
+            }
+        }
+    };
     // What ran, to the record (ADR-0029 decision 5): the image's digest, the sandbox
     // table's hash, the host table as nft lists it. The record's, not the jail's gate.
     let guest_report = mediatore_proto::GuestReport {
@@ -503,26 +591,16 @@ async fn serve_claim(
             "the report did not reach the broker; the record will show none"
         ),
     }
-    // The proxy before the jail: the workload's only route out must exist when its first
-    // instruction runs (ADR-0025 decision 1).
-    let mut proxy = egress::spawn(
-        &args.agent_binary,
-        &proxy_args,
-        uid,
-        gid,
-        std::time::Duration::from_secs(PROXY_READY_SECS),
-    )
-    .await?;
-    tracing::info!(
-        claim_uid = %me.claim_uid,
-        pid = proxy.id(),
-        user = username,
-        %listen,
-        routes = routes.len(),
-        gateways = gateways.len(),
-        gateways_from = ?source,
-        "egress proxy ready"
-    );
+    let spec = jail::JailSpec {
+        user: username.to_string(),
+        rootfs: layout.rootfs,
+        work: layout.work,
+        agent_binary: args.agent_binary.clone(),
+        argv: me.workload.args.clone(),
+        rlimit_as_mib: jail::DEFAULT_RLIMIT_AS_MIB,
+        proxy_port: args.egress_proxy_port,
+        phantom,
+    };
     let result = supervise::run(&spec, me.expires_at, &mut proxy, me.workload.restart).await;
     // The proxy ends with the claim, whichever way it ended.
     if let Err(e) = proxy.start_kill() {

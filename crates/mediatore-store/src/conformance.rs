@@ -49,6 +49,8 @@ macro_rules! suite {
                 delete_node_removes_the_row_and_is_idempotent,
                 a_sweep_removes_claims_that_ended_before_the_retention,
                 a_session_is_taken_once_deleted_on_demand_and_swept_when_stale,
+                an_envelope_is_swept_when_it_expires_and_not_only_when_it_is_old,
+                a_bound_claims_delegation_is_removed_when_it_expires,
                 delegations_are_parked_per_audience_and_revocation_empties_them,
                 a_policy_floor_round_trips_to_the_nanosecond,
                 a_policy_floor_moves_only_from_what_is_held,
@@ -527,6 +529,86 @@ pub(crate) async fn delegations_are_parked_per_audience_and_revocation_empties_t
     s.delete_session(sandbox_uid).await.unwrap();
     assert!(s.take_session(sandbox_uid).await.unwrap().is_none());
     assert_eq!(s.take_delegations(sandbox_uid).await.unwrap(), Vec::new());
+}
+
+/// ADR-0043 decision 4: a credential parked for a claim that never binds must not outlive that claim. The
+/// age rule alone (`created_at` before the cutoff) keeps it for the whole grace period, long after the claim's
+/// TTL; the envelope's own `expires_at` is when it stops being useful, so a sweep removes it then.
+pub(crate) async fn an_envelope_is_swept_when_it_expires_and_not_only_when_it_is_old(
+    s: &dyn ClaimStore,
+) {
+    let (expired_uid, open_ended_uid, later_uid) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    // All three were created after the cutoff below, so the age rule removes none of them.
+    let mut expired = parked(expired_uid, Some("registry"), b"user:secret", Some(at(160))).await;
+    expired.created_at = at(100);
+    let mut open_ended = parked(open_ended_uid, Some("registry"), b"user:secret", None).await;
+    open_ended.created_at = at(100);
+    let mut later = parked(
+        later_uid,
+        Some("registry"),
+        b"user:secret",
+        Some(Utc::now() + Duration::hours(1)),
+    )
+    .await;
+    later.created_at = at(100);
+    for r in [&expired, &open_ended, &later] {
+        s.put_session(r.clone()).await.unwrap();
+    }
+
+    assert_eq!(
+        s.sweep_sessions(at(50)).await.unwrap(),
+        1,
+        "the envelope that has expired goes; one with no expiry or an expiry ahead stays"
+    );
+    assert_eq!(s.take_delegations(expired_uid).await.unwrap(), Vec::new());
+    assert_eq!(s.take_delegations(open_ended_uid).await.unwrap().len(), 1);
+    assert_eq!(s.take_delegations(later_uid).await.unwrap().len(), 1);
+}
+
+/// The operator's rule, 2026-11-15 (ADR-0043 decision 4): a delegated secret is stored no longer than the claim's TTL.
+/// Once the claim is bound the envelope lives on its record, and the sweep removes it there when it expires, not at
+/// the claim's end, which can be later than the envelope's expiry by the time the claim waited to bind.
+pub(crate) async fn a_bound_claims_delegation_is_removed_when_it_expires(s: &dyn ClaimStore) {
+    let uid = Uuid::new_v4();
+    let envelope = |plain: &'static [u8]| async move { sealer().seal(uid, plain).await.unwrap() };
+    let mut rec = claim(uid);
+    rec.delegations.insert(
+        "expired".into(),
+        DelegatedSession {
+            envelope: envelope(b"{\"token\":\"a\"}").await,
+            expires_at: Some(at(160)),
+        },
+    );
+    rec.delegations.insert(
+        "later".into(),
+        DelegatedSession {
+            envelope: envelope(b"{\"token\":\"b\"}").await,
+            expires_at: Some(Utc::now() + Duration::hours(1)),
+        },
+    );
+    rec.delegations.insert(
+        "open".into(),
+        DelegatedSession {
+            envelope: envelope(b"{\"token\":\"c\"}").await,
+            expires_at: None,
+        },
+    );
+    s.put_claim(rec).await.unwrap();
+
+    assert_eq!(
+        s.sweep_sessions(at(50)).await.unwrap(),
+        1,
+        "the expired envelope on the record goes"
+    );
+    let kept: Vec<String> = s
+        .get_claim(uid)
+        .await
+        .unwrap()
+        .delegations
+        .keys()
+        .cloned()
+        .collect();
+    assert_eq!(kept, vec!["later".to_string(), "open".to_string()]);
 }
 
 /// A session parked for `sandbox_uid`: the issuer's (`audience` `None`) or a delegation's.

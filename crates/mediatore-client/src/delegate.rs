@@ -116,10 +116,10 @@ impl Credential {
 
 /// Read a source now. A credential the source says has expired is refused here, with the
 /// fix, rather than by the broker later. `audience` names the Keychain item for `store` and the
-/// prompt's question.
-pub fn read(audience: &str, source: &Source) -> anyhow::Result<Credential> {
+/// prompt's question; `ttl_seconds` is the claim's, which bounds how long a saved item is kept.
+pub fn read(audience: &str, source: &Source, ttl_seconds: u32) -> anyhow::Result<Credential> {
     let cred = match source {
-        Source::Prompt => prompt_basic(audience)?,
+        Source::Prompt => prompt_basic(audience, ttl_seconds)?,
         Source::Store => store::load(audience)?,
         Source::ClaudeCode => parse_claude_code(&claude_code_store()?)?,
         Source::Env(name) => {
@@ -285,12 +285,12 @@ mod tests {
         let dir = mediatore_testkit::tempdir();
         let file = dir.join("token");
         std::fs::write(&file, "tok-from-file\n").unwrap();
-        let cred = read("a", &Source::File(file.clone())).unwrap();
+        let cred = read("a", &Source::File(file.clone()), 900).unwrap();
         assert_eq!(cred.token, "tok-from-file");
         assert!(cred.refresh_token.is_none() && cred.expires_at.is_none());
         std::fs::write(&file, "   \n").unwrap();
         assert!(
-            read("a", &Source::File(file))
+            read("a", &Source::File(file), 900)
                 .unwrap_err()
                 .to_string()
                 .contains("empty")
@@ -303,12 +303,48 @@ mod tests {
         let err = std::env::var("MEDIATORE_TEST_UNSET_VARIABLE")
             .err()
             .map(|_| {
-                read("a", &Source::Env("MEDIATORE_TEST_UNSET_VARIABLE".into()))
-                    .unwrap_err()
-                    .to_string()
+                read(
+                    "a",
+                    &Source::Env("MEDIATORE_TEST_UNSET_VARIABLE".into()),
+                    900,
+                )
+                .unwrap_err()
+                .to_string()
             })
             .unwrap();
         assert!(err.contains("not set"), "{err}");
+    }
+
+    #[test]
+    fn a_saved_credential_is_good_only_for_the_claim_it_was_saved_for() {
+        // ADR-0043 decision 5: the item records the claim's TTL, and its age limit is the least of six hours and that
+        // TTL. A credential typed for a 15 minute claim is not still usable an hour later.
+        use chrono::TimeZone;
+        let now = Utc.timestamp_opt(1_800_000_000, 0).unwrap();
+        let item = |age: i64, max: Option<i64>| {
+            let limit = max.map_or(String::new(), |m| format!(r#","max_age_secs":{m}"#));
+            format!(
+                r#"{{"saved_at":{}{limit},"token":"user:secret"}}"#,
+                now.timestamp() - age
+            )
+        };
+        assert!(
+            parse_stored(&item(1000, Some(900)), now).is_err(),
+            "older than the 900 s claim it was saved for"
+        );
+        assert_eq!(
+            parse_stored(&item(800, Some(900)), now).unwrap(),
+            "user:secret",
+            "inside the claim's TTL"
+        );
+        assert!(
+            parse_stored(&item(7 * 3600, Some(24 * 3600)), now).is_err(),
+            "a limit above six hours is capped at six hours"
+        );
+        assert!(
+            parse_stored(&item(5 * 3600, None), now).is_ok(),
+            "an item with no limit (saved before this change) keeps the six hours"
+        );
     }
 
     #[test]
@@ -334,12 +370,14 @@ mod tests {
     #[test]
     fn a_saved_credential_older_than_six_hours_is_refused_and_a_fresh_one_is_read() {
         let now = Utc::now();
-        let fresh = stored_json("alice:s3cret", now - chrono::Duration::hours(5)).unwrap();
+        let fresh =
+            stored_json("alice:s3cret", now - chrono::Duration::hours(5), 24 * 3600).unwrap();
         assert_eq!(parse_stored(&fresh, now).unwrap(), "alice:s3cret");
-        let old = stored_json("alice:s3cret", now - chrono::Duration::hours(7)).unwrap();
+        let old = stored_json("alice:s3cret", now - chrono::Duration::hours(7), 24 * 3600).unwrap();
         let e = parse_stored(&old, now).unwrap_err().to_string();
         assert!(e.contains("six hours") && !e.contains("s3cret"), "{e}");
-        let future = stored_json("alice:s3cret", now + chrono::Duration::hours(2)).unwrap();
+        let future =
+            stored_json("alice:s3cret", now + chrono::Duration::hours(2), 24 * 3600).unwrap();
         assert!(parse_stored(&future, now).is_err());
         assert!(parse_stored("not json", now).is_err());
     }
@@ -347,7 +385,7 @@ mod tests {
     #[test]
     #[cfg(not(target_os = "macos"))]
     fn without_a_credential_store_the_store_source_says_so_and_logout_is_a_noop() {
-        let e = read("a", &Source::Store).unwrap_err().to_string();
+        let e = read("a", &Source::Store, 900).unwrap_err().to_string();
         assert!(e.contains("no credential store"), "{e}");
         forget("a");
     }
@@ -391,6 +429,10 @@ fn basic(token: String) -> Credential {
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Stored {
     saved_at: i64,
+    /// How long the item may be used, in seconds: the claim's TTL, at most six hours (ADR-0043 decision 5). An item
+    /// saved before this field existed has none, and keeps the six hours.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_age_secs: Option<i64>,
     token: String,
 }
 
@@ -400,9 +442,13 @@ pub fn parse_stored(json: &str, now: DateTime<Utc>) -> anyhow::Result<String> {
     let s: Stored = serde_json::from_str(json)
         .map_err(|_| anyhow::anyhow!("the saved credential is not what mediatore wrote"))?;
     let age = now.timestamp() - s.saved_at;
+    // The least of the item's own limit (the claim it was saved for) and the six hours no item may pass.
+    let limit = s
+        .max_age_secs
+        .map_or(STORE_MAX_AGE_SECS, |m| m.min(STORE_MAX_AGE_SECS));
     anyhow::ensure!(
-        age <= STORE_MAX_AGE_SECS,
-        "the saved credential is older than six hours; enter it again (--delegate <audience>=prompt)"
+        age <= limit,
+        "the saved credential is older than the claim it was saved for (at most six hours); enter it again (--delegate <audience>=prompt)"
     );
     anyhow::ensure!(
         age >= -60,
@@ -411,19 +457,33 @@ pub fn parse_stored(json: &str, now: DateTime<Utc>) -> anyhow::Result<String> {
     Ok(s.token)
 }
 
-/// The Keychain item as JSON for `token`, saved now.
+/// The Keychain item as JSON for `token`, saved now for a claim of `ttl_seconds`: it is good for that long and no
+/// longer, and never past six hours.
 #[cfg(any(target_os = "macos", test))]
-fn stored_json(token: &str, now: DateTime<Utc>) -> anyhow::Result<String> {
+fn stored_json(token: &str, now: DateTime<Utc>, ttl_seconds: u32) -> anyhow::Result<String> {
     Ok(serde_json::to_string(&Stored {
         saved_at: now.timestamp(),
+        max_age_secs: Some(i64::from(ttl_seconds).min(STORE_MAX_AGE_SECS)),
         token: token.to_owned(),
     })?)
 }
 
+/// A lifetime in words for the prompt: `15 minutes`, `1 hour`, `90 seconds`.
+fn lifetime_words(secs: i64) -> String {
+    let plural = |n: i64, unit: &str| format!("{n} {unit}{}", if n == 1 { "" } else { "s" });
+    if secs >= 3600 && secs % 3600 == 0 {
+        plural(secs / 3600, "hour")
+    } else if secs >= 60 && secs % 60 == 0 {
+        plural(secs / 60, "minute")
+    } else {
+        plural(secs, "second")
+    }
+}
+
 /// Type a user name and a secret at the terminal: the question on stderr, the secret with echo off,
 /// nothing when stdin is not a terminal (a script uses `env:` or `file:`). On macOS it then offers to
-/// keep them in the Keychain for six hours; the default is no.
-fn prompt_basic(audience: &str) -> anyhow::Result<Credential> {
+/// keep them in the Keychain for the claim's TTL (at most six hours); the default is no.
+fn prompt_basic(audience: &str, ttl_seconds: u32) -> anyhow::Result<Credential> {
     use std::io::{BufRead, IsTerminal, Write};
     anyhow::ensure!(
         std::io::stdin().is_terminal(),
@@ -446,12 +506,16 @@ fn prompt_basic(audience: &str) -> anyhow::Result<Credential> {
     };
     let token = join_basic(&user, &secret)?;
     if cfg!(target_os = "macos") {
-        eprint!("Keep it in the macOS Keychain for 6 hours? [y/N] ");
+        let keep = i64::from(ttl_seconds).min(STORE_MAX_AGE_SECS);
+        eprint!(
+            "Keep it in the macOS Keychain for the claim's TTL, {}? [y/N] ",
+            lifetime_words(keep)
+        );
         std::io::stderr().flush().ok();
         let mut yn = String::new();
         stdin.read_line(&mut yn)?;
         if matches!(yn.trim(), "y" | "Y" | "yes") {
-            store::save(audience, &token)?;
+            store::save(audience, &token, ttl_seconds)?;
             eprintln!("saved; `mediatore logout --audience {audience}` removes it");
         }
     }
@@ -512,8 +576,8 @@ mod store {
         }
     }
 
-    pub fn save(audience: &str, token: &str) -> anyhow::Result<()> {
-        let json = stored_json(token, Utc::now())?;
+    pub fn save(audience: &str, token: &str, ttl_seconds: u32) -> anyhow::Result<()> {
+        let json = stored_json(token, Utc::now(), ttl_seconds)?;
         set_generic_password(STORE_SERVICE, audience, json.as_bytes())
             .map_err(|e| anyhow::anyhow!("saving to the Keychain: {e}"))
     }
@@ -532,7 +596,7 @@ mod store {
         )
     }
 
-    pub fn save(_audience: &str, _token: &str) -> anyhow::Result<()> {
+    pub fn save(_audience: &str, _token: &str, _ttl_seconds: u32) -> anyhow::Result<()> {
         anyhow::bail!("no credential store on this platform yet (macOS only)")
     }
 

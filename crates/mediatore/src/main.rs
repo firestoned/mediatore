@@ -304,6 +304,7 @@ async fn claim_watcher(
                 .collect(),
             issuers: cfg.issuers.iter().map(|i| i.url.clone()).collect(),
             reachable_registries: cfg.reachable_registries(),
+            placed_registries: cfg.placed_registries(),
             retention: std::time::Duration::from_secs(cfg.store.retention_secs),
             egress_mode: cfg.policy.as_ref().map(|p| p.egress).unwrap_or_default(),
             delegated_audiences: cfg

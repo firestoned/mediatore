@@ -763,6 +763,19 @@ async fn create_sandbox(
     Ok((StatusCode::CREATED, Json(response_of(&created))))
 }
 
+/// When a parked delegation's envelope stops being stored (the operator's rule, 2026-11-15, ADR-0043
+/// decision 4): the least of the credential's own expiry, when the caller said one, and the claim's creation plus
+/// its TTL. The sweep removes an envelope past this, so a secret is never stored longer than the claim it was
+/// delegated for, and a use after it is refused (the credential route checks the same instant).
+fn parked_expiry(
+    credential_expires_at: Option<DateTime<Utc>>,
+    created_at: DateTime<Utc>,
+    ttl_seconds: u32,
+) -> DateTime<Utc> {
+    let claim_end = created_at + Duration::seconds(i64::from(ttl_seconds));
+    credential_expires_at.map_or(claim_end, |e| e.min(claim_end))
+}
+
 /// Seal each delegation with the sandbox's UID and park it, one Secret per audience, until
 /// the reconciler creates the record (ADR-0035 decision 3).
 async fn park_delegations(
@@ -782,18 +795,20 @@ async fn park_delegations(
         let refresh = seal_delegation(sealer, sandbox_uid, d)
             .await
             .map_err(|e| anyhow::anyhow!("sealing the delegation failed: {}", e.body.error))?;
+        let created_at = Utc::now();
+        let expires_at = parked_expiry(d.expires_at, created_at, created.spec.ttl_seconds);
         st.store
             .put_session(SessionRecord {
                 sandbox_uid,
                 subject: validated.subject.clone(),
                 issuer: String::new(),
                 refresh,
-                created_at: Utc::now(),
+                created_at,
                 audience: Some(d.audience.clone()),
-                expires_at: d.expires_at,
+                expires_at: Some(expires_at),
             })
             .await?;
-        tracing::info!(%sandbox_uid, subject = %validated.subject.id, audience = %d.audience, expires_at = ?d.expires_at, "delegation parked");
+        tracing::info!(%sandbox_uid, subject = %validated.subject.id, audience = %d.audience, %expires_at, "delegation parked");
     }
     Ok(())
 }
@@ -2330,6 +2345,31 @@ mod tests {
             "the user ends at the first colon; the secret may hold more"
         );
         assert!(c.expires_at <= Utc::now() + Duration::seconds(300));
+    }
+
+    #[test]
+    fn a_parked_credential_never_outlives_the_claims_ttl() {
+        use chrono::TimeZone;
+        // The operator's rule, 2026-11-15: a delegated secret is stored no longer than the claim's TTL. The envelope's own
+        // expiry is the least of the credential's (when the caller knows it) and the claim's creation plus its TTL.
+        let created = Utc.timestamp_opt(1_800_000_000, 0).unwrap();
+        let ttl_end = created + Duration::seconds(900);
+        assert_eq!(
+            parked_expiry(None, created, 900),
+            ttl_end,
+            "no expiry known: the claim's TTL"
+        );
+        assert_eq!(
+            parked_expiry(Some(created + Duration::hours(5)), created, 900),
+            ttl_end,
+            "a credential that outlives the claim is still stored only that long"
+        );
+        let sooner = created + Duration::seconds(300);
+        assert_eq!(
+            parked_expiry(Some(sooner), created, 900),
+            sooner,
+            "a credential that dies first is stored only until it does"
+        );
     }
 
     #[test]
