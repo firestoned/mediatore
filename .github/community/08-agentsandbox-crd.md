@@ -18,6 +18,14 @@ roadmap 05: the store keeps only what cannot sit on a custom resource.
       `poolRef`, `ttlSeconds`, `audiences`, `workload`; status mirrors the claim plus
       `entrySet` and `ready`); the `crdgen` binary writes `deploy/base/crds/` (`make crds`),
       and a unit test fails on a stale file
+- [x] [ADR-0044](../../docs/adr/0044-a-sandbox-selects-its-pool-by-label.md) (2026-11-16):
+      `spec.poolRef` optional beside `spec.poolSelector` (banlieue's `LabelSelector`, `{}` for
+      every pool in the namespace), exactly one by CEL on the sandbox as on the claim;
+      `status.poolRef` and the `Pool` column show the pool bound from; `POST /v1/claims`
+      takes `pool_ref` or `pool_selector` and refuses neither-or-both with `400 invalid_pool`;
+      `mediatore sandbox create` takes `--pool` or `--pool-selector key=value`, and with
+      neither sends the empty selector. Lands with the `banlieue-api` tag that carries
+      banlieue ADR-0132
 - [x] Reconciler on the roadmap 03 leader-elected loop (`Watcher::reconcile_sandbox`, a
       third `Controller` owning the claims): create the owned claim, write the record,
       mirror the status, `ready` only when the claim is `Bound` and the entry is set

@@ -13,7 +13,7 @@ use banlieue_api::common::LocalObjectReference;
 use mediatore_api::{AppState, Limiter};
 use mediatore_claims::sandbox::{AgentSandboxStatus, SandboxPhase};
 use mediatore_entra::{Backend, IssuerConfig, Validator};
-use mediatore_proto::{ClaimPhase, ClaimRequest, ClaimResponse, ErrorBody, Workload};
+use mediatore_proto::{ClaimPhase, ClaimRequest, ClaimResponse, ErrorBody, PoolSelector, Workload};
 use mediatore_spire::Naming;
 use mediatore_store::MemoryStore;
 use mediatore_testkit::{FakeIdp, MemorySandboxes};
@@ -97,7 +97,8 @@ impl Harness {
             .post(format!("{}/v1/claims", self.user_url))
             .bearer_auth(token)
             .json(&ClaimRequest {
-                pool_ref: "pool-a".into(),
+                pool_ref: Some("pool-a".into()),
+                pool_selector: None,
                 ttl_seconds: 3600,
                 audiences: audiences.iter().map(|a| (*a).to_owned()).collect(),
                 workload: Workload {
@@ -109,6 +110,17 @@ impl Harness {
                 policy_ref: Some("agent".into()),
                 delegations: vec![],
             })
+            .send()
+            .await
+            .expect("create")
+    }
+
+    /// `POST /v1/claims` with the body as given, for the shapes `create` does not send.
+    async fn create_raw(&self, token: &str, body: &serde_json::Value) -> reqwest::Response {
+        self.http
+            .post(format!("{}/v1/claims", self.user_url))
+            .bearer_auth(token)
+            .json(body)
             .send()
             .await
             .expect("create")
@@ -145,7 +157,11 @@ async fn post_creates_an_agentsandbox_with_the_callers_subject() {
         sb.spec.subject.id, "octocat",
         "the token's subject, not a request field"
     );
-    assert_eq!(sb.spec.pool_ref.name, "pool-a");
+    assert_eq!(
+        sb.spec.pool_ref.as_ref().map(|p| p.name.as_str()),
+        Some("pool-a")
+    );
+    assert!(sb.spec.pool_selector.is_none());
     assert_eq!(sb.spec.ttl_seconds, 3600);
     assert_eq!(sb.spec.audiences, vec![AUDIENCE.to_owned()]);
     assert_eq!(
@@ -179,6 +195,9 @@ async fn get_mirrors_the_resources_status() {
                 name: created.name.clone(),
             }),
             claim_uid: Some(claim_uid.to_string()),
+            pool_ref: Some(LocalObjectReference {
+                name: "pool-b".into(),
+            }),
             addresses: vec!["192.0.2.10".into()],
             expires_at: Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
                 k8s_openapi::jiff::Timestamp::from_second(1_800_000_000).unwrap(),
@@ -197,6 +216,11 @@ async fn get_mirrors_the_resources_status() {
     assert_eq!(got.phase, ClaimPhase::Bound);
     assert!(got.ready);
     assert_eq!(got.uid, Some(claim_uid));
+    assert_eq!(
+        got.pool.as_deref(),
+        Some("pool-b"),
+        "the pool the member came from, from status (ADR-0044 decision 5)"
+    );
     assert_eq!(got.addresses, vec!["192.0.2.10".to_owned()]);
     assert_eq!(got.expires_at.map(|t| t.timestamp()), Some(1_800_000_000));
 }
@@ -242,6 +266,127 @@ async fn delete_removes_the_resource_and_the_finalizer_does_the_rest() {
     assert_eq!(del.status(), 204);
     assert_eq!(h.sandboxes.all().len(), 0);
     assert_eq!(h.get(&token, &created.name).await.status(), 404);
+}
+
+// ----- ADR-0044: a sandbox selects its pool by label, or names it -----------------------------
+
+fn body_with_pool(pool: serde_json::Value) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "ttl_seconds": 3600,
+        "audiences": [],
+        "workload": { "image": "registry.internal:5000/sandbox:latest", "args": ["sh"] }
+    });
+    if let serde_json::Value::Object(fields) = pool {
+        for (k, v) in fields {
+            body[k] = v;
+        }
+    }
+    body
+}
+
+/// A selector lands on `spec.poolSelector` in banlieue's spelling, with no `poolRef`
+/// beside it; the empty one is kept, since it means every pool in the namespace (ADR-0044
+/// decisions 1, 2 and 4). `POST` answers with no pool: banlieue has not picked one yet.
+#[tokio::test]
+async fn post_with_a_selector_creates_a_sandbox_that_selects_and_names_no_pool() {
+    let h = Harness::start(true).await;
+    let token = h.login("octocat");
+    let resp = h
+        .create_raw(
+            &token,
+            &body_with_pool(serde_json::json!({ "pool_selector": {
+                "match_labels": { "sandbox.example.com/image": "agent" },
+                "match_expressions": [{ "key": "topology.kubernetes.io/zone", "operator": "NotIn", "values": ["c"] }]
+            } })),
+        )
+        .await;
+    assert_eq!(resp.status(), 201);
+    let body: ClaimResponse = resp.json().await.expect("body");
+    assert!(body.pool.is_none(), "no pool until bound: {body:?}");
+    let sb = &h.sandboxes.all()[0];
+    assert!(sb.spec.pool_ref.is_none());
+    let spec = serde_json::to_value(&sb.spec).unwrap();
+    assert_eq!(
+        spec["poolSelector"],
+        serde_json::json!({
+            "matchLabels": { "sandbox.example.com/image": "agent" },
+            "matchExpressions": [{ "key": "topology.kubernetes.io/zone", "operator": "NotIn", "values": ["c"] }]
+        }),
+        "got {spec}"
+    );
+    assert!(spec.get("poolRef").is_none(), "got {spec}");
+
+    let any = h
+        .create_raw(
+            &token,
+            &body_with_pool(serde_json::json!({ "pool_selector": {} })),
+        )
+        .await;
+    assert_eq!(any.status(), 201);
+    let sb = h
+        .sandboxes
+        .all()
+        .into_iter()
+        .find(|s| s.spec.pool_selector == Some(banlieue_api::common::LabelSelector::default()))
+        .expect("a sandbox with the empty selector");
+    let spec = serde_json::to_value(&sb.spec).unwrap();
+    assert_eq!(spec["poolSelector"], serde_json::json!({}), "kept: {spec}");
+}
+
+/// The typed request the CLI sends with neither flag: the empty selector (ADR-0044
+/// decision 3), and it is what arrives.
+#[tokio::test]
+async fn the_typed_empty_selector_arrives_as_any_pool() {
+    let h = Harness::start(true).await;
+    let resp = h
+        .http
+        .post(format!("{}/v1/claims", h.user_url))
+        .bearer_auth(h.login("octocat"))
+        .json(&ClaimRequest {
+            pool_ref: None,
+            pool_selector: Some(PoolSelector::default()),
+            ttl_seconds: 60,
+            audiences: vec![],
+            workload: Workload {
+                image: "registry.internal:5000/sandbox:latest".into(),
+                args: vec![],
+                restart: mediatore_proto::RestartPolicy::Always,
+            },
+            refresh_token: None,
+            policy_ref: None,
+            delegations: vec![],
+        })
+        .send()
+        .await
+        .expect("create");
+    assert_eq!(resp.status(), 201);
+    let sb = &h.sandboxes.all()[0];
+    assert_eq!(
+        sb.spec.pool_selector,
+        Some(banlieue_api::common::LabelSelector::default())
+    );
+}
+
+/// Neither is refused and never read as "any pool"; both is refused; an empty name is
+/// refused. Nothing is created (ADR-0044 decision 2, fail closed).
+#[tokio::test]
+async fn a_request_with_neither_or_both_pool_fields_is_refused_before_anything_is_created() {
+    let h = Harness::start(true).await;
+    let token = h.login("octocat");
+    for (what, pool) in [
+        ("neither", serde_json::json!({})),
+        (
+            "both",
+            serde_json::json!({ "pool_ref": "pool-a", "pool_selector": {} }),
+        ),
+        ("an empty name", serde_json::json!({ "pool_ref": "" })),
+    ] {
+        let resp = h.create_raw(&token, &body_with_pool(pool)).await;
+        assert_eq!(resp.status(), 400, "{what}");
+        let body: ErrorBody = resp.json().await.expect("error body");
+        assert_eq!(body.error, "invalid_pool", "{what}");
+    }
+    assert_eq!(h.sandboxes.all().len(), 0);
 }
 
 #[tokio::test]

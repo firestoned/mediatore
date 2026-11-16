@@ -3,7 +3,7 @@
 
 # ADR-0008: AgentSandbox is a mediatore CRD, reconciled by mediatore
 
-**Status:** Accepted · **Date:** 2026-10-12 · **Accepted:** 2026-10-14 · **Amended:** 2026-11-09 (decision 8, `spec.workload.restart`, [ADR-0033](0033-a-one-shot-workload-the-restart-policy-and-the-claim-released-when-it-is-done.md))
+**Status:** Accepted · **Date:** 2026-10-12 · **Accepted:** 2026-10-14 · **Amended:** 2026-11-09 (decision 8, `spec.workload.restart`, [ADR-0033](0033-a-one-shot-workload-the-restart-policy-and-the-claim-released-when-it-is-done.md)); 2026-11-16 (decision 7, `spec.poolRef` optional beside `spec.poolSelector`, exactly one, and `status.poolRef` the pool bound from, [ADR-0044](0044-a-sandbox-selects-its-pool-by-label.md))
 
 Supersedes banlieue
 [ADR-0055](https://github.com/firestoned/banlieue/blob/main/docs/adr/0055-agentsandbox.md)

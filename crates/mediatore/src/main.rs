@@ -751,7 +751,7 @@ mod tests {
                 create,
                 Ok(Cmd::User(mediatore_client::cli::UserCmd::Sandbox(
                     mediatore_client::cli::SandboxCmd::Create(ref a)
-                ))) if a.pool == "pool-a" && a.args == ["/bin/sh"]
+                ))) if a.pool.as_deref() == Some("pool-a") && a.args == ["/bin/sh"]
             ),
             "{create:?}"
         );
@@ -776,6 +776,69 @@ mod tests {
             parse(&["mediatore", "revoke", "--claim", "sandbox-3f9a1c2e"]),
             Ok(Cmd::Revoke { .. })
         ));
+    }
+
+    /// ADR-0044 decision 3: `--pool` names one pool, `--pool-selector` selects among them,
+    /// neither is every pool in the namespace, and both together is a usage error.
+    #[test]
+    fn the_pool_flags_are_a_name_a_selector_or_neither_never_both() {
+        let selected = parse(&[
+            "mediatore",
+            "sandbox",
+            "create",
+            "--mediatore",
+            "https://mediatore.sandbox.example",
+            "--pool-selector",
+            "sandbox.example.com/image=agent",
+            "--pool-selector",
+            "zone=a",
+            "--image",
+            "registry.internal:5000/sandbox:latest",
+        ]);
+        assert!(
+            matches!(
+                selected,
+                Ok(Cmd::User(mediatore_client::cli::UserCmd::Sandbox(
+                    mediatore_client::cli::SandboxCmd::Create(ref a)
+                ))) if a.pool.is_none() && a.pool_selector == ["sandbox.example.com/image=agent", "zone=a"]
+            ),
+            "{selected:?}"
+        );
+        let any = parse(&[
+            "mediatore",
+            "sandbox",
+            "create",
+            "--mediatore",
+            "https://mediatore.sandbox.example",
+            "--image",
+            "registry.internal:5000/sandbox:latest",
+        ]);
+        assert!(
+            matches!(
+                any,
+                Ok(Cmd::User(mediatore_client::cli::UserCmd::Sandbox(
+                    mediatore_client::cli::SandboxCmd::Create(ref a)
+                ))) if a.pool.is_none() && a.pool_selector.is_empty()
+            ),
+            "neither flag parses; the CLI sends the empty selector: {any:?}"
+        );
+        assert!(
+            parse(&[
+                "mediatore",
+                "sandbox",
+                "create",
+                "--mediatore",
+                "https://mediatore.sandbox.example",
+                "--pool",
+                "pool-a",
+                "--pool-selector",
+                "zone=a",
+                "--image",
+                "registry.internal:5000/sandbox:latest",
+            ])
+            .is_err(),
+            "--pool and --pool-selector conflict"
+        );
     }
 
     /// The jail mounts the path the node entry selects (ADR-0014 decision 5), so the two

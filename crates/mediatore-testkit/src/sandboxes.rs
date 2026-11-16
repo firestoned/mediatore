@@ -65,8 +65,18 @@ fn validate(sb: &AgentSandbox) -> Result<(), FrontDoorError> {
     if spec.workload.image.is_empty() {
         return invalid("spec.workload.image must not be empty");
     }
-    if spec.pool_ref.name.is_empty() {
-        return invalid("spec.poolRef.name must not be empty");
+    // The CRD's CEL rule (ADR-0044 decisions 1 and 2): exactly one of the two, and neither
+    // is never "any pool".
+    match (spec.pool_ref.as_ref(), spec.pool_selector.as_ref()) {
+        (Some(_), Some(_)) | (None, None) => {
+            return invalid(
+                "a sandbox takes exactly one of poolRef or poolSelector; use poolSelector: {} for any pool in the namespace",
+            );
+        }
+        (Some(r), None) if r.name.is_empty() => {
+            return invalid("spec.poolRef.name must not be empty");
+        }
+        _ => {}
     }
     Ok(())
 }
