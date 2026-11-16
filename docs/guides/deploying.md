@@ -643,6 +643,33 @@ The broker refuses at start an audience with `inject: gateway` that has no `gate
 
 **Rollout order and rollback.** Release the broker and authorizer first and confirm the running broker is the new one before editing the config: the configuration does not reject unknown fields, so a broker that predates ADR-0040 ignores `inject: gateway` without a word and keeps the audience in the proxy, which would put the credential on the pool VM. Then roll the gateways, then the pool image, then set `inject: gateway`. To roll back, set the audience back to `inject: proxy` (or remove the line) and restart the broker; the proxy then fetches the credential as before. Stopping `envoy-inject.service` alone fails the placed path closed.
 
+### A person's user name and secret, and a placed registry (ADR-0041, ADR-0043)
+
+An audience for an upstream that wants a person's own user name and secret is `via: delegated` with `credential: basic` and `inject: gateway`; the broker refuses `basic` on anything else, on a header other than `authorization`, or with a `refresh`. The gateway places `Authorization: Basic`, and the audience's `rules` are matched segment by segment (`*` is one segment, `**` zero or more, anything else literal).
+
+```yaml
+audiences:
+  - name: gitserver
+    via: delegated
+    credential: basic
+    inject: gateway
+    max_ttl: 300
+    egress: ["git.example.com:443"]
+    rules:
+      - { method: GET, path: "/*/*/info/refs" }
+      - { method: POST, path: "/*/*/git-upload-pack" }
+```
+
+**A registry as a placed audience.** To pull a person's image with their credential, make the registry's host an audience of this shape (rules `GET` and `HEAD` on `/v2/**`) and list the host under `registries` with `reach: relay`. With `gateways` set, every registry needs a `reach`, and a clean start does not show that: a missing one refuses every claim whose image is on a registry, so **run one claim after any change to the file**. Beyond the broker:
+
+- the registry's exact host is in each gateway's `INJECT_ENDPOINTS` and the datacenter firewall lets the gateways reach it (without the allowance the pull fails closed with a connect timeout);
+- the pool image carries a guest that has the pull listener (a second loopback port on the claim's egress proxy, `MEDIATORE_EGRESS_PULL_PORT`, default 18129; it must not equal the proxy's own port, and no jail rule lists it, so the workload cannot reach it);
+- the pull is made as root with no credential of its own, and a claim's image on a placed registry must name the registry's audience.
+
+**Sealing.** A delegated credential is kept only as ciphertext in a Secret of the broker's namespace while the claim lives, sealed under the OpenBao transit key (`store.sealing.transit`, a derived key per claim), so the broker survives a restart. It is deleted when the claim ends and at the credential's expiry, and never outlives the claim's TTL: the watcher sweeps expired envelopes every 15 seconds. Do not set a longer TTL on the CLI's side expecting a longer life; the broker caps it.
+
+**Rollout.** As for ADR-0040: broker and authorizer first, then the gateways (the authorizer needs `--socket-dir-mode 2750` and, from v0.2.9, a unit with `RestrictSUIDSGID=yes` is fine because the directory mode is changed only when it differs), then the pool image, then the audience. On a first boot, make sure the `envoy-inject` group exists before the step that installs files with that group.
+
 ## What the NetworkPolicy allows
 
 | Direction | Peer | Port | Why |

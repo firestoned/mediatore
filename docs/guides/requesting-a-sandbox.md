@@ -45,6 +45,29 @@ the same request, `"delegations": [{ "audience": "anthropic", "token": "...", "e
 (`--delegate anthropic=claude-code`, `env:CLAUDE_CODE_OAUTH_TOKEN`, `file:<path>`) and
 prints one line saying so. A claim naming such an audience without it is refused.
 
+An audience can also want **your user name and a secret**, not an OAuth bearer
+([ADR-0041](../adr/0041-a-requesters-own-username-and-password-or-token-from-the-os-credential-store.md),
+`credential: basic`): the delegation's `token` is then `user:secret` (no colon in the user
+name), and the gateway places it as `Authorization: Basic`, so the pool VM and the sandbox
+never see it. `--delegate <audience>=prompt` asks at the terminal for the user name and then the
+secret with echo off; `env:<NAME>` and `file:<path>` take the same `user:secret` shape for a
+script. There is no flag that carries the secret. A host that refuses passwords for a protocol
+(an on-premises git host answers `403 Password authentication is not available for Git
+operations`) needs a personal access token as the secret.
+
+On macOS, `prompt` offers to keep the credential in the Keychain **for the claim's TTL** (never
+longer than six hours; the offer names the duration, default no), and `--delegate
+<audience>=store` reads it back. A saved item older than that limit is deleted and refused.
+`mediatore logout --audience <name>` deletes it at once. Nothing is stored in the cluster beyond
+the sealed envelope below, and the broker deletes that envelope when the claim ends or at the
+credential's expiry, whichever comes first, never later than the claim's TTL
+([ADR-0043](../adr/0043-a-persons-registry-credential-is-placed-at-the-gateway-the-vm-never-sees-it.md)).
+
+The image's registry can be such an audience too: when it is, name it with `--audience
+<registry-host>` and `--delegate <registry-host>=prompt`, and the pull is made with your
+credential through the gateway; a claim whose image is on such a registry without naming its
+audience is refused at admission.
+
 `workload.image` is your agent as an ordinary OCI container image, the runtime and your
 code, not the VM: the guest on the pool member pulls it at bind and runs `workload.args`
 inside it under `nsjail` as your sandbox user ([what "the workload"
