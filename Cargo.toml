@@ -53,10 +53,12 @@ mediatore-testkit = { path = "crates/mediatore-testkit" }
 banlieue-api = { git = "https://github.com/firestoned/banlieue", tag = "v0.5.9", package = "banlieue-api", default-features = false }
 
 # notaio's bundle verifier, version floor and conformance vectors (ADR-0026 decision 1), pinned
-# to a signed release tag (notaio ADR-0014). No kube, no schemars: the `schema` feature stays off.
+# to a signed release tag (notaio ADR-0014), or to the commit on main that carries a change this
+# tree needs until that release is tagged (the chrono to jiff move, notaio#94). No kube, no
+# schemars: the `schema` feature stays off.
 # cargo deny allows this git source too. A bump is reviewed with that release's notes.
-sandboxpolicy-bundle = { git = "https://github.com/firestoned/notaio", tag = "v0.3.4", default-features = false }
-sandboxpolicy-types = { git = "https://github.com/firestoned/notaio", tag = "v0.3.4", default-features = false }
+sandboxpolicy-bundle = { git = "https://github.com/firestoned/notaio", rev = "296c5695f18623a29cbfc7e815de766c1c968226", default-features = false }
+sandboxpolicy-types = { git = "https://github.com/firestoned/notaio", rev = "296c5695f18623a29cbfc7e815de766c1c968226", default-features = false }
 
 # async + web
 tokio        = { version = "1", features = ["rt-multi-thread", "macros", "signal", "process", "fs", "time", "sync", "net", "io-util"] }
@@ -127,7 +129,7 @@ x509-cert    = { version = "0.3", default-features = false, features = ["pem"] }
 uuid         = { version = "1", features = ["v4", "serde"] }
 # The refresh envelope's AES-256-GCM (ADR-0012): the provider rustls already runs on.
 aws-lc-rs    = "1"
-chrono       = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+jiff         = { version = "0.2", default-features = false, features = ["std", "serde"] }
 
 
 # kubernetes. The kube major follows banlieue-api: two kube majors in one graph leave its

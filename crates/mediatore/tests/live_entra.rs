@@ -95,7 +95,7 @@ async fn the_live_tenant_exchanges_refreshes_for_mediatore_and_refreshes_for_the
         .await
         .expect("a refresh for the audience");
     assert!(downstream.validated.is_none());
-    assert!(downstream.expires_at > chrono::Utc::now());
+    assert!(downstream.expires_at > jiff::Timestamp::now());
     println!(
         "refresh for {audience}: a token expiring {}",
         downstream.expires_at

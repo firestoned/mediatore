@@ -662,7 +662,7 @@ mod tests {
             };
             Ok(Answer::Found(ClaimEgress {
                 claim_uid: Uuid::nil(),
-                expires_at: chrono::Utc::now() + chrono::Duration::seconds(600),
+                expires_at: jiff::Timestamp::now() + jiff::SignedDuration::from_secs(600),
                 egress: vec![route.endpoint.clone()],
                 inject: vec![route],
             }))
@@ -688,7 +688,7 @@ mod tests {
                     name: "anthropic-version".into(),
                     value: "2023-06-01".into(),
                 }],
-                expires_at: chrono::Utc::now() + chrono::Duration::seconds(200),
+                expires_at: jiff::Timestamp::now() + jiff::SignedDuration::from_secs(200),
             }))
         }
     }

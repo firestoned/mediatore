@@ -12,8 +12,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
 use futures::StreamExt as _;
+use jiff::Timestamp;
 use k8s_openapi::api::core::v1::ConfigMap;
 use kube::runtime::WatchStreamExt as _;
 use kube::runtime::watcher::{self, Event};
@@ -223,7 +223,7 @@ impl BundleCache {
         &self,
         sandbox_namespace: &str,
         name: &str,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> Option<Arc<BundlePayload>> {
         if let Some(b) = self.get(sandbox_namespace, name, now) {
             return Some(b);
@@ -249,12 +249,7 @@ impl BundleCache {
 
     /// The verified bundle of `namespace/name` if one is cached and still valid at `now`.
     #[must_use]
-    pub fn get(
-        &self,
-        namespace: &str,
-        name: &str,
-        now: DateTime<Utc>,
-    ) -> Option<Arc<BundlePayload>> {
+    pub fn get(&self, namespace: &str, name: &str, now: Timestamp) -> Option<Arc<BundlePayload>> {
         let map = self.read();
         map.get(&(namespace.to_owned(), name.to_owned()))
             .filter(|v| v.payload.meta.not_after > now)
@@ -265,7 +260,7 @@ impl BundleCache {
     /// valid at `now`: the claim's bundle, found from the record (ADR-0030 decision 2). The
     /// current bundle, never the version the claim was created under.
     #[must_use]
-    pub fn by_uid(&self, uid: &str, now: DateTime<Utc>) -> Option<Arc<BundlePayload>> {
+    pub fn by_uid(&self, uid: &str, now: Timestamp) -> Option<Arc<BundlePayload>> {
         self.read()
             .values()
             .filter(|v| v.payload.meta.not_after > now && v.payload.content.policy.uid == uid)
@@ -367,12 +362,12 @@ impl BundleReflector {
 
     /// A `ConfigMap` seen (added, changed, or listed at start), at the current time.
     pub async fn applied(&self, cm: &ConfigMap) -> Outcome {
-        self.applied_at(cm, Utc::now()).await
+        self.applied_at(cm, Timestamp::now()).await
     }
 
     /// [`applied`](Self::applied) with the clock injected: verify at `now`, decide and write
     /// the floor, then cache (decision 4). Logs the outcome; never the envelope.
-    pub async fn applied_at(&self, cm: &ConfigMap, now: DateTime<Utc>) -> Outcome {
+    pub async fn applied_at(&self, cm: &ConfigMap, now: Timestamp) -> Outcome {
         let name = cm.name_any();
         let namespace = cm.namespace().unwrap_or_default();
         if !self.namespaces.contains(&namespace) {
@@ -454,7 +449,7 @@ impl BundleReflector {
     }
 
     /// Drop bundles past their `notAfter` at `now`; how many.
-    pub fn sweep(&self, now: DateTime<Utc>) -> usize {
+    pub fn sweep(&self, now: Timestamp) -> usize {
         let dropped = self.cache.retain(|_, v| v.payload.meta.not_after > now);
         for (ns, policy) in &dropped {
             tracing::info!(namespace = %ns, policy = %policy, "policy bundle expired");
@@ -517,7 +512,7 @@ pub async fn run(client: Client, reflector: Arc<BundleReflector>) -> anyhow::Res
         tick.tick().await;
         loop {
             tick.tick().await;
-            reflector.sweep(Utc::now());
+            reflector.sweep(Timestamp::now());
         }
     };
     tracing::info!(namespaces = ?reflector.namespaces(), "policy bundle reflector running");
@@ -615,7 +610,7 @@ mod tests {
                 .unwrap()
         }
 
-        fn cached(&self, now: DateTime<Utc>) -> Option<Arc<BundlePayload>> {
+        fn cached(&self, now: Timestamp) -> Option<Arc<BundlePayload>> {
             self.reflector
                 .cache()
                 .get(&self.suite.policy.namespace, &self.suite.policy.name, now)
@@ -912,7 +907,7 @@ mod tests {
     }
 
     fn bundle_with_egress(entries: &[(&str, bool)]) -> BundlePayload {
-        let mut b = mediatore_testkit::policy::fresh_bundle(Utc::now(), 1).payload;
+        let mut b = mediatore_testkit::policy::fresh_bundle(Timestamp::now(), 1).payload;
         b.content.egress = entries
             .iter()
             .map(
@@ -976,7 +971,7 @@ mod tests {
     #[test]
     fn a_bundle_is_found_by_its_policy_uid_while_valid() {
         let cache = BundleCache::default();
-        let fresh = mediatore_testkit::policy::fresh_bundle(Utc::now(), 3).payload;
+        let fresh = mediatore_testkit::policy::fresh_bundle(Timestamp::now(), 3).payload;
         let uid = fresh.content.policy.uid.clone();
         let key = (
             fresh.content.policy.namespace.clone(),
@@ -989,12 +984,12 @@ mod tests {
                 configmap: "cm".into(),
             },
         );
-        let now = Utc::now();
+        let now = Timestamp::now();
         assert_eq!(cache.by_uid(&uid, now).map(|p| p.meta.version), Some(3));
         assert!(cache.by_uid("some-other-uid", now).is_none());
         assert!(
             cache
-                .by_uid(&uid, now + chrono::Duration::hours(3))
+                .by_uid(&uid, now + jiff::SignedDuration::from_hours(3))
                 .is_none(),
             "an expired bundle is never handed out"
         );

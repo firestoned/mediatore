@@ -89,11 +89,11 @@ impl Session {
     /// True while the ID token is good for at least `margin_secs` more seconds.
     #[must_use]
     pub fn is_fresh(&self, margin_secs: i64) -> bool {
-        self.expires_at - margin_secs > chrono_now()
+        self.expires_at - margin_secs > now_unix()
     }
 }
 
-fn chrono_now() -> i64 {
+fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))

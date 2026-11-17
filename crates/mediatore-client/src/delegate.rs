@@ -14,7 +14,7 @@
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use mediatore_proto::{Delegation, Secret};
 
 /// The Keychain item Claude Code keeps its session in on macOS.
@@ -84,7 +84,7 @@ pub struct Credential {
     /// What renews it, when the source has one.
     pub refresh_token: Option<String>,
     /// When it dies, when the source says.
-    pub expires_at: Option<DateTime<Utc>>,
+    pub expires_at: Option<Timestamp>,
 }
 
 impl std::fmt::Debug for Credential {
@@ -134,7 +134,7 @@ pub fn read(audience: &str, source: &Source, ttl_seconds: u32) -> anyhow::Result
         }
     };
     if let Some(e) = cred.expires_at
-        && e <= Utc::now()
+        && e <= Timestamp::now()
     {
         anyhow::bail!(
             "the credential expired at {e}; log in again at its source (`claude login` for claude-code)"
@@ -209,7 +209,7 @@ pub fn parse_claude_code(json: &str) -> anyhow::Result<Credential> {
     let expires_at = oauth
         .get("expiresAt")
         .and_then(serde_json::Value::as_i64)
-        .and_then(DateTime::<Utc>::from_timestamp_millis);
+        .and_then(|ms| Timestamp::from_millisecond(ms).ok());
     Ok(Credential {
         token,
         refresh_token,
@@ -257,7 +257,7 @@ mod tests {
         assert_eq!(cred.refresh_token.as_deref(), Some("sk-ant-ort01-fixture"));
         assert_eq!(
             cred.expires_at.unwrap(),
-            DateTime::<Utc>::from_timestamp(4_102_444_800, 0).unwrap()
+            Timestamp::from_second(4_102_444_800).unwrap()
         );
         let d = cred.delegation("anthropic");
         assert_eq!(d.audience, "anthropic");
@@ -298,7 +298,7 @@ mod tests {
 
         let expired = r#"{"claudeAiOauth":{"accessToken":"old","expiresAt":1000}}"#;
         let cred = parse_claude_code(expired).unwrap();
-        assert!(cred.expires_at.unwrap() < Utc::now());
+        assert!(cred.expires_at.unwrap() < Timestamp::now());
         // The read path refuses it; the parser alone reports what it found.
         let err = std::env::var("MEDIATORE_TEST_UNSET_VARIABLE")
             .err()
@@ -319,13 +319,12 @@ mod tests {
     fn a_saved_credential_is_good_only_for_the_claim_it_was_saved_for() {
         // ADR-0043 decision 5: the item records the claim's TTL, and its age limit is the least of six hours and that
         // TTL. A credential typed for a 15 minute claim is not still usable an hour later.
-        use chrono::TimeZone;
-        let now = Utc.timestamp_opt(1_800_000_000, 0).unwrap();
+        let now = Timestamp::from_second(1_800_000_000).unwrap();
         let item = |age: i64, max: Option<i64>| {
             let limit = max.map_or(String::new(), |m| format!(r#","max_age_secs":{m}"#));
             format!(
                 r#"{{"saved_at":{}{limit},"token":"user:secret"}}"#,
-                now.timestamp() - age
+                now.as_second() - age
             )
         };
         assert!(
@@ -369,15 +368,28 @@ mod tests {
 
     #[test]
     fn a_saved_credential_older_than_six_hours_is_refused_and_a_fresh_one_is_read() {
-        let now = Utc::now();
-        let fresh =
-            stored_json("alice:s3cret", now - chrono::Duration::hours(5), 24 * 3600).unwrap();
+        let now = Timestamp::now();
+        let fresh = stored_json(
+            "alice:s3cret",
+            now - jiff::SignedDuration::from_hours(5),
+            24 * 3600,
+        )
+        .unwrap();
         assert_eq!(parse_stored(&fresh, now).unwrap(), "alice:s3cret");
-        let old = stored_json("alice:s3cret", now - chrono::Duration::hours(7), 24 * 3600).unwrap();
+        let old = stored_json(
+            "alice:s3cret",
+            now - jiff::SignedDuration::from_hours(7),
+            24 * 3600,
+        )
+        .unwrap();
         let e = parse_stored(&old, now).unwrap_err().to_string();
         assert!(e.contains("six hours") && !e.contains("s3cret"), "{e}");
-        let future =
-            stored_json("alice:s3cret", now + chrono::Duration::hours(2), 24 * 3600).unwrap();
+        let future = stored_json(
+            "alice:s3cret",
+            now + jiff::SignedDuration::from_hours(2),
+            24 * 3600,
+        )
+        .unwrap();
         assert!(parse_stored(&future, now).is_err());
         assert!(parse_stored("not json", now).is_err());
     }
@@ -438,10 +450,10 @@ struct Stored {
 
 /// The `user:secret` of a stored item, or an error when it is older than six hours or unreadable.
 /// `now` is a parameter so the age rule is testable.
-pub fn parse_stored(json: &str, now: DateTime<Utc>) -> anyhow::Result<String> {
+pub fn parse_stored(json: &str, now: Timestamp) -> anyhow::Result<String> {
     let s: Stored = serde_json::from_str(json)
         .map_err(|_| anyhow::anyhow!("the saved credential is not what mediatore wrote"))?;
-    let age = now.timestamp() - s.saved_at;
+    let age = now.as_second() - s.saved_at;
     // The least of the item's own limit (the claim it was saved for) and the six hours no item may pass.
     let limit = s
         .max_age_secs
@@ -460,9 +472,9 @@ pub fn parse_stored(json: &str, now: DateTime<Utc>) -> anyhow::Result<String> {
 /// The Keychain item as JSON for `token`, saved now for a claim of `ttl_seconds`: it is good for that long and no
 /// longer, and never past six hours.
 #[cfg(any(target_os = "macos", test))]
-fn stored_json(token: &str, now: DateTime<Utc>, ttl_seconds: u32) -> anyhow::Result<String> {
+fn stored_json(token: &str, now: Timestamp, ttl_seconds: u32) -> anyhow::Result<String> {
     Ok(serde_json::to_string(&Stored {
-        saved_at: now.timestamp(),
+        saved_at: now.as_second(),
         max_age_secs: Some(i64::from(ttl_seconds).min(STORE_MAX_AGE_SECS)),
         token: token.to_owned(),
     })?)
@@ -554,7 +566,7 @@ pub fn forget(audience: &str) {
 
 #[cfg(target_os = "macos")]
 mod store {
-    use super::{STORE_SERVICE, Utc, parse_stored, stored_json};
+    use super::{STORE_SERVICE, Timestamp, parse_stored, stored_json};
     use security_framework::passwords::{
         delete_generic_password, get_generic_password, set_generic_password,
     };
@@ -567,7 +579,7 @@ mod store {
         })?;
         let json = String::from_utf8(raw)
             .map_err(|_| anyhow::anyhow!("the saved credential is not what mediatore wrote"))?;
-        match parse_stored(&json, Utc::now()) {
+        match parse_stored(&json, Timestamp::now()) {
             Ok(token) => Ok(super::basic(token)),
             Err(e) => {
                 let _ = delete_generic_password(STORE_SERVICE, audience);
@@ -577,7 +589,7 @@ mod store {
     }
 
     pub fn save(audience: &str, token: &str, ttl_seconds: u32) -> anyhow::Result<()> {
-        let json = stored_json(token, Utc::now(), ttl_seconds)?;
+        let json = stored_json(token, Timestamp::now(), ttl_seconds)?;
         set_generic_password(STORE_SERVICE, audience, json.as_bytes())
             .map_err(|e| anyhow::anyhow!("saving to the Keychain: {e}"))
     }

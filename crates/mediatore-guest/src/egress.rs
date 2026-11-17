@@ -41,13 +41,13 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use chrono::{DateTime, Duration, Utc};
 use http::header::{self, HeaderName, HeaderValue};
 use http::{Method, Request, Response, StatusCode};
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Bytes, Incoming};
 use hyper_util::rt::TokioIo;
+use jiff::{SignedDuration, Timestamp};
 use mediatore_proto::tls::UpstreamTls;
 use mediatore_proto::{Endpoint, Route, TokenRequest, TokenResponse};
 use rustls::pki_types::ServerName;
@@ -518,7 +518,7 @@ impl Placement {
 /// fetch at a time: two requests arriving together do not both spend the claim's rate limit.
 #[derive(Default)]
 struct TokenCache {
-    tokens: tokio::sync::Mutex<HashMap<String, (Placement, DateTime<Utc>)>>,
+    tokens: tokio::sync::Mutex<HashMap<String, (Placement, Timestamp)>>,
 }
 
 impl TokenCache {
@@ -529,7 +529,8 @@ impl TokenCache {
     ) -> anyhow::Result<Placement> {
         let mut tokens = self.tokens.lock().await;
         if let Some((placed, expires_at)) = tokens.get(audience)
-            && *expires_at - Utc::now() > Duration::seconds(REFRESH_MARGIN_SECS)
+            && expires_at.duration_since(Timestamp::now())
+                > SignedDuration::from_secs(REFRESH_MARGIN_SECS)
         {
             return Ok(placed.clone());
         }
@@ -1741,7 +1742,7 @@ mod tests {
         let keyed = TokenResponse {
             access_token: "sk-real".into(),
             token_type: "Header".into(),
-            expires_at: Utc::now() + Duration::minutes(10),
+            expires_at: Timestamp::now() + SignedDuration::from_mins(10),
             audience: "anthropic".into(),
             subject: subject.clone(),
             header: Some("x-api-key".into()),

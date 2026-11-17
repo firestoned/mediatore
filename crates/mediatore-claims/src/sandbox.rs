@@ -22,7 +22,7 @@ use banlieue_api::banlieue::{ClaimSubject, VirtualMachineClaim, VirtualMachineCl
 use banlieue_api::common::{
     LabelSelector, LabelSelectorOperator, LabelSelectorRequirement, LocalObjectReference,
 };
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 use kube::api::{DeleteParams, ObjectMeta, PostParams};
 use kube::runtime::controller::Action;
@@ -297,15 +297,6 @@ impl From<&Workload> for SandboxWorkload {
     }
 }
 
-/// `chrono` for a Kubernetes timestamp (the wire types use `chrono`).
-#[must_use]
-pub fn chrono_of(t: &Time) -> Option<DateTime<Utc>> {
-    DateTime::from_timestamp(
-        t.0.as_second(),
-        u32::try_from(t.0.subsec_nanosecond()).ok()?,
-    )
-}
-
 /// Every CRD `deploy/base/crds/` carries, by file name (ADR-0008; ADR-0034 for the two
 /// store resources).
 ///
@@ -506,7 +497,7 @@ pub fn record_for(
         workload: Workload::from(&sb.spec.workload),
         ttl_seconds: sb.spec.ttl_seconds,
         refresh: None,
-        created_at: Utc::now(),
+        created_at: Timestamp::now(),
         expires_at: None,
         revoked_at: None,
         sandbox_uid: sandbox_uid_of(sb),
@@ -764,7 +755,7 @@ impl Watcher {
         self.bundles.as_ref()?.resolve(
             &sb.namespace().unwrap_or_default(),
             &policy.name,
-            Utc::now(),
+            Timestamp::now(),
         )
     }
 
@@ -1209,7 +1200,7 @@ mod tests {
                 nonce: vec![0; 12],
                 ciphertext: vec![1, 2, 3],
             },
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             audience: None,
             expires_at: None,
         }
@@ -2164,7 +2155,8 @@ mod tests {
         async fn admit(&self, version: u64, edit: impl FnOnce(&mut BundlePayload)) {
             let mut next = self.payload.clone();
             edit(&mut next);
-            let fresh = mediatore_testkit::policy::signed_bundle(Utc::now(), version, next.content);
+            let fresh =
+                mediatore_testkit::policy::signed_bundle(Timestamp::now(), version, next.content);
             let policy = &fresh.payload.content.policy;
             let cm = mediatore_testkit::policy::bundle_configmap(
                 &policy.namespace,
@@ -2186,7 +2178,7 @@ mod tests {
             keys,
             envelope,
             payload,
-        } = mediatore_testkit::policy::fresh_bundle(Utc::now(), version);
+        } = mediatore_testkit::policy::fresh_bundle(Timestamp::now(), version);
         let policy = payload.content.policy.clone();
         let reflector = BundleReflector::new(
             Arc::new(mediatore_store::MemoryStore::default()),
@@ -2575,9 +2567,7 @@ mod tests {
     }
 
     #[test]
-    fn timestamps_convert_to_chrono() {
-        let t = Time(k8s_openapi::jiff::Timestamp::from_second(1_800_000_000).unwrap());
-        assert_eq!(chrono_of(&t).unwrap().timestamp(), 1_800_000_000);
+    fn an_empty_fake_knows_no_sandbox() {
         let fake = FakeClaims::default();
         assert!(fake.sandbox("x", "y").is_none());
     }

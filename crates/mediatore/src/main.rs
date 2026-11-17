@@ -141,7 +141,7 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
                 &s.issuer,
                 &s.kid,
                 &pem,
-                chrono::Duration::seconds(max),
+                jiff::SignedDuration::from_secs(max),
             )?)
         }
         None => None,
@@ -444,7 +444,7 @@ fn audience_secrets(
                 value: mediatore_proto::Secret(value.to_owned()),
                 header: a.secret_header.clone(),
                 extra_headers: a.secret_extra_headers.clone(),
-                ttl: chrono::Duration::seconds(a.max_ttl),
+                ttl: jiff::SignedDuration::from_secs(a.max_ttl),
             },
         );
     }
@@ -466,7 +466,7 @@ fn delegated_audiences(
                 mediatore_api::DelegatedAudience {
                     header: a.header.clone(),
                     extra_headers: a.extra_headers.clone(),
-                    ttl: chrono::Duration::seconds(a.max_ttl),
+                    ttl: jiff::SignedDuration::from_secs(a.max_ttl),
                     basic: a.credential == config::Credential::Basic,
                 },
             )

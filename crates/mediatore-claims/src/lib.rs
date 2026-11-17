@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 
-use chrono::Utc;
+use jiff::Timestamp;
 use mediatore_proto::ClaimPhase;
 use mediatore_spire::{EntryKind, EntryManager, Naming};
 use mediatore_store::{ClaimStore, StoreError};
@@ -88,7 +88,7 @@ impl Reconciler {
         rec.entry_id = Some(entry);
         rec.node_id = Some(self.naming.agent_id(ek_hash));
         rec.expires_at.get_or_insert_with(|| {
-            Utc::now() + chrono::Duration::seconds(i64::from(rec.ttl_seconds))
+            Timestamp::now() + jiff::SignedDuration::from_secs(i64::from(rec.ttl_seconds))
         });
         self.store.update_claim(rec).await?;
         tracing::info!(%claim_uid, ek_hash, "claim bound: entry set");
@@ -105,7 +105,7 @@ impl Reconciler {
         if let Some(entry) = &rec.entry_id {
             self.spire.delete_entry(entry).await?;
         }
-        self.store.revoke_claim(claim_uid, Utc::now()).await?;
+        self.store.revoke_claim(claim_uid, Timestamp::now()).await?;
         tracing::info!(%claim_uid, "claim released: entry retracted, tokens cut off");
         Ok(())
     }
@@ -139,7 +139,7 @@ impl Reconciler {
 
 #[cfg(test)]
 mod tests {
-    use chrono::Utc;
+    use jiff::Timestamp;
     use mediatore_proto::{Subject, Workload};
     use mediatore_spire::{MemoryEntries, claim_entry_name};
     use mediatore_store::{ClaimRecord, MemoryStore};
@@ -189,7 +189,7 @@ mod tests {
             workload: Workload::default(),
             ttl_seconds: 600,
             refresh: None,
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             expires_at: None,
             revoked_at: None,
             sandbox_uid: None,
@@ -269,7 +269,7 @@ mod tests {
         store.put_claim(record(revoked)).await.unwrap();
         r.bind(live, EK).await.unwrap();
         r.bind(revoked, EK).await.unwrap();
-        store.revoke_claim(revoked, Utc::now()).await.unwrap();
+        store.revoke_claim(revoked, Timestamp::now()).await.unwrap();
         // An entry declared by a previous broker instance for a claim this store never saw.
         entries
             .create_claim_entry(

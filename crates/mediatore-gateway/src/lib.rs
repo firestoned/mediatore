@@ -45,7 +45,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use mediatore_proto::{ClaimEgress, Endpoint, HeaderPair, InjectRoute, Secret};
 use mediatore_spire::Naming;
 use uuid::Uuid;
@@ -200,7 +200,7 @@ pub struct InjectDecision {
 struct Entry {
     egress: BTreeSet<Endpoint>,
     inject: Arc<Vec<InjectRoute>>,
-    expires_at: DateTime<Utc>,
+    expires_at: Timestamp,
     fetched_at: Instant,
     used_at: Instant,
 }
@@ -386,7 +386,7 @@ impl Authorizer {
         uid: Uuid,
         read: impl Fn(&Entry) -> T,
     ) -> (Result<T, Refusal>, Served) {
-        if let Some(v) = self.fresh_with(uid, Utc::now(), Instant::now(), &read) {
+        if let Some(v) = self.fresh_with(uid, Timestamp::now(), Instant::now(), &read) {
             return (Ok(v), Served::Cache);
         }
         let ask_lock = self.asking_lock(uid);
@@ -405,7 +405,7 @@ impl Authorizer {
         uid: Uuid,
         read: &impl Fn(&Entry) -> T,
     ) -> (Result<T, Refusal>, Served) {
-        if let Some(v) = self.fresh_with(uid, Utc::now(), Instant::now(), read) {
+        if let Some(v) = self.fresh_with(uid, Timestamp::now(), Instant::now(), read) {
             return (Ok(v), Served::Cache);
         }
         match self.source.ask(uid).await {
@@ -425,7 +425,7 @@ impl Authorizer {
                 (Err(Refusal::BrokerRefused), Served::None)
             }
             Err(AskError::Unreachable(why)) => {
-                if let Some(v) = self.stale_with(uid, Utc::now(), Instant::now(), read) {
+                if let Some(v) = self.stale_with(uid, Timestamp::now(), Instant::now(), read) {
                     tracing::warn!(claim_uid = %uid, error = %why, "broker unreachable; serving the stale allowlist");
                     (Ok(v), Served::Stale)
                 } else {
@@ -446,7 +446,7 @@ impl Authorizer {
     fn fresh_with<T>(
         &self,
         uid: Uuid,
-        now: DateTime<Utc>,
+        now: Timestamp,
         tick: Instant,
         read: impl FnOnce(&Entry) -> T,
     ) -> Option<T> {
@@ -470,7 +470,7 @@ impl Authorizer {
     fn stale_with<T>(
         &self,
         uid: Uuid,
-        now: DateTime<Utc>,
+        now: Timestamp,
         tick: Instant,
         read: impl FnOnce(&Entry) -> T,
     ) -> Option<T> {
@@ -493,7 +493,7 @@ impl Authorizer {
     /// Keep the broker's answer; `false` when it is already past its deadline, in which
     /// case nothing is kept.
     fn admit(&self, uid: Uuid, answer: ClaimEgress, tick: Instant) -> bool {
-        if answer.expires_at <= Utc::now() {
+        if answer.expires_at <= Timestamp::now() {
             lock(&self.cache).entries.remove(&uid);
             self.forget_credentials(uid);
             return false;
@@ -559,7 +559,7 @@ impl Authorizer {
         };
         match creds.credential(uid, audience).await {
             Ok(CredentialAnswer::Found(cred)) => {
-                if cred.audience != audience || cred.expires_at <= Utc::now() {
+                if cred.audience != audience || cred.expires_at <= Timestamp::now() {
                     tracing::warn!(claim_uid = %uid, audience, "the broker's credential answer was for another audience or already expired; denied");
                     return Err(Refusal::CredentialRefused);
                 }
@@ -598,9 +598,10 @@ impl Authorizer {
         key: &CredentialKey,
         cred: mediatore_proto::GatewayCredential,
     ) -> HeldCredential {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let tick = Instant::now();
-        let left = |at: DateTime<Utc>| (at - now).to_std().unwrap_or(Duration::ZERO);
+        let left =
+            |at: Timestamp| Duration::try_from(at.duration_since(now)).unwrap_or(Duration::ZERO);
         let mut bound = left(cred.expires_at)
             .saturating_sub(self.cfg.credential_margin)
             .min(self.cfg.credential_for);
@@ -777,7 +778,7 @@ mod tests {
     fn found(egress: &[&str], ttl_secs: i64) -> Answer {
         Answer::Found(ClaimEgress {
             claim_uid: Uuid::nil(),
-            expires_at: Utc::now() + chrono::Duration::seconds(ttl_secs),
+            expires_at: Timestamp::now() + jiff::SignedDuration::from_secs(ttl_secs),
             egress: egress.iter().map(|e| e.parse().unwrap()).collect(),
             inject: Vec::new(),
         })
@@ -1094,7 +1095,7 @@ mod tests {
     fn found_inject(routes: Vec<InjectRoute>, ttl_secs: i64) -> Answer {
         Answer::Found(ClaimEgress {
             claim_uid: Uuid::nil(),
-            expires_at: Utc::now() + chrono::Duration::seconds(ttl_secs),
+            expires_at: Timestamp::now() + jiff::SignedDuration::from_secs(ttl_secs),
             egress: routes.iter().map(|r| r.endpoint.clone()).collect(),
             inject: routes,
         })
@@ -1118,7 +1119,7 @@ mod tests {
                 name: "anthropic-version".into(),
                 value: "2023-06-01".into(),
             }],
-            expires_at: Utc::now() + chrono::Duration::seconds(ttl_secs),
+            expires_at: Timestamp::now() + jiff::SignedDuration::from_secs(ttl_secs),
         }))
     }
 

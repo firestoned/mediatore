@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use chrono::{Duration, Utc};
+use jiff::{SignedDuration, Timestamp};
 use mediatore_api::{AppState, Limiter, Namespaces};
 use mediatore_entra::{Backend, ClientAssertion, EntraConfig, IssuerConfig, Validator};
 use mediatore_proto::{
@@ -157,7 +157,7 @@ impl Harness {
             "https://mediatore.test",
             "e2e-1",
             mediatore_testkit::entra::fresh_p256_key_pem().as_bytes(),
-            Duration::minutes(15),
+            SignedDuration::from_mins(15),
         )
         .expect("sts");
         let store = MemoryStore::shared();
@@ -326,9 +326,9 @@ async fn the_bearer_is_exchanged_once_and_every_issue_refreshes_for_the_audience
     assert_eq!(obo.token_type, "Bearer");
     assert_eq!(obo.audience, OBO_AUDIENCE);
     assert_eq!(obo.subject.id, "octocat");
-    let life = obo.expires_at - Utc::now();
+    let life = obo.expires_at.duration_since(Timestamp::now());
     assert!(
-        life > Duration::minutes(50) && life <= Duration::minutes(60),
+        life > SignedDuration::from_mins(50) && life <= SignedDuration::from_mins(60),
         "Entra's lifetime, not the STS's: {life}"
     );
     assert_eq!(

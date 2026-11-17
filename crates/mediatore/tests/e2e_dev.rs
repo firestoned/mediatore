@@ -14,7 +14,7 @@
 use std::future::IntoFuture;
 use std::sync::Arc;
 
-use chrono::Duration;
+use jiff::SignedDuration;
 use mediatore_api::{AppState, Limiter, Namespaces};
 use mediatore_entra::{Backend, IssuerConfig, Validator};
 use mediatore_proto::{
@@ -109,7 +109,7 @@ fn delegated_map() -> std::collections::BTreeMap<String, mediatore_api::Delegate
                 name: "anthropic-beta".into(),
                 value: "oauth-2025-04-20".into(),
             }],
-            ttl: Duration::minutes(15),
+            ttl: SignedDuration::from_mins(15),
             basic: false,
         },
     )]
@@ -135,7 +135,7 @@ impl Harness {
             "https://mediatore.test",
             "e2e-1",
             STS_TEST_KEY.as_bytes(),
-            Duration::minutes(15),
+            SignedDuration::from_mins(15),
         )
         .expect("sts");
         let state = Arc::new(AppState {
@@ -416,7 +416,7 @@ async fn a_one_shot_workload_ends_its_claim_at_the_broker() {
     assert!(!ended.ready);
     let recorded = ended.exit.expect("the exit is on the record");
     assert_eq!(recorded.exit, exit);
-    assert!(recorded.exited_at <= chrono::Utc::now());
+    assert!(recorded.exited_at <= jiff::Timestamp::now());
     let resp = h.token_for(&claim_svid(&uid), AUDIENCE).await;
     assert_eq!(resp.status(), 403, "no token for a released claim");
 
@@ -497,7 +497,7 @@ async fn report_round_trip(h: &Harness, claim: &ClaimResponse, uid: uuid::Uuid, 
         .expect("get body");
     let recorded = after_report.report.expect("the report is on the record");
     assert_eq!(recorded.report, report);
-    assert!(recorded.reported_at <= chrono::Utc::now());
+    assert!(recorded.reported_at <= jiff::Timestamp::now());
 }
 
 #[tokio::test]
@@ -1051,11 +1051,7 @@ fn delegated_request(delegations: Vec<Delegation>, ttl_seconds: u32) -> ClaimReq
     }
 }
 
-fn delegation(
-    audience: &str,
-    token: &str,
-    expires_at: Option<chrono::DateTime<chrono::Utc>>,
-) -> Delegation {
+fn delegation(audience: &str, token: &str, expires_at: Option<jiff::Timestamp>) -> Delegation {
     Delegation {
         audience: audience.into(),
         token: Some(mediatore_proto::Secret(token.into())),
@@ -1073,7 +1069,7 @@ async fn a_delegated_credential_is_sealed_at_the_claim_and_handed_to_the_proxy_w
     let h = Harness::start().await;
     h.register_node().await;
     let user_token = h.login("octocat");
-    let dies_at = chrono::Utc::now() + Duration::hours(2);
+    let dies_at = jiff::Timestamp::now() + SignedDuration::from_hours(2);
     let resp = h
         .http
         .post(format!("{}/v1/claims", h.user_url))
@@ -1114,7 +1110,7 @@ async fn a_delegated_credential_is_sealed_at_the_claim_and_handed_to_the_proxy_w
     assert_eq!(route.credential, mediatore_proto::Credential::Token);
     assert!(route.credential_header.is_none());
 
-    let before = chrono::Utc::now();
+    let before = jiff::Timestamp::now();
     let tok_resp = h.token_for(&claim_svid(&uid), DELEGATED).await;
     assert_eq!(
         tok_resp.status(),
@@ -1132,7 +1128,7 @@ async fn a_delegated_credential_is_sealed_at_the_claim_and_handed_to_the_proxy_w
     assert_eq!(tok.extra_headers[0].name, "anthropic-beta");
     assert_eq!(tok.extra_headers[0].value, "oauth-2025-04-20");
     assert!(
-        tok.expires_at <= before + Duration::minutes(15) + Duration::seconds(1),
+        tok.expires_at <= before + SignedDuration::from_mins(15) + SignedDuration::from_secs(1),
         "the proxy asks again within max_ttl"
     );
     assert!(tok.expires_at <= dies_at);
@@ -1199,7 +1195,7 @@ async fn a_delegation_is_required_where_the_audience_wants_one_and_refused_anywh
             vec![delegation(
                 DELEGATED,
                 "sess",
-                Some(chrono::Utc::now() + Duration::seconds(30)),
+                Some(jiff::Timestamp::now() + SignedDuration::from_secs(30)),
             )],
             3600,
         ))

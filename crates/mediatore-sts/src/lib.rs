@@ -9,7 +9,7 @@
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use chrono::{DateTime, Duration, Utc};
+use jiff::{SignedDuration, Timestamp};
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use mediatore_proto::Subject;
 use p256::elliptic_curve::sec1::ToSec1Point;
@@ -75,7 +75,7 @@ pub struct MintRequest<'a> {
     /// Group memberships carried through from the upstream token.
     pub groups: Vec<String>,
     /// Requested lifetime; capped by [`Sts::max_ttl`].
-    pub ttl: Duration,
+    pub ttl: SignedDuration,
 }
 
 /// A minted token.
@@ -84,7 +84,7 @@ pub struct Minted {
     /// Compact JWS.
     pub token: String,
     /// Absolute expiry.
-    pub expires_at: DateTime<Utc>,
+    pub expires_at: Timestamp,
 }
 
 /// ES256 token issuer.
@@ -92,7 +92,7 @@ pub struct Sts {
     issuer: String,
     kid: String,
     key: EncodingKey,
-    max_ttl: Duration,
+    max_ttl: SignedDuration,
     jwks: serde_json::Value,
 }
 
@@ -140,7 +140,7 @@ impl Sts {
         issuer: impl Into<String>,
         kid: impl Into<String>,
         private_key_pem: &[u8],
-        max_ttl: Duration,
+        max_ttl: SignedDuration,
     ) -> Result<Self, StsError> {
         let key = EncodingKey::from_ec_pem(private_key_pem).map_err(StsError::Key)?;
         let kid: String = kid.into();
@@ -162,7 +162,7 @@ impl Sts {
 
     /// Maximum lifetime this issuer will grant.
     #[must_use]
-    pub fn max_ttl(&self) -> Duration {
+    pub fn max_ttl(&self) -> SignedDuration {
         self.max_ttl
     }
 
@@ -173,11 +173,11 @@ impl Sts {
     }
 
     /// Mint a token. `now` is injectable for tests.
-    pub fn mint_at(&self, req: &MintRequest<'_>, now: DateTime<Utc>) -> Result<Minted, StsError> {
+    pub fn mint_at(&self, req: &MintRequest<'_>, now: Timestamp) -> Result<Minted, StsError> {
         if req.ttl > self.max_ttl {
             return Err(StsError::TtlTooLong {
-                requested: req.ttl.num_seconds(),
-                max: self.max_ttl.num_seconds(),
+                requested: req.ttl.as_secs(),
+                max: self.max_ttl.as_secs(),
             });
         }
         let expires_at = now + req.ttl;
@@ -185,9 +185,9 @@ impl Sts {
             iss: &self.issuer,
             sub: &req.subject.id,
             aud: req.audience,
-            exp: expires_at.timestamp(),
-            iat: now.timestamp(),
-            nbf: now.timestamp() - 30,
+            exp: expires_at.as_second(),
+            iat: now.as_second(),
+            nbf: now.as_second() - 30,
             jti: Uuid::new_v4().to_string(),
             act: Actor {
                 sub: req.actor_spiffe_id,
@@ -207,7 +207,7 @@ impl Sts {
 
     /// Mint a token as of now.
     pub fn mint(&self, req: &MintRequest<'_>) -> Result<Minted, StsError> {
-        self.mint_at(req, Utc::now())
+        self.mint_at(req, Timestamp::now())
     }
 }
 
@@ -228,7 +228,7 @@ MUX5AKaxsGDNBXbbUOvRmJfjaSyiqtitNnd5Zd7UoxcUu0EiVY9OuHW2
             "https://mediatore.test",
             "k1",
             TEST_KEY.as_bytes(),
-            Duration::minutes(15),
+            SignedDuration::from_mins(15),
         )
         .unwrap()
     }
@@ -247,7 +247,7 @@ MUX5AKaxsGDNBXbbUOvRmJfjaSyiqtitNnd5Zd7UoxcUu0EiVY9OuHW2
             claim_uid: Uuid::new_v4(),
             audience: "grafana",
             groups: vec![],
-            ttl: Duration::hours(2),
+            ttl: SignedDuration::from_hours(2),
         };
         assert!(matches!(sts.mint(&req), Err(StsError::TtlTooLong { .. })));
     }
@@ -266,7 +266,7 @@ MUX5AKaxsGDNBXbbUOvRmJfjaSyiqtitNnd5Zd7UoxcUu0EiVY9OuHW2
             claim_uid: Uuid::new_v4(),
             audience: "grafana",
             groups: vec!["firestoned:sandbox-users".into()],
-            ttl: Duration::minutes(5),
+            ttl: SignedDuration::from_mins(5),
         };
         let m = sts.mint(&req).unwrap();
         assert_eq!(m.token.split('.').count(), 3);
@@ -301,7 +301,7 @@ MUX5AKaxsGDNBXbbUOvRmJfjaSyiqtitNnd5Zd7UoxcUu0EiVY9OuHW2
             claim_uid,
             audience: "grafana",
             groups: vec![],
-            ttl: Duration::minutes(5),
+            ttl: SignedDuration::from_mins(5),
         };
         let m = sts.mint(&req).unwrap();
 

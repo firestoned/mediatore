@@ -41,7 +41,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect, Response};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use chrono::{Duration, Utc};
+use jiff::{SignedDuration, Timestamp};
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header};
 use p256::elliptic_curve::sec1::ToSec1Point;
 use p256::pkcs8::DecodePrivateKey;
@@ -560,8 +560,9 @@ fn identity_access_token(issuer: &str, identity: &serde_json::Value, client_id: 
     let mut claims = identity.clone();
     claims["scp"] = serde_json::json!("sandbox.access");
     claims["azp"] = serde_json::json!(client_id);
-    claims["exp"] =
-        serde_json::json!((Utc::now() + Duration::seconds(ENTRA_ACCESS_TTL_SECS)).timestamp());
+    claims["exp"] = serde_json::json!(
+        (Timestamp::now() + SignedDuration::from_secs(ENTRA_ACCESS_TTL_SECS)).as_second()
+    );
     mint(issuer, claims)
 }
 
@@ -838,15 +839,17 @@ impl FakeIdp {
 #[must_use]
 pub fn mint(issuer: &str, mut claims: serde_json::Value) -> String {
     let key = EncodingKey::from_ec_pem(idp_test_key().as_bytes()).expect("test key");
-    let now = Utc::now();
+    let now = Timestamp::now();
     if let Some(obj) = claims.as_object_mut() {
         let defaults = [
             ("iss", serde_json::json!(issuer)),
-            ("iat", serde_json::json!(now.timestamp())),
-            ("nbf", serde_json::json!(now.timestamp())),
+            ("iat", serde_json::json!(now.as_second())),
+            ("nbf", serde_json::json!(now.as_second())),
             (
                 "exp",
-                serde_json::json!((now + Duration::minutes(TEST_TOKEN_TTL_MINUTES)).timestamp()),
+                serde_json::json!(
+                    (now + SignedDuration::from_mins(TEST_TOKEN_TTL_MINUTES)).as_second()
+                ),
             ),
         ];
         for (k, v) in defaults {

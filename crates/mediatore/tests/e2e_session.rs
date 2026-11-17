@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use chrono::Duration;
+use jiff::SignedDuration;
 use mediatore_api::{AppState, Limiter, Namespaces};
 use mediatore_entra::{Backend, IssuerConfig, SessionConfig, Validator};
 use mediatore_proto::{
@@ -85,7 +85,7 @@ impl Harness {
             "https://mediatore.test",
             "e2e-1",
             STS_TEST_KEY.as_bytes(),
-            Duration::minutes(15),
+            SignedDuration::from_mins(15),
         )
         .expect("sts");
         let store = MemoryStore::shared();

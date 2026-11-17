@@ -12,7 +12,7 @@ use std::path::PathBuf;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
-use chrono::{Duration, Utc};
+use jiff::{SignedDuration, Timestamp};
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use mediatore_proto::cert::ClientCertificate;
 use serde::{Deserialize, Serialize};
@@ -21,7 +21,7 @@ use uuid::Uuid;
 use crate::IdpError;
 
 /// How long a signed assertion is good for. Microsoft asks for minutes, not hours.
-const ASSERTION_LIFETIME: Duration = Duration::minutes(5);
+const ASSERTION_LIFETIME: SignedDuration = SignedDuration::from_mins(5);
 
 /// Entra ID (`backend: entra-obo`): how the broker authenticates as itself. Exactly one
 /// of `key_file`, `transit` or `token_file`; the first two name the registered certificate
@@ -216,15 +216,15 @@ impl ClientAssertion {
             Kind::Certificate {
                 signer, thumbprint, ..
             } => {
-                let now = Utc::now();
+                let now = Timestamp::now();
                 let claims = Claims {
                     aud: token_endpoint,
                     iss: client_id,
                     sub: client_id,
                     jti: Uuid::new_v4().to_string(),
-                    nbf: now.timestamp(),
-                    iat: now.timestamp(),
-                    exp: (now + ASSERTION_LIFETIME).timestamp(),
+                    nbf: now.as_second(),
+                    iat: now.as_second(),
+                    exp: (now + ASSERTION_LIFETIME).as_second(),
                 };
                 let header = Header {
                     alg: Algorithm::PS256,
@@ -379,7 +379,7 @@ mod tests {
         assert_eq!(claims["sub"], "app-id");
         assert!(claims["jti"].as_str().is_some_and(|j| !j.is_empty()));
         let life = claims["exp"].as_i64().unwrap() - claims["nbf"].as_i64().unwrap();
-        assert_eq!(life, ASSERTION_LIFETIME.num_seconds());
+        assert_eq!(life, ASSERTION_LIFETIME.as_secs());
         let again = assertion.assert("app-id", "x").await.unwrap();
         assert_ne!(jwt, again, "every assertion has its own jti");
     }

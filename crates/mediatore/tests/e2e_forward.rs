@@ -167,7 +167,7 @@ impl Harness {
             "https://mediatore.test",
             "e2e-1",
             STS_TEST_KEY.as_bytes(),
-            chrono::Duration::minutes(15),
+            jiff::SignedDuration::from_mins(15),
         )
         .expect("sts");
         let state = Arc::new(AppState {

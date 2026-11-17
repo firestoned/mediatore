@@ -268,7 +268,7 @@ fn glob_covers(a: &[&str], b: &[&str]) -> bool {
 #[cfg(test)]
 mod tests {
     use banlieue_api::common::LocalObjectReference;
-    use chrono::Utc;
+    use jiff::Timestamp;
     use mediatore_policy::types::{Access, AudienceGrant, EgressRule};
 
     use super::*;
@@ -277,7 +277,7 @@ mod tests {
     /// The conformance bundle's content: audience `internal-git` at 300 s with endpoint
     /// `git.foo.io:443` and the rule `GET /repos/**`, a 14400 s lease, no direct egress.
     fn bundle() -> BundlePayload {
-        mediatore_testkit::policy::fresh_bundle(Utc::now(), 1).payload
+        mediatore_testkit::policy::fresh_bundle(Timestamp::now(), 1).payload
     }
 
     fn spec(audiences: &[&str], policy: Option<&str>) -> AgentSandboxSpec {
