@@ -4,8 +4,8 @@
 # ADR-0046: Who may claim: a list of groups, and a mapping from namespaces to groups
 
 **Status:** Accepted 2026-11-17 (the seven open questions were answered by the maintainer the same day; their answers are
-folded into decisions 3, 4, 5, 14, 16 and 17 and listed at the end); implemented on `main` (#129),
-not yet released (v0.2.10 predates it) · **Date:** 2026-11-17
+folded into decisions 3, 4, 5, 14, 16 and 17 and listed at the end); implemented on `main` (#129)
+and released in v0.3.0 (2026-11-17; v0.2.10 predates it) · **Date:** 2026-11-17
 
 Roadmap 08 (the `AgentSandbox` CRD) and roadmap 04 (issuer profiles). Amends
 [ADR-0017](0017-issuer-profiles.md) (the issuer's `required_group`),
@@ -422,7 +422,7 @@ What is already true and this ADR builds on (verified in the source):
     only then adds `required_groups`, `sandboxes.namespaces` or `--namespace` use. The reverse
     (new config, old broker) is the fail-open case: builds that carry decision 17's deny refuse the
     unknown key, but the builds before it cannot, so the release notes and the guide
-    (`docs/guides`) state the order and that the release carrying this ADR is the floor. A
+    (`docs/guides`) state the order and that the release carrying this ADR (v0.3.0) is the floor. A
     rollback to an older build removes the new keys first. At start the broker logs, per issuer,
     one `info` line naming the issuer `url` and the gate form in force: `required_groups` (with the
     count), `required_group` (the alias, count 1) or `none (explicit)` (decision 19); and for the

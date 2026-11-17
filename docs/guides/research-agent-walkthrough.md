@@ -7,7 +7,7 @@ One workload, followed from the image a team publishes to the report it pushes: 
 packaged as `ghcr.io/octocat/research-agent`, run by `octocat` in a sandbox under a policy
 that [notaio](https://github.com/firestoned/notaio) certifies, on a VM that mediatore binds
 to that login. Every file on this page is a placeholder you replace, and every command is
-one the pieces accept today, at mediatore v0.2.10 and notaio v0.6.0 (the bundle crates the
+one the pieces accept today, at mediatore v0.3.0 and notaio v0.6.0 (the bundle crates the
 broker pins).
 
 > **What is proven and what is designed.** mediatore's side of this page runs in the kind
@@ -227,10 +227,9 @@ issuers:
     backend: sts
     client_id: mediatore
     subject_claim: preferred_username
-    # The group a login must carry to claim at all. One gate for the broker today (a list,
-    # `required_groups`, and a namespace-to-groups map, `sandboxes.namespaces`, are on main
-    # since ADR-0046, in the next release); the policy's subjects.groups is the per-policy
-    # version, which M3 brings.
+    # The group a login must carry to claim at all. One gate for the broker (or, since v0.3.0,
+    # a list, `required_groups`, and a namespace-to-groups map, `sandboxes.namespaces`,
+    # ADR-0046); the policy's subjects.groups is the per-policy version, which M3 brings.
     required_group: firestoned:research
     session: { client_id: mediatore }
 audiences:
@@ -283,7 +282,7 @@ mediatore sandbox create --mediatore https://mediatore.home.example \
 ```
 
 The first line is on stderr: a broker with one namespace answers it, and `--namespace`
-names another on a broker with a namespace map (ADR-0046, in the next release).
+names another on a broker with a namespace map (ADR-0046, since v0.3.0).
 
 The broker validates the login (issuer, signature, audience, the group), parses the image
 reference (one it cannot parse is refused with `400 invalid_workload_image`), checks the
@@ -377,7 +376,7 @@ banlieue destroys the member. Nothing of the run survives on it.
 | In the policy | Enforced today by | Reported in shadow (ADR-0026) | Under notaio M3 |
 | --- | --- | --- | --- |
 | `profileRef: standard` | nothing in mediatore: the profile is notaio's, applied at lint and compile | nothing: the knobs are not compared | the bundle's knobs, verified by mediatore at every mint and by the guest before it renders the jail |
-| `subjects.groups` | the issuer's `required_group`, one for the broker (`required_groups` and the namespace-to-groups map of ADR-0046 are on main, in the next release) | nothing: eligibility is the enforcing step's | the policy's groups, per policy, at the claim |
+| `subjects.groups` | the issuer's `required_group`, one for the broker (or, since v0.3.0, `required_groups` and the namespace-to-groups map of ADR-0046) | nothing: eligibility is the enforcing step's | the policy's groups, per policy, at the claim |
 | `audiences[].name` | `audiences[]` in the broker's config; a claim naming one not there is refused before any VM exists | `P001`, an audience on the sandbox the bundle does not list | the same, with the policy's set as the ceiling and the version stamped into the token |
 | `audiences[].access: Write`, `scopes` | not expressed: a token carries `aud`, `sub` and `act`; what it may do is the git host's authorization of `octocat` | nothing: the broker has no setting to compare | the bundle's access and scopes, carried in the token |
 | `ttlSeconds: 900` | the audience's `max_ttl` and the broker's 15-minute cap | `P002`, a `max_ttl` above the bundle's `ttlSeconds` | the bundle's value |

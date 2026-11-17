@@ -4,13 +4,13 @@
 # How to support multi-tenant authorization
 
 Several teams share one mediatore and one pool platform. This guide says who may do what at each
-step, what you can configure today, how a service (not a person) claims programmatically, and
-what the next release brings for per-team namespaces. Everything marked **Next release** is
-decided ([ADR-0046](../adr/0046-who-may-claim-a-list-of-groups-and-a-namespace-to-groups-mapping.md),
-accepted 2026-11-17) and implemented on `main`, but not yet in a release: nothing below that
-heading works on a released broker (v0.2.10 or earlier). Do not put the new keys in a
-configuration of a broker that predates the release: its issuer and `sandboxes` blocks ignore a
-key they do not know (only the `audiences` entries reject one,
+step, what you can configure, how a service (not a person) claims programmatically, and how
+per-team namespaces work since v0.3.0
+([ADR-0046](../adr/0046-who-may-claim-a-list-of-groups-and-a-namespace-to-groups-mapping.md),
+accepted and released 2026-11-17). Nothing in [section 5](#5-groups-per-namespace-v030) works
+on a broker before v0.3.0 (v0.2.10 or earlier). Do not put the new keys in the configuration of
+such a broker: its issuer and `sandboxes` blocks ignore a key they do not know (only the
+`audiences` entries reject one,
 [ADR-0040](../adr/0040-the-gateway-places-an-audiences-credential-the-pool-never-holds-it.md)),
 so on such a broker a `required_groups` would be silently dropped, and an issuer with no
 `required_group` gates nothing. [Upgrading](#upgrading) says the order.
@@ -20,19 +20,21 @@ broker), `example-org:APP_EXAMPLE_ADMIN` (a group as the GitHub connector spells
 `APP_EXAMPLE_TEAM_A_USER` (a group as LDAP and Entra spell it), `svc-example` (a service ID),
 `team-a` (a tenant namespace).
 
-## 1. Who may do what: four separate checks
+## 1. Who may do what: five separate checks
 
-A request to create a sandbox passes four independent checks. A tenant is only as isolated as the
+A request to create a sandbox passes five independent checks. A tenant is only as isolated as the
 weakest of them, so know which one you are configuring.
 
 | Check | Where it lives | Decides | Configured by |
 | --- | --- | --- | --- |
-| Issuer gate | the broker, `issuers[].required_group` ([`crates/mediatore-entra/src/lib.rs`](https://github.com/firestoned/mediatore/blob/main/crates/mediatore-entra/src/lib.rs)) | whether this login may use the broker at all | `mediatore.yaml` |
+| Issuer gate | the broker, `issuers[].required_group` or `required_groups` ([`crates/mediatore-entra/src/lib.rs`](https://github.com/firestoned/mediatore/blob/main/crates/mediatore-entra/src/lib.rs)) | whether this login may use the broker at all | `mediatore.yaml` |
+| Namespace groups (v0.3.0) | the broker, `sandboxes.namespaces` ([`crates/mediatore/src/config.rs`](https://github.com/firestoned/mediatore/blob/main/crates/mediatore/src/config.rs)) | in which namespace this login may create, read and delete sandboxes through the API | `mediatore.yaml` ([section 5](#5-groups-per-namespace-v030)) |
 | Policy subjects | the signed bundle for the `policyRef`, read from the policy namespaces ([ADR-0026](../adr/0026-notaio-bundles-verified-in-shadow.md)) | which groups a policy is written for, and the audiences and egress it grants | the policy repository, by pull request |
 | Claim subject | banlieue's admission policy `banlieue-virtualmachineclaim-subject-authorization` | that a `VirtualMachineClaim` names its own creator, except for listed brokers | ConfigMap `banlieue-claim-subject-policy` (`brokers`, `issuers`, `usernamePrefix`) |
 | Kubernetes RBAC | the API server | who may create an `AgentSandbox` directly, in which namespace (the declarative path) | a RoleBinding per namespace, for example to a role that grants `create` and `delete` on `agentsandboxes` |
 
-The first and third are checked for every API claim. The fourth is the only check on the
+The first, the second (once `sandboxes.namespaces` is set) and the fourth are checked for every
+API claim. The fifth is the only check on the
 declarative path (a team applying an `AgentSandbox` with `kubectl`), together with the
 `mediatore-agentsandbox-subject` admission policy, which limits a requester to the subject it is.
 
@@ -40,7 +42,7 @@ The policy's group list is compared in shadow today: a named policy reports conf
 grants nothing the broker's own configuration does not ([the policy bundle](the-policy-bundle.md)).
 The issuer gate is the enforcement point for who may claim.
 
-## 2. The issuer gate, as it works today
+## 2. The issuer gate
 
 ```yaml
 issuers:
@@ -51,13 +53,16 @@ issuers:
     required_group: example-org:APP_EXAMPLE_ADMIN
 ```
 
-- **One value.** `required_group` is a single string.
+- **One value, or a list.** `required_group` is a single string. Since v0.3.0 an issuer may
+  write `required_groups`, a list matched any-of, instead ([section 5](#5-groups-per-namespace-v030)).
 - **Exact match.** The check compares it, case-sensitively, with each entry of the token's
   `groups` claim and its `roles` claim (or only `groups_claim`, when the issuer sets one).
   There is no prefix stripping, no glob and no regex.
-- **No group, no claim.** A login without the group gets `403`: `not in required group <value>`
-  from a released broker (v0.2.10 and earlier), `not in a required group` from the next release.
-  An unset `required_group` gates nothing on a released broker (the issuers guide says when that is acceptable); the release that carries ADR-0046 refuses to start an issuer with no written gate ([section 5](#5-next-release-groups-per-namespace)).
+- **No group, no claim.** A login without the group gets `403`: `not in a required group` since
+  v0.3.0, `not in required group <value>` from v0.2.10 and earlier. Since v0.3.0 an issuer must
+  write its gate: one with none of `required_group`, `required_groups` and
+  `allow_any_authenticated: true` refuses to start. On v0.2.10 and earlier an unset
+  `required_group` gates nothing (the issuers guide says when that is acceptable).
 - **Fail closed in the sense that matters.** A token with no groups claim at all does not match a
   set `required_group`.
 
@@ -76,9 +81,9 @@ signing in through the GitHub connector can never satisfy a bare one. With one s
 pick a spelling and accept that the other population is refused, which is why the single value is
 a limit for any deployment that has both people and services.
 
-Today's workaround: gate on the spelling your callers share. If every claimant arrives through
-LDAP or Entra, use the bare name. If you need both populations, you cannot do it with one string
-(see `required_groups` below, in the next release).
+Since v0.3.0, list both spellings in `required_groups` ([section 5](#5-groups-per-namespace-v030)).
+On v0.2.10 and earlier, gate on the spelling your callers share: if every claimant arrives through
+LDAP or Entra, use the bare name; if you need both populations, you cannot do it with one string.
 
 ## 3. A service that claims programmatically
 
@@ -138,9 +143,10 @@ To check a token without printing it, print only the claims:
 python3 -c 'import sys,json,base64;t=json.load(sys.stdin);p=t["id_token"].split(".")[1];c=json.loads(base64.urlsafe_b64decode(p+"="*(-len(p)%4)));print({k:c.get(k) for k in ("iss","aud","preferred_username","groups")})'
 ```
 
-## 4. Onboarding a tenant namespace, today
+## 4. Onboarding a tenant namespace with one claim namespace
 
-What works with a released broker (`sandboxes.namespace` is one namespace):
+What works on any broker, with `sandboxes.namespace` naming one namespace (on v0.3.0, the API
+path of [section 5](#5-groups-per-namespace-v030) comes on top of this):
 
 1. **A namespace per team**, labelled the way the platform selects tenants.
 2. **A pool the platform owns in that namespace.** The team gets read-only access to
@@ -158,21 +164,19 @@ What works with a released broker (`sandboxes.namespace` is one namespace):
    namespace names its policy by `policyRef` and is resolved from its own namespace first, then
    from those. Teams change policy by pull request, never in the cluster. Prefix policy names per
    team, because a name is global across the policy namespaces.
-5. **Create the sandbox in the team's namespace** with `kubectl apply`. On a released broker,
+5. **Create the sandbox in the team's namespace** with `kubectl apply`. With one claim namespace,
    `POST /v1/claims` and the CLI create sandboxes in `sandboxes.namespace` only.
 
-What a released broker does not do: an API claim into a team's own namespace, and a gate that
-depends on the namespace. Both are on `main` ([section 5](#5-next-release-groups-per-namespace)).
+What this setup does not do: an API claim into a team's own namespace, and a gate that depends on
+the namespace. Both are v0.3.0's ([section 5](#5-groups-per-namespace-v030)); on v0.2.10 and
+earlier this section is all there is.
 
-## 5. Next release: groups per namespace
-
-<!-- flip this section to available when the release ships -->
+## 5. Groups per namespace (v0.3.0)
 
 This section describes
 [ADR-0046](../adr/0046-who-may-claim-a-list-of-groups-and-a-namespace-to-groups-mapping.md)
-(Accepted; implemented on `main`, not yet in a release). **Not yet released:** the keys below do
-not exist in a released broker, and a broker that predates them ignores them without a warning
-(see the note at the top). This heading and these tenses change when the release ships.
+(Accepted; released in v0.3.0, 2026-11-17). The keys below do not exist in a broker before
+v0.3.0, and such a broker ignores them without a warning (see the note at the top).
 
 The two limits above (one `required_group` string, one claim namespace) are the same problem seen
 twice: the gate cannot say "this group may claim here". The decision:
@@ -184,7 +188,7 @@ twice: the gate cannot say "this group may claim here". The decision:
   `403` no longer names the group: `not in a required group`.
 - **An issuer must write its gate.** Exactly one of `required_group`, `required_groups` or
   `allow_any_authenticated: true`. An issuer with none of the three refuses to start rather than
-  gating nothing; `allow_any_authenticated: true` is today's "no gate", written down, with a
+  gating nothing; `allow_any_authenticated: true` is v0.2.10's "no gate", written down, with a
   comment giving the reason (a Google issuer: who may log in is decided at Google).
 - **A namespace-to-groups map**, `sandboxes.namespaces`. Each namespace lists the groups (any-of,
   exact) whose members may create, read and delete sandboxes in it. The operator's own admin group
@@ -194,7 +198,7 @@ twice: the gate cannot say "this group may claim here". The decision:
   are exclusive: writing both is a start error. A create that omits `namespace` is
   `400 namespace_required`, and so are `GET` and `DELETE` without `?namespace=`. A caller in several
   namespaces' groups always names one; the broker never picks. Without the map, everything is as
-  today: one namespace, open to whoever passes the issuer gate.
+  before v0.3.0: one namespace, open to whoever passes the issuer gate.
 - **The issuer gate and the namespace groups are two checks, and both must pass to create.** The
   namespace check only narrows what the issuer gate admitted; it never implies it. To make the map
   the only gate, set `allow_any_authenticated: true` on the issuer, knowing anyone the IdP
@@ -210,7 +214,7 @@ twice: the gate cannot say "this group may claim here". The decision:
 - **No super-user namespace.** The operator's admin group maps to the admin namespace and gets no
   access to other tenants' sandboxes through the API.
 - **Pool and policy stay same-namespace, and policy stays in one namespace.** A tenant namespace
-  still needs its own pool and its own `Provider` ([section 4](#4-onboarding-a-tenant-namespace-today)).
+  still needs its own pool and its own `Provider` ([section 4](#4-onboarding-a-tenant-namespace-with-one-claim-namespace)).
   There is one global policy namespace: the map does not widen `policy.namespaces`, and no
   per-tenant policy `Role` is added. **With the map set, an empty `policy.namespaces` is a start
   error** telling you to list the policy namespaces: it no longer defaults to the claims' namespace,
@@ -221,10 +225,10 @@ twice: the gate cannot say "this group may claim here". The decision:
   `groups:`, a misspelled `sandboxes`) is a start error naming the key, in the issuer, `session`,
   `entra`, `sandboxes` and namespace-entry blocks and at the top level.
 
-The shape, as `main`'s parser takes it; not working configuration on a released broker:
+The shape, as a v0.3.0 broker takes it (not working configuration on v0.2.10 or earlier):
 
 ```yaml
-# On main (ADR-0046), not yet in a release
+# v0.3.0 and later (ADR-0046)
 issuers:
   - url: https://login.example.com
     backend: sts
@@ -248,20 +252,20 @@ nowhere else; a person in `APP_EXAMPLE_ADMIN` can do so in `infra`.
 The trust boundary this moves is real: the broker becomes the enforcement point for where a person
 may place a sandbox, and a mapping mistake grants cross-tenant claims, so review the map as a
 security configuration. The ADR states the checks, the tests that prove them and the
-threat-model entries. Until the release ships, use sections 2 to 4, and do not rely on any
+threat-model entries. On a broker before v0.3.0, use sections 2 to 4, and do not rely on any
 isolation between tenants beyond what Kubernetes RBAC and the pool's namespace give you.
 
 ### Upgrading
 
-Two start-time refusals are breaking changes for every config, by design, in the release that
-carries this ADR (items 3 and 4 below apply only when you adopt the map):
+Two start-time refusals are breaking changes for every config, by design, from v0.3.0 (items 3
+and 4 below apply only when you adopt the map):
 
 1. **Unknown keys are refused.** A stray or misspelled key anywhere in `mediatore.yaml` (the issuer,
    `session`, `entra` and `sandboxes` blocks, and every other section and the top level) stops the
-   broker from starting, with an error naming the key and the block. Today such a key is a silent
-   no-op that may have been meant as a gate. Remove or fix it before upgrading.
+   broker from starting, with an error naming the key and the block. On v0.2.10 such a key is a
+   silent no-op that may have been meant as a gate. Remove or fix it before upgrading.
 2. **An issuer with no written gate is refused.** Every issuer needs exactly one of `required_group`,
-   `required_groups` or `allow_any_authenticated: true`. An issuer that gates nothing today
+   `required_groups` or `allow_any_authenticated: true`. An issuer that gates nothing on v0.2.10
    (a Google issuer, a test issuer) needs `allow_any_authenticated: true` added, a one-line edit
    the error message spells out. A config that already sets `required_group` is unchanged.
 
@@ -278,18 +282,18 @@ comes from that namespace, and sends the `DELETE` only if it does: an older brok
 `?namespace=` and would otherwise delete in its default namespace. `sandbox get --namespace` runs
 the same check on its answer.
 
-**Order: the broker first, then the configuration.** Deploy the build that has the new parser and
-confirm it started (its log has one line per issuer naming the gate in force, and one for the
-namespaces) before adding `required_groups`, `sandboxes.namespaces` or `--namespace`. Doing it the
-other way round, new keys on an older broker, is the fail-open case: that broker drops the keys
-silently and an issuer with no `required_group` gates nothing. To roll back, remove the new keys
-first. The release carrying the ADR is the floor.
+**Order: the broker first, then the configuration.** Deploy v0.3.0 and confirm it started (its
+log has one line per issuer naming the gate in force, and one for the namespaces) before adding
+`required_groups`, `sandboxes.namespaces` or `--namespace`. Doing it the other way round, new keys
+on an older broker, is the fail-open case: that broker drops the keys silently and an issuer with
+no `required_group` gates nothing. To roll back to v0.2.10, remove the new keys first. v0.3.0 is
+the floor.
 
 ## 6. Checking an access decision
 
 - **The token.** Decode `groups` as above and compare it, character for character, with the gate.
-- **The broker's answer.** A `403` with `not in required group ...` (`not in a required group`
-  from the next release) is the issuer gate. A
+- **The broker's answer.** A `403` with `not in a required group` (`not in required group ...`
+  from v0.2.10 and earlier) is the issuer gate. A
   `delegation_refused` or `session_required` is the claim body or the login, not the gate.
 - **banlieue's side.** A claim stuck `Pending` with `sandbox reconcile failed` in the broker log
   carries the admission policy's own message. Reproduce it without creating anything: a

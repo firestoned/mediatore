@@ -34,7 +34,7 @@ document tracks what is still open on the path.
       `required_groups` on it (ADR-0046: any of a list, matched exactly; an issuer carries
       exactly one of `required_group`, `required_groups` and `allow_any_authenticated: true`).
       Today the policies' `subjects.groups` name a group no token carries, and the broker
-      gates on nothing but the issuer (with ADR-0046's release that is written out as
+      gates on nothing but the issuer (since v0.3.0, ADR-0046, that is written out as
       `allow_any_authenticated: true`)
 - [ ] **A policy for the repository shape.** `research-agent` names `github` alone and
       `claude-agent` names `anthropic` alone; the agent's repository mode needs both in one

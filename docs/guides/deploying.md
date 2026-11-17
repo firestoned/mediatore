@@ -26,7 +26,7 @@ binary that says otherwise. An overlay can name the manifest instead of a checko
 every asset verifies offline:
 
 ```sh
-# <version> is the release, v0.2.10 at the time of writing.
+# <version> is the release, v0.3.0 at the time of writing.
 gh release download v<version> --repo firestoned/mediatore --pattern 'mediatore-<version>*' --pattern checksums.sha256
 shasum -a 256 -c checksums.sha256
 gh attestation verify mediatore-<version>.yaml --repo firestoned/mediatore

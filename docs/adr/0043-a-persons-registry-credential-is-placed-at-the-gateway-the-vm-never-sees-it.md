@@ -200,7 +200,7 @@ Built in this repository, each piece with a test written first (`make check` gre
 
 Not built, or not shown:
 
-- **Not run live.** The deployment needs, in this order: a release carrying these changes; the registry declared as an
+- **Not run live.** The deployment needs, in this order: a release carrying these changes (v0.2.10 or later); the registry declared as an
   audience in the broker's configuration (`via: delegated`, `credential: basic`, `inject: gateway`, the registry's
   host as `egress`, rules admitting `GET` and `HEAD` on `/v2/**`); the registry's host in the gateways'
   `INJECT_ENDPOINTS` (and the datacenter firewall's allowance for the gateways); a pool image with the new guest; then a
