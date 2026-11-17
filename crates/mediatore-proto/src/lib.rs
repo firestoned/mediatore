@@ -240,6 +240,104 @@ pub struct WorkloadExit {
     pub exit: GuestExit,
 }
 
+/// Which of the workload's two output streams a [`LogRecord`] came from (ADR-0045 decision 3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogStream {
+    /// The workload's standard output.
+    Stdout,
+    /// The workload's standard error.
+    Stderr,
+}
+
+/// One line of the workload's output, already redacted in the VM (ADR-0045 decisions 1 and 2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogRecord {
+    /// Per-claim sequence number, strictly increasing in the order the guest's readers produced
+    /// the records. It is what makes a retried batch idempotent at the broker.
+    pub seq: u64,
+    /// The stream the line was read from.
+    pub stream: LogStream,
+    /// When the guest read the line.
+    pub ts: DateTime<Utc>,
+    /// The line, lossy UTF-8, without its terminator.
+    pub text: String,
+}
+
+/// The guest's `POST /v1/me/logs` body (ADR-0045 decision 9): output the claim's node ships to
+/// the broker. The broker re-validates sizes and does not redact again, because it cannot know
+/// which secrets the jail was given; redaction is the guest's, before this leaves the VM.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogBatch {
+    /// The records, `seq` strictly increasing.
+    pub records: Vec<LogRecord>,
+    /// Bytes of stdout the guest dropped from its queue since the last accepted batch.
+    #[serde(default)]
+    pub dropped_stdout: u64,
+    /// Bytes of stderr the guest dropped from its queue since the last accepted batch.
+    #[serde(default)]
+    pub dropped_stderr: u64,
+}
+
+/// First line of the user route's NDJSON answer (ADR-0045 decision 9).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogHeader {
+    /// Bytes of older output the broker's ring dropped (ADR-0045 decision 4); `0` when none.
+    pub truncated_before: u64,
+    /// The claim's phase when the read started.
+    pub claim_phase: String,
+}
+
+/// Why a log stream ended: the `reason` of its last line (ADR-0045 decision 9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LogEnd {
+    /// The claim ended and everything stored was sent.
+    ClaimEnded,
+    /// The output's retention expired.
+    Ttl,
+    /// The reader went away.
+    Client,
+}
+
+/// Largest single record text the broker accepts (ADR-0045 decision 9): the guest splits longer
+/// lines.
+pub const MAX_LOG_RECORD_BYTES: usize = 64 * 1024;
+
+/// Largest batch the broker accepts, as the sum of record texts (ADR-0045 decision 4).
+pub const MAX_LOG_BATCH_BYTES: usize = 256 * 1024;
+
+impl LogBatch {
+    /// Total bytes of record text, what the size limits count.
+    #[must_use]
+    pub fn text_bytes(&self) -> usize {
+        self.records.iter().map(|r| r.text.len()).sum()
+    }
+
+    /// Check the shape the broker requires (ADR-0045 decision 9): `seq` strictly increasing, no
+    /// record over [`MAX_LOG_RECORD_BYTES`].
+    ///
+    /// # Errors
+    /// A description of the first violation, for a `400`.
+    pub fn validate(&self) -> Result<(), String> {
+        let mut last: Option<u64> = None;
+        for r in &self.records {
+            if last.is_some_and(|l| r.seq <= l) {
+                return Err(format!("seq {} is not strictly increasing", r.seq));
+            }
+            if r.text.len() > MAX_LOG_RECORD_BYTES {
+                return Err(format!(
+                    "record {} is {} bytes, over the {MAX_LOG_RECORD_BYTES} limit",
+                    r.seq,
+                    r.text.len()
+                ));
+            }
+            last = Some(r.seq);
+        }
+        Ok(())
+    }
+}
+
 /// A destination the jailed workload may reach: a host (a name or an address) and a TCP
 /// port. Declared per audience in the broker's config, returned by `GET /v1/me` for the
 /// claim's audiences, admitted by the guest's ruleset for the sandbox uid (ADR-0020).
@@ -934,6 +1032,64 @@ pub struct ErrorBody {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn log_record(seq: u64, text: &str) -> LogRecord {
+        LogRecord {
+            seq,
+            stream: LogStream::Stdout,
+            ts: DateTime::<Utc>::UNIX_EPOCH,
+            text: text.to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_log_batch_must_have_strictly_increasing_seq() {
+        let ok = LogBatch {
+            records: vec![log_record(1, "a"), log_record(2, "b"), log_record(9, "c")],
+            ..LogBatch::default()
+        };
+        assert!(ok.validate().is_ok());
+        assert_eq!(ok.text_bytes(), 3);
+        for seqs in [[1, 1], [2, 1]] {
+            let bad = LogBatch {
+                records: seqs.iter().map(|s| log_record(*s, "x")).collect(),
+                ..LogBatch::default()
+            };
+            assert!(bad.validate().is_err(), "{seqs:?}");
+        }
+        assert!(LogBatch::default().validate().is_ok(), "an empty batch is valid");
+    }
+
+    #[test]
+    fn a_log_record_over_the_limit_is_refused() {
+        let big = "x".repeat(MAX_LOG_RECORD_BYTES + 1);
+        let bad = LogBatch {
+            records: vec![log_record(1, &big)],
+            ..LogBatch::default()
+        };
+        assert!(bad.validate().unwrap_err().contains("over the"));
+        let edge = "x".repeat(MAX_LOG_RECORD_BYTES);
+        let ok = LogBatch {
+            records: vec![log_record(1, &edge)],
+            ..LogBatch::default()
+        };
+        assert!(ok.validate().is_ok(), "exactly the limit is allowed");
+    }
+
+    #[test]
+    fn the_log_wire_shape_is_lowercase_streams_and_snake_case_reasons() {
+        let b: LogBatch = serde_json::from_value(serde_json::json!({
+            "records": [{ "seq": 1, "stream": "stderr", "ts": "2026-11-17T00:00:00Z", "text": "boom" }]
+        }))
+        .unwrap();
+        assert_eq!(b.records[0].stream, LogStream::Stderr);
+        assert_eq!((b.dropped_stdout, b.dropped_stderr), (0, 0), "dropped counts default to 0");
+        assert_eq!(
+            serde_json::to_value(LogEnd::ClaimEnded).unwrap(),
+            serde_json::json!("claim_ended")
+        );
+        assert_eq!(serde_json::to_value(LogEnd::Ttl).unwrap(), serde_json::json!("ttl"));
+    }
 
     #[test]
     fn an_endpoint_is_host_and_port_with_ipv6_in_brackets() {
