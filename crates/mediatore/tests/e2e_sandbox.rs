@@ -10,7 +10,7 @@ use std::future::IntoFuture;
 use std::sync::Arc;
 
 use banlieue_api::common::LocalObjectReference;
-use mediatore_api::{AppState, Limiter};
+use mediatore_api::{AppState, Limiter, Namespaces};
 use mediatore_claims::sandbox::{AgentSandboxStatus, SandboxPhase};
 use mediatore_entra::{Backend, IssuerConfig, Validator};
 use mediatore_proto::{ClaimPhase, ClaimRequest, ClaimResponse, ErrorBody, PoolSelector, Workload};
@@ -46,6 +46,8 @@ impl Harness {
                 client_id: "mediatore".into(),
                 subject_claim: "preferred_username".into(),
                 required_group: None,
+                required_groups: None,
+                allow_any_authenticated: true,
                 session: None,
                 ca_file: None,
                 entra: None,
@@ -64,7 +66,7 @@ impl Harness {
             reachable_registries: None,
             policy_egress: None,
             sandboxes: front_door.then(|| sandboxes.clone() as _),
-            sandbox_namespace: NAMESPACE.into(),
+            namespaces: Namespaces::Single(NAMESPACE.into()),
             sealer: None,
             limiter: Limiter::new(10),
             dev_mode: false,
@@ -97,6 +99,7 @@ impl Harness {
             .post(format!("{}/v1/claims", self.user_url))
             .bearer_auth(token)
             .json(&ClaimRequest {
+                namespace: None,
                 pool_ref: Some("pool-a".into()),
                 pool_selector: None,
                 ttl_seconds: 3600,
@@ -343,6 +346,7 @@ async fn the_typed_empty_selector_arrives_as_any_pool() {
         .post(format!("{}/v1/claims", h.user_url))
         .bearer_auth(h.login("octocat"))
         .json(&ClaimRequest {
+            namespace: None,
             pool_ref: None,
             pool_selector: Some(PoolSelector::default()),
             ttl_seconds: 60,
@@ -408,4 +412,60 @@ async fn without_a_front_door_the_claim_endpoints_fail_closed() {
     let body: ErrorBody = resp.json().await.expect("error body");
     assert_eq!(body.error, "not_implemented");
     assert_eq!(h.get(&token, "sandbox-x").await.status(), 501);
+}
+
+// ----- ADR-0046 -----------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn create_sandbox_in_the_default_namespace_is_byte_identical_to_before() {
+    let h = Harness::start(true).await;
+    let resp = h.create(&h.login("octocat"), &[AUDIENCE]).await;
+    assert_eq!(resp.status(), 201);
+    let body: ClaimResponse = resp.json().await.expect("body");
+    let all = h.sandboxes.all();
+    let got = serde_json::to_value(&all[0]).expect("sandbox json");
+    assert_eq!(got["metadata"]["name"], body.name.as_str());
+    // The name is random, the rest of `metadata` is the fake API server's; what the broker
+    // writes is the namespace and the whole `spec`, pinned here as the pre-ADR-0046 shape.
+    let issuer = h.idp.issuer.clone();
+    assert_eq!(got["metadata"]["namespace"], NAMESPACE);
+    assert_eq!(
+        got["spec"],
+        serde_json::json!({
+            "audiences": ["grafana.test"],
+            "policyRef": { "name": "agent" },
+            "poolRef": { "name": "pool-a" },
+            "subject": { "display": "octocat@example.com", "id": "octocat", "issuer": issuer },
+            "ttlSeconds": 3600,
+            "workload": { "args": ["sh"], "image": "registry.internal:5000/sandbox:latest" },
+        })
+    );
+    assert_eq!(got["apiVersion"], "mediatore.io/v1alpha1");
+    assert_eq!(got["kind"], "AgentSandbox");
+    assert!(
+        got.get("status").is_none(),
+        "the reconciler writes the status"
+    );
+}
+
+#[tokio::test]
+async fn create_without_the_front_is_501_with_a_namespace_set() {
+    let h = Harness::start(false).await;
+    let token = h.login("octocat");
+    for namespace in [None, Some(NAMESPACE)] {
+        let mut body = serde_json::json!({
+            "pool_ref": "pool-a",
+            "ttl_seconds": 3600,
+            "audiences": [AUDIENCE],
+            "workload": { "image": "registry.internal:5000/sandbox:latest" },
+        });
+        if let Some(ns) = namespace {
+            body["namespace"] = ns.into();
+        }
+        let resp = h.create_raw(&token, &body).await;
+        assert_eq!(resp.status(), 501, "namespace {namespace:?}");
+        let err: ErrorBody = resp.json().await.expect("error body");
+        assert_eq!(err.error, "not_implemented");
+    }
+    assert!(h.sandboxes.all().is_empty(), "nothing was created");
 }

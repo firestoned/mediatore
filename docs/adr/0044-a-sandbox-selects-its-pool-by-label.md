@@ -3,7 +3,7 @@
 
 # ADR-0044: A sandbox selects its pool by label, or names it
 
-**Status:** Accepted · **Date:** 2026-11-16
+**Status:** Accepted · **Date:** 2026-11-16 · **Amended:** 2026-11-17 (decision 6, the namespace boundary, [ADR-0046](0046-who-may-claim-a-list-of-groups-and-a-namespace-to-groups-mapping.md))
 
 Roadmap 08 (the `AgentSandbox` CRD). Amends
 [ADR-0008](0008-agentsandbox-crd-owned-by-mediatore.md) decision 7 (the spec's fields) and
@@ -80,6 +80,12 @@ In Rust, `VirtualMachineClaimSpec.pool_ref` is now `Option<LocalObjectReference>
    because banlieue matches it there. Who may claim from a pool is still the namespace RBAC
    question of ADR-0008 decision 5 and banlieue ADR-0047 decision 10; a selector can reach
    no pool a `poolRef` in the same namespace could not already name.
+
+   *Amended by [ADR-0046](0046-who-may-claim-a-list-of-groups-and-a-namespace-to-groups-mapping.md) (2026-11-17):* the claim's namespace is no longer always
+   `sandboxes.namespace`; with `sandboxes.namespaces` set it is the one the caller names and is
+   in the groups of. For a request through the broker, "who may claim" is that per-namespace group
+   check; the Kubernetes RBAC answer stands for the declarative path. A selector and a `poolRef`
+   are still matched only in the sandbox's own namespace.
 
 7. **`dev_mode` is unchanged.** The dev binder has no pools: it binds the first registered
    free node whatever the request says, as before. It accepts both forms and logs them.

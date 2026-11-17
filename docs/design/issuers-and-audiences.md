@@ -20,14 +20,15 @@ configuration and its cross-field rules). The guides [Issuers](../guides/issuers
 | `backend` | `sts` (mediatore signs its own tokens; the issuer is only for login) or `entra-obo` (Entra On-Behalf-Of) |
 | `client_id` | mediatore's client at this issuer, and the required `aud` |
 | `subject_claim` | the claim carrying the person's id: `oid` for Entra, `preferred_username` for Dex |
-| `required_group`, `groups_claim` | the group the token must carry, and the claim that carries groups when it is not `groups` or `roles` |
+| `required_groups`, `required_group`, `allow_any_authenticated` | the login gate, exactly one of the three: a list of groups of which the token must carry at least one (exact, case-sensitive; `required_group: X` is `[X]`), or `allow_any_authenticated: true` for no group gate, written down. An issuer with none, or more than one, does not start (ADR-0046) |
+| `groups_claim` | the claim that carries groups when it is not `groups` or `roles` |
 | `session` | present when a claim from this issuer must delegate a refresh token (ADR-0013); `client_secret_file` for a token endpoint that wants one |
 | `entra` | present for `entra-obo`: the broker's own credential for the exchange (a key file, an OpenBao transit key, or a federated service-account token) |
 | `ca_file` | the CA that signs this issuer's certificate, for an issuer on a private PKI; discovery, the JWKS and token requests then trust exactly it |
 
 **Validating a bearer** (`POST /v1/claims`): the issuer is known, the audience is mediatore's client, the signature
 verifies through the issuer's JWKS (cached for five minutes), the token is not expired, the subject claim is present,
-and the **group gate** passes. Failures are `IdpError` variants (`UnknownIssuer`, `Invalid`, `Forbidden`, and for a session `SessionRevoked`,
+and the **group gate** passes (a token carrying one of `required_groups`, or `allow_any_authenticated: true`). Where a person may then create a sandbox is the namespace map, `sandboxes.namespaces`, checked on the same groups ([Configuration](configuration.md)). Failures are `IdpError` variants (`UnknownIssuer`, `Invalid`, `Forbidden`, and for a session `SessionRevoked`,
 `Upstream` and `Credential`).
 
 **A session.** For an issuer with a `session`, the caller delegates its refresh token with the claim. The broker seals
@@ -108,7 +109,7 @@ holds a key, only that leased capability to use one.
 
 ## Rules this part keeps
 
-- The group gate is checked at claim creation **and** at every refresh.
+- The group gate is checked at claim creation **and** at every refresh, and an issuer must state one (`allow_any_authenticated: true` is a statement).
 - An upstream refusal releases the claim; an upstream outage does not.
 - A credential a person delegated is never placed on a pool VM when its audience is gateway-placed, and a `basic` one
   always is.
@@ -117,4 +118,4 @@ holds a key, only that leased capability to use one.
 ## Read next
 
 ADR-0003, ADR-0013, ADR-0015, ADR-0016, ADR-0017 (issuer profiles), ADR-0025 (the phantom token), ADR-0032, ADR-0035,
-ADR-0040, ADR-0041, ADR-0043. Threat model TB-5 (to the issuer) and TB-10 (OpenBao). Guide: [Issuers](../guides/issuers.md).
+ADR-0040, ADR-0041, ADR-0043, ADR-0046 (who may claim). Threat model TB-5 (to the issuer) and TB-10 (OpenBao). Guide: [Issuers](../guides/issuers.md).

@@ -154,6 +154,9 @@ pub enum SandboxCmd {
         target: Target,
         /// The sandbox name
         name: String,
+        /// The namespace to act in (ADR-0046); without it nothing is sent and the broker decides
+        #[arg(long)]
+        namespace: Option<String>,
     },
     /// Delete a sandbox.
     Delete {
@@ -162,6 +165,9 @@ pub enum SandboxCmd {
         target: Target,
         /// The sandbox name
         name: String,
+        /// The namespace to act in (ADR-0046); without it nothing is sent and the broker decides
+        #[arg(long)]
+        namespace: Option<String>,
     },
 }
 
@@ -171,6 +177,10 @@ pub struct CreateArgs {
     /// Where and as whom.
     #[command(flatten)]
     pub target: Target,
+    /// The namespace to claim in (ADR-0046). Without it nothing is sent: a broker with one
+    /// namespace uses it, a broker with a namespace map answers `400 namespace_required`.
+    #[arg(long)]
+    pub namespace: Option<String>,
     /// One pool, by name. Without it and without --pool-selector, the claim is made across
     /// every pool in the sandbox namespace (ADR-0044 decision 3).
     #[arg(
@@ -256,15 +266,23 @@ pub async fn run(cmd: UserCmd) -> anyhow::Result<()> {
             Ok(())
         }
         UserCmd::Sandbox(SandboxCmd::Create(args)) => create(args).await,
-        UserCmd::Sandbox(SandboxCmd::Get { target, name }) => {
+        UserCmd::Sandbox(SandboxCmd::Get {
+            target,
+            name,
+            namespace,
+        }) => {
             let session = Session::load(&target.session.path()?)?;
-            let claim = target.api()?.get(&session, &name).await?;
+            let claim = get_claim(&target.api()?, &session, &name, namespace.as_deref()).await?;
             println!("{}", serde_json::to_string_pretty(&claim)?);
             Ok(())
         }
-        UserCmd::Sandbox(SandboxCmd::Delete { target, name }) => {
+        UserCmd::Sandbox(SandboxCmd::Delete {
+            target,
+            name,
+            namespace,
+        }) => {
             let session = Session::load(&target.session.path()?)?;
-            target.api()?.delete(&session, &name).await?;
+            delete_claim(&target.api()?, &session, &name, namespace.as_deref()).await?;
             println!("{name} deleted");
             Ok(())
         }
@@ -378,6 +396,57 @@ pub fn pool_choice(
     Ok((None, Some(sel)))
 }
 
+/// ADR-0046 decision 16: when the user named a namespace, the broker must have reported the
+/// same one. An absent `namespace` is a broker that predates the field and ignored the
+/// request; a different one is a claim that landed elsewhere. Either is an error, and nothing
+/// is deleted on the user's behalf: the CLI holds no list of namespaces and remembers none.
+///
+/// # Errors
+/// The response's namespace is absent or differs from `asked`.
+pub fn check_namespace(asked: Option<&str>, reported: Option<&str>) -> anyhow::Result<()> {
+    match (asked, reported) {
+        (Some(a), Some(r)) if a != r => anyhow::bail!(
+            "you asked for namespace {a} but the broker answered for namespace {r}; \
+             nothing was changed by the CLI (check what exists in {r})"
+        ),
+        (Some(a), None) => anyhow::bail!(
+            "you asked for namespace {a} but the broker did not report a namespace (an older \
+             broker ignores the field); it may have acted in its default namespace, and the \
+             CLI changed nothing"
+        ),
+        _ => Ok(()),
+    }
+}
+
+/// `sandbox get`: with a namespace, the answer must come from that namespace (ADR-0046
+/// decision 16), so an old broker that ignores `?namespace=` is told apart.
+async fn get_claim(
+    api: &Api,
+    session: &Session,
+    name: &str,
+    namespace: Option<&str>,
+) -> anyhow::Result<mediatore_proto::ClaimResponse> {
+    let claim = api.get(session, name, namespace).await?;
+    check_namespace(namespace, claim.namespace.as_deref())?;
+    Ok(claim)
+}
+
+/// `sandbox delete`: with a namespace, a GET first (ADR-0046 decision 16).
+async fn delete_claim(
+    api: &Api,
+    session: &Session,
+    name: &str,
+    namespace: Option<&str>,
+) -> anyhow::Result<()> {
+    if let Some(asked) = namespace {
+        // An old broker ignores `?namespace=` and would delete in its default namespace; the
+        // read tells it apart before anything is deleted.
+        let claim = api.get(session, name, Some(asked)).await?;
+        check_namespace(Some(asked), claim.namespace.as_deref())?;
+    }
+    api.delete(session, name, namespace).await
+}
+
 async fn create(args: CreateArgs) -> anyhow::Result<()> {
     let path = args.target.session.path()?;
     let session = Session::load(&path)?;
@@ -406,6 +475,7 @@ async fn create(args: CreateArgs) -> anyhow::Result<()> {
         );
     }
     let request = ClaimRequest {
+        namespace: args.namespace.clone(),
         pool_ref,
         pool_selector,
         ttl_seconds: args.ttl,
@@ -420,7 +490,14 @@ async fn create(args: CreateArgs) -> anyhow::Result<()> {
         delegations,
     };
     let (claim, spent) = args.target.api()?.claim(&session, &request).await?;
+    // The refresh token is spent at the broker whatever follows, so the session is saved first.
     spent.save(&path)?;
+    check_namespace(args.namespace.as_deref(), claim.namespace.as_deref())?;
+    if args.namespace.is_none()
+        && let Some(ns) = &claim.namespace
+    {
+        eprintln!("claimed in namespace {ns} (the broker's default; --namespace names another)");
+    }
     if args.json {
         println!("{}", serde_json::to_string_pretty(&claim)?);
     } else {
@@ -599,5 +676,374 @@ mod tests {
             .to_string();
         assert!(err.contains("no certificate"), "{err}");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // ----- ADR-0046 decisions 15 and 16: --namespace --------------------------------------
+
+    /// A one-shot HTTP server: answers `status` and `body` to the next request and hands back
+    /// the whole request text (head and body) it received.
+    async fn one_shot(status: &str, body: &str) -> (String, tokio::task::JoinHandle<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let reply = format!(
+            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let h = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut got = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = sock.read(&mut buf).await.unwrap();
+                got.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&got).into_owned();
+                if let Some((head, rest)) = text.split_once("\r\n\r\n") {
+                    let want = head
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    if rest.len() >= want {
+                        break;
+                    }
+                }
+                if n == 0 {
+                    break;
+                }
+            }
+            sock.write_all(reply.as_bytes()).await.unwrap();
+            String::from_utf8_lossy(&got).into_owned()
+        });
+        (url, h)
+    }
+
+    fn session() -> Session {
+        Session {
+            issuer: "https://dex.example".into(),
+            client_id: "mediatore".into(),
+            login: "octocat".into(),
+            id_token: "id-token".into(),
+            refresh_token: Some("refresh".into()),
+            expires_at: i64::MAX,
+        }
+    }
+
+    fn request(namespace: Option<&str>) -> ClaimRequest {
+        ClaimRequest {
+            namespace: namespace.map(str::to_owned),
+            pool_ref: None,
+            pool_selector: Some(PoolSelector::default()),
+            ttl_seconds: 60,
+            audiences: vec![],
+            workload: Workload {
+                image: "registry.internal:5000/agent:1".into(),
+                args: vec![],
+                restart: mediatore_proto::RestartPolicy::Always,
+            },
+            refresh_token: None,
+            policy_ref: None,
+            delegations: vec![],
+        }
+    }
+
+    const CLAIM: &str = r#"{"name":"sb-1","namespace":"team-a","phase":"Pending"}"#;
+
+    #[test]
+    fn the_namespace_flag_parses_on_create_get_and_delete() {
+        #[derive(Parser)]
+        struct S {
+            #[command(subcommand)]
+            cmd: SandboxCmd,
+        }
+        let m = "https://mediatore.example";
+        match S::try_parse_from([
+            "s",
+            "create",
+            "--mediatore",
+            m,
+            "--image",
+            "i",
+            "--namespace",
+            "team-a",
+        ])
+        .unwrap()
+        .cmd
+        {
+            SandboxCmd::Create(a) => assert_eq!(a.namespace.as_deref(), Some("team-a")),
+            _ => panic!("create"),
+        }
+        match S::try_parse_from(["s", "get", "--mediatore", m, "--namespace", "infra", "sb-1"])
+            .unwrap()
+            .cmd
+        {
+            SandboxCmd::Get { namespace, .. } => assert_eq!(namespace.as_deref(), Some("infra")),
+            _ => panic!("get"),
+        }
+        match S::try_parse_from(["s", "delete", "--mediatore", m, "sb-1"])
+            .unwrap()
+            .cmd
+        {
+            SandboxCmd::Delete { namespace, .. } => assert!(namespace.is_none()),
+            _ => panic!("delete"),
+        }
+    }
+
+    #[tokio::test]
+    async fn namespace_flag_is_sent_in_the_request_and_the_query() {
+        let (url, h) = one_shot("201 Created", CLAIM).await;
+        let api = Api::new(&url).unwrap();
+        api.claim(&session(), &request(Some("team-a")))
+            .await
+            .unwrap();
+        let got = h.await.unwrap();
+        assert!(got.starts_with("POST /v1/claims "), "{got}");
+        assert!(got.contains(r#""namespace":"team-a""#), "{got}");
+
+        let (url, h) = one_shot("200 OK", CLAIM).await;
+        Api::new(&url)
+            .unwrap()
+            .get(&session(), "sb-1", Some("team-a"))
+            .await
+            .unwrap();
+        assert!(
+            h.await
+                .unwrap()
+                .starts_with("GET /v1/claims/sb-1?namespace=team-a ")
+        );
+
+        let (url, h) = one_shot("204 No Content", "").await;
+        Api::new(&url)
+            .unwrap()
+            .delete(&session(), "sb-1", Some("infra"))
+            .await
+            .unwrap();
+        assert!(
+            h.await
+                .unwrap()
+                .starts_with("DELETE /v1/claims/sb-1?namespace=infra ")
+        );
+    }
+
+    #[tokio::test]
+    async fn without_the_flag_the_request_has_no_namespace() {
+        let (url, h) = one_shot("201 Created", CLAIM).await;
+        Api::new(&url)
+            .unwrap()
+            .claim(&session(), &request(None))
+            .await
+            .unwrap();
+        let got = h.await.unwrap();
+        assert!(!got.contains("namespace"), "{got}");
+
+        let (url, h) = one_shot("200 OK", CLAIM).await;
+        Api::new(&url)
+            .unwrap()
+            .get(&session(), "sb-1", None)
+            .await
+            .unwrap();
+        assert!(h.await.unwrap().starts_with("GET /v1/claims/sb-1 "));
+
+        let (url, h) = one_shot("204 No Content", "").await;
+        Api::new(&url)
+            .unwrap()
+            .delete(&session(), "sb-1", None)
+            .await
+            .unwrap();
+        assert!(h.await.unwrap().starts_with("DELETE /v1/claims/sb-1 "));
+    }
+
+    #[test]
+    fn a_response_namespace_that_differs_from_the_flag_is_an_error() {
+        let err = check_namespace(Some("team-a"), Some("infra"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("team-a") && err.contains("infra"), "{err}");
+        assert!(check_namespace(Some("team-a"), Some("team-a")).is_ok());
+        // No flag: whatever the broker used is fine (it is printed, not checked).
+        assert!(check_namespace(None, Some("infra")).is_ok());
+        assert!(check_namespace(None, None).is_ok());
+    }
+
+    #[test]
+    fn a_response_without_a_namespace_is_an_error_when_the_flag_was_given() {
+        let err = check_namespace(Some("team-a"), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("team-a"), "{err}");
+        assert!(err.contains("did not report a namespace"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn the_400_namespace_required_message_is_shown_as_the_error() {
+        let body = r#"{"error":"namespace_required","message":"a namespace is required: pass --namespace"}"#;
+        let (url, h) = one_shot("400 Bad Request", body).await;
+        let err = Api::new(&url)
+            .unwrap()
+            .claim(&session(), &request(None))
+            .await
+            .unwrap_err()
+            .to_string();
+        h.await.unwrap();
+        assert!(err.contains("400"), "{err}");
+        assert!(
+            err.contains("a namespace is required: pass --namespace"),
+            "{err}"
+        );
+    }
+
+    type Log = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
+    /// A server that answers `replies` to successive requests, in order, logging each request
+    /// line. It keeps waiting after the last reply, so a test sees what was NOT sent.
+    async fn sequence(replies: Vec<(&'static str, &'static str)>) -> (String, Log) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let log: Log = Log::default();
+        let seen = log.clone();
+        tokio::spawn(async move {
+            for (status, body) in replies {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut got = Vec::new();
+                let mut buf = [0u8; 4096];
+                while !got.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let n = sock.read(&mut buf).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    got.extend_from_slice(&buf[..n]);
+                }
+                let line = String::from_utf8_lossy(&got)
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned();
+                seen.lock().unwrap().push(line);
+                let reply = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                sock.write_all(reply.as_bytes()).await.unwrap();
+            }
+        });
+        (url, log)
+    }
+
+    fn lines(log: &Log) -> Vec<String> {
+        log.lock().unwrap().clone()
+    }
+
+    #[tokio::test]
+    async fn delete_with_a_namespace_gets_first_and_deletes_when_it_matches() {
+        let (url, log) = sequence(vec![("200 OK", CLAIM), ("204 No Content", "")]).await;
+        let api = Api::new(&url).unwrap();
+        delete_claim(&api, &session(), "sb-1", Some("team-a"))
+            .await
+            .unwrap();
+        let l = lines(&log);
+        assert_eq!(l.len(), 2, "{l:?}");
+        assert!(
+            l[0].starts_with("GET /v1/claims/sb-1?namespace=team-a "),
+            "{l:?}"
+        );
+        assert!(
+            l[1].starts_with("DELETE /v1/claims/sb-1?namespace=team-a "),
+            "{l:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_with_a_namespace_does_not_delete_when_the_get_reports_a_different_namespace() {
+        let (url, log) = sequence(vec![("200 OK", CLAIM), ("204 No Content", "")]).await;
+        let api = Api::new(&url).unwrap();
+        let err = delete_claim(&api, &session(), "sb-1", Some("infra"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("infra") && err.contains("team-a"), "{err}");
+        let l = lines(&log);
+        assert_eq!(l.len(), 1, "{l:?}");
+        assert!(l[0].starts_with("GET "), "{l:?}");
+    }
+
+    #[tokio::test]
+    async fn delete_with_a_namespace_does_not_delete_when_the_get_reports_none() {
+        let body = r#"{"name":"sb-1","phase":"Pending"}"#;
+        let (url, log) = sequence(vec![("200 OK", body), ("204 No Content", "")]).await;
+        let api = Api::new(&url).unwrap();
+        let err = delete_claim(&api, &session(), "sb-1", Some("team-a"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("did not report a namespace"), "{err}");
+        let l = lines(&log);
+        assert_eq!(l.len(), 1, "{l:?}");
+        assert!(l[0].starts_with("GET "), "{l:?}");
+    }
+
+    #[tokio::test]
+    async fn delete_with_a_namespace_sends_no_delete_when_the_get_is_404() {
+        let body = r#"{"error":"not_found","message":"no such sandbox"}"#;
+        let (url, log) = sequence(vec![("404 Not Found", body), ("204 No Content", "")]).await;
+        let api = Api::new(&url).unwrap();
+        let err = delete_claim(&api, &session(), "sb-1", Some("team-a"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("404") && err.contains("no such sandbox"),
+            "{err}"
+        );
+        assert_eq!(lines(&log).len(), 1, "{:?}", lines(&log));
+    }
+
+    #[tokio::test]
+    async fn delete_without_a_namespace_sends_no_get() {
+        let (url, log) = sequence(vec![("204 No Content", ""), ("200 OK", CLAIM)]).await;
+        let api = Api::new(&url).unwrap();
+        delete_claim(&api, &session(), "sb-1", None).await.unwrap();
+        let l = lines(&log);
+        assert_eq!(l.len(), 1, "{l:?}");
+        assert!(l[0].starts_with("DELETE /v1/claims/sb-1 "), "{l:?}");
+    }
+
+    #[tokio::test]
+    async fn get_with_a_namespace_that_differs_from_the_response_is_an_error() {
+        let (url, _log) = sequence(vec![("200 OK", CLAIM)]).await;
+        let api = Api::new(&url).unwrap();
+        let err = get_claim(&api, &session(), "sb-1", Some("infra"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("infra") && err.contains("team-a"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn get_with_a_namespace_and_a_response_without_one_is_an_error() {
+        let body = r#"{"name":"sb-1","phase":"Pending"}"#;
+        let (url, _log) = sequence(vec![("200 OK", body)]).await;
+        let api = Api::new(&url).unwrap();
+        let err = get_claim(&api, &session(), "sb-1", Some("team-a"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("did not report a namespace"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn get_without_a_namespace_does_not_check() {
+        let (url, log) = sequence(vec![("200 OK", CLAIM)]).await;
+        let api = Api::new(&url).unwrap();
+        let claim = get_claim(&api, &session(), "sb-1", None).await.unwrap();
+        assert_eq!(claim.name, "sb-1");
+        assert!(
+            lines(&log)[0].starts_with("GET /v1/claims/sb-1 "),
+            "{:?}",
+            lines(&log)
+        );
     }
 }

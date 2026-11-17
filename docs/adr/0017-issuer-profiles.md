@@ -3,7 +3,7 @@
 
 # ADR-0017: Issuer profiles: any OIDC issuer on the session path, Entra on its own
 
-**Status:** Accepted · **Date:** 2026-10-21
+**Status:** Accepted · **Date:** 2026-10-21 · **Amended:** 2026-11-17 (decision 4, the issuer's gate, [ADR-0046](0046-who-may-claim-a-list-of-groups-and-a-namespace-to-groups-mapping.md))
 
 Corrects the framing of [ADR-0013](0013-dex-session-delegation.md) and
 [ADR-0016](0016-entra-on-behalf-of.md), and closes the gaps that kept Google and Auth0
@@ -62,6 +62,12 @@ gate reads when it is not `groups` or `roles`; when set, only that claim is read
 deployments name their namespaced claim; Google deployments leave `required_group` unset
 and gate on who may log in at Google (Workspace domain, the `hd` claim) or on nothing,
 which the issuers guide says plainly.
+
+*Amended by [ADR-0046](0046-who-may-claim-a-list-of-groups-and-a-namespace-to-groups-mapping.md) (2026-11-17):* `required_group` stays valid and means a list of one;
+`required_groups` is the any-of list, matched exactly; and an issuer must now carry exactly one of
+`required_group`, `required_groups` or `allow_any_authenticated: true`, so "leave `required_group`
+unset" is written `allow_any_authenticated: true` and an issuer with none of the three refuses to
+start.
 
 **5. The fake issuer has profiles.** `FakeIdp::start_as(Profile::Google | Auth0)` mints
 the identity those providers do (`email` and a numeric or `auth0|` `sub`, no username;

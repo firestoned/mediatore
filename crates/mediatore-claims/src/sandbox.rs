@@ -498,6 +498,7 @@ pub fn record_for(
     ClaimRecord {
         uid: claim_uid,
         name: sb.name_any(),
+        namespace: crate::kubestore::namespace_of(sb),
         subject: Subject::from(&sb.spec.subject),
         entry_id: None,
         node_id: None,
@@ -1368,6 +1369,47 @@ mod tests {
         }
     }
 
+    /// ADR-0046 decision 10: the broker's `ClusterRole` is the widest thing it holds (it can create
+    /// sandboxes in every namespace; the namespace map narrows the user API in code, not here).
+    /// A change to these rules is a trust-boundary change: it needs an ADR and a pass over
+    /// `docs/security/threat-model.md` (TB-2, the row on the broker's `ServiceAccount`), not a
+    /// quiet edit of this literal. A new tenant namespace needs no change here.
+    #[test]
+    fn the_brokers_cluster_role_is_pinned() {
+        use serde_json::json;
+        let path = format!("{}/../../deploy/base/rbac.yaml", env!("CARGO_MANIFEST_DIR"));
+        let text = std::fs::read_to_string(&path).unwrap();
+        let roles: Vec<serde_json::Value> = text
+            .split("\n---\n")
+            .map(|d| serde_saphyr::from_str::<serde_json::Value>(d).unwrap())
+            .filter(|d| d["kind"] == "ClusterRole" && d["metadata"]["name"] == "mediatore")
+            .collect();
+        assert_eq!(roles.len(), 1, "exactly one ClusterRole named mediatore");
+        let expected = json!([
+            {"apiGroups": ["mediatore.io"], "resources": ["agentsandboxes"],
+             "verbs": ["get", "list", "watch", "patch", "create", "delete"]},
+            {"apiGroups": ["mediatore.io"], "resources": ["agentsandboxes/status"],
+             "verbs": ["patch"]},
+            {"apiGroups": ["mediatore.io"], "resources": ["agentsandboxes/finalizers"],
+             "verbs": ["update"]},
+            {"apiGroups": ["mediatore.io"], "resources": ["sandboxnodes", "policyfloors"],
+             "verbs": ["get", "list", "watch", "create", "update", "patch", "delete"]},
+            {"apiGroups": ["banlieue.io"], "resources": ["virtualmachineclaims"],
+             "verbs": ["get", "list", "watch", "create", "delete"]},
+            {"apiGroups": ["banlieue.io"], "resources": ["virtualmachineclaims/status"],
+             "verbs": ["get"]},
+            {"apiGroups": ["banlieue.io"], "resources": ["virtualmachines"],
+             "verbs": ["get", "list", "watch"]},
+            {"apiGroups": ["spire.spiffe.io"], "resources": ["clusterstaticentries"],
+             "verbs": ["get", "list", "watch", "create", "delete"]},
+        ]);
+        assert_eq!(
+            roles[0]["rules"], expected,
+            "deploy/base/rbac.yaml's ClusterRole changed: that is a trust-boundary change \
+             (ADR-0046 decision 10); write the ADR and do the threat-model pass first"
+        );
+    }
+
     #[test]
     fn the_base_kustomization_lists_every_crd() {
         // A rendered CRD the base does not list is a CRD `kubectl apply -k deploy/base`
@@ -1459,6 +1501,17 @@ mod tests {
             !phase["nullable"].as_bool().unwrap_or(false),
             "phase is never null"
         );
+    }
+
+    /// ADR-0046 decision 14: a create into a namespace that does not exist is the API server's
+    /// 404, which is no refusal the broker names: it is `Api`, and the user API answers it with
+    /// `500 internal` (`a_listed_namespace_that_does_not_exist_fails_the_create_and_parks_nothing`).
+    #[test]
+    fn a_404_from_the_api_server_is_the_catch_all_error() {
+        let status = kube::core::Status::failure("namespaces \"team-a\" not found", "NotFound")
+            .with_code(404);
+        let e = front_door_error(kube::Error::Api(Box::new(status)));
+        assert!(matches!(e, FrontDoorError::Api(_)), "{e:?}");
     }
 
     #[test]

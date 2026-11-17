@@ -41,6 +41,10 @@ base64.workspace = true
 [dev-dependencies]
 mediatore-testkit.workspace = true
 sandboxpolicy-bundle.workspace = true
+# A fake Kubernetes API for the store's cross-namespace Secret tests (ADR-0046 decision 9).
+tower-test.workspace = true
+http.workspace = true
+http-body-util.workspace = true
 
 [lints]
 workspace = true

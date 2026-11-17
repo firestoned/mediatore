@@ -20,7 +20,7 @@ use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::routing::any;
 use chrono::Duration;
-use mediatore_api::{AppState, Limiter};
+use mediatore_api::{AppState, Limiter, Namespaces};
 use mediatore_entra::{Backend, IssuerConfig, Validator};
 use mediatore_guest::egress::{Phantom, Proxy, Routes, TokenSource};
 use mediatore_guest::forward::Dialer;
@@ -157,6 +157,8 @@ fn state(idp: &FakeIdp, upstream: &TlsUpstream, keyed_upstream: &TlsUpstream) ->
             client_id: "mediatore".into(),
             subject_claim: "preferred_username".into(),
             required_group: Some(REQUIRED_GROUP.into()),
+            required_groups: None,
+            allow_any_authenticated: false,
             session: None,
             ca_file: None,
             entra: None,
@@ -229,7 +231,7 @@ fn state(idp: &FakeIdp, upstream: &TlsUpstream, keyed_upstream: &TlsUpstream) ->
         reachable_registries: None,
         policy_egress: None,
         sandboxes: None,
-        sandbox_namespace: "sandboxes".into(),
+        namespaces: Namespaces::Single("sandboxes".into()),
         sealer: None,
         limiter: Limiter::new(10),
         dev_mode: true,
@@ -329,6 +331,7 @@ impl Harness {
             .post(format!("{}/v1/claims", self.user_url))
             .bearer_auth(self.login("octocat"))
             .json(&ClaimRequest {
+                namespace: None,
                 pool_ref: Some("pool-a".into()),
                 pool_selector: None,
                 ttl_seconds: 3600,

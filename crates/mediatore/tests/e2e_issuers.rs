@@ -12,7 +12,7 @@ use std::future::IntoFuture;
 use std::sync::Arc;
 
 use chrono::Duration;
-use mediatore_api::{AppState, Limiter};
+use mediatore_api::{AppState, Limiter, Namespaces};
 use mediatore_client::{Api, LoginOptions, Session};
 use mediatore_entra::{Backend, IssuerConfig, SessionConfig, Validator};
 use mediatore_proto::{
@@ -56,6 +56,8 @@ impl Harness {
             client_id: CLIENT_ID.into(),
             subject_claim: "email".into(),
             required_group: None,
+            required_groups: None,
+            allow_any_authenticated: true,
             session: Some(SessionConfig {
                 client_id: CLIENT_ID.into(),
                 client_secret_file: Some(secret_file),
@@ -70,6 +72,8 @@ impl Harness {
             client_id: CLIENT_ID.into(),
             subject_claim: "email".into(),
             required_group: Some(REQUIRED_GROUP.into()),
+            required_groups: None,
+            allow_any_authenticated: false,
             session: Some(SessionConfig {
                 client_id: CLIENT_ID.into(),
                 client_secret_file: None,
@@ -111,7 +115,7 @@ impl Harness {
             reachable_registries: None,
             policy_egress: None,
             sandboxes: None,
-            sandbox_namespace: "sandboxes".into(),
+            namespaces: Namespaces::Single("sandboxes".into()),
             sealer: Some(Arc::new(LocalKeySealer::new([5u8; 32]))),
             limiter: Limiter::new(60),
             dev_mode: true,
@@ -215,6 +219,7 @@ impl Harness {
             .claim(
                 session,
                 &ClaimRequest {
+                    namespace: None,
                     pool_ref: Some("pool-a".into()),
                     pool_selector: None,
                     ttl_seconds: 3600,
@@ -354,4 +359,122 @@ async fn an_auth0_login_is_by_email_with_groups_under_the_namespaced_claim() {
         .unwrap();
     let err = h.claim(&session).await.unwrap_err().to_string();
     assert!(err.contains("403"), "{err}");
+}
+
+// ----- ADR-0046 decision 2: the spelling of a group is exactly what the operator lists ------------------------------
+
+const GATE_PREFIXED: &str = "example-org:APP_EXAMPLE_ADMIN";
+const GATE_BARE: &str = "APP_EXAMPLE_ADMIN";
+
+/// A user API over real HTTP behind one issuer whose gate is `gate`, and a token for a
+/// service ID that carries exactly `groups`. Returns the status and the raw body of
+/// `POST /v1/claims`.
+async fn claim_through_gate(gate: IssuerGate, groups: &[&str]) -> (u16, String) {
+    let idp = FakeIdp::start().await;
+    let (required_group, required_groups) = match gate {
+        IssuerGate::Single(g) => (Some(g.to_owned()), None),
+        IssuerGate::List(l) => (None, Some(l.iter().map(|g| (*g).to_owned()).collect())),
+    };
+    let validator = Validator::new(vec![IssuerConfig {
+        url: idp.issuer.clone(),
+        backend: Backend::Sts,
+        client_id: CLIENT_ID.into(),
+        subject_claim: "preferred_username".into(),
+        required_group,
+        required_groups,
+        allow_any_authenticated: false,
+        session: None,
+        ca_file: None,
+        entra: None,
+        groups_claim: None,
+    }]);
+    let state = Arc::new(AppState {
+        inject: std::collections::BTreeMap::new(),
+        inject_port: None,
+        store: MemoryStore::shared(),
+        spire: Arc::new(MemoryEntries::default()),
+        naming: Naming {
+            trust_domain: TRUST_DOMAIN.into(),
+        },
+        validator,
+        sts: None,
+        audiences: vec![AUDIENCE.into()],
+        obo_audiences: vec![],
+        egress: std::collections::BTreeMap::new(),
+        rules: std::collections::BTreeMap::new(),
+        cas: std::collections::BTreeMap::new(),
+        no_credential: std::collections::BTreeSet::new(),
+        secrets: std::collections::BTreeMap::new(),
+        delegated: std::collections::BTreeMap::new(),
+        registries: std::collections::BTreeMap::new(),
+        reachable_registries: None,
+        policy_egress: None,
+        sandboxes: None,
+        namespaces: Namespaces::Single("sandboxes".into()),
+        sealer: Some(Arc::new(LocalKeySealer::new([5u8; 32]))),
+        limiter: Limiter::new(60),
+        dev_mode: true,
+        gateways: vec![],
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(axum::serve(listener, mediatore_api::user_router(state)).into_future());
+    let token = idp.token(serde_json::json!({
+        "aud": CLIENT_ID,
+        "sub": "svc-example",
+        "preferred_username": "svc-example",
+        "groups": groups,
+    }));
+    let resp = reqwest::Client::new()
+        .post(format!("{url}/v1/claims"))
+        .bearer_auth(token)
+        .json(&ClaimRequest {
+            namespace: None,
+            pool_ref: Some("pool-a".into()),
+            pool_selector: None,
+            ttl_seconds: 600,
+            audiences: vec![AUDIENCE.into()],
+            workload: Workload {
+                image: "registry.internal:5000/sandbox:latest".into(),
+                args: vec![],
+                restart: mediatore_proto::RestartPolicy::Always,
+            },
+            refresh_token: None,
+            policy_ref: None,
+            delegations: vec![],
+        })
+        .send()
+        .await
+        .unwrap();
+    (resp.status().as_u16(), resp.text().await.unwrap())
+}
+
+enum IssuerGate {
+    /// The pre-ADR-0046 `required_group: <value>`.
+    Single(&'static str),
+    /// `required_groups: [..]`.
+    List(&'static [&'static str]),
+}
+
+#[tokio::test]
+async fn a_service_id_with_a_bare_group_passes_when_both_spellings_are_listed() {
+    let (status, body) =
+        claim_through_gate(IssuerGate::List(&[GATE_PREFIXED, GATE_BARE]), &[GATE_BARE]).await;
+    assert_eq!(status, 201, "{body}");
+}
+
+#[tokio::test]
+async fn the_same_service_id_is_refused_under_the_single_prefixed_required_group() {
+    let (status, body) = claim_through_gate(IssuerGate::Single(GATE_PREFIXED), &[GATE_BARE]).await;
+    assert_eq!(status, 403, "{body}");
+    for group in [GATE_PREFIXED, GATE_BARE] {
+        assert!(!body.contains(group), "the 403 names a group: {body}");
+    }
+}
+
+#[tokio::test]
+async fn a_prefixed_group_is_refused_under_a_gate_that_lists_only_the_bare_name() {
+    let (status, body) = claim_through_gate(IssuerGate::List(&[GATE_BARE]), &[GATE_PREFIXED]).await;
+    assert_eq!(status, 403, "{body}");
+    assert!(!body.contains(GATE_BARE), "the 403 names a group: {body}");
 }

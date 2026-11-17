@@ -822,6 +822,7 @@ mod tests {
         ClaimRecord {
             uid,
             name: "claim-x".into(),
+            namespace: "sandboxes".into(),
             subject: Subject {
                 issuer: "https://issuer.example.com".into(),
                 id: "octocat".into(),

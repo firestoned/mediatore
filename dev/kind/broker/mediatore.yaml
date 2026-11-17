@@ -23,6 +23,7 @@ issuers:
   - url: https://issuer.example.com
     backend: sts
     client_id: mediatore
+    allow_any_authenticated: true   # a placeholder issuer for the kind tier, no groups to gate on (ADR-0046 decision 19)
   - url: https://mediatore-dex.banlieue-system.svc:5556
     backend: sts
     client_id: mediatore

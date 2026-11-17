@@ -21,7 +21,7 @@ use envoy_types::pb::envoy::service::auth::v3::attribute_context::{
 };
 use envoy_types::pb::envoy::service::auth::v3::authorization_client::AuthorizationClient;
 use envoy_types::pb::envoy::service::auth::v3::check_response::HttpResponse;
-use mediatore_api::{AppState, Limiter};
+use mediatore_api::{AppState, Limiter, Namespaces};
 use mediatore_entra::{Backend, IssuerConfig, Validator};
 use mediatore_gateway::broker::Broker;
 use mediatore_gateway::{Authorizer, CacheConfig};
@@ -85,6 +85,8 @@ fn state(idp: &FakeIdp, policy_egress: Option<mediatore_api::PolicyEgress>) -> A
             client_id: "mediatore".into(),
             subject_claim: "preferred_username".into(),
             required_group: Some(REQUIRED_GROUP.into()),
+            required_groups: None,
+            allow_any_authenticated: false,
             session: None,
             ca_file: None,
             entra: None,
@@ -108,7 +110,7 @@ fn state(idp: &FakeIdp, policy_egress: Option<mediatore_api::PolicyEgress>) -> A
         reachable_registries: None,
         policy_egress,
         sandboxes: None,
-        sandbox_namespace: "sandboxes".into(),
+        namespaces: Namespaces::Single("sandboxes".into()),
         sealer: None,
         limiter: Limiter::new(10),
         dev_mode: true,
@@ -245,6 +247,7 @@ impl Harness {
             .post(format!("{}/v1/claims", self.user_url))
             .bearer_auth(&token)
             .json(&ClaimRequest {
+                namespace: None,
                 pool_ref: Some("pool-a".into()),
                 pool_selector: None,
                 ttl_seconds: 3600,
@@ -477,6 +480,7 @@ async fn the_dev_header_transport_reaches_a_dev_mode_broker() {
         .post(format!("{user_url}/v1/claims"))
         .bearer_auth(&token)
         .json(&ClaimRequest {
+            namespace: None,
             pool_ref: Some("pool-a".into()),
             pool_selector: None,
             ttl_seconds: 3600,

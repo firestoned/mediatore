@@ -15,7 +15,7 @@ use std::future::IntoFuture;
 use std::sync::Arc;
 use std::time::Duration;
 
-use mediatore_api::{AppState, Limiter};
+use mediatore_api::{AppState, Limiter, Namespaces};
 use mediatore_entra::{Backend, IssuerConfig, Validator};
 use mediatore_proto::{
     ClaimRequest, ClaimResponse, Me, NodeRegistered, NodeRegistration, TokenRequest, TokenResponse,
@@ -76,6 +76,8 @@ fn state(idp: &FakeIdp, dev_mode: bool) -> Arc<AppState> {
             client_id: "mediatore".into(),
             subject_claim: "preferred_username".into(),
             required_group: Some(REQUIRED_GROUP.into()),
+            required_groups: None,
+            allow_any_authenticated: false,
             session: None,
             ca_file: None,
             entra: None,
@@ -94,7 +96,7 @@ fn state(idp: &FakeIdp, dev_mode: bool) -> Arc<AppState> {
         reachable_registries: None,
         policy_egress: None,
         sandboxes: None,
-        sandbox_namespace: "sandboxes".into(),
+        namespaces: Namespaces::Single("sandboxes".into()),
         sealer: None,
         limiter: Limiter::new(10),
         dev_mode,
@@ -218,6 +220,7 @@ impl Harness {
             .post(format!("{}/v1/claims", self.user_url))
             .bearer_auth(token)
             .json(&ClaimRequest {
+                namespace: None,
                 pool_ref: Some("pool-a".into()),
                 pool_selector: None,
                 ttl_seconds: 3600,

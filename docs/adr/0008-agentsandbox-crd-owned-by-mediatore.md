@@ -3,7 +3,7 @@
 
 # ADR-0008: AgentSandbox is a mediatore CRD, reconciled by mediatore
 
-**Status:** Accepted · **Date:** 2026-10-12 · **Accepted:** 2026-10-14 · **Amended:** 2026-11-09 (decision 8, `spec.workload.restart`, [ADR-0033](0033-a-one-shot-workload-the-restart-policy-and-the-claim-released-when-it-is-done.md)); 2026-11-16 (decision 7, `spec.poolRef` optional beside `spec.poolSelector`, exactly one, and `status.poolRef` the pool bound from, [ADR-0044](0044-a-sandbox-selects-its-pool-by-label.md))
+**Status:** Accepted · **Date:** 2026-10-12 · **Accepted:** 2026-10-14 · **Amended:** 2026-11-09 (decision 8, `spec.workload.restart`, [ADR-0033](0033-a-one-shot-workload-the-restart-policy-and-the-claim-released-when-it-is-done.md)); 2026-11-16 (decision 7, `spec.poolRef` optional beside `spec.poolSelector`, exactly one, and `status.poolRef` the pool bound from, [ADR-0044](0044-a-sandbox-selects-its-pool-by-label.md)); 2026-11-17 (the Namespace paragraph, the claim's namespace chosen from the caller's groups, [ADR-0046](0046-who-may-claim-a-list-of-groups-and-a-namespace-to-groups-mapping.md))
 
 Supersedes banlieue
 [ADR-0055](https://github.com/firestoned/banlieue/blob/main/docs/adr/0055-agentsandbox.md)
@@ -187,7 +187,10 @@ What roadmap 08 fixed within the decisions above, so a reader of the code finds 
   user API's `ClaimResponse` gains `ready`.
 - **Namespace.** `POST /v1/claims` creates the resource in `sandboxes.namespace` from
   `mediatore.yaml`; the pool it names must live there, since `poolRef` is a same-namespace
-  reference on the claim.
+  reference on the claim. *Amended by [ADR-0046](0046-who-may-claim-a-list-of-groups-and-a-namespace-to-groups-mapping.md) (2026-11-17):* with `sandboxes.namespaces` set,
+  the resource is created in the namespace the caller names and is in the groups of, there is no
+  default namespace, and `sandboxes.namespace` stays only for the single-namespace form (the two
+  are exclusive).
 - **RBAC** on `agentsandboxes` is get, list, watch, patch (the finalizer), create and
   delete (the user API, decisions 4 and 5), plus `agentsandboxes/status` and
   `agentsandboxes/finalizers` (the claim's `ownerReference` sets `blockOwnerDeletion`,

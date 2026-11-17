@@ -27,6 +27,7 @@ const ASSERTION_LIFETIME: Duration = Duration::minutes(5);
 /// of `key_file`, `transit` or `token_file`; the first two name the registered certificate
 /// with `certificate_file`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EntraConfig {
     /// The certificate registered on the app registration (PEM), for the `x5t#S256`
     /// header and the startup check that the signing key is its key.

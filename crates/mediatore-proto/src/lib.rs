@@ -528,6 +528,11 @@ pub enum PoolChoiceError {
 /// `POST /v1/claims` body, sent by a user or agent with an `IdP` bearer token.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClaimRequest {
+    /// The namespace the claim is made in (ADR-0046 decision 4). Absent means the one
+    /// namespace of a broker without a namespace map, and `400 namespace_required` with one;
+    /// never serialised when `None`, so an existing client's body is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
     /// `spec.poolRef` on the banlieue claim: one pool, by name. Exactly one of this or
     /// `pool_selector` (ADR-0044 decision 2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -630,6 +635,11 @@ pub enum ClaimPhase {
 pub struct ClaimResponse {
     /// Kubernetes object name.
     pub name: String,
+    /// The namespace the claim lives in (ADR-0046 decisions 4 and 16). A current broker
+    /// always sets it; `None` is an old broker that predates the field, which the client
+    /// tells from a broker that answered a different namespace than the one it asked for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
     /// The claim's UID, once the claim exists: the key of the claim's SPIFFE identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uid: Option<Uuid>,
@@ -785,6 +795,22 @@ pub mod error_code {
     /// `POST /v1/gateway/claims/{uid}/credential` for an audience that is not declared
     /// `inject: gateway` (`403`): the route answers nothing for an audience placed in the proxy.
     pub const NOT_PLACED_AT_GATEWAY: &str = "not_placed_at_gateway";
+    /// A claim or `GET`/`DELETE` that names no namespace on a broker with a namespace map
+    /// (`400`, ADR-0046 decision 4): there is no default to fall back to.
+    pub const NAMESPACE_REQUIRED: &str = "namespace_required";
+    /// A namespace that is not an RFC 1123 label (`400`, ADR-0046 decision 4).
+    pub const INVALID_NAMESPACE: &str = "invalid_namespace";
+}
+
+/// An RFC 1123 label, which is what a namespace name must be (ADR-0046 decision 4). The
+/// broker's config check and the API share this one function.
+#[must_use]
+pub fn is_dns_label(s: &str) -> bool {
+    (1..=63).contains(&s.len())
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && !s.starts_with('-')
+        && !s.ends_with('-')
 }
 
 /// `POST /v1/gateway/claims/{uid}/credential` body (ADR-0040 decision 2), sent by the gateway
@@ -1165,6 +1191,7 @@ mod tests {
             refresh_token: None,
             policy_ref: None,
             delegations: vec![],
+            namespace: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let back: ClaimRequest = serde_json::from_str(&json).unwrap();
@@ -1188,6 +1215,7 @@ mod tests {
             refresh_token: None,
             policy_ref: None,
             delegations: vec![],
+            namespace: None,
         }
     }
 
@@ -1518,5 +1546,70 @@ mod tests {
         let req: GatewayCredentialRequest =
             serde_json::from_value(serde_json::json!({ "audience": "anthropic" })).unwrap();
         assert_eq!(req.audience, "anthropic");
+    }
+
+    // ----- ADR-0046: a claim names the namespace it is made in --------------------------------------------------
+
+    #[test]
+    fn a_claim_request_without_namespace_serialises_as_before() {
+        let v = serde_json::to_value(request_with(Some("pool-a"), None)).unwrap();
+        assert!(
+            v.get("namespace").is_none(),
+            "an existing client's body is unchanged: {v}"
+        );
+    }
+
+    #[test]
+    fn a_claim_request_with_namespace_round_trips() {
+        let mut req = request_with(Some("pool-a"), None);
+        req.namespace = Some("team-a".into());
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains(r#""namespace":"team-a""#));
+        let back: ClaimRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.namespace.as_deref(), Some("team-a"));
+        let old: ClaimRequest = serde_json::from_str(
+            r#"{"pool_ref":"pool-a","ttl_seconds":60,"workload":{"image":"r/i:1","args":[]}}"#,
+        )
+        .unwrap();
+        assert_eq!(old.namespace, None);
+    }
+
+    fn response_json(extra: &str) -> String {
+        format!(r#"{{"name":"sb-1","phase":"Pending"{extra}}}"#)
+    }
+
+    #[test]
+    fn a_claim_response_carries_its_namespace() {
+        let r: ClaimResponse =
+            serde_json::from_str(&response_json(r#","namespace":"team-a""#)).unwrap();
+        assert_eq!(r.namespace.as_deref(), Some("team-a"));
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["namespace"], "team-a");
+    }
+
+    #[test]
+    fn an_old_claim_response_without_namespace_is_detectable() {
+        let r: ClaimResponse = serde_json::from_str(&response_json("")).unwrap();
+        assert_eq!(
+            r.namespace, None,
+            "absent is None, not an empty or default namespace"
+        );
+        assert!(serde_json::to_value(&r).unwrap().get("namespace").is_none());
+    }
+
+    #[test]
+    fn the_namespace_error_codes_are_stable_strings() {
+        assert_eq!(error_code::NAMESPACE_REQUIRED, "namespace_required");
+        assert_eq!(error_code::INVALID_NAMESPACE, "invalid_namespace");
+    }
+
+    #[test]
+    fn is_dns_label_is_an_rfc_1123_label() {
+        for ok in ["a", "team-a", "a1", &"a".repeat(63)] {
+            assert!(is_dns_label(ok), "{ok}");
+        }
+        for bad in ["", "-a", "a-", "Team", "a.b", "a_b", "a b", &"a".repeat(64)] {
+            assert!(!is_dns_label(bad), "{bad}");
+        }
     }
 }

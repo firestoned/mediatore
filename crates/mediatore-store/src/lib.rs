@@ -39,6 +39,17 @@ pub enum StoreError {
     Backend(String),
 }
 
+/// What a record written before ADR-0046 reads as: the single namespace the broker had
+/// configured then. The API layer maps it to that namespace (ADR-0046 decision 9); the store
+/// only gives it a fixed, documented value.
+pub const FALLBACK_NAMESPACE: &str = "sandboxes";
+
+/// The serde default of [`ClaimRecord::namespace`].
+#[must_use]
+pub fn fallback_namespace() -> String {
+    FALLBACK_NAMESPACE.to_owned()
+}
+
 /// One claim mediatore has brokered. The request fields are a copy of the `AgentSandbox`
 /// spec (ADR-0008); the resource is their source of truth.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,6 +58,10 @@ pub struct ClaimRecord {
     pub uid: Uuid,
     /// Kubernetes object name.
     pub name: String,
+    /// The namespace the claim lives in (ADR-0046 decision 9). A record written before the
+    /// ADR has none and reads as [`FALLBACK_NAMESPACE`].
+    #[serde(default = "fallback_namespace")]
+    pub namespace: String,
     /// Who the claim is for.
     pub subject: Subject,
     /// SPIRE registration entry id, once created.
@@ -196,8 +211,13 @@ pub trait ClaimStore: Send + Sync + 'static {
     async fn put_claim(&self, rec: ClaimRecord) -> Result<(), StoreError>;
     /// Fetch by UID.
     async fn get_claim(&self, uid: Uuid) -> Result<ClaimRecord, StoreError>;
-    /// Fetch by Kubernetes name.
-    async fn get_claim_by_name(&self, name: &str) -> Result<ClaimRecord, StoreError>;
+    /// Fetch by namespace and Kubernetes name: a name in one namespace never returns another's
+    /// record (ADR-0046 decision 9).
+    async fn get_claim_by_name(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> Result<ClaimRecord, StoreError>;
     /// Replace an existing claim record.
     async fn update_claim(&self, rec: ClaimRecord) -> Result<(), StoreError>;
     /// Mark revoked and drop the refresh envelope; idempotent (the first timestamp wins).
@@ -311,12 +331,16 @@ impl ClaimStore for MemoryStore {
             .ok_or_else(|| StoreError::NotFound(uid.to_string()))
     }
 
-    async fn get_claim_by_name(&self, name: &str) -> Result<ClaimRecord, StoreError> {
+    async fn get_claim_by_name(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> Result<ClaimRecord, StoreError> {
         self.claims
             .read()
             .await
             .values()
-            .find(|c| c.name == name)
+            .find(|c| c.namespace == namespace && c.name == name)
             .cloned()
             .ok_or_else(|| StoreError::NotFound(name.to_string()))
     }

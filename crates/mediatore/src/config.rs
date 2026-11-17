@@ -5,6 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
+use mediatore_api::Namespaces;
 use mediatore_entra::{Backend, IssuerConfig};
 use mediatore_proto::image::canonical_registry;
 use mediatore_proto::{
@@ -153,6 +154,7 @@ impl AudienceConfig {
 /// Where a delegated credential is refreshed (ADR-0035 decision 5): the operator's values,
 /// never a default of the broker's.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DelegationRefresh {
     /// The OAuth token endpoint; `https` outside `dev_mode`.
     pub token_endpoint: String,
@@ -186,6 +188,7 @@ fn endpoints<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Endpoint>, D:
 /// segment or behind a gateway's registry leg, ADR-0038), declared by its host and its reach
 /// alone.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RegistryConfig {
     /// The registry as a reference names it (`ghcr.io`, `registry.internal:5000`,
     /// `docker.io`).
@@ -229,6 +232,7 @@ impl RegistryConfig {
 
 /// STS signing material.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StsConfig {
     /// `iss` for self-issued tokens.
     pub issuer: String,
@@ -240,6 +244,7 @@ pub struct StsConfig {
 
 /// Listeners.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ListenConfig {
     /// User-facing HTTPS (terminated upstream by Traefik) or plain HTTP in dev.
     #[serde(default = "default_user_addr")]
@@ -259,6 +264,7 @@ fn default_sandbox_addr() -> String {
 /// Where entries are declared (ADR-0006): the cluster that hosts the downstream SPIRE
 /// server's controller manager.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EntriesSection {
     /// `spec.className` on every `ClusterStaticEntry`; must equal the controller manager's
     /// class (the hardened chart ignores classless resources).
@@ -316,6 +322,7 @@ impl TryFrom<&EntriesSection> for mediatore_spire::EntriesConfig {
 
 /// SPIRE-facing configuration. Required outside `dev_mode`.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SpireConfig {
     /// Workload API socket the broker fetches its own SVID from (ADR-0007), e.g.
     /// `unix:///run/spire/sockets/spire-agent.sock`.
@@ -328,6 +335,7 @@ pub struct SpireConfig {
 // The `_secs` suffix is the unit, part of the config file's contract (as in `EntriesSection`).
 #[allow(clippy::struct_field_names)]
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WatcherSection {
     /// Seconds between resyncs: records whose claim is gone are released and orphan
     /// entries swept (default 300).
@@ -362,30 +370,111 @@ impl Default for WatcherSection {
     }
 }
 
-/// `AgentSandbox` resources the user API creates (ADR-0008 decision 4).
-#[derive(Debug, Clone, Deserialize)]
+/// `AgentSandbox` resources the user API creates (ADR-0008 decision 4, ADR-0046).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SandboxesSection {
-    /// Namespace `POST /v1/claims` creates sandboxes in. The `VirtualMachinePool` a request
-    /// names must live there (the claim's `poolRef` is a same-namespace reference).
-    #[serde(default = "default_sandbox_namespace")]
-    pub namespace: String,
+    /// Namespace `POST /v1/claims` creates sandboxes in, the single-namespace form. The
+    /// `VirtualMachinePool` a request names must live there (the claim's `poolRef` is a
+    /// same-namespace reference). `None` is "not written": the default is `sandboxes`, and
+    /// with `namespaces` set the key must not be written at all (ADR-0046 decisions 3, 14).
+    #[serde(default)]
+    pub namespace: Option<String>,
+    /// Namespace to the groups whose members may create sandboxes there (ADR-0046 decision 3).
+    /// Exclusive with `namespace`; with it set there is no default namespace.
+    #[serde(default)]
+    pub namespaces: Option<std::collections::BTreeMap<String, NamespaceEntry>>,
+}
+
+/// One namespace of `sandboxes.namespaces`. A typo in the field is a start error, never an
+/// entry with no groups (ADR-0046 decision 3).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NamespaceEntry {
+    /// Groups of which a caller must hold at least one, matched exactly (ADR-0046 decision 2).
+    /// Required and non-empty.
+    pub groups: Vec<String>,
 }
 
 fn default_sandbox_namespace() -> String {
     "sandboxes".into()
 }
 
-impl Default for SandboxesSection {
-    fn default() -> Self {
-        Self {
-            namespace: default_sandbox_namespace(),
+impl SandboxesSection {
+    /// The single namespace: the one written, or `sandboxes`. Meaningful only without
+    /// `namespaces`, which [`Config::parse`] guarantees by refusing both.
+    #[must_use]
+    pub fn single_namespace(&self) -> String {
+        self.namespace
+            .clone()
+            .unwrap_or_else(default_sandbox_namespace)
+    }
+
+    /// What the user API serves (ADR-0046 decision 3): the map when `namespaces` is set,
+    /// otherwise the single open namespace, exactly as before.
+    #[must_use]
+    pub fn resolve(&self) -> Namespaces {
+        match &self.namespaces {
+            Some(map) => Namespaces::Map(
+                map.iter()
+                    .map(|(ns, e)| (ns.clone(), e.groups.clone()))
+                    .collect(),
+            ),
+            None => Namespaces::Single(self.single_namespace()),
         }
+    }
+
+    /// ADR-0046 decision 14, each refusal naming the key and the value.
+    fn validate(&self) -> anyhow::Result<()> {
+        let Some(map) = &self.namespaces else {
+            if self.single_namespace().trim().is_empty() {
+                anyhow::bail!("sandboxes.namespace must not be empty");
+            }
+            return Ok(());
+        };
+        if let Some(ns) = &self.namespace {
+            anyhow::bail!(
+                "sandboxes.namespace ({ns:?}) is written together with sandboxes.namespaces: the two are exclusive, and with the map set there is no default namespace (ADR-0046 decision 3)"
+            );
+        }
+        if map.is_empty() {
+            anyhow::bail!(
+                "sandboxes.namespaces is empty: list at least one namespace, or leave the key out for the single-namespace form (ADR-0046 decision 14)"
+            );
+        }
+        for (ns, entry) in map {
+            if !mediatore_proto::is_dns_label(ns) {
+                anyhow::bail!(
+                    "sandboxes.namespaces: key {ns:?} is not an RFC 1123 label (lowercase letters, digits and `-`, at most 63) (ADR-0046 decision 14)"
+                );
+            }
+            if entry.groups.is_empty() {
+                anyhow::bail!(
+                    "sandboxes.namespaces.{ns}.groups is empty: list the groups whose members may claim there (ADR-0046 decision 14)"
+                );
+            }
+            let mut seen = std::collections::BTreeSet::new();
+            for g in &entry.groups {
+                if g.trim().is_empty() || g.trim() != g {
+                    anyhow::bail!(
+                        "sandboxes.namespaces.{ns}.groups: {g:?} is empty or has leading or trailing whitespace (ADR-0046 decision 14)"
+                    );
+                }
+                if !seen.insert(g.as_str()) {
+                    anyhow::bail!(
+                        "sandboxes.namespaces.{ns}.groups: {g:?} is listed twice (ADR-0046 decision 14)"
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 }
 
 /// notaio's policy bundles, read, verified and compared with each sandbox in shadow
 /// (ADR-0026). Absent, the broker reads no bundle and compares nothing.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PolicySection {
     /// The keys notaio signs bundles with (decision 2): from this file only, never from the
     /// cluster. List two versions of the key while notaio re-signs during a rotation.
@@ -405,6 +494,7 @@ pub struct PolicySection {
 /// The wrapping key for refresh material (ADR-0012 decision 3): exactly one of the local
 /// key file (the homelab shape) or `OpenBao` transit (the work shape, ADR-0015).
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SealingSection {
     /// File holding the 32-byte key (raw, or 64 hex characters): a Secret volume. Read at
     /// startup; a missing or malformed key stops the process.
@@ -419,6 +509,7 @@ pub struct SealingSection {
 /// under it; nothing to point at. What remains to configure is how long an ended claim is
 /// kept, and the sealer.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StoreSection {
     /// Seconds an ended claim stays on its `AgentSandbox` before the resync sweeps it,
     /// logging the audit line (default 3600; ADR-0034 decision 4).
@@ -455,6 +546,7 @@ impl Default for StoreSection {
 
 /// `POST /v1/token` limits (ADR-0013 decision 5).
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TokenSection {
     /// Issues one claim may ask for per minute, and the burst it may spend at once
     /// (default 10). Checked before any upstream refresh.
@@ -476,6 +568,7 @@ impl Default for TokenSection {
 
 /// Top-level config.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     /// SPIFFE trust domain.
     pub trust_domain: String,
@@ -856,6 +949,7 @@ impl Config {
         cfg.check_routes()?;
         cfg.check_inject()?;
         cfg.check_entra()?;
+        cfg.check_gates()?;
         if !cfg.dev_mode && cfg.spire.is_none() {
             anyhow::bail!("`spire` (workload_api_socket, entries) is required outside dev_mode");
         }
@@ -873,9 +967,7 @@ impl Config {
                 "watcher.resync_secs and resolve_timeout_secs must be positive and lease_duration_secs at least 3"
             );
         }
-        if cfg.sandboxes.namespace.trim().is_empty() {
-            anyhow::bail!("sandboxes.namespace must not be empty");
-        }
+        cfg.sandboxes.validate()?;
         if let Some(e) = cfg.spire.as_ref().map(|s| &s.entries) {
             if e.class_name.trim().is_empty() {
                 anyhow::bail!("spire.entries.class_name must not be empty");
@@ -931,12 +1023,72 @@ impl Config {
 }
 
 impl Config {
+    /// ADR-0046 decision 19: every issuer carries exactly one written gate. Refused at start
+    /// with the issuer's `url` and the keys, never read as "no gate".
+    fn check_gates(&self) -> anyhow::Result<()> {
+        for issuer in &self.issuers {
+            issuer.gate()?;
+        }
+        Ok(())
+    }
+
+    /// What the user API serves: the map, or the single open namespace (ADR-0046 decision 3).
+    #[must_use]
+    pub fn namespaces(&self) -> Namespaces {
+        self.sandboxes.resolve()
+    }
+
+    /// ADR-0046 decision 15: a map is enforced by the broker's own Kubernetes front door. A
+    /// build that has none (outside `dev_mode`) must not start with a map it cannot honour.
+    ///
+    /// # Errors
+    /// When `sandboxes.namespaces` is set, the front is absent and this is not `dev_mode`.
+    pub fn check_front(&self, front_present: bool) -> anyhow::Result<()> {
+        if self.sandboxes.namespaces.is_some() && !front_present && !self.dev_mode {
+            anyhow::bail!(
+                "sandboxes.namespaces is set but this broker has no Kubernetes front: claim creation would answer 501 (ADR-0046 decision 15)"
+            );
+        }
+        Ok(())
+    }
+
+    /// The startup lines (ADR-0046 decisions 14 and 18): one per issuer with its gate form,
+    /// and the namespaces in force with their group values. Values are configuration, never a
+    /// token.
+    pub fn log_startup(&self) {
+        for issuer in &self.issuers {
+            // `check_gates` ran at load; a gate that does not resolve is logged as such.
+            let form = issuer
+                .gate_form()
+                .unwrap_or_else(|e| format!("invalid ({e})"));
+            tracing::info!(issuer = %issuer.url, gate = %form, "issuer gate in force");
+        }
+        match self.namespaces() {
+            Namespaces::Single(ns) => {
+                tracing::info!(namespaces = %format!("single open namespace {ns}"), "sandbox namespaces in force");
+            }
+            Namespaces::Map(map) => {
+                tracing::info!(
+                    namespaces = %format!("map of {} namespaces", map.len()),
+                    "sandbox namespaces in force"
+                );
+                for (ns, groups) in &map {
+                    tracing::info!(namespace = %ns, groups = %groups.join(", "), "namespace groups");
+                }
+                tracing::info!(
+                    "a namespace in the map that does not exist fails the create with the API server's error (502)"
+                );
+            }
+        }
+    }
+
     /// ADR-0026 decisions 2 and 3: at least one key, every key a well-formed Ed25519 key with
     /// an id of its own, and namespaces that are Kubernetes names, listed once. Fills in the
     /// default namespace. A `policy` section without keys is refused rather than read as "off":
     /// leaving the section out is how the broker is told to read no bundle.
     fn check_policy(&mut self) -> anyhow::Result<()> {
-        let default_ns = self.sandboxes.namespace.clone();
+        let single = self.sandboxes.namespaces.is_none();
+        let default_ns = self.sandboxes.single_namespace();
         let Some(policy) = self.policy.as_mut() else {
             return Ok(());
         };
@@ -948,11 +1100,19 @@ impl Config {
         mediatore_policy::trusted_keys(&policy.trusted_keys)
             .map_err(|e| anyhow::anyhow!("policy.trusted_keys: {e} (ADR-0026)"))?;
         if policy.namespaces.is_empty() {
+            // With `sandboxes.namespaces` set there is no default namespace to fall back to
+            // (ADR-0046 decision 3), and the map does not widen the policy namespaces
+            // (decision 8): the operator lists them.
+            if !single {
+                anyhow::bail!(
+                    "policy.namespaces must list the namespaces whose bundles are read: with sandboxes.namespaces set there is no default namespace (ADR-0046 decisions 3 and 8)"
+                );
+            }
             policy.namespaces.push(default_ns);
         }
         let mut seen = std::collections::BTreeSet::new();
         for ns in &policy.namespaces {
-            if !is_dns_label(ns) {
+            if !mediatore_proto::is_dns_label(ns) {
                 anyhow::bail!("policy.namespaces: {ns:?} is not a Kubernetes namespace name");
             }
             if !seen.insert(ns.as_str()) {
@@ -1024,15 +1184,6 @@ impl Config {
         }
         Ok(())
     }
-}
-
-/// An RFC 1123 label, which is what a namespace name must be.
-fn is_dns_label(s: &str) -> bool {
-    (1..=63).contains(&s.len())
-        && s.bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-        && !s.starts_with('-')
-        && !s.ends_with('-')
 }
 
 /// True only for a literal loopback socket address: a hostname, even `localhost`, is not
@@ -1403,12 +1554,12 @@ listen: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }
     #[test]
     fn the_sandbox_namespace_defaults_and_must_not_be_empty() {
         let cfg = Config::parse(&format!("{BASE}dev_mode: true\n")).unwrap();
-        assert_eq!(cfg.sandboxes.namespace, "sandboxes");
+        assert_eq!(cfg.sandboxes.single_namespace(), "sandboxes");
         let cfg = Config::parse(&format!(
             "{BASE}dev_mode: true\nsandboxes: {{ namespace: agents }}\n"
         ))
         .unwrap();
-        assert_eq!(cfg.sandboxes.namespace, "agents");
+        assert_eq!(cfg.sandboxes.single_namespace(), "agents");
         let err = Config::parse(&format!(
             "{BASE}dev_mode: true\nsandboxes: {{ namespace: \" \" }}\n"
         ))
@@ -1458,6 +1609,7 @@ listen: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }
     backend: sts
     client_id: mediatore
     subject_claim: preferred_username
+    allow_any_authenticated: true
     session: { client_id: mediatore }
 ";
         let base = "trust_domain: sandbox.test\naudiences: []\nlisten: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }\ndev_mode: true\n";
@@ -1520,7 +1672,7 @@ listen: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }
     #[test]
     fn an_issuer_may_name_its_groups_claim_and_the_secret_its_token_endpoint_wants() {
         let cfg = Config::parse(
-            "trust_domain: sandbox.test\naudiences: []\nlisten: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }\ndev_mode: true\nstore: { sealing: { key_file: /k } }\nissuers:\n  - url: https://accounts.google.com\n    backend: sts\n    client_id: 1234.apps.googleusercontent.com\n    subject_claim: email\n    session: { client_id: 1234.apps.googleusercontent.com, client_secret_file: /etc/mediatore-google/secret }\n  - url: https://tenant.us.auth0.com/\n    backend: sts\n    client_id: abc\n    subject_claim: email\n    required_group: sandbox-users\n    groups_claim: https://example.com/groups\n    session: { client_id: abc }\n",
+            "trust_domain: sandbox.test\naudiences: []\nlisten: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }\ndev_mode: true\nstore: { sealing: { key_file: /k } }\nissuers:\n  - url: https://accounts.google.com\n    backend: sts\n    client_id: 1234.apps.googleusercontent.com\n    subject_claim: email\n    allow_any_authenticated: true\n    session: { client_id: 1234.apps.googleusercontent.com, client_secret_file: /etc/mediatore-google/secret }\n  - url: https://tenant.us.auth0.com/\n    backend: sts\n    client_id: abc\n    subject_claim: email\n    required_group: sandbox-users\n    groups_claim: https://example.com/groups\n    session: { client_id: abc }\n",
         )
         .unwrap();
         assert_eq!(
@@ -1544,7 +1696,7 @@ listen: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }
         let base = "trust_domain: sandbox.test\naudiences: []\nlisten: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }\ndev_mode: true\nstore: { sealing: { key_file: /etc/mediatore-sealing/key } }\n";
         let entra = |body: &str| {
             format!(
-                "issuers:\n  - url: https://login.microsoftonline.com/tenant/v2.0\n    backend: entra-obo\n    client_id: broker-app-id\n{body}"
+                "issuers:\n  - url: https://login.microsoftonline.com/tenant/v2.0\n    backend: entra-obo\n    client_id: broker-app-id\n    allow_any_authenticated: true\n{body}"
             )
         };
         let cfg = Config::parse(&format!(
@@ -2139,5 +2291,510 @@ listen: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }
         .unwrap();
         assert_eq!(cfg.audiences[0].inject_routes(), Vec::<InjectRoute>::new());
         assert_eq!(cfg.gateway_placed().len(), 0);
+    }
+
+    // ----- ADR-0046: namespaces, gates, unknown keys ----------------------------------------------------------
+
+    const DEV: &str = "trust_domain: sandbox.test\nissuers: []\naudiences: []\nlisten: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }\ndev_mode: true\n";
+
+    fn with(extra: &str) -> anyhow::Result<Config> {
+        Config::parse(&format!("{DEV}{extra}"))
+    }
+
+    fn refused(extra: &str) -> String {
+        with(extra).unwrap_err().to_string()
+    }
+
+    #[test]
+    fn a_config_without_namespaces_resolves_to_the_single_open_namespace() {
+        assert_eq!(
+            with("").unwrap().namespaces(),
+            Namespaces::Single("sandboxes".into()),
+            "neither key: the default, as before"
+        );
+        assert_eq!(
+            with("sandboxes: { namespace: agents }\n")
+                .unwrap()
+                .namespaces(),
+            Namespaces::Single("agents".into())
+        );
+    }
+
+    #[test]
+    fn namespaces_resolve_to_the_map_with_no_default() {
+        let cfg = with("sandboxes:\n  namespaces:\n    infra: { groups: [\"example-org:APP_EXAMPLE_ADMIN\", APP_EXAMPLE_ADMIN] }\n    team-a: { groups: [APP_EXAMPLE_TEAM_A_USER] }\n").unwrap();
+        let Namespaces::Map(m) = cfg.namespaces() else {
+            panic!("a map was written");
+        };
+        assert_eq!(m.len(), 2);
+        assert_eq!(m["team-a"], ["APP_EXAMPLE_TEAM_A_USER"]);
+        assert_eq!(m["infra"].len(), 2);
+    }
+
+    #[test]
+    fn a_namespaces_map_with_an_empty_groups_list_refuses_to_start() {
+        let err = refused("sandboxes:\n  namespaces:\n    team-a: { groups: [] }\n");
+        assert!(err.contains("sandboxes.namespaces.team-a.groups"), "{err}");
+        let err = refused("sandboxes:\n  namespaces: {}\n");
+        assert!(err.contains("sandboxes.namespaces is empty"), "{err}");
+        let err = refused("sandboxes:\n  namespaces:\n    team-a: {}\n");
+        assert!(err.contains("groups"), "an entry with no groups key: {err}");
+        for bad in ["\"\"", "\" \"", "\" x\"", "\"x \""] {
+            let err = refused(&format!(
+                "sandboxes:\n  namespaces:\n    team-a: {{ groups: [{bad}] }}\n"
+            ));
+            assert!(
+                err.contains("team-a") && err.contains("whitespace"),
+                "{bad}: {err}"
+            );
+        }
+        let err = refused("sandboxes:\n  namespaces:\n    team-a: { groups: [G, G] }\n");
+        assert!(err.contains("listed twice"), "{err}");
+    }
+
+    #[test]
+    fn a_namespaces_map_with_a_duplicate_key_refuses_to_start() {
+        let err = refused(
+            "sandboxes:\n  namespaces:\n    team-a: { groups: [A] }\n    team-a: { groups: [B] }\n",
+        );
+        assert!(
+            err.contains("team-a") || err.to_lowercase().contains("duplicate"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_namespaces_map_with_a_non_dns_label_key_refuses_to_start() {
+        for bad in ["Team-A", "team_a", "-a", "a-", "\"\"", "team.a"] {
+            let err = refused(&format!(
+                "sandboxes:\n  namespaces:\n    {bad}: {{ groups: [G] }}\n"
+            ));
+            assert!(err.contains("RFC 1123"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_namespaces_map_together_with_sandboxes_namespace_refuses_to_start() {
+        let err = refused(
+            "sandboxes:\n  namespace: sandboxes\n  namespaces:\n    team-a: { groups: [G] }\n",
+        );
+        assert!(
+            err.contains("sandboxes.namespace") && err.contains("exclusive"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_namespaces_map_with_a_typo_in_an_entry_field_refuses_to_start() {
+        let err = refused("sandboxes:\n  namespaces:\n    team-a: { group: [G] }\n");
+        assert!(err.contains("group"), "{err}");
+        let err = refused("sandboxes:\n  namespaces:\n    team-a: { groups: [G], extra: 1 }\n");
+        assert!(err.contains("extra"), "{err}");
+    }
+
+    #[test]
+    fn a_group_in_two_namespaces_is_accepted() {
+        let cfg = with("sandboxes:\n  namespaces:\n    team-a: { groups: [SHARED] }\n    infra: { groups: [SHARED] }\n").unwrap();
+        let Namespaces::Map(m) = cfg.namespaces() else {
+            panic!("a map was written");
+        };
+        assert_eq!(m["team-a"], m["infra"]);
+    }
+
+    #[test]
+    fn a_namespace_map_without_the_kubernetes_front_refuses_to_start() {
+        let cfg = with("sandboxes:\n  namespaces:\n    team-a: { groups: [G] }\n").unwrap();
+        assert!(cfg.check_front(true).is_ok());
+        let mut prod = cfg.clone();
+        prod.dev_mode = false;
+        let err = prod.check_front(false).unwrap_err().to_string();
+        assert!(err.contains("no Kubernetes front"), "{err}");
+        assert!(prod.check_front(true).is_ok());
+        assert!(
+            cfg.check_front(false).is_ok(),
+            "dev_mode has the dev store and the same checks (decision 12)"
+        );
+        let single = with("").unwrap();
+        let mut prod = single;
+        prod.dev_mode = false;
+        assert!(prod.check_front(false).is_ok(), "no map, nothing to refuse");
+    }
+
+    #[test]
+    fn the_policy_namespaces_have_no_default_once_the_map_is_set() {
+        let k = conformance_key();
+        let err = refused(&format!(
+            "sandboxes:\n  namespaces:\n    team-a: {{ groups: [G] }}\npolicy:\n  trusted_keys: [{{ id: \"notaio:v1\", public_key: \"{k}\" }}]\n"
+        ));
+        assert!(err.contains("policy.namespaces must list"), "{err}");
+        let cfg = with(&format!("sandboxes:\n  namespaces:\n    team-a: {{ groups: [G] }}\npolicy:\n  trusted_keys: [{{ id: \"notaio:v1\", public_key: \"{k}\" }}]\n  namespaces: [team-a]\n")).unwrap();
+        assert_eq!(cfg.policy.unwrap().namespaces, ["team-a"]);
+    }
+
+    const GATELESS: &str =
+        "issuers:\n  - url: https://idp.example.com\n    backend: sts\n    client_id: mediatore\n";
+
+    fn issuer_cfg(extra: &str) -> String {
+        format!(
+            "trust_domain: sandbox.test\naudiences: []\nlisten: {{ user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }}\ndev_mode: true\n{GATELESS}{extra}"
+        )
+    }
+
+    #[test]
+    fn an_issuer_with_no_gate_key_refuses_to_start() {
+        let err = Config::parse(&issuer_cfg("")).unwrap_err().to_string();
+        assert!(
+            err.contains("https://idp.example.com")
+                && err.contains("required_group")
+                && err.contains("required_groups")
+                && err.contains("allow_any_authenticated"),
+            "{err}"
+        );
+        // `false` counts as absent.
+        let err = Config::parse(&issuer_cfg("    allow_any_authenticated: false\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no login gate"), "{err}");
+        // One gate is enough, in each of its three spellings; two are refused.
+        for ok in [
+            "    required_group: G\n",
+            "    required_groups: [G, H]\n",
+            "    allow_any_authenticated: true\n",
+        ] {
+            assert!(Config::parse(&issuer_cfg(ok)).is_ok(), "{ok}");
+        }
+        let err = Config::parse(&issuer_cfg(
+            "    required_group: G\n    required_groups: [G]\n",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("more than one"), "{err}");
+        let err = Config::parse(&issuer_cfg("    required_groups: []\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("required_groups"), "{err}");
+    }
+
+    #[test]
+    fn a_google_issuer_needs_the_explicit_marker() {
+        let google = "issuers:\n  - url: https://accounts.google.com\n    backend: sts\n    client_id: 1234.apps.googleusercontent.com\n    subject_claim: email\n    session: { client_id: 1234.apps.googleusercontent.com, client_secret_file: /etc/mediatore-google/secret }\n";
+        let base = "trust_domain: sandbox.test\naudiences: []\nlisten: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }\ndev_mode: true\nstore: { sealing: { key_file: /k } }\n";
+        let err = Config::parse(&format!("{base}{google}"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("accounts.google.com") && err.contains("allow_any_authenticated"),
+            "{err}"
+        );
+        let marked = google.replace(
+            "    session:",
+            "    allow_any_authenticated: true\n    session:",
+        );
+        assert!(Config::parse(&format!("{base}{marked}")).is_ok());
+    }
+
+    #[test]
+    fn an_issuer_with_an_unknown_key_refuses_to_start() {
+        for key in ["required_groupz: [G]", "allow_any_authenticated_: true"] {
+            let err = Config::parse(&issuer_cfg(&format!("    required_group: G\n    {key}\n")))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("required_groupz") || err.contains("allow_any_authenticated_"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_top_level_unknown_key_refuses_to_start() {
+        let err = refused("unknown_top_level: 1\n");
+        assert!(err.contains("unknown_top_level"), "{err}");
+    }
+
+    #[test]
+    fn a_misspelled_sandboxes_section_refuses_to_start() {
+        let err = refused("sandbox: { namespace: team-a }\n");
+        assert!(err.contains("sandbox"), "{err}");
+        let err = refused("sandboxes: { namespce: team-a }\n");
+        assert!(err.contains("namespce"), "{err}");
+    }
+
+    #[test]
+    fn every_section_rejects_an_unknown_key() {
+        for extra in [
+            "listen: { user: 127.0.0.1:1, sandbox: 127.0.0.1:2, typo: 1 }\n".to_owned(),
+            "watcher: { typo: 1 }\n".into(),
+            "store: { typo: 1 }\n".into(),
+            "token: { typo: 1 }\n".into(),
+            "registries: [{ host: ghcr.io, typo: 1 }]\n".into(),
+            "sts: { issuer: https://m, kid: k, signing_key_file: /k, typo: 1 }\n".into(),
+            "policy: { typo: 1 }\n".into(),
+        ] {
+            let yaml = format!(
+                "trust_domain: sandbox.test\nissuers: []\naudiences: []\ndev_mode: true\n{extra}"
+            );
+            let yaml = if extra.starts_with("listen") {
+                yaml
+            } else {
+                yaml.replacen(
+                    "dev_mode: true\n",
+                    "dev_mode: true\nlisten: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }\n",
+                    1,
+                )
+            };
+            let err = Config::parse(&yaml).unwrap_err().to_string();
+            assert!(err.contains("typo"), "{extra}: {err}");
+        }
+    }
+
+    // ----- the startup log (ADR-0046 decisions 14 and 18) ---------------------------------------------------
+
+    // One process-wide subscriber writing into a buffer per thread, as in mediatore-api's tests: a
+    // scoped `set_default` is not reliable under the parallel runner.
+    thread_local! {
+        static LOGS: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    struct ThreadLogs;
+
+    impl std::io::Write for ThreadLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            LOGS.with(|l| l.borrow_mut().extend_from_slice(buf));
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn startup_log(cfg: &Config) -> String {
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            let _ = tracing::subscriber::set_global_default(
+                tracing_subscriber::fmt()
+                    .with_writer(|| ThreadLogs)
+                    .with_max_level(tracing::Level::TRACE)
+                    .with_ansi(false)
+                    .finish(),
+            );
+        });
+        LOGS.with(|l| l.borrow_mut().clear());
+        cfg.log_startup();
+        LOGS.with(|l| String::from_utf8_lossy(&l.borrow()).into_owned())
+    }
+
+    fn two_issuers(extra: &str) -> Config {
+        Config::parse(&format!(
+            "{DEV}issuers:\n  - {{ url: \"https://dex.example.com\", backend: sts, client_id: m, required_groups: [\"example-org:APP_EXAMPLE_ADMIN\", APP_EXAMPLE_ADMIN] }}\n  - {{ url: \"https://accounts.example.com\", backend: sts, client_id: m, allow_any_authenticated: true }}\n  - {{ url: \"https://old.example.com\", backend: sts, client_id: m, required_group: LEGACY }}\n{extra}"
+        ).replace("issuers: []\n", ""))
+        .unwrap()
+    }
+
+    #[test]
+    fn startup_logs_the_gate_form_per_issuer() {
+        let logs = startup_log(&two_issuers(""));
+        let line = |url: &str| -> String {
+            logs.lines()
+                .find(|l| l.contains(url))
+                .unwrap_or_else(|| panic!("a line for {url} in {logs}"))
+                .to_owned()
+        };
+        let l = line("https://dex.example.com");
+        assert!(
+            l.contains("required_groups (example-org:APP_EXAMPLE_ADMIN, APP_EXAMPLE_ADMIN)"),
+            "{l}"
+        );
+        assert!(line("https://accounts.example.com").contains("none (explicit)"));
+        assert!(line("https://old.example.com").contains("required_group (LEGACY)"));
+    }
+
+    #[test]
+    fn startup_logs_single_open_namespace_without_a_map() {
+        let logs = startup_log(&two_issuers("sandboxes: { namespace: agents }\n"));
+        assert!(logs.contains("single open namespace agents"), "{logs}");
+        let logs = startup_log(&two_issuers(""));
+        assert!(logs.contains("single open namespace sandboxes"), "{logs}");
+        assert!(!logs.contains("map of"), "{logs}");
+    }
+
+    #[test]
+    fn startup_logs_the_namespace_names_and_no_token() {
+        let logs = startup_log(&two_issuers(
+            "sandboxes:\n  namespaces:\n    infra: { groups: [\"example-org:APP_EXAMPLE_ADMIN\", APP_EXAMPLE_ADMIN] }\n    team-a: { groups: [APP_EXAMPLE_TEAM_A_USER] }\n",
+        ));
+        assert!(logs.contains("map of 2 namespaces"), "{logs}");
+        let infra = logs
+            .lines()
+            .find(|l| l.contains("namespace=infra"))
+            .unwrap_or_else(|| panic!("an infra line in {logs}"));
+        assert!(
+            infra.contains("example-org:APP_EXAMPLE_ADMIN, APP_EXAMPLE_ADMIN"),
+            "{infra}"
+        );
+        assert!(logs.contains("APP_EXAMPLE_TEAM_A_USER"), "{logs}");
+        assert!(!logs.contains("single open namespace"), "{logs}");
+        for secret in ["eyJ", "Bearer", "client_secret", "refresh_token"] {
+            assert!(!logs.contains(secret), "{secret} in {logs}");
+        }
+    }
+
+    // ----- what ships still parses (ADR-0046 decision 17) -----------------------------------------------------
+
+    fn repo_root() -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .unwrap()
+    }
+
+    /// Every `*.yaml` under `dir` (relative to the repo root) that declares `issuers:` at the top
+    /// level, which is what a broker config does and a Kubernetes manifest does not.
+    fn config_files(dir: &str, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(repo_root().join(dir)) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let path = e.path();
+            if path.is_dir() {
+                config_files(
+                    path.strip_prefix(repo_root()).unwrap().to_str().unwrap(),
+                    out,
+                );
+            } else if path.extension().is_some_and(|x| x == "yaml" || x == "yml")
+                && std::fs::read_to_string(&path)
+                    .is_ok_and(|t| t.lines().any(|l| l.starts_with("issuers:")))
+            {
+                out.push(path);
+            }
+        }
+    }
+
+    /// A fenced yaml block of a doc that is, or is a fragment of, a broker config: its top-level
+    /// keys are all keys of `Config` and it names at least one of the keys this ADR is about.
+    /// The keys a fragment lacks are filled in with the smallest valid value.
+    fn doc_configs(doc: &str) -> Vec<String> {
+        const KEYS: [&str; 15] = [
+            "trust_domain",
+            "spire",
+            "issuers",
+            "audiences",
+            "sts",
+            "registries",
+            "listen",
+            "dev_mode",
+            "watcher",
+            "sandboxes",
+            "store",
+            "token",
+            "policy",
+            "gateways",
+            "gateway_inject_port",
+        ];
+        let mut out = Vec::new();
+        let mut rest = doc;
+        while let Some(i) = rest.find("```yaml\n").or_else(|| rest.find("```yml\n")) {
+            let body_start = rest[i..].find('\n').unwrap() + i + 1;
+            let Some(len) = rest[body_start..].find("```") else {
+                break;
+            };
+            let block = &rest[body_start..body_start + len];
+            rest = &rest[body_start + len + 3..];
+            let top: Vec<&str> = block
+                .lines()
+                .filter(|l| !l.starts_with([' ', '#', '-']) && l.contains(':'))
+                .map(|l| l.split(':').next().unwrap())
+                .collect();
+            let is_config = top
+                .iter()
+                .any(|k| ["issuers", "sandboxes", "trust_domain"].contains(k))
+                && top.iter().all(|k| KEYS.contains(k));
+            if !is_config {
+                continue;
+            }
+            let has = |k: &str| top.contains(&k);
+            let mut text = block.to_owned();
+            if !has("trust_domain") {
+                text.push_str("trust_domain: sandbox.test\n");
+            }
+            if !has("issuers") {
+                text.push_str("issuers: []\n");
+            }
+            if !has("audiences") {
+                text.push_str("audiences: []\n");
+            }
+            if !has("listen") {
+                text.push_str("listen: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }\n");
+            }
+            if !has("spire") && !has("dev_mode") {
+                text.push_str("dev_mode: true\n");
+            }
+            if !has("sts") {
+                text.push_str(
+                    "sts: { issuer: https://mediatore.test, kid: k, signing_key_file: /k }\n",
+                );
+            }
+            if !has("store") {
+                text.push_str("store: { sealing: { key_file: /k } }\n");
+            }
+            out.push(text);
+        }
+        out
+    }
+
+    #[test]
+    fn every_issuer_in_the_shipped_examples_and_guides_parses() {
+        // Whole files: every broker config under deploy/, dev/ and examples/.
+        let mut files = Vec::new();
+        for dir in ["deploy", "dev", "examples"] {
+            config_files(dir, &mut files);
+        }
+        assert!(
+            files.len() >= 4,
+            "the shipped broker configs were found: {files:?}"
+        );
+        for f in &files {
+            let text = std::fs::read_to_string(f).unwrap();
+            if let Err(e) = Config::parse(&text) {
+                panic!("{} does not parse: {e}", f.display());
+            }
+        }
+        // Fenced yaml blocks in the guides and the design docs that are a config or a fragment of one.
+        let (mut blocks, mut skipped) = (0, 0);
+        for doc in std::fs::read_dir(repo_root().join("docs/guides"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .chain([
+                repo_root().join("docs/design/configuration.md"),
+                repo_root().join("docs/design/issuers-and-audiences.md"),
+            ])
+            .filter(|p| p.extension().is_some_and(|x| x == "md"))
+        {
+            let text = std::fs::read_to_string(&doc).unwrap();
+            for block in doc_configs(&text) {
+                // A block that elides a value with `[...]` is a sketch, not a config.
+                if block.contains("[...]") {
+                    skipped += 1;
+                    continue;
+                }
+                blocks += 1;
+                // The docs spell the public key as a `<placeholder>`: a real one stands in.
+                let block = block
+                    .replace(
+                        "<base64 of a 32-byte Ed25519 public key>",
+                        &conformance_key(),
+                    )
+                    .replace("<base64 Ed25519 public key>", &conformance_key());
+                if let Err(e) = Config::parse(&block) {
+                    panic!("a block in {} does not parse: {e}\n{block}", doc.display());
+                }
+            }
+        }
+        assert!(blocks >= 5, "the doc blocks were found, got {blocks}");
+        assert!(
+            skipped <= 1,
+            "only the elided sketch is skipped, got {skipped}"
+        );
     }
 }

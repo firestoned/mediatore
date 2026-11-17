@@ -2068,6 +2068,7 @@ name = "mediatore-api"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "banlieue-api",
  "base64 0.23.1",
@@ -2103,6 +2104,8 @@ dependencies = [
  "clap",
  "futures",
  "hex",
+ "http",
+ "http-body-util",
  "k8s-openapi",
  "kube",
  "mediatore-policy",
@@ -2118,6 +2121,7 @@ dependencies = [
  "sha2",
  "thiserror",
  "tokio",
+ "tower-test",
  "tracing",
  "uuid",
 ]

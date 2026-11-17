@@ -15,7 +15,7 @@ use std::sync::Arc;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::{Duration, Utc};
-use mediatore_api::{AppState, Limiter};
+use mediatore_api::{AppState, Limiter, Namespaces};
 use mediatore_entra::{Backend, ClientAssertion, EntraConfig, IssuerConfig, Validator};
 use mediatore_proto::{
     ClaimRequest, ClaimResponse, ErrorBody, NodeRegistration, Secret, TokenResponse, Workload,
@@ -128,6 +128,8 @@ impl Harness {
             client_id: CLIENT_ID.into(),
             subject_claim: "oid".into(),
             required_group: Some(REQUIRED_GROUP.into()),
+            required_groups: None,
+            allow_any_authenticated: false,
             session: None,
             ca_file: None,
             entra: Some(entra_cfg.clone()),
@@ -139,6 +141,8 @@ impl Harness {
             client_id: "mediatore".into(),
             subject_claim: "preferred_username".into(),
             required_group: Some(REQUIRED_GROUP.into()),
+            required_groups: None,
+            allow_any_authenticated: false,
             session: None,
             ca_file: None,
             entra: None,
@@ -180,7 +184,7 @@ impl Harness {
             reachable_registries: None,
             policy_egress: None,
             sandboxes: None,
-            sandbox_namespace: "sandboxes".into(),
+            namespaces: Namespaces::Single("sandboxes".into()),
             sealer: Some(Arc::new(LocalKeySealer::new([7u8; 32]))),
             limiter: Limiter::new(60),
             dev_mode: true,
@@ -235,6 +239,7 @@ impl Harness {
             .post(format!("{}/v1/claims", self.user_url))
             .bearer_auth(bearer)
             .json(&ClaimRequest {
+                namespace: None,
                 pool_ref: Some("pool-a".into()),
                 pool_selector: None,
                 ttl_seconds: 3600,

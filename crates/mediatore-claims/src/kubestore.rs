@@ -443,6 +443,38 @@ impl KubeStore {
         Ok(())
     }
 
+    /// Every Secret kept for a sandbox, in any state: the issuer's session and each
+    /// delegation, in the broker's home namespace whichever namespace the sandbox is in.
+    async fn delete_secrets_of(&self, sandbox_uid: Uuid) -> Result<(), StoreError> {
+        let held = self
+            .secrets()
+            .list(&ListParams::default().labels(&format!("{SANDBOX_UID_LABEL}={sandbox_uid}")))
+            .await
+            .map_err(|e| backend(&e))?;
+        for secret in &held.items {
+            match self
+                .secrets()
+                .delete(&secret.name_any(), &DeleteParams::default())
+                .await
+            {
+                Ok(_) => {}
+                Err(e) if is_not_found(&e) => {}
+                Err(e) => return Err(backend(&e)),
+            }
+        }
+        // The session by name too, for one written before the label existed.
+        match self
+            .secrets()
+            .delete(&session_name(sandbox_uid), &DeleteParams::default())
+            .await
+        {
+            Ok(_) => {}
+            Err(e) if is_not_found(&e) => {}
+            Err(e) => return Err(backend(&e)),
+        }
+        Ok(())
+    }
+
     /// Every sandbox carrying a record.
     async fn sandboxes_with_records(&self) -> Result<Vec<AgentSandbox>, StoreError> {
         Ok(self
@@ -529,6 +561,12 @@ fn record_status_from(rec: &ClaimRecord) -> RecordStatus {
     }
 }
 
+/// The namespace a sandbox lives in (ADR-0046 decision 9): the resource's own is the truth.
+pub(crate) fn namespace_of(sb: &AgentSandbox) -> String {
+    sb.namespace()
+        .unwrap_or_else(|| mediatore_store::FALLBACK_NAMESPACE.to_owned())
+}
+
 /// The record a sandbox and its `status.record` describe, without the envelope.
 fn record_from(sb: &AgentSandbox, status: &RecordStatus) -> Result<ClaimRecord, StoreError> {
     let uid = Uuid::parse_str(&status.claim_uid)
@@ -538,6 +576,7 @@ fn record_from(sb: &AgentSandbox, status: &RecordStatus) -> Result<ClaimRecord, 
     Ok(ClaimRecord {
         uid,
         name: sb.name_any(),
+        namespace: namespace_of(sb),
         subject: Subject::from(&sb.spec.subject),
         entry_id: status.entry_id.clone(),
         node_id: status.node_id.clone(),
@@ -802,13 +841,17 @@ impl ClaimStore for KubeStore {
         self.record_of(&sb).await
     }
 
-    async fn get_claim_by_name(&self, name: &str) -> Result<ClaimRecord, StoreError> {
-        // By name across namespaces: the newest sandbox of that name carrying a record.
+    async fn get_claim_by_name(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> Result<ClaimRecord, StoreError> {
+        // By name in that namespace only: the newest sandbox of that name carrying a record.
         let sb = self
             .sandboxes_with_records()
             .await?
             .into_iter()
-            .filter(|sb| sb.name_any() == name)
+            .filter(|sb| sb.name_any() == name && sb.namespace().as_deref() == Some(namespace))
             .max_by_key(|sb| sb.metadata.creation_timestamp.clone().map(|t| t.0))
             .ok_or_else(|| StoreError::NotFound(name.to_owned()))?;
         self.record_of(&sb).await
@@ -974,16 +1017,10 @@ impl ClaimStore for KubeStore {
                 exit = ?rec.exit.as_ref().map(|x| (x.exit.code, x.exit.signal, x.exit.restarts)),
                 "claim swept after its retention (ADR-0034 decision 4): the audit line"
             );
-            // The session goes with the sandbox: by owner reference when they share the
-            // namespace, by this delete otherwise.
-            if let Some(sandbox_uid) = rec.sandbox_uid
-                && let Err(e) = self
-                    .secrets()
-                    .delete(&session_name(sandbox_uid), &DeleteParams::default())
-                    .await
-                && !is_not_found(&e)
-            {
-                return Err(backend(&e));
+            // The session and every delegation go with the sandbox: by owner reference when
+            // they share the namespace, by this delete otherwise (ADR-0046 decision 9).
+            if let Some(sandbox_uid) = rec.sandbox_uid {
+                self.delete_secrets_of(sandbox_uid).await?;
             }
             if sb.metadata.deletion_timestamp.is_none()
                 && let Err(e) = self
@@ -1285,6 +1322,248 @@ mod tests {
         );
     }
 
+    /// A fake Kubernetes API for the Secret tests: sandboxes in a tenant namespace, Secrets in
+    /// the broker's home namespace, every request recorded.
+    mod fake {
+        use super::*;
+        use http::{Request, Response};
+        use http_body_util::BodyExt as _;
+        use kube::client::Body;
+        use std::sync::{Arc, Mutex};
+
+        pub const HOME: &str = "infra";
+        pub const TENANT: &str = "team-a";
+
+        #[derive(Default)]
+        pub struct State {
+            pub sandboxes: Vec<serde_json::Value>,
+            pub secrets: Vec<serde_json::Value>,
+            pub log: Vec<(String, String)>,
+        }
+
+        pub fn store(state: &Arc<Mutex<State>>) -> KubeStore {
+            let (svc, mut handle) = tower_test::mock::pair::<Request<Body>, Response<Body>>();
+            let state = Arc::clone(state);
+            tokio::spawn(async move {
+                while let Some((req, send)) = handle.next_request().await {
+                    let method = req.method().as_str().to_owned();
+                    let path = req.uri().path().to_owned();
+                    let query = req
+                        .uri()
+                        .query()
+                        .unwrap_or("")
+                        .replace("%3D", "=")
+                        .replace("%2C", ",")
+                        .replace("%2F", "/");
+                    let _ = req.into_body().collect().await;
+                    let (code, body) = answer(&mut state.lock().unwrap(), &method, &path, &query);
+                    state.lock().unwrap().log.push((method, path));
+                    send.send_response(
+                        Response::builder()
+                            .status(code)
+                            .header("content-type", "application/json")
+                            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                            .unwrap(),
+                    );
+                }
+            });
+            KubeStore::new(Client::new(svc, HOME))
+        }
+
+        fn matches(secret: &serde_json::Value, selector: &str) -> bool {
+            selector
+                .split(',')
+                .filter(|c| !c.is_empty())
+                .all(|c| match c.split_once('=') {
+                    Some((k, v)) => secret["metadata"]["labels"][k] == v,
+                    None => secret["metadata"]["labels"].get(c).is_some(),
+                })
+        }
+
+        fn answer(
+            st: &mut State,
+            method: &str,
+            path: &str,
+            query: &str,
+        ) -> (u16, serde_json::Value) {
+            let selector = query
+                .split('&')
+                .find_map(|p| p.strip_prefix("labelSelector="))
+                .unwrap_or("");
+            if path.contains("/agentsandboxes") {
+                let sb = st.sandboxes[0].clone();
+                return match (method, path.ends_with("/agentsandboxes")) {
+                    ("GET", true) => (
+                        200,
+                        serde_json::json!({"apiVersion": "mediatore.io/v1alpha1",
+                            "kind": "AgentSandboxList", "metadata": {"resourceVersion": "1"},
+                            "items": st.sandboxes}),
+                    ),
+                    _ => (200, sb),
+                };
+            }
+            let rest = path.strip_prefix("/api/v1/namespaces/").unwrap_or("");
+            let (ns, rest) = rest.split_once("/secrets").unwrap_or(("", ""));
+            let name = rest.trim_start_matches('/');
+            let at = |s: &serde_json::Value| {
+                s["metadata"]["namespace"] == ns
+                    && (name.is_empty() || s["metadata"]["name"] == name)
+            };
+            match (method, name.is_empty()) {
+                ("GET", true) => (
+                    200,
+                    serde_json::json!({"apiVersion": "v1", "kind": "SecretList",
+                        "metadata": {"resourceVersion": "1"},
+                        "items": st.secrets.iter().filter(|s| at(s) && matches(s, selector)).collect::<Vec<_>>()}),
+                ),
+                ("GET" | "DELETE", false) => {
+                    let Some(i) = st.secrets.iter().position(at) else {
+                        return (
+                            404,
+                            serde_json::json!({"apiVersion": "v1", "kind": "Status", "status": "Failure",
+                                "reason": "NotFound", "code": 404, "message": "not found", "metadata": {}}),
+                        );
+                    };
+                    let found = if method == "DELETE" {
+                        st.secrets.remove(i)
+                    } else {
+                        st.secrets[i].clone()
+                    };
+                    (200, found)
+                }
+                _ => (
+                    500,
+                    serde_json::json!({"apiVersion": "v1", "kind": "Status", "status": "Failure",
+                        "code": 500, "message": format!("unexpected {method} {path}"), "metadata": {}}),
+                ),
+            }
+        }
+
+        fn home_secret(sandbox: Uuid, audience: Option<&str>) -> serde_json::Value {
+            let mut v = serde_json::to_value(session_secret(
+                &SessionRecord {
+                    sandbox_uid: sandbox,
+                    subject: Subject {
+                        issuer: "https://idp.example".into(),
+                        id: "octocat".into(),
+                        display: None,
+                    },
+                    issuer: String::new(),
+                    refresh: Sealed {
+                        key_id: "k1".into(),
+                        nonce: vec![1],
+                        ciphertext: vec![2],
+                    },
+                    created_at: Utc::now(),
+                    audience: audience.map(str::to_owned),
+                    expires_at: None,
+                },
+                "claimed",
+            ))
+            .unwrap();
+            v["apiVersion"] = "v1".into();
+            v["kind"] = "Secret".into();
+            v["metadata"]["namespace"] = HOME.into();
+            v
+        }
+
+        /// A sandbox in the tenant namespace with a record, its session Secret and one
+        /// delegation Secret in the home namespace.
+        pub fn seed(revoked: bool) -> (Arc<Mutex<State>>, Uuid) {
+            let claim = Uuid::new_v4();
+            let sandbox = Uuid::new_v4();
+            let mut sb = serde_json::to_value(AgentSandbox::new(
+                "sb-1",
+                crate::sandbox::AgentSandboxSpec {
+                    subject: crate::sandbox::SandboxSubject {
+                        issuer: "https://idp.example".into(),
+                        id: "octocat".into(),
+                        display: None,
+                    },
+                    pool_ref: Some(banlieue_api::common::LocalObjectReference {
+                        name: "pool-a".into(),
+                    }),
+                    pool_selector: None,
+                    ttl_seconds: 600,
+                    audiences: vec![],
+                    workload: crate::sandbox::SandboxWorkload {
+                        image: "registry.internal:5000/x:1".into(),
+                        args: vec!["/bin/x".into()],
+                        restart: None,
+                    },
+                    policy_ref: None,
+                },
+            ))
+            .unwrap();
+            sb["metadata"] = serde_json::json!({
+                "name": "sb-1", "namespace": TENANT, "uid": sandbox.to_string(),
+                "labels": { CLAIM_UID_LABEL: claim.to_string() },
+                "finalizers": [FINALIZER],
+            });
+            let mut record = serde_json::json!({
+                "claimUid": claim.to_string(),
+                "createdAt": "2026-01-01T00:00:00Z",
+                "refresh": true,
+                "delegations": [{ "audience": "api.example" }],
+            });
+            if revoked {
+                record["revokedAt"] = "2026-01-01T01:00:00Z".into();
+            }
+            sb["status"] = serde_json::json!({ "record": record });
+            let st = State {
+                sandboxes: vec![sb],
+                secrets: vec![
+                    home_secret(sandbox, None),
+                    home_secret(sandbox, Some("api.example")),
+                ],
+                log: vec![],
+            };
+            (Arc::new(Mutex::new(st)), claim)
+        }
+
+        pub fn assert_only_home_secrets(st: &State) {
+            for (m, p) in &st.log {
+                if p.contains("/secrets") {
+                    assert!(
+                        p.starts_with(&format!("/api/v1/namespaces/{HOME}/secrets")),
+                        "{m} {p}: a Secret outside the broker's namespace"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn releasing_a_claim_in_a_tenant_namespace_deletes_its_session_and_delegation_secrets() {
+        let (state, claim) = fake::seed(false);
+        assert_eq!(state.lock().unwrap().secrets.len(), 2);
+        let store = fake::store(&state);
+        store.revoke_claim(claim, Utc::now()).await.unwrap();
+        let st = state.lock().unwrap();
+        assert!(st.secrets.is_empty(), "left: {:?}", st.secrets);
+        fake::assert_only_home_secrets(&st);
+    }
+
+    #[tokio::test]
+    async fn the_sweep_removes_a_tenant_sandboxs_secrets_when_the_release_was_missed() {
+        let (state, _claim) = fake::seed(true);
+        let store = fake::store(&state);
+        let swept = store.sweep(Utc::now()).await.unwrap();
+        assert_eq!(swept, 1);
+        let st = state.lock().unwrap();
+        assert!(st.secrets.is_empty(), "left: {:?}", st.secrets);
+        fake::assert_only_home_secrets(&st);
+    }
+
+    #[tokio::test]
+    async fn a_lookup_by_name_reads_only_its_namespace() {
+        let (state, _claim) = fake::seed(false);
+        let store = fake::store(&state);
+        assert!(store.get_claim_by_name("team-b", "sb-1").await.is_err());
+        let rec = store.get_claim_by_name(fake::TENANT, "sb-1").await.unwrap();
+        assert_eq!(rec.namespace, fake::TENANT);
+    }
+
     #[test]
     fn the_node_label_fits_a_label_value_and_differs_per_node() {
         let a = node_label("spiffe://sandbox.test/spire/agent/tpm/aaaa");
@@ -1295,6 +1574,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one record literal with every field, kept whole"
+    )]
     fn a_record_round_trips_through_the_status_and_the_secret_shapes() {
         let uid = Uuid::new_v4();
         let sandbox_uid = Uuid::new_v4();
@@ -1329,6 +1612,7 @@ mod tests {
         let rec = ClaimRecord {
             uid,
             name: "sandbox-abc".into(),
+            namespace: "sandboxes".into(),
             subject: Subject::from(&sb.spec.subject),
             entry_id: Some("entry-1".into()),
             node_id: Some("spiffe://sandbox.test/spire/agent/tpm/aaaa".into()),

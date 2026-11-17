@@ -21,7 +21,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -109,8 +109,9 @@ pub struct AppState {
     /// `dev_mode`, where the store and the dev binder stand in. Absent outside `dev_mode`,
     /// the claim endpoints fail closed with `501`.
     pub sandboxes: Option<Arc<dyn SandboxFrontDoor>>,
-    /// Namespace `POST /v1/claims` creates sandboxes in; the pool must live there.
-    pub sandbox_namespace: String,
+    /// Where `POST /v1/claims` may create sandboxes, and who may reach them (ADR-0046); the
+    /// pool must live in the resolved namespace.
+    pub namespaces: Namespaces,
     /// Seals refresh material before it reaches the store (ADR-0012 decision 3); `None`
     /// until `store.sealing` is configured. Roadmap 04 brings its first caller.
     pub sealer: Option<Arc<dyn Sealer>>,
@@ -131,6 +132,116 @@ pub struct AppState {
     /// `gateway_inject_port` (ADR-0040 decision 7): the port of the gateways' inject listener,
     /// carried on every route of a gateway-placed audience on `GET /v1/me`.
     pub inject_port: Option<u16>,
+}
+
+/// Which namespaces the user API serves and who may use each (ADR-0046 decisions 3 to 5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Namespaces {
+    /// Today's form: `sandboxes.namespace` only; every caller who passed the issuer gate may
+    /// claim here.
+    Single(String),
+    /// `sandboxes.namespaces`: namespace -> groups (any-of, exact). With the map set there is
+    /// no default namespace.
+    Map(BTreeMap<String, Vec<String>>),
+}
+
+/// Why a namespace was refused. One rendering per variant, so the response carries nothing
+/// that separates an unlisted namespace from an unqualified one (ADR-0046 decision 6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NsDenied {
+    /// A map is set and the request named no namespace: `400 namespace_required`.
+    Required,
+    /// Not an RFC 1123 label: `400 invalid_namespace`.
+    Invalid,
+    /// Create only: unlisted or unqualified, carrying the value the caller sent: `403`.
+    Forbidden(String),
+    /// Get and delete only: unlisted or unqualified, the answer for "no such sandbox": `404`.
+    NotFound,
+}
+
+impl NsDenied {
+    /// The `4xx` answer.
+    fn into_error(self) -> ApiError {
+        match self {
+            Self::Required => ApiError::bad_request(
+                error_code::NAMESPACE_REQUIRED,
+                "this broker needs a namespace; send `namespace`",
+            ),
+            Self::Invalid => ApiError::bad_request(
+                error_code::INVALID_NAMESPACE,
+                "namespace must be a lowercase RFC 1123 label",
+            ),
+            Self::Forbidden(ns) => ApiError::forbidden(format!(
+                "not permitted to create sandboxes in namespace {ns}"
+            )),
+            Self::NotFound => ApiError::not_found("no such sandbox"),
+        }
+    }
+}
+
+impl Namespaces {
+    /// The namespace a create targets (decision 4). A malformed name is refused first, from
+    /// the string alone.
+    ///
+    /// # Errors
+    /// [`NsDenied`] when the name is malformed, missing with a map, unlisted, or the groups
+    /// do not intersect the namespace's.
+    pub fn resolve_for_create(
+        &self,
+        requested: Option<&str>,
+        groups: &[String],
+    ) -> Result<String, NsDenied> {
+        if let Some(r) = requested
+            && !mediatore_proto::is_dns_label(r)
+        {
+            return Err(NsDenied::Invalid);
+        }
+        match (self, requested) {
+            (Self::Single(ns), None) => Ok(ns.clone()),
+            (Self::Single(ns), Some(r)) if r == ns => Ok(ns.clone()),
+            (Self::Single(_), Some(r)) => Err(NsDenied::Forbidden(r.to_owned())),
+            (Self::Map(_), None) => Err(NsDenied::Required),
+            (Self::Map(_), Some(r)) => {
+                if self.matched_group(r, groups).is_some() {
+                    Ok(r.to_owned())
+                } else {
+                    Err(NsDenied::Forbidden(r.to_owned()))
+                }
+            }
+        }
+    }
+
+    /// The namespace an existing claim is looked up in (decision 5): the same resolution, but
+    /// unlisted and unqualified are both [`NsDenied::NotFound`].
+    ///
+    /// # Errors
+    /// [`NsDenied`] as for a create, with `NotFound` in place of `Forbidden`.
+    pub fn authorise_existing(
+        &self,
+        requested: Option<&str>,
+        groups: &[String],
+    ) -> Result<String, NsDenied> {
+        self.resolve_for_create(requested, groups)
+            .map_err(|d| match d {
+                NsDenied::Forbidden(_) => NsDenied::NotFound,
+                other => other,
+            })
+    }
+
+    /// The listed group of `namespace` the caller holds, for the audit line: a configuration
+    /// value, never the caller's group list. `None` when unlisted or unqualified, and for the
+    /// single form, which has no listed group.
+    #[must_use]
+    pub fn matched_group<'a>(&'a self, namespace: &str, groups: &[String]) -> Option<&'a str> {
+        match self {
+            Self::Single(_) => None,
+            Self::Map(m) => m
+                .get(namespace)?
+                .iter()
+                .find(|l| mediatore_entra::groups_intersect(groups, std::slice::from_ref(l)))
+                .map(String::as_str),
+        }
+    }
 }
 
 /// The per-claim gate on `POST /v1/token`: a token bucket (`per_minute` issues a minute,
@@ -394,6 +505,10 @@ async fn create_claim(
 ) -> Result<(StatusCode, Json<ClaimResponse>), ApiError> {
     let bearer_token = bearer(&headers)?.to_owned();
     let validated = caller(&st, &headers).await?;
+    // The namespace first (ADR-0046 decision 4): nothing is parked or written for a refusal.
+    // In `dev_mode` the same check runs on the dev token's groups (decision 12): the testkit's
+    // fake IdP puts the groups it was given in the token, and no header supplies any.
+    let namespace = resolve_create(&st, &validated, req.namespace.as_deref())?;
     // Exactly one of pool_ref and pool_selector (ADR-0044 decision 2): the CRD would refuse
     // the sandbox; say so now, and never read "neither" as "any pool".
     req.pool()
@@ -438,6 +553,7 @@ async fn create_claim(
             &st,
             &validated,
             &name,
+            &namespace,
             &req,
             sealer.as_deref(),
             session.as_ref(),
@@ -451,11 +567,56 @@ async fn create_claim(
         &validated,
         &req,
         name,
+        namespace,
         sealer.as_deref(),
         session.as_ref(),
         &delegations,
     )
     .await
+}
+
+/// Resolve a create's namespace and write the audit line (ADR-0046 decision 13): subject,
+/// issuer, requested (`omitted` when none), resolved, decision and the listed group matched.
+/// Never a token and never the caller's group list.
+fn resolve_create(
+    st: &AppState,
+    validated: &Validated,
+    requested: Option<&str>,
+) -> Result<String, ApiError> {
+    let result = st
+        .namespaces
+        .resolve_for_create(requested, &validated.groups);
+    let shown = requested.unwrap_or("omitted");
+    match &result {
+        Ok(ns) => {
+            let matched = st
+                .namespaces
+                .matched_group(ns, &validated.groups)
+                .unwrap_or("open");
+            tracing::info!(subject = %validated.subject.id, issuer = %validated.subject.issuer, requested = %shown, namespace = %ns, decision = "allowed", matched_group = %matched, "namespace decision");
+        }
+        Err(_) => {
+            tracing::info!(subject = %validated.subject.id, issuer = %validated.subject.issuer, requested = %shown, decision = "denied", "namespace decision");
+        }
+    }
+    result.map_err(NsDenied::into_error)
+}
+
+/// The namespace of an existing claim, for `GET` and `DELETE` (decision 5), before any read.
+fn resolve_existing(
+    st: &AppState,
+    validated: &Validated,
+    requested: Option<&str>,
+) -> Result<String, ApiError> {
+    st.namespaces
+        .authorise_existing(requested, &validated.groups)
+        .map_err(NsDenied::into_error)
+}
+
+/// `?namespace=` on `GET` and `DELETE /v1/claims/{name}`.
+#[derive(serde::Deserialize, Default)]
+struct NamespaceQuery {
+    namespace: Option<String>,
 }
 
 /// Which pool a validated request asks for, for the log line (ADR-0044 decision 5): a name,
@@ -466,11 +627,14 @@ fn pool_of(req: &ClaimRequest) -> String {
 
 /// `dev_mode`: the record written by the API itself and bound by the dev binder, no
 /// resource; the envelopes bind to the record's UID.
+// One argument over the limit: the resolved namespace joins the request's parts.
+#[allow(clippy::too_many_arguments)]
 async fn dev_claim(
     st: &AppState,
     validated: &Validated,
     req: &ClaimRequest,
     name: String,
+    namespace: String,
     sealer: Option<&dyn Sealer>,
     session: Option<&Secret>,
     delegations: &[Delegation],
@@ -518,6 +682,7 @@ async fn dev_claim(
             report: None,
             exit: None,
             delegations: dev_delegations,
+            namespace,
         })
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
@@ -554,6 +719,7 @@ fn record_response(rec: &ClaimRecord) -> ClaimResponse {
         report: rec.report.clone(),
         exit: rec.exit.clone(),
         sandbox_uid: rec.sandbox_uid,
+        namespace: Some(rec.namespace.clone()),
     }
 }
 
@@ -715,10 +881,13 @@ async fn seal_delegation(
 /// in the configured namespace, `spec.subject` from the validated token. mediatore's
 /// `ServiceAccount` is exempt from the subject admission check for exactly this, so the
 /// token validation above is the control.
+// One argument over the limit: the resolved namespace joins the request's parts.
+#[allow(clippy::too_many_arguments)]
 async fn create_sandbox(
     st: &AppState,
     validated: &Validated,
     name: &str,
+    namespace: &str,
     req: &ClaimRequest,
     sealer: Option<&dyn Sealer>,
     session: Option<&Secret>,
@@ -747,9 +916,9 @@ async fn create_sandbox(
                 .map(|name| LocalObjectReference { name }),
         },
     );
-    sandbox.metadata.namespace = Some(st.sandbox_namespace.clone());
+    sandbox.metadata.namespace = Some(namespace.to_owned());
     let created = front.create(sandbox).await?;
-    tracing::info!(subject = %validated.subject.id, pool = %pool_of(req), sandbox = %name, namespace = %st.sandbox_namespace, "sandbox created");
+    tracing::info!(subject = %validated.subject.id, pool = %pool_of(req), sandbox = %name, %namespace, "sandbox created");
     // ADR-0013 decision 2: the session is parked under the sandbox's UID, sealed with it,
     // before the caller hears back; a failure here undoes the resource. ADR-0035: each
     // delegation the same way, one Secret per audience.
@@ -765,7 +934,7 @@ async fn create_sandbox(
     };
     if let Err(e) = parked {
         tracing::warn!(sandbox = %name, error = %e, "session not parked; sandbox withdrawn");
-        if let Err(d) = front.delete(&st.sandbox_namespace, name).await {
+        if let Err(d) = front.delete(namespace, name).await {
             tracing::warn!(sandbox = %name, error = %d, "sandbox withdrawal failed");
         }
         return Err(match e.downcast::<SealError>() {
@@ -773,7 +942,9 @@ async fn create_sandbox(
             Err(_) => ApiError::internal("session could not be stored"),
         });
     }
-    Ok((StatusCode::CREATED, Json(response_of(&created))))
+    let mut resp = response_of(&created);
+    resp.namespace = Some(namespace.to_owned());
+    Ok((StatusCode::CREATED, Json(resp)))
 }
 
 /// When a parked delegation's envelope stops being stored (the operator's rule, 2026-11-15, ADR-0043
@@ -877,25 +1048,29 @@ fn response_of(sb: &AgentSandbox) -> ClaimResponse {
             .uid
             .as_deref()
             .and_then(|u| Uuid::parse_str(u).ok()),
+        namespace: sb.metadata.namespace.clone(),
     }
 }
 
-/// Fetch a sandbox by name and require the caller to be its subject. A sandbox that does
-/// not exist and one that belongs to someone else are told apart (404 / 403): the names
-/// are random and the subject check is the control, not obscurity.
+/// Fetch a sandbox by name in its namespace and require the caller to be in that namespace's
+/// groups and to be its subject (ADR-0046 decision 5). A namespace the caller may not use is
+/// `404`, before any read; a sandbox that does not exist and one that belongs to someone else
+/// are told apart (404 / 403): the names are random and the subject check is the control.
 async fn owned_sandbox(
     st: &AppState,
     headers: &HeaderMap,
+    namespace: Option<&str>,
     name: &str,
-) -> Result<AgentSandbox, ApiError> {
+) -> Result<(String, AgentSandbox), ApiError> {
     let validated = caller(st, headers).await?;
+    let namespace = resolve_existing(st, &validated, namespace)?;
     let Some(front) = st.sandboxes.as_ref() else {
         return Err(ApiError::not_implemented(
             "claim lookup via the kubernetes api",
         ));
     };
     let sb = front
-        .get(&st.sandbox_namespace, name)
+        .get(&namespace, name)
         .await?
         .ok_or_else(|| ApiError::not_found(format!("no sandbox named {name}")))?;
     if sb.spec.subject.issuer != validated.subject.issuer
@@ -903,19 +1078,21 @@ async fn owned_sandbox(
     {
         return Err(ApiError::forbidden("claim belongs to another subject"));
     }
-    Ok(sb)
+    Ok((namespace, sb))
 }
 
-/// Fetch a claim by name and require the caller to be its subject.
+/// `dev_mode`: the same checks over the store's record.
 async fn owned_claim(
     st: &AppState,
     headers: &HeaderMap,
+    namespace: Option<&str>,
     name: &str,
 ) -> Result<ClaimRecord, ApiError> {
     let validated = caller(st, headers).await?;
+    let namespace = resolve_existing(st, &validated, namespace)?;
     let rec = st
         .store
-        .get_claim_by_name(name)
+        .get_claim_by_name(&namespace, name)
         .await
         .map_err(|e| ApiError::not_found(e.to_string()))?;
     if rec.subject.issuer != validated.subject.issuer || rec.subject.id != validated.subject.id {
@@ -928,19 +1105,21 @@ async fn get_claim(
     State(st): State<Shared>,
     headers: HeaderMap,
     Path(name): Path<String>,
+    Query(q): Query<NamespaceQuery>,
 ) -> Result<Json<ClaimResponse>, ApiError> {
     if !st.dev_mode {
-        let sb = owned_sandbox(&st, &headers, &name).await?;
+        let (namespace, sb) = owned_sandbox(&st, &headers, q.namespace.as_deref(), &name).await?;
         let mut resp = response_of(&sb);
+        resp.namespace = Some(namespace.clone());
         // The guest's report lives on the record (ADR-0029 decision 5), not on the
         // resource; a record not yet written is simply no report.
-        if let Ok(rec) = st.store.get_claim_by_name(&name).await {
+        if let Ok(rec) = st.store.get_claim_by_name(&namespace, &name).await {
             resp.report = rec.report;
             resp.exit = rec.exit;
         }
         return Ok(Json(resp));
     }
-    let rec = owned_claim(&st, &headers, &name).await?;
+    let rec = owned_claim(&st, &headers, q.namespace.as_deref(), &name).await?;
     Ok(Json(record_response(&rec)))
 }
 
@@ -948,25 +1127,26 @@ async fn delete_claim(
     State(st): State<Shared>,
     headers: HeaderMap,
     Path(name): Path<String>,
+    Query(q): Query<NamespaceQuery>,
 ) -> Result<StatusCode, ApiError> {
     if !st.dev_mode {
-        let sb = owned_sandbox(&st, &headers, &name).await?;
+        let (namespace, sb) = owned_sandbox(&st, &headers, q.namespace.as_deref(), &name).await?;
         // The reconciler's finalizer retracts the entry, revokes the record and deletes
         // the claim (ADR-0008 decision 10); the API only asks.
         st.sandboxes
             .as_ref()
             .ok_or_else(|| ApiError::not_implemented("claim deletion via the kubernetes api"))?
-            .delete(&st.sandbox_namespace, &name)
+            .delete(&namespace, &name)
             .await?;
-        tracing::info!(sandbox = %name, subject = %sb.spec.subject.id, "sandbox deleted by its subject");
+        tracing::info!(sandbox = %name, %namespace, subject = %sb.spec.subject.id, "sandbox deleted by its subject");
         return Ok(StatusCode::NO_CONTENT);
     }
-    let rec = owned_claim(&st, &headers, &name).await?;
+    let rec = owned_claim(&st, &headers, q.namespace.as_deref(), &name).await?;
     reconciler(&st)
         .release(rec.uid)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
-    tracing::info!(uid = %rec.uid, "claim released by its subject");
+    tracing::info!(uid = %rec.uid, namespace = %rec.namespace, "claim released by its subject");
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1110,7 +1290,7 @@ async fn exit(
         st.sandboxes
             .as_ref()
             .ok_or_else(|| ApiError::not_implemented("claim release via the kubernetes api"))?
-            .delete(&st.sandbox_namespace, &rec.name)
+            .delete(&rec.namespace, &rec.name)
             .await?;
     }
     Ok(StatusCode::NO_CONTENT)
@@ -2066,7 +2246,7 @@ mod tests {
             reachable_registries: None,
             policy_egress: None,
             sandboxes: None,
-            sandbox_namespace: "sandboxes".into(),
+            namespaces: Namespaces::Single("sandboxes".into()),
             sealer: None,
             limiter: Limiter::new(10),
             dev_mode: true,
@@ -2189,6 +2369,7 @@ mod tests {
             report: None,
             exit: None,
             delegations: BTreeMap::new(),
+            namespace: "sandboxes".into(),
         }
     }
 
@@ -2993,6 +3174,867 @@ mod tests {
                 !logs.contains(secret_bytes),
                 "the credential must never reach a log line, found {secret_bytes:?} in:\n{logs}"
             );
+        }
+    }
+
+    // ----- ADR-0046: who may claim where --------------------------------------------------------------------------
+
+    use mediatore_claims::sandbox::SandboxFrontDoor;
+    use mediatore_entra::{Backend, IssuerConfig};
+    use mediatore_testkit::FakeIdp;
+    use mediatore_testkit::sandboxes::MemorySandboxes;
+
+    const TEAM_A: &str = "APP_EXAMPLE_TEAM_A_USER";
+    const ADMIN: &str = "example-org:APP_EXAMPLE_ADMIN";
+
+    fn tenant_map() -> Namespaces {
+        Namespaces::Map(BTreeMap::from([
+            ("infra".to_owned(), vec![ADMIN.to_owned()]),
+            ("team-a".to_owned(), vec![TEAM_A.to_owned()]),
+        ]))
+    }
+
+    /// A front door that counts the reads it is asked for and forwards to the in-memory API.
+    struct Counting {
+        inner: Arc<MemorySandboxes>,
+        gets: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl SandboxFrontDoor for Counting {
+        async fn create(&self, sandbox: AgentSandbox) -> Result<AgentSandbox, FrontDoorError> {
+            self.inner.create(sandbox).await
+        }
+        async fn get(&self, ns: &str, name: &str) -> Result<Option<AgentSandbox>, FrontDoorError> {
+            self.gets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.get(ns, name).await
+        }
+        async fn delete(&self, ns: &str, name: &str) -> Result<(), FrontDoorError> {
+            self.inner.delete(ns, name).await
+        }
+    }
+
+    struct Broker {
+        idp: FakeIdp,
+        st: Shared,
+        front: Arc<MemorySandboxes>,
+        counting: Arc<Counting>,
+    }
+
+    async fn broker(namespaces: Namespaces, dev_mode: bool) -> Broker {
+        let idp = FakeIdp::start().await;
+        let front = Arc::new(MemorySandboxes::default());
+        let counting = Arc::new(Counting {
+            inner: front.clone(),
+            gets: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut st = base_state();
+        st.validator = Validator::new(vec![IssuerConfig {
+            url: idp.issuer.clone(),
+            backend: Backend::Sts,
+            client_id: "mediatore".into(),
+            subject_claim: "preferred_username".into(),
+            required_group: None,
+            required_groups: None,
+            allow_any_authenticated: true,
+            session: None,
+            ca_file: None,
+            entra: None,
+            groups_claim: None,
+        }]);
+        st.namespaces = namespaces;
+        st.dev_mode = dev_mode;
+        if !dev_mode {
+            st.sandboxes = Some(counting.clone());
+        }
+        Broker {
+            idp,
+            st: Arc::new(st),
+            front,
+            counting,
+        }
+    }
+
+    impl Broker {
+        fn token(&self, login: &str, groups: &[&str]) -> String {
+            self.idp.token(serde_json::json!({
+                "aud": "mediatore",
+                "sub": login,
+                "preferred_username": login,
+                "groups": groups,
+            }))
+        }
+
+        fn reads(&self) -> usize {
+            self.counting.gets.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        async fn user(
+            &self,
+            method: &str,
+            uri: &str,
+            token: &str,
+            extra: &[(&str, &str)],
+            body: serde_json::Value,
+        ) -> (StatusCode, serde_json::Value, String) {
+            let mut req = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {token}"));
+            for (k, v) in extra {
+                req = req.header(*k, *v);
+            }
+            let resp = user_router(self.st.clone())
+                .oneshot(req.body(Body::from(body.to_string())).unwrap())
+                .await
+                .unwrap();
+            let status = resp.status();
+            let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            let text = String::from_utf8_lossy(&bytes).into_owned();
+            (
+                status,
+                serde_json::from_str(&text).unwrap_or(serde_json::Value::Null),
+                text,
+            )
+        }
+
+        async fn create(
+            &self,
+            token: &str,
+            namespace: Option<&str>,
+        ) -> (StatusCode, serde_json::Value, String) {
+            self.user("POST", "/v1/claims", token, &[], request(namespace))
+                .await
+        }
+
+        async fn get(
+            &self,
+            token: &str,
+            name: &str,
+            namespace: Option<&str>,
+        ) -> (StatusCode, serde_json::Value, String) {
+            self.user(
+                "GET",
+                &claim_uri(name, namespace),
+                token,
+                &[],
+                serde_json::Value::Null,
+            )
+            .await
+        }
+
+        async fn delete(
+            &self,
+            token: &str,
+            name: &str,
+            namespace: Option<&str>,
+        ) -> (StatusCode, serde_json::Value, String) {
+            self.user(
+                "DELETE",
+                &claim_uri(name, namespace),
+                token,
+                &[],
+                serde_json::Value::Null,
+            )
+            .await
+        }
+    }
+
+    fn claim_uri(name: &str, namespace: Option<&str>) -> String {
+        namespace.map_or_else(
+            || format!("/v1/claims/{name}"),
+            |ns| format!("/v1/claims/{name}?namespace={ns}"),
+        )
+    }
+
+    fn request(namespace: Option<&str>) -> serde_json::Value {
+        request_for_pool(
+            namespace,
+            None,
+            Some(mediatore_proto::PoolSelector::default()),
+        )
+    }
+
+    fn request_for_pool(
+        namespace: Option<&str>,
+        pool_ref: Option<&str>,
+        pool_selector: Option<mediatore_proto::PoolSelector>,
+    ) -> serde_json::Value {
+        serde_json::to_value(ClaimRequest {
+            namespace: namespace.map(str::to_owned),
+            pool_ref: pool_ref.map(str::to_owned),
+            pool_selector,
+            ttl_seconds: 600,
+            audiences: vec![],
+            workload: mediatore_proto::Workload {
+                image: "registry.example/sandbox:1".into(),
+                ..mediatore_proto::Workload::default()
+            },
+            refresh_token: None,
+            policy_ref: None,
+            delegations: vec![],
+        })
+        .unwrap()
+    }
+
+    /// The name of the claim a `201` answered.
+    fn created(r: &(StatusCode, serde_json::Value, String)) -> String {
+        assert_eq!(r.0, StatusCode::CREATED, "{}", r.2);
+        r.1["name"].as_str().unwrap().to_owned()
+    }
+
+    // ----- Namespaces, on their own -----
+
+    #[test]
+    fn the_single_form_resolves_an_omitted_or_equal_namespace_and_refuses_any_other() {
+        let n = Namespaces::Single("sandboxes".into());
+        assert_eq!(n.resolve_for_create(None, &[]).as_deref(), Ok("sandboxes"));
+        assert_eq!(
+            n.resolve_for_create(Some("sandboxes"), &[]).as_deref(),
+            Ok("sandboxes")
+        );
+        assert_eq!(
+            n.resolve_for_create(Some("team-a"), &[]),
+            Err(NsDenied::Forbidden("team-a".into()))
+        );
+        assert_eq!(n.authorise_existing(None, &[]).as_deref(), Ok("sandboxes"));
+        assert_eq!(
+            n.authorise_existing(Some("team-a"), &[]),
+            Err(NsDenied::NotFound)
+        );
+    }
+
+    #[test]
+    fn the_map_form_needs_a_named_listed_namespace_and_a_listed_group() {
+        let n = tenant_map();
+        let held = |g: &[&str]| g.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        assert_eq!(
+            n.resolve_for_create(None, &held(&[TEAM_A])),
+            Err(NsDenied::Required)
+        );
+        assert_eq!(
+            n.resolve_for_create(Some("team-a"), &held(&[TEAM_A]))
+                .as_deref(),
+            Ok("team-a")
+        );
+        assert_eq!(
+            n.resolve_for_create(Some("team-a"), &held(&[ADMIN])),
+            Err(NsDenied::Forbidden("team-a".into()))
+        );
+        assert_eq!(
+            n.resolve_for_create(Some("Team_A"), &held(&[TEAM_A])),
+            Err(NsDenied::Invalid)
+        );
+        assert_eq!(
+            n.matched_group("team-a", &held(&["x", TEAM_A])),
+            Some(TEAM_A)
+        );
+        assert_eq!(n.matched_group("team-a", &held(&["x"])), None);
+        assert_eq!(
+            n.authorise_existing(None, &held(&[TEAM_A])),
+            Err(NsDenied::Required)
+        );
+        assert_eq!(
+            n.authorise_existing(Some("infra"), &held(&[TEAM_A])),
+            Err(NsDenied::NotFound)
+        );
+    }
+
+    // ----- create -----
+
+    #[tokio::test]
+    async fn omitting_namespace_without_a_map_targets_the_single_namespace() {
+        let b = broker(Namespaces::Single("sandboxes".into()), false).await;
+        let t = b.token("alice", &[]);
+        let r = b.create(&t, None).await;
+        created(&r);
+        assert_eq!(r.1["namespace"], "sandboxes");
+        assert_eq!(
+            b.front.all()[0].metadata.namespace.as_deref(),
+            Some("sandboxes")
+        );
+        // The one namespace may also be named; any other is the 403 of decision 6.
+        created(&b.create(&t, Some("sandboxes")).await);
+        let (status, body, _) = b.create(&t, Some("team-a")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(code(&body), "forbidden");
+        assert_eq!(b.front.all().len(), 2, "the refused request wrote nothing");
+    }
+
+    // ADR-0046 decision 8. The broker does not match pools (banlieue does, in the sandbox's own
+    // namespace, ADR-0132 there): what it controls, and what these two tests pin, is that the
+    // `AgentSandbox` it writes lands in the one resolved namespace and carries the pool fields
+    // exactly as sent, so a selector or a name can only ever be read against that namespace.
+
+    #[tokio::test]
+    async fn a_selector_in_team_a_matches_only_team_as_pools() {
+        let b = broker(tenant_map(), false).await;
+        let selector = mediatore_proto::PoolSelector {
+            match_labels: BTreeMap::from([("tier".to_owned(), "gpu".to_owned())]),
+            match_expressions: vec![],
+        };
+        let r = b
+            .user(
+                "POST",
+                "/v1/claims",
+                &b.token("alice", &[TEAM_A, ADMIN]),
+                &[],
+                request_for_pool(Some("team-a"), None, Some(selector.clone())),
+            )
+            .await;
+        created(&r);
+        let all = b.front.all();
+        assert_eq!(all.len(), 1);
+        let sb = &all[0];
+        assert_eq!(sb.metadata.namespace.as_deref(), Some("team-a"));
+        assert_eq!(sb.spec.pool_selector, Some(label_selector_of(&selector)));
+        assert!(sb.spec.pool_ref.is_none());
+        assert!(
+            b.front
+                .all()
+                .iter()
+                .all(|s| s.metadata.namespace.as_deref() != Some("infra")),
+            "nothing was written for the other listed namespace"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pool_ref_naming_another_namespaces_pool_is_carried_as_a_plain_name_in_the_resolved_namespace_only()
+     {
+        // The broker has no pool lookup: a name is a plain `LocalObjectReference`, resolved by
+        // banlieue in the sandbox's namespace, where a pool that exists only elsewhere is its
+        // `PoolNotFound`. So a name that tries to reach across (`team-b/pool`, `pool.team-b`)
+        // is carried verbatim into team-a and nowhere else; the broker writes nothing in team-b.
+        let b = broker(tenant_map(), false).await;
+        let t = b.token("alice", &[TEAM_A, ADMIN]);
+        for name in ["pool-b", "team-b/pool", "pool.team-b"] {
+            let r = b
+                .user(
+                    "POST",
+                    "/v1/claims",
+                    &t,
+                    &[],
+                    request_for_pool(Some("team-a"), Some(name), None),
+                )
+                .await;
+            created(&r);
+        }
+        let all = b.front.all();
+        assert_eq!(all.len(), 3);
+        for sb in &all {
+            assert_eq!(sb.metadata.namespace.as_deref(), Some("team-a"));
+            assert!(sb.spec.pool_selector.is_none());
+        }
+        let mut names: Vec<_> = all
+            .iter()
+            .map(|s| s.spec.pool_ref.clone().unwrap().name)
+            .collect();
+        names.sort();
+        assert_eq!(names, ["pool-b", "pool.team-b", "team-b/pool"]);
+    }
+
+    // ADR-0046 decision 14: the broker cannot know a listed namespace exists; the API server's
+    // refusal of the create is what says so. The real mapping (`front_door_error`) sends a 404
+    // to `FrontDoorError::Api`, which is a `500 internal`, not a `502` (the ADR said 502; the
+    // ADR text is corrected).
+
+    /// An API server for which the listed namespace does not exist.
+    struct NamespaceMissing;
+
+    #[async_trait::async_trait]
+    impl SandboxFrontDoor for NamespaceMissing {
+        async fn create(&self, _: AgentSandbox) -> Result<AgentSandbox, FrontDoorError> {
+            Err(FrontDoorError::Api(
+                "ApiError: namespaces \"team-a\" not found: NotFound (404)".into(),
+            ))
+        }
+        async fn get(&self, _: &str, _: &str) -> Result<Option<AgentSandbox>, FrontDoorError> {
+            Ok(None)
+        }
+        async fn delete(&self, _: &str, _: &str) -> Result<(), FrontDoorError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_listed_namespace_that_does_not_exist_fails_the_create_and_parks_nothing() {
+        let mut b = broker(tenant_map(), false).await;
+        {
+            let st = Arc::get_mut(&mut b.st).expect("the state is not shared yet");
+            st.sandboxes = Some(Arc::new(NamespaceMissing));
+            st.sealer = Some(Arc::new(mediatore_store::seal::LocalKeySealer::new(
+                [3; 32],
+            )));
+            // A session issuer, so the create has a refresh token to park were it to get that far.
+            st.validator = Validator::new(vec![IssuerConfig {
+                url: b.idp.issuer.clone(),
+                backend: Backend::Sts,
+                client_id: "mediatore".into(),
+                subject_claim: "preferred_username".into(),
+                required_group: None,
+                required_groups: None,
+                allow_any_authenticated: true,
+                session: Some(mediatore_entra::SessionConfig {
+                    client_id: "mediatore".into(),
+                    client_secret_file: None,
+                }),
+                ca_file: None,
+                entra: None,
+                groups_claim: None,
+            }]);
+        }
+        let mut body = request(Some("team-a"));
+        body["refresh_token"] = serde_json::json!("refresh-material-placeholder");
+        let (status, resp, text) = b
+            .user(
+                "POST",
+                "/v1/claims",
+                &b.token("alice", &[TEAM_A]),
+                &[],
+                body,
+            )
+            .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{text}");
+        assert_eq!(code(&resp), "internal");
+        assert!(!text.contains("refresh-material-placeholder"), "{text}");
+        // Nothing parked: the sandbox never got a UID for a session to be sealed under.
+        let far = Utc::now() + Duration::days(1);
+        assert_eq!(
+            b.st.store.sweep_sessions(far).await.unwrap(),
+            0,
+            "no session or delegation Secret is left behind"
+        );
+        assert!(b.front.all().is_empty());
+    }
+
+    #[tokio::test]
+    async fn omitting_namespace_with_a_map_is_400_namespace_required() {
+        let b = broker(tenant_map(), false).await;
+        let (status, body, _) = b.create(&b.token("alice", &[TEAM_A]), None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(code(&body), "namespace_required");
+        assert_eq!(b.front.all().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn the_400_for_a_missing_namespace_names_no_namespace() {
+        let b = broker(tenant_map(), false).await;
+        let (_, _, text) = b.create(&b.token("alice", &[TEAM_A, ADMIN]), None).await;
+        for listed in ["infra", "team-a", TEAM_A, ADMIN] {
+            assert!(!text.contains(listed), "{listed} in {text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_caller_in_two_namespaces_must_name_one() {
+        let b = broker(tenant_map(), false).await;
+        let t = b.token("alice", &[TEAM_A, ADMIN]);
+        assert_eq!(b.create(&t, None).await.0, StatusCode::BAD_REQUEST);
+        let r = b.create(&t, Some("team-a")).await;
+        created(&r);
+        assert_eq!(r.1["namespace"], "team-a");
+        let r = b.create(&t, Some("infra")).await;
+        created(&r);
+        assert_eq!(r.1["namespace"], "infra");
+        let mut at: Vec<_> = b
+            .front
+            .all()
+            .iter()
+            .map(|s| s.metadata.namespace.clone().unwrap())
+            .collect();
+        at.sort();
+        assert_eq!(at, ["infra", "team-a"]);
+    }
+
+    #[tokio::test]
+    async fn a_namespace_outside_the_map_is_403_whatever_the_groups() {
+        let b = broker(tenant_map(), false).await;
+        let t = b.token("alice", &[TEAM_A, ADMIN]);
+        for ns in ["kube-system", "sandboxes", "team-b"] {
+            let (status, body, _) = b.create(&t, Some(ns)).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{ns}");
+            assert_eq!(code(&body), "forbidden");
+        }
+        assert_eq!(b.front.all().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_namespace_value_that_is_not_a_dns_label_is_400() {
+        let b = broker(tenant_map(), false).await;
+        let t = b.token("alice", &[TEAM_A]);
+        for bad in ["Team_A", "", "a/b", "-a", &"a".repeat(64)] {
+            let (status, body, _) = b.create(&t, Some(bad)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad:?}");
+            assert_eq!(code(&body), "invalid_namespace");
+            let (status, body, _) = b.get(&t, "sandbox-x", Some(bad)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "get {bad:?}");
+            assert_eq!(code(&body), "invalid_namespace");
+        }
+        assert_eq!(
+            b.reads(),
+            0,
+            "a malformed name is refused before any lookup"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_403_for_an_unlisted_namespace_equals_the_403_for_an_unqualified_one() {
+        // "infra" is listed here and the caller does not qualify ...
+        let unqualified = broker(tenant_map(), false).await;
+        let a = unqualified
+            .create(&unqualified.token("alice", &[TEAM_A]), Some("infra"))
+            .await;
+        // ... and not listed here.
+        let only_a = Namespaces::Map(BTreeMap::from([(
+            "team-a".to_owned(),
+            vec![TEAM_A.to_owned()],
+        )]));
+        let unlisted = broker(only_a, false).await;
+        let b = unlisted
+            .create(&unlisted.token("alice", &[TEAM_A, ADMIN]), Some("infra"))
+            .await;
+        assert_eq!(a.0, StatusCode::FORBIDDEN);
+        assert_eq!(a.0, b.0);
+        assert_eq!(a.2, b.2, "byte-equal bodies");
+        assert_eq!(
+            a.1["detail"],
+            "not permitted to create sandboxes in namespace infra"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_403_body_contains_no_group_and_no_other_namespace() {
+        let b = broker(tenant_map(), false).await;
+        let (status, _, text) = b
+            .create(&b.token("alice", &["SOME_OTHER_GROUP"]), Some("infra"))
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        for leak in [TEAM_A, ADMIN, "SOME_OTHER_GROUP", "team-a"] {
+            assert!(!text.contains(leak), "{leak} in {text}");
+        }
+    }
+
+    // ----- get and delete -----
+
+    #[tokio::test]
+    async fn get_and_delete_find_a_claim_in_its_own_namespace() {
+        let b = broker(tenant_map(), false).await;
+        let t = b.token("alice", &[TEAM_A]);
+        let name = created(&b.create(&t, Some("team-a")).await);
+        let (status, body, _) = b.get(&t, &name, Some("team-a")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["namespace"], "team-a");
+        // The same name in a namespace it is not in is not found, even for a caller who qualifies.
+        let both = b.token("alice", &[TEAM_A, ADMIN]);
+        assert_eq!(
+            b.get(&both, &name, Some("infra")).await.0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            b.delete(&t, &name, Some("team-a")).await.0,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(b.front.all().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn get_without_a_namespace_and_no_map_reads_the_single_namespace() {
+        let b = broker(Namespaces::Single("sandboxes".into()), false).await;
+        let t = b.token("alice", &[]);
+        let name = created(&b.create(&t, None).await);
+        assert_eq!(b.get(&t, &name, None).await.0, StatusCode::OK);
+        assert_eq!(b.delete(&t, &name, None).await.0, StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn get_without_namespace_with_a_map_is_400_namespace_required() {
+        let b = broker(tenant_map(), false).await;
+        let t = b.token("alice", &[TEAM_A]);
+        let name = created(&b.create(&t, Some("team-a")).await);
+        for r in [
+            b.get(&t, &name, None).await,
+            b.delete(&t, &name, None).await,
+        ] {
+            assert_eq!(r.0, StatusCode::BAD_REQUEST);
+            assert_eq!(code(&r.1), "namespace_required");
+        }
+        assert_eq!(b.reads(), 0);
+        assert_eq!(b.front.all().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn another_subject_in_the_same_namespace_is_403() {
+        let b = broker(tenant_map(), false).await;
+        let name = created(&b.create(&b.token("alice", &[TEAM_A]), Some("team-a")).await);
+        let bob = b.token("bob", &[TEAM_A]);
+        for r in [
+            b.get(&bob, &name, Some("team-a")).await,
+            b.delete(&bob, &name, Some("team-a")).await,
+        ] {
+            assert_eq!(r.0, StatusCode::FORBIDDEN);
+            assert_eq!(r.1["detail"], "claim belongs to another subject");
+        }
+        assert_eq!(b.front.all().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_caller_who_left_the_group_can_no_longer_read_or_delete_their_claim() {
+        let b = broker(tenant_map(), false).await;
+        let name = created(&b.create(&b.token("alice", &[TEAM_A]), Some("team-a")).await);
+        let left = b.token("alice", &["SOME_OTHER_GROUP"]);
+        b.counting
+            .gets
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+        for r in [
+            b.get(&left, &name, Some("team-a")).await,
+            b.delete(&left, &name, Some("team-a")).await,
+        ] {
+            assert_eq!(r.0, StatusCode::NOT_FOUND);
+            assert_eq!(code(&r.1), "not_found");
+        }
+        assert_eq!(
+            b.reads(),
+            0,
+            "no read is issued for a namespace the caller may not use"
+        );
+        assert_eq!(b.front.all().len(), 1, "the claim is still there");
+    }
+
+    #[tokio::test]
+    async fn a_namespace_outside_the_map_is_404_on_get_and_delete() {
+        let b = broker(tenant_map(), false).await;
+        let t = b.token("alice", &[TEAM_A, ADMIN]);
+        let unlisted = [
+            b.get(&t, "sandbox-x", Some("team-z")).await,
+            b.delete(&t, "sandbox-x", Some("team-z")).await,
+        ];
+        // The same answer as a listed namespace with no such sandbox.
+        let absent = [
+            b.get(&t, "sandbox-x", Some("team-a")).await,
+            b.delete(&t, "sandbox-x", Some("team-a")).await,
+        ];
+        // Delete of a listed namespace with nothing there is the existing owner-lookup 404.
+        for (u, a) in unlisted.iter().zip(&absent) {
+            assert_eq!(u.0, StatusCode::NOT_FOUND);
+            assert_eq!(code(&u.1), "not_found");
+            assert_eq!(u.0, a.0);
+            assert_eq!(code(&u.1), code(&a.1));
+        }
+    }
+
+    #[tokio::test]
+    async fn an_admin_namespace_member_cannot_get_or_delete_a_tenants_claim() {
+        let b = broker(tenant_map(), false).await;
+        let name = created(&b.create(&b.token("alice", &[TEAM_A]), Some("team-a")).await);
+        // An infra admin who is not in team-a's groups: not found, as for any unqualified caller.
+        let admin = b.token("carol", &[ADMIN]);
+        assert_eq!(
+            b.get(&admin, &name, Some("team-a")).await.0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            b.delete(&admin, &name, Some("team-a")).await.0,
+            StatusCode::NOT_FOUND
+        );
+        // One who is in both is qualified for team-a and is still not the claim's subject.
+        let both = b.token("carol", &[ADMIN, TEAM_A]);
+        assert_eq!(
+            b.get(&both, &name, Some("team-a")).await.0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            b.delete(&both, &name, Some("team-a")).await.0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(b.front.all().len(), 1, "the claim still exists");
+    }
+
+    // ----- exit: the claim's own namespace -----
+
+    fn sandbox_in(namespace: &str, name: &str) -> AgentSandbox {
+        let mut sb = AgentSandbox::new(
+            name,
+            AgentSandboxSpec {
+                subject: SandboxSubject::from(&subject()),
+                pool_ref: None,
+                pool_selector: Some(label_selector_of(&mediatore_proto::PoolSelector::default())),
+                ttl_seconds: 600,
+                audiences: vec![],
+                workload: SandboxWorkload::from(&mediatore_proto::Workload {
+                    image: "registry.example/sandbox:1".into(),
+                    ..mediatore_proto::Workload::default()
+                }),
+                policy_ref: None,
+            },
+        );
+        sb.metadata.namespace = Some(namespace.into());
+        sb
+    }
+
+    #[tokio::test]
+    async fn exit_releases_a_claim_through_the_records_namespace() {
+        let b = broker(tenant_map(), false).await;
+        let ek = "ab".repeat(32);
+        b.st.store
+            .put_node(NodeRecord {
+                ek_hash: ek.clone(),
+                node_id: b.st.naming.node_id(&ek),
+                dmi_uuid: Uuid::new_v4(),
+                hostname: "vm".into(),
+                provider: None,
+                banned: false,
+                registered_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+        // The same name in two namespaces: only the record's namespace is released.
+        b.front
+            .create(sandbox_in("team-a", "sandbox-x"))
+            .await
+            .unwrap();
+        b.front
+            .create(sandbox_in("infra", "sandbox-x"))
+            .await
+            .unwrap();
+        let mut rec = claim(&[], Some(b.st.naming.node_id(&ek)));
+        rec.name = "sandbox-x".into();
+        rec.namespace = "team-a".into();
+        stored(&b.st, rec).await;
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/v1/me/exit")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({"code": 0, "restarts": 0}).to_string(),
+            ))
+            .unwrap();
+        req.extensions_mut()
+            .insert(PeerSpiffeId(b.st.naming.node_id(&ek)));
+        let resp = sandbox_router(b.st.clone()).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let left: Vec<_> = b
+            .front
+            .all()
+            .iter()
+            .map(|s| s.metadata.namespace.clone().unwrap())
+            .collect();
+        assert_eq!(
+            left,
+            ["infra"],
+            "team-a's sandbox was released, infra's was not"
+        );
+    }
+
+    // ----- dev_mode -----
+
+    #[tokio::test]
+    async fn dev_mode_enforces_the_namespace_groups() {
+        let b = broker(tenant_map(), true).await;
+        let (status, _, _) = b
+            .create(&b.token("alice", &["SOME_OTHER_GROUP"]), Some("team-a"))
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            b.create(&b.token("alice", &[TEAM_A]), None).await.0,
+            StatusCode::BAD_REQUEST
+        );
+        let t = b.token("alice", &[TEAM_A]);
+        let r = b.create(&t, Some("team-a")).await;
+        let name = created(&r);
+        assert_eq!(r.1["namespace"], "team-a");
+        let rec = b.st.store.get_claim_by_name("team-a", &name).await.unwrap();
+        assert_eq!(rec.namespace, "team-a");
+        assert_eq!(b.get(&t, &name, Some("team-a")).await.0, StatusCode::OK);
+        assert_eq!(b.get(&t, &name, None).await.0, StatusCode::BAD_REQUEST);
+        let left = b.token("alice", &["SOME_OTHER_GROUP"]);
+        assert_eq!(
+            b.get(&left, &name, Some("team-a")).await.0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            b.delete(&left, &name, Some("team-a")).await.0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            b.delete(&t, &name, Some("team-a")).await.0,
+            StatusCode::NO_CONTENT
+        );
+    }
+
+    #[tokio::test]
+    async fn no_header_can_select_a_namespace_or_supply_groups() {
+        let b = broker(tenant_map(), true).await;
+        let t = b.token("alice", &["SOME_OTHER_GROUP"]);
+        let headers = [
+            ("x-mediatore-namespace", "team-a"),
+            ("x-mediatore-groups", TEAM_A),
+            ("x-mediatore-peer-spiffe-id", "spiffe://sandbox.test/x"),
+        ];
+        let r = b
+            .user("POST", "/v1/claims", &t, &headers, request(None))
+            .await;
+        assert_eq!(
+            r.0,
+            StatusCode::BAD_REQUEST,
+            "a header names no namespace: {}",
+            r.2
+        );
+        let r = b
+            .user("POST", "/v1/claims", &t, &headers, request(Some("team-a")))
+            .await;
+        assert_eq!(
+            r.0,
+            StatusCode::FORBIDDEN,
+            "a header supplies no groups: {}",
+            r.2
+        );
+    }
+
+    // ----- the audit line -----
+
+    #[tokio::test]
+    async fn a_create_logs_subject_namespace_and_decision_and_never_a_token() {
+        capture_logs();
+        let b = broker(tenant_map(), false).await;
+        let ok = b.token("alice", &[TEAM_A, "SOME_OTHER_GROUP"]);
+        created(&b.create(&ok, Some("team-a")).await);
+        let line_for = |decision: &str| {
+            captured()
+                .lines()
+                .find(|l| l.contains("namespace decision") && l.contains(decision))
+                .map(str::to_owned)
+        };
+        let allowed = line_for("allowed").expect("an allowed line");
+        for needle in ["alice", "team-a", &b.idp.issuer, TEAM_A] {
+            assert!(allowed.contains(needle), "{needle} in {allowed}");
+        }
+        assert!(!allowed.contains("SOME_OTHER_GROUP"), "{allowed}");
+
+        let denied_token = b.token("mallory", &["SOME_OTHER_GROUP"]);
+        assert_eq!(
+            b.create(&denied_token, Some("infra")).await.0,
+            StatusCode::FORBIDDEN
+        );
+        let omitted = b.token("mallory", &[]);
+        assert_eq!(b.create(&omitted, None).await.0, StatusCode::BAD_REQUEST);
+        let logs = captured();
+        let denied = line_for("denied").expect("a denied line");
+        for needle in ["mallory", "infra"] {
+            assert!(denied.contains(needle), "{needle} in {denied}");
+        }
+        assert!(
+            logs.contains("omitted"),
+            "an omitted namespace is logged as omitted"
+        );
+        assert!(
+            !logs.contains("SOME_OTHER_GROUP"),
+            "the caller's groups are not logged"
+        );
+        for token in [&ok, &denied_token, &omitted] {
+            assert!(!logs.contains(token.as_str()), "a token reached a log line");
         }
     }
 }
