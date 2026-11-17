@@ -13,13 +13,4 @@ ignore = [
   # exercised. Revisit when RustCrypto/RSA gains a constant-time fix or
   # jsonwebtoken makes the rsa dependency optional per algorithm.
   "RUSTSEC-2023-0071",
-  # chrono is flagged unmaintained: an informational advisory, no vulnerability
-  # is published against it. It is a direct dependency of 12 workspace crates
-  # (timestamps in tokens, claims and the store), so replacing it with jiff or
-  # time is a workspace-wide migration that needs its own ADR, not a side
-  # effect of an unrelated change. `cargo audit --deny warnings` fails on an
-  # unmaintained warning, hence the entry. Revisit when a replacement is
-  # decided, chrono is maintained again, or a vulnerability is published
-  # against it.
-  "RUSTSEC-2026-0543",
 ]

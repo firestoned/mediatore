@@ -68,7 +68,7 @@ fn state(idp: &FakeIdp, policy_egress: Option<mediatore_api::PolicyEgress>) -> A
         "https://mediatore.test",
         "e2e-1",
         STS_TEST_KEY.as_bytes(),
-        chrono::Duration::minutes(15),
+        jiff::SignedDuration::from_mins(15),
     )
     .expect("sts");
     Arc::new(AppState {
@@ -520,7 +520,7 @@ async fn the_dev_header_transport_reaches_a_dev_mode_broker() {
 /// `entries` (host:port, and whether the entry carries a rule), and the cache it filled.
 async fn cache_with_direct_egress(
     entries: &[(&str, bool)],
-    now: chrono::DateTime<chrono::Utc>,
+    now: jiff::Timestamp,
 ) -> (Arc<mediatore_claims::policy::BundleCache>, String) {
     let base = mediatore_testkit::policy::fresh_bundle(now, 1).payload;
     let mut content = base.content.clone();
@@ -582,7 +582,7 @@ async fn enforcing_serves_a_policys_direct_egress_and_shadow_serves_none_of_it()
                 // An audience's own endpoint named again as direct egress.
                 (ALLOWED[0], false),
             ],
-            chrono::Utc::now(),
+            jiff::Timestamp::now(),
         )
         .await;
         let h = Harness::start_with(
@@ -678,7 +678,7 @@ async fn a_claim_with_no_policy_or_a_bundle_the_cache_does_not_hold_gets_the_aud
     // answer the second ask of a claim from the first.
     for named in [None, Some("a-policy-uid-nobody-published")] {
         let (bundles, _published) =
-            cache_with_direct_egress(&[(DIRECT, false)], chrono::Utc::now()).await;
+            cache_with_direct_egress(&[(DIRECT, false)], jiff::Timestamp::now()).await;
         let h = Harness::start_with(
             &gateway_svid(),
             CacheConfig::default(),

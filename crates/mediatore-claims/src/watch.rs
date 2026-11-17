@@ -495,7 +495,7 @@ impl Watcher {
             return Ok(0);
         }
         let live = ek_hashes_of(&self.claims.list_machines().await?);
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         let busy: HashSet<String> = store
             .list_claims()
             .await?
@@ -508,8 +508,8 @@ impl Watcher {
             live_ek_hashes: &live,
             busy_node_ids: &busy,
             now,
-            grace: chrono::Duration::from_std(self.config().node_grace)
-                .unwrap_or(chrono::Duration::MAX),
+            grace: jiff::SignedDuration::try_from(self.config().node_grace)
+                .unwrap_or(jiff::SignedDuration::MAX),
             cap: MAX_DELETIONS_PER_PASS,
         });
         let mut removed = 0;
@@ -541,7 +541,9 @@ impl Watcher {
         let swept = self
             .reconciler
             .store
-            .sweep_sessions(chrono::Utc::now() - chrono::Duration::seconds(SESSION_GRACE_SECS))
+            .sweep_sessions(
+                jiff::Timestamp::now() - jiff::SignedDuration::from_secs(SESSION_GRACE_SECS),
+            )
             .await?;
         if swept > 0 {
             tracing::info!(swept, "expired or stale envelopes swept");
@@ -565,8 +567,10 @@ impl Watcher {
             }
         }
         let swept = self.reconciler.sweep_orphans().await?;
-        let before = chrono::Utc::now()
-            - chrono::Duration::from_std(self.config().retention).unwrap_or(chrono::Duration::MAX);
+        let before = jiff::SignedDuration::try_from(self.config().retention)
+            .ok()
+            .and_then(|d| jiff::Timestamp::now().checked_sub(d).ok())
+            .unwrap_or(jiff::Timestamp::MIN);
         let archived = self.reconciler.store.sweep(before).await?;
         self.sweep_envelopes().await?;
         self.declared
@@ -770,7 +774,7 @@ pub async fn run(client: Client, watcher: Arc<Watcher>) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use chrono::Utc;
+    use jiff::Timestamp;
     use mediatore_proto::{Subject, Workload};
     use mediatore_spire::{EntryManager, claim_entry_name, node_entry_name};
     use mediatore_store::{ClaimRecord, ClaimStore};
@@ -838,7 +842,7 @@ mod tests {
             },
             ttl_seconds: 600,
             refresh: None,
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             expires_at: None,
             revoked_at: None,
             sandbox_uid: None,
@@ -1141,12 +1145,12 @@ mod tests {
             subject: subject(),
             issuer: String::new(),
             refresh: sealed(),
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             audience: Some("registry".into()),
             expires_at,
         };
-        let gone = parked(Some(Utc::now() - chrono::Duration::seconds(1)));
-        let kept = parked(Some(Utc::now() + chrono::Duration::minutes(10)));
+        let gone = parked(Some(Timestamp::now() - jiff::SignedDuration::from_secs(1)));
+        let kept = parked(Some(Timestamp::now() + jiff::SignedDuration::from_mins(10)));
         r.store.put_session(gone.clone()).await.unwrap();
         r.store.put_session(kept.clone()).await.unwrap();
         // And one already on a bound claim's record.
@@ -1156,7 +1160,7 @@ mod tests {
             "registry".into(),
             mediatore_store::DelegatedSession {
                 envelope: sealed(),
-                expires_at: Some(Utc::now() - chrono::Duration::seconds(1)),
+                expires_at: Some(Timestamp::now() - jiff::SignedDuration::from_secs(1)),
             },
         );
         r.store.put_claim(rec).await.unwrap();
@@ -1237,7 +1241,7 @@ mod tests {
             r.store.put_claim(record(u)).await.unwrap();
             r.claims.mark_existing(u);
         }
-        r.store.revoke_claim(ended, Utc::now()).await.unwrap();
+        r.store.revoke_claim(ended, Timestamp::now()).await.unwrap();
         let (released, swept, archived) = r.watcher.resync().await.unwrap();
         assert_eq!((released, swept, archived), (0, 0, 1));
         assert!(matches!(
@@ -1252,7 +1256,7 @@ mod tests {
     /// A node registered an hour ago, past the default grace.
     fn old_node(ek: &str) -> mediatore_store::NodeRecord {
         let mut n = node(ek, false);
-        n.registered_at = Utc::now() - chrono::Duration::hours(1);
+        n.registered_at = Timestamp::now() - jiff::SignedDuration::from_hours(1);
         n
     }
 
@@ -1300,7 +1304,7 @@ mod tests {
         let mut rec = record(uid());
         rec.node_id = Some(busy.node_id.clone());
         rec.entry_id = Some("entry".into());
-        rec.expires_at = Some(Utc::now() + chrono::Duration::minutes(10));
+        rec.expires_at = Some(Timestamp::now() + jiff::SignedDuration::from_mins(10));
         r.store.put_claim(rec).await.unwrap();
         r.store.put_node(busy).await.unwrap();
         r.store.put_node(node("young-ek", false)).await.unwrap();
@@ -1319,7 +1323,7 @@ mod tests {
         let mut rec = record(uid());
         rec.node_id = Some(n.node_id.clone());
         rec.entry_id = Some("entry".into());
-        rec.revoked_at = Some(Utc::now() - chrono::Duration::minutes(5));
+        rec.revoked_at = Some(Timestamp::now() - jiff::SignedDuration::from_mins(5));
         r.store.put_claim(rec).await.unwrap();
         r.store.put_node(n).await.unwrap();
         r.claims.put_machine(machine(&[RSA_EK_PEM]));

@@ -7,7 +7,7 @@
 
 use std::path::Path;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 
 use mediatore_proto::RestartPolicy;
 
@@ -90,14 +90,14 @@ pub fn after_event(event: Event, policy: RestartPolicy) -> Next {
 /// The proxy exiting is an error too.
 pub async fn run(
     spec: &JailSpec,
-    expires_at: DateTime<Utc>,
+    expires_at: Timestamp,
     proxy: &mut tokio::process::Child,
     policy: RestartPolicy,
 ) -> anyhow::Result<Outcome> {
     let mut restarts: u32 = 0;
     loop {
-        let remaining = expires_at - Utc::now();
-        let Ok(remaining) = remaining.to_std() else {
+        let remaining = expires_at.duration_since(Timestamp::now());
+        let Ok(remaining) = std::time::Duration::try_from(remaining) else {
             tracing::info!("claim deadline reached");
             return Ok(Outcome::Deadline);
         };

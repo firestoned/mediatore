@@ -12,7 +12,7 @@ pub mod ek;
 pub mod image;
 pub mod tls;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -156,7 +156,7 @@ impl GuestReport {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaimReport {
     /// When the broker received it.
-    pub reported_at: DateTime<Utc>,
+    pub reported_at: Timestamp,
     /// What the guest said.
     #[serde(flatten)]
     pub report: GuestReport,
@@ -234,7 +234,7 @@ pub struct GuestExit {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkloadExit {
     /// When the broker received it.
-    pub exited_at: DateTime<Utc>,
+    pub exited_at: Timestamp,
     /// What the guest said.
     #[serde(flatten)]
     pub exit: GuestExit,
@@ -259,7 +259,7 @@ pub struct LogRecord {
     /// The stream the line was read from.
     pub stream: LogStream,
     /// When the guest read the line.
-    pub ts: DateTime<Utc>,
+    pub ts: Timestamp,
     /// The line, lossy UTF-8, without its terminator.
     pub text: String,
 }
@@ -698,7 +698,7 @@ pub struct Delegation {
     pub refresh_token: Option<Secret>,
     /// When the bearer dies, if the caller knows: a claim that would outlast it is refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expires_at: Option<DateTime<Utc>>,
+    pub expires_at: Option<Timestamp>,
     /// The envelope follows, sealed on the caller's machine (decision 3, transit shape).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub pending: bool,
@@ -757,7 +757,7 @@ pub struct ClaimResponse {
     pub pool: Option<String>,
     /// Deadline, once bound.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expires_at: Option<DateTime<Utc>>,
+    pub expires_at: Option<Timestamp>,
     /// Guest addresses, once known.
     #[serde(default)]
     pub addresses: Vec<String>,
@@ -778,7 +778,7 @@ pub struct Me {
     /// Who the sandbox is for.
     pub subject: Subject,
     /// Deadline after which the guest tears the jail down regardless.
-    pub expires_at: DateTime<Utc>,
+    pub expires_at: Timestamp,
     /// What to run.
     pub workload: Workload,
     /// Where the workload may connect, beyond the broker: the `egress` of every audience
@@ -818,7 +818,7 @@ pub struct ClaimEgress {
     /// The claim, as its SVID names it.
     pub claim_uid: Uuid,
     /// The claim's deadline; no cached answer outlives it.
-    pub expires_at: DateTime<Utc>,
+    pub expires_at: Timestamp,
     /// The `host:port` pairs the claim may reach: the union of its audiences' `egress`,
     /// sorted and deduplicated, exactly what `GET /v1/me` hands the guest.
     #[serde(default)]
@@ -938,7 +938,7 @@ pub struct GatewayCredential {
     pub extra_headers: Vec<HeaderPair>,
     /// Absolute expiry, at most [`GATEWAY_CREDENTIAL_MAX_TTL_SECS`] after the broker's clock
     /// when it answered. The gateway holds nothing past it.
-    pub expires_at: DateTime<Utc>,
+    pub expires_at: Timestamp,
 }
 
 impl GatewayCredential {
@@ -947,8 +947,8 @@ impl GatewayCredential {
     /// and an expiry never later than `now` plus the cap (and never extended: an earlier one
     /// is kept).
     #[must_use]
-    pub fn from_token_response(resp: TokenResponse, now: DateTime<Utc>) -> Self {
-        let cap = now + chrono::TimeDelta::seconds(GATEWAY_CREDENTIAL_MAX_TTL_SECS);
+    pub fn from_token_response(resp: TokenResponse, now: Timestamp) -> Self {
+        let cap = now + jiff::SignedDuration::from_secs(GATEWAY_CREDENTIAL_MAX_TTL_SECS);
         let (header, value) = match resp.header {
             Some(h) => (h, resp.access_token),
             None => (
@@ -995,7 +995,7 @@ pub struct TokenResponse {
     /// `Bearer`, or `Header` when `header` names one (ADR-0032 decision 2).
     pub token_type: String,
     /// Absolute expiry; the workload must not cache past this.
-    pub expires_at: DateTime<Utc>,
+    pub expires_at: Timestamp,
     /// Echo of the requested audience.
     pub audience: String,
     /// Who the token acts for.
@@ -1037,7 +1037,7 @@ mod tests {
         LogRecord {
             seq,
             stream: LogStream::Stdout,
-            ts: DateTime::<Utc>::UNIX_EPOCH,
+            ts: Timestamp::UNIX_EPOCH,
             text: text.to_owned(),
         }
     }
@@ -1654,7 +1654,7 @@ mod tests {
 
     #[test]
     fn a_gateway_credential_is_a_bearer_unless_the_token_names_a_header() {
-        let now: DateTime<Utc> = "2026-01-01T00:00:00Z".parse().unwrap();
+        let now: Timestamp = "2026-01-01T00:00:00Z".parse().unwrap();
         let bearer = GatewayCredential::from_token_response(
             token_response(None, "2026-01-01T00:04:00Z"),
             now,
@@ -1678,14 +1678,14 @@ mod tests {
     #[test]
     fn a_gateway_credential_never_outlives_the_cap_and_is_never_extended() {
         assert_eq!(GATEWAY_CREDENTIAL_MAX_TTL_SECS, 300);
-        let now: DateTime<Utc> = "2026-01-01T00:00:00Z".parse().unwrap();
+        let now: Timestamp = "2026-01-01T00:00:00Z".parse().unwrap();
         let long = GatewayCredential::from_token_response(
             token_response(None, "2026-01-01T00:15:00Z"),
             now,
         );
         assert_eq!(
             long.expires_at,
-            "2026-01-01T00:05:00Z".parse::<DateTime<Utc>>().unwrap()
+            "2026-01-01T00:05:00Z".parse::<Timestamp>().unwrap()
         );
         let short = GatewayCredential::from_token_response(
             token_response(None, "2026-01-01T00:01:40Z"),
@@ -1693,7 +1693,7 @@ mod tests {
         );
         assert_eq!(
             short.expires_at,
-            "2026-01-01T00:01:40Z".parse::<DateTime<Utc>>().unwrap()
+            "2026-01-01T00:01:40Z".parse::<Timestamp>().unwrap()
         );
         let past = GatewayCredential::from_token_response(
             token_response(None, "2025-12-31T23:59:50Z"),
@@ -1701,7 +1701,7 @@ mod tests {
         );
         assert_eq!(
             past.expires_at,
-            "2025-12-31T23:59:50Z".parse::<DateTime<Utc>>().unwrap()
+            "2025-12-31T23:59:50Z".parse::<Timestamp>().unwrap()
         );
     }
 
@@ -1777,5 +1777,32 @@ mod tests {
         for bad in ["", "-a", "a-", "Team", "a.b", "a_b", "a b", &"a".repeat(64)] {
             assert!(!is_dns_label(bad), "{bad}");
         }
+    }
+
+    #[test]
+    fn a_timestamp_written_by_an_earlier_broker_still_parses() {
+        // Earlier brokers wrote `expires_at` as RFC 3339 with the fraction trimmed to three, six
+        // or nine digits and a `Z`, or with a `+00:00` offset in the Kubernetes store: a guest or
+        // CLI reading them during a rolling upgrade gets the same instant either way.
+        let at = |s: &str| {
+            serde_json::from_value::<Timestamp>(serde_json::Value::String(s.into())).unwrap()
+        };
+        let whole = at("2026-11-15T16:46:49Z");
+        assert_eq!(
+            whole,
+            "2026-11-15T16:46:49+00:00".parse::<Timestamp>().unwrap()
+        );
+        assert_eq!(
+            at("2026-11-15T16:46:49.500Z"),
+            at("2026-11-15T16:46:49.5+00:00")
+        );
+        assert!(at("2026-11-15T16:46:49.123456789Z") > at("2026-11-15T16:46:49.123456Z"));
+        assert!(
+            serde_json::from_value::<Timestamp>(serde_json::Value::String(
+                "2026-11-15T16:46:49".into()
+            ))
+            .is_err(),
+            "a timestamp with no offset is refused"
+        );
     }
 }

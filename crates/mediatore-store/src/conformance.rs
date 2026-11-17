@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, Duration, TimeZone, Utc};
+use jiff::{SignedDuration, Timestamp};
 use mediatore_proto::{Provider, Subject, Workload};
 use uuid::Uuid;
 
@@ -73,9 +73,8 @@ fn subject() -> Subject {
 }
 
 /// A fixed, microsecond-precise instant: both engines store microseconds.
-fn at(secs: i64) -> DateTime<Utc> {
-    Utc.timestamp_opt(1_700_000_000 + secs, 123_456_000)
-        .unwrap()
+fn at(secs: i64) -> Timestamp {
+    Timestamp::new(1_700_000_000 + secs, 123_456_000).unwrap()
 }
 
 pub(crate) fn claim(uid: Uuid) -> ClaimRecord {
@@ -297,7 +296,7 @@ pub(crate) async fn revoke_of_an_unknown_claim_is_not_found(s: &dyn ClaimStore) 
 
 pub(crate) async fn claim_by_node_finds_only_the_newest_live_claim(s: &dyn ClaimStore) {
     let node = "spiffe://sandbox.test/spire/agent/tpm/ek1";
-    let far = Utc::now() + Duration::hours(1);
+    let far = Timestamp::now() + SignedDuration::from_hours(1);
     let old = Uuid::new_v4();
     let mut rec = claim(old);
     rec.node_id = Some(node.into());
@@ -315,12 +314,12 @@ pub(crate) async fn claim_by_node_finds_only_the_newest_live_claim(s: &dyn Claim
     s.put_claim(rec).await.unwrap();
     assert_eq!(s.get_claim_by_node(node).await.unwrap().uid, new);
 
-    s.revoke_claim(new, Utc::now()).await.unwrap();
+    s.revoke_claim(new, Timestamp::now()).await.unwrap();
     assert_eq!(s.get_claim_by_node(node).await.unwrap().uid, old);
 
     // An expired deadline is as dead as a revocation.
     let mut rec = s.get_claim(old).await.unwrap();
-    rec.expires_at = Some(Utc::now() - Duration::seconds(1));
+    rec.expires_at = Some(Timestamp::now() - SignedDuration::from_secs(1));
     s.update_claim(rec).await.unwrap();
     assert!(matches!(
         s.get_claim_by_node(node).await,
@@ -586,7 +585,7 @@ pub(crate) async fn an_envelope_is_swept_when_it_expires_and_not_only_when_it_is
         later_uid,
         Some("registry"),
         b"user:secret",
-        Some(Utc::now() + Duration::hours(1)),
+        Some(Timestamp::now() + SignedDuration::from_hours(1)),
     )
     .await;
     later.created_at = at(100);
@@ -622,7 +621,7 @@ pub(crate) async fn a_bound_claims_delegation_is_removed_when_it_expires(s: &dyn
         "later".into(),
         DelegatedSession {
             envelope: envelope(b"{\"token\":\"b\"}").await,
-            expires_at: Some(Utc::now() + Duration::hours(1)),
+            expires_at: Some(Timestamp::now() + SignedDuration::from_hours(1)),
         },
     );
     rec.delegations.insert(
@@ -655,7 +654,7 @@ async fn parked(
     sandbox_uid: Uuid,
     audience: Option<&str>,
     plain: &[u8],
-    expires_at: Option<DateTime<Utc>>,
+    expires_at: Option<Timestamp>,
 ) -> SessionRecord {
     SessionRecord {
         sandbox_uid,
@@ -668,7 +667,7 @@ async fn parked(
     }
 }
 
-fn floor(name: &str, uid: &str, version: u64, issued_at: DateTime<Utc>) -> PolicyFloor {
+fn floor(name: &str, uid: &str, version: u64, issued_at: Timestamp) -> PolicyFloor {
     PolicyFloor {
         namespace: "sandboxes".into(),
         name: name.into(),
@@ -684,7 +683,7 @@ pub(crate) async fn a_policy_floor_round_trips_to_the_nanosecond(s: &dyn ClaimSt
         None
     );
     // notaio's issuedAt carries nanoseconds; the floor orders incarnations by it.
-    let issued = at(0) + Duration::nanoseconds(927_958_397);
+    let issued = at(0) + SignedDuration::from_nanos(927_958_397);
     let f = floor("agent", "uid-1", 3, issued);
     s.advance_policy_floor(None, f.clone()).await.unwrap();
     assert_eq!(
@@ -723,7 +722,7 @@ pub(crate) async fn a_policy_floor_moves_only_from_what_is_held(s: &dyn ClaimSto
     assert!(matches!(err, StoreError::Conflict(_)), "{err}");
     // Held matching on uid and version but not issuedAt is not held either.
     let mut almost = v4.clone();
-    almost.issued_at = at(10) + Duration::nanoseconds(1);
+    almost.issued_at = at(10) + SignedDuration::from_nanos(1);
     let err = s
         .advance_policy_floor(Some(&almost), floor("agent", "uid-1", 5, at(20)))
         .await

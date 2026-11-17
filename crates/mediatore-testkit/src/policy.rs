@@ -3,13 +3,13 @@
 
 //! A notaio bundle signed here and now (ADR-0026). notaio's conformance vectors are fixed at
 //! 2026-01-01 and expired against any real clock, so a test that drives the reflector at
-//! `Utc::now()` signs its own bundle: the conformance content under a key of this module's,
+//! `Timestamp::now()` signs its own bundle: the conformance content under a key of this module's,
 //! valid for an hour either side of `now`. The key is a fixed seed, test-only; it signs
 //! nothing a real broker trusts.
 
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, Duration, Utc};
+use jiff::{SignedDuration, Timestamp};
 use k8s_openapi::api::core::v1::ConfigMap;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use sandboxpolicy_bundle::conformance;
@@ -38,7 +38,7 @@ pub struct FreshBundle {
 /// If notaio's checked-in vectors do not parse or verify, which its own release gate rules
 /// out.
 #[must_use]
-pub fn fresh_bundle(now: DateTime<Utc>, version: u64) -> FreshBundle {
+pub fn fresh_bundle(now: Timestamp, version: u64) -> FreshBundle {
     let suite = conformance::suite().expect("notaio's vectors parse");
     let base = suite
         .vectors
@@ -64,12 +64,12 @@ pub fn fresh_bundle(now: DateTime<Utc>, version: u64) -> FreshBundle {
 /// If `content` has no canonical form (a float in it), which the conformance content and
 /// any edit of its integers never has.
 #[must_use]
-pub fn signed_bundle(now: DateTime<Utc>, version: u64, content: BundleContent) -> FreshBundle {
+pub fn signed_bundle(now: Timestamp, version: u64, content: BundleContent) -> FreshBundle {
     let payload = BundlePayload::new(
         BundleMeta {
             version,
-            issued_at: now - Duration::hours(1),
-            not_after: now + Duration::hours(1),
+            issued_at: now - SignedDuration::from_hours(1),
+            not_after: now + SignedDuration::from_hours(1),
         },
         content,
     )

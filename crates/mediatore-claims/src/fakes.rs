@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use banlieue_api::banlieue::{VirtualMachine, VirtualMachineClaim};
-use chrono::Utc;
+use jiff::Timestamp;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use kube::ResourceExt;
 use mediatore_spire::{MemoryEntries, Naming};
@@ -184,9 +184,7 @@ impl ClaimsApi for FakeClaims {
             .metadata
             .uid
             .get_or_insert_with(|| Uuid::new_v4().to_string());
-        claim.metadata.creation_timestamp = Some(Time(
-            k8s_openapi::jiff::Timestamp::from_second(Utc::now().timestamp()).unwrap(),
-        ));
+        claim.metadata.creation_timestamp = Some(Time(Timestamp::now()));
         claims.insert(k, claim.clone());
         Ok(claim)
     }
@@ -275,6 +273,6 @@ pub(crate) fn node(ek_hash: &str, banned: bool) -> NodeRecord {
         hostname: "member".into(),
         provider: None,
         banned,
-        registered_at: Utc::now(),
+        registered_at: Timestamp::now(),
     }
 }

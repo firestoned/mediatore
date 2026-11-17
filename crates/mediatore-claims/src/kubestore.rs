@@ -20,7 +20,7 @@
 use std::collections::BTreeMap;
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use k8s_openapi::ByteString;
 use k8s_openapi::api::core::v1::Secret;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{OwnerReference, Time};
@@ -36,7 +36,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::sandbox::{AgentSandbox, FINALIZER, chrono_of, sandbox_uid_of};
+use crate::sandbox::{AgentSandbox, FINALIZER, sandbox_uid_of};
 
 /// The label carrying the claim's UID on an `AgentSandbox` with a record.
 pub const CLAIM_UID_LABEL: &str = "mediatore.io/claim-uid";
@@ -297,7 +297,7 @@ impl KubeStore {
                         d.audience.clone(),
                         DelegatedSession {
                             envelope,
-                            expires_at: d.expires_at.as_ref().and_then(chrono_of),
+                            expires_at: d.expires_at.as_ref().map(|t| t.0),
                         },
                     );
                 }
@@ -389,7 +389,7 @@ impl KubeStore {
         sandbox_uid: Uuid,
         audience: Option<&str>,
         sealed: Option<&Sealed>,
-        expires_at: Option<DateTime<Utc>>,
+        expires_at: Option<Timestamp>,
     ) -> Result<(), StoreError> {
         let name = match audience {
             Some(a) => delegation_name(sandbox_uid, a),
@@ -526,12 +526,8 @@ fn is_not_found(e: &kube::Error) -> bool {
     matches!(e, kube::Error::Api(a) if a.code == 404)
 }
 
-fn time_of(t: DateTime<Utc>) -> Time {
-    let nanos = i128::from(t.timestamp()) * 1_000_000_000 + i128::from(t.timestamp_subsec_nanos());
-    Time(
-        k8s_openapi::jiff::Timestamp::from_nanosecond(nanos)
-            .unwrap_or(k8s_openapi::jiff::Timestamp::UNIX_EPOCH),
-    )
+fn time_of(t: Timestamp) -> Time {
+    Time(t)
 }
 
 fn record_status_from(rec: &ClaimRecord) -> RecordStatus {
@@ -571,8 +567,7 @@ pub(crate) fn namespace_of(sb: &AgentSandbox) -> String {
 fn record_from(sb: &AgentSandbox, status: &RecordStatus) -> Result<ClaimRecord, StoreError> {
     let uid = Uuid::parse_str(&status.claim_uid)
         .map_err(|e| StoreError::Backend(format!("status.record.claimUid: {e}")))?;
-    let created_at = chrono_of(&status.created_at)
-        .ok_or_else(|| StoreError::Backend("status.record.createdAt out of range".into()))?;
+    let created_at = status.created_at.0;
     Ok(ClaimRecord {
         uid,
         name: sb.name_any(),
@@ -585,8 +580,8 @@ fn record_from(sb: &AgentSandbox, status: &RecordStatus) -> Result<ClaimRecord, 
         ttl_seconds: sb.spec.ttl_seconds,
         refresh: None,
         created_at,
-        expires_at: status.expires_at.as_ref().and_then(chrono_of),
-        revoked_at: status.revoked_at.as_ref().and_then(chrono_of),
+        expires_at: status.expires_at.as_ref().map(|t| t.0),
+        revoked_at: status.revoked_at.as_ref().map(|t| t.0),
         sandbox_uid: sandbox_uid_of(sb),
         policy_uid: status.policy_uid.clone(),
         bundle_version: status.bundle_version,
@@ -680,7 +675,7 @@ fn session_secret(rec: &SessionRecord, state: &str) -> Secret {
     if let Some(e) = expires_at {
         data.insert(
             "expires_at".to_owned(),
-            ByteString(e.to_rfc3339().into_bytes()),
+            ByteString(e.to_string().into_bytes()),
         );
     }
     data.insert(
@@ -690,7 +685,7 @@ fn session_secret(rec: &SessionRecord, state: &str) -> Secret {
     data.insert("issuer".to_owned(), ByteString(issuer.as_bytes().to_vec()));
     data.insert(
         "created_at".to_owned(),
-        ByteString(created_at.to_rfc3339().into_bytes()),
+        ByteString(created_at.to_string().into_bytes()),
     );
     data.insert(
         "key_id".to_owned(),
@@ -736,18 +731,14 @@ fn session_of(secret: &Secret) -> Option<SessionRecord> {
         subject: serde_json::from_str(&text("subject")?).ok()?,
         issuer: text("issuer")?,
         refresh: envelope_of(secret)?,
-        created_at: DateTime::parse_from_rfc3339(&text("created_at")?)
-            .ok()?
-            .with_timezone(&Utc),
+        created_at: text("created_at")?.parse().ok()?,
         audience: secret
             .metadata
             .labels
             .as_ref()
             .and_then(|l| l.get(AUDIENCE_LABEL))
             .cloned(),
-        expires_at: text("expires_at")
-            .and_then(|t| DateTime::parse_from_rfc3339(&t).ok())
-            .map(|t| t.with_timezone(&Utc)),
+        expires_at: text("expires_at").and_then(|t| t.parse().ok()),
     })
 }
 
@@ -762,8 +753,7 @@ fn node_record_of(n: &SandboxNode) -> Result<NodeRecord, StoreError> {
             serde_json::from_value::<Provider>(serde_json::Value::String(p.into())).ok()
         }),
         banned: n.spec.banned,
-        registered_at: chrono_of(&n.spec.registered_at)
-            .ok_or_else(|| StoreError::Backend("sandboxnode registeredAt out of range".into()))?,
+        registered_at: n.spec.registered_at.0,
     })
 }
 
@@ -804,9 +794,11 @@ fn floor_of(f: &PolicyFloor) -> Result<mediatore_store::PolicyFloor, StoreError>
         name: f.spec.policy_name.clone(),
         uid: f.spec.uid.clone(),
         version: f.spec.version,
-        issued_at: DateTime::parse_from_rfc3339(&f.spec.issued_at)
-            .map_err(|e| StoreError::Backend(format!("policyfloor issuedAt: {e}")))?
-            .with_timezone(&Utc),
+        issued_at: f
+            .spec
+            .issued_at
+            .parse()
+            .map_err(|e| StoreError::Backend(format!("policyfloor issuedAt: {e}")))?,
     })
 }
 
@@ -816,9 +808,7 @@ fn floor_spec_of(f: &mediatore_store::PolicyFloor) -> PolicyFloorSpec {
         policy_name: f.name.clone(),
         uid: f.uid.clone(),
         version: f.version,
-        issued_at: f
-            .issued_at
-            .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+        issued_at: format!("{:.9}", f.issued_at),
     }
 }
 
@@ -863,7 +853,7 @@ impl ClaimStore for KubeStore {
         self.write_record(&sb, &rec).await
     }
 
-    async fn revoke_claim(&self, uid: Uuid, at: DateTime<Utc>) -> Result<(), StoreError> {
+    async fn revoke_claim(&self, uid: Uuid, at: Timestamp) -> Result<(), StoreError> {
         let sb = self.sandbox_of_claim(uid).await?;
         let mut rec = self.record_of(&sb).await?;
         rec.revoked_at.get_or_insert(at);
@@ -874,7 +864,7 @@ impl ClaimStore for KubeStore {
     }
 
     async fn get_claim_by_node(&self, node_id: &str) -> Result<ClaimRecord, StoreError> {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let list = self
             .all_sandboxes()
             .list(&ListParams::default().labels(&format!("{NODE_LABEL}={}", node_label(node_id))))
@@ -995,7 +985,7 @@ impl ClaimStore for KubeStore {
         }
     }
 
-    async fn sweep(&self, before: DateTime<Utc>) -> Result<usize, StoreError> {
+    async fn sweep(&self, before: Timestamp) -> Result<usize, StoreError> {
         let mut swept = 0;
         for sb in self.sandboxes_with_records().await? {
             let Ok(rec) = self.record_of(&sb).await else {
@@ -1153,8 +1143,8 @@ impl ClaimStore for KubeStore {
         Ok(())
     }
 
-    async fn sweep_sessions(&self, before: DateTime<Utc>) -> Result<usize, StoreError> {
-        let now = Utc::now();
+    async fn sweep_sessions(&self, before: Timestamp) -> Result<usize, StoreError> {
+        let now = Timestamp::now();
         let list = self
             .secrets()
             .list(&ListParams::default().labels(&format!("{SESSION_LABEL}=parked")))
@@ -1454,7 +1444,7 @@ mod tests {
                         nonce: vec![1],
                         ciphertext: vec![2],
                     },
-                    created_at: Utc::now(),
+                    created_at: Timestamp::now(),
                     audience: audience.map(str::to_owned),
                     expires_at: None,
                 },
@@ -1538,7 +1528,7 @@ mod tests {
         let (state, claim) = fake::seed(false);
         assert_eq!(state.lock().unwrap().secrets.len(), 2);
         let store = fake::store(&state);
-        store.revoke_claim(claim, Utc::now()).await.unwrap();
+        store.revoke_claim(claim, Timestamp::now()).await.unwrap();
         let st = state.lock().unwrap();
         assert!(st.secrets.is_empty(), "left: {:?}", st.secrets);
         fake::assert_only_home_secrets(&st);
@@ -1548,7 +1538,7 @@ mod tests {
     async fn the_sweep_removes_a_tenant_sandboxs_secrets_when_the_release_was_missed() {
         let (state, _claim) = fake::seed(true);
         let store = fake::store(&state);
-        let swept = store.sweep(Utc::now()).await.unwrap();
+        let swept = store.sweep(Timestamp::now()).await.unwrap();
         assert_eq!(swept, 1);
         let st = state.lock().unwrap();
         assert!(st.secrets.is_empty(), "left: {:?}", st.secrets);
@@ -1620,15 +1610,15 @@ mod tests {
             workload: Workload::from(&sb.spec.workload),
             ttl_seconds: 600,
             refresh: Some(sealed.clone()),
-            created_at: DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
-            expires_at: Some(DateTime::from_timestamp(1_700_000_600, 0).unwrap()),
+            created_at: Timestamp::from_second(1_700_000_000).unwrap(),
+            expires_at: Some(Timestamp::from_second(1_700_000_600).unwrap()),
             revoked_at: None,
             sandbox_uid: Some(sandbox_uid),
             policy_uid: Some("p-uid".into()),
             bundle_version: Some(4),
             report: None,
             exit: Some(WorkloadExit {
-                exited_at: DateTime::from_timestamp(1_700_000_100, 0).unwrap(),
+                exited_at: Timestamp::from_second(1_700_000_100).unwrap(),
                 exit: mediatore_proto::GuestExit {
                     code: Some(0),
                     signal: None,
@@ -1692,7 +1682,7 @@ mod tests {
             hostname: "member-01".into(),
             provider: Some(Provider::Libvirt),
             banned: false,
-            registered_at: DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            registered_at: Timestamp::from_second(1_700_000_000).unwrap(),
         };
         let res = sandbox_node_of(&node);
         assert_eq!(res.metadata.name.as_deref(), Some(node.ek_hash.as_str()));
@@ -1712,7 +1702,7 @@ mod tests {
             name: "agents".into(),
             uid: "u-1".into(),
             version: 7,
-            issued_at: DateTime::from_timestamp(1_700_000_000, 123_456_789).unwrap(),
+            issued_at: Timestamp::new(1_700_000_000, 123_456_789).unwrap(),
         };
         let spec = floor_spec_of(&floor);
         assert!(
@@ -1723,5 +1713,93 @@ mod tests {
         let res = PolicyFloor::new(&floor_name("sandboxes", "agents"), spec);
         assert_eq!(res.metadata.name.as_deref(), Some("sandboxes.agents"));
         assert_eq!(floor_of(&res).unwrap(), floor);
+    }
+
+    #[test]
+    fn a_floor_written_by_an_earlier_broker_still_reads() {
+        // Every broker so far wrote `issuedAt` as RFC 3339 with nine fraction digits and a `Z`;
+        // a resource left by one of them reads back to the same instant.
+        let res = PolicyFloor::new(
+            &floor_name("sandboxes", "agents"),
+            PolicyFloorSpec {
+                policy_namespace: "sandboxes".into(),
+                policy_name: "agents".into(),
+                uid: "u-1".into(),
+                version: 7,
+                issued_at: "2026-11-15T16:46:49.123456789Z".into(),
+            },
+        );
+        assert_eq!(
+            floor_of(&res).unwrap().issued_at,
+            Timestamp::new(1_794_761_209, 123_456_789).unwrap()
+        );
+        let res = PolicyFloor::new(
+            &floor_name("sandboxes", "agents"),
+            PolicyFloorSpec {
+                policy_namespace: "sandboxes".into(),
+                policy_name: "agents".into(),
+                uid: "u-1".into(),
+                version: 7,
+                issued_at: "not a time".into(),
+            },
+        );
+        assert!(floor_of(&res).is_err());
+    }
+
+    #[test]
+    fn a_session_written_by_an_earlier_broker_still_reads() {
+        // Earlier brokers wrote `created_at` and `expires_at` as RFC 3339 with a `+00:00` offset
+        // and the fraction as it came; a Secret left by one of them reads back to the same
+        // instants.
+        let sandbox_uid = Uuid::new_v4();
+        let mut secret = session_secret(
+            &SessionRecord {
+                sandbox_uid,
+                subject: Subject {
+                    issuer: "https://idp.example".into(),
+                    id: "octocat".into(),
+                    display: None,
+                },
+                issuer: "https://idp.example".into(),
+                refresh: Sealed {
+                    key_id: "k1".into(),
+                    nonce: vec![1, 2, 3],
+                    ciphertext: vec![9, 9, 9, 9],
+                },
+                created_at: Timestamp::from_second(1_700_000_000).unwrap(),
+                audience: Some("anthropic".into()),
+                expires_at: None,
+            },
+            "parked",
+        );
+        let data = secret.data.as_mut().unwrap();
+        data.insert(
+            "created_at".into(),
+            ByteString(b"2026-11-15T16:46:49.123456789+00:00".to_vec()),
+        );
+        data.insert(
+            "expires_at".into(),
+            ByteString(b"2026-11-15T17:46:49+00:00".to_vec()),
+        );
+        let back = session_of(&secret).unwrap();
+        assert_eq!(back.sandbox_uid, sandbox_uid);
+        assert_eq!(back.audience.as_deref(), Some("anthropic"));
+        assert_eq!(
+            back.created_at,
+            Timestamp::new(1_794_761_209, 123_456_789).unwrap()
+        );
+        assert_eq!(
+            back.expires_at,
+            Some(Timestamp::from_second(1_794_764_809).unwrap())
+        );
+        secret
+            .data
+            .as_mut()
+            .unwrap()
+            .insert("created_at".into(), ByteString(b"yesterday".to_vec()));
+        assert!(
+            session_of(&secret).is_none(),
+            "an unreadable instant is refused"
+        );
     }
 }

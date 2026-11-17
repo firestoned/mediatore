@@ -28,11 +28,11 @@ use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use banlieue_api::common::LocalObjectReference;
 use base64::Engine as _;
-use chrono::{DateTime, Duration, Utc};
+use jiff::{SignedDuration, Timestamp};
 use mediatore_claims::Reconciler;
 use mediatore_claims::sandbox::{
     AgentSandbox, AgentSandboxSpec, FrontDoorError, SandboxFrontDoor, SandboxSubject,
-    SandboxWorkload, chrono_of, label_selector_of,
+    SandboxWorkload, label_selector_of,
 };
 use mediatore_entra::{IdpError, Validated, Validator};
 use mediatore_proto::ek::is_ek_hash;
@@ -673,7 +673,7 @@ async fn dev_claim(
             workload: req.workload.clone(),
             ttl_seconds: req.ttl_seconds,
             refresh,
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             expires_at: None,
             revoked_at: None,
             sandbox_uid: None,
@@ -819,7 +819,7 @@ fn delegations_for(st: &AppState, req: &ClaimRequest) -> Result<Vec<Delegation>,
             ));
         }
         if let Some(expires_at) = d.expires_at
-            && expires_at < Utc::now() + Duration::seconds(i64::from(req.ttl_seconds))
+            && expires_at < Timestamp::now() + SignedDuration::from_secs(i64::from(req.ttl_seconds))
         {
             return Err(ApiError::bad_request(
                 "delegation_expires_first",
@@ -952,11 +952,11 @@ async fn create_sandbox(
 /// its TTL. The sweep removes an envelope past this, so a secret is never stored longer than the claim it was
 /// delegated for, and a use after it is refused (the credential route checks the same instant).
 fn parked_expiry(
-    credential_expires_at: Option<DateTime<Utc>>,
-    created_at: DateTime<Utc>,
+    credential_expires_at: Option<Timestamp>,
+    created_at: Timestamp,
     ttl_seconds: u32,
-) -> DateTime<Utc> {
-    let claim_end = created_at + Duration::seconds(i64::from(ttl_seconds));
+) -> Timestamp {
+    let claim_end = created_at + SignedDuration::from_secs(i64::from(ttl_seconds));
     credential_expires_at.map_or(claim_end, |e| e.min(claim_end))
 }
 
@@ -979,7 +979,7 @@ async fn park_delegations(
         let refresh = seal_delegation(sealer, sandbox_uid, d)
             .await
             .map_err(|e| anyhow::anyhow!("sealing the delegation failed: {}", e.body.error))?;
-        let created_at = Utc::now();
+        let created_at = Timestamp::now();
         let expires_at = parked_expiry(d.expires_at, created_at, created.spec.ttl_seconds);
         st.store
             .put_session(SessionRecord {
@@ -1018,7 +1018,7 @@ async fn park_session(
             subject: validated.subject.clone(),
             issuer: validated.issuer.url.clone(),
             refresh,
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             audience: None,
             expires_at: None,
         })
@@ -1039,7 +1039,7 @@ fn response_of(sb: &AgentSandbox) -> ClaimResponse {
         phase: st.phase.into(),
         ready: st.ready,
         pool: st.pool_ref.map(|p| p.name),
-        expires_at: st.expires_at.as_ref().and_then(chrono_of),
+        expires_at: st.expires_at.as_ref().map(|t| t.0),
         addresses: st.addresses,
         report: None,
         exit: None,
@@ -1192,7 +1192,7 @@ async fn register_node(
             hostname: reg.hostname,
             provider: reg.provider,
             banned: false,
-            registered_at: Utc::now(),
+            registered_at: Timestamp::now(),
         })
         .await
         .map_err(|e| match e {
@@ -1274,7 +1274,7 @@ async fn exit(
         "workload exited and its restart policy ends the claim (ADR-0033)"
     );
     rec.exit = Some(WorkloadExit {
-        exited_at: Utc::now(),
+        exited_at: Timestamp::now(),
         exit: body,
     });
     st.store
@@ -1320,7 +1320,7 @@ async fn report(
         "guest report recorded"
     );
     rec.report = Some(ClaimReport {
-        reported_at: Utc::now(),
+        reported_at: Timestamp::now(),
         report: body,
     });
     st.store
@@ -1444,7 +1444,7 @@ pub struct AudienceSecret {
     /// Headers the proxy adds beside the credential; public material.
     pub extra_headers: Vec<HeaderPair>,
     /// How long the proxy may keep its copy before asking again (decision 4).
-    pub ttl: Duration,
+    pub ttl: SignedDuration,
 }
 
 /// How a `via: delegated` audience's credential is handed to the proxy (ADR-0035 decision 4).
@@ -1456,7 +1456,7 @@ pub struct DelegatedAudience {
     /// Headers the proxy adds beside the credential; public material.
     pub extra_headers: Vec<HeaderPair>,
     /// How long the proxy may keep its copy before asking again.
-    pub ttl: Duration,
+    pub ttl: SignedDuration,
     /// The credential is a user name and a secret (`user:secret` in the delegation's token), placed
     /// as `Authorization: Basic` at the gateway (ADR-0041); false for a bearer.
     pub basic: bool,
@@ -1472,7 +1472,7 @@ impl AudienceSecret {
         TokenResponse {
             access_token: self.value.0.clone(),
             token_type: if bearer { "Bearer" } else { "Header" }.into(),
-            expires_at: Utc::now() + self.ttl,
+            expires_at: Timestamp::now() + self.ttl,
             audience,
             subject,
             header: (!bearer).then(|| self.header.clone()),
@@ -1518,7 +1518,7 @@ fn served_direct_egress(st: &AppState, rec: &ClaimRecord, audience: &[Endpoint])
     let Some(uid) = rec.policy_uid.as_deref() else {
         return vec![];
     };
-    let Some(bundle) = pe.bundles.by_uid(uid, Utc::now()) else {
+    let Some(bundle) = pe.bundles.by_uid(uid, Timestamp::now()) else {
         return vec![];
     };
     let direct = mediatore_claims::policy::direct_egress(&bundle);
@@ -1599,7 +1599,7 @@ async fn claim_egress(
         StoreError::NotFound(_) => unknown(),
         other => ApiError::internal(other.to_string()),
     })?;
-    let now = Utc::now();
+    let now = Timestamp::now();
     let Some(expires_at) = rec.expires_at.filter(|_| rec.is_live(now)) else {
         tracing::debug!(claim_uid = %uid, "gateway asked about a claim that is not live");
         return Err(unknown());
@@ -1637,13 +1637,13 @@ fn inject_of(st: &AppState, rec: &ClaimRecord) -> Vec<InjectRoute> {
 /// What the issuer answered a refresh with: the refresh token to keep, the validated
 /// identity when the fresh token is one mediatore can read, the token for an audience
 /// Entra serves.
-type RefreshOutcome = (String, Option<Validated>, Option<(Secret, DateTime<Utc>)>);
+type RefreshOutcome = (String, Option<Validated>, Option<(Secret, Timestamp)>);
 
 /// What a refresh left for the issue: the groups to mint (empty when the fresh token was
 /// not one mediatore can read), and for an audience Entra serves, its token.
 struct Fresh {
     groups: Vec<String>,
-    obo: Option<(Secret, DateTime<Utc>)>,
+    obo: Option<(Secret, Timestamp)>,
 }
 
 /// Refresh the session behind `rec` and re-seal the rotated token into it. On the Dex
@@ -1877,7 +1877,7 @@ async fn issue_token(
                 .get_claim(claim_uid)
                 .await
                 .map_err(|_| ApiError::forbidden("unknown claim"))?;
-            if !rec.is_live(Utc::now()) {
+            if !rec.is_live(Timestamp::now()) {
                 return Err(ApiError::forbidden("claim revoked or expired"));
             }
             refresh_session(st, &rec, issuer, &audience, obo).await?
@@ -1911,7 +1911,7 @@ async fn issue_token(
             claim_uid,
             audience: &audience,
             groups: fresh.groups,
-            ttl: Duration::minutes(15).min(sts.max_ttl()),
+            ttl: SignedDuration::from_mins(15).min(sts.max_ttl()),
         })
         .map_err(|e| ApiError::internal(e.to_string()))?;
     if placement == Placement::Proxy {
@@ -1947,7 +1947,7 @@ async fn token_claim(
         .get_claim(claim_uid)
         .await
         .map_err(|_| ApiError::forbidden("unknown claim"))?;
-    if !rec.is_live(Utc::now()) {
+    if !rec.is_live(Timestamp::now()) {
         return Err(ApiError::forbidden("claim revoked or expired"));
     }
     if !rec.audiences.iter().any(|a| a == audience) {
@@ -2005,7 +2005,7 @@ async fn delegated_token(
             "no credential was delegated for this audience, or it was revoked",
         ));
     };
-    let now = Utc::now();
+    let now = Timestamp::now();
     let mut expires_at = now + d.ttl;
     if let Some(e) = held.expires_at {
         expires_at = expires_at.min(e);
@@ -2069,7 +2069,7 @@ fn policy_admits(st: &AppState, rec: &ClaimRecord, audience: &str) -> Result<(),
     let admitted = rec
         .policy_uid
         .as_deref()
-        .and_then(|uid| pe.bundles.by_uid(uid, Utc::now()))
+        .and_then(|uid| pe.bundles.by_uid(uid, Timestamp::now()))
         .is_some_and(|b| b.content.audiences.iter().any(|g| g.name == audience));
     match pe.mode {
         mediatore_claims::policy::EgressMode::Enforce if !admitted => {
@@ -2113,7 +2113,7 @@ async fn gateway_credential(
         StoreError::NotFound(_) => unknown(),
         other => ApiError::internal(other.to_string()),
     })?;
-    if rec.expires_at.is_none() || !rec.is_live(Utc::now()) {
+    if rec.expires_at.is_none() || !rec.is_live(Timestamp::now()) {
         tracing::debug!(%claim_uid, "gateway asked for a credential of a claim that is not live");
         return Err(unknown());
     }
@@ -2139,7 +2139,7 @@ async fn gateway_credential(
     let backend = backend_of(&st, &audience);
     let actor = st.naming.claim_id(claim_uid);
     let issued = issue_token(&st, &actor, claim_uid, rec, audience, Placement::Gateway).await?;
-    let credential = GatewayCredential::from_token_response(issued, Utc::now());
+    let credential = GatewayCredential::from_token_response(issued, Timestamp::now());
     tracing::info!(%claim_uid, audience = %credential.audience, subject = %credential.subject.id, backend, expires_at = %credential.expires_at, "gateway credential issued");
     Ok(Json(credential))
 }
@@ -2281,7 +2281,7 @@ mod tests {
                 value: Secret(SECRET_VALUE.into()),
                 header: "x-api-key".into(),
                 extra_headers: vec![pair("anthropic-version", "2023-06-01")],
-                ttl: Duration::minutes(15),
+                ttl: SignedDuration::from_mins(15),
             },
         );
         st.secrets.insert(
@@ -2290,7 +2290,7 @@ mod tests {
                 value: Secret("grafana-key".into()),
                 header: "authorization".into(),
                 extra_headers: vec![],
-                ttl: Duration::minutes(15),
+                ttl: SignedDuration::from_mins(15),
             },
         );
         st.delegated.insert(
@@ -2298,7 +2298,7 @@ mod tests {
             DelegatedAudience {
                 header: "authorization".into(),
                 extra_headers: vec![],
-                ttl: Duration::minutes(15),
+                ttl: SignedDuration::from_mins(15),
                 basic: false,
             },
         );
@@ -2308,7 +2308,7 @@ mod tests {
                 "t-1",
                 // A key made for this test: no key lives in the source (the testkit's generator).
                 mediatore_testkit::entra::fresh_p256_key_pem().as_bytes(),
-                Duration::minutes(15),
+                SignedDuration::from_mins(15),
             )
             .expect("sts"),
         );
@@ -2360,8 +2360,8 @@ mod tests {
             workload: Workload::default(),
             ttl_seconds: 900,
             refresh: None,
-            created_at: Utc::now(),
-            expires_at: Some(Utc::now() + Duration::minutes(15)),
+            created_at: Timestamp::now(),
+            expires_at: Some(Timestamp::now() + SignedDuration::from_mins(15)),
             revoked_at: None,
             sandbox_uid: None,
             policy_uid: None,
@@ -2444,7 +2444,7 @@ mod tests {
      {
         let st: Shared = Arc::new(placed_state());
         let rec = stored(&st, claim(&["anthropic"], None)).await;
-        let before = Utc::now();
+        let before = Timestamp::now();
         let (status, body, _) = ask(&st, rec.uid, Some(&gateway_peer()), "anthropic").await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let c: GatewayCredential = serde_json::from_value(body).unwrap();
@@ -2461,7 +2461,8 @@ mod tests {
         );
         let cap = mediatore_proto::GATEWAY_CREDENTIAL_MAX_TTL_SECS;
         assert!(
-            c.expires_at > before && c.expires_at <= Utc::now() + Duration::seconds(cap),
+            c.expires_at > before
+                && c.expires_at <= Timestamp::now() + SignedDuration::from_secs(cap),
             "the 15 minute secret ttl is cut to the 300 second cap: {}",
             c.expires_at
         );
@@ -2482,7 +2483,7 @@ mod tests {
             "claude".into(),
             DelegatedSession {
                 envelope,
-                expires_at: Some(Utc::now() + Duration::hours(1)),
+                expires_at: Some(Timestamp::now() + SignedDuration::from_hours(1)),
             },
         );
         st.sealer = Some(sealer);
@@ -2493,7 +2494,7 @@ mod tests {
         let c: GatewayCredential = serde_json::from_value(body).unwrap();
         assert_eq!(c.header, "authorization");
         assert_eq!(c.value.0, format!("Bearer {SESSION_TOKEN}"));
-        assert!(c.expires_at <= Utc::now() + Duration::seconds(300));
+        assert!(c.expires_at <= Timestamp::now() + SignedDuration::from_secs(300));
     }
 
     #[tokio::test]
@@ -2505,7 +2506,7 @@ mod tests {
             DelegatedAudience {
                 header: "authorization".into(),
                 extra_headers: vec![],
-                ttl: Duration::minutes(15),
+                ttl: SignedDuration::from_mins(15),
                 basic: true,
             },
         );
@@ -2539,27 +2540,26 @@ mod tests {
             c.value.0, want,
             "the user ends at the first colon; the secret may hold more"
         );
-        assert!(c.expires_at <= Utc::now() + Duration::seconds(300));
+        assert!(c.expires_at <= Timestamp::now() + SignedDuration::from_secs(300));
     }
 
     #[test]
     fn a_parked_credential_never_outlives_the_claims_ttl() {
-        use chrono::TimeZone;
         // The operator's rule, 2026-11-15: a delegated secret is stored no longer than the claim's TTL. The envelope's own
         // expiry is the least of the credential's (when the caller knows it) and the claim's creation plus its TTL.
-        let created = Utc.timestamp_opt(1_800_000_000, 0).unwrap();
-        let ttl_end = created + Duration::seconds(900);
+        let created = Timestamp::from_second(1_800_000_000).unwrap();
+        let ttl_end = created + SignedDuration::from_secs(900);
         assert_eq!(
             parked_expiry(None, created, 900),
             ttl_end,
             "no expiry known: the claim's TTL"
         );
         assert_eq!(
-            parked_expiry(Some(created + Duration::hours(5)), created, 900),
+            parked_expiry(Some(created + SignedDuration::from_hours(5)), created, 900),
             ttl_end,
             "a credential that outlives the claim is still stored only that long"
         );
-        let sooner = created + Duration::seconds(300);
+        let sooner = created + SignedDuration::from_secs(300);
         assert_eq!(
             parked_expiry(Some(sooner), created, 900),
             sooner,
@@ -2593,7 +2593,7 @@ mod tests {
         assert_eq!(c.header, "authorization");
         let jwt = c.value.0.strip_prefix("Bearer ").expect("a bearer");
         assert_eq!(jwt.split('.').count(), 3, "a compact JWT: {jwt}");
-        assert!(c.expires_at <= Utc::now() + Duration::seconds(300));
+        assert!(c.expires_at <= Timestamp::now() + SignedDuration::from_secs(300));
     }
 
     #[tokio::test]
@@ -2646,10 +2646,10 @@ mod tests {
             "unknown"
         );
         let mut revoked = claim(&["anthropic"], None);
-        revoked.revoked_at = Some(Utc::now());
+        revoked.revoked_at = Some(Timestamp::now());
         let revoked = stored(&st, revoked).await;
         let mut expired = claim(&["anthropic"], None);
-        expired.expires_at = Some(Utc::now() - Duration::seconds(1));
+        expired.expires_at = Some(Timestamp::now() - SignedDuration::from_secs(1));
         let expired = stored(&st, expired).await;
         let mut unbound = claim(&["anthropic"], None);
         unbound.expires_at = None;
@@ -2737,7 +2737,7 @@ mod tests {
             "claude".into(),
             DelegatedSession {
                 envelope: sealer.seal(expired.seal_binding(), &plain).await.unwrap(),
-                expires_at: Some(Utc::now() - Duration::seconds(5)),
+                expires_at: Some(Timestamp::now() - SignedDuration::from_secs(5)),
             },
         );
         st.sealer = Some(sealer);
@@ -2768,7 +2768,7 @@ mod tests {
         audiences: &[&str],
         mode: mediatore_claims::policy::EgressMode,
     ) -> (PolicyEgress, String) {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let base = mediatore_testkit::policy::fresh_bundle(now, 1).payload;
         let mut content = base.content.clone();
         content
@@ -2814,7 +2814,7 @@ mod tests {
                 value: Secret(SECRET_VALUE.into()),
                 header: "x-api-key".into(),
                 extra_headers: vec![],
-                ttl: Duration::minutes(5),
+                ttl: SignedDuration::from_mins(5),
             },
         );
         st.inject.insert(
@@ -2946,7 +2946,7 @@ mod tests {
                 hostname: "pool-1".into(),
                 provider: None,
                 banned: false,
-                registered_at: Utc::now(),
+                registered_at: Timestamp::now(),
             })
             .await
             .unwrap();
@@ -3134,7 +3134,7 @@ mod tests {
             "claude".into(),
             DelegatedSession {
                 envelope: sealer.seal(delegated.seal_binding(), &plain).await.unwrap(),
-                expires_at: Some(Utc::now() + Duration::hours(1)),
+                expires_at: Some(Timestamp::now() + SignedDuration::from_hours(1)),
             },
         );
         st.sealer = Some(sealer);
@@ -3601,7 +3601,7 @@ mod tests {
         assert_eq!(code(&resp), "internal");
         assert!(!text.contains("refresh-material-placeholder"), "{text}");
         // Nothing parked: the sandbox never got a UID for a session to be sealed under.
-        let far = Utc::now() + Duration::days(1);
+        let far = Timestamp::now() + SignedDuration::from_hours(24);
         assert_eq!(
             b.st.store.sweep_sessions(far).await.unwrap(),
             0,
@@ -3886,7 +3886,7 @@ mod tests {
                 hostname: "vm".into(),
                 provider: None,
                 banned: false,
-                registered_at: Utc::now(),
+                registered_at: Timestamp::now(),
             })
             .await
             .unwrap();

@@ -13,7 +13,7 @@
 use std::collections::HashSet;
 
 use banlieue_api::banlieue::VirtualMachine;
-use chrono::{DateTime, Duration, Utc};
+use jiff::{SignedDuration, Timestamp};
 use mediatore_proto::ek::ek_hash_from_pems;
 use mediatore_store::NodeRecord;
 
@@ -30,10 +30,10 @@ pub struct Inputs<'a> {
     /// The SPIRE agent ID of every node a claim that has not ended is bound to.
     pub busy_node_ids: &'a HashSet<String>,
     /// The time of the pass.
-    pub now: DateTime<Utc>,
+    pub now: Timestamp,
     /// A node younger than this is never collected: a registration may precede its VM's
     /// published endorsement certificate.
-    pub grace: Duration,
+    pub grace: SignedDuration,
     /// The most to return.
     pub cap: usize,
 }
@@ -47,7 +47,7 @@ pub struct Inputs<'a> {
 /// register.
 #[must_use]
 pub fn nodes_to_delete(i: &Inputs<'_>) -> Vec<String> {
-    let aged = |n: &NodeRecord| i.now - n.registered_at >= i.grace;
+    let aged = |n: &NodeRecord| i.now.duration_since(n.registered_at) >= i.grace;
     if i.live_ek_hashes.is_empty()
         && (!i.busy_node_ids.is_empty() || i.nodes.iter().any(|n| !aged(n)))
     {
@@ -105,7 +105,7 @@ pub fn ek_hashes_of(machines: &[VirtualMachine]) -> HashSet<String> {
 mod tests {
     use std::collections::HashSet;
 
-    use chrono::{DateTime, Duration, TimeZone, Utc};
+    use jiff::{SignedDuration, Timestamp};
     use mediatore_store::NodeRecord;
     use uuid::Uuid;
 
@@ -115,8 +115,8 @@ mod tests {
 
     use super::{Inputs, MAX_DELETIONS_PER_PASS, ek_hashes_of, nodes_to_delete};
 
-    fn at(minutes: i64) -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 11, 15, 0, 0, 0).unwrap() + Duration::minutes(minutes)
+    fn at(minutes: i64) -> Timestamp {
+        "2026-11-15T00:00:00Z".parse::<Timestamp>().unwrap() + SignedDuration::from_mins(minutes)
     }
 
     /// A node registered at minute `registered`.
@@ -147,7 +147,7 @@ mod tests {
             live_ek_hashes: live,
             busy_node_ids: busy,
             now: at(100),
-            grace: Duration::minutes(10),
+            grace: SignedDuration::from_mins(10),
             cap: MAX_DELETIONS_PER_PASS,
         })
     }

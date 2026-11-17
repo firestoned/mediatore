@@ -264,7 +264,7 @@ mod tests {
             "header": "x-api-key",
             "value": value,
             "extra_headers": [ { "name": "anthropic-version", "value": "2023-06-01" } ],
-            "expires_at": (chrono::Utc::now() + chrono::Duration::seconds(200)).to_rfc3339(),
+            "expires_at": (jiff::Timestamp::now() + jiff::SignedDuration::from_secs(200)).to_string(),
         })
         .to_string()
     }

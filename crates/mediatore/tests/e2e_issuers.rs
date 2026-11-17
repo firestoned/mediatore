@@ -11,7 +11,7 @@
 use std::future::IntoFuture;
 use std::sync::Arc;
 
-use chrono::Duration;
+use jiff::SignedDuration;
 use mediatore_api::{AppState, Limiter, Namespaces};
 use mediatore_client::{Api, LoginOptions, Session};
 use mediatore_entra::{Backend, IssuerConfig, SessionConfig, Validator};
@@ -89,7 +89,7 @@ impl Harness {
             "https://mediatore.test",
             "e2e-1",
             mediatore_testkit::entra::fresh_p256_key_pem().as_bytes(),
-            Duration::minutes(15),
+            SignedDuration::from_mins(15),
         )
         .expect("sts");
         let store = MemoryStore::shared();

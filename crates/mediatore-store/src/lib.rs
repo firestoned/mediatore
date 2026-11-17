@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use mediatore_proto::{ClaimReport, Provider, Subject, Workload, WorkloadExit};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
@@ -80,11 +80,11 @@ pub struct ClaimRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refresh: Option<Sealed>,
     /// When mediatore created the claim.
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     /// Bind deadline, once bound.
-    pub expires_at: Option<DateTime<Utc>>,
+    pub expires_at: Option<Timestamp>,
     /// Set on release or revocation; a revoked claim never issues again.
-    pub revoked_at: Option<DateTime<Utc>>,
+    pub revoked_at: Option<Timestamp>,
     /// The `AgentSandbox` the record came from (ADR-0013): the associated data that opens
     /// `refresh`. `None` for a record the dev binder wrote, which seals with its own UID.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -119,7 +119,7 @@ pub struct DelegatedSession {
     pub envelope: Sealed,
     /// When the bearer dies, if the caller said.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expires_at: Option<DateTime<Utc>>,
+    pub expires_at: Option<Timestamp>,
 }
 
 impl ClaimRecord {
@@ -131,14 +131,14 @@ impl ClaimRecord {
 
     /// True when tokens may still be issued for this claim.
     #[must_use]
-    pub fn is_live(&self, now: DateTime<Utc>) -> bool {
+    pub fn is_live(&self, now: Timestamp) -> bool {
         self.revoked_at.is_none() && self.expires_at.is_none_or(|e| e > now)
     }
 
     /// When the claim ended: its revocation, or its deadline once that has passed. `None`
     /// while it may still issue, or while it was never bound and never revoked.
     #[must_use]
-    pub fn ended_at(&self) -> Option<DateTime<Utc>> {
+    pub fn ended_at(&self) -> Option<Timestamp> {
         self.revoked_at.or(self.expires_at)
     }
 }
@@ -159,7 +159,7 @@ pub struct NodeRecord {
     /// A banned node is never bound again, even if still Ready.
     pub banned: bool,
     /// First registration time.
-    pub registered_at: DateTime<Utc>,
+    pub registered_at: Timestamp,
 }
 
 /// A delegated upstream session between the API call that received it and the record
@@ -176,14 +176,14 @@ pub struct SessionRecord {
     /// The refresh token, sealed with `sandbox_uid`.
     pub refresh: Sealed,
     /// When it was delegated; stale sessions are swept.
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     /// The audience this is for (ADR-0035): `None` is the issuer's session, `Some` a
     /// delegated credential for that audience, one Secret each.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audience: Option<String>,
     /// When a delegated bearer dies, if the caller said.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expires_at: Option<DateTime<Utc>>,
+    pub expires_at: Option<Timestamp>,
 }
 
 /// The version floor of one notaio policy (ADR-0026 decision 5): which incarnation it holds
@@ -201,7 +201,7 @@ pub struct PolicyFloor {
     /// The highest bundle version accepted for that incarnation.
     pub version: u64,
     /// `issuedAt` of the bundle the floor was last moved by, kept to the nanosecond.
-    pub issued_at: DateTime<Utc>,
+    pub issued_at: Timestamp,
 }
 
 /// Storage contract.
@@ -221,7 +221,7 @@ pub trait ClaimStore: Send + Sync + 'static {
     /// Replace an existing claim record.
     async fn update_claim(&self, rec: ClaimRecord) -> Result<(), StoreError>;
     /// Mark revoked and drop the refresh envelope; idempotent (the first timestamp wins).
-    async fn revoke_claim(&self, uid: Uuid, at: DateTime<Utc>) -> Result<(), StoreError>;
+    async fn revoke_claim(&self, uid: Uuid, at: Timestamp) -> Result<(), StoreError>;
     /// The live claim bound to a node (by the node's SPIRE agent SPIFFE ID).
     async fn get_claim_by_node(&self, node_id: &str) -> Result<ClaimRecord, StoreError>;
     /// All claims.
@@ -244,7 +244,7 @@ pub trait ClaimStore: Send + Sync + 'static {
     /// Remove every claim record that ended ([`ClaimRecord::ended_at`]) before `before`,
     /// after the retention window (ADR-0034 decision 4: the audit is the log line the
     /// store writes as it does so). Returns how many.
-    async fn sweep(&self, before: DateTime<Utc>) -> Result<usize, StoreError>;
+    async fn sweep(&self, before: Timestamp) -> Result<usize, StoreError>;
     /// Park a delegated session until the reconciler creates the record. `Conflict` if
     /// the sandbox already has one.
     async fn put_session(&self, rec: SessionRecord) -> Result<(), StoreError>;
@@ -257,7 +257,7 @@ pub trait ClaimStore: Send + Sync + 'static {
     /// nothing to remove is fine.
     async fn delete_session(&self, sandbox_uid: Uuid) -> Result<(), StoreError>;
     /// Remove every session delegated before `before`. Returns how many.
-    async fn sweep_sessions(&self, before: DateTime<Utc>) -> Result<usize, StoreError>;
+    async fn sweep_sessions(&self, before: Timestamp) -> Result<usize, StoreError>;
     /// The floor held for a policy, if one was ever recorded.
     async fn get_policy_floor(
         &self,
@@ -354,7 +354,7 @@ impl ClaimStore for MemoryStore {
         Ok(())
     }
 
-    async fn revoke_claim(&self, uid: Uuid, at: DateTime<Utc>) -> Result<(), StoreError> {
+    async fn revoke_claim(&self, uid: Uuid, at: Timestamp) -> Result<(), StoreError> {
         let mut m = self.claims.write().await;
         let rec = m
             .get_mut(&uid)
@@ -366,7 +366,7 @@ impl ClaimStore for MemoryStore {
     }
 
     async fn get_claim_by_node(&self, node_id: &str) -> Result<ClaimRecord, StoreError> {
-        let now = Utc::now();
+        let now = Timestamp::now();
         self.claims
             .read()
             .await
@@ -434,7 +434,7 @@ impl ClaimStore for MemoryStore {
         Ok(())
     }
 
-    async fn sweep(&self, before: DateTime<Utc>) -> Result<usize, StoreError> {
+    async fn sweep(&self, before: Timestamp) -> Result<usize, StoreError> {
         let mut claims = self.claims.write().await;
         let gone: Vec<Uuid> = claims
             .values()
@@ -482,8 +482,8 @@ impl ClaimStore for MemoryStore {
         Ok(())
     }
 
-    async fn sweep_sessions(&self, before: DateTime<Utc>) -> Result<usize, StoreError> {
-        let now = Utc::now();
+    async fn sweep_sessions(&self, before: Timestamp) -> Result<usize, StoreError> {
+        let now = Timestamp::now();
         let mut m = self.sessions.write().await;
         let n = m.len();
         // Old (the grace period) or expired (ADR-0043 decision 4: a credential stops being useful when it expires).

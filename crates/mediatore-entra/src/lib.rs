@@ -23,7 +23,7 @@ pub use assertion::{ClientAssertion, EntraConfig};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use jsonwebtoken::jwk::{AlgorithmParameters, EllipticCurve, Jwk, JwkSet};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 use mediatore_proto::{Secret, Subject};
@@ -275,7 +275,7 @@ pub struct Validated {
     /// Groups carried in the token, if any.
     pub groups: Vec<String>,
     /// Token expiry, informational.
-    pub expires_at: DateTime<Utc>,
+    pub expires_at: Timestamp,
 }
 
 /// Unverified `iss` peek, used to pick the issuer config before verifying the signature.
@@ -323,7 +323,7 @@ pub struct EntraRefreshed {
     /// The access token for the resource asked for.
     pub access_token: Secret,
     /// When that access token expires, from Entra's `expires_in`.
-    pub expires_at: DateTime<Utc>,
+    pub expires_at: Timestamp,
     /// Set when the resource was mediatore itself: the access token validated exactly
     /// like a login (signature, issuer, audience, the group gate, the subject).
     pub validated: Option<Validated>,
@@ -742,7 +742,7 @@ impl Validator {
         Ok(EntraRefreshed {
             refresh_token: Secret(refresh_token),
             access_token: Secret(access_token),
-            expires_at: Utc::now() + chrono::Duration::seconds(expires_in),
+            expires_at: Timestamp::now() + jiff::SignedDuration::from_secs(expires_in),
             validated,
         })
     }
@@ -796,7 +796,7 @@ impl Validator {
         let expires_at = claims
             .get("exp")
             .and_then(serde_json::Value::as_i64)
-            .and_then(|ts| DateTime::from_timestamp(ts, 0))
+            .and_then(|ts| Timestamp::from_second(ts).ok())
             .ok_or_else(|| IdpError::Invalid("missing exp".into()))?;
 
         Ok(Validated {
@@ -1258,7 +1258,7 @@ mod tests {
             "aud": "mediatore",
             "preferred_username": "octocat",
             "groups": ["firestoned:sandbox-users"],
-            "exp": chrono::Utc::now().timestamp() - 3600,
+            "exp": jiff::Timestamp::now().as_second() - 3600,
         }));
         assert!(matches!(
             v.validate(&token).await,
@@ -1331,7 +1331,7 @@ mod tests {
         assert_eq!(validated.groups, vec!["firestoned:sandbox-users"]);
         assert_ne!(own.refresh_token.0, session.0, "rotated");
         assert!(!idp.is_live(&session.0));
-        assert!(own.expires_at > Utc::now() + chrono::Duration::minutes(55));
+        assert!(own.expires_at > Timestamp::now() + jiff::SignedDuration::from_mins(55));
 
         // For the audience: Entra's token, unread.
         let downstream = v

@@ -225,7 +225,10 @@ async fn get_mirrors_the_resources_status() {
         "the pool the member came from, from status (ADR-0044 decision 5)"
     );
     assert_eq!(got.addresses, vec!["192.0.2.10".to_owned()]);
-    assert_eq!(got.expires_at.map(|t| t.timestamp()), Some(1_800_000_000));
+    assert_eq!(
+        got.expires_at.map(jiff::Timestamp::as_second),
+        Some(1_800_000_000)
+    );
 }
 
 #[tokio::test]

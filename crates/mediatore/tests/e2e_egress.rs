@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::routing::any;
-use chrono::Duration;
+use jiff::SignedDuration;
 use mediatore_api::{AppState, Limiter, Namespaces};
 use mediatore_entra::{Backend, IssuerConfig, Validator};
 use mediatore_guest::egress::{Phantom, Proxy, Routes, TokenSource};
@@ -140,7 +140,7 @@ fn state(idp: &FakeIdp, upstream: &TlsUpstream, keyed_upstream: &TlsUpstream) ->
         "https://mediatore.test",
         "e2e-1",
         STS_TEST_KEY.as_bytes(),
-        Duration::minutes(15),
+        SignedDuration::from_mins(15),
     )
     .expect("sts");
     Arc::new(AppState {
@@ -221,7 +221,7 @@ fn state(idp: &FakeIdp, upstream: &TlsUpstream, keyed_upstream: &TlsUpstream) ->
                     name: "anthropic-beta".into(),
                     value: "oauth-2025-04-20".into(),
                 }],
-                ttl: Duration::minutes(15),
+                ttl: SignedDuration::from_mins(15),
             },
         )]
         .into_iter()
@@ -675,9 +675,9 @@ async fn an_operator_held_credential_is_placed_by_the_proxy_and_never_enters_the
     assert_eq!(token.token_type, "Header");
     assert_eq!(token.header.as_deref(), Some("x-api-key"));
     assert_eq!(token.extra_headers[0].name, "anthropic-beta");
-    let left = token.expires_at - chrono::Utc::now();
+    let left = token.expires_at.duration_since(jiff::Timestamp::now());
     assert!(
-        left > Duration::minutes(14) && left <= Duration::minutes(15),
+        left > SignedDuration::from_mins(14) && left <= SignedDuration::from_mins(15),
         "expires_at is now plus max_ttl: {left}"
     );
 

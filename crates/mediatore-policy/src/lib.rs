@@ -12,7 +12,7 @@
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use mediatore_store::{ClaimStore, PolicyFloor, StoreError};
 use sandboxpolicy_bundle::conformance::error_name;
 use sandboxpolicy_bundle::floor::{FloorEntry, next_floor};
@@ -142,7 +142,7 @@ pub async fn admit(
     envelope: &Envelope,
     namespace: &str,
     keys: &TrustedKeys,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Result<BundlePayload, Refusal> {
     let payload =
         verify_bundle(envelope, keys, &VerifyOptions::at(now)).map_err(Refusal::Bundle)?;

@@ -27,7 +27,7 @@ clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
-chrono.workspace = true
+jiff.workspace = true
 sha2.workspace = true
 hex.workspace = true
 # Redaction (ADR-0045 decision 2): the base64 forms of a secret the jail was given.
