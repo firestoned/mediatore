@@ -26,7 +26,7 @@ These are the project's testing standards (`.claude/rules/testing.md`), and each
 | Kind | Where | Runs |
 | --- | --- | --- |
 | unit | an embedded `#[cfg(test)] mod tests` at the bottom of the source file (crates are small and few-file; there is no separate `_tests.rs`) | `cargo test` |
-| the store contract | `crates/mediatore-store/src/conformance.rs`: one case per behaviour, run against **each** store implementation | `cargo test` |
+| the store contract | `crates/mediatore-store/src/conformance.rs`: one case per behaviour, run over `MemoryStore` (`KubeStore` is proven by the kind tiers on a real API server) | `cargo test` |
 | end to end, hermetic | `crates/mediatore/tests/e2e_*.rs`: the real broker, the real proxy and guest code, over real HTTP listeners, with the test kit's fakes | `cargo test` |
 | live, in a kind cluster | `make kind-e2e-*` (SPIRE, mTLS, the watcher, the sandbox CRD, policy, the gateway, Dex, TPM) | by hand and in CI |
 | live, on the build host | `jail_exec_live.rs` (Landlock on a real kernel), `live_entra.rs` (a real Entra tenant), `kind-e2e-tpm` | by hand, `#[ignore]` |

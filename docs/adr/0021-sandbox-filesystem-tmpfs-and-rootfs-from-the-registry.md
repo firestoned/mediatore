@@ -3,7 +3,15 @@
 
 # ADR-0021: The sandbox filesystem is a tmpfs per claim, its rootfs pulled from the registry by the guest
 
-**Status:** Accepted · **Date:** 2026-10-26
+**Status:** Implemented · **Date:** 2026-10-26 · **Implemented:** 2026-10-26 (roadmap 06:
+`crates/mediatore-guest/src/sandboxfs.rs`, `image.rs`; live on a libvirt member
+2026-10-31) · **Amended:** 2026-11-04 by
+[ADR-0029](0029-the-pull-on-a-routeless-segment-and-the-pool-vms-root-rules.md) (the
+registry consequence: a gateway-era pool pulls from a registry declared on the segment,
+and the root rules admit it); 2026-11-15 by
+[ADR-0038](0038-the-pull-reaches-the-operators-registry-through-a-fourth-relay-leg.md)
+(the pull through the relay's fourth leg where no registry can sit on the segment,
+`reach: relay`)
 
 Roadmap 06, the two filesystem items. Implements the second half of
 [ADR-0008](0008-agentsandbox-crd-owned-by-mediatore.md) decision 8 (the workload comes from
@@ -88,6 +96,9 @@ rely on: a container runtime in the VM (none is baked, and none should be, the j
    ruleset, jail. The registry is a destination of the guest's, not the workload's, so
    nothing in the sandbox uid's chain of ADR-0020 admits it. The root egress chain of
    roadmap 06 will have to admit the registry, which is now a known input to that item.
+   *Done 2026-11-04 by ADR-0029 (`image/host-table` admits the declared registries to uid
+   0, read from `/etc/mediatore/registries`) and 2026-11-15 by ADR-0038 (the relay's
+   registry leg, to uid 0 alone).*
 
 6. **Any failure fails the claim before the jail.** An unreachable registry, a refused
    pull, a mismatched digest, a tmpfs that fills (`ENOSPC` against `--sandbox-size`), an
@@ -127,7 +138,8 @@ rely on: a container runtime in the VM (none is baked, and none should be, the j
   ignored tests run on the build host: the tmpfs mounted for real (`MEDIATORE_SUDO`) and
   an image pulled from a real registry (`MEDIATORE_PULL_IMAGE`); each fails rather than
   skips without its variable. The kind tiers run the guest with `--dev-skip-setup` and
-  mount and pull nothing; the live proof is roadmap 06's libvirt item.
+  mount and pull nothing; the live proof is roadmap 06's libvirt item. (Done 2026-10-31:
+  the member pulled the public curl image and ran it under nsjail; roadmap 06.)
 - A layer entry that passes through a symbolic link pointing outside the rootfs is
   refused where `umoci` would resolve the link inside. Layers produced by the usual
   builders carry such entries under the link's target, not through the link; an image

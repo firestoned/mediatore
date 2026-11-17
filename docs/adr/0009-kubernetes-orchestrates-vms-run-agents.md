@@ -3,7 +3,9 @@
 
 # ADR-0009: Kubernetes orchestrates, VMs run agents
 
-**Status:** Accepted · **Date:** 2026-09-30 · **Moved here:** 2026-10-12
+**Status:** Accepted · **Date:** 2026-09-30 · **Moved here:** 2026-10-12 · **Amended:**
+2026-10-30 by [ADR-0027](0027-control-plane-relay-on-the-egress-gateway.md) (decision 4:
+a sandbox reaches mediatore only through the control relay on the egress gateway)
 
 Scope: banlieue, mediatore, the AgentSandbox platform. Origin: platform ADR-0001, first
 recorded as banlieue
@@ -52,7 +54,11 @@ microVM pods (Kata and similar) are not available on them.
    material is shared between VMs.
 4. The management cluster is separate from general-purpose clusters. The
    sandbox network segment never has a route to any Kubernetes API server.
-   Sandboxes reach only mediatore and the egress gateway.
+   Sandboxes reach only mediatore and the egress gateway. *Amended 2026-10-30
+   by [ADR-0027](0027-control-plane-relay-on-the-egress-gateway.md) decision 4:
+   where egress gateways exist, a sandbox reaches mediatore and the SPIRE
+   server only through the control relay on the gateway, so the gateway is
+   the one thing on the segment it reaches by address.*
 
 ## Options considered
 
@@ -124,4 +130,4 @@ other exception requires a new ADR.
 ## Related
 
 - Platform threat model: hard floors, T2.1, T6.1, T8.3, T8.7.
-- [ADR-0010](https://github.com/firestoned/banlieue/blob/main/docs/adr/0010-no-inbound-to-sandboxes.md): No inbound to sandboxes.
+- [ADR-0010](0010-no-inbound-to-sandboxes.md): No inbound to sandboxes.

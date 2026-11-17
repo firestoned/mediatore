@@ -22,8 +22,8 @@ The broker talks to one trait, `ClaimStore` (`crates/mediatore-store/src/lib.rs`
 Plus `sweep` (archive claims past retention) and `ping`.
 
 There are two implementations and one rule between them: **what both do is pinned by a conformance suite**
-(`crates/mediatore-store/src/conformance.rs`, one `#[tokio::test]` per case, run against each store). `MemoryStore` is
-for `dev_mode` and tests. `KubeStore` is the shipped one. A behaviour that matters to the broker is a conformance case,
+(`crates/mediatore-store/src/conformance.rs`, one `#[tokio::test]` per case, run over `MemoryStore`; `KubeStore` needs a
+real API server, so the kind tiers prove it). `MemoryStore` is for `dev_mode` and tests. `KubeStore` is the shipped one. A behaviour that matters to the broker is a conformance case,
 so the in-memory fake is never more permissive than the real store.
 
 ## What lives where (`KubeStore`)

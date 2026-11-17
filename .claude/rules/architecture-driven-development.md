@@ -27,7 +27,7 @@
 
 Full cycle for anything that changes a **trust boundary, token shape, SPIFFE ID scheme,
 storage contract, API surface, deployment topology, or dependency on an external system**
-(IdP, SPIRE, banlieue, OpenBao, PostgreSQL). TDD-only for typos, isolated bugfixes and
+(IdP, SPIRE, banlieue, OpenBao, the Kubernetes API). TDD-only for typos, isolated bugfixes and
 mechanical refactors. When unsure, write the ADR.
 
 ## Checklist

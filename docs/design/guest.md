@@ -35,7 +35,7 @@ down: there is no partial-trust mode.
 | tmpfs | `sandboxfs.rs` | a fresh tmpfs per claim at the sandbox root, `nosuid,nodev`, mode `0711`, size-bounded (`--sandbox-size`), holding the rootfs, the layers and the proxy's files |
 | pull the image | `image.rs` | the workload's rootfs from its registry, **as root**, every blob digest-verified, nothing escaping the rootfs, setuid bits dropped and device nodes skipped (ADR-0021); the manifest digest is logged and reported |
 | choose gateways | `net.rs` | the broker's list from `GET /v1/me`, or the pool's bootstrap file when the broker lists none, or none (the proxy then dials directly) |
-| the ruleset | `net.rs` | one `nftables` table per claim whose output hook sends the **sandbox uid's** packets to a chain admitting a short list of TCP destinations and DNS to the VM's resolvers; everything else from that uid is dropped |
+| the ruleset | `net.rs` | one `nftables` table per claim whose output hook sends the **sandbox uid's** packets to a chain admitting a short list of TCP destinations: with gateways, the broker as the relay has it, the gateways' sandbox addresses and the proxy on loopback, every one an address and nothing on port 53 (`Shape::Gateways`); without, the resolved broker and egress addresses, the proxy, and DNS to the VM's resolvers (`Shape::Direct`); everything else from that uid is dropped |
 | the proxy's files | `egress.rs` | the routes, the gateways and a fresh phantom token, written as read-only files of the sandbox user |
 | load the ruleset | `net.rs` | `nft` loads the table and its hash is recorded |
 | start the egress proxy | `egress.rs` | a second process as the sandbox user, outside the jail, waited on until it says it is ready |

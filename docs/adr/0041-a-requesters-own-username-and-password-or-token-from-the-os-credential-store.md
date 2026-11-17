@@ -3,7 +3,7 @@
 
 # ADR-0041: A requester's own username and password, or token, from the OS credential store, for an audience that is not OAuth
 
-**Status:** Accepted 2026-11-15; implemented in v0.2.8; amended 2026-11-15 after the first live run (decision 7: a git host may refuse the password, and then a token is required; a threat-model pass and an SSH decision are still owed) · **Date:** 2026-11-15
+**Status:** Accepted 2026-11-15; implemented in v0.2.8; amended 2026-11-15 after the first live run (decision 7: a git host may refuse the password, and then a token is required; the threat-model pass was done the same day, TB-18, A-25, R-30) and 2026-11-16 by [ADR-0043](0043-a-persons-registry-credential-is-placed-at-the-gateway-the-vm-never-sees-it.md) (decision 5: the saved item's age limit is the lesser of six hours and the claim's TTL); the SSH decision is still open · **Date:** 2026-11-15
 
 Roadmap 04 (the backends) and roadmap 12 (the path to the upstreams). Extends
 [ADR-0035](0035-a-requesters-own-session-delegated-at-claim-time.md) (`via: delegated`, the
@@ -107,6 +107,12 @@ Three questions follow, and this ADR answers each:
    Linux), writes nothing to its own session file (which keeps the issuer's session only), and logs
    the source's name, never a value.
 
+   *Amended 2026-11-16 by
+   [ADR-0043](0043-a-persons-registry-credential-is-placed-at-the-gateway-the-vm-never-sees-it.md)
+   (decision 5): the item records the claim's TTL and its age limit is the lesser of six hours
+   and that TTL (`crates/mediatore-client/src/delegate.rs`); an item saved before this change
+   keeps the six hours.*
+
 6. **The browser's cookie store is not a source, now or later.** The CLI does not read, import or
    decrypt any browser's cookies, local storage or saved passwords, with or without a flag. Three
    reasons, each enough alone:
@@ -203,7 +209,7 @@ Three questions follow, and this ADR answers each:
   in the local sealer shape; for `basic` the transit shape is required when the broker offers one, so
   the plaintext path is not chosen by the client (the same rule as ADR-0035 decision 2).
 
-## Implementation notes (2026-11-15, branch `feat/basic-credential-adr-0041`)
+## Implementation notes (2026-11-15, branch `feat/basic-credential-adr-0041`, merged as #121 and released in v0.2.8)
 
 Built on v0.2.7 for the first platform (macOS) and the two sources the operator needs now. Where the
 code is narrower or different from the decisions above:
@@ -285,5 +291,7 @@ nothing on a non-TTY with no store; the cookie path does not exist), then the co
 4. **Threat model.** `docs/security/threat-model.md` has no entry for a delegated Basic credential or for a
    token as the secret (long-lived, its own scope, a secret the person created on the upstream). The pass
    that an implemented ADR owes (`.claude/rules/threat-modeling.md`) is owed here, with the stamp bumped.
+   (Done 2026-11-15: TB-18 new, A-25 new, R-30 to R-32 new, R-28 narrowed, the stamp bumped;
+   `docs/security/threat-model.md`.)
 5. **Kerberos.** `proxy.home.example:8080` wants Kerberos, not Basic. It is a different shape and has
    its own ADR: [ADR-0042](0042-the-corporate-forward-proxy-through-a-kerberos-holder-on-the-gateway.md).

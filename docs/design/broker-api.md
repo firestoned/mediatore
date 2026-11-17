@@ -24,8 +24,8 @@ never sits behind a TLS-ending proxy: it is exposed as a TLS passthrough so the 
 | `GET /healthz` | liveness |
 | `GET /.well-known/jwks.json` | the STS's public keys, when the STS backend is configured |
 | `POST /v1/claims` | request a sandbox (below) |
-| `GET /v1/claims/{name}` | the sandbox's status, mirrored from its `AgentSandbox`; only its subject may read it |
-| `DELETE /v1/claims/{name}` | delete the `AgentSandbox`; the reconciler's finalizer does the rest |
+| `GET /v1/claims/{name}` | the sandbox's status, mirrored from its `AgentSandbox`; only its subject may read it, in a namespace the caller's groups admit (`?namespace=`, ADR-0046: a namespace they do not admit answers `404`, the same as no such sandbox) |
+| `DELETE /v1/claims/{name}` | delete the `AgentSandbox` (`?namespace=` as for `GET`); the reconciler's finalizer does the rest |
 
 **Sandbox API** (`sandbox_router`)
 
@@ -56,22 +56,27 @@ needs a claim identity checks the SPIFFE ID's shape (`/banlieue/claim/<uid>`), a
 `create_claim` checks in this order, each failure a stable error code and nothing created:
 
 1. **The bearer.** Validated against the configured issuers: signature through the JWKS, expiry, audience, and the
-   issuer's authorisation gate (a required group). See [Issuers and audiences](issuers-and-audiences.md).
-2. **`unknown_audience`.** Every audience the body names must be one the broker is configured to serve.
-3. **`invalid_workload_image`**, then **`unreachable_registry`.** The image must parse, and in an environment with
+   issuer's authorisation gate (one of `required_groups`, any of; `required_group`, its alias; or an explicit
+   `allow_any_authenticated`). See [Issuers and audiences](issuers-and-audiences.md).
+2. **The namespace** (`resolve_create`, ADR-0046). With a namespace map, the body must name one (`400
+   namespace_required`) that the token's groups admit (`403`); with a single namespace every caller past the gate
+   claims there. Nothing is parked for a refusal.
+3. **`invalid_pool`.** Exactly one of `pool_ref` and `pool_selector` (ADR-0044); neither is never read as "any pool".
+4. **`unknown_audience`.** Every audience the body names must be one the broker is configured to serve.
+5. **`invalid_workload_image`**, then **`unreachable_registry`.** The image must parse, and in an environment with
    gateways its registry must be one the pool reaches: a registry declared with a `reach`, or the host of a
    gateway-placed audience.
-4. **The session** (`session_for`). An issuer configured with a `session` requires the refresh token in the body
+6. **The session** (`session_for`). An issuer configured with a `session` requires the refresh token in the body
    (`session_required`); any other issuer refuses one (`session_unexpected`); an Entra issuer exchanges the caller's
    token On-Behalf-Of here (`session_refused` when Entra says no, `audience_needs_entra` for an audience Entra alone
    serves).
-5. **The delegations** (`delegations_for`). A `delegated` audience needs exactly one delegation with a token
+7. **The delegations** (`delegations_for`). A `delegated` audience needs exactly one delegation with a token
    (`delegation_required`); an audience that is not `delegated` takes none (`delegation_refused`); a `credential:
    basic` secret must be `user:secret` with no control character; a credential the caller says dies before the
    claim's TTL is refused (`delegation_expires_first`); a pending one (the envelope sealed on the caller's machine)
    is not served yet (`501`).
-6. **Sealing must be configured** when there is anything to seal; otherwise `501 sealing`, never a plaintext store.
-7. **`invalid_ttl`** for a TTL of zero.
+8. **Sealing must be configured** when there is anything to seal; otherwise `501 sealing`, never a plaintext store.
+9. **`invalid_ttl`** for a TTL of zero.
 
 Then, outside `dev_mode`, `create_sandbox` creates the `AgentSandbox` with the token's subject (the broker's
 `ServiceAccount` is exempt from the subject admission policy for exactly this, so the token validation above is the

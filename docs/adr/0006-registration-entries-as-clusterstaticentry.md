@@ -3,7 +3,16 @@
 
 # ADR-0006: Registration entries are declared as ClusterStaticEntry, never pushed over the SPIRE admin API
 
-**Status:** Accepted · **Date:** 2026-10-10 · **Accepted:** 2026-10-11
+**Status:** Implemented · **Date:** 2026-10-10 · **Accepted:** 2026-10-11 ·
+**Implemented:** 2026-10-13 (roadmap 01: `KubeEntryManager` in `crates/mediatore-spire`,
+the admission policy, `make kind-e2e-mtls`) · **Amended:** 2026-10-15 by
+[ADR-0014](0014-one-binary-roles-as-subcommands.md) decision 5 (the node entry's
+`unix:path` selector names the one `mediatore` binary); 2026-10-22 by
+[ADR-0018](0018-tpm-attestation-with-the-spiffe-plugin.md) (the attestor plugin and what
+signs the EKs); 2026-10-27 by [ADR-0023](0023-sandbox-vm-image-kairos-derivative.md)
+decision 2 (the pinned path is `/usr/bin/mediatore`); 2026-10-30 by
+[ADR-0027](0027-control-plane-relay-on-the-egress-gateway.md) decision 7 (the claim
+entry's `x509SVIDTTL` is at most 15 minutes, never more than the claim has left)
 
 Amends [ADR-0005](0005-spire-topology.md) (the entry transport only; the topology stands).
 Companion: [ADR-0007](0007-broker-identity-and-spiffe-mtls.md) (how mediatore gets its own
@@ -100,6 +109,12 @@ flowchart LR
 | --- | --- | --- | --- | --- | --- |
 | node | `mediatore-node-<ek-hash>` | `spiffe://<td>/banlieue/node/<ek-hash>` | `spiffe://<td>/spire/agent/tpm/<ek-hash>` | `unix:uid:0`, `unix:path:/usr/local/bin/mediatore-guest` | server default |
 | claim | `mediatore-claim-<uid>` | `spiffe://<td>/banlieue/claim/<uid>` | `spiffe://<td>/spire/agent/tpm/<ek-hash>` | `unix:user:sb-<12 hex>` | `1h` |
+
+*Amended:* two cells of the table have moved since. The node entry's path selector is
+`unix:path:/usr/bin/mediatore`, the one binary of ADR-0014 at the pinned path of ADR-0023
+decision 2 (`GUEST_AGENT_PATH` in `crates/mediatore-spire/src/lib.rs`). The claim entry's
+`x509SVIDTTL` is `spire.entries.claim_svid_ttl`, default `15m` and never more
+(`MAX_CLAIM_SVID_TTL`; `crates/mediatore/src/config.rs`), per ADR-0027 decision 7.
 
 Every resource carries `spec.className` (the controller manager this cluster runs with
 `watchClassless: false`, so a classless resource is silently ignored; the value is
@@ -215,13 +230,15 @@ sequenceDiagram
 The SPIFFE ID scheme and selectors (ADR-0004), the `EntryManager` trait as the single
 boundary in `crates/mediatore-spire` (its implementation changes from "gRPC, planned" to
 `KubeEntryManager`; `Noop` stays for `dev_mode`), the release ordering (entry first, then
-refresh material), and the nested topology (ADR-0005).
+refresh material), and the nested topology (ADR-0005). (As built, the `dev_mode` and test
+implementation is `MemoryEntries`, which validates like `KubeEntryManager`; there is no
+`Noop`.)
 
 ## Security analysis
 
 STRIDE for the boundary this ADR creates or changes. "Control" names what the
 implementation must provide; the threat model records it only once the code exists
-(`rules/threat-modeling.md`).
+(`.claude/rules/threat-modeling.md`).
 
 | Boundary | Threat | S/T/R/I/D/E | Control |
 | --- | --- | --- | --- |

@@ -36,10 +36,10 @@ unless the allow carries a one-line justification.
 
 1. **Fail closed.** An unimplemented path returns an error (`501 not_implemented`),
    and there is a test proving the refusal. A permissive default is a bug.
-2. **A fake more permissive than the real thing hides bugs.** When the mTLS, SPIRE
-   gRPC or sqlx implementations land, any behaviour a live test finds that the fake
-   (dev header, `Noop`, `MemoryStore`) got wrong is fixed in the fake in the same
-   change.
+2. **A fake more permissive than the real thing hides bugs.** Any behaviour a live
+   test (a kind tier, an ignored test on the build host) finds that a fake
+   (`MemoryStore`, `MemoryEntries`, `MemorySandboxes`, the test kit's fake IdP and
+   CA, the dev header) got wrong is fixed in the fake in the same change.
 3. **A test that skips must never report success.** Live tests (`#[ignore]`) fail
    loudly when their fixture is missing.
 4. **Never log or assert on secret material.** Tests inspect token *claims* after

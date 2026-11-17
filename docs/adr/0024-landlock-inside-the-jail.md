@@ -3,7 +3,11 @@
 
 # ADR-0024: Landlock inside the jail, applied by the one binary before the workload runs
 
-**Status:** Accepted · **Date:** 2026-10-30
+**Status:** Accepted (implemented) · **Date:** 2026-10-30 · **Amended:** 2026-10-30 by
+[ADR-0025](0025-phantom-token-egress-proxy.md) (decision 2: the workload connects to the
+proxy port only); 2026-11-12 by
+[ADR-0036](0036-proc-inside-the-jail-the-workloads-own-processes-only.md) (decision 1: a
+`subset=pid` `/proc`)
 
 Roadmap 06, the confinement item (listed until now as "a real seccomp policy for
 nsjail"). Adds an inner layer to the jail of
@@ -79,6 +83,11 @@ of this workspace (ADR-0007, `deny.toml`).
    `crates/mediatore-guest/src/confine.rs`), pinned by unit tests on every platform
    like the nsjail arguments and the ruleset text are. UDP is not Landlock's: DNS to
    the resolvers keeps working and keeps being the ruleset's to bound (ADR-0020, R-12).
+
+   *Amended 2026-10-30 by [ADR-0025](0025-phantom-token-egress-proxy.md) (its decision 5): the
+   jail reaches the egress proxy on loopback and nothing else, so the connect set is the
+   proxy's port alone (`JailSpec::proxy_port` is what `jail-exec` is handed, and `Plan` in
+   `crates/mediatore-guest/src/confine.rs` is built from it).*
 
 3. **Through the `nono` library, pinned exactly, with the keyring feature off.** Not
    the raw `landlock` crate: nono carries the ABI detection and the hard-requirement

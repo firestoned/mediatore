@@ -14,7 +14,7 @@
   ],
   "metadata": {
     "owner": "mediatore-maintainers",
-    "last_reviewed": "2026-10-12",
+    "last_reviewed": "2026-11-17",
     "source": "sandbox-stack.drawio, 'AgentSandbox: high-level stack, from physical TPM to signed policy'",
     "scope": "The AgentSandbox platform end to end: the signed policy path (Git, notaio, the DSSE bundle), the AgentSandbox request and banlieue's VM orchestration (supervisory agent, AgentSandbox, VMClaim, VMPool, controller), identity (identity provider, SPIRE, mediatore), the sandbox VM and its single way out, and the hardware root of trust. Companion model to architecture.json, which models mediatore itself. Moved from the banlieue repository on 2026-10-12 with ADR-0008; banlieue, notaio and the egress gateway are summarized here and their own repositories are the source of truth for them. Nodes and relationships tagged metadata.status=proposed are not built."
   },
@@ -229,7 +229,7 @@
       "unique-id": "agentsandbox-mediatore",
       "node-type": "service",
       "name": "mediatore",
-      "description": "Binds each claim to its attested VM. Mints short-lived, audience-scoped tokens by on-behalf-of or STS exchange. Verifies the signed bundle, evaluates it at every mint, and stamps the policy version into each token. The user's token never enters the VM.",
+      "description": "Binds each claim to its attested VM. Mints short-lived, audience-scoped tokens by on-behalf-of or STS exchange. Verifies the signed bundle when it arrives, holds its version floor as a PolicyFloor resource and compares it with the broker's configuration in shadow (ADR-0026); under policy.egress: enforce the bundle's direct egress is served at the gateway (ADR-0030). Evaluating the bundle at every mint and stamping the policy version into each token is proposed, not built. The user's token never enters the VM.",
       "controls": {
         "user-token-never-enters-vm": {
           "description": "The person's token stays in mediatore; a VM only ever receives short-lived tokens scoped to one audience.",
@@ -247,7 +247,7 @@
           ]
         },
         "policy-evaluated-every-mint": {
-          "description": "Every token mint verifies the current signed bundle and evaluates it, so a policy change applies at the next mint without restarting anything.",
+          "description": "Proposed, not built: every token mint would evaluate the current signed bundle, so a policy change applies at the next mint. Today a bundle is verified when its ConfigMap changes and the sandboxes naming the policy are reconciled then, without a restart.",
           "requirements": [
             {
               "requirement-url": "https://github.com/firestoned/mediatore/blob/main/docs/adr/0009-kubernetes-orchestrates-vms-run-agents.md",
@@ -261,6 +261,10 @@
             }
           ]
         }
+      },
+      "metadata": {
+        "status": "implemented",
+        "proposed": "evaluation at every mint and the policy version stamped into each token"
       }
     },
     {
@@ -352,7 +356,11 @@
       "unique-id": "agentsandbox-mediatore-guest",
       "node-type": "service",
       "name": "mediatore-guest",
-      "description": "Runs as root in the VM. Attests the VM to SPIRE, verifies the signed bundle and refuses downgrades, renders and applies the nsjail, nftables and settings configuration, and holds the VM's only connection out. With egress gateways the image's host table bounds root and every uid to the gateways' two planes and the registry mirror on the segment before the guest starts (ADR-0029), and the workload image is pulled from that mirror."
+      "description": "Runs as root in the VM. Attests the VM to SPIRE, takes from the broker what the claim may run and reach (the bundle is verified and its floor held by the broker, never by the guest), renders and applies the nsjail, Landlock and nftables configuration, and starts the egress proxy, the VM's only connection out. With egress gateways the image's host table bounds root and every uid to the gateways' two planes and the registry mirror on the segment before the guest starts (ADR-0029), and the workload image is pulled from that mirror.",
+      "metadata": {
+        "status": "implemented",
+        "proposed": "a bundle verifier in the guest that refuses downgrades"
+      }
     },
     {
       "unique-id": "agentsandbox-egress-forwarder",

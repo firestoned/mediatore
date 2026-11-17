@@ -19,7 +19,7 @@ roadmap 06's image work (the VM image carries the SPIRE agent and the `mediatore
 Runs on banlieue's proxy VMs and sandbox segment
 ([banlieue ADR-0109](https://github.com/firestoned/banlieue/blob/main/docs/adr/0109-isolated-sandbox-network-with-proxy-egress.md));
 the segment and its VLAN must exist before the three VMs do. Roadmap 07 (credential
-injection) builds on this and stays design-only.
+injection) builds on this: its proxy, built 2026-10-30, tunnels through these gateways.
 
 - [x] ADR-0028 accepted (2026-11-02)
 - [x] banlieue ADR-0109 decision 4 amended (haproxy to Envoy, 2026-10-28; this roadmap

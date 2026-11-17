@@ -10,7 +10,9 @@ agent starts with is the PKI root the server's CA chains to, good for years, not
 server's CA of the day);
 2026-11-14 by [ADR-0037](0037-the-pool-fetches-its-spire-bundle-at-boot-through-the-relay.md)
 (decisions 2 and 3: a third fixed leg, the SPIRE bundle endpoint on `RELAY_BUNDLE_PORT`, so a
-pool member fetches its bundle at boot instead of carrying one)
+pool member fetches its bundle at boot instead of carrying one);
+2026-11-15 by [ADR-0038](0038-the-pull-reaches-the-operators-registry-through-a-fourth-relay-leg.md)
+(decision 2: a fourth fixed leg, the operator's registry on `RELAY_REGISTRY_PORT`, for root only)
 
 Roadmap 10. Amends [ADR-0028](0028-egress-gateway-envoy-with-spiffe-identity.md) decisions 4
 and 6 (what the gateway carries, and whether the sandbox reaches the broker directly),
@@ -152,7 +154,10 @@ What roadmap 10 fixed within the decisions above, as it is built:
 - **The relay is a second Envoy** (decisions 1, 2 and 9), `envoy-relay.service` in the
   gateway image (`image/gateway/`), as user `envoy-relay`, on the bootstrap
   `image/gateway/envoy/relay.yaml.in`: two `tcp_proxy` listeners on the sandbox address,
-  3129 to the SPIRE server and 3130 to the broker, each a static cluster by address from
+  3129 to the SPIRE server and 3130 to the broker (four since ADR-0037 and ADR-0038: the
+  bundle endpoint on `RELAY_BUNDLE_PORT` and the operator's registry on
+  `RELAY_REGISTRY_PORT`; the host table lists the four relay ports and, where set, the
+  inject port of ADR-0040, `image/gateway/nftables.conf.in`), each a static cluster by address from
   the deployment's env file, no TLS context, no SDS, no admin block, one access-log line per
   connection (source, upstream, bytes each way, duration, flags). Its unit keeps `/run/spire`
   inaccessible, so the mount namespace enforces "no socket" beside the file modes, and it
@@ -213,7 +218,9 @@ What roadmap 10 fixed within the decisions above, as it is built:
   per-interface rule in `crates/mediatore-guest/src/net.rs`.
 - **Threat model and CALM:** a new boundary (the control relay), a new relation (sandbox to
   SPIRE and broker through it) and a changed assumption (ADR-0009 decision 4). The pass is
-  owed when this is implemented.
+  owed when this is implemented. (Done: the pass of 2026-11-04 added TB-13, TB-14 and TB-15
+  for the relay, `docs/security/threat-model.md`, and the passes for ADR-0037 and ADR-0038
+  extended TB-15 for the third and fourth legs.)
 - **Rejected:**
   - a certificate and key delivered through `guestinfo` (the key in the VM's configuration);
   - a route or SVI from the segment to the SPIRE servers and the broker (breaks ADR-0109
@@ -244,7 +251,11 @@ What roadmap 10 fixed within the decisions above, as it is built:
   `RELAY_CAP=16` is an order of magnitude above need; a rate limit was not needed.
 - **Whether the broker's node leg needs a second, separate listener** from the one the
   gateway's own SVID uses, or one listener that accepts both SVID shapes.
-- **The bundle's age limit:** how often the image's bundle is rebuilt so a long-lived image
-  still shares a root with the servers.
+- ~~**The bundle's age limit:** how often the image's bundle is rebuilt so a long-lived image
+  still shares a root with the servers.~~ Settled: the anchor is the OpenBao PKI root, good
+  for years ([ADR-0031](0031-a-trust-anchor-that-outlives-the-servers-ca.md), 2026-11-07),
+  and where the bundle endpoint serves a web PKI certificate the bundle is fetched at boot
+  through the relay, not baked
+  ([ADR-0037](0037-the-pool-fetches-its-spire-bundle-at-boot-through-the-relay.md), 2026-11-14).
 - **The `x509_svid_ttl` value,** against the SPIRE server's capacity at the renewal rate it
   implies for the pool's size.

@@ -3,7 +3,7 @@
 
 # ADR-0044: A sandbox selects its pool by label, or names it
 
-**Status:** Accepted · **Date:** 2026-11-16 · **Amended:** 2026-11-17 (decision 6, the namespace boundary, [ADR-0046](0046-who-may-claim-a-list-of-groups-and-a-namespace-to-groups-mapping.md))
+**Status:** Accepted 2026-11-16; implemented, released in v0.2.10 (#127, whose title names ADR-0043 by mistake; `PoolSelector`, `--pool-selector`, `invalid_pool`, banlieue-api v0.5.9) · **Date:** 2026-11-16 · **Amended:** 2026-11-17 (decision 6, the namespace boundary, [ADR-0046](0046-who-may-claim-a-list-of-groups-and-a-namespace-to-groups-mapping.md))
 
 Roadmap 08 (the `AgentSandbox` CRD). Amends
 [ADR-0008](0008-agentsandbox-crd-owned-by-mediatore.md) decision 7 (the spec's fields) and

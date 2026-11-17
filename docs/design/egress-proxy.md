@@ -96,9 +96,9 @@ claim SVID from the Workload API (one source for the broker client and the gatew
 prints one line, `ready <addr>`, on standard output. The guest starts the jail when it reads it. A failure at any step
 exits before that line, which ends the claim before the workload runs.
 
-The default listen port is 3128 (`DEFAULT_PORT`); the reference deployment moves it with `MEDIATORE_EGRESS_PROXY_PORT`
-because 3128 is the gateways' data-plane port and the guest refuses a claim whose destination port equals the proxy's
-(the workload's one allowed port would name two destinations).
+The default listen port is 3128 (`DEFAULT_PORT`); `MEDIATORE_EGRESS_PROXY_PORT` moves it. The guest refuses a claim whose
+broker or egress destination uses the proxy's port, whatever that port is (the workload's one allowed port would name
+two destinations), so a deployment moves the port when the broker or an audience is served on 3128.
 
 ## Rules this part keeps
 

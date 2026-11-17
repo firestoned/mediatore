@@ -42,8 +42,9 @@ are the questions it answers, with the recommendation this roadmap is built on.
    a Role per listed namespace with `get`, `list` and `watch` on ConfigMaps and nothing else.
 4. **The floor lives in the store.** A `policy_floors` table (namespace, name, uid, version,
    issued_at), in both the SQLite and the PostgreSQL migrations and in the store conformance
-   suite, so the floor survives restarts with the claims. The rules stay notaio's (its ADR-0008),
-   not re-implemented here. One gap to close: notaio's `VersionFloor` is synchronous and
+   suite, so the floor survives restarts with the claims (since ADR-0034 a `PolicyFloor`
+   resource in the broker's namespace, no SQL; roadmap 05). The rules stay notaio's (its
+   ADR-0008), not re-implemented here. One gap to close: notaio's `VersionFloor` is synchronous and
    `ClaimStore` is async. Recommended: notaio exposes the floor decision as a pure function
    (held entry and verified payload in, next entry or refusal out), released as a patch, and
    mediatore verifies, decides, awaits the write, and only then uses the bundle. The alternative,
@@ -80,11 +81,12 @@ are the questions it answers, with the recommendation this roadmap is built on.
       floor, the flow `flow-policy-shadow` (write, verify, floor, compare, mint unchanged);
       `make calm-validate` and the diagrams re-rendered
 - [x] notaio: the floor decision as a pure function, in a patch release; mediatore pins that tag.
-      Done 2026-11-01: `next_floor` in notaio v0.3.3, verified like every release
+      Done 2026-11-01: `next_floor` in notaio v0.3.3 (the pin is v0.6.0 now), verified like
+      every release
 - [x] The dependency and `deny.toml`; the crate's conformance vectors run in mediatore's own tests,
       so mediatore's verifier is shown to reach notaio's verdict on every vector. Done
-      2026-11-01: `sandboxpolicy-bundle` at notaio `v0.3.3`, notaio in `allow-git`; the new
-      `mediatore-policy` crate (`trusted_keys`, `admit`); all 14 vectors pass through `admit`
+      2026-11-01: `sandboxpolicy-bundle` at notaio `v0.3.3` (both crates at `v0.6.0` now),
+      notaio in `allow-git`; the new `mediatore-policy` crate (`trusted_keys`, `admit`); all 14 vectors pass through `admit`
       over the store, not through notaio's own `run`; no `kube`, `schemars`, `ring` or
       `openssl-sys` added, and no new duplicate crate
 - [x] `policy.trusted_keys` and `policy.namespaces` in the configuration, a malformed key refusing
@@ -94,8 +96,9 @@ are the questions it answers, with the recommendation this roadmap is built on.
       twice all refuse the start; ADR-0026, implementation notes); the example overlay's
       commented `policy` block and the deploying guide's step 1
 - [x] `policy_floors` in both migrations, `ClaimStore` methods for it, the store conformance suite
-      extended. Done 2026-11-01: `get_policy_floor` and `advance_policy_floor`, a compare and set
-      (ADR-0026, implementation notes); three cases (a round trip to the nanosecond, a write
+      extended (the migrations went with ADR-0034; the floor is a `PolicyFloor` resource,
+      the methods stay). Done 2026-11-01: `get_policy_floor` and `advance_policy_floor`, a
+      compare and set (ADR-0026, implementation notes); three cases (a round trip to the nanosecond, a write
       decided from a floor that moved refused, a floor written under another policy refused) on
       the memory store, SQLite and PostgreSQL 17. The floor rule itself (a downgrade, a new
       incarnation, a replay) is notaio's `next_floor`, tested there and run by the broker
@@ -111,7 +114,8 @@ are the questions it answers, with the recommendation this roadmap is built on.
 - [x] `spec.policyRef` on `AgentSandbox` (`make crds`), immutable under the existing admission
       policy; the record's policy uid and bundle version. Done 2026-11-01: an optional
       `{ name }` on the spec, `policy_ref` on `POST /v1/claims` and `--policy` on the CLI;
-      `claims.policy_uid` and `claims.bundle_version` (migration 4, both engines, the
+      `claims.policy_uid` and `claims.bundle_version` (migration 4, both engines, until
+      ADR-0034 made them fields of the record on the `AgentSandbox` status; the
       conformance suite's round trip and update); the reconciler reads the reflector's cache
       once, when it creates the record, and a sandbox whose policy has no verified bundle is
       admitted with nothing recorded (three reconcile tests over a bundle the testkit signs

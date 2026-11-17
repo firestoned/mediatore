@@ -5,8 +5,9 @@
 
 **Status:** Implemented · **Date:** 2026-11-09 (accepted, implemented and run live the same day: `docs/guides/testing.md`, run 7)
 
-Roadmap 06 (the guest). Amends [ADR-0014](0014-one-binary-roles-as-subcommands.md)
-decision 3 (what the guest does when the jail exits) and
+Roadmap 06 (the guest). Amends the guest supervisor's restart on exit
+([ADR-0024](0024-landlock-inside-the-jail.md) decision 4: any exit but the fatal `125` was
+restarted; the roles of [ADR-0014](0014-one-binary-roles-as-subcommands.md) are unchanged) and
 [ADR-0008](0008-agentsandbox-crd-owned-by-mediatore.md) decision 8 (the shape of `workload`), and adds one
 route to the sandbox API beside `POST /v1/me/report`
 ([ADR-0029](0029-the-pull-on-a-routeless-segment-and-the-pool-vms-root-rules.md) decision
@@ -63,7 +64,9 @@ recycled, the exit on record, with no one watching a log to delete the sandbox.
 
 - `RestartPolicy` and `Workload::restart`, `WorkloadExit` and `ClaimResponse::exit`
   (`crates/mediatore-proto`); `ClaimRecord::exit` and the `exit` column with its audit
-  twin (`crates/mediatore-store`, migration 6); `SandboxWorkload::restart` and the
+  twin (`crates/mediatore-store`, migration 6; since ADR-0034, the same day,
+  `RecordStatus::exit` in `status.record`, `crates/mediatore-claims/src/kubestore.rs`);
+  `SandboxWorkload::restart` and the
   rendered CRD (`crates/mediatore-claims`, `make crds`); `POST /v1/me/exit`
   (`crates/mediatore-api`); `supervise::run` deciding by the policy and returning how the
   round ended, the guest posting it (`crates/mediatore-guest`); `--restart` on

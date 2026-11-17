@@ -3,7 +3,16 @@
 
 # ADR-0013: The Dex path: the upstream session is delegated at claim creation, sealed, and refreshed before every issue
 
-**Status:** Accepted · **Date:** 2026-10-14
+**Status:** Implemented · **Date:** 2026-10-14 · **Implemented:** 2026-10-14 (roadmap 04:
+`crates/mediatore/tests/e2e_session.rs`; Dex in kind on 2026-10-15) · **Amended:**
+2026-10-15 by [ADR-0014](0014-one-binary-roles-as-subcommands.md) (the CLI is the one
+binary's subcommands, `mediatore login` and `mediatore sandbox create`); 2026-10-21 by
+[ADR-0017](0017-issuer-profiles.md) (the framing: the session path is any OIDC issuer's,
+not Dex's alone); 2026-11-09 by
+[ADR-0034](0034-the-kubernetes-api-as-the-brokers-store.md) (decision 2: the sealed session
+is a Secret owned by its sandbox, not a row); 2026-11-10 by
+[ADR-0035](0035-a-requesters-own-session-delegated-at-claim-time.md) (the same delegation,
+generalised from the issuer to an audience)
 
 Roadmap 04, first slice. Implements the `sts` half of [ADR-0003](0003-token-backends.md)
 ("before every issue, mediatore refreshes the upstream session so revocation upstream
@@ -68,6 +77,11 @@ does), so an agent with its own Dex client keeps working for login; delegation n
 token to mediatore and forgets it: Dex rotates refresh tokens, so after the first refresh
 by mediatore the CLI's copy would be dead anyway. A second claim is a second login.
 
+*Amended 2026-10-15 by [ADR-0014](0014-one-binary-roles-as-subcommands.md):* there is no
+`mediatore-cli`. The commands are `mediatore login` and `mediatore sandbox create`
+(with `sandbox get`, `sandbox delete` and `session`), subcommands of the one binary
+(`crates/mediatore-client`, flattened into `crates/mediatore/src/main.rs`).
+
 **4. Refresh before every issue, revoke on refusal.** On `POST /v1/token` for a record
 with an envelope, mediatore opens it, calls the issuer's `token_endpoint` (from the
 discovery document the validator already fetches) with `grant_type=refresh_token` and the
@@ -97,14 +111,17 @@ from inside the cluster.
 ## Consequences
 
 - `crates/mediatore-cli` is new: `login`, `claim`, `get`, `delete`, `status`. It depends
-  on `mediatore-proto` only.
+  on `mediatore-proto` only. (Since ADR-0014 the crate is `crates/mediatore-client` and
+  the commands are `login`, `sandbox create|get|delete` and `session`.)
 - `crates/mediatore-entra`: `IssuerConfig.session`, `Validator::refresh` (token endpoint
   from discovery, cached with the JWKS), `IdpError::SessionRevoked` distinct from
   `Upstream`.
 - `crates/mediatore-store`: migration `0002` adds `claims.sandbox_uid` and the `sessions`
   table on both engines; `ClaimStore` gains `put_session`, `take_session`,
   `delete_session` and `sweep_sessions`; the conformance suite covers them on all three
-  backends.
+  backends. (Superseded 2026-11-09 by ADR-0034 decision 2: no migrations and no engines;
+  the sealed session is a Secret owned by its sandbox, and the store trait's session
+  methods work on it.)
 - `crates/mediatore-api`: `ClaimRequest.refresh_token`, the delegation in `create_claim`
   and `create_sandbox`, the refresh in `token`, the limiter.
 - `crates/mediatore-claims`: the reconciler moves the session into the record and removes

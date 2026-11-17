@@ -3,7 +3,17 @@
 
 # ADR-0018: TPM node attestation with the SPIFFE community plugin, the hypervisors' swtpm CAs as the EK trust bundle
 
-**Status:** Accepted · **Date:** 2026-10-22
+**Status:** Implemented · **Date:** 2026-10-22 · **Implemented:** 2026-10-24
+(`deploy/spire-tpm`, `make kind-e2e-tpm`; live on a libvirt member 2026-10-31, roadmap
+02 and roadmap 06) · **Amended:** 2026-10-27 by
+[ADR-0023](0023-sandbox-vm-image-kairos-derivative.md) (decision 3: the agent plugin at
+`/usr/lib/spire/tpm_attestor_agent` in the immutable rootfs, `agent.conf` written by the
+deployment layer); 2026-11-07 by
+[ADR-0031](0031-a-trust-anchor-that-outlives-the-servers-ca.md) decision 3 (the bundle the
+agent starts with is the PKI root the server's CA chains to); 2026-11-14 by
+[ADR-0037](0037-the-pool-fetches-its-spire-bundle-at-boot-through-the-relay.md) (the
+bundle is fetched at every boot through the relay to `/run/spire/bundle.json`, in the
+SPIFFE format; a PEM file is the fallback for a deployment with no bundle endpoint)
 
 Roadmap 02, second half. Amends [ADR-0005](0005-spire-topology.md) and
 [ADR-0006](0006-registration-entries-as-clusterstaticentry.md) on which attestor plugin
@@ -78,6 +88,16 @@ verifies their checksums, so the image builder (banlieue's, roadmap 06) takes th
 `dist/` like the `mediatore` binary. The agent's systemd unit grants the `tss` group and
 the TPM character devices and nothing else.
 
+   *Amended 2026-10-27 by [ADR-0023](0023-sandbox-vm-image-kairos-derivative.md) and
+   2026-11-14 by [ADR-0037](0037-the-pool-fetches-its-spire-bundle-at-boot-through-the-relay.md):*
+   as built, `plugin_cmd` is `/usr/lib/spire/tpm_attestor_agent` (the immutable rootfs of
+   the image this repository builds, `image/Dockerfile`), `agent.conf` is written to
+   `/etc/spire/agent.conf` by the deployment's cloud-config layer, and the trust bundle is
+   `trust_bundle_path = "/run/spire/bundle.json"` in the SPIFFE format, fetched at every
+   boot through the gateway's bundle leg (`image/spire/agent.conf`,
+   `image/spire-bundle-fetch`). `/etc/spire/bundle.pem` is the fallback for a deployment
+   with no bundle endpoint.
+
 **4. PVE mode stays off.** The plugin's Proxmox extension binds an agent to a Proxmox VM
 id through a host hook; banlieue's providers run libvirt and Cloud Hypervisor, whose VMs
 are identified by the EK alone (ADR-0004), so `pve { enabled = false }` and the server
@@ -118,7 +138,9 @@ configured host CA never becomes an agent, let alone a node.
   **A-15 new** (the hypervisors' swtpm CA keys); R-6 reworded; the stamp.
 - Still outside this repository: the VM image build (banlieue-imagebuilder, roadmap 06),
   the SPIRE manifests the component patches (the operator's, rendered once), and the
-  acceptance on libvirt (roadmap 02).
+  acceptance on libvirt (roadmap 02). (Since then: the image is built here,
+  `image/Dockerfile` and `make guest-image`, ADR-0023, 2026-10-27; the libvirt acceptance
+  ran 2026-10-31, roadmap 02 and roadmap 06. The SPIRE manifests stay the operator's.)
 - The kind tier exercises the component the way the cluster does: `dev/kind/spire` is
   SPIRE's distribution rendered once (`make kind-spire-render`), the component included,
   the `server.conf` patch generated from the fragment; `make kind-spire` applies it with

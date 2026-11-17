@@ -5,13 +5,14 @@
 
 Several teams share one mediatore and one pool platform. This guide says who may do what at each
 step, what you can configure today, how a service (not a person) claims programmatically, and
-what is planned for per-team namespaces. Everything marked **Planned** is decided
-([ADR-0046](../adr/0046-who-may-claim-a-list-of-groups-and-a-namespace-to-groups-mapping.md),
-accepted 2026-11-17) but not shipped: nothing below that heading works on a released broker yet.
-Do not put the planned keys in a configuration of a broker that predates the release: its issuer
-and `sandboxes` blocks ignore a key they do not know (only the `audiences` entries reject one,
+what the next release brings for per-team namespaces. Everything marked **Next release** is
+decided ([ADR-0046](../adr/0046-who-may-claim-a-list-of-groups-and-a-namespace-to-groups-mapping.md),
+accepted 2026-11-17) and implemented on `main`, but not yet in a release: nothing below that
+heading works on a released broker (v0.2.10 or earlier). Do not put the new keys in a
+configuration of a broker that predates the release: its issuer and `sandboxes` blocks ignore a
+key they do not know (only the `audiences` entries reject one,
 [ADR-0040](../adr/0040-the-gateway-places-an-audiences-credential-the-pool-never-holds-it.md)),
-so on such a broker a planned `required_groups` would be silently dropped, and an issuer with no
+so on such a broker a `required_groups` would be silently dropped, and an issuer with no
 `required_group` gates nothing. [Upgrading](#upgrading) says the order.
 
 Placeholders throughout: `login.example.com` (the Dex login hub), `mediatore.example.com` (the
@@ -54,8 +55,9 @@ issuers:
 - **Exact match.** The check compares it, case-sensitively, with each entry of the token's
   `groups` claim and its `roles` claim (or only `groups_claim`, when the issuer sets one).
   There is no prefix stripping, no glob and no regex.
-- **No group, no claim.** A login without the group gets `403` with `not in required group <value>`.
-  An unset `required_group` gates nothing today (the issuers guide says when that is acceptable); the release that carries ADR-0046 refuses to start an issuer with no written gate ([section 5](#5-planned-groups-per-namespace)).
+- **No group, no claim.** A login without the group gets `403`: `not in required group <value>`
+  from a released broker (v0.2.10 and earlier), `not in a required group` from the next release.
+  An unset `required_group` gates nothing on a released broker (the issuers guide says when that is acceptable); the release that carries ADR-0046 refuses to start an issuer with no written gate ([section 5](#5-next-release-groups-per-namespace)).
 - **Fail closed in the sense that matters.** A token with no groups claim at all does not match a
   set `required_group`.
 
@@ -76,7 +78,7 @@ a limit for any deployment that has both people and services.
 
 Today's workaround: gate on the spelling your callers share. If every claimant arrives through
 LDAP or Entra, use the bare name. If you need both populations, you cannot do it with one string
-(see the planned `required_groups` below).
+(see `required_groups` below, in the next release).
 
 ## 3. A service that claims programmatically
 
@@ -138,7 +140,7 @@ python3 -c 'import sys,json,base64;t=json.load(sys.stdin);p=t["id_token"].split(
 
 ## 4. Onboarding a tenant namespace, today
 
-What works with the broker as it stands (`sandboxes.namespace` is one namespace):
+What works with a released broker (`sandboxes.namespace` is one namespace):
 
 1. **A namespace per team**, labelled the way the platform selects tenants.
 2. **A pool the platform owns in that namespace.** The team gets read-only access to
@@ -156,21 +158,21 @@ What works with the broker as it stands (`sandboxes.namespace` is one namespace)
    namespace names its policy by `policyRef` and is resolved from its own namespace first, then
    from those. Teams change policy by pull request, never in the cluster. Prefix policy names per
    team, because a name is global across the policy namespaces.
-5. **Create the sandbox in the team's namespace** with `kubectl apply`. `POST /v1/claims` and the
-   CLI still create sandboxes in `sandboxes.namespace` only.
+5. **Create the sandbox in the team's namespace** with `kubectl apply`. On a released broker,
+   `POST /v1/claims` and the CLI create sandboxes in `sandboxes.namespace` only.
 
-What does not work yet: an API claim into a team's own namespace, and a gate that depends on the
-namespace.
+What a released broker does not do: an API claim into a team's own namespace, and a gate that
+depends on the namespace. Both are on `main` ([section 5](#5-next-release-groups-per-namespace)).
 
-## 5. Planned: groups per namespace
+## 5. Next release: groups per namespace
 
 <!-- flip this section to available when the release ships -->
 
-This section describes a decision,
+This section describes
 [ADR-0046](../adr/0046-who-may-claim-a-list-of-groups-and-a-namespace-to-groups-mapping.md)
-(Accepted, in implementation). **Planned, not implemented:** the keys below do not exist in a
-released broker, and a broker that predates them ignores them without a warning (see the note at
-the top). This heading and these tenses change when the release ships.
+(Accepted; implemented on `main`, not yet in a release). **Not yet released:** the keys below do
+not exist in a released broker, and a broker that predates them ignores them without a warning
+(see the note at the top). This heading and these tenses change when the release ships.
 
 The two limits above (one `required_group` string, one claim namespace) are the same problem seen
 twice: the gate cannot say "this group may claim here". The decision:
@@ -219,10 +221,10 @@ twice: the gate cannot say "this group may claim here". The decision:
   `groups:`, a misspelled `sandboxes`) is a start error naming the key, in the issuer, `session`,
   `entra`, `sandboxes` and namespace-entry blocks and at the top level.
 
-An illustration of the intended shape, not working configuration:
+The shape, as `main`'s parser takes it; not working configuration on a released broker:
 
 ```yaml
-# PLANNED, not implemented
+# On main (ADR-0046), not yet in a release
 issuers:
   - url: https://login.example.com
     backend: sts
@@ -245,7 +247,7 @@ nowhere else; a person in `APP_EXAMPLE_ADMIN` can do so in `infra`.
 
 The trust boundary this moves is real: the broker becomes the enforcement point for where a person
 may place a sandbox, and a mapping mistake grants cross-tenant claims, so review the map as a
-security configuration. The ADR states the checks, the tests that will prove them and the
+security configuration. The ADR states the checks, the tests that prove them and the
 threat-model entries. Until the release ships, use sections 2 to 4, and do not rely on any
 isolation between tenants beyond what Kubernetes RBAC and the pool's namespace give you.
 
@@ -286,7 +288,8 @@ first. The release carrying the ADR is the floor.
 ## 6. Checking an access decision
 
 - **The token.** Decode `groups` as above and compare it, character for character, with the gate.
-- **The broker's answer.** A `403` with `not in required group ...` is the issuer gate. A
+- **The broker's answer.** A `403` with `not in required group ...` (`not in a required group`
+  from the next release) is the issuer gate. A
   `delegation_refused` or `session_required` is the claim body or the login, not the gate.
 - **banlieue's side.** A claim stuck `Pending` with `sandbox reconcile failed` in the broker log
   carries the admission policy's own message. Reproduce it without creating anything: a

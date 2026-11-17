@@ -6,7 +6,13 @@
 **Status:** Accepted, implemented 2026-11-04 · **Date:** 2026-10-28 · **Amended:** 2026-10-30 by
 [ADR-0027](0027-control-plane-relay-on-the-egress-gateway.md) (decisions 4 and 6: the
 sandbox reaches the broker and the SPIRE server only through a control relay on the
-gateway, not directly; the data plane stands) · 2026-11-09 (decision 7: a gateway's own `5xx` moves the forwarder on; a `4xx` stays the verdict)
+gateway, not directly; the data plane stands) · 2026-11-05 by
+[ADR-0030](0030-policy-egress-enforced-at-the-gateway.md) (decision 4: the broker's answer to the
+gateway is the verified bundle's `egress[]` too, behind the `policy.egress` switch) ·
+2026-11-09 (decision 7: a gateway's own `5xx` moves the forwarder on; a `4xx` stays the verdict) ·
+2026-11-15 by [ADR-0040](0040-the-gateway-places-an-audiences-credential-the-pool-never-holds-it.md)
+(decision 9: the credential injection it reserved, on a third Envoy, `envoy-inject`, under
+decision 8's hardening)
 
 Roadmap 10. Gives the egress gateway of [ADR-0010](0010-no-inbound-to-sandboxes.md)
 decision 4 its software, its identity and its authorization. Amends banlieue
@@ -95,6 +101,10 @@ that identity.
    claim gets `404`, and the cache entry is dropped on the answer. Broker unreachable and
    no cached answer is a deny. The cache never outlives the claim's deadline.
 
+   *Amended 2026-11-05 by [ADR-0030](0030-policy-egress-enforced-at-the-gateway.md)
+   (decision 4): the answer is `audiences[].egress` and, with `policy.egress: enforce`, the
+   verified notaio bundle's direct `egress[]` as well; the same `egress_of` feeds `/v1/me`.*
+
 5. **The gateway resolves names, not the sandbox.** Envoy resolves the CONNECT authority
    on its own `egress` interface and connects from its own address. The sandbox has no
    resolver to ask and no use for one.
@@ -143,6 +153,13 @@ that identity.
    certificate authority trusted by the workload or a per-API opt-in for known hosts. That
    is a different trust decision with its own ADR, and Envoy's filters (`ext_proc`, Lua,
    a credential-injection listener) leave room for it without a change to this one.
+
+   *Amended 2026-11-15 by
+   [ADR-0040](0040-the-gateway-places-an-audiences-credential-the-pool-never-holds-it.md):
+   that ADR is the one reserved here. The injection is a third Envoy on the gateway,
+   `envoy-inject`, its own process and user (`image/gateway/envoy/inject.yaml.in`,
+   `image/gateway/systemd/envoy-inject.service`), under decision 8's hardening; still no
+   TLS interception and no certificate authority.*
 
 10. **The gateway is image content, owned by whoever runs the environment (banlieue
     ADR-0100, ADR-0097 decision 5).** A `VMImage` carries Envoy (version and checksum
@@ -257,7 +274,8 @@ What roadmap 10 fixed within the decisions above, as it is built:
   1, 2, 5 and 9): the same Kairos base as the sandbox image (ADR-0023), Envoy's binary
   copied from the official image at the digest the kind tier runs, the one `mediatore`
   binary, the SPIRE agent and the TPM plugin, `nftables`, three service users (`envoy`,
-  `envoy-relay`, `mediatore-gateway`), no sshd, forwarding off in `sysctl`
+  `envoy-relay`, `mediatore-gateway`; four since ADR-0040, with `envoy-inject`,
+  `image/gateway/Dockerfile`), no sshd, forwarding off in `sysctl`
   (`image/gateway/sysctl/`). The bootstraps are templates in the image rendered at every
   unit start by `image/gateway/render` from two env files, the deployment's
   (`/etc/mediatore-gateway/env`: trust domain, ports, the relay's upstream addresses) and
@@ -267,13 +285,16 @@ What roadmap 10 fixed within the decisions above, as it is built:
   and `make gateway-render-check` fails on drift, so the bootstrap proven in kind is the
   one the image carries. Units: `mediatore-gateway-network` (the sandbox interface, a
   networkd file in `/run`), `mediatore-gateway-nft` (the host table: default-drop input,
-  the data port and the two relay ports on the sandbox interface only, a per-source
-  connection cap on the relay ports with a dynamic set, nothing new on egress, forward
+  the data port and the two relay ports (four since ADR-0037 and ADR-0038, plus the inject
+  port of ADR-0040 where set, `image/gateway/nftables.conf.in`) on the sandbox interface
+  only, a per-source connection cap on the relay ports with a dynamic set, nothing new on
+  egress, forward
   dropped), `envoy-gateway` (the data plane, user `envoy`, `NoNewPrivileges`, no
   capability, `ProtectSystem=strict`, private `/tmp`, `--mode validate` before start),
   `envoy-relay` (the control relay, user `envoy-relay`, the same hardening,
   `InaccessiblePaths=/run/spire`), `mediatore-gateway` (the authorizer on loopback); both
-  Envoys `Require` the table and the interface, so no listener exists without them.
+  Envoys `Require` the table and the interface, so no listener exists without them (since
+  ADR-0040 a third, `envoy-inject`, under the same rule).
   `image/gateway/check.sh` proves all of it inside the built image on every pull request
   (`make gateway-image-check`), as `image/check.sh` does for the sandbox image; the Build
   workflow publishes it as `ghcr.io/firestoned/mediatore-gateway`, signed and attested,
@@ -334,7 +355,8 @@ What roadmap 10 fixed within the decisions above, as it is built:
   is not a covert channel from the workload. What remains is the gateway's own
   resolution of an allowed authority, bounded by the allowlist, and the claim's name in
   the tunnel's authority, which is data the destination sees. Recorded in the threat
-  model when this is implemented.
+  model when this is implemented. (Done: the pass of 2026-11-04 revised R-12, DNS from the
+  jail closed where gateways exist, `docs/security/threat-model.md`.)
 - **The gateway is a new trust boundary and the first component on both sides of the
   sandbox segment.** It holds a routable address and an SVID. Compromising it yields
   every in-flight tunnel and the ability to dial any destination its egress firewall

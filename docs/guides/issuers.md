@@ -5,7 +5,10 @@
 
 mediatore trusts whatever OIDC issuers its configuration names, and banlieue's claim
 subject policy does the same on its side. Which backend mints a token is a property of
-the audience (`sts` or `entra-obo`, [ADR-0003](../adr/0003-token-backends.md)); which
+the audience (`sts` or `entra-obo`, [ADR-0003](../adr/0003-token-backends.md); `none`,
+`secret` or `delegated` since [ADR-0025](../adr/0025-phantom-token-egress-proxy.md),
+[ADR-0032](../adr/0032-operator-held-credentials-as-an-audience-backend.md) and
+[ADR-0035](../adr/0035-a-requesters-own-session-delegated-at-claim-time.md)); which
 issuer a person logs in at is a property of the issuer block
 ([ADR-0017](../adr/0017-issuer-profiles.md)). Every issuer but Entra works the same way:
 `mediatore login` runs the authorization-code flow with PKCE as mediatore's public
@@ -34,10 +37,14 @@ staticClients:
     name: mediatore
     public: true
     redirectURIs:
-      - http://127.0.0.1/callback   # the CLI's loopback listener, any port
+      - http://localhost:8000    # the CLI's loopback listener, kubelogin's ports
+      - http://localhost:18000
 ```
 
-Dex accepts any loopback port for a public client. On the broker:
+Dex matches redirect URIs exactly, so the CLI tries 8000 and then 18000 and no other
+port (`--redirect-port`, `--redirect-host` and `--redirect-path` change what it sends;
+`--redirect-port 0` takes an OS-chosen port at an issuer that accepts any). On the
+broker:
 
 ```yaml
 issuers:
@@ -106,10 +113,10 @@ added before the release that carries the ADR will start it.
 
 Auth0 is an OIDC issuer (`https://<tenant>.<region>.auth0.com/`, the trailing slash is
 part of the issuer value) and needs no Dex. Create a **Native** application, enable the
-authorization-code grant with PKCE and the refresh-token grant, allow `http://127.0.0.1`
-callbacks, and on the API the login targets tick *Allow Offline Access*. Auth0 issues no
-`preferred_username`, so the subject is `email`, and it puts groups in an ID token only
-through an Action that adds a namespaced claim:
+authorization-code grant with PKCE and the refresh-token grant, allow `http://localhost:8000`
+and `http://localhost:18000` as callbacks, and on the API the login targets tick *Allow
+Offline Access*. Auth0 issues no `preferred_username`, so the subject is `email`, and it
+puts groups in an ID token only through an Action that adds a namespaced claim:
 
 ```js
 exports.onExecutePostLogin = async (event, api) => {

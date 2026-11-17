@@ -34,7 +34,8 @@ Facts established 2026-11-15, and facts still to be confirmed:
   (servers keep a replay cache), and so cannot be a static header or one fetched once a minute as in
   ADR-0040 decision 5.
 - Mediatore has no Kerberos code. A search of the repository finds Kerberos mentioned only in
-  ADR-0007, ADR-0028, the threat model and the testing guide, as a thing it is not.
+  ADR-0007, ADR-0028, the threat model and the testing guide, as a thing it is not. (As of
+  2026-11-17 those mentions are gone too: Kerberos appears in ADR-0041 and this ADR alone.)
 - The operator has said the credential could be injected as for the Anthropic audience, with
   OpenBao holding it, or the gateway could proxy to the proxy through Envoy. This ADR takes the second
   with the first's rule (OpenBao holds the secret) and says why neither alone is enough.
@@ -90,7 +91,10 @@ Facts established 2026-11-15, and facts still to be confirmed:
 
 3. **OpenBao holds the keytab; the gateway holds the ticket, in memory.** The keytab is stored in
    OpenBao and fetched by the holder at start and on renewal over a JWT-SVID (the holder's SPIFFE ID,
-   by the same Kerberos-free SPIFFE-to-OpenBao path ADR-0015 uses for the broker). It is written to no
+   by the same Kerberos-free SPIFFE-to-OpenBao path ADR-0015 uses for the broker; a correction,
+   2026-11-17: ADR-0015's broker path is OpenBao's Kubernetes auth with a projected ServiceAccount
+   token, so the holder, a VM process with no ServiceAccount, needs a JWT auth role for its JWT-SVID,
+   a new role beside that one). It is written to no
    disk (a `memfd`, or held in the process), the unit has no `ProtectHome` exception, no
    `PrivateTmp` leak and no core dump (`LimitCORE=0`), and the ticket cache is in memory. A keytab on
    the gateway's disk is rejected (Alternatives). The holder asks for the keytab again when the

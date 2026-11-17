@@ -3,7 +3,11 @@
 
 # ADR-0016: The Entra path: On-Behalf-Of at claim creation, the session refreshed before every issue, the broker's credential a signed assertion
 
-**Status:** Accepted · **Date:** 2026-10-16
+**Status:** Implemented · **Date:** 2026-10-16 · **Implemented:** 2026-10-16 (roadmap 04,
+proven against the fake issuer playing Entra, `crates/mediatore/tests/e2e_entra.rs`; the
+live run against a tenant is roadmap 04's open item) · **Amended:** 2026-10-21 by
+[ADR-0017](0017-issuer-profiles.md) (the framing: Entra is one issuer profile, the session
+path is any OIDC issuer's)
 
 Roadmap 04, fourth slice. Implements the `entra-obo` half of
 [ADR-0003](0003-token-backends.md) on the session shape of

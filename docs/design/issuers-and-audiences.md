@@ -99,7 +99,7 @@ pull is placed at the gateway (ADR-0043); see [The guest](guest.md).
 
 `mediatore-sts` is mediatore as a token service, used when the upstream cannot delegate (Dex with GitHub, in a
 homelab) and optionally for internal services that validate JWTs against a JWKS (`/.well-known/jwks.json`). Its signing
-key is a file or an OpenBao transit key.
+key is a PEM file (`sts.signing_key_file`); a signer over an OpenBao transit key is planned, not built.
 
 `mediatore-openbao` is the one client for OpenBao. The broker logs in at the Kubernetes auth method (at the mount
 `auth_mount` names, one per cluster on this platform) with its projected service-account token, keeps the OpenBao

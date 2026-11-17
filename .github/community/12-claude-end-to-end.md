@@ -9,7 +9,8 @@ notaio, the `sandbox-policies` repository, the broker, the gateways, the pool an
 Anthropic side. The hello shape of it is proven live (`docs/guides/testing.md`, runs 5
 and 7: one Messages call through the proxy, the operator's key placed by the proxy, the
 jail never holding it). The repository shape, GitHub and Claude under one policy, is the
-open item. Every name and address below is a placeholder (`rules/no-real-infrastructure.md`);
+open item. Every name and address below is a placeholder
+(`.claude/rules/no-real-infrastructure.md`);
 the real values live in the operator's configuration directory, outside this repository.
 
 Depends on roadmaps 04 (`via: secret`, ADR-0032), 07 (the proxy and `via: none`), 09 and 11
@@ -30,8 +31,11 @@ document tracks what is still open on the path.
       the record on the resource (run 7, 2026-11-09)
 - [ ] **Dex groups.** The GitHub connector carries `orgs: [{ name: <org>, teams: [sandbox-users] }]`
       so the ID token's `groups` claim names `<org>:sandbox-users`; the broker's issuer gets
-      `required_group` on it. Today the policies' `subjects.groups` name a group no token
-      carries, and the broker gates on nothing but the issuer
+      `required_groups` on it (ADR-0046: any of a list, matched exactly; an issuer carries
+      exactly one of `required_group`, `required_groups` and `allow_any_authenticated: true`).
+      Today the policies' `subjects.groups` name a group no token carries, and the broker
+      gates on nothing but the issuer (with ADR-0046's release that is written out as
+      `allow_any_authenticated: true`)
 - [ ] **A policy for the repository shape.** `research-agent` names `github` alone and
       `claude-agent` names `anthropic` alone; the agent's repository mode needs both in one
       claim, and `standard` allows one audience (K5.3 R1, lint `L005`). Decide, in
@@ -44,7 +48,8 @@ document tracks what is still open on the path.
       (`github` `via: none` 480 s, `anthropic` `via: secret` 900 s); the comparison must come
       out `PolicyConformant=True` for a sandbox naming the new policy (`max_ttl` at or below
       the policy's `ttlSeconds`, the same rules and endpoints)
-- [ ] **The repository run, live.** `MODE=repo` of the example agent: `GET /repos/<org>/mediatore`
+- [ ] **The repository run, live.** The example agent's repository shape
+      (`research-agent <owner/repo> [question]`): `GET /repos/<org>/mediatore`
       and the README through the proxy bare, one Messages call with the key placed, the
       report in `/work`, exit 0 ending the claim; recorded as run 9 in
       `docs/guides/testing.md` with the broker's and the proxy's lines
@@ -77,6 +82,6 @@ document tracks what is still open on the path.
       GitHub token behind it, so a claim under an `sts` audience fails to mint after about
       eight hours; the Anthropic flow alone does not refresh, so the window only matters when
       `github` moves to `via: sts`
-- [ ] **One reference, kept current.** This document is where the four configurations are
+- [ ] **One reference, kept current.** This document is where the six configurations are
       read together; a change to any of them in the guides updates the table here in the
       same commit

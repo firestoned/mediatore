@@ -3,7 +3,7 @@
 
 # ADR-0040: The gateway places an audience's credential, so the pool VM never holds it
 
-**Status:** Accepted, implemented in the repository 2026-11-15 (config and validation, the broker's credential route, the authorizer's inject check and two sockets, the guest's route and ruleset, the host table's inject port, three Envoy templates; the live proof is pending the gateways' egress allowance, the OpenBao transit key and a release, and the per-claim limit and the real-Envoy integration test are open) · **Date:** 2026-11-15
+**Status:** Accepted, implemented in the repository 2026-11-15 (config and validation, the broker's credential route, the authorizer's inject check and two sockets, the guest's route and ruleset, the host table's inject port, three Envoy templates); released in v0.2.7, a fix in v0.2.9; the inject path and the transit seal proven live 2026-11-16 (the ADR-0041 run, `docs/guides/testing.md`; R-28 narrowed); the Anthropic egress allowance, the per-claim limit and the real-Envoy gRPC integration test are open · **Date:** 2026-11-15
 
 Roadmap 07 (the egress proxy) and roadmap 10 (the gateway). Takes the "own ADR" that
 [ADR-0028](0028-egress-gateway-envoy-with-spiffe-identity.md) decision 9 reserved for credential
@@ -134,7 +134,7 @@ Anthropic flow, under any placement, needs an egress allowance first (open quest
    credential whose value or header name is empty is refused (`credential_refused`), because Envoy's
    header add drops an empty value without an error and the request would reach the upstream with no
    credential at all. A refusal is the same `403` and code as today, marked as decision 12 says. The
-   design rule, shown on the pinned Envoy 1.40.2 (the spike, TESTING.md T-61, with an HTTP-service
+   design rule, shown on the pinned Envoy 1.40.2 (the spike, the deployment's TESTING.md T-61, with an HTTP-service
    `ext_authz`): route-level and virtual-host-level `request_headers_to_remove` run after `ext_authz`
    has mutated the request and removed the very header the authorizer had added, so the credential
    header must never be added or removed at route, virtual-host or listener level; only the
@@ -258,7 +258,11 @@ Anthropic flow, under any placement, needs an egress allowance first (open quest
     policy, role attachment). (i) Docs. (j) The threat-model pass, which is what makes this ADR
     implemented.
     Stages (a) to (g), (i) and (j) exist in the repository; (h) and the live proof are the
-    operator's (the egress allowance, the transit key and a release).
+    operator's (the egress allowance, the transit key and a release). (2026-11-16: released in
+    v0.2.7 and v0.2.9; the transit key exists and a claim was sealed under it, and a credential was
+    placed through the inject listener to an on-premises git host, the ADR-0041 run in
+    `docs/guides/testing.md`. The egress allowance to the Anthropic audience is still the
+    operator's.)
 
 The next three decisions are what building it found; the numbering above is unchanged because the
 code, the templates and the tests cite it.
@@ -377,7 +381,7 @@ Proven by tests in this repository (each a pinned unit, integration or shell tes
 - The templates: `make gateway-render-check` in this repository, and, in the deployment's gateway
   repository, its render tests (off by default byte for byte, no header handling at route level, the
   normalisation settings, the unit, the sockets, the SPIRE entry).
-- On the pinned Envoy 1.40.2: the spike (TESTING.md T-61: overwrite of a client's header, the route
+- On the pinned Envoy 1.40.2: the spike (the deployment's TESTING.md T-61: overwrite of a client's header, the route
   and virtual-host removal stripping the authorizer's header, the deny relayed, exact authority
   matching) and `envoy --mode validate` accepting all four rendered bootstraps (the inject and the
   data-plane one, in each repository).
@@ -398,7 +402,9 @@ Not proven, said plainly:
 - The per-claim limit (decision 5): a placeholder, not a mechanism.
 - Server-sent events through the listener with its idle and stream timeouts, against a real upstream.
 - The live path: the egress allowance to the upstream, the OpenBao transit key, a release carrying
-  this change on the gateways, the guest image and the broker, and a claim end to end.
+  this change on the gateways, the guest image and the broker, and a claim end to end. (Proven
+  2026-11-16 for the transit key, the release and the placement through the inject listener,
+  against an on-premises git host; the Anthropic audience still waits for the egress allowance.)
 
 ## Open questions
 
@@ -418,9 +424,13 @@ Not proven, said plainly:
 
 3. **Transit specifics.** Whether the transit mount and a `derived`, non-exportable key exist, and
    whether the existing Kubernetes-auth role's policy covers encrypt and decrypt on that key alone,
-   with a short token TTL (the operator, with the OpenBao owners).
+   with a short token TTL (the operator, with the OpenBao owners). (Answered 2026-11-16 by the
+   live run: a claim's delegated credential was sealed under the transit key, `key_id`
+   `transit:transit/<key>`, and the claim served from the envelope, `docs/guides/testing.md`.)
 4. **Egress from the gateway.** The gateways cannot reach the audience today (Context). Either a
    datacenter firewall allowance for the gateways' routable addresses to the audience's host on 443,
    by name or the vendor's published ranges, or a corporate proxy that `envoy-inject` tunnels
    through (a `CONNECT` upstream in its cluster, a change to the template). The operator says which
-   exists.
+   exists. (The corporate proxy is
+   [ADR-0042](0042-the-corporate-forward-proxy-through-a-kerberos-holder-on-the-gateway.md),
+   accepted 2026-11-15 and deferred; the allowance is still open.)

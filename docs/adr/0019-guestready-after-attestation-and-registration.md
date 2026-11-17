@@ -3,7 +3,9 @@
 
 # ADR-0019: The guest announces `GuestReady` after it is attested and registered
 
-**Status:** Accepted · **Date:** 2026-10-24
+**Status:** Implemented · **Date:** 2026-10-24 · **Implemented:** 2026-10-24 (roadmap 06:
+`crates/mediatore-guest/src/ready.rs`, the two units' installed-disk guard; the live proof
+on a libvirt member 2026-10-31)
 
 Roadmap 06, the readiness item. Builds on banlieue
 [ADR-0043](https://github.com/firestoned/banlieue/blob/main/docs/adr/0043-guestready-installed-guest-signal.md)
@@ -95,9 +97,10 @@ this ADR decides is *when* an honest guest says it, so the pool's count is hones
 - The kind TPM tier (`make kind-e2e-tpm`) asserts the order: `GuestReady announced` appears
   in the guest's log after `node registered`, at first boot and after the pod is replaced.
   The live proof that `guestInstalled` flips only after registration is roadmap 06's
-  libvirt item.
+  libvirt item. (Done 2026-10-31 against v0.2.0-rc.3 on the homelab cluster: the member
+  attested, registered and went `GuestReady` in that order; roadmap 06.)
 - The image item of roadmap 06 bakes banlieue's EK-certificate layer
-  (`examples/20-cloud-config-guest-ek-certificate.yaml`: the EK leaves the guest as a file
+  (`examples/21-cloud-config-guest-ek-certificate.yaml`: the EK leaves the guest as a file
   for libvirt's provider) but not its phase layer; the two units carry the guard.
 - banlieue is unchanged: its providers read what they read, and ADR-0043's decision 9
   stands.

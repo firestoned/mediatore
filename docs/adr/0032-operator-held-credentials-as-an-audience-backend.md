@@ -3,7 +3,7 @@
 
 # ADR-0032: An operator-held credential as an audience backend, placed by the proxy, never in the jail
 
-**Status:** Implemented · **Date:** 2026-11-08 (accepted and implemented the same day; the live run against Claude through the gateways is roadmap 04's open item)
+**Status:** Implemented 2026-11-08; live 2026-11-09 · **Date:** 2026-11-08 (accepted and implemented the same day; the live run against Claude through the gateways, v0.2.0-rc.8, is `docs/guides/testing.md` section 5, roadmap 04)
 
 Roadmap 04 (the backends) and roadmap 07 (what the proxy puts on the wire). Adds a third
 backend to [ADR-0003](0003-token-backends.md), beside `entra-obo` and `sts`, and amends

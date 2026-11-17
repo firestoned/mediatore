@@ -20,7 +20,7 @@ identity) and a hardened systemd unit.
 
 | Process | Unit | Port (on the sandbox address) | Identity | Does |
 | --- | --- | --- | --- | --- |
-| **Data plane** (Envoy) | `envoy-gateway.service` | 3128 | the gateway SVID | accepts a claim's `CONNECT` over mutual TLS, asks the authorizer, relays the tunnel untouched |
+| **Data plane** (Envoy) | `envoy-gateway.service` | 8443 (`DATA_PORT`) | the gateway SVID | accepts a claim's `CONNECT` over mutual TLS, asks the authorizer, relays the tunnel untouched |
 | **Authorizer** (`mediatore gateway`) | `mediatore-gateway.service` | unix sockets (below) | the gateway SVID | answers each Envoy check; fetches per-claim answers and credentials from the broker |
 | **Control relay** (Envoy) | `envoy-relay.service` | 3129 SPIRE, 3130 broker, 3131 bundle, 3132 registry | none | four `tcp_proxy` legs to fixed upstreams: the only path from the segment to the identity plane; credential-less and sees ciphertext only |
 | **Inject** (Envoy) | `envoy-inject.service` | 3133 (`INJECT_PORT`) | the gateway SVID | terminates a claim's mutual TLS, originates TLS to a fixed host, and adds the credential the authorizer returned; shipped, and enabled only where an audience is `inject: gateway` |
@@ -94,11 +94,11 @@ so the hardening stays on. (Found on the first live roll of the inject path, fix
 | `systemd/` | the units, each its own user, no capability and a read-only root |
 | `nftables.conf.in`, `network.in` | the gateway's own firewall: the sandbox filter, with a per-source connection cap, and the two interfaces |
 | `render` | fills a template's placeholders from the env file; it refuses one left unfilled or a value that holds its delimiter |
-| `env.example`, `env.inject.example`, `vm.env.example` | the settings, including `INJECT_ENDPOINTS` (the exact hosts the inject Envoy may originate to) and `INJECT_PORT` |
+| `env.example`, `env.inject.example`, `vm.env.example` | the settings, including `INJECT_HOST`, `INJECT_UPSTREAM_PORT` and `INJECT_DOMAIN` (the one upstream the inject Envoy may originate to; a second is a reviewed change to the template, never a parameter) and `INJECT_PORT` |
 | `check.sh` | validates the rendered output; each unit also runs `envoy --mode validate` before every start |
 
 Settings that must agree across the repository and the deployment: the broker's `gateways` and `gateway_inject_port`
-(see [Configuration](configuration.md)), the gateway's `INJECT_ENDPOINTS` and `INJECT_PORT`, the pool's
+(see [Configuration](configuration.md)), the gateway's `INJECT_HOST` and `INJECT_PORT`, the pool's
 `MEDIATORE_INJECT_PORT` (so a pool VM's host table admits the port), and the SPIRE entries for each gateway user.
 
 ## What the gateway cannot do

@@ -3,7 +3,7 @@
 
 # ADR-0045: A sandbox workload's output, redacted in the VM and streamed to its owner
 
-**Status:** Proposed · **Date:** 2026-11-17
+**Status:** Proposed 2026-11-17; the redactor (`crates/mediatore-guest/src/redact.rs`) and the proto wire types (`LogStream`, `LogRecord`, `LogBatch`, `crates/mediatore-proto`) are in the tree; capture, shipping, the store, both routes and the CLI are not built · **Date:** 2026-11-17
 
 Roadmap 06 (the guest) and roadmap 08 (the `AgentSandbox` CRD). Adds routes to both APIs
 beside `POST /v1/me/exit` ([ADR-0033](0033-a-one-shot-workload-the-restart-policy-and-the-claim-released-when-it-is-done.md))
@@ -29,12 +29,13 @@ The shape of the answer is constrained from outside. banlieue ADR-0082 gives a s
 inbound access, so there is no exec, attach or logs-over-the-network into the VM, and mediatore
 does not ask for one. The channel that exists is the one the guest already uses: node SVID
 mTLS to the broker's sandbox API (`POST /v1/me/report`, `POST /v1/me/exit`, `GET /v1/me`),
-outbound from the VM through the control relay (ADR-0029, ADR-0037).
+outbound from the VM through the control relay (ADR-0027; ADR-0029, ADR-0037).
 
 The data is hazardous in a way the exit code is not. A workload is handed credentials in
 several forms (the phantom token it presents to the egress proxy, ADR-0025 and
 [ADR-0040](0040-the-gateway-places-an-audiences-credential-the-pool-never-holds-it.md);
-environment values the requester asked for; tokens it fetched with `POST /v1/token`), and a
+environment values the requester asked for; tokens the egress proxy fetched for it with
+`POST /v1/token`, since ADR-0025 decision 5 the jail has no route to the broker), and a
 workload, or a library it calls in debug mode, can print them. The broker also keeps its
 records in the Kubernetes API (ADR-0034), where an object is capped near 1 MiB by etcd and
 every write is replicated, so unbounded output cannot simply be appended to the claim.
@@ -44,7 +45,9 @@ every write is replicated, so unbounded output cannot simply be appended to the 
 The in-VM `mediatore-guest` (root, the parent of the jail) tees the workload's stdout and
 stderr, redacts them, and ships them to the broker over the node SVID. The broker stores a
 bounded copy and serves it to the claim's owner. Four layers are required and none exists
-today; each is a numbered decision with its control, its home and its proof.
+today; each is a numbered decision with its control, its home and its proof. (As of
+2026-11-17 the redactor of decision 2 and the wire types of decision 9 are built; the rest
+is not.)
 
 1. **Capture and ship (guest, `crates/mediatore-guest`).** `supervise::run` spawns `nsjail`
    with `Stdio::piped()` on stdout and stderr (nsjail's own diagnostics go to its `--log`
@@ -63,8 +66,9 @@ today; each is a numbered decision with its control, its home and its proof.
    `[REDACTED]`:
    - the exact value of every secret the guest placed in the jail: the phantom token, and
      every environment value the guest marks secret-bearing when it builds the jail
-     environment (`JailSpec::env`), each matched literally and also in its standard base64
-     and percent-encoded forms;
+     environment (a new `JailSpec::env`; today `JailSpec` in `crates/mediatore-guest/src/jail.rs`
+     has no such field and the environment is built from `phantom` and `proxy_port`), each
+     matched literally and also in its standard base64 and percent-encoded forms;
    - every token the guest obtained from the broker for this claim (`POST /v1/token`
      responses), added to the set when it arrives, for the rest of the claim;
    - by shape, whatever the set does not know: a JWT (three base64url segments, the first
@@ -72,7 +76,9 @@ today; each is a numbered decision with its control, its home and its proof.
      from `-----BEGIN ... PRIVATE KEY-----` to its `END` line.
 
    Matching is done on the byte stream with a carry-over of the longest literal minus one byte,
-   so a secret split across two reads is still caught; a PEM block is dropped from its `BEGIN`
+   so a secret split across two reads is still caught (as built, `redact.rs` matches per whole
+   line, so a secret inside a line is caught however the pipe was read; the caller splits an
+   overlong line after redacting); a PEM block is dropped from its `BEGIN`
    line on, until its `END` line or the end of the output, since a partial key must not leak.
    Values under 8 bytes are not added to the literal set (a short environment value would
    redact ordinary words and teach users to distrust the tool); the shape rules still apply.
@@ -202,8 +208,9 @@ today; each is a numbered decision with its control, its home and its proof.
    - **Node API (node SVID, `crates/mediatore-proto`, `crates/mediatore-api`):**
      `POST /v1/me/logs` with `LogBatch { records: Vec<LogRecord>, dropped_stdout: u64,
      dropped_stderr: u64 }` and `LogRecord { seq: u64, stream: LogStream (stdout|stderr),
-     ts: DateTime<Utc>, text: String }`. The node must be the one the claim is bound to
-     (`claim_of_node_peer`, as `exit` does); another identity is refused. `204` on accept
+     ts: Timestamp, text: String }` (jiff's `Timestamp`, as built in `crates/mediatore-proto`).
+     The node must be the one the claim is bound to (`claim_of_node_peer`, as `exit` does);
+     another identity is refused. `204` on accept
      (including a late batch, dropped), `413`, `429`, `400` for a malformed batch (a `seq` not
      strictly increasing, a record over 64 KiB) and `501 not_implemented` when the feature is
      off. The broker re-validates sizes and does not trust the guest's redaction to be present;
@@ -241,7 +248,7 @@ today; each is a numbered decision with its control, its home and its proof.
     both routes answer `501 not_implemented` and the guest keeps the console copy; the CRD
     and the broker's Role are unchanged by merely deploying this release. In `dev_mode` the
     `MemoryStore` gets an in-memory ring with the same cap, TTL and ownership rules (the fake
-    must be no more permissive than the real thing, `rules/testing.md` rule 2); the dev
+    must be no more permissive than the real thing, `.claude/rules/testing.md` rule 2); the dev
     binder's behaviour is otherwise unchanged. A node route used when the broker does not know
     the feature is a `404`, which the guest treats like `501`.
 
@@ -314,7 +321,7 @@ today; each is a numbered decision with its control, its home and its proof.
 - [ ] CALM: add the log flow (guest to broker over the node route, the Secret ring in TB-9,
       the user read route) to `docs/architecture/calm/architecture.json`;
       `make calm-validate` and `make calm-diagrams` pass.
-- [ ] Tests first (`rules/testing.md`): redactor units (literal, encoded, shape, split read,
+- [ ] Tests first (`.claude/rules/testing.md`): redactor units (literal, encoded, shape, split read,
       PEM, short value); supervisor capture and backpressure units; the store conformance
       (ring, cap, TTL, ownership labels); e2e in `e2e_dev.rs` with the negative cases
       (another subject, wrong audience, node on the user route, user on the node route, `413`,

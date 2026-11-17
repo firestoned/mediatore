@@ -246,7 +246,8 @@ data:
 
 ## 5. mediatore's cluster-side objects
 
-From this repository, with nothing yours in them: the `AgentSandbox` CRD, the broker's
+From this repository, with nothing yours in them: the CRDs (`AgentSandbox`, `PolicyFloor`,
+`SandboxNode`), the broker's
 ServiceAccount and RBAC, its `ClusterSPIFFEID`, and the two admission policies (what
 the ServiceAccount may declare as an entry; who may name which subject on a sandbox).
 These are what `make kind-deploy` applies in kind, and what the live admission test
@@ -329,15 +330,20 @@ mediatore/dev/kind/spire/render-server-conf-patch.sh spire/spire.yaml \
 kubectl apply -k spire
 kubectl -n spire-server rollout restart statefulset/spire-server   # the certificates are copied at start
 kubectl -n spire-server rollout status statefulset/spire-server
-kubectl -n spire-server exec spire-server-0 -c spire-server -- spire-server bundle show > bundle.pem
+kubectl -n spire-server exec spire-server-0 -c spire-server -- spire-server bundle show > bundle.pem   # only without a bundle endpoint (ADR-0037)
 ```
 
 The VM side is the image of [ADR-0023](../adr/0023-sandbox-vm-image-kairos-derivative.md):
 the SPIRE agent, the plugin and the one binary in the immutable rootfs, built from
-`image/Dockerfile` and published as `ghcr.io/firestoned/mediatore-guest`; the bundle just
-exported and the agent's configuration go into your copy of
+`image/Dockerfile` and published as `ghcr.io/firestoned/mediatore-guest`; the agent's
+configuration, the `SPIRE_BUNDLE_*` lines of `/etc/mediatore-guest/env` and the bundle
+endpoint's CA (`/etc/mediatore/bundle-ca.pem`) go into your copy of
 `image/cloud-config-deployment.example.yaml`, the third cloud-config layer of the `VMImage`
-in `deploy/overlays/homelab-example/vmimage.yaml` ([deploying](deploying.md), step 6).
+in `deploy/overlays/homelab-example/vmimage.yaml` ([deploying](deploying.md), step 6). The
+agent fetches its bundle at every boot through a gateway's bundle leg
+([ADR-0037](../adr/0037-the-pool-fetches-its-spire-bundle-at-boot-through-the-relay.md));
+only a deployment with no bundle endpoint writes the bundle just exported into the layer
+instead.
 
 ```sh
 make dist && make guest-image BINARY_FROM=host CONTAINER_CLI=podman && make guest-image-check CONTAINER_CLI=podman

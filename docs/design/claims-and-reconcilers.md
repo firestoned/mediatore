@@ -62,7 +62,7 @@ The watcher runs three controllers and two timers (`watch::run`):
 | claims | a `VirtualMachineClaim` | `reconcile_claim`: on `Bound`, resolve the node, declare the claim's entry, record it; on `Releasing`, `Failed` or deletion, retract the entry and revoke the record |
 | machines | a pool member (`VirtualMachine`) | `reconcile_machine`: declare the node's bootstrap entry as soon as the VM publishes its endorsement certificate |
 | sandboxes | an `AgentSandbox` | `reconcile_sandbox`, above; also woken by a policy bundle change |
-| resync | every `WatcherConfig::resync` (5 minutes by default) | `resync`: release bound records whose claim is gone, sweep orphan entries, archive rows past retention, collect nodes of gone VMs |
+| resync | every `WatcherConfig::resync` (5 minutes by default) | `resync`: release bound records whose claim is gone, sweep orphan entries, sweep ended sandboxes past retention (held by the finalizer until then; an audit line is logged, ADR-0034), collect nodes of gone VMs |
 | envelope sweep | every 15 seconds (`ENVELOPE_SWEEP_SECS`) | `sweep_envelopes`: remove sealed envelopes past their expiry |
 
 **On `Bound`.** The claim carries the certificate banlieue mirrored from the VM. The watcher computes its EK hash,

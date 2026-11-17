@@ -5,10 +5,10 @@
 
 How code actually ends up executing inside a sandbox, for each kind of caller:
 
-- **A** — a human user, directly;
-- **B** — an existing agent (an orchestrator, a bot, a CI job) acting *on behalf of* a
+- **A**: a human user, directly;
+- **B**: an existing agent (an orchestrator, a bot, a CI job) acting *on behalf of* a
   user;
-- **C** — a service acting *as itself*, with an app-only JWT from another Entra ID app
+- **C**: a service acting *as itself*, with an app-only JWT from another Entra ID app
   registration.
 
 All three converge on the same call, `POST /v1/claims` with a bearer token whose
@@ -142,7 +142,7 @@ sequenceDiagram
 ## Path B: an agent acting on behalf of a user
 
 An orchestrating agent (its own confidential Entra app) already holds a token *its
-users* gave it — `aud` = the agent's API, not mediatore's. It cannot forward that
+users* gave it: `aud` = the agent's API, not mediatore's. It cannot forward that
 token; mediatore would reject the audience. Instead the agent performs its own
 **On-Behalf-Of exchange** to get a mediatore-audience token that still carries the
 user's identity:
@@ -173,7 +173,7 @@ Setup, once, in Entra:
 
 At runtime the agent exchanges every user's token before claiming
 (`grant_type=jwt-bearer`, `requested_token_use=on_behalf_of`, its own
-`client_assertion`). The result: `spec.subject.id` is the **human's** `oid` — the
+`client_assertion`). The result: `spec.subject.id` is the **human's** `oid`, the
 sandbox belongs to the user, not to the agent. The agent shows up as `azp` in
 mediatore's audit log, exactly like mediatore itself shows up as `azp` downstream.
 This is runbook §4.3 and the recommendation of open decision #10: an agent claiming
@@ -182,7 +182,7 @@ caller is explicitly app-only.
 
 Two properties worth noticing:
 
-- The user's original token still never reaches mediatore or the VM — mediatore sees
+- The user's original token still never reaches mediatore or the VM: mediatore sees
   the OBO *result*, and the VM sees no user token at all, ever.
 - The sandbox's downstream tokens are minted for the **user**; the agent cannot widen
   them beyond the audiences it requested at claim time, and the user's Conditional
@@ -206,14 +206,14 @@ credentials**:
    member type *Application*).
 2. The calling app is granted that application permission + admin consent.
 3. It requests `scope=api://mediatore/.default` with its client secret/certificate
-   and receives a token with `aud` = mediatore and `roles: ["Sandbox.Access"]` — no
+   and receives a token with `aud` = mediatore and `roles: ["Sandbox.Access"]`, no
    `scp`, no user.
 
 mediatore records `spec.subject.id` = the **app's** `oid` and issues downstream
 tokens app-only as well (runbook §4.3: OBO is replaced by app-only tokens with
 `roles`; there is no user to act for). The `sb-` username derives from the app's
-`oid` exactly like a human's. Use this for fleet jobs — nightly report generation,
-scheduled data pulls — where the audit trail should say *the service did this*,
+`oid` exactly like a human's. Use this for fleet jobs (nightly report generation,
+scheduled data pulls) where the audit trail should say *the service did this*,
 not a person.
 
 > The `required_group` gate reads `roles` as it reads `groups`, so an app role gates an
@@ -327,10 +327,11 @@ Because nothing inbound reaches the VM, pick one of:
   legs over SPIFFE mTLS (roadmap 01); the claim as a real `VirtualMachineClaim` behind
   an `AgentSandbox` (roadmaps 03 and 08); the persistent store (roadmap 05); the
   transit sealer (ADR-0015).
-- Still to come: roadmap 04's live run against a tenant; 02 gives VMs a real SPIRE
-  server to attest to; 06's open items are root's own egress and the input chain with
-  the image, seccomp, the image bake and the live libvirt proof. See
-  [`ROADMAPS.md`](https://github.com/firestoned/mediatore/blob/main/ROADMAPS.md).
+- Still to come: roadmap 04's live run against a tenant; 02's SPIRE manifests rendered
+  into a tracked overlay and `make live-admission-test` against the cluster; 06's tier
+  that boots the guest under the image's own units on a Kairos VM; 07's remaining proxy
+  items; 11's rollout of `enforce` across the tiers; 12's repository run against Claude.
+  See [`ROADMAPS.md`](https://github.com/firestoned/mediatore/blob/main/ROADMAPS.md).
 - Threat model: the workload holds no token since the egress proxy
   ([ADR-0025](../adr/0025-phantom-token-egress-proxy.md), roadmap 07): what a
   prompt-injected workload can do is drive requests through the proxy, within the

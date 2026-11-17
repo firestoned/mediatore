@@ -3,7 +3,7 @@
 
 # ADR-0036: `/proc` inside the jail, the workload's own processes only
 
-**Status:** Accepted · **Date:** 2026-11-12
+**Status:** Implemented (`JAIL_PROC_MOUNT` and `proc_is_mounted_with_the_jails_own_processes_only`, `crates/mediatore-guest/src/jail.rs`; live in run 8, `docs/guides/testing.md`) · **Date:** 2026-11-12
 
 Roadmap 12, the live run of Claude Code in the jail (run 8). Amends
 [ADR-0020](0020-jail-network-nftables-keyed-by-sandbox-uid.md) and

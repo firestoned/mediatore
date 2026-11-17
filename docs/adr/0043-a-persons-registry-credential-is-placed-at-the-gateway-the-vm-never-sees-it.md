@@ -3,7 +3,7 @@
 
 # ADR-0043: A person's registry credential is placed at the gateway for the image pull; the VM never sees it
 
-**Status:** Proposed 2026-11-15; built and unit-tested 2026-11-16, not yet run live (the direction was set by the operator on 2026-11-15; see "Implementation notes" for what is built and what is left) · **Date:** 2026-11-15
+**Status:** Accepted 2026-11-15; implemented 2026-11-16, released in v0.2.10; not yet run live (the direction was set by the operator on 2026-11-15; see "Implementation notes" for what is built and what is left; the threat-model pass of 2026-11-16) · **Date:** 2026-11-15
 
 Roadmap 10 (the gateways) and roadmap 12 (the path to the upstreams). Extends
 [ADR-0040](0040-the-gateway-places-an-audiences-credential-the-pool-never-holds-it.md) (the gateway
@@ -163,7 +163,7 @@ What the code does today, so the decisions below are about a real starting point
 
 ## What was proven, and what was not
 
-Nothing of this ADR is built. One thing was measured: a registry that challenges with Bearer took Basic on
+Before the implementation of 2026-11-16 ("Implementation notes" below), nothing of this ADR was built. One thing was measured: a registry that challenges with Bearer took Basic on
 `GET /v2/` and on a manifest (open question 1). What it reuses was proven live on 2026-11-15 on mediatore 0.2.9, broker, three
 gateways and the CLI (ADR-0041, "What was proven"): a person's secret delegated in the claim body, sealed
 with transit, issued to the gateway for five minutes, placed as `Authorization: Basic`, the upstream
@@ -243,8 +243,9 @@ Not built, or not shown:
 ## The ADD checklist
 
 - [x] ADR written, Status and Date present
-- [ ] CALM updated (`docs/architecture/calm/architecture.json`); `make calm-validate` passes; diagrams render
-- [ ] Tests written first; quality gate green (`make check`)
-- [ ] README and guides updated
-- [ ] Threat-model full pass done; header stamp bumped (the registry audience on TB-17, TB-15's registry leg
-      for the anonymous case, the deleted envelope on TB-9, the proxy-before-pull order on TB-6 and TB-12)
+- [x] CALM updated (`docs/architecture/calm/architecture.json`, the store and the credential-store nodes); `make calm-validate` passes; diagrams render (2026-11-16)
+- [x] Tests written first; quality gate green (`make check`) (2026-11-16)
+- [x] README and guides updated (2026-11-16, #128)
+- [x] Threat-model full pass done; header stamp bumped (the registry audience on TB-17, TB-15's registry leg
+      for the anonymous case, the deleted envelope on TB-9, the proxy-before-pull order on TB-6 and TB-12;
+      the pass of 2026-11-16, R-33 new)

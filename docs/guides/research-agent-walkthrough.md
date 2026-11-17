@@ -7,16 +7,20 @@ One workload, followed from the image a team publishes to the report it pushes: 
 packaged as `ghcr.io/octocat/research-agent`, run by `octocat` in a sandbox under a policy
 that [notaio](https://github.com/firestoned/notaio) certifies, on a VM that mediatore binds
 to that login. Every file on this page is a placeholder you replace, and every command is
-one the pieces accept today, at mediatore 0.1 and notaio v0.1.0.
+one the pieces accept today, at mediatore v0.2.10 and notaio v0.6.0 (the bundle crates the
+broker pins).
 
 > **What is proven and what is designed.** mediatore's side of this page runs in the kind
 > tiers (`make kind-e2e-dex`, `make kind-e2e-sandbox`, `make kind-e2e-tpm`,
-> [testing](testing.md)) with the guest in a pod; booting the VM image on a libvirt host
-> is roadmap 06's live item, not yet done. notaio's side runs as notaio v0.1.0 ships it:
-> the lint, the controller, the signed bundle in a ConfigMap. Since
+> [testing](testing.md)) with the guest in a pod, and was run live on a libvirt member on
+> 2026-10-31 (roadmap 06); what is still open there is a tier that boots the Kairos VM
+> itself on the build host. notaio's side runs as notaio v0.6.0 ships it: the lint, the
+> controller, the signed bundle in a ConfigMap. Since
 > [ADR-0026](../adr/0026-notaio-bundles-verified-in-shadow.md) mediatore reads and verifies
-> that bundle and compares the sandbox with it in shadow (`make kind-e2e-policy`); what is
-> still design only is enforcing it, and the guest rendering the jail from it. Section 5
+> that bundle and compares the sandbox with it in shadow (`make kind-e2e-policy`); under
+> `policy.egress: enforce` the bundle's direct egress is served to the gateway
+> ([ADR-0030](../adr/0030-policy-egress-enforced-at-the-gateway.md)). The rest of the bundle
+> is still compared only, and the guest rendering the jail from it is design. Section 5
 > says what enforces each line of the policy today, and what the comparison reports.
 
 ## The cast
@@ -138,7 +142,7 @@ non-production data.
 
 ```yaml
 # policy/research-agent.yaml, in the policy repository notaio lints on every pull request
-apiVersion: sandbox.firestoned.io/v1alpha1
+apiVersion: sandbox.firestoned.io/v1alpha2
 kind: SandboxPolicy
 metadata:
   name: research-agent
@@ -154,6 +158,8 @@ spec:
       access: Write
       scopes: ["repo:read", "repo:write"]
       ttlSeconds: 900
+      # Where the token may be spent, through the proxy; the broker's `egress` must match.
+      endpoints: ["git.home.example:443"]
   # No direct egress: the audience's host is reached as the audience, nothing else is.
   egress: []
   tools: []
@@ -162,14 +168,14 @@ spec:
     maxConcurrent: 1
 ---
 # No ceiling, no bundle (notaio ADR-0007): the policy may never exceed this, whoever edits it.
-apiVersion: sandbox.firestoned.io/v1alpha1
+apiVersion: sandbox.firestoned.io/v1alpha2
 kind: ExposureCeiling
 metadata:
   name: research-agent
   namespace: sandboxes
 spec:
   audiences:
-    - { name: internal-git, access: Write, maxTtlSeconds: 900 }
+    - { name: internal-git, access: Write, maxTtlSeconds: 900, endpoints: ["git.home.example:443"] }
   egressHosts: []
   tools: []
   maxLeaseSeconds: 14400
@@ -197,7 +203,7 @@ kubectl -n sandboxes get sbpolicy research-agent
 # NAME             PROFILE    VERSION   READY   AGE
 # research-agent   standard   3         True    41s
 kubectl -n sandboxes get configmap research-agent-bundle -o jsonpath='{.data.bundle\.dsse\.json}' | jq .payloadType
-# "application/vnd.firestoned.sandboxpolicy.bundle.v2+json"
+# "application/vnd.firestoned.sandboxpolicy.bundle.v3+json"
 ```
 
 The ConfigMap is named after the policy, carries one key, `bundle.dsse.json`, and the
@@ -221,8 +227,10 @@ issuers:
     backend: sts
     client_id: mediatore
     subject_claim: preferred_username
-    # The group a login must carry to claim at all. One gate for the broker today; the
-    # policy's subjects.groups is the per-policy version, which M3 brings.
+    # The group a login must carry to claim at all. One gate for the broker today (a list,
+    # `required_groups`, and a namespace-to-groups map, `sandboxes.namespaces`, are on main
+    # since ADR-0046, in the next release); the policy's subjects.groups is the per-policy
+    # version, which M3 brings.
     required_group: firestoned:research
     session: { client_id: mediatore }
 audiences:
@@ -270,8 +278,12 @@ mediatore sandbox create --mediatore https://mediatore.home.example \
   --image ghcr.io/octocat/research-agent@sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08 \
   --arg /usr/local/bin/research-agent \
   --arg "which services still call the v1 ledger API?"
+# claimed in namespace sandboxes (the broker's default; --namespace names another)
 # sandbox-7c2e91a4	Pending	ready=false
 ```
+
+The first line is on stderr: a broker with one namespace answers it, and `--namespace`
+names another on a broker with a namespace map (ADR-0046, in the next release).
 
 The broker validates the login (issuer, signature, audience, the group), parses the image
 reference (one it cannot parse is refused with `400 invalid_workload_image`), checks the
@@ -319,16 +331,38 @@ diagram):
    token near its expiry is replaced before the next request.
 
    ```
-   INFO mediatore_guest::egress: token fetched for the proxy audience=internal-git expires_at=…
-   INFO mediatore_guest::egress: forwarded audience=internal-git host=git.home.example:443 method=GET path=/platform/services.git/info/refs?service=git-upload-pack status=200 OK credential=true
+   INFO mediatore_guest::egress: token fetched for the proxy audience=internal-git expires_at=… header=authorization
+   INFO mediatore_guest::egress: forwarded audience=internal-git host=git.home.example:443 method=GET path=/platform/services.git/info/refs?service=git-upload-pack status=200 OK credential=true via=direct
    ```
-5. The report lands on `research/2026-10-28` at `git.home.example`. The agent exits; the
-   guest restarts it until the deadline, since a workload that exits early is restarted
-   (the agent is idempotent: a branch that exists is a no-op).
+5. The report lands on `research/2026-10-28` at `git.home.example`. The agent exits 0;
+   under `--restart on-failure` that ends the claim and the member is recycled
+   ([ADR-0033](../adr/0033-a-one-shot-workload-the-restart-policy-and-the-claim-released-when-it-is-done.md)).
+   A non-zero exit is restarted until the deadline, which is why the agent is idempotent:
+   a branch that exists is a no-op.
 
 ```sh
 mediatore sandbox get --mediatore https://mediatore.home.example sandbox-7c2e91a4
-# {"name":"sandbox-7c2e91a4","phase":"Bound","ready":true,"addresses":["192.0.2.41"]}
+# {
+#   "name": "sandbox-7c2e91a4",
+#   "namespace": "sandboxes",
+#   "uid": "…",
+#   "sandbox_uid": "…",
+#   "phase": "Bound",
+#   "ready": true,
+#   "pool": "research",
+#   "expires_at": "2026-10-28T16:04:05Z",
+#   "addresses": [
+#     "192.0.2.41"
+#   ],
+#   "report": {
+#     "reported_at": "2026-10-28T15:04:31Z",
+#     "image_digest": "sha256:9f86…",
+#     "sandbox_ruleset_sha256": "…",
+#     "host_table": {
+#       "state": "not_loaded"
+#     }
+#   }
+# }
 kubectl -n sandboxes get agentsandboxes
 # NAME               SUBJECT   POOL       PHASE   READY   AGE
 # sandbox-7c2e91a4   octocat   research   Bound   true    2m
@@ -343,7 +377,7 @@ banlieue destroys the member. Nothing of the run survives on it.
 | In the policy | Enforced today by | Reported in shadow (ADR-0026) | Under notaio M3 |
 | --- | --- | --- | --- |
 | `profileRef: standard` | nothing in mediatore: the profile is notaio's, applied at lint and compile | nothing: the knobs are not compared | the bundle's knobs, verified by mediatore at every mint and by the guest before it renders the jail |
-| `subjects.groups` | the issuer's `required_group`, one for the broker | nothing: eligibility is the enforcing step's | the policy's groups, per policy, at the claim |
+| `subjects.groups` | the issuer's `required_group`, one for the broker (`required_groups` and the namespace-to-groups map of ADR-0046 are on main, in the next release) | nothing: eligibility is the enforcing step's | the policy's groups, per policy, at the claim |
 | `audiences[].name` | `audiences[]` in the broker's config; a claim naming one not there is refused before any VM exists | `P001`, an audience on the sandbox the bundle does not list | the same, with the policy's set as the ceiling and the version stamped into the token |
 | `audiences[].access: Write`, `scopes` | not expressed: a token carries `aud`, `sub` and `act`; what it may do is the git host's authorization of `octocat` | nothing: the broker has no setting to compare | the bundle's access and scopes, carried in the token |
 | `ttlSeconds: 900` | the audience's `max_ttl` and the broker's 15-minute cap | `P002`, a `max_ttl` above the bundle's `ttlSeconds` | the bundle's value |

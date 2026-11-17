@@ -11,15 +11,13 @@
     with `make calm-diagrams`.
 
 Each business flow defined in the CALM architecture is rendered below as
-its own Mermaid `flowchart TD` — one diagram per flow, linking the
-transitions in sequence order. Three flows are modelled today:
+its own Mermaid `flowchart TD`: one diagram per flow, linking the
+transitions in sequence order. The flows modelled today, from the
+`flows` of `architecture.json`:
 
-- **Create a VirtualMachine** — the happy path from `kubectl apply` to
-  `Ready=true`.
-- **Swap a VirtualMachine's backend** — the canonical least-touch
-  demonstration: change one field, the controller rebuilds the infra.
-- **Delete a VirtualMachine** — finalizer-gated teardown that guarantees
-  no backend leaks.
+{{#each flows}}
+- **{{name}}** (`{{unique-id}}`)
+{{/each}}
 
 {{#each flows}}
 

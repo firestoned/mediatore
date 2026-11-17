@@ -79,7 +79,7 @@ bao read -format=json transit/keys/notaio \
 policy:
   trusted_keys:
     - { id: "notaio:v1", public_key: "<base64 Ed25519 public key>" }
-  namespaces: [sandboxes]        # default: sandboxes.namespace
+  namespaces: [sandboxes]        # default: sandboxes.namespace (no default once sandboxes.namespaces is set)
 ```
 
 During a key rotation list the old and the new version side by side until every bundle
@@ -97,12 +97,12 @@ listed, one below the floor, one copied from another namespace are all logged an
 
 Every bundle carries a version that notaio bumps when the content changes. The broker
 keeps, per policy, the highest version it admitted, with the policy's incarnation (its
-`uid`) and the bundle's `issuedAt`, in the `policy_floors` table of the store, written
-before the bundle is used (decision 5). A bundle below the floor is refused as a
+`uid`) and the bundle's `issuedAt`, as a `PolicyFloor` resource in the broker's namespace
+(ADR-0034), written before the bundle is used (decision 5). A bundle below the floor is refused as a
 `Downgrade`, one from an earlier incarnation of a recreated policy as `StaleIncarnation`,
 and both stay refused after a restart because the floor came back from the store. The
 rule is notaio's (`next_floor`); the store's part is a compare-and-set, so two replicas
-cannot move a floor down between them. Rows are never deleted with their policy.
+cannot move a floor down between them. A floor is never deleted with its policy.
 
 notaio re-signs every bundle when half its lifetime is left (the default lifetime is 15
 minutes, a site value between 5 minutes and a day): the same version and content digest,
@@ -141,7 +141,8 @@ mediatore sandbox create --pool agents --audience api://trading-data \
 
 When the reconciler creates the claim record it looks the policy up in the bundles it
 holds and writes the policy's uid and the bundle's version on the record
-(`claims.policy_uid`, `claims.bundle_version`), for the audit and for the enforcing step.
+(`status.record.policyUid`, `status.record.bundleVersion` on the `AgentSandbox`), for the
+audit and for the enforcing step.
 A sandbox naming a policy with no verified bundle is admitted exactly like one naming
 none, with nothing recorded; the record is never rewritten by a later bundle.
 
@@ -150,14 +151,13 @@ none, with nothing recorded; the record is never rewritten by a later bundle.
 With a `policy` section configured, every sandbox carries a `PolicyConformant` condition
 (decision 7), recomputed on each reconcile and whenever its policy's bundle changes. A
 `Failed` sandbox keeps it, and keeps following the bundle: the verdict is about the spec,
-not the claim. It is only written for sandboxes in the namespaces the `policy` section
-lists; a sandbox elsewhere stays `Unknown`.
+not the claim.
 
 | Status | Reason | Meaning |
 | --- | --- | --- |
 | `True` | `Conformant` | the broker's configuration allows this sandbox nothing the bundle does not |
 | `False` | `Gaps` | the message lists each gap as `<code> <detail>`, separated by `;` |
-| `Unknown` | `BundlesNotRead` | the broker has not finished reading the bundles of this namespace yet |
+| `Unknown` | `BundlesNotRead` | the broker has not finished reading the bundles of the watched namespaces yet |
 
 ```
 $ kubectl -n agents get agentsandbox ledgers-2026-10-14 \

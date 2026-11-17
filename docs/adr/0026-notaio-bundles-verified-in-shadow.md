@@ -3,7 +3,9 @@
 
 # ADR-0026: notaio's policy bundles, verified by the broker and compared in shadow
 
-**Status:** Implemented · **Date:** 2026-11-01 · **Implemented:** 2026-11-02 (roadmap 09; the threat-model pass of that day) · **Amended:** 2026-11-05 (decision 6: a `policyRef` resolved across the watched namespaces, from the first live run)
+**Status:** Implemented · **Date:** 2026-11-01 · **Implemented:** 2026-11-02 (roadmap 09; the threat-model pass of that day) · **Amended:** 2026-11-05 (decision 6: a `policyRef` resolved across the watched namespaces, from the first live run) · 2026-11-09 by
+[ADR-0034](0034-the-kubernetes-api-as-the-brokers-store.md) (decision 5: the floor is a
+`PolicyFloor` resource, moved by compare-and-set on `resourceVersion`)
 
 Roadmap 09, the first step of notaio's roadmap 00 (M3, "integrate the consumers"), phase 1.
 Decides notaio's question D3 (where a sandbox names its policy) for this phase. Amends
@@ -94,6 +96,12 @@ where they disagree is from refused sandboxes. This ADR reads the bundle first a
    ADR-0008, consequences); they are a few dozen bytes each. `dev_mode`'s memory store keeps
    them in memory, as it keeps the claims.
 
+   *Amended 2026-11-09 by [ADR-0034](0034-the-kubernetes-api-as-the-brokers-store.md): there
+   is no table. The floor is a `PolicyFloor` resource in the Kubernetes API, one per
+   (namespace, name), and decision 4's compare-and-set is an update conditioned on its
+   `resourceVersion` (`crates/mediatore-claims/src/kubestore.rs`); a replica that lost the race
+   gets the API server's `409`.*
+
 6. **A sandbox names its policy with `spec.policyRef`** (amends ADR-0008; notaio's D3). The name
    of a `SandboxPolicy`, resolved in the sandbox's own namespace first and then across
    `policy.namespaces` in their listed order (amended 2026-11-05: the first live run had the pool
@@ -143,7 +151,9 @@ What roadmap 09 fixed within the decisions above, so a reader of the code finds 
   row is still exactly what was read: an `INSERT` when there was none, an `UPDATE` matching
   `uid`, `version` and `issued_at` otherwise. A replica that lost a race gets `Conflict`,
   reads again and decides again. This gives decision 4's guarantee with no row lock, which
-  sqlx's `Any` driver cannot express on SQLite.
+  sqlx's `Any` driver cannot express on SQLite. (Historical since ADR-0034, 2026-11-09: the
+  compare-and-set is now the `resourceVersion` precondition on the `PolicyFloor` resource,
+  and the lost race is the API server's `409`.)
 - **The crate is `mediatore-policy`,** shared with the guest when it verifies too (notaio
   roadmap 00, phase 3). `trusted_keys` checks the configured keys (decision 2), refusing a
   duplicate id itself before notaio's `TrustedKeys` sees it; since notaio v0.3.4 `TrustedKeys`
@@ -181,7 +191,8 @@ What roadmap 09 fixed within the decisions above, so a reader of the code finds 
   `poolRef`, optional, rendered into the CRD by `make crds`; the admission policy's
   `object.spec == oldObject.spec` already freezes it. When the reconciler creates the claim
   record it looks the named policy up in the reflector's cache, on the replica holding the
-  Lease, and writes `policy_uid` and `bundle_version` (migration 4, both engines) from the
+  Lease, and writes `policy_uid` and `bundle_version` (migration 4, both engines; since
+  ADR-0034 the two fields of `RecordStatus` in `status.record`) from the
   verified bundle valid at that moment, or nothing when there is none. The record is never
   rewritten by a later bundle: it says what was current when the claim was created, and a
   later bundle is the comparison's business. `POST /v1/claims` carries the name as

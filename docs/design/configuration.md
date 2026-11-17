@@ -49,7 +49,7 @@ issuers:
     session: { client_id: mediatore }       # claims from this issuer delegate a refresh token
 
 # The pool and the gateways. With `gateways` set, every registry needs a `reach`.
-gateways: ["192.0.2.10:3128", "192.0.2.11:3128", "192.0.2.12:3128"]
+gateways: ["192.0.2.10:8443", "192.0.2.11:8443", "192.0.2.12:8443"]
 gateway_inject_port: 3133
 registries:
   - { host: mirror.example.com, reach: relay }

@@ -3,8 +3,15 @@
 
 # ADR-0029: The image pull on a routeless segment, and the pool VM's root rules
 
-**Status:** Accepted · **Date:** 2026-11-04 (proposed and accepted the same day: the segment
-reach is what the homelab runs; the relay reach is recorded, not built)
+**Status:** Accepted (implemented) · **Date:** 2026-11-04 (proposed and accepted the same day: the segment
+reach is what the homelab runs; the relay reach is recorded, not built) · **Amended:**
+2026-11-15 by [ADR-0038](0038-the-pull-reaches-the-operators-registry-through-a-fourth-relay-leg.md)
+(decisions 1 and 2: `reach: relay` built, `RegistryReach::Relay` in
+`crates/mediatore/src/config.rs`);
+2026-11-15 by [ADR-0040](0040-the-gateway-places-an-audiences-credential-the-pool-never-holds-it.md)
+(decision 3's host table admits the inject port, ADR-0040 decision 13); 2026-11-16 by
+[ADR-0043](0043-a-persons-registry-credential-is-placed-at-the-gateway-the-vm-never-sees-it.md)
+(a placed registry is pulled through the claim's proxy on loopback and the gateway's inject port)
 
 Roadmap 06, the last network item. Amends [ADR-0021](0021-sandbox-filesystem-tmpfs-and-rootfs-from-the-registry.md)
 (its consequence that "the segment's firewall must let the members reach the registry")
@@ -75,6 +82,14 @@ where root is allowed to go, which is the pull.
    `gateways`: a gateway-era environment pulls from its declared registries and no other.
    An environment without `gateways` keeps today's behaviour.
 
+   *Amended 2026-11-15 by
+   [ADR-0038](0038-the-pull-reaches-the-operators-registry-through-a-fourth-relay-leg.md):
+   the relay reach is built, a fourth fixed leg of the control relay on
+   `RELAY_REGISTRY_PORT`, for root only. Amended 2026-11-16 by
+   [ADR-0043](0043-a-persons-registry-credential-is-placed-at-the-gateway-the-vm-never-sees-it.md):
+   a registry that is a placed audience is pulled through the claim's egress proxy on
+   loopback and the gateway's inject port, the credential placed at the gateway.*
+
 2. **The broker's `registries[]` gains `reach`,** `segment` for now, so that one
    configuration says both who may pull (ADR-0022) and from where; the credential becomes
    optional on an entry, so an anonymous mirror is declared by its host and its reach
@@ -102,6 +117,10 @@ where root is allowed to go, which is the pull.
    - forward: policy drop.
    The sandbox uid's per-claim table stays as it is (ADR-0020): the workload's bound is
    the uid's, root's is the host's, and a flush of either is visible in the other's log.
+
+   *Amended 2026-11-15 by
+   [ADR-0040](0040-the-gateway-places-an-audiences-credential-the-pool-never-holds-it.md)
+   (decision 13): the table also admits the gateways' inject port, for every uid.*
 
 4. **Direct environments load no host table.** Without gateways the exits are the
    broker, the SPIRE server, the registries, the resolvers and whatever the operator's
@@ -153,12 +172,14 @@ What roadmap 06 fixed within the decisions above, as it is built (2026-11-04):
   no table is loaded, or `not_loaded` where none is expected (`crates/mediatore-guest/src/report.rs`).
   The broker validates the shapes, logs one line (a missing table at `warn`), stamps
   `reported_at` and keeps it on the record (`claims.report`, migration `0005`, swept into
-  the audit row with the claim); `GET /v1/claims/{name}` shows it to the subject and
+  the audit row with the claim; since ADR-0034, `RecordStatus::report` in `status.record`,
+  `crates/mediatore-claims/src/kubestore.rs`); `GET /v1/claims/{name}` shows it to the subject and
   `mediatore sandbox get` prints it. The guest sends it once, after the tables are loaded
   and before the jail starts, bounded at fifteen seconds; a broker unreachable then is
   said at `warn` and the claim goes on: the report is the record's, not the jail's gate,
   and a record with no report is itself visible. The `AgentSandbox` status does not carry
-  it yet; the resource says the claim's phase, the record says what ran.
+  it yet; the resource says the claim's phase, the record says what ran. (Since ADR-0034,
+  2026-11-09, it does: the record is `status.record` on the resource.)
 - **Proven live on 2026-11-05** (the gateway run of roadmap 06, v0.2.0-rc.4): a pool
   member on the routeless segment with a static address from the pool's range (through a
   `userData` stage with banlieue's placeholders, since a Kairos guest reads no seed
@@ -174,10 +195,15 @@ What roadmap 06 fixed within the decisions above, as it is built (2026-11-04):
 
 ### Still to decide
 
-- Whether `reach: relay` is ever worth its listener: the homelab runs a mirror on the
-  segment (decided 2026-11-04); an environment that cannot host one reopens it.
-- Whether the report belongs on the `AgentSandbox` status too, for a requester who reads
-  the resource and not the API; and whether the guest re-reports on a change (today once).
+- ~~Whether `reach: relay` is ever worth its listener: the homelab runs a mirror on the
+  segment (decided 2026-11-04); an environment that cannot host one reopens it.~~ Answered
+  2026-11-15: an environment with no mirror on the segment needed it, and
+  [ADR-0038](0038-the-pull-reaches-the-operators-registry-through-a-fourth-relay-leg.md)
+  built it.
+- ~~Whether the report belongs on the `AgentSandbox` status too, for a requester who reads
+  the resource and not the API;~~ answered 2026-11-09 by
+  [ADR-0034](0034-the-kubernetes-api-as-the-brokers-store.md) (the record, report included,
+  is `status.record`); whether the guest re-reports on a change (today once) stays open.
 - A broker-side comparison: the host table's expected hash per pool image, so a flushed
   or altered table is refused rather than recorded.
 - The clock: whether pool VMs need NTP through the gateway, or the hypervisor's clock

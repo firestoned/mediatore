@@ -71,7 +71,7 @@ The recommendation, to be confirmed before an ADR:
 ## Tasks
 
 - [ ] Confirm the option (D recommended) and the answers to the six questions above
-- [ ] ADR: the declarative claim's credential (ADR → CALM → TDD, `rules/architecture-driven-development.md`)
+- [ ] ADR: the declarative claim's credential (ADR → CALM → TDD, `.claude/rules/architecture-driven-development.md`)
 - [ ] CALM updated, `make calm-validate` and `make calm-diagrams`
 - [ ] Failing tests first: a handle consumed once; an expired handle refused; a handle for another subject
       or another audience refused; a claim that is deleted before it binds deletes its parked envelope;
