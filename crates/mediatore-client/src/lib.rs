@@ -434,6 +434,14 @@ impl Api {
         })
     }
 
+    fn claim_url(&self, name: &str, namespace: Option<&str>) -> String {
+        let base = format!("{}/v1/claims/{name}", self.base);
+        match namespace {
+            Some(ns) => format!("{base}?namespace={}", encode(ns)),
+            None => base,
+        }
+    }
+
     /// `POST /v1/claims` with the session's ID token as bearer and its refresh token
     /// delegated in the body. On success the refresh token is spent: the session comes
     /// back without it.
@@ -464,11 +472,17 @@ impl Api {
         Ok((claim, spent))
     }
 
-    /// `GET /v1/claims/{name}`.
-    pub async fn get(&self, session: &Session, name: &str) -> anyhow::Result<ClaimResponse> {
+    /// `GET /v1/claims/{name}`, with `?namespace=` when one is given (ADR-0046 decision 5);
+    /// without it nothing is sent and the broker's answer decides.
+    pub async fn get(
+        &self,
+        session: &Session,
+        name: &str,
+        namespace: Option<&str>,
+    ) -> anyhow::Result<ClaimResponse> {
         let resp = self
             .http
-            .get(format!("{}/v1/claims/{name}", self.base))
+            .get(self.claim_url(name, namespace))
             .bearer_auth(&session.id_token)
             .send()
             .await?;
@@ -482,11 +496,16 @@ impl Api {
         Ok(resp.json().await?)
     }
 
-    /// `DELETE /v1/claims/{name}`.
-    pub async fn delete(&self, session: &Session, name: &str) -> anyhow::Result<()> {
+    /// `DELETE /v1/claims/{name}`, with `?namespace=` when one is given (ADR-0046 decision 5).
+    pub async fn delete(
+        &self,
+        session: &Session,
+        name: &str,
+        namespace: Option<&str>,
+    ) -> anyhow::Result<()> {
         let resp = self
             .http
-            .delete(format!("{}/v1/claims/{name}", self.base))
+            .delete(self.claim_url(name, namespace))
             .bearer_auth(&session.id_token)
             .send()
             .await?;

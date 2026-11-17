@@ -39,6 +39,8 @@ macro_rules! suite {
             crate::conformance::cases!($make;
                 a_claim_round_trips_every_field,
                 a_second_put_of_the_same_uid_is_a_conflict,
+                a_name_in_one_namespace_is_not_found_in_another,
+                an_old_claim_record_reads_as_the_fallback_namespace,
                 update_replaces_and_needs_an_existing_row,
                 revoke_is_idempotent_and_drops_the_refresh_envelope,
                 revoke_of_an_unknown_claim_is_not_found,
@@ -80,6 +82,7 @@ pub(crate) fn claim(uid: Uuid) -> ClaimRecord {
     ClaimRecord {
         uid,
         name: format!("sandbox-{}", &uid.to_string()[..8]),
+        namespace: "team-a".into(),
         subject: subject(),
         entry_id: None,
         node_id: None,
@@ -152,7 +155,9 @@ pub(crate) async fn a_claim_round_trips_every_field(s: &dyn ClaimStore) {
 
     for got in [
         s.get_claim(uid).await.unwrap(),
-        s.get_claim_by_name(&rec.name).await.unwrap(),
+        s.get_claim_by_name(&rec.namespace, &rec.name)
+            .await
+            .unwrap(),
     ] {
         assert_eq!(got.uid, uid);
         assert_eq!(got.name, rec.name);
@@ -200,9 +205,43 @@ pub(crate) async fn a_claim_round_trips_every_field(s: &dyn ClaimStore) {
         Err(StoreError::NotFound(_))
     ));
     assert!(matches!(
-        s.get_claim_by_name("nope").await,
+        s.get_claim_by_name("team-a", "nope").await,
         Err(StoreError::NotFound(_))
     ));
+}
+
+pub(crate) async fn a_name_in_one_namespace_is_not_found_in_another(s: &dyn ClaimStore) {
+    let a = claim(Uuid::new_v4());
+    let mut b = claim(Uuid::new_v4());
+    b.name.clone_from(&a.name);
+    b.namespace = "infra".into();
+    s.put_claim(a.clone()).await.unwrap();
+    assert!(matches!(
+        s.get_claim_by_name("infra", &a.name).await,
+        Err(StoreError::NotFound(_))
+    ));
+    s.put_claim(b.clone()).await.unwrap();
+    assert_eq!(
+        s.get_claim_by_name("team-a", &a.name).await.unwrap().uid,
+        a.uid
+    );
+    assert_eq!(
+        s.get_claim_by_name("infra", &a.name).await.unwrap().uid,
+        b.uid
+    );
+}
+
+pub(crate) async fn an_old_claim_record_reads_as_the_fallback_namespace(s: &dyn ClaimStore) {
+    let mut v = serde_json::to_value(claim(Uuid::new_v4())).unwrap();
+    v.as_object_mut().unwrap().remove("namespace");
+    let old: ClaimRecord = serde_json::from_value(v).unwrap();
+    assert_eq!(old.namespace, crate::FALLBACK_NAMESPACE);
+    s.put_claim(old.clone()).await.unwrap();
+    let got = s
+        .get_claim_by_name(crate::FALLBACK_NAMESPACE, &old.name)
+        .await
+        .unwrap();
+    assert_eq!(got.uid, old.uid);
 }
 
 pub(crate) async fn a_second_put_of_the_same_uid_is_a_conflict(s: &dyn ClaimStore) {

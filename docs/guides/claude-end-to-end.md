@@ -239,7 +239,7 @@ spire:
   workload_api_socket: unix:///run/spire/sockets/spire-agent.sock
   entries: { class_name: spire-server-spire }
 issuers:                      # section A
-  - { url: https://dex.<tailnet>, backend: sts, client_id: mediatore, subject_claim: preferred_username, session: { client_id: mediatore } }
+  - { url: https://dex.<tailnet>, backend: sts, client_id: mediatore, subject_claim: preferred_username, required_group: "<org>:sandbox-users", session: { client_id: mediatore } }
 audiences:
   - name: github              # ADR-0025 decision 8: reached bare, the phantom dropped
     via: none

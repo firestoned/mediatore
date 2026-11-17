@@ -106,6 +106,19 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
+/// The Kubernetes front door of the user API, and the ADR-0046 start checks and log that depend
+/// on it: a namespace map this build cannot honour is refused, and what was resolved is logged.
+fn sandbox_front(
+    cfg: &Config,
+    client: Option<&kube::Client>,
+) -> anyhow::Result<Option<Arc<dyn SandboxFrontDoor>>> {
+    let front =
+        client.map(|c| Arc::new(KubeSandboxes::new(c.clone())) as Arc<dyn SandboxFrontDoor>);
+    cfg.check_front(front.is_some())?;
+    cfg.log_startup();
+    Ok(front)
+}
+
 async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
     let cfg = Config::load(path)?;
     let naming = Naming {
@@ -118,9 +131,7 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
     }
     let store = store(&cfg, client.as_ref())?;
     let sealer = sealer(&cfg).await?;
-    let sandboxes: Option<Arc<dyn SandboxFrontDoor>> = client
-        .as_ref()
-        .map(|c| Arc::new(KubeSandboxes::new(c.clone())) as Arc<dyn SandboxFrontDoor>);
+    let sandboxes = sandbox_front(&cfg, client.as_ref())?;
 
     let sts = match &cfg.sts {
         Some(s) => {
@@ -172,7 +183,7 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
         delegated: delegated_audiences(&cfg),
         registries,
         sandboxes,
-        sandbox_namespace: cfg.sandboxes.namespace.clone(),
+        namespaces: cfg.namespaces(),
         sealer,
         limiter: Limiter::new(cfg.token.rate_per_minute),
         dev_mode: cfg.dev_mode,

@@ -14,7 +14,7 @@ use std::sync::Arc;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::Duration;
-use mediatore_api::{AppState, Limiter};
+use mediatore_api::{AppState, Limiter, Namespaces};
 use mediatore_entra::{Backend, IssuerConfig, SessionConfig, Validator};
 use mediatore_proto::{
     ClaimRequest, ClaimResponse, ErrorBody, NodeRegistration, Secret, TokenResponse, Workload,
@@ -104,6 +104,8 @@ impl Harness {
                 client_id: "mediatore".into(),
                 subject_claim: "preferred_username".into(),
                 required_group: Some(REQUIRED_GROUP.into()),
+                required_groups: None,
+                allow_any_authenticated: false,
                 session: Some(SessionConfig {
                     client_id: "mediatore".into(),
                     client_secret_file: None,
@@ -125,7 +127,7 @@ impl Harness {
             reachable_registries: None,
             policy_egress: None,
             sandboxes: None,
-            sandbox_namespace: "sandboxes".into(),
+            namespaces: Namespaces::Single("sandboxes".into()),
             sealer: Some(sealer),
             limiter: Limiter::new(rate_per_minute),
             dev_mode: true,
@@ -173,6 +175,7 @@ impl Harness {
             .post(format!("{}/v1/claims", self.user_url))
             .bearer_auth(id_token)
             .json(&ClaimRequest {
+                namespace: None,
                 pool_ref: Some("pool-a".into()),
                 pool_selector: None,
                 ttl_seconds: 3600,

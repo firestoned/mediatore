@@ -2,10 +2,14 @@
 all-features = true
 
 [advisories]
-# No ignores. jsonwebtoken runs on aws-lc-rs (Cargo.toml), so the `rsa` crate's Marvin
+# jsonwebtoken runs on aws-lc-rs (Cargo.toml), so the `rsa` crate's Marvin
 # side channel (RUSTSEC-2023-0071) and the crypto-bigint 0.5 line (RUSTSEC-2026-0387)
 # are out of the tree rather than waived.
-ignore = []
+#
+# One accepted advisory, mirrored in .cargo/audit.toml with the same justification (keep the two in sync).
+ignore = [
+  { id = "RUSTSEC-2026-0543", reason = "chrono is flagged unmaintained: an informational advisory, no vulnerability is published against it. It is a direct dependency of 12 workspace crates (timestamps in tokens, claims and the store), so replacing it with jiff or time is a workspace-wide migration that needs its own ADR, not a side effect of an unrelated change. Revisit when a replacement is decided, chrono is maintained again, or a vulnerability is published against it." },
+]
 
 [licenses]
 allow = [

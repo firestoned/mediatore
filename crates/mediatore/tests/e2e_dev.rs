@@ -15,7 +15,7 @@ use std::future::IntoFuture;
 use std::sync::Arc;
 
 use chrono::Duration;
-use mediatore_api::{AppState, Limiter};
+use mediatore_api::{AppState, Limiter, Namespaces};
 use mediatore_entra::{Backend, IssuerConfig, Validator};
 use mediatore_proto::{
     ClaimEgress, ClaimRequest, ClaimResponse, Delegation, Endpoint, ErrorBody, Me, NodeRegistered,
@@ -126,6 +126,10 @@ struct Harness {
 
 impl Harness {
     async fn start() -> Self {
+        Self::start_with(Namespaces::Single("sandboxes".into())).await
+    }
+
+    async fn start_with(namespaces: Namespaces) -> Self {
         let idp = FakeIdp::start().await;
         let sts = Sts::new(
             "https://mediatore.test",
@@ -148,6 +152,8 @@ impl Harness {
                 client_id: "mediatore".into(),
                 subject_claim: "preferred_username".into(),
                 required_group: Some(REQUIRED_GROUP.into()),
+                required_groups: None,
+                allow_any_authenticated: false,
                 session: None,
                 ca_file: None,
                 entra: None,
@@ -175,7 +181,7 @@ impl Harness {
             reachable_registries: None,
             policy_egress: None,
             sandboxes: None,
-            sandbox_namespace: "sandboxes".into(),
+            namespaces,
             sealer: Some(Arc::new(LocalKeySealer::new([9u8; 32]))),
             limiter: Limiter::new(10),
             dev_mode: true,
@@ -246,6 +252,7 @@ impl Harness {
             .post(format!("{}/v1/claims", self.user_url))
             .bearer_auth(token)
             .json(&ClaimRequest {
+                namespace: None,
                 pool_ref: Some("pool-a".into()),
                 pool_selector: None,
                 ttl_seconds: 3600,
@@ -270,6 +277,7 @@ impl Harness {
             .post(format!("{}/v1/claims", self.user_url))
             .bearer_auth(token)
             .json(&ClaimRequest {
+                namespace: None,
                 pool_ref: Some("pool-a".into()),
                 pool_selector: None,
                 ttl_seconds: 3600,
@@ -311,6 +319,7 @@ impl Harness {
 /// broker records it and releases the claim as a delete does; a claim identity cannot
 /// post it, and a late post after the release is `204` with nothing done.
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // one scripted scenario, front to back; splitting it would hide the order
 async fn a_one_shot_workload_ends_its_claim_at_the_broker() {
     let h = Harness::start().await;
     h.register_node().await;
@@ -320,6 +329,7 @@ async fn a_one_shot_workload_ends_its_claim_at_the_broker() {
         .post(format!("{}/v1/claims", h.user_url))
         .bearer_auth(&user_token)
         .json(&ClaimRequest {
+            namespace: None,
             pool_ref: Some("pool-a".into()),
             pool_selector: None,
             ttl_seconds: 3600,
@@ -801,6 +811,7 @@ async fn a_token_for_another_audience_client_is_unauthorized() {
         .post(format!("{}/v1/claims", h.user_url))
         .bearer_auth(&token)
         .json(&ClaimRequest {
+            namespace: None,
             pool_ref: Some("pool-a".into()),
             pool_selector: None,
             ttl_seconds: 3600,
@@ -829,6 +840,7 @@ async fn a_login_outside_the_required_group_is_forbidden() {
         .post(format!("{}/v1/claims", h.user_url))
         .bearer_auth(&token)
         .json(&ClaimRequest {
+            namespace: None,
             pool_ref: Some("pool-a".into()),
             pool_selector: None,
             ttl_seconds: 3600,
@@ -998,6 +1010,7 @@ async fn an_issuer_without_a_session_refuses_a_delegated_refresh_token() {
         .post(format!("{}/v1/claims", h.user_url))
         .bearer_auth(h.login("octocat"))
         .json(&ClaimRequest {
+            namespace: None,
             pool_ref: Some("pool-a".into()),
             pool_selector: None,
             ttl_seconds: 3600,
@@ -1022,6 +1035,7 @@ async fn an_issuer_without_a_session_refuses_a_delegated_refresh_token() {
 /// A claim request naming the delegated audience beside the ordinary one.
 fn delegated_request(delegations: Vec<Delegation>, ttl_seconds: u32) -> ClaimRequest {
     ClaimRequest {
+        namespace: None,
         pool_ref: Some("pool-a".into()),
         pool_selector: None,
         ttl_seconds,
@@ -1221,4 +1235,228 @@ async fn a_delegation_is_required_where_the_audience_wants_one_and_refused_anywh
         .await
         .expect("create");
     assert_eq!(code(resp).await, (400, "delegation_required".to_owned()));
+}
+
+// ----- ADR-0046: who may claim where, over real listeners --------------------------------------------------
+
+const ADMIN_GROUP: &str = "example-org:APP_EXAMPLE_ADMIN";
+const TEAM_A_GROUP: &str = "APP_EXAMPLE_TEAM_A_USER";
+
+fn tenant_map() -> Namespaces {
+    Namespaces::Map(std::collections::BTreeMap::from([
+        ("infra".to_owned(), vec![ADMIN_GROUP.to_owned()]),
+        ("team-a".to_owned(), vec![TEAM_A_GROUP.to_owned()]),
+    ]))
+}
+
+impl Harness {
+    /// A login that passes the issuer gate and holds `groups` besides.
+    fn login_in(&self, login: &str, groups: &[&str]) -> String {
+        let mut all = vec![REQUIRED_GROUP];
+        all.extend_from_slice(groups);
+        self.idp.token(serde_json::json!({
+            "aud": "mediatore",
+            "preferred_username": login,
+            "groups": all,
+        }))
+    }
+
+    async fn create_in(&self, token: &str, namespace: Option<&str>) -> reqwest::Response {
+        let mut body = serde_json::json!({
+            "pool_ref": "pool-a",
+            "ttl_seconds": 3600,
+            "audiences": [AUDIENCE],
+            "workload": { "image": "registry.internal:5000/sandbox:latest" },
+        });
+        if let Some(ns) = namespace {
+            body["namespace"] = ns.into();
+        }
+        self.http
+            .post(format!("{}/v1/claims", self.user_url))
+            .bearer_auth(token)
+            .json(&body)
+            .send()
+            .await
+            .expect("create")
+    }
+
+    async fn claim_at(
+        &self,
+        method: reqwest::Method,
+        token: &str,
+        name: &str,
+        namespace: Option<&str>,
+    ) -> reqwest::Response {
+        let query = namespace.map_or_else(String::new, |ns| format!("?namespace={ns}"));
+        self.http
+            .request(method, format!("{}/v1/claims/{name}{query}", self.user_url))
+            .bearer_auth(token)
+            .send()
+            .await
+            .expect("claim request")
+    }
+}
+
+/// The error code and detail of a refusal.
+async fn refusal(resp: reqwest::Response) -> (u16, ErrorBody) {
+    (
+        resp.status().as_u16(),
+        resp.json().await.expect("error body"),
+    )
+}
+
+#[tokio::test]
+async fn a_tenant_claims_in_its_namespace_and_not_in_the_admin_namespace() {
+    let h = Harness::start_with(tenant_map()).await;
+    let tenant = h.login_in("octocat", &[TEAM_A_GROUP]);
+
+    let resp = h.create_in(&tenant, Some("team-a")).await;
+    assert_eq!(resp.status(), 201);
+    let claim: ClaimResponse = resp.json().await.expect("claim");
+    assert_eq!(claim.namespace.as_deref(), Some("team-a"));
+
+    // The admin namespace: 403, one code, one message naming only what the caller sent.
+    let (status, body) = refusal(h.create_in(&tenant, Some("infra")).await).await;
+    assert_eq!(status, 403);
+    assert_eq!(body.error, "forbidden");
+    assert_eq!(
+        body.detail.as_deref(),
+        Some("not permitted to create sandboxes in namespace infra")
+    );
+    // A namespace the map does not list answers the same way: no oracle for what exists.
+    let (status, unlisted) = refusal(h.create_in(&tenant, Some("nowhere")).await).await;
+    assert_eq!(status, 403);
+    assert_eq!(unlisted.error, body.error);
+    assert_eq!(
+        unlisted.detail.as_deref(),
+        Some("not permitted to create sandboxes in namespace nowhere")
+    );
+    for text in [body.detail.unwrap(), unlisted.detail.unwrap()] {
+        for leaked in [ADMIN_GROUP, TEAM_A_GROUP, REQUIRED_GROUP, "team-a"] {
+            assert!(!text.contains(leaked), "{leaked} in {text}");
+        }
+    }
+
+    // With a map and no namespace there is no default: 400, naming no namespace.
+    let (status, body) = refusal(h.create_in(&tenant, None).await).await;
+    assert_eq!(status, 400);
+    assert_eq!(body.error, "namespace_required");
+    let detail = body.detail.unwrap_or_default();
+    assert!(
+        !detail.contains("team-a") && !detail.contains("infra"),
+        "{detail}"
+    );
+    let (status, body) = refusal(h.create_in(&tenant, Some("Team_A")).await).await;
+    assert_eq!((status, body.error.as_str()), (400, "invalid_namespace"));
+
+    // The claim is read and deleted in its namespace, by name, by its owner.
+    let name = &claim.name;
+    let get = h
+        .claim_at(reqwest::Method::GET, &tenant, name, Some("team-a"))
+        .await;
+    assert_eq!(get.status(), 200);
+    let got: ClaimResponse = get.json().await.expect("claim");
+    assert_eq!(got.namespace.as_deref(), Some("team-a"));
+    // Unqualified for the namespace, an unlisted one, and a listed one with no such claim are one
+    // answer; and with the map a get with no namespace is 400.
+    let (status, body) = refusal(
+        h.claim_at(reqwest::Method::GET, &tenant, name, Some("infra"))
+            .await,
+    )
+    .await;
+    assert_eq!((status, body.error.as_str()), (404, "not_found"));
+    let (status, _) = refusal(
+        h.claim_at(reqwest::Method::GET, &tenant, name, Some("nowhere"))
+            .await,
+    )
+    .await;
+    assert_eq!(status, 404);
+    let (status, body) = refusal(h.claim_at(reqwest::Method::GET, &tenant, name, None).await).await;
+    assert_eq!((status, body.error.as_str()), (400, "namespace_required"));
+    let (status, body) = refusal(
+        h.claim_at(reqwest::Method::DELETE, &tenant, name, None)
+            .await,
+    )
+    .await;
+    assert_eq!((status, body.error.as_str()), (400, "namespace_required"));
+
+    // An admin does not see the tenant's claim, and cannot delete it: 404, and it is still there.
+    let admin = h.login_in("hexley", &[ADMIN_GROUP]);
+    for ns in ["team-a", "infra"] {
+        let get = h
+            .claim_at(reqwest::Method::GET, &admin, name, Some(ns))
+            .await;
+        assert_eq!(get.status(), 404, "admin GET in {ns}");
+        let del = h
+            .claim_at(reqwest::Method::DELETE, &admin, name, Some(ns))
+            .await;
+        assert_eq!(del.status(), 404, "admin DELETE in {ns}");
+    }
+    assert_eq!(
+        h.claim_at(reqwest::Method::GET, &tenant, name, Some("team-a"))
+            .await
+            .status(),
+        200,
+        "the admin's refused delete left the claim"
+    );
+
+    let del = h
+        .claim_at(reqwest::Method::DELETE, &tenant, name, Some("team-a"))
+        .await;
+    assert!(del.status().is_success(), "{}", del.status());
+}
+
+#[tokio::test]
+async fn an_admin_claims_in_the_admin_namespace_and_not_in_a_tenants() {
+    let h = Harness::start_with(tenant_map()).await;
+    let admin = h.login_in("hexley", &[ADMIN_GROUP]);
+    let tenant = h.login_in("octocat", &[TEAM_A_GROUP]);
+
+    let resp = h.create_in(&admin, Some("infra")).await;
+    assert_eq!(resp.status(), 201);
+    let claim: ClaimResponse = resp.json().await.expect("claim");
+    assert_eq!(claim.namespace.as_deref(), Some("infra"));
+
+    let (status, body) = refusal(h.create_in(&admin, Some("team-a")).await).await;
+    assert_eq!((status, body.error.as_str()), (403, "forbidden"));
+    // The tenant cannot claim in infra, nor see the admin's claim there.
+    let (status, _) = refusal(h.create_in(&tenant, Some("infra")).await).await;
+    assert_eq!(status, 403);
+    for method in [reqwest::Method::GET, reqwest::Method::DELETE] {
+        let resp = h
+            .claim_at(method.clone(), &tenant, &claim.name, Some("infra"))
+            .await;
+        assert_eq!(resp.status(), 404, "tenant {method} in infra");
+    }
+    assert_eq!(
+        h.claim_at(reqwest::Method::GET, &admin, &claim.name, Some("infra"))
+            .await
+            .status(),
+        200
+    );
+    // A person in both namespaces' groups still names one.
+    let both = h.login_in("mona", &[ADMIN_GROUP, TEAM_A_GROUP]);
+    let (status, body) = refusal(h.create_in(&both, None).await).await;
+    assert_eq!((status, body.error.as_str()), (400, "namespace_required"));
+    assert_eq!(h.create_in(&both, Some("team-a")).await.status(), 201);
+}
+
+#[tokio::test]
+async fn without_a_map_the_single_namespace_is_open_and_any_other_is_403() {
+    let h = Harness::start().await;
+    let token = h.login("octocat");
+    let resp = h.create_in(&token, None).await;
+    assert_eq!(resp.status(), 201);
+    let claim: ClaimResponse = resp.json().await.expect("claim");
+    assert_eq!(claim.namespace.as_deref(), Some("sandboxes"));
+    assert_eq!(h.create_in(&token, Some("sandboxes")).await.status(), 201);
+    let (status, body) = refusal(h.create_in(&token, Some("team-a")).await).await;
+    assert_eq!((status, body.error.as_str()), (403, "forbidden"));
+    // A get with no namespace means the one namespace, as before.
+    assert_eq!(
+        h.claim_at(reqwest::Method::GET, &token, &claim.name, None)
+            .await
+            .status(),
+        200
+    );
 }

@@ -48,6 +48,8 @@ async fn the_live_tenant_exchanges_refreshes_for_mediatore_and_refreshes_for_the
         client_id: client_id.clone(),
         subject_claim: "oid".into(),
         required_group: None,
+        required_groups: None,
+        allow_any_authenticated: true,
         session: None,
         ca_file: None,
         entra: Some(entra.clone()),

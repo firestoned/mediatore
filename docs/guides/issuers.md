@@ -78,6 +78,7 @@ issuers:
     backend: sts
     client_id: 1234567890-abc.apps.googleusercontent.com
     subject_claim: email
+    allow_any_authenticated: true   # no groups in a Google token; who may log in is decided at Google
     session:
       client_id: 1234567890-abc.apps.googleusercontent.com
       client_secret_file: /etc/mediatore-google/client-secret   # a Secret volume
@@ -91,10 +92,15 @@ mediatore login --issuer https://accounts.google.com \
   --auth-param access_type=offline --auth-param prompt=consent
 ```
 
-Leave `required_group` unset: there is nothing in the token to gate on. Who may log in
-is decided at Google (a Workspace domain, which the token shows as `hd`); a deployment
-that needs a group gate puts Dex in front of Google and uses its Google connector's
-group support instead.
+Write `allow_any_authenticated: true` and no group key: there is nothing in the token to
+gate on. Who may log in is decided at Google (a Workspace domain, which the token shows
+as `hd`); a deployment that needs a group gate puts Dex in front of Google and uses its
+Google connector's group support instead. The key is required, not optional: an issuer
+that writes none of `required_group`, `required_groups` and `allow_any_authenticated`
+refuses to start, so a lost or misspelled gate can never read as "no gate"
+([ADR-0046](../adr/0046-who-may-claim-a-list-of-groups-and-a-namespace-to-groups-mapping.md)
+decision 19). An existing Google configuration that has no gate key needs this one line
+added before the release that carries the ADR will start it.
 
 ## Auth0
 
@@ -142,8 +148,16 @@ but the session is not delegated: mediatore exchanges the caller's token On-Beha
 - The subject written on the sandbox is the issuer URL plus the `subject_claim` value.
   banlieue's policy prefixes usernames per issuer (`github:`, `google:`) when it compares
   a declarative requester with `spec.subject`; the token side never carries a prefix.
-- The gate is `required_group` against `groups` and `roles`, or against `groups_claim`
-  when set. It runs on the login and on every fresh token a refresh returns.
+- Every issuer writes exactly one gate: `required_group` (one group), `required_groups`
+  (a list, any one of them admits) or `allow_any_authenticated: true` (no gate, with a
+  comment saying why). Both group keys on one issuer, an empty list, a duplicate or a
+  padded entry, and none of the three keys are refused at start. The match is exact and
+  case-sensitive against `groups` and `roles`, or against `groups_claim` when set; there is
+  no prefix stripping, so where both spellings of a group exist (`<org>:<team>` from
+  Dex's GitHub connector, the bare name from LDAP or Entra) list both in `required_groups`.
+  It runs on the login and on every fresh token a refresh returns. The planned keys are in
+  [multi-tenant authorization](multi-tenant-authorization.md); they are not in a released
+  broker until that guide says so.
 - A refresh refused with `invalid_grant` (and at Entra `interaction_required` or
   `consent_required`) releases the claim; an issuer outage is `503` and releases nothing.
 - `ca_file` pins an issuer on a private PKI to exactly that CA, for the broker and the

@@ -35,6 +35,8 @@ mediatore-testkit.workspace = true
 mediatore-policy.workspace = true
 tower = { workspace = true, features = ["util"] }
 tracing-subscriber.workspace = true
+# A counting front door, to prove a refused namespace issues no read (ADR-0046 decision 5).
+async-trait.workspace = true
 
 [lints]
 workspace = true

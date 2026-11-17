@@ -25,7 +25,7 @@ use std::time::Duration;
 use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::routing::any;
-use mediatore_api::{AppState, Limiter};
+use mediatore_api::{AppState, Limiter, Namespaces};
 use mediatore_entra::{Backend, IssuerConfig, Validator};
 use mediatore_guest::egress::{Phantom, Proxy, Routes, TokenSource};
 use mediatore_guest::forward::{Dialer, Forwarder};
@@ -184,6 +184,8 @@ impl Harness {
                 client_id: "mediatore".into(),
                 subject_claim: "preferred_username".into(),
                 required_group: Some(REQUIRED_GROUP.into()),
+                required_groups: None,
+                allow_any_authenticated: false,
                 session: None,
                 ca_file: None,
                 entra: None,
@@ -206,7 +208,7 @@ impl Harness {
             reachable_registries,
             policy_egress: None,
             sandboxes: None,
-            sandbox_namespace: "sandboxes".into(),
+            namespaces: Namespaces::Single("sandboxes".into()),
             sealer: None,
             limiter: Limiter::new(10),
             dev_mode: true,
@@ -262,6 +264,7 @@ impl Harness {
             .post(format!("{}/v1/claims", self.user_url))
             .bearer_auth(self.login("octocat"))
             .json(&ClaimRequest {
+                namespace: None,
                 pool_ref: Some("pool-a".into()),
                 pool_selector: None,
                 ttl_seconds: 3600,
@@ -562,6 +565,7 @@ async fn a_claim_naming_a_registry_the_pool_cannot_reach_is_refused_and_the_mirr
     let reachable = ["registry.internal:5000".to_owned()].into_iter().collect();
     let h = Harness::start(ca, upstream, vec![dead], Some(reachable)).await;
     let claim = |image: &str| ClaimRequest {
+        namespace: None,
         pool_ref: Some("pool-a".into()),
         pool_selector: None,
         ttl_seconds: 3600,

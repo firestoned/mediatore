@@ -58,6 +58,7 @@ pub enum Backend {
 /// the refresh token it got as `client_id` (a public client, no secret), and mediatore
 /// refreshes it before every issue.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionConfig {
     /// The OAuth client the refresh token was issued to; `mediatore login` uses
     /// mediatore's own public client, so this is normally the issuer's `client_id`.
@@ -71,6 +72,7 @@ pub struct SessionConfig {
 
 /// One trusted issuer, from config.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IssuerConfig {
     /// `iss` value, byte-for-byte.
     pub url: String,
@@ -81,9 +83,20 @@ pub struct IssuerConfig {
     /// Claim carrying the subject id: `oid` for Entra, `preferred_username` for Dex.
     #[serde(default = "default_subject_claim")]
     pub subject_claim: String,
-    /// A group the token must carry (Dex `groups`, Entra `groups`/`roles`); none = no gate.
+    /// Alias for `required_groups` with one entry (ADR-0046 decision 1). Exactly one of
+    /// `required_group`, `required_groups` and `allow_any_authenticated: true` is set;
+    /// [`IssuerConfig::gate`] enforces it.
     #[serde(default)]
     pub required_group: Option<String>,
+    /// Groups of which the token must carry at least one (Dex `groups`, Entra
+    /// `groups`/`roles`), matched exactly (ADR-0046 decisions 1 and 2). `None` is absent;
+    /// `Some(vec![])` is an empty list, which is refused.
+    #[serde(default)]
+    pub required_groups: Option<Vec<String>>,
+    /// The explicit "no group gate": any authenticated person of this issuer may log in
+    /// (ADR-0046 decision 19). `false` counts as absent.
+    #[serde(default)]
+    pub allow_any_authenticated: bool,
     /// The claim that carries the groups, when it is not `groups` or `roles`: Auth0 puts
     /// them under a namespaced claim such as `https://example.com/groups` (ADR-0017).
     /// When set, only that claim is read.
@@ -107,6 +120,120 @@ pub struct IssuerConfig {
 
 fn default_subject_claim() -> String {
     "oid".to_owned()
+}
+
+/// The login gate of one issuer, resolved and validated (ADR-0046 decisions 1, 18, 19).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Gate {
+    /// The token must carry at least one of these groups, exactly. Built from
+    /// `required_groups`, or from `required_group` as a one-element list.
+    Groups(Vec<String>),
+    /// No group gate, written down as `allow_any_authenticated: true`.
+    AnyAuthenticated,
+}
+
+impl std::fmt::Display for Gate {
+    /// `required_groups (<values>)`, `required_group (<value>)` for a single entry, or
+    /// `none (explicit)`. Values are configuration, never token content.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AnyAuthenticated => f.write_str("none (explicit)"),
+            Self::Groups(g) => write!(f, "required_groups ({})", g.join(", ")),
+        }
+    }
+}
+
+/// A gate configuration the broker refuses to start with.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("issuer {issuer}: {reason}")]
+pub struct GateError {
+    issuer: String,
+    reason: String,
+}
+
+impl IssuerConfig {
+    /// Resolve and validate this issuer's gate: exactly one of `required_group`,
+    /// `required_groups`, `allow_any_authenticated: true`; no empty list, blank,
+    /// whitespace-padded or duplicate entry. The error names the issuer url and the keys.
+    ///
+    /// # Errors
+    /// [`GateError`] for any of the refused shapes.
+    pub fn gate(&self) -> Result<Gate, GateError> {
+        let err = |reason: &str| GateError {
+            issuer: self.url.clone(),
+            reason: reason.to_owned(),
+        };
+        let set = usize::from(self.required_group.is_some())
+            + usize::from(self.required_groups.is_some())
+            + usize::from(self.allow_any_authenticated);
+        match set {
+            0 => {
+                return Err(err(
+                    "no login gate: set one of required_group, required_groups, or \
+                     allow_any_authenticated: true",
+                ));
+            }
+            1 => {}
+            _ => {
+                return Err(err(
+                    "more than one of required_group, required_groups, allow_any_authenticated \
+                     is set; set exactly one",
+                ));
+            }
+        }
+        if self.allow_any_authenticated {
+            return Ok(Gate::AnyAuthenticated);
+        }
+        let (key, list) = match (&self.required_group, &self.required_groups) {
+            (Some(one), _) => ("required_group", vec![one.clone()]),
+            (_, Some(many)) => ("required_groups", many.clone()),
+            (None, None) => unreachable!("exactly one key is set"),
+        };
+        if list.is_empty() {
+            return Err(err(
+                "required_groups is empty; an empty list is not a gate (use \
+                 allow_any_authenticated: true for none)",
+            ));
+        }
+        for (i, g) in list.iter().enumerate() {
+            if g.trim().is_empty() {
+                return Err(err(&format!("{key} has an empty or blank entry")));
+            }
+            if g.trim() != g {
+                return Err(err(&format!(
+                    "{key} has an entry with leading or trailing whitespace"
+                )));
+            }
+            if list[..i].contains(g) {
+                return Err(err(&format!("{key} has a duplicate entry")));
+            }
+        }
+        Ok(Gate::Groups(list))
+    }
+}
+
+impl IssuerConfig {
+    /// The gate form for the startup log (ADR-0046 decision 18): `required_groups (<values>)`,
+    /// `required_group (<value>)` for the alias, or `none (explicit)`. Values are
+    /// configuration, never token content.
+    ///
+    /// # Errors
+    /// [`GateError`] when the gate is invalid, as [`Self::gate`].
+    pub fn gate_form(&self) -> Result<String, GateError> {
+        let gate = self.gate()?;
+        Ok(match (&gate, &self.required_group) {
+            (Gate::Groups(g), Some(_)) => format!("required_group ({})", g.join(", ")),
+            _ => gate.to_string(),
+        })
+    }
+}
+
+/// Whether the token's groups and the listed groups share a value. Exact, case-sensitive,
+/// no prefix stripping: `org:ADMIN` and `ADMIN` are different groups (ADR-0046 decision 2).
+/// The one function behind the issuer gate and the namespace check.
+#[must_use]
+pub fn groups_intersect(token_groups: &[String], listed: &[String]) -> bool {
+    token_groups.iter().any(|g| listed.contains(g))
 }
 
 /// Errors from validation or exchange.
@@ -649,12 +776,17 @@ impl Validator {
             groups.extend(string_array(&claims, "roles"));
             groups
         };
-        if let Some(required) = &issuer.required_group
-            && !groups.iter().any(|g| g == required)
+        // A gate the configuration load should have refused is still refused here: fail closed.
+        match issuer
+            .gate()
+            .map_err(|e| IdpError::Credential(e.to_string()))?
         {
-            return Err(IdpError::Forbidden(format!(
-                "not in required group {required}"
-            )));
+            Gate::AnyAuthenticated => {}
+            Gate::Groups(listed) => {
+                if !groups_intersect(&groups, &listed) {
+                    return Err(IdpError::Forbidden("not in a required group".into()));
+                }
+            }
         }
 
         let display = ["upn", "email", "name"]
@@ -713,6 +845,8 @@ mod tests {
             client_id: "mediatore".into(),
             subject_claim: "preferred_username".into(),
             required_group: Some("firestoned:sandbox-users".into()),
+            required_groups: None,
+            allow_any_authenticated: false,
             session: Some(SessionConfig {
                 client_id: "mediatore".into(),
                 client_secret_file: None,
@@ -823,6 +957,273 @@ mod tests {
         ));
     }
 
+    fn gate_cfg(extra: &serde_json::Value) -> IssuerConfig {
+        let mut v = serde_json::json!({
+            "url": "https://idp.example.com",
+            "backend": "sts",
+            "client_id": "mediatore",
+            "subject_claim": "preferred_username",
+        });
+        v.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        serde_json::from_value(v).unwrap()
+    }
+
+    fn strs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    async fn login_with(
+        cfg_extra: serde_json::Value,
+        groups: &[&str],
+    ) -> Result<Validated, IdpError> {
+        let idp = FakeIdp::start().await;
+        let mut cfg = issuer_config(&idp);
+        cfg.required_group = None;
+        cfg.required_groups = None;
+        cfg.allow_any_authenticated = false;
+        let extra = cfg_extra.as_object().unwrap();
+        if let Some(g) = extra.get("required_groups") {
+            cfg.required_groups = Some(serde_json::from_value(g.clone()).unwrap());
+        }
+        if let Some(g) = extra.get("required_group") {
+            cfg.required_group = Some(g.as_str().unwrap().to_owned());
+        }
+        if let Some(g) = extra.get("allow_any_authenticated") {
+            cfg.allow_any_authenticated = g.as_bool().unwrap();
+        }
+        let v = Validator::new(vec![cfg]);
+        let token = idp.token(serde_json::json!({
+            "aud": "mediatore",
+            "preferred_username": "octocat",
+            "groups": groups,
+        }));
+        v.validate(&token).await
+    }
+
+    #[tokio::test]
+    async fn required_groups_admits_any_one_of_them() {
+        let list = serde_json::json!({"required_groups": ["example-org:APP_EXAMPLE_ADMIN", "APP_EXAMPLE_ADMIN"]});
+        for g in ["example-org:APP_EXAMPLE_ADMIN", "APP_EXAMPLE_ADMIN"] {
+            let ok = login_with(list.clone(), &[g]).await.unwrap();
+            assert_eq!(ok.groups, strs(&[g]));
+        }
+    }
+
+    #[tokio::test]
+    async fn required_groups_refuses_a_token_with_none_of_them() {
+        let list = serde_json::json!({"required_groups": ["example-org:APP_EXAMPLE_ADMIN", "APP_EXAMPLE_ADMIN"]});
+        let err = login_with(list, &["APP_EXAMPLE_TEAM_A_USER"])
+            .await
+            .unwrap_err();
+        let IdpError::Forbidden(msg) = err else {
+            panic!("expected forbidden")
+        };
+        assert!(
+            !msg.contains("APP_EXAMPLE_ADMIN"),
+            "the message must not name the values: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn required_group_alone_behaves_as_before() {
+        let one = serde_json::json!({"required_group": "example-org:APP_EXAMPLE_ADMIN"});
+        assert!(
+            login_with(one.clone(), &["example-org:APP_EXAMPLE_ADMIN"])
+                .await
+                .is_ok()
+        );
+        assert!(matches!(
+            login_with(one, &["APP_EXAMPLE_TEAM_A_USER"]).await,
+            Err(IdpError::Forbidden(_))
+        ));
+    }
+
+    #[test]
+    fn an_issuer_with_both_required_group_keys_refuses_to_start() {
+        let cfg = gate_cfg(&serde_json::json!({"required_group": "a", "required_groups": ["b"]}));
+        let e = cfg.gate().unwrap_err().to_string();
+        assert!(
+            e.contains("https://idp.example.com")
+                && e.contains("required_group")
+                && e.contains("required_groups"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn an_empty_required_groups_refuses_to_start() {
+        let e = gate_cfg(&serde_json::json!({"required_groups": []}))
+            .gate()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("https://idp.example.com") && e.contains("required_groups"),
+            "{e}"
+        );
+        for bad in [
+            serde_json::json!([""]),
+            serde_json::json!(["  "]),
+            serde_json::json!([" a"]),
+            serde_json::json!(["a "]),
+            serde_json::json!(["a", "a"]),
+        ] {
+            assert!(
+                gate_cfg(&serde_json::json!({"required_groups": bad}))
+                    .gate()
+                    .is_err()
+            );
+        }
+        assert!(
+            gate_cfg(&serde_json::json!({"required_group": " a"}))
+                .gate()
+                .is_err()
+        );
+        assert!(
+            gate_cfg(&serde_json::json!({"required_group": ""}))
+                .gate()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn group_matching_is_exact_and_case_sensitive() {
+        let held = strs(&["example-org:APP_EXAMPLE_ADMIN"]);
+        assert!(groups_intersect(
+            &held,
+            &strs(&["example-org:APP_EXAMPLE_ADMIN"])
+        ));
+        assert!(!groups_intersect(
+            &held,
+            &strs(&["example-org:app_example_admin"])
+        ));
+        assert!(!groups_intersect(
+            &held,
+            &strs(&["Example-Org:APP_EXAMPLE_ADMIN"])
+        ));
+        assert!(!groups_intersect(&[], &strs(&["x"])));
+        assert!(!groups_intersect(&held, &[]));
+    }
+
+    #[test]
+    fn a_prefixed_group_does_not_match_the_bare_name() {
+        assert!(!groups_intersect(
+            &strs(&["example-org:APP_EXAMPLE_ADMIN"]),
+            &strs(&["APP_EXAMPLE_ADMIN"])
+        ));
+    }
+
+    #[test]
+    fn a_bare_group_does_not_match_the_prefixed_name() {
+        assert!(!groups_intersect(
+            &strs(&["APP_EXAMPLE_ADMIN"]),
+            &strs(&["example-org:APP_EXAMPLE_ADMIN"])
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_service_id_with_a_bare_group_passes_when_both_spellings_are_listed() {
+        let both = serde_json::json!({"required_groups": ["example-org:APP_EXAMPLE_ADMIN", "APP_EXAMPLE_ADMIN"]});
+        assert!(login_with(both, &["APP_EXAMPLE_ADMIN"]).await.is_ok());
+        let prefixed = serde_json::json!({"required_group": "example-org:APP_EXAMPLE_ADMIN"});
+        assert!(matches!(
+            login_with(prefixed, &["APP_EXAMPLE_ADMIN"]).await,
+            Err(IdpError::Forbidden(_))
+        ));
+    }
+
+    #[test]
+    fn an_issuer_with_no_gate_key_refuses_to_start() {
+        let e = gate_cfg(&serde_json::json!({}))
+            .gate()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("https://idp.example.com")
+                && e.contains("required_group")
+                && e.contains("required_groups")
+                && e.contains("allow_any_authenticated"),
+            "{e}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_issuer_with_allow_any_authenticated_admits_a_token_with_no_groups() {
+        let ok = login_with(serde_json::json!({"allow_any_authenticated": true}), &[])
+            .await
+            .unwrap();
+        assert_eq!(ok.groups, Vec::<String>::new());
+        let cfg = gate_cfg(&serde_json::json!({"allow_any_authenticated": true}));
+        assert_eq!(cfg.gate().unwrap(), Gate::AnyAuthenticated);
+        assert_eq!(cfg.gate().unwrap().to_string(), "none (explicit)");
+    }
+
+    #[test]
+    fn allow_any_authenticated_with_required_groups_refuses_to_start() {
+        assert!(
+            gate_cfg(
+                &serde_json::json!({"allow_any_authenticated": true, "required_groups": ["a"]})
+            )
+            .gate()
+            .is_err()
+        );
+        assert!(
+            gate_cfg(&serde_json::json!({"allow_any_authenticated": true, "required_group": "a"}))
+                .gate()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn allow_any_authenticated_false_is_not_a_gate() {
+        assert!(
+            gate_cfg(&serde_json::json!({"allow_any_authenticated": false}))
+                .gate()
+                .is_err()
+        );
+        let g =
+            gate_cfg(&serde_json::json!({"allow_any_authenticated": false, "required_group": "a"}))
+                .gate()
+                .unwrap();
+        assert_eq!(g, Gate::Groups(strs(&["a"])));
+        let alias = gate_cfg(&serde_json::json!({"required_group": "a"}));
+        assert_eq!(alias.gate_form().unwrap(), "required_group (a)");
+        let g = gate_cfg(&serde_json::json!({"required_groups": ["a", "b"]}))
+            .gate()
+            .unwrap();
+        assert_eq!(g.to_string(), "required_groups (a, b)");
+    }
+
+    #[test]
+    fn an_issuer_with_an_unknown_key_refuses_to_start() {
+        let v =
+            serde_json::json!({"url": "u", "backend": "sts", "client_id": "c", "allow_any": true});
+        assert!(serde_json::from_value::<IssuerConfig>(v).is_err());
+    }
+
+    #[test]
+    fn a_misspelled_required_groups_refuses_to_start() {
+        let v = serde_json::json!({"url": "u", "backend": "sts", "client_id": "c", "required_group": ["a"]});
+        assert!(serde_json::from_value::<IssuerConfig>(v).is_err());
+        let v = serde_json::json!({"url": "u", "backend": "sts", "client_id": "c", "requiredgroups": ["a"]});
+        assert!(serde_json::from_value::<IssuerConfig>(v).is_err());
+    }
+
+    #[test]
+    fn an_entra_or_session_block_with_an_unknown_key_refuses_to_start() {
+        let base = serde_json::json!({"url": "u", "backend": "sts", "client_id": "c", "allow_any_authenticated": true});
+        let mut with_session = base.clone();
+        with_session["session"] = serde_json::json!({"client_id": "c", "client_sekret_file": "/x"});
+        assert!(serde_json::from_value::<IssuerConfig>(with_session).is_err());
+        let mut with_entra = base.clone();
+        with_entra["entra"] = serde_json::json!({"key_file": "/k", "key_fil": "/k"});
+        assert!(serde_json::from_value::<IssuerConfig>(with_entra).is_err());
+        let mut ok = base;
+        ok["session"] = serde_json::json!({"client_id": "c"});
+        assert!(serde_json::from_value::<IssuerConfig>(ok).is_ok());
+    }
+
     #[tokio::test]
     async fn missing_required_group_is_forbidden() {
         let idp = FakeIdp::start().await;
@@ -892,6 +1293,8 @@ mod tests {
             client_id: ENTRA_CLIENT.into(),
             subject_claim: "oid".into(),
             required_group: Some("firestoned:sandbox-users".into()),
+            required_groups: None,
+            allow_any_authenticated: false,
             session: None,
             ca_file: None,
             entra: Some(cfg.clone()),
