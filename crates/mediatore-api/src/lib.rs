@@ -3607,7 +3607,7 @@ mod tests {
             0,
             "no session or delegation Secret is left behind"
         );
-        assert!(b.front.all().is_empty());
+        assert_eq!(b.front.all().len(), 0);
     }
 
     #[tokio::test]

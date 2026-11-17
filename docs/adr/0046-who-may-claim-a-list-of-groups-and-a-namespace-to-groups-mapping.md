@@ -568,7 +568,7 @@ Answered by the maintainer on 2026-11-17 and folded into the decisions above.
 - [x] Docs: `README.md` status table, `docs/guides` (the config reference and a multi-tenant
   example with placeholder groups), the ADR-0008 Namespace paragraph and ADR-0044 decision 6 gain a
   pointer to this ADR, ADR-0017's `required_group` text gains one.
-- [ ] (open: another change is editing `docs/security/threat-model.md`; the ADR is not implemented until the stamp is bumped) Threat-model full pass (`rules/threat-modeling.md`): every section, TB-1 and TB-2 rows as above,
+- [x] Threat-model full pass (`rules/threat-modeling.md`): every section, TB-1 and TB-2 rows as above,
   A-9 re-read, the namespace map as an asset, the residual-risk entry with its *Revisit when*, the
   Mermaid diagram checked, the header stamp bumped (date and ADR range to ADR-0046).
 - [ ] (open, manual, build host) `make kind-e2e-sandbox` with a second namespace, run by hand before release
@@ -576,5 +576,5 @@ Answered by the maintainer on 2026-11-17 and folded into the decisions above.
   (plus the provider and CLI variables the host needs). Not run for this change.
 - [ ] (open) `make check` overall: `cargo fmt`, `clippy` and `cargo test` pass; `cargo deny` advisories fail on
   RUSTSEC-2026-0543 (`chrono`), which fails on `main` too and is not caused by this change.
-- [ ] (open: done at hand-back, on the final diff) Infrastructure sweep of the diff (`rules/no-real-infrastructure.md`): placeholders only in the
+- [x] Infrastructure sweep of the diff (`rules/no-real-infrastructure.md`): placeholders only in the
   docs, tests and examples (`rbc-cm:APP_EXAMPLE_ADMIN`, `APP_EXAMPLE_TEAM_A_USER`, `team-a`).
