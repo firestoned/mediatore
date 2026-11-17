@@ -107,7 +107,7 @@ that writes none of `required_group`, `required_groups` and `allow_any_authentic
 refuses to start, so a lost or misspelled gate can never read as "no gate"
 ([ADR-0046](../adr/0046-who-may-claim-a-list-of-groups-and-a-namespace-to-groups-mapping.md)
 decision 19). An existing Google configuration that has no gate key needs this one line
-added before the release that carries the ADR will start it.
+added before v0.3.0 or later will start it.
 
 ## Auth0
 

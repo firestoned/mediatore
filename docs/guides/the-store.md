@@ -56,8 +56,8 @@ ClusterRole), and `get`, `list`, `create`, `update`, `patch` and `delete` on Sec
 its own namespace alone (a Role): `deploy/base/rbac.yaml`. The broker reads no Secret
 elsewhere. The broker's namespace is the client's default, the ServiceAccount's in a
 pod, so nothing names it in the configuration. The sandboxes may live anywhere the
-controller watches: `sandboxes.namespace` is where `POST /v1/claims` creates them (from
-the next release, the namespace the request names, one of `sandboxes.namespaces`,
+controller watches: `sandboxes.namespace` is where `POST /v1/claims` creates them (or, since
+v0.3.0, the namespace the request names, one of `sandboxes.namespaces`,
 [ADR-0046](../adr/0046-who-may-claim-a-list-of-groups-and-a-namespace-to-groups-mapping.md)),
 and a sandbox applied in another namespace gets its record where it is.
 

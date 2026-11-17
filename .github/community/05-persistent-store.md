@@ -73,4 +73,4 @@ datastore.
       `Watcher::collect_nodes` on the resync ticker; `store.node_grace_secs`; threat model full
       pass (TB-9, A-11, R-26).
 - [ ] The live proof: a recycled pool with `kubectl get sandboxnodes` settling at the pool's
-      size, after a release that carries it (no RBAC change: the role already has `delete`).
+      size, on v0.2.5 or later (no RBAC change: the role already has `delete`).

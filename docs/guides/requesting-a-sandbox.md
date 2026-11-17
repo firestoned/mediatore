@@ -13,7 +13,7 @@ claim's SPIFFE identity, and the sandbox is `Ready`.
 
 `POST /v1/claims` with a bearer token whose audience is mediatore creates the resource
 with `spec.subject` taken from the validated token, in the namespace `sandboxes.namespace`
-names in `mediatore.yaml` (from the next release, the one the request names with
+names in `mediatore.yaml` (or, since v0.3.0, the one the request names with
 `namespace`, `--namespace` on the CLI, among `sandboxes.namespaces`,
 [ADR-0046](../adr/0046-who-may-claim-a-list-of-groups-and-a-namespace-to-groups-mapping.md);
 the answer then carries it). The caller never touches the cluster and needs no Kubernetes

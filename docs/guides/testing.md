@@ -656,7 +656,7 @@ with the lines each component printed, so the proof is in the repository and not
 terminal. Every name and address below is a placeholder for the real one (`rules/no-real-infrastructure.md`);
 the run log with the real values lives outside the repository. Hashes, claim UIDs, digests
 and request ids are as printed. So are timestamps: these runs wrote them as
-`2026-11-15 16:46:49 UTC`; a build after the move from chrono to jiff (after v0.2.10)
+`2026-11-15 16:46:49 UTC`; a build after the move from chrono to jiff (v0.3.0 and later)
 prints RFC 3339, `2026-11-15T16:46:49Z`, and the CLI `expires 2026-11-16T00:36:32.975Z`.
 
 The environment, for all four runs: one cluster (banlieue v0.5.0, then v0.5.1 the same
@@ -1149,4 +1149,4 @@ Run on the dev cluster with broker, gateways and pool on v0.2.9 (hostnames and i
 
 **Offline, in `make check` (563 tests):** the max-TTL rule (a parked credential never outlives the claim's TTL; the 15-second sweep of expired envelopes; a released claim's envelope deleted, not blanked), the Keychain item's claim-TTL limit, the placed-registry pull (no credential, a `401` is an error, a redirect is refused), the pull listener (one host, placed routes only, loopback), and the admission refusal of an image on a placed registry that does not name its audience.
 
-**Not proven live, and so not claimed:** the placed-registry pull (ADR-0043) end to end, which needs a release carrying it, the registry as an audience, its host as the gateways' inject upstream (`INJECT_HOST`, `INJECT_DOMAIN`) with the firewall allowance, and a pool image with the new guest; a connect attempt from the jail to the pull port (so far only the absence of a rule shows it); the streaming of a large layer through the inject listener's timeouts; SSH-key authentication for git (needs its own ADR); and the exact-expiry spike (roadmap 14: today the sweep is every 15 seconds).
+**Not proven live, and so not claimed:** the placed-registry pull (ADR-0043) end to end, which needs v0.2.10 or later deployed, the registry as an audience, its host as the gateways' inject upstream (`INJECT_HOST`, `INJECT_DOMAIN`) with the firewall allowance, and a pool image with the new guest; a connect attempt from the jail to the pull port (so far only the absence of a rule shows it); the streaming of a large layer through the inject listener's timeouts; SSH-key authentication for git (needs its own ADR); and the exact-expiry spike (roadmap 14: today the sweep is every 15 seconds).
