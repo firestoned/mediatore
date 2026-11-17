@@ -30,6 +30,8 @@ uuid.workspace = true
 chrono.workspace = true
 sha2.workspace = true
 hex.workspace = true
+# Redaction (ADR-0045 decision 2): the base64 forms of a secret the jail was given.
+base64.workspace = true
 tar.workspace = true
 flate2.workspace = true
 anyhow.workspace = true
