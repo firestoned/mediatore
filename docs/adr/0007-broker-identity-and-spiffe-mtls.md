@@ -3,9 +3,17 @@
 
 # ADR-0007: Broker identity from the Workload API over the SPIFFE CSI driver; the sandbox listener terminates SPIFFE mTLS in-process
 
-**Status:** Accepted · **Date:** 2026-10-10 · **Accepted:** 2026-10-11 · **Amended:** 2026-10-13
+**Status:** Implemented · **Date:** 2026-10-10 · **Accepted:** 2026-10-11 ·
+**Implemented:** 2026-10-13 (roadmap 01: `crates/mediatore-tls`,
+`crates/mediatore/tests/e2e_mtls.rs`, `make kind-e2e-mtls`) · **Amended:** 2026-10-13
 (TLS layer: `mediatore-tls` instead of `spiffe-rustls`; decisions 2, 5, 6 and 8, see the
-amendment note) · **Amended:** 2026-11-03 by
+amendment note) · **Amended:** 2026-10-15 by
+[ADR-0014](0014-one-binary-roles-as-subcommands.md) decision 5 (decision 5: `sandbox-token`
+is `mediatore token`, the one binary bind-mounted into the jail) · **Amended:** 2026-10-30
+by [ADR-0025](0025-phantom-token-egress-proxy.md) decision 5 (decision 5: the Workload API
+socket is no longer mounted into the jail; the claim SVID is held by the egress proxy
+beside the jail) and [ADR-0027](0027-control-plane-relay-on-the-egress-gateway.md)
+decision 7 (the claim SVID's TTL is at most 15 minutes) · **Amended:** 2026-11-03 by
 [ADR-0028](0028-egress-gateway-envoy-with-spiffe-identity.md) decision 4 (decision 2: the
 sandbox listener's authorizer admits the gateway identity `spiffe://<td>/gateway`, exactly
 that id, beside node and claim identities; it reaches its own route and nothing else)
@@ -155,6 +163,14 @@ point them at another broker). SNI and hostnames carry no trust. Both binaries h
 `--dev-spiffe-id` path only under a `dev` cargo feature that `make e2e` enables and the
 release build does not.
 
+*Amended 2026-10-15 by [ADR-0014](0014-one-binary-roles-as-subcommands.md) and 2026-10-30
+by [ADR-0025](0025-phantom-token-egress-proxy.md) decision 5:* `sandbox-token` is
+`mediatore token`, the one binary bind-mounted read-only into the jail. The agent socket is
+no longer in `JailSpec`: the claim SVID is held by the egress proxy beside the jail, the
+jail reaches the proxy's loopback port and nothing else, and `SPIFFE_ENDPOINT_SOCKET` and
+`MEDIATORE_URL` are absent from its environment (pinned in
+`crates/mediatore-guest/src/jail.rs`).
+
 ```mermaid
 sequenceDiagram
   autonumber
@@ -199,7 +215,9 @@ the day SPIRE issues them nothing here changes. That residue is threat-model R-8
 pods: ingress to 8443 from the sandbox segment's CIDR only and to 8080 from the ingress
 controller only; egress to the API server, the IdP's discovery and token endpoints, and
 nothing else. The Workload API is a socket, not a network path, so no egress rule is needed
-for it. The manifest is deployment-specific (CIDRs) and lands with roadmap 02.
+for it. The manifest is deployment-specific (CIDRs) and lands with roadmap 02. (Landed:
+`deploy/overlays/homelab-example/networkpolicy.yaml`, with RFC 5737 placeholders for the
+CIDRs.)
 
 **8. Tests.** `mediatore-testkit` gains a test CA (`TestCa`) that mints SPIFFE-shaped X.509
 SVIDs (URI SAN, short TTL) and an in-memory, rotatable `MaterialSource`, so the e2e suite
@@ -209,8 +227,8 @@ another trust domain, a `/mediatore` peer calling the sandbox API, an expired SV
 CA-shaped leaf, a node SVID calling `/v1/token`, the dev header on an mTLS connection
 (ignored) and outside `dev_mode` (refused), a server whose SPIFFE ID is not the broker's,
 and a rotation that new handshakes must pick up. The fake is never more permissive than
-the real thing (`rules/testing.md`): only the certificates differ between the suite and
-production, never the verification path. The kind tier (`make kind-e2e-mtls`,
+the real thing (`.claude/rules/testing.md`): only the certificates differ between the
+suite and production, never the verification path. The kind tier (`make kind-e2e-mtls`,
 `dev/kind/mtls-e2e.sh`, landed 2026-10-13) runs the broker image from `deploy/base` on
 the CSI driver's socket and four client pods whose SVIDs a real agent issued: a claim, a
 node, an identity outside `/banlieue/` and a second pod holding the broker's own ID. The
@@ -226,7 +244,7 @@ SVIDs.
 | VM / jail → sandbox API | Dev header injected from the network | S | Header read only under `dev_mode`; `dev_mode` refused unless the listener is loopback (decision 3) |
 | VM / jail → sandbox API | Broker impersonated to a guest (rogue listener on the segment) | S | Guests accept only `spiffe://<td>/mediatore`, verified against the bundle the VM agent delivered (decision 5); no hostname trust |
 | VM / jail → sandbox API | Harvest-now-decrypt-later on issued tokens in flight | I | X25519MLKEM768 via `aws-lc-rs` (decision 6) |
-| VM / jail → sandbox API | Revoked claim's SVID still valid for its TTL | E | Entry deleted on release (ADR-0006); store refuses `/v1/token` for a revoked claim immediately (existing `is_live`); claim SVID TTL 1 h bounds an offline agent |
+| VM / jail → sandbox API | Revoked claim's SVID still valid for its TTL | E | Entry deleted on release (ADR-0006); store refuses `/v1/token` for a revoked claim immediately (existing `is_live`); claim SVID TTL 1 h bounds an offline agent (amended 2026-10-30 by ADR-0027 decision 7: at most 15 minutes) |
 | pod → agent socket (new) | Another pod obtains the broker SVID | S/E | Agent attests the caller by pod via a kubelet whose certificate it verifies; `ClusterSPIFFEID` requires ns, label, SA and container name; creating a pod with SA `mediatore` in `banlieue-system` is RBAC-gated (deployment; cluster admin trusted, §9) |
 | pod → agent socket | Broker SVID or key read from disk | I | Never on disk: in-memory `X509Source`; read-only root filesystem; no sidecar (decision 1) |
 | node → pod (CSI) | CSI driver or agent compromised on a node | E | Same tier as the kubelet, which already holds every pod's SA token on that node: no new authority; both DaemonSets come from the hardened chart (deployment) |

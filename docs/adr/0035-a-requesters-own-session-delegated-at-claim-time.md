@@ -3,7 +3,13 @@
 
 # ADR-0035: A requester's own upstream session, delegated at claim time and placed by the proxy
 
-**Status:** Accepted · **Date:** 2026-11-10 (accepted the same day)
+**Status:** Accepted 2026-11-10; phase 1 implemented and live (`Backend::Delegated`, the `Delegation` in the claim body, `examples/claude-code`; `docs/guides/testing.md` run 8); phases 2 and 3 not built (a pending delegation is refused `501 not_implemented`, `crates/mediatore-api/src/lib.rs`; no `DelegationEnvelope`, no `PUT`, no `GET /v1/delegations`, no refresh) · **Date:** 2026-11-10 (accepted the same day) · **Amended:** 2026-11-15 by
+[ADR-0040](0040-the-gateway-places-an-audiences-credential-the-pool-never-holds-it.md)
+(decision 4: for an audience with `inject: gateway` the opened envelope goes to the gateway's
+authorizer, not the guest's proxy); 2026-11-16 by
+[ADR-0043](0043-a-persons-registry-credential-is-placed-at-the-gateway-the-vm-never-sees-it.md)
+(decision 3: the Secret is deleted at release, not emptied, and the envelope's expiry is
+bounded by the claim's TTL)
 
 Roadmap 12 (the path to the Anthropic API) and roadmap 04 (the backends). Adds a fourth
 backend to [ADR-0003](0003-token-backends.md), beside `entra-obo`, `sts` and `secret`,
@@ -98,8 +104,11 @@ one to another workload is the operator's misuse, not a thing the broker can tel
 3. **Sealed like the issuer's session, one envelope per delegation; sealed on the
    requester's machine when the sealer is transit.** Each delegation ends up as a `Sealed`
    envelope bound to the sandbox's UID and parked in its own Secret,
-   `mediatore-session-<sandbox uid>-<audience>`, labelled `mediatore.io/sandbox-uid`,
-   `mediatore.io/session` and `mediatore.io/audience`, owned by the `AgentSandbox` as the
+   `mediatore-session-<sandbox uid>-<audience>` (as built, the audience part is the first 16
+   hex characters of the audience's SHA-256, `delegation_name` in
+   `crates/mediatore-claims/src/kubestore.rs`; the label carries the name), labelled
+   `mediatore.io/sandbox-uid`, `mediatore.io/session` and `mediatore.io/audience`, owned by
+   the `AgentSandbox` as the
    issuer's session Secret is (ADR-0034 decision 2), claimed by the reconciler with the
    record, emptied on release and revocation, deleted by the retention sweep. The record
    type has no plaintext field; nothing of it is logged beyond the audience and the expiry.
@@ -124,12 +133,26 @@ one to another workload is the operator's misuse, not a thing the broker can tel
      address, mount and key), so the CLI needs no configuration of its own; `GET` is open
      to any logged-in requester and reveals no secret.
 
+   *Amended 2026-11-16 by
+   [ADR-0043](0043-a-persons-registry-credential-is-placed-at-the-gateway-the-vm-never-sees-it.md)
+   (decision 4): the Secret is deleted at release, not emptied (the released marker is the
+   `AgentSandbox` status record), and the envelope's `expires_at` is bounded by the claim's
+   creation plus its `ttl_seconds` (`parked_expiry`, `crates/mediatore-api/src/lib.rs`), swept
+   every 15 seconds. The transit shape (the CLI sealing, `GET /v1/delegations`) is not built:
+   a pending delegation is refused.*
+
 4. **`POST /v1/token` opens the envelope and the proxy places it.** For a `delegated`
    audience the response is the delegated bearer, `header` and `extra_headers` as
    configured, `expires_at` the earlier of the delegation's own expiry and the claim's
    deadline; the proxy keeps it for at most `max_ttl` (ADR-0025) and asks again. Revocation
    empties the envelope and every later ask is `403 claim_revoked`, as for any backend;
    the upstream session itself is the person's to end.
+
+   *Amended 2026-11-15 by
+   [ADR-0040](0040-the-gateway-places-an-audiences-credential-the-pool-never-holds-it.md)
+   (decision 4): for an audience with `inject: gateway` the envelope is opened for the
+   gateway's authorizer, over the gateway-only credential route, and the gateway places it;
+   the guest's proxy forwards the phantom and never sees the credential.*
 
 5. **Refresh is configured, never assumed (phase 2).** When the delegation carries a
    `refresh_token` and the audience declares
@@ -202,7 +225,7 @@ one to another workload is the operator's misuse, not a thing the broker can tel
 
 - `crates/mediatore-proto`: `ClaimRequest.delegations: Vec<Delegation>`
   (`audience`, `token: Option<Secret>`, `refresh_token: Option<Secret>`,
-  `expires_at: Option<DateTime>`, `pending: bool`), `ClaimResponse.sandbox_uid`,
+  `expires_at: Option<Timestamp>` (jiff's), `pending: bool`), `ClaimResponse.sandbox_uid`,
   `DelegationEnvelope` for the `PUT` (`key_id`, `ciphertext`, `expires_at`), the
   `GET /v1/delegations` answer (the sealer kind, the OpenBao address, mount and key);
   `TokenResponse` unchanged (ADR-0032 already carries `header` and `extra_headers`).

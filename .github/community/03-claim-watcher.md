@@ -9,8 +9,8 @@ Decisions: [ADR-0011](../../docs/adr/0011-claim-watcher.md) (2026-10-13).
 
 - [x] `banlieue-api` pinned in `[workspace.dependencies]` by commit (banlieue PR #98,
       2026-10-13: the crate on kube's `derive` feature only, so `ring` stays out of this
-      graph; re-pin to the merge commit, then to a tag when banlieue cuts one). Schema
-      drift is a compile error (ADR-0002)
+      graph; re-pin to the merge commit, then to a tag when banlieue cuts one; the pin is
+      the `v0.5.9` tag since ADR-0044). Schema drift is a compile error (ADR-0002)
 - [x] kube-runtime `Controller` on `VirtualMachineClaim` (managed-by label) driving
       `Reconciler::{bind,release}` (`crates/mediatore-claims/src/watch.rs`); the claim
       UID is the object's `metadata.uid`
@@ -37,5 +37,6 @@ Decisions: [ADR-0011](../../docs/adr/0011-claim-watcher.md) (2026-10-13).
 - [x] banlieue side: revise ADR-0049 (SPIRE attestation supersedes quote-over-nonce;
       retire `status.nonce`): tracked here, done in banlieue #142 (v0.4.14, 2026-11-07);
       the controller no longer mints the nonce and the field is deprecated, never set.
-      mediatore never read it; the pin moved to the v0.4.14 tag in the same change
+      mediatore never read it; the pin moved to the v0.4.14 tag in the same change (and
+      to v0.5.9 with ADR-0044)
 - [x] Threat model pass (2026-10-13): TB-2 gains five rows, TB-4 one; stamp to ADR-0011

@@ -3,7 +3,7 @@
 
 # ADR-0008: AgentSandbox is a mediatore CRD, reconciled by mediatore
 
-**Status:** Accepted · **Date:** 2026-10-12 · **Accepted:** 2026-10-14 · **Amended:** 2026-11-09 (decision 8, `spec.workload.restart`, [ADR-0033](0033-a-one-shot-workload-the-restart-policy-and-the-claim-released-when-it-is-done.md)); 2026-11-16 (decision 7, `spec.poolRef` optional beside `spec.poolSelector`, exactly one, and `status.poolRef` the pool bound from, [ADR-0044](0044-a-sandbox-selects-its-pool-by-label.md)); 2026-11-17 (the Namespace paragraph, the claim's namespace chosen from the caller's groups, [ADR-0046](0046-who-may-claim-a-list-of-groups-and-a-namespace-to-groups-mapping.md))
+**Status:** Implemented · **Date:** 2026-10-12 · **Accepted:** 2026-10-14 · **Implemented:** 2026-10-14 (roadmap 08; the implementation notes below) · **Amended:** 2026-11-01 (a new optional, immutable `spec.policyRef`, [ADR-0026](0026-notaio-bundles-verified-in-shadow.md) decision 6); 2026-11-09 (decision 8, `spec.workload.restart`, [ADR-0033](0033-a-one-shot-workload-the-restart-policy-and-the-claim-released-when-it-is-done.md)); 2026-11-09 (decision 12, the store: the claim record is `status.record` on the `AgentSandbox`, sessions are Secrets and nodes are `SandboxNode` resources, no tables, [ADR-0034](0034-the-kubernetes-api-as-the-brokers-store.md)); 2026-11-10 (a delegation per audience on the request and the `DelegationsPending` condition, [ADR-0035](0035-a-requesters-own-session-delegated-at-claim-time.md)); 2026-11-16 (decision 7, `spec.poolRef` optional beside `spec.poolSelector`, exactly one, and `status.poolRef` the pool bound from, [ADR-0044](0044-a-sandbox-selects-its-pool-by-label.md)); 2026-11-17 (the Namespace paragraph, the claim's namespace chosen from the caller's groups, [ADR-0046](0046-who-may-claim-a-list-of-groups-and-a-namespace-to-groups-mapping.md))
 
 Supersedes banlieue
 [ADR-0055](https://github.com/firestoned/banlieue/blob/main/docs/adr/0055-agentsandbox.md)
@@ -184,7 +184,10 @@ What roadmap 08 fixed within the decisions above, so a reader of the code finds 
 - **Status** carries `phase` (mirrored from the claim: `Pending`, `Bound`, `Releasing`,
   `Failed`), `claimRef`, `claimUid`, `virtualMachineRef`, `addresses`, `boundAt`,
   `expiresAt`, `entrySet`, `ready` (decision 11), `reason` and `observedGeneration`. The
-  user API's `ClaimResponse` gains `ready`.
+  user API's `ClaimResponse` gains `ready`. (Since then: `record`, the claim record the
+  store writes, ADR-0034 decision 1, 2026-11-09; and `conditions`, `PolicyConformant` from
+  ADR-0026 decision 7 and `DelegationsPending` from ADR-0035;
+  `crates/mediatore-claims/src/sandbox.rs`.)
 - **Namespace.** `POST /v1/claims` creates the resource in `sandboxes.namespace` from
   `mediatore.yaml`; the pool it names must live there, since `poolRef` is a same-namespace
   reference on the claim. *Amended by [ADR-0046](0046-who-may-claim-a-list-of-groups-and-a-namespace-to-groups-mapping.md) (2026-11-17):* with `sandboxes.namespaces` set,

@@ -4,8 +4,8 @@
 # ADR-0046: Who may claim: a list of groups, and a mapping from namespaces to groups
 
 **Status:** Accepted 2026-11-17 (the seven open questions were answered by the maintainer the same day; their answers are
-folded into decisions 3, 4, 5, 14, 16 and 17 and listed at the end); implemented in the branch
-`feat/adr-0046-claim-groups`, not yet released · **Date:** 2026-11-17
+folded into decisions 3, 4, 5, 14, 16 and 17 and listed at the end); implemented on `main` (#129),
+not yet released (v0.2.10 predates it) · **Date:** 2026-11-17
 
 Roadmap 08 (the `AgentSandbox` CRD) and roadmap 04 (issuer profiles). Amends
 [ADR-0017](0017-issuer-profiles.md) (the issuer's `required_group`),
@@ -162,7 +162,8 @@ What is already true and this ADR builds on (verified in the source):
    to `sandbox.metadata.namespace` (replacing `st.sandbox_namespace` there). A malformed name (not an
    RFC 1123 label) is `400 invalid_namespace` before any lookup: it depends on the string alone, so
    it says nothing about which namespaces exist. Control: a `resolve_namespace(&NamespaceMap,
-   requested: Option<&str>, groups: &[String]) -> Result<&str, Denied>` in
+   requested: Option<&str>, groups: &[String]) -> Result<&str, Denied>` (as built:
+   `Namespaces::resolve_for_create`, returning `NsDenied`) in
    `crates/mediatore-api/src/lib.rs`, called by `create_claim` before the session is parked and
    before anything is written. Tests: `omitting_namespace_without_a_map_targets_the_single_namespace`,
    `omitting_namespace_with_a_map_is_400_namespace_required`,
@@ -211,7 +212,8 @@ What is already true and this ADR builds on (verified in the source):
    namespace and the text names that one. The same status, code and
    text for a namespace that is not in the map and for one the caller does not qualify for, so the
    response is no oracle for which namespaces exist. It never lists the other namespaces, the groups
-   a namespace requires, or the groups the caller holds. Control: one `Denied` type, one rendering,
+   a namespace requires, or the groups the caller holds. Control: one `Denied` type (as built,
+   `NsDenied`; reads and deletes go through `Namespaces::authorise_existing`), one rendering,
    in `crates/mediatore-api/src/lib.rs`. Tests:
    `the_403_for_an_unlisted_namespace_equals_the_403_for_an_unqualified_one` (status and body byte
    equal) and `the_403_body_contains_no_group_and_no_other_namespace`.
@@ -265,23 +267,28 @@ What is already true and this ADR builds on (verified in the source):
 
 9. **The record carries its namespace.** `ClaimRecord` (`crates/mediatore-store`) gains
    `namespace: String`, `#[serde(default = ...)]` to the broker's `sandboxes.namespace` (the single
-   namespace) for a record written before; **an operator who moves to the map lists that namespace
-   in it**, or those records answer `404` (no default exists once the map is set, decision 3). Put
+   namespace) for a record written before (as built, the default is the constant
+   `FALLBACK_NAMESPACE`, `"sandboxes"`, `crates/mediatore-store/src/lib.rs`); **an operator who
+   moves to the map lists that namespace in it**, or those records answer `404` (no default exists
+   once the map is set, decision 3). Put
    plainly: a claim created before the move to the map is unreachable (`404`) unless the operator
    lists its old namespace in the map
    (ADR-0034: the record is rebuilt from the `AgentSandbox` resource and its status, so the
    truth is the resource's `metadata.namespace`; the field is its copy for the paths that hold a
    record and not a resource: `exit`, `report`, `get_claim_by_name` in `dev_mode`). `ClaimResponse`
-   gains `namespace`, always present. The store trait is otherwise unchanged and `ClaimRecord` stays
-   a Rust-side contract, not a CRD schema change: no `AgentSandbox` spec or status field is added and
+   gains `namespace`, always present (an `Option<String>` on the wire, `crates/mediatore-proto`,
+   so an older broker's answer still parses; a current broker always sets it). The store trait is
+   otherwise unchanged and `ClaimRecord` stays a Rust-side contract, not a CRD schema change: no
+   `AgentSandbox` spec or status field is added and
    banlieue is untouched. `get_claim_by_name` becomes `get_claim_by_name(namespace, name)` for the
    dev store, so a name in one namespace cannot return another's record. The session and delegation
    Secrets stay in the broker's home namespace, keyed by the sandbox UID as now; for a sandbox in
    another namespace they carry no owner reference (`owner_refs`), so their removal on release is the
    explicit path and the sweep, not Kubernetes garbage collection. Tests:
-   `a_record_without_a_namespace_reads_as_the_default`, `the_dev_store_keys_a_claim_by_namespace_and_name`,
+   `an_old_claim_record_reads_as_the_fallback_namespace`, `a_name_in_one_namespace_is_not_found_in_another`
+   (the store conformance suite),
    `releasing_a_claim_in_a_tenant_namespace_deletes_its_session_and_delegation_secrets` (the
-   `kubestore` fake), `a_response_carries_the_namespace`.
+   `kubestore` fake), `a_claim_response_carries_its_namespace` (`crates/mediatore-proto`).
 
 10. **RBAC: the `ClusterRole` stays; a new tenant namespace needs no new grant for the
     broker.** The grants the code needs are already cluster-wide (`deploy/base/rbac.yaml`) because
@@ -312,7 +319,7 @@ What is already true and this ADR builds on (verified in the source):
 
 12. **`dev_mode`.** The map and the checks apply in `dev_mode` the same way: the dev token's
     groups (the testkit's fake IdP issues them) are checked against the namespace's groups, so a dev
-    run does not skip the control it exists to exercise (`rules/testing.md`: a fake more permissive
+    run does not skip the control it exists to exercise (`.claude/rules/testing.md`: a fake more permissive
     than the real thing hides bugs). The dev store has no resources and records the namespace on the
     record (decision 9). Nothing reads a namespace, a group or an identity from a header; the
     existing gate on the header-driven peer identity (`dev_mode` only) is untouched and no new
@@ -324,12 +331,12 @@ What is already true and this ADR builds on (verified in the source):
     group the caller matched (a configuration value, not a claim of the caller's). A denial logs
     the subject, the namespace and `denied`; it does not log the caller's group list. Reads and
     deletes keep their lines and gain the namespace. Never a token, a refresh token or a header. Tests:
-    `a_create_logs_subject_namespace_and_decision` and `no_log_line_contains_a_token` (the existing
+    `a_create_logs_subject_namespace_and_decision_and_never_a_token` (the two merged into one, the existing
     tracing capture helper).
 
 14. **Validation at start, and the log of what was resolved.** Refused at start, message naming the
     key and the value: `sandboxes.namespaces` present and empty; a key that is not an RFC 1123 label
-    (`is_dns_label` in `config.rs`); a duplicate key (the YAML parse is checked, a duplicate map key
+    (`is_dns_label`, in `crates/mediatore-proto`); a duplicate key (the YAML parse is checked, a duplicate map key
     must not silently take the last); an entry with no `groups` key, an empty `groups`, an empty or
     whitespace-padded group, or a duplicate group inside one entry (the same group in two
     namespaces is allowed: it is how one person belongs to several, and is why decision 4 requires
@@ -366,7 +373,8 @@ What is already true and this ADR builds on (verified in the source):
     nothing and, against a broker with the map, prints the broker's `400 namespace_required`
     message as the error; against a single-namespace broker it says on stderr, one line, which
     namespace the broker used (the response's `namespace`), in the way ADR-0044 decision 3 says the
-    pool default. `sandbox get`, `sandbox delete` and `sandbox logs` (ADR-0045) take `--namespace`
+    pool default. `sandbox get`, `sandbox delete` and `sandbox logs` (ADR-0045; pending, with that
+    ADR, since the command does not exist yet) take `--namespace`
     and send it as `?namespace=`; omitted, nothing is sent (the broker's answer decides, decision 5).
     If a response's `namespace` differs from the flag the user gave, the CLI prints an error naming
     both and exits non-zero (an old broker ignored the field), without deleting anything on its
@@ -574,7 +582,8 @@ Answered by the maintainer on 2026-11-17 and folded into the decisions above.
 - [ ] (open, manual, build host) `make kind-e2e-sandbox` with a second namespace, run by hand before release
   (`.claude/rules/testing.md`; a cluster is needed and the tier is not in CI): `make kind-delete && make kind-e2e-ci KIND_E2E_SUITES=kind-e2e-sandbox`
   (plus the provider and CLI variables the host needs). Not run for this change.
-- [ ] (open) `make check` overall: `cargo fmt`, `clippy` and `cargo test` pass; `cargo deny` advisories fail on
-  RUSTSEC-2026-0543 (`chrono`), which fails on `main` too and is not caused by this change.
+- [x] `make check` overall: `cargo fmt`, `clippy` and `cargo test` pass; `cargo deny` advisories failed on
+  RUSTSEC-2026-0543 (`chrono`), which failed on `main` too and was not caused by this change
+  (cleared 2026-11-17 by #131, chrono replaced with jiff across the workspace).
 - [x] Infrastructure sweep of the diff (`rules/no-real-infrastructure.md`): placeholders only in the
   docs, tests and examples (`rbc-cm:APP_EXAMPLE_ADMIN`, `APP_EXAMPLE_TEAM_A_USER`, `team-a`).

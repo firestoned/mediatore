@@ -12,24 +12,27 @@ from the empty cluster, with every command. The enterprise split (a root on its 
 [a separate guide](enterprise-spire-topology.md); roadmap 02 tracks what is still
 missing for VMs to attest ([`ROADMAPS.md`](https://github.com/firestoned/mediatore/blob/main/ROADMAPS.md)).
 
-Every release attaches what the install needs beside the two images: the binary for Linux
+Every release attaches what the install needs beside the three images (the server, the
+guest and the gateway): the binary for Linux
 (`mediatore-<version>-linux-amd64`, static, every role) and for a Mac
-(`mediatore-<version>-darwin-arm64`, the CLI: `login`, `sandbox`, `session`), `mediatore-<version>.yaml`
-(this `deploy/base` with the server image pinned by digest), the `VMImage` of step 6 pinned to
-the guest image's digest with the two cloud-config layers it names, the SBOMs and
-`checksums.sha256`, each file attested by the Build workflow. Every binary and both images
+(`mediatore-<version>-darwin-arm64`, the CLI: `login`, `logout`, `sandbox`, `session`), `mediatore-<version>.yaml`
+(this `deploy/base` with the server image pinned by digest), the `VMImage`s of step 6 and
+step 7 pinned to the guest and gateway images' digests with the two cloud-config layers
+each names, the SBOMs and
+`checksums.sha256`, each file attested by the Build workflow. Every binary and all three images
 report the release's version (`mediatore --version` prints `mediatore <version>`): the
 workspace version is set from the tag before each build, and the release job refuses a
 binary that says otherwise. An overlay can name the manifest instead of a checkout, and
 every asset verifies offline:
 
 ```sh
-gh release download v0.1.0 --repo firestoned/mediatore --pattern 'mediatore-0.1.0*' --pattern checksums.sha256
+# <version> is the release, v0.2.10 at the time of writing.
+gh release download v<version> --repo firestoned/mediatore --pattern 'mediatore-<version>*' --pattern checksums.sha256
 shasum -a 256 -c checksums.sha256
-gh attestation verify mediatore-0.1.0.yaml --repo firestoned/mediatore
+gh attestation verify mediatore-<version>.yaml --repo firestoned/mediatore
 # kustomization.yaml of your overlay:
 #   resources:
-#     - https://github.com/firestoned/mediatore/releases/download/v0.1.0/mediatore-0.1.0.yaml
+#     - https://github.com/firestoned/mediatore/releases/download/v<version>/mediatore-<version>.yaml
 ```
 
 ## What the cluster must already have
@@ -61,7 +64,8 @@ URL, your CIDRs. Edit:
   enforces for it (`{ method, path }` globs, [ADR-0025](../adr/0025-phantom-token-egress-proxy.md);
   none means every method and path) and, for an audience on a private PKI, the `ca_file`
   the proxy trusts for its endpoints instead of the Mozilla roots (a PEM from a Secret
-  volume, read at start; the homelab overlay mounts one),
+  volume mounted like the STS key, read at start; the example overlay leaves the key
+  commented out),
   `sts.issuer` (what downstream services will see as `iss`), and
   `spire.entries.class_name` if SPIRE was rendered with another namespace or release
   name (the class is `<namespace>-<release name>`, `spire-server-spire` in the example),
@@ -111,7 +115,7 @@ kubectl -n banlieue-system create secret generic mediatore-sealing --from-file=k
 
 Delete the local files afterwards. With the transit sealer ([the store](the-store.md))
 the sealing Secret is not needed; with Entra ([the Entra path](the-entra-path.md)) a
-fourth Secret holds the client credential.
+third Secret holds the client credential.
 
 An audience served from a credential you hold (`via: secret`, [ADR-0032](../adr/0032-operator-held-credentials-as-an-audience-backend.md):
 an API key the upstream issued you, Anthropic's for Claude from inside the sandbox) is one
@@ -140,8 +144,8 @@ The broker fails the start on anything it cannot use, and says which: a key file
 does not parse, an issuer whose discovery document it cannot fetch, a class name the
 controller manager does not serve. What a healthy start logs, in order: the store (the
 Kubernetes API, ADR-0034), the sealing key loaded, each issuer (and `issuer pinned
-to a private CA` when `ca_file` is set), `broker SVID` from the Workload API, the
-listeners, `claim watcher running` on the replica that holds the Lease.
+to a private CA` when `ca_file` is set), the listeners (`listening`), `broker identity
+from the Workload API`, `claim watcher running` on the replica that holds the Lease.
 
 `/healthz` on the user API answers true only while the API server answers the store;
 the Ingress routes to it.
@@ -179,12 +183,12 @@ mediatore sandbox create --mediatore https://mediatore.<tailnet> --pool pool-a \
 Each claim spends the delegated refresh token, so log in again before the next one.
 The sandbox turns `Bound` when banlieue hands it a member and `Ready` once the member
 has registered its node and the entry is set ([requesting a sandbox](requesting-a-sandbox.md)).
-Until pool VMs attest with a TPM (roadmap 02's second half: the server's TPM attestor
-and the guest image), a claim binds and nothing registers, so `ready` stays false and
-the claim fails after `watcher.resolve_timeout_secs`; the API, the issuer, the store,
-the entries and the policies are nonetheless live at that point, which is what this
-page gets you. Once the image carries the guest, the pool's `GuestReady` is the guest's
-own announcement after it registered ([ADR-0019](../adr/0019-guestready-after-attestation-and-registration.md)),
+`ready` turns true once the attested member's guest has registered (step 6). On a pool
+whose members do not attest (no TPM attestor on the server, or an image without the
+guest), a claim binds and nothing registers, so `ready` stays false and the claim
+fails after `watcher.resolve_timeout_secs`; the API, the issuer, the store, the
+entries and the policies are nonetheless live at that point. With the image of step 6
+the pool's `GuestReady` is the guest's own announcement after it registered ([ADR-0019](../adr/0019-guestready-after-attestation-and-registration.md)),
 so a `GuestReady` pool binds only members that can take the claim.
 
 ## 6. Let the VMs attest
@@ -199,7 +203,7 @@ One VM image serves every workload image.
 The VM image is built from this repository ([ADR-0023](../adr/0023-sandbox-vm-image-kairos-derivative.md)): `image/Dockerfile` is a
 Kairos Debian 13 derivative with the guest software in the immutable rootfs (`/usr/bin`,
 never `/usr/local`, which Kairos mounts the persistent partition over), every listener the
-base shipped removed, the `spire` user created, both units enabled and Yama's `ptrace_scope` raised to 1 (`image/sysctl/`). The Build workflow
+base shipped removed, the `spire` user created, the four units (the agent, the guest, the host table, the bundle fetch) enabled and Yama's `ptrace_scope` raised to 1 (`image/sysctl/`). The Build workflow
 publishes it as `ghcr.io/firestoned/mediatore-guest`, signed and attested like the server
 image, on every push and release; `make guest-image` builds it locally and
 `make guest-image-check` proves what it carries. The image holds no trust bundle, no trust
@@ -356,14 +360,15 @@ deployment layer writes `/etc/spire/agent.conf` and the bundle at every boot
 `dist/`, for the record. A VM whose EK certificate chains to no configured host CA never
 becomes an agent, and so never a node.
 
-Both units (`image/systemd/spire-agent.service`, `mediatore-guest.service`) start only
+All four units (`image/systemd/spire-agent.service`, `mediatore-guest.service`,
+`mediatore-host-nft.service`, `spire-bundle-fetch.service`) start only
 when Kairos's installed-disk sentinel exists (`/run/cos/active_mode` or
 `passive_mode`), so the live installer, which boots the same image with the same
 enabled units, never attests with the member's vTPM, registers or announces
 `GuestReady` mid-install ([ADR-0019](../adr/0019-guestready-after-attestation-and-registration.md)).
 The image carries no phase stage of banlieue's: the guest announces after it registered.
-On a non-Kairos image, drop the two `ConditionPathExists` lines or provide the sentinel,
-and take the installer case on yourself.
+On a non-Kairos image, drop the two `ConditionPathExists` lines from each unit or provide
+the sentinel, and take the installer case on yourself.
 
 When a claim binds, the guest loads a ruleset keyed
 by the sandbox user's uid before it starts the jail, and refuses to start the jail
@@ -379,8 +384,8 @@ the proxy, DNS to the VM's resolvers. In both, the rest is logged under
 `mediatore-sandbox drop:` and dropped, and a packet to the proxy's port from any other uid
 is dropped too. The guest's log carries the shape and the ruleset's SHA-256 per claim, and
 `nft list table inet mediatore_sandbox` on the VM shows what is loaded. Root's own egress
-and the input chain are not in that table: those rules come once the image's system users
-are settled (roadmap 06).
+and the input chain are not in that table: they are the host table's (`inet
+mediatore_host`, below), loaded when `/etc/mediatore/gateways` is present.
 
 The guest then starts `mediatore egress-proxy` as the sandbox user, outside the jail, on
 `127.0.0.1:3128` (`--egress-proxy-port`, or `MEDIATORE_EGRESS_PROXY_PORT`, on the guest's
@@ -463,12 +468,13 @@ kind.
 **The image.** `image/gateway/Dockerfile` is the same Kairos derivative as the sandbox
 image with Envoy copied from its official image at the digest the kind tier runs
 (`dev/kind/gateway/kustomization.yaml`), the authorizer (`mediatore gateway`, the one
-binary), the agent and the plugin, `nftables`, and three service users. The Build workflow
+binary), the agent and the plugin, `nftables`, and four service users. The Build workflow
 publishes it as `ghcr.io/firestoned/mediatore-gateway`, signed and attested; `make
 gateway-image` builds it locally and `make gateway-image-check` proves what it carries
-(both Envoys unprivileged with no capability and a read-only root, the relay kept out of
+(all three Envoys unprivileged with no capability and a read-only root, the inject one
+installed but off until a deployment turns it on, the relay kept out of
 `/run/spire`, the host table, no sshd, forwarding off, the examples filling every
-template). Nothing in it is yours: at every unit start `image/gateway/render` fills the two
+template). Nothing in it is yours: at every unit start `image/gateway/render` fills the three
 Envoy bootstraps, the host table and the sandbox interface's networkd file from two env
 files, the deployment's `/etc/mediatore-gateway/env` (`image/gateway/env.example`: the
 trust domain, the sandbox NIC's name and prefix, the ports, the SPIRE server's and the
@@ -603,10 +609,11 @@ mediatore_host` on a member shows it; `make host-table-test` pins the text.
 host of the zone (banlieue ADR-0109 decision 3), the three gateways' `egress` addresses
 allowed to reach the SPIRE server's attestation port, the broker's sandbox listener and the
 audiences' endpoints, and the SPIRE server and the broker admitting those three addresses
-and nothing from the sandbox range (ADR-0027's consequences). The broker's
-`networkpolicy.yaml` already carries the row for the gateways' addresses on `8443`; with
-the relay in place the sandbox segment's own row on `8443` is no longer needed, since no
-sandbox reaches the listener directly any more.
+and nothing from the sandbox range (ADR-0027's consequences). Add an ingress row to the
+broker's `networkpolicy.yaml` for the gateways' `egress` addresses on `8443` (the example
+overlay carries only the sandbox segment's row); with the relay in place the sandbox
+segment's own row on `8443` is no longer needed, since no sandbox reaches the listener
+directly any more.
 
 **What proves it before a VM does.** `make kind-e2e-gateway` runs the data plane end to end
 against a real Envoy on the bootstrap the image renders (`make gateway-render-check` keeps
@@ -635,13 +642,13 @@ audiences:
 
 The broker refuses at start an audience with `inject: gateway` that has no `gateways`, no `gateway_inject_port`, no `egress`, no `rules`, an IP-literal host, a `max_ttl` above 300 or no credential to place. A placed audience's host is removed from the claim's tunnel lists, so the only path to it is the injecting one. `POST /v1/token` for it answers `403 placed_at_gateway`.
 
-**On each gateway**, nothing changes until a deployment turns the third process on: write the two lines of `image/gateway/env.inject.example` into `/etc/mediatore-gateway/env` above the rest (the authorizer endpoint moves to the check socket, and the host table admits the inject port), start the authorizer with `--check-socket`, `--inject-socket` and `--socket-dir-mode 2750` (two setgid directories, one Envoy's group each; there are no owner or group flags), register the third SPIRE entry for `unix:user:envoy-inject` under the gateway's SPIFFE ID, then `systemctl enable --now envoy-inject.service`. The unit validates its bootstrap before every start. This repository's template renders one upstream; a deployment that places several audiences renders its own from the same shape.
+**On each gateway**, nothing changes until a deployment turns the third process on: write the two lines of `image/gateway/env.inject.example` into `/etc/mediatore-gateway/env` above the rest (the authorizer endpoint moves to the check socket, and the host table admits the inject port), start the authorizer with `--check-socket`, `--inject-socket` and `--socket-dir-mode 2750` (two setgid directories, one Envoy's group each, named with `--check-socket-group` and `--inject-socket-group`; `--socket-owner` defaults to the authorizer's own user and `--socket-mode` to `0660`), register the third SPIRE entry for `unix:user:envoy-inject` under the gateway's SPIFFE ID, then `systemctl enable --now envoy-inject.service`. The unit validates its bootstrap before every start. This repository's template renders one upstream; a deployment that places several audiences renders its own from the same shape.
 
 **On each pool VM**, `MEDIATORE_INJECT_PORT` in the guest's env admits the inject port in the host table; the sandbox uid's per-claim table lists it only for a claim with a placed route.
 
 **Operator prerequisites, none of them in this repository** (threat model R-29): the datacenter firewall's allowance for the gateways to reach the audience's host, an OpenBao transit key for `store.sealing.transit` with a policy limited to encrypt and decrypt on it, and the upstream's answer on terms and refresh-token rotation for a delegated session placed from a gateway address. Without the allowance the path fails closed.
 
-**Rollout order and rollback.** Release the broker and authorizer first and confirm the running broker is the new one before editing the config: the configuration does not reject unknown fields, so a broker that predates ADR-0040 ignores `inject: gateway` without a word and keeps the audience in the proxy, which would put the credential on the pool VM. Then roll the gateways, then the pool image, then set `inject: gateway`. To roll back, set the audience back to `inject: proxy` (or remove the line) and restart the broker; the proxy then fetches the credential as before. Stopping `envoy-inject.service` alone fails the placed path closed.
+**Rollout order and rollback.** Release the broker and authorizer first and confirm the running broker is the new one before editing the config: a broker that predates ADR-0040 (before v0.2.7) did not reject unknown fields, so it ignores `inject: gateway` without a word and keeps the audience in the proxy, which would put the credential on the pool VM; a current broker refuses an unknown key at start. Then roll the gateways, then the pool image, then set `inject: gateway`. To roll back, set the audience back to `inject: proxy` (or remove the line) and restart the broker; the proxy then fetches the credential as before. Stopping `envoy-inject.service` alone fails the placed path closed.
 
 ### A person's user name and secret, and a placed registry (ADR-0041, ADR-0043)
 
@@ -662,7 +669,7 @@ audiences:
 
 **A registry as a placed audience.** To pull a person's image with their credential, make the registry's host an audience of this shape (rules `GET` and `HEAD` on `/v2/**`) and list the host under `registries` with `reach: relay`. With `gateways` set, every registry needs a `reach`, and a clean start does not show that: a missing one refuses every claim whose image is on a registry, so **run one claim after any change to the file**. Beyond the broker:
 
-- the registry's exact host is in each gateway's `INJECT_ENDPOINTS` and the datacenter firewall lets the gateways reach it (without the allowance the pull fails closed with a connect timeout);
+- the registry's host is each gateway's inject upstream (`INJECT_HOST` and `INJECT_DOMAIN` in `/etc/mediatore-gateway/env`, or your own inject template when you place several audiences) and the datacenter firewall lets the gateways reach it (without the allowance the pull fails closed with a connect timeout);
 - the pool image carries a guest that has the pull listener (a second loopback port on the claim's egress proxy, `MEDIATORE_EGRESS_PULL_PORT`, default 18129; it must not equal the proxy's own port, and no jail rule lists it, so the workload cannot reach it);
 - the pull is made as root with no credential of its own, and a claim's image on a placed registry must name the registry's audience.
 
@@ -675,7 +682,7 @@ audiences:
 | Direction | Peer | Port | Why |
 | --- | --- | --- | --- |
 | ingress | the sandbox segment | 8443 | the guest and the egress proxy, over SPIFFE mTLS (TB-6); with the control relay in place ([step 7](#7-the-egress-gateways)) this row narrows to the gateways' `egress` addresses below, since no sandbox reaches the listener directly any more |
-| ingress | the gateways' `egress` addresses | 8443 | the gateway's authorizer asking what a claim may reach, over SPIFFE mTLS with the gateway SVID ([ADR-0028](../adr/0028-egress-gateway-envoy-with-spiffe-identity.md) decision 4), and the control relay carrying the pool VMs' own node and claim sessions to the listener ([ADR-0027](../adr/0027-control-plane-relay-on-the-egress-gateway.md) decision 3) |
+| ingress | the gateways' `egress` addresses | 8443 | a row to add (the example overlay does not carry it): the gateway's authorizer asking what a claim may reach, over SPIFFE mTLS with the gateway SVID ([ADR-0028](../adr/0028-egress-gateway-envoy-with-spiffe-identity.md) decision 4), and the control relay carrying the pool VMs' own node and claim sessions to the listener ([ADR-0027](../adr/0027-control-plane-relay-on-the-egress-gateway.md) decision 3) |
 | ingress | the ingress controller's namespace | 8080 | people and their tools, bearer over the ingress's TLS (TB-1) |
 | ingress | the node CIDR | 8080 | the kubelet's readiness probe, where the CNI does not exempt it |
 | egress | kube-dns | 53 | names |

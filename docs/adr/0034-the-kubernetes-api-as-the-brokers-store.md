@@ -3,7 +3,7 @@
 
 # ADR-0034: The Kubernetes API as the broker's store: the resource is the record, no database
 
-**Status:** Implemented · **Date:** 2026-11-09 (accepted, implemented and cut over on the homelab the same day, v0.2.0: `docs/guides/testing.md`, run 6)
+**Status:** Implemented · **Date:** 2026-11-09 (accepted, implemented and cut over on the homelab the same day, v0.2.0: `docs/guides/testing.md`, run 6) · **Amended:** 2026-11-16 by [ADR-0043](0043-a-persons-registry-credential-is-placed-at-the-gateway-the-vm-never-sees-it.md) (decision 2: a delegation's Secret is deleted at release, not emptied, and its envelope expires with the claim's TTL)
 
 Roadmap 05 reopened (the store). Supersedes the engine decisions of
 [ADR-0012](0012-persistent-store.md) (one sqlx query set over SQLite or PostgreSQL, the
@@ -67,6 +67,13 @@ It need not. Every table of ADR-0012 has a natural home in the API:
    the API server treats one that does as absent and collects the dependent. The Secret
    carries the reference when the sandboxes live in the broker's namespace, and the
    retention sweep of decision 4 deletes it with the sandbox either way.)
+
+   *Amended 2026-11-16 by
+   [ADR-0043](0043-a-persons-registry-credential-is-placed-at-the-gateway-the-vm-never-sees-it.md)
+   (decision 4): a delegation's Secret is deleted when the claim is released, not emptied (the
+   released marker is the status record), and its envelope's `expires_at` is bounded by the
+   claim's creation plus its `ttl_seconds`, swept every 15 seconds
+   (`crates/mediatore-claims/src/watch.rs`). The issuer's own session is unchanged.*
 
 3. **`SandboxNode` and `PolicyFloor`, two CRDs in the broker's namespace.** `SandboxNode`
    is named by the EK hash and holds what `nodes` held: the node's SPIFFE ID, the DMI UUID

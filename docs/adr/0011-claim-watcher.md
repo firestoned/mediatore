@@ -3,7 +3,9 @@
 
 # ADR-0011: The claim watcher binds and releases on `VirtualMachineClaim` events, resolves the node by its EK, and runs on one leader
 
-**Status:** Accepted · **Date:** 2026-10-13
+**Status:** Implemented · **Date:** 2026-10-13 · **Implemented:** 2026-10-13 (roadmap 03:
+the watcher on the `mediatore-watcher` Lease, `crates/mediatore/src/main.rs` and
+`crates/mediatore-claims`; the roadmap closed 2026-11-07)
 
 Roadmap 03. Builds on [ADR-0002](0002-separate-project-from-banlieue.md) (banlieue's
 types are a pinned dependency), [ADR-0004](0004-spiffe-identity-scheme.md) (the claim and
@@ -92,7 +94,8 @@ API stays stateless and runs on every replica.
 makes the crate depend on kube's `derive` feature only: with kube's default features it
 dragged the `ring` provider into this graph and `cargo deny` refused it; the pin moves to
 the merge commit, then to a tag when banlieue cuts a release with `VirtualMachineClaim`;
-on the `v0.4.14` tag since 2026-11-07), so schema drift is a compile error (ADR-0002). `cargo deny` already allows that one git source. The watcher runs only
+on the `v0.4.14` tag since 2026-11-07, on `v0.5.9` since 2026-11-16 with ADR-0044; the pin
+is in `Cargo.toml`), so schema drift is a compile error (ADR-0002). `cargo deny` already allows that one git source. The watcher runs only
 outside `dev_mode`; under `dev_mode` the dev binder is unchanged and the dev loop needs no
 cluster.
 
@@ -117,7 +120,9 @@ cluster.
   order; the dev binder survives only under `dev_mode`.
 - Until ADR-0008 lands, nothing outside `dev_mode` creates store records, so the watcher
   binds nothing in production yet; the node-entry trigger and the leader election are live
-  from this ADR on. The kind tier proves those two against a real cluster.
+  from this ADR on. The kind tier proves those two against a real cluster. (Resolved
+  2026-10-14: ADR-0008's reconciler writes the record before the claim exists, and the
+  watcher binds from it.)
 - The roadmap's DMI route is dropped, not deferred: `NodeRecord.dmi_uuid` stays for audit
   and for the cloned-TPM check (two registrations of one EK with different DMI UUIDs are
   refused, threat model TB-4), not for resolution.

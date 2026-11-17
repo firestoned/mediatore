@@ -153,5 +153,5 @@ rules, and the design below states which rules, in how many independent places.
   name; the table carries the address.
 - **Listening on 443 so the image reference needs no mapping.** A listener below 1024 needs a
   capability or a host-wide change to the unprivileged port range on a gateway whose relay has
-  none by design (ADR-0023 decision 8); the mapping in the guest costs nothing on the gateway.
+  none by design (ADR-0028 decision 8); the mapping in the guest costs nothing on the gateway.
 - **A pull window.** Deferred, decision 8.

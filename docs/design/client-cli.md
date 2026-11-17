@@ -25,10 +25,12 @@ delegation available`).
 | Command | Does |
 | --- | --- |
 | `sandbox create` | `POST /v1/claims` with the ID token as the bearer; prints the sandbox's name and phase (`--json` for the whole answer) |
-| `sandbox get <name>` | `GET /v1/claims/{name}`: the phase, readiness, deadline, the guest's report (the image digest, the ruleset's hash) and the workload's exit |
-| `sandbox delete <name>` | `DELETE /v1/claims/{name}` |
+| `sandbox get <name>` | `GET /v1/claims/{name}` (`--namespace` adds `?namespace=`, ADR-0046): the phase, readiness, deadline, the guest's report (the image digest, the ruleset's hash) and the workload's exit |
+| `sandbox delete <name>` | `DELETE /v1/claims/{name}` (`--namespace` as for `get`) |
 
-`create` takes the request's fields as flags: `--pool`, `--ttl` (seconds), `--audience` (repeatable), `--image`, `--arg`
+`create` takes the request's fields as flags: `--namespace` (the namespace to claim in, ADR-0046; a broker with a
+namespace map requires it), `--pool` (one pool by name) or `--pool-selector key=value` (repeatable, all must match;
+neither means every pool in the namespace, ADR-0044), `--ttl` (seconds), `--audience` (repeatable), `--image`, `--arg`
 (repeatable, the workload's argv; use `--arg=-c` for a value that starts with a dash), `--policy` (a notaio policy by
 name), `--restart` (`always`, the default, `on-failure` or `never`), and `--delegate` (below). `--mediatore` is the broker's URL and
 `--ca-file` a CA for a broker behind a private PKI (`MEDIATORE_CA_FILE`).

@@ -21,7 +21,7 @@ adds another when its successor registers. Nothing deleted one: the store interf
 no owner reference and no finalizer, and ADR-0034 decision 3 says only that it "holds what
 `nodes` held", a table that was never pruned either. A homelab pool recreated a few times
 and used for a handful of claims held twenty-five records for three VMs after five hours
-(testing log T-54, F-36). With one-shot claims, which end their VM, the register grows by
+(the deployment's testing log, T-54, F-36). With one-shot claims, which end their VM, the register grows by
 one object per claim without bound.
 
 It is not a binding hazard: a claim binds to a live VM through that VM's published
@@ -97,7 +97,8 @@ built so that does not happen to a node whose VM exists.
   with a new `registeredAt`: the record is a cache of what attestation proved, not the
   proof.
 - No RBAC change: the broker's ClusterRole already has `delete` on `sandboxnodes`. The code
-  needs a release (the live broker predates it).
+  needs a release (the live broker predates it). (Released in v0.2.5; the live proof is
+  roadmap 05's.)
 - A ban on a node whose VM is gone stays until an operator deletes it: the safe side of a
   security record, noisier than the alternative, and visible as `BANNED true`.
 

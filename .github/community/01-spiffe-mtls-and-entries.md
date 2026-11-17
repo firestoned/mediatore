@@ -23,11 +23,13 @@ Design (decided 2026-10-10, no gRPC anywhere in mediatore's own code):
   memory only, PSS `restricted`); the sandbox listener terminates SPIFFE mTLS in-process
   with `spiffe-rustls` on `aws-lc-rs`; guests verify the broker by SPIFFE ID.
 
-Stack: `spiffe` 0.18 (`x509-source`: the Workload API client, SPIFFE ID and SVID
-parsing; Apache-2.0) and the in-repo `mediatore-tls` crate for the rustls verifiers over
-it (ADR-0007 as amended 2026-10-13: `spiffe-rustls` only accepts a live `X509Source`,
+Stack: `spiffe` 0.19 (0.18 when this was built; `x509-source`: the Workload API client,
+SPIFFE ID and SVID parsing; Apache-2.0) and the in-repo `mediatore-tls` crate for the
+rustls verifiers over it (ADR-0007 as amended 2026-10-13: `spiffe-rustls` only accepts a live `X509Source`,
 which would have put a fake Workload API, so gRPC, into the hermetic suite). `kube-rs`
-(already a dependency) for the entries. No `tonic`/`prost` of our own, no vendored protos.
+(already a dependency) for the entries. No `tonic`/`prost` of our own, no vendored protos
+(the one exception since ADR-0028, roadmap 10: the gateway's authorizer answers Envoy's
+check over gRPC with `tonic` and `envoy-types`).
 
 ## Design (done)
 
@@ -49,8 +51,9 @@ which would have put a fake Workload API, so gRPC, into the hermetic suite). `ku
       thing and remembers declarations so tests can assert retraction
 - [x] `KubeEntryManager` (`crates/mediatore-spire/src/kube.rs`): deterministic names,
       labels, `className` from `spire.entries.class_name`, 409 tolerated, 403 surfaced as
-      `Denied`; waits for `status.set && !masked` by polling (`poll_interval_ms`, default
-      500 ms) with `ready_timeout_secs` (default 30 s); `masked` fails the claim; inputs
+      `Denied`; waits for `status.set && !masked` with a watch bounded by
+      `ready_timeout_secs` (default 30 s; a poll on `poll_interval_ms` at first, turned
+      into the watch by ADR-0006 decision 5, below); `masked` fails the claim; inputs
       that admission would refuse are refused before any request
 - [x] EK hash from PEM (`mediatore_proto::ek`): certificate parsed, SubjectPublicKeyInfo
       DER-encoded, hex SHA-256; `ek_hash_from_pems` picks the RSA EK among what banlieue
@@ -101,7 +104,8 @@ which would have put a fake Workload API, so gRPC, into the hermetic suite). `ku
       rebuilt on every rotation of the source
 - [x] `Config::load` refuses `dev_mode: true` unless `listen.sandbox` is a literal loopback
       address
-- [x] `mediatore-guest` and `sandbox-token`: client configs from their agent socket, the
+- [x] `mediatore-guest` and `sandbox-token` (since ADR-0014 the `guest` and `token` roles of
+      the one binary): client configs from their agent socket, the
       server accepted only as `spiffe://<td>/mediatore` (derived from their own SVID's trust
       domain, no flag); `--dev-spiffe-id` behind a `dev` cargo feature that `make e2e`
       enables and release builds do not

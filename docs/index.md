@@ -14,14 +14,18 @@ banlieue schedules VMs and hands them out through `VirtualMachineClaim`s, but de
 carries no credential: a claim records *who* a sandbox is for, and stops there. mediatore is
 the component that finishes the story.
 
-- **Front door.** Accepts an Entra ID token (or a Dex-bridged GitHub login in a homelab),
-  validates it, and creates the `VirtualMachineClaim` with the subject taken from the token.
+- **Front door.** Accepts a token from an issuer it trusts (Entra ID at work; Google, Auth0
+  or a Dex-bridged GitHub login in a homelab), validates it, and creates an `AgentSandbox`
+  with the subject taken from the token; its reconciler creates the `VirtualMachineClaim`.
 - **Binding.** When the claim binds to a pool member that has already attested its vTPM to
   SPIRE, mediatore registers a SPIFFE identity for that claim, scoped to that VM and to the
   per-subject Linux user the in-guest agent creates.
-- **Delegation.** The jailed workload presents its SVID and asks for a token for one downstream
-  audience. mediatore answers with a short-lived, audience-scoped token, minted via Entra
-  On-Behalf-Of or by its own STS. The user's original token never enters the VM.
+- **Delegation.** The egress proxy beside the jail presents the claim's SVID and asks for a
+  credential for one downstream audience; the jail itself only ever holds a phantom.
+  mediatore answers with a short-lived, audience-scoped credential, minted via Entra
+  On-Behalf-Of or by its own STS, or an operator-held key or the requester's own session,
+  placed on the request by the proxy or by a gateway. The user's original token never
+  enters the VM.
 - **Cut-off.** When the claim expires or is deleted, mediatore removes the SPIFFE entry and
   the tokens stop.
 

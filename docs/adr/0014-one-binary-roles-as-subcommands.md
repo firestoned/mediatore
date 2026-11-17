@@ -3,7 +3,18 @@
 
 # ADR-0014: One binary, the roles as subcommands
 
-**Status:** Accepted · **Date:** 2026-10-15 · **Amended:** 2026-11-09 (decision 3, what the guest does when the jail exits: the workload's restart policy, [ADR-0033](0033-a-one-shot-workload-the-restart-policy-and-the-claim-released-when-it-is-done.md))
+**Status:** Implemented · **Date:** 2026-10-15 · **Implemented:** 2026-10-15 (the one
+binary, `crates/mediatore/src/main.rs`; `crates/sandbox-token` and `crates/mediatore-cli`
+gone) · **Amended:** 2026-10-27 by
+[ADR-0023](0023-sandbox-vm-image-kairos-derivative.md) decision 2 (decisions 4 and 5: the
+pinned path is `/usr/bin/mediatore`); 2026-10-30 by
+[ADR-0025](0025-phantom-token-egress-proxy.md) decision 5 (decision 4: the Workload API
+socket is no longer mounted into the jail, so the binary there has no SVID to fetch; it
+stays mounted for `jail-exec`, and the workload reaches its audiences through the proxy
+with a phantom); 2026-11-09 (what the guest does when the jail exits: the workload's
+restart policy, [ADR-0033](0033-a-one-shot-workload-the-restart-policy-and-the-claim-released-when-it-is-done.md);
+no decision here names it, the restart-on-exit it replaces was the guest supervisor's
+behaviour that ADR-0024 recorded)
 
 Consolidates the four executables that [ADR-0002](0002-separate-project-from-banlieue.md)
 and [ADR-0013](0013-dex-session-delegation.md) accumulated into the one `mediatore`
@@ -76,14 +87,21 @@ Workload API socket yields the claim SVID only.
    so a binary baked there is hidden on an installed member; the immutable rootfs is where a
    pinned path belongs.*
 
+   *Amended 2026-10-30 by [ADR-0025](0025-phantom-token-egress-proxy.md) decision 5: the
+   Workload API socket is no longer mounted into the jail and `SPIFFE_ENDPOINT_SOCKET` is
+   not in its environment, so the binary yields no SVID there at all. The claim SVID is held
+   by the egress proxy beside the jail; the binary stays mounted for `mediatore jail-exec`
+   (ADR-0024), and `mediatore token` inside the jail has no socket and no route.*
+
 **5. The node entry pins the new path, and the uid is what tells the roles apart.** The
 node entry's selectors become `unix:uid:0` and `unix:path:/usr/local/bin/mediatore`
-(`GUEST_AGENT_PATH`), amending ADR-0006's table. Because the jailed workload can now
-present that same path, the `unix:uid:0` selector is the one that distinguishes the node
-from the jail; SPIRE requires every selector of an entry to match, as it always did, and
-the claim entry keeps `unix:user:<sb-user>`. A node entry declared before this change is
-not rewritten (the entry manager leaves an existing object alone): delete it and the next
-registration declares it with the new selector.
+(`GUEST_AGENT_PATH`; `/usr/bin/mediatore` since ADR-0023 decision 2, 2026-10-27, which is
+what `crates/mediatore-spire/src/lib.rs` pins), amending ADR-0006's table. Because the
+jailed workload can now present that same path, the `unix:uid:0` selector is the one that
+distinguishes the node from the jail; SPIRE requires every selector of an entry to match,
+as it always did, and the claim entry keeps `unix:user:<sb-user>`. A node entry declared
+before this change is not rewritten (the entry manager leaves an existing object alone):
+delete it and the next registration declares it with the new selector.
 
 ## Alternatives considered
 
@@ -109,7 +127,9 @@ registration declares it with the new selector.
   and `make e2e` build the one binary; the build workflow's artifact is
   `mediatore-linux-amd64-musl`.
 - ADR-0006's selector table reads `/usr/local/bin/mediatore`; the kind tiers start from a
-  fresh cluster, so no entry there predates the change.
+  fresh cluster, so no entry there predates the change. (The table was not rewritten; it
+  kept `/usr/local/bin/mediatore-guest` and carries an amendment note since 2026-11-17.
+  The path is `/usr/bin/mediatore` since ADR-0023.)
 - The guides, the CALM model, the README and the threat model name the subcommands
   (`mediatore guest`, `mediatore token`, `mediatore login`, `mediatore sandbox create`)
   instead of the old binaries; the threat model's TB-7 gains the row for the binary in the

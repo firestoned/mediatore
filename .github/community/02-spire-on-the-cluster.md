@@ -21,7 +21,8 @@ installed beyond a `ServiceAccount` a live test left behind.
 ## First half: the broker on the cluster (no VM attests yet)
 
 - [x] A deployable overlay for the single-cluster shape, with placeholders only
-      (`deploy/overlays/homelab-example`, 2026-10-21): one replica on a SQLite PVC, the
+      (`deploy/overlays/homelab-example`, 2026-10-21): one replica on a SQLite PVC (since
+      ADR-0034 the store is the cluster's API and the overlay has no PVC), the
       local sealer, the user API behind the Tailscale ingress class instead of Traefik,
       the sandbox listener as a MetalLB LoadBalancer, the image pinned by the operator;
       the real copy lives outside the repository (`docs/guides/deploying.md`)
@@ -95,8 +96,11 @@ installed beyond a `ServiceAccount` a live test left behind.
       has a CA keeps it across the upgrade until it prepares its next one, and its serving
       certificate stays until its half-life (the guide now carries the rotation and the
       restart)
-- [ ] The VM image with the agent, the plugin from `dist/` and the fragments baked by
-      banlieue-imagebuilder (roadmap 06's image item; the mediatore side is `image/`)
+- [x] The VM image with the agent, the plugin from `dist/` and the fragments baked by
+      banlieue-imagebuilder (roadmap 06's image item; the mediatore side is `image/`).
+      Done 2026-10-27 as ADR-0023: built from `image/Dockerfile` (the agent and the plugin
+      pinned by digest, the fragments in the rootfs) rather than by the imagebuilder, and
+      booted on members from 2026-10-31 (roadmap 06)
 - [x] Part 3 acceptance on libvirt: a fresh member appears in `agent list` as type
       `tpm` within 60 s, EK hash matches the local computation, reboot does not create
       a second agent. Done 2026-10-31 and 2026-11-05: every member and every gateway

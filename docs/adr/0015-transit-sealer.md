@@ -3,7 +3,8 @@
 
 # ADR-0015: The transit sealer: OpenBao holds the wrapping key
 
-**Status:** Accepted · **Date:** 2026-10-15
+**Status:** Implemented · **Date:** 2026-10-15 · **Implemented:** 2026-10-15 (roadmap 04:
+`TransitSealer` in `crates/mediatore-store/src/seal.rs`, `make kind-openbao`)
 
 Roadmap 04, third slice. Builds the work shape that [ADR-0012](0012-persistent-store.md)
 decision 3 named and deferred: a `Sealer` whose key never enters the broker process.

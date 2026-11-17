@@ -6,11 +6,9 @@
 # two in sync.
 
 [advisories]
-ignore = [
-  # Marvin timing side channel in the `rsa` crate; no patched release exists.
-  # Pulled in by jsonwebtoken's rust_crypto backend, but mediatore signs and
-  # verifies ES256 (P-256) exclusively, so the RSA code path is never
-  # exercised. Revisit when RustCrypto/RSA gains a constant-time fix or
-  # jsonwebtoken makes the rsa dependency optional per algorithm.
-  "RUSTSEC-2023-0071",
-]
+# No accepted advisory at present. RUSTSEC-2023-0071 (the `rsa` crate's Marvin
+# side channel) was waived here while jsonwebtoken's rust_crypto backend pulled
+# `rsa` in; jsonwebtoken runs on aws-lc-rs now (Cargo.toml), so the crate is
+# out of the tree rather than waived. RUSTSEC-2026-0543 (chrono unmaintained)
+# was waived until the workspace moved to jiff; chrono is out of the tree.
+ignore = []

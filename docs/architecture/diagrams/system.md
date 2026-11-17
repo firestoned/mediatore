@@ -15,9 +15,12 @@ and the connections between them. `connects` and `interacts`
 relationships become arrows (the protocol, when defined, labels the
 arrow); `deployed-in` / `composed-of` containers become subgraphs.
 
-Note: nodes whose `name` includes "(planned, Phase 1B/C/D)" are not yet
-implemented in the repo — the diagram shows the *target* architecture so
-contributors and users have one canonical picture.
+Note: a node whose `metadata.status` is anything but `implemented` (for
+example `planned` or `proposed`) is not yet implemented in the repository;
+the diagram shows the *target* architecture so contributors and users have
+one canonical picture, and labels such a node with its status. The nodes so
+marked today, if any:
+
 
 ```mermaid
 flowchart LR

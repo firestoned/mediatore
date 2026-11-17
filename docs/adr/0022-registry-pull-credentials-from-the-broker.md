@@ -3,7 +3,12 @@
 
 # ADR-0022: Registry pull credentials are the operator's, delivered per claim by the broker
 
-**Status:** Accepted · **Date:** 2026-10-27
+**Status:** Implemented · **Date:** 2026-10-27 · **Implemented:** 2026-10-27 (roadmap 06:
+`registries` in the config, `Me.registry_credential`, `ImageReference`,
+`400 invalid_workload_image`) · **Extended:** 2026-11-15 by
+[ADR-0043](0043-a-persons-registry-credential-is-placed-at-the-gateway-the-vm-never-sees-it.md)
+(a person's own registry credential placed at the gateway where the operator's cannot be
+used; proposed, built, not yet run live)
 
 Roadmap 06, the pull-credentials item. Completes
 [ADR-0021](0021-sandbox-filesystem-tmpfs-and-rootfs-from-the-registry.md), whose decision
@@ -88,7 +93,9 @@ workload and the egress endpoints.
 - Rejected: the credential on the `AgentSandbox` spec (a secret in a resource GitOps
   commits and the API server stores; the requester is not who publishes the image); a
   Kubernetes pull Secret read by the broker (`secrets` RBAC for the broker, which has
-  none, and a second channel beside the config volume); a file in the pool image (on
+  none, and a second channel beside the config volume; since ADR-0034, 2026-11-09, the
+  broker holds a namespaced Role on Secrets for its own sealed sessions,
+  `deploy/base/rbac.yaml`, and still reads no pull Secret); a file in the pool image (on
   every disk, rotated by rebaking); the broker pulling and serving the image itself (a
   registry mirror inside the broker, with the broker's egress and memory on the path of
   every bind); re-reading the password file at each `me` (a rotation without a restart,

@@ -3,7 +3,17 @@
 
 # ADR-0023: The sandbox VM image is a Kairos derivative built from this repository
 
-**Status:** Accepted · **Date:** 2026-10-27
+**Status:** Implemented · **Date:** 2026-10-27 · **Implemented:** 2026-10-27
+(`image/Dockerfile`, `make guest-image` and `make guest-image-check`, the `guest-image`
+job of the Build workflow; booted on a libvirt member 2026-10-31, roadmap 06) ·
+**Amended:** 2026-11-04 by
+[ADR-0029](0029-the-pull-on-a-routeless-segment-and-the-pool-vms-root-rules.md) (a third
+unit, `mediatore-host-nft.service`, and the host table); 2026-11-07 by
+[ADR-0031](0031-a-trust-anchor-that-outlives-the-servers-ca.md) decision 3 (the bundle the
+deployment layer writes is the PKI root the server's CA chains to); 2026-11-14 by
+[ADR-0037](0037-the-pool-fetches-its-spire-bundle-at-boot-through-the-relay.md) (decision
+3: the bundle is fetched at every boot through the relay to `/run/spire/bundle.json` by a
+fourth unit, `spire-bundle-fetch.service`; the PEM file is the fallback)
 
 Roadmap 06, the image item. Implements mediatore's share of banlieue
 [ADR-0108](https://github.com/firestoned/banlieue/blob/main/docs/adr/0108-sandbox-guest-software-is-consumer-image-content.md)
@@ -57,7 +67,9 @@ runs `Deferred` installs, which banlieue's libvirt guide calls the simpler path 
    omitted it, and `image/check.sh` now proves it*); every listening service the base
    ships removed or masked (`openssh-server`, `snmpd`, `lldpd`, `fail2ban`, `rpcbind`:
    no inbound, [ADR-0010](0010-no-inbound-to-sandboxes.md) decision 2); the `spire` system
-   user created, in group `tss`; the two units installed and enabled. The build takes the
+   user created, in group `tss`; the two units installed and enabled (four since
+   ADR-0029 and ADR-0037: `mediatore-host-nft.service` and `spire-bundle-fetch.service`
+   beside them, `image/systemd/`). The build takes the
    `mediatore` binary from the same two-stage choice as the server image (`BINARY_FROM`:
    compiled in the build, or `dist/mediatore` from the host), the SPIRE agent from the
    `spiffe/spire-agent` image and the attestor plugin from the `spire-tpm-plugin` image,
@@ -80,6 +92,13 @@ runs `Deferred` installs, which banlieue's libvirt guide calls the simpler path 
    agent's key is generated on the member's first boot onto storage sealed to its own
    vTPM and never exists in the image (ADR-0108 decisions 2 and 3), and it re-asserts the
    directories and the enabled units at every boot.
+
+   *Amended 2026-11-14 by [ADR-0037](0037-the-pool-fetches-its-spire-bundle-at-boot-through-the-relay.md):*
+   the deployment layer writes `agent.conf` alone. The bundle is fetched at every boot
+   through the gateway's bundle leg into `/run/spire/bundle.json`, in the SPIFFE format
+   (`image/spire/agent.conf`, `image/spire-bundle-fetch`,
+   `image/cloud-config-deployment.example.yaml`); `/etc/spire/bundle.pem` is written only
+   by a deployment with no bundle endpoint, and then it is the PKI root of ADR-0031.
 
 4. **Published by this repository's Build workflow as `ghcr.io/firestoned/mediatore-guest`**,
    on push and release, keyless-signed by digest, with an SBOM and build provenance, like
@@ -107,7 +126,9 @@ runs `Deferred` installs, which banlieue's libvirt guide calls the simpler path 
   anywhere, and the kind TPM tier proves the attestation path on the paths the image now
   uses; booting the image on a libvirt member, the install, the sealed partition, the EK
   export and a claim end to end are roadmap 06's live item, which this ADR makes possible
-  rather than done.
+  rather than done. (Done 2026-10-31 against v0.2.0-rc.3: a member installed from an
+  AuroraBoot ISO with the three layers attested, registered, went `GuestReady` and ran a
+  claim; roadmap 06.)
 - `Immediate` plus `firstBootSealing` replaces `deferred` in the example the day a Kairos
   4.4 Debian base exists; nothing else in the image changes.
 - Rejected: installing the software from cloud-config stages at template build or first

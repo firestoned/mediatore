@@ -3,7 +3,17 @@
 
 # ADR-0010: No inbound to sandboxes
 
-**Status:** Proposed · **Date:** 2026-09-30 · **Moved here:** 2026-10-12
+**Status:** Accepted (decisions 1, 2, 4 and 5 built: the image ships no sshd,
+[ADR-0023](0023-sandbox-vm-image-kairos-derivative.md); the in-guest rulesets,
+[ADR-0020](0020-jail-network-nftables-keyed-by-sandbox-uid.md) and
+[ADR-0029](0029-the-pull-on-a-routeless-segment-and-the-pool-vms-root-rules.md); the
+gateways, [ADR-0028](0028-egress-gateway-envoy-with-spiffe-identity.md); decision 3 and
+task delivery are still to decide) · **Date:** 2026-09-30 · **Moved here:** 2026-10-12 ·
+**Amended:** 2026-10-24 by ADR-0020 (decision 5); 2026-11-04 by
+[ADR-0027](0027-control-plane-relay-on-the-egress-gateway.md) decision 6 and ADR-0028
+decision 6 (the ruleset outline: with gateways, the sandbox uid reaches the gateways'
+`sandbox` addresses and the broker through the control relay, by address; there is no
+gateway resolver, names are refused)
 
 Scope: banlieue, mediatore, mediatore-guest, the egress gateway. Origin: platform
 ADR-0002, first recorded as banlieue
@@ -70,6 +80,15 @@ the audiences' declared endpoints, DNS to the VM's resolvers) is loaded per
 claim by `mediatore guest` before the jail starts. The root rules, the input
 policy, the gateway resolver and the hash report are still to come.
 
+*Landed 2026-11-04 with ADR-0029:* the root rules and the input policy are the
+image's `inet mediatore_host` table (`image/host-table`,
+`image/systemd/mediatore-host-nft.service`: input and forward dropped, output
+to the gateways and the registries alone), and the hash report is
+`POST /v1/me/report` over the node SVID (`crates/mediatore-guest/src/report.rs`,
+ADR-0029 decision 5). There is no gateway resolver by design: a sandbox is
+given addresses and names are refused (ADR-0028 decision 6); the gateway
+resolves the CONNECT authority on its own interface (ADR-0028 decision 5).
+
 ## Consequences
 
 - The attack surface on each VM has no network listener.
@@ -109,6 +128,6 @@ not assumed here.
 
 ## Related
 
-- [ADR-0009](https://github.com/firestoned/banlieue/blob/main/docs/adr/0009-kubernetes-orchestrates-vms-run-agents.md): Kubernetes
+- [ADR-0009](0009-kubernetes-orchestrates-vms-run-agents.md): Kubernetes
   orchestrates, VMs run agents.
 - Platform threat model: T4.5, T4.6, T5.7, K4.5, K8.4.

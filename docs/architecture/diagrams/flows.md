@@ -11,15 +11,15 @@
     with `make calm-diagrams`.
 
 Each business flow defined in the CALM architecture is rendered below as
-its own Mermaid `flowchart TD` — one diagram per flow, linking the
-transitions in sequence order. Three flows are modelled today:
+its own Mermaid `flowchart TD`: one diagram per flow, linking the
+transitions in sequence order. The flows modelled today, from the
+`flows` of `architecture.json`:
 
-- **Create a VirtualMachine** — the happy path from `kubectl apply` to
-  `Ready=true`.
-- **Swap a VirtualMachine's backend** — the canonical least-touch
-  demonstration: change one field, the controller rebuilds the infra.
-- **Delete a VirtualMachine** — finalizer-gated teardown that guarantees
-  no backend leaks.
+- **Claim a sandbox and act as the user** (`flow-claim-to-token`)
+- **Release and cut-off** (`flow-release-cutoff`)
+- **Node bootstrap: from EK certificate to node SVID** (`flow-node-bootstrap`)
+- **A policy bundle, verified and compared in shadow** (`flow-policy-shadow`)
+- **A private image pulled with the person&#x27;s own credential, which the VM never sees (ADR-0043)** (`flow-registry-pull-placed`)
 
 
 ## Claim a sandbox and act as the user
@@ -51,7 +51,7 @@ Any of four independent cut-offs stops the sandbox acting as the user; this is t
 
 ```mermaid
 flowchart TD
-    t1["1. DELETE /v1/claims (or the TTL fires). The store row is revoked: /v1/token refuses immediately."]
+    t1["1. DELETE /v1/claims (or the TTL fires). The record (status.record on the AgentSandbox, ADR-0034) is revoked: /v1/token refuses immediately."]
     t2["2. The ClusterStaticEntry is deleted; the controller manager removes the server entry and the workload's SVID stops within the agent sync interval."]
     t3["3. The VirtualMachineClaim is deleted (or its deletion observed)."]
     t4["4. banlieue destroys the member, vTPM included; the guest agent tears down the jail and user regardless."]
@@ -81,7 +81,7 @@ flowchart TD
 
 ## A policy bundle, verified and compared in shadow
 
-How notaio's reviewed policy reaches the broker and what the broker does with it in this phase: observe and report, never admit, refuse or mint differently (ADR-0026).
+How notaio's reviewed policy reaches the broker and what the broker does with it in shadow, the default: observe and report, never admit, refuse or mint differently (ADR-0026). ADR-0030 and ADR-0040 add the enforcing mode.
 
 ```mermaid
 flowchart TD
@@ -89,7 +89,7 @@ flowchart TD
     t2["2. The broker's reflector sees the ConfigMap and verifies the envelope against policy.trusted_keys at the current time; a bundle that fails is logged with its reason and goes no further."]
     t3["3. notaio's floor rule decides from the held floor (the same uid never goes down; a new uid only if issued after the held one); the store writes the next floor to its PolicyFloor resource only if the held one is still what was read, a compare-and-set on resourceVersion (ADR-0034), and a replica that lost the race reads and decides again."]
     t4["4. Only after the write succeeds does the verified payload enter the cache; each sandbox naming the policy is reconciled, every gap between the broker's configuration and the bundle is logged with its code, and PolicyConformant is set True, False with the codes, or Unknown while no bundle has been read."]
-    t5["5. Tokens are minted exactly as before: the comparison changes no admission, no claim and no mint. The enforcing ADR is the one that makes a gap a refusal."]
+    t5["5. In shadow (policy.egress: shadow, the default) tokens are minted exactly as before: the comparison changes no admission, no claim and no mint. Under policy.egress: enforce the bundle's servable direct egress is served at the gateway (ADR-0030) and a gateway-placed audience must be one the policy admits (ADR-0040)."]
     t1 --> t2 --> t3 --> t4 --> t5
 ```
 

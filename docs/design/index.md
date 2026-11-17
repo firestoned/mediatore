@@ -50,7 +50,7 @@ one file and the node's registration entry selects on its path.
 | `jail-exec` | inside the jail, before the workload | Landlock, then the workload (ADR-0024) |
 | `token` | where a Workload API socket and a broker route exist (not inside the jail since ADR-0025) | trade the claim identity for a token; the egress proxy does this for the workload |
 | `gateway` | each gateway VM | [the authorizer](gateway.md) |
-| `login`, `sandbox`, `session` | the person's machine | [the CLI](client-cli.md) |
+| `login`, `logout`, `sandbox`, `session` | the person's machine | [the CLI](client-cli.md) |
 | `revoke` | an operator | revoke a claim at once (an admin stub) |
 
 ## A claim, from login to release
@@ -75,7 +75,7 @@ The path through the parts, in order. Each step links to the page that owns it.
 6. **Run.** The workload holds only a phantom token. Its requests go to the egress proxy, which swaps in a real token
    from the broker, tunnels through a gateway, or sends the request to a gateway that places the credential itself.
    ([Egress proxy](egress-proxy.md), [Gateway](gateway.md), [Issuers and audiences](issuers-and-audiences.md))
-7. **End.** The TTL, a delete, the workload's own exit under its restart policy, or `revoke` ends the claim. The
+7. **End.** The TTL, a delete, or the workload's own exit under its restart policy ends the claim. The
    entry is retracted, the record is revoked, the sealed envelopes are deleted, and the guest tears the VM's
    state down. ([Claims](claims-and-reconcilers.md), [Store and sealing](store-and-sealing.md))
 
@@ -89,7 +89,8 @@ These are enforced by tests, not just stated; the pages say which.
 - **Never log a secret.** Tokens, refresh material, passwords and keys are never logged; the logs name claim UIDs,
   SPIFFE IDs, audiences and subjects. Secret-carrying types print `[redacted]`.
 - **A fake is no more permissive than the real thing.** `MemoryStore`, the in-memory entries and the test CA behave as
-  the production ones do, and the conformance suite pins what the two stores share.
+  the production ones do; the conformance suite pins what `MemoryStore` must share with `KubeStore`, which the kind
+  tiers prove on a real API server.
 - **The pool VM and the sandbox never see a person's secret.** A credential for an audience that opts in is placed at
   the gateway (ADR-0040, ADR-0041, ADR-0043), and no secret is stored longer than its claim's TTL.
 - **One decision, one record.** A change to a trust boundary, a token shape, the SPIFFE ID scheme or the storage

@@ -40,7 +40,9 @@ roadmap 05: the store keeps only what cannot sit on a custom resource.
 - [x] Audiences (and the subject's issuer) outside mediatore's configuration refused at
       reconcile, `Failed` with a reason and no claim; `POST /v1/claims` refuses with `400`
       before creating anything
-- [x] `POST /v1/claims` creates an `AgentSandbox` in `sandboxes.namespace`; `GET` answers
+- [x] `POST /v1/claims` creates an `AgentSandbox` in `sandboxes.namespace` (since ADR-0046,
+      with `sandboxes.namespaces` set, in the namespace `ClaimRequest.namespace` names and
+      the caller's groups admit); `GET` answers
       from its status (`ready` added to the response); `DELETE` deletes it
       (`crates/mediatore/tests/e2e_sandbox.rs` over `MemorySandboxes`)
 - [x] RBAC: `agentsandboxes` get, list, watch, patch, create, delete; `agentsandboxes/status`

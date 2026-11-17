@@ -3,7 +3,12 @@
 
 # ADR-0004: SPIFFE identity scheme and sandbox username derivation
 
-**Status:** Accepted · **Date:** 2026-09-26
+**Status:** Implemented · **Date:** 2026-09-26 · **Implemented:** 2026-09-26 (roadmap 00:
+`mediatore_spire::Naming`, `mediatore_proto::Subject::sandbox_username`) · **Amended:**
+2026-11-03 by [ADR-0028](0028-egress-gateway-envoy-with-spiffe-identity.md) decision 4
+(a fifth identity, the egress gateway's `spiffe://<td>/gateway`); 2026-11-09 by
+[ADR-0034](0034-the-kubernetes-api-as-the-brokers-store.md) (the node register is a
+`SandboxNode` resource, not a table)
 
 ## Context
 
@@ -40,6 +45,12 @@ The agent ID is the parent of both workload entries on a node. The `<ek-hash>` i
 SHA-256 of the endorsement public key, computed identically by the SPIRE TPM attestor
 plugin and by `mediatore-guest`.
 
+*Amended 2026-11-03 by [ADR-0028](0028-egress-gateway-envoy-with-spiffe-identity.md)
+decision 4:* the table gains `spiffe://<td>/gateway`, held by the egress gateway VMs
+(exactly that id, nothing under it; `Naming::gateway_id` in
+`crates/mediatore-spire/src/lib.rs`), declared by the operator as `ClusterStaticEntry`
+objects under each gateway VM's own TPM agent, never by the broker.
+
 **Username derivation**, implemented in `mediatore-proto::Subject::sandbox_username`:
 `sb-` followed by the first 12 lowercase hex characters of
 `sha256(issuer || "|" || subject.id)`, where `subject.id` is `oid` on Entra and
@@ -57,4 +68,6 @@ issuer-scoped so `octocat` at two issuers yields two users.
 - Changing the trust domain or the derivation later invalidates every registration entry
   and every provisioned user; both would be a new major version and a drained pool.
 - Node SPIFFE IDs carry no provider name; the broker's `nodes` table records the
-  provider for audit instead (runbook, Provider variants).
+  provider for audit instead (runbook, Provider variants). (Amended 2026-11-09 by
+  ADR-0034: the register is a `SandboxNode` resource, and the provider is its
+  `spec.provider`; `crates/mediatore-claims/src/kubestore.rs`.)

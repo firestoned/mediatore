@@ -6,8 +6,8 @@
 At work the issuer is Entra ID and the downstream APIs want Entra tokens. mediatore gets
 them On-Behalf-Of the user ([ADR-0016](../adr/0016-entra-on-behalf-of.md)): the access
 token a caller presents to `POST /v1/claims` is exchanged once for a refresh token issued
-to mediatore for that user, that session is sealed into the claim's record like a Dex
-session ([ADR-0013](../adr/0013-dex-session-delegation.md)), and every `POST /v1/token`
+to mediatore for that user, that session is sealed into the sandbox's session Secret like
+a Dex session ([ADR-0013](../adr/0013-dex-session-delegation.md)), and every `POST /v1/token`
 refreshes it for the audience's resource before anything is handed out. This page is the
 operator's side: the app registration, the broker's credential, the configuration, and
 the proof against a tenant.
@@ -143,7 +143,7 @@ caller says dies before the claim's deadline (`400 delegation_expires_first`): w
 `refresh` block the claim cannot outlast the bearer. `refresh: { token_endpoint, client_id,
 scope? }` names where the broker renews it from the delegated refresh token (`https` outside
 `dev_mode`; nothing is defaulted, Anthropic's endpoint being undocumented) and is not served
-yet. Release and revocation empty the envelope; the retention sweep deletes it. The upstream
+yet. Release, revocation and the credential's expiry delete the envelope. The upstream
 sees the requester's own session, so attribution is the upstream's too; the session is for
 the requester's own Claude Code in the jail (`examples/claude-code`), which Anthropic's terms
 bind it to.
@@ -160,8 +160,10 @@ audiences:
 ```
 
 `egress` is where the workload reaches the audience's API from the jail ([ADR-0020](../adr/0020-jail-network-nftables-keyed-by-sandbox-uid.md)): the
-guest admits those `host:port` pairs for the sandbox uid and nothing else beyond the
-broker and DNS. Without it the jail reaches the broker only.
+guest admits those `host:port` pairs for the sandbox uid (directly, or through the
+gateways when `gateways` is set) and nothing else; the jail itself reaches only the
+egress proxy, which carries the request ([ADR-0025](../adr/0025-phantom-token-egress-proxy.md)).
+Without it the audience's tokens can be spent nowhere.
 
 An `entra-obo` audience is the downstream app's id URI (or client id); the token
 mediatore hands the workload is Entra's for `<name>/.default`, with the lifetime Entra

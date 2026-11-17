@@ -15,7 +15,7 @@ a restart.
 | What | Where | Found by |
 | --- | --- | --- |
 | The claim record: the SPIRE entry id, the bound node, the bind deadline, the revocation, the policy incarnation and bundle version the claim was created under, the guest's report, the workload's exit | `AgentSandbox.status.record`, written by the store alone (the reconciler's mirroring leaves it out of its patches) | the label `mediatore.io/claim-uid` (the claim's UID, the record's key) and `mediatore.io/node` (a digest of the bound node's SPIFFE ID) |
-| The sealed session: the delegated refresh token, sealed with the sandbox's UID | Secret `mediatore-session-<sandbox uid>` in the broker's own namespace, owned by the `AgentSandbox` when the sandboxes live there too (an owner reference cannot cross a namespace), deleted by the retention sweep otherwise; parked by `POST /v1/claims`, claimed by the reconciler when it writes the record, rotated in place at every mint, emptied on revocation | its name; the labels `mediatore.io/sandbox-uid` and `mediatore.io/session` (`parked` or `claimed`) |
+| The sealed session: the delegated refresh token, sealed with the sandbox's UID | Secret `mediatore-session-<sandbox uid>` in the broker's own namespace, owned by the `AgentSandbox` when the sandboxes live there too (an owner reference cannot cross a namespace), deleted by the retention sweep otherwise; parked by `POST /v1/claims`, claimed by the reconciler when it writes the record, rotated in place at every mint, deleted on revocation | its name; the labels `mediatore.io/sandbox-uid` and `mediatore.io/session` (`parked` or `claimed`) |
 | The attested nodes: EK hash, the agent's SPIFFE ID, DMI UUID, hostname, provider, banned | `SandboxNode` in the broker's namespace, named by the EK hash | its name; the label `mediatore.io/dmi-uuid` for the clone check |
 | The version floor of each notaio policy ([ADR-0026](../adr/0026-notaio-bundles-verified-in-shadow.md) decision 5) | `PolicyFloor` in the broker's namespace, named `<policy namespace>.<policy name>` | its name; moved by compare-and-set on `resourceVersion`, so two replicas cannot move a floor down |
 
@@ -56,15 +56,17 @@ ClusterRole), and `get`, `list`, `create`, `update`, `patch` and `delete` on Sec
 its own namespace alone (a Role): `deploy/base/rbac.yaml`. The broker reads no Secret
 elsewhere. The broker's namespace is the client's default, the ServiceAccount's in a
 pod, so nothing names it in the configuration. The sandboxes may live anywhere the
-controller watches: `sandboxes.namespace` is where `POST /v1/claims` creates them, and a
-sandbox applied in another namespace gets its record where it is.
+controller watches: `sandboxes.namespace` is where `POST /v1/claims` creates them (from
+the next release, the namespace the request names, one of `sandboxes.namespaces`,
+[ADR-0046](../adr/0046-who-may-claim-a-list-of-groups-and-a-namespace-to-groups-mapping.md)),
+and a sandbox applied in another namespace gets its record where it is.
 
 ## Refresh material
 
 A claim holds refresh material only as a sealed envelope: the id of the key that sealed
 it, a fresh nonce, and the AES-256-GCM ciphertext with the sandbox's UID as associated
 data, so an envelope copied onto another sandbox's Secret does not open. The record type
-has no plaintext field. Revocation empties the envelope.
+has no plaintext field. Revocation deletes the envelope's Secret.
 
 There are two sealers, and `store.sealing` names exactly one of them.
 
@@ -105,10 +107,11 @@ exactly as the local sealer's associated data arranges. The envelope's `key_id` 
 key rotated at OpenBao (`bao write -f transit/keys/mediatore/rotate`) keeps old
 envelopes readable until the administrator raises `min_decryption_version`; the broker
 re-seals every session at its next refresh anyway. The broker logs in at
-`auth/kubernetes/login` with the projected ServiceAccount token the base Deployment
-mounts (audience `openbao`), keeps the OpenBao token in memory until its lease nears
-its end, and exchanges it again at once on a 403. At start it seals and unseals a probe,
-so a wrong URL, CA, role, policy, mount or key, or a key created without `derived`,
+`auth/<auth_mount>/login` (`kubernetes` by default) with the projected ServiceAccount
+token the base Deployment mounts (audience `openbao`), keeps the OpenBao token in memory
+until its lease nears its end, and exchanges it again at once on a 403. At start it seals
+and unseals a probe, so a wrong URL, CA, role, policy, mount or key, or a key created
+without `derived`,
 stops the process. The URL must be `https` outside `dev_mode`. OpenBao being away is
 `503 sealer_unavailable` on the request that needed it and revokes nothing. On the
 OpenBao side the broker's policy needs `update` on the two paths and nothing else; the

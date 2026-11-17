@@ -105,7 +105,7 @@ ADR-0028, ADR-0031.
 | The broker's identity | `ClusterSPIFFEID` `mediatore` from `deploy/base`: `spiffe://sandbox.home.example/mediatore` for the Deployment's pods |
 | VM attestation | the `deploy/spire-tpm` component: the `spiffe/spire-tpm-plugin` server binary (v1.11.3, pinned by digest, `plugin_checksum` in `server.conf`), `ca_path: /tpm/cas` with one PEM per swtpm local CA (the issuing certificate; libvirt's per host, and the Cloud Hypervisor provider's own beside it on a host that runs both); no hash allowlist (decision 2 of ADR-0018) |
 | Upstream authority | the `deploy/spire-upstream` component (ADR-0031): OpenBao's PKI mount `spire`, Kubernetes auth role `spire-server`, the CA the server chains to in ConfigMap `spire-upstream-ca`; the guests' bundle is the root alone |
-| CA TTL | 24 h: a bundle baked into an image admits a first boot for a day; refresh the bundle layer before a pool scale-up, or ship the root (ADR-0031) |
+| CA TTL | 24 h; the agent fetches its bundle at every boot through the relay's bundle leg (`3131`, ADR-0037), so nothing in the image goes stale. Only an image without a bundle endpoint bakes a bundle, and then it is the OpenBao root alone (ADR-0031), not the CA of the day |
 | Server reach for VMs | a LoadBalancer address on the LAN for port 8081, reached by pool members only through a gateway's relay (`3129`) |
 | Bundle endpoint | the SPIRE server's `bundle_endpoint` (https_web, a certificate from a CA the image trusts), reached by pool members only through the relay's bundle leg (`3131`, ADR-0037) |
 | Registry for the image pull | on a gateway-era pool without a registry on the segment, the operator's registry behind the relay's registry leg (`3132`, ADR-0038): `reach: relay` on the broker, `MEDIATORE_RELAY_REGISTRIES=<registry>=3132` in the pool's env; a dedicated read-only repository of digest-pinned images |
@@ -143,7 +143,7 @@ The identities the flow uses, and who declares them:
 The admission policy `mediatore-clusterstaticentry` constrains what the broker's
 ServiceAccount may declare to the two `banlieue/` shapes; the gateway entries are applied by
 hand because of it. The TPM path is proven by `make kind-e2e-tpm` on the build host before
-any change to it merges (`rules/testing.md`).
+any change to it merges (`.claude/rules/testing.md`).
 
 ## C. notaio: the policy certified
 
@@ -156,7 +156,7 @@ own install guide and `dev/kind/notaio-install.sh` as the reference.
 | Signing key | OpenBao transit key `notaio`, `ed25519`, `exportable=false`; policy `notaio-sign` allowing `transit/sign/notaio` and nothing else; Kubernetes auth role `notaio` bound to the `notaio` ServiceAccount, audience `openbao`, 15 min tokens |
 | What consumers trust | the key's public half, read from OpenBao once (`notaio:v1 <base64>`), never from the cluster: `policy.trusted_keys` on the broker |
 | Per policy namespace | Role `notaio-bundles` (ConfigMaps `get`, `create`, `patch`) for notaio; Role `mediatore-policy-bundles` (`deploy/policy-bundles`, `get`, `list`, `watch`) for the broker |
-| The bundle | ConfigMap `<policy>-bundle` beside the policy, key `bundle.dsse.json`, annotations `sandbox.firestoned.io/bundle-version` and `bundle-digest`; payload type `application/vnd.firestoned.sandboxpolicy.bundle.v2+json` |
+| The bundle | ConfigMap `<policy>-bundle` beside the policy, key `bundle.dsse.json`, annotations `sandbox.firestoned.io/bundle-version` and `bundle-digest`; payload type `application/vnd.firestoned.sandboxpolicy.bundle.v3+json` |
 | Profiles that matter | `standard`: K5.3 at R1, one audience, write allowed, tokens of at most 900 s. `lab`: K5.3 at R2, several audiences, but `LabOnly` data scope, so every audience it names must carry `dataScope: LabOnly` on its ceiling (notaio ADR-0017) |
 | Lints that bite here | `L005` the audience set does not fit K5.3; `L006` write without K5.2 or TTL over K5.1; `L014` the policy's exposure exceeds its approved ceiling |
 
@@ -267,9 +267,9 @@ registries:
   - { host: "198.51.100.10:5000", reach: segment }                         # the mirror
 ```
 
-The audience's `max_ttl`, `egress`, `rules` and `endpoints` must agree with the policy's,
-or the shadow comparison reports the gap (`P002` for TTL, and so on) and
-`PolicyConformant` goes `False`.
+The audience's `max_ttl`, `egress` and `rules` must agree with the policy audience's
+`ttlSeconds`, `endpoints` and `rules`, or the shadow comparison reports the gap (`P002` for
+TTL, `P003` for an endpoint, `P004` for a rule) and `PolicyConformant` goes `False`.
 
 Secrets in `banlieue-system`, each a file read once at start:
 
@@ -298,7 +298,7 @@ pod to a node since ADR-0034.
 | Gateway attestation | each gateway's agent attests with its vTPM against the EK CAs of section B; `envoy-gateway.service` requires the agent, so an agent the server refuses (`Nodeattestor(tpm): could not verify cert`) takes the data plane down with it every few seconds: `8443` open for about 27 s, refused for about 16 s, the relay ports steady. The CA that issued the gateway's EK is missing from the ConfigMap, or the gateway was recreated and its entries name the old agent |
 | Admission | banlieue's `ValidatingAdmissionPolicy` on `VirtualMachineClaim` lets a claim name a subject other than its creator only for a listed broker: ConfigMap `banlieue-claim-subject-policy` in banlieue's namespace carries `brokers:` with `system:serviceaccount:banlieue-system:mediatore` and `issuers:` with the Dex issuer URL. Without both, every claim the broker creates is forbidden and the sandbox retries every five seconds, never binding |
 | Pool | `VirtualMachinePool` `sandbox-pool`: `readiness: GuestReady`, `recycleOnImageChange: true`, one warm member, `VMClass` with one NIC on the segment, addresses from the pool's `addressing` and a `userData` stage writing the static network file |
-| Pool image | `VMImage` `mediatore-guest` on the ISO built from `ghcr.io/firestoned/mediatore-guest` at the release's digest (`auroraboot`), three cloud-config layers: the image's base, banlieue's EK layer, the deployment layer (section B's `agent.conf`, the bundle, `/etc/mediatore-guest/env` with `MEDIATORE_URL=https://<gateway sandbox address>:3130`, `/etc/mediatore/gateways`, `/etc/mediatore/registries`, the mirror's CA or `MEDIATORE_PLAIN_HTTP_REGISTRIES`) |
+| Pool image | `VMImage` `mediatore-guest` on the ISO built from `ghcr.io/firestoned/mediatore-guest` at the release's digest (`auroraboot`), three cloud-config layers: the image's base, banlieue's EK layer, the deployment layer (section B's `agent.conf`, `/etc/mediatore-guest/env` with `MEDIATORE_URL=https://<gateway sandbox address>:3130` and the `SPIRE_BUNDLE_*` lines, `/etc/mediatore/bundle-ca.pem` for the bundle endpoint's CA, `/etc/mediatore/gateways`, `/etc/mediatore/registries`, the mirror's CA or `MEDIATORE_PLAIN_HTTP_REGISTRIES`) |
 | Mirror | `registry:2` in proxy mode to `ghcr.io`, listening on the host's own segment address (a forwarded port is refused by the isolated network); declared on the broker with `reach: segment` and on the pool in `/etc/mediatore/registries` |
 | Host table | `inet mediatore_host` on every member: output to the gateways' data port, the relay ports and the mirror alone |
 
@@ -379,4 +379,4 @@ mediatore sandbox create --mediatore https://mediatore.<tailnet> --pool sandbox-
       - { method: POST, path: "/v1/messages/count_tokens" }
 ```
 
-Beyond sections A to H it needs `gateways` and `gateway_inject_port` on the broker, the third Envoy running on each gateway, and the three operator prerequisites, all in the deploying guide ("Placing an audience's credential at the gateway"). The jail sees no credential for this audience. A refusal by the gateway reaches the workload as `502 gateway_refused` and no reachable gateway as `502 gateway_unreachable`. Whether Anthropic accepts a subscription session placed from a gateway address, and whether refreshing it invalidates the person's own login, is the operator's to answer before this is used (ADR-0035, ADR-0040 open question 1). It is not proven live: see the testing guide.
+Beyond sections A to H it needs `gateways` and `gateway_inject_port` on the broker, the third Envoy running on each gateway, and the three operator prerequisites, all in the deploying guide ("Placing an audience's credential at the gateway"). The jail sees no credential for this audience. A refusal by the gateway reaches the workload as `502 gateway_refused` and no reachable gateway as `502 gateway_unreachable`. Whether Anthropic accepts a subscription session placed from a gateway address, and whether refreshing it invalidates the person's own login, is the operator's to answer before this is used (ADR-0035, ADR-0040 open question 1). The inject path itself is proven live: a `Basic` credential placed by a gateway for a git host on 2026-11-16 (ADR-0041, [testing](testing.md)); a subscription bearer for `anthropic` placed from a gateway is not.

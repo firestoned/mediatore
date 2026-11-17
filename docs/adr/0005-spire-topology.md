@@ -7,6 +7,9 @@
 [ADR-0006](0006-registration-entries-as-clusterstaticentry.md) (entry transport: the
 `admin_ids` grant and the gRPC entry endpoint below are replaced by `ClusterStaticEntry`
 resources rendered by the downstream server's controller manager; the topology stands) ·
+**Amended:** 2026-10-22 by
+[ADR-0018](0018-tpm-attestation-with-the-spiffe-plugin.md) (which attestor plugin the
+downstream server runs and what signs the endorsement keys; the identities stand) ·
 **Amended:** 2026-11-07 by [ADR-0031](0031-a-trust-anchor-that-outlives-the-servers-ca.md)
 (the homelab collapse gains the `UpstreamAuthority` this ADR names for the root server:
 OpenBao's PKI engine signs the one server's CA, so the trust domain's root is no longer

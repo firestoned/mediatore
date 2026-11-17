@@ -21,8 +21,8 @@ Do not open a public issue for a security finding, and do not record specific
 unremediated findings in the public [threat model](docs/security/threat-model.md).
 
 You can expect an acknowledgement within a week. Please include the commit or
-release you tested, the component (server, guest agent, workload CLI), and a
-reproduction.
+release you tested, the component (the broker, the guest agent, the egress proxy,
+the gateway's authorizer or one of its Envoys, the user CLI), and a reproduction.
 
 ## What is in scope
 

@@ -13,7 +13,10 @@ claim's SPIFFE identity, and the sandbox is `Ready`.
 
 `POST /v1/claims` with a bearer token whose audience is mediatore creates the resource
 with `spec.subject` taken from the validated token, in the namespace `sandboxes.namespace`
-names in `mediatore.yaml`. The caller never touches the cluster and needs no Kubernetes
+names in `mediatore.yaml` (from the next release, the one the request names with
+`namespace`, `--namespace` on the CLI, among `sandboxes.namespaces`,
+[ADR-0046](../adr/0046-who-may-claim-a-list-of-groups-and-a-namespace-to-groups-mapping.md);
+the answer then carries it). The caller never touches the cluster and needs no Kubernetes
 RBAC. [Running workloads on a claimed VM](running-workloads.md) has the three ways to get
 that token.
 
@@ -25,7 +28,7 @@ curl -sS https://mediatore.sandbox.example/v1/claims \
         "workload": { "image": "registry.internal:5000/sandbox/claude:latest",
                       "args": ["/usr/bin/claude", "-p", "reconcile the ledgers"] },
         "policy_ref": "agents" }'
-# {"name":"sandbox-3f9a1c2e","phase":"Pending","ready":false,"addresses":[]}
+# {"name":"sandbox-3f9a1c2e","namespace":"sandboxes","phase":"Pending","ready":false,"addresses":[]}
 ```
 
 `pool_ref` names one `VirtualMachinePool` in that namespace. To let banlieue pick among
@@ -130,8 +133,11 @@ the same for a named pool and a selected one, and is empty while the sandbox is 
 `spec.policyRef` (`policy_ref` on `POST /v1/claims`, `--policy` on `mediatore sandbox
 create`) names the notaio `SandboxPolicy` the sandbox is under, in the sandbox's own
 namespace ([ADR-0026](../adr/0026-notaio-bundles-verified-in-shadow.md) decision 6). It is
-optional, and in this release it grants and refuses nothing: the broker's configuration is
-still the policy, and the bundle notaio signs for the named policy is read in shadow. What
+optional and refuses nothing: under `policy.egress: enforce`
+([ADR-0030](../adr/0030-policy-egress-enforced-at-the-gateway.md)) the bundle's direct
+egress entries are opened at the gateway; under `shadow`, the default, it grants nothing
+beyond the broker's configuration, and the bundle notaio signs for the named policy is
+read in shadow. What
 naming one does is put on the claim record the policy's uid and the version of the verified
 bundle current when the claim was created, and give the comparison below something to
 compare with. A sandbox naming a policy with no verified bundle (no such policy, or none
@@ -153,7 +159,8 @@ With a `policy` section configured, every sandbox carries a `PolicyConformant` c
 `True` when the broker's configuration allows the sandbox nothing the bundle does not,
 `False` with a code per gap in its message, `Unknown` until the broker has read the
 namespace's bundles. [The policy bundle, in shadow](the-policy-bundle.md) has the codes
-and how to read them. None of it changes what the sandbox gets.
+and how to read them. None of it changes what the sandbox gets; only `policy.egress:
+enforce` does, above.
 
 ### Who may name which subject
 

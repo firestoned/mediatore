@@ -3,8 +3,13 @@
 
 # ADR-0025: The egress proxy, a phantom token in the jail and the real one in a process the workload cannot read
 
-**Status:** Accepted · **Date:** 2026-10-30 · **Amended:** 2026-10-30 (decision 7, the
-audience's own CA) · 2026-11-08 (decision 8, a route without a credential)
+**Status:** Implemented · **Date:** 2026-10-30 · **Amended:** 2026-10-30 (decision 7, the
+audience's own CA) · 2026-11-08 (decision 8, a route without a credential) · 2026-11-08 by
+[ADR-0032](0032-operator-held-credentials-as-an-audience-backend.md) (decision 3: the phantom
+may be presented where the credential will go) · 2026-11-15 by
+[ADR-0040](0040-the-gateway-places-an-audiences-credential-the-pool-never-holds-it.md)
+(decisions 1 to 3: for an audience with `inject: gateway`, the swap moves from the guest's
+proxy to the gateway)
 
 Roadmap 07, the credential-injecting egress proxy: phase 2 of the delegation model that
 [ADR-0003](0003-token-backends.md) recorded as a trade-off and that threat model R-3
@@ -86,6 +91,15 @@ audience, and the audience chooses the token.
    carries, and a credential baked into an image is exactly what the policy must not
    let through. The phantom is not a secret in the usual sense: it is useless anywhere
    but at this proxy, from this uid, during this claim.
+
+   *Amended 2026-11-08 by
+   [ADR-0032](0032-operator-held-credentials-as-an-audience-backend.md) (decision 3): the
+   phantom may be presented in whichever header the audience's credential will go, not only
+   `Authorization`. Amended 2026-11-15 by
+   [ADR-0040](0040-the-gateway-places-an-audiences-credential-the-pool-never-holds-it.md)
+   (decisions 1 to 3): for an audience with `inject: gateway`, the proxy forwards the phantom
+   to the gateway and the gateway's authorizer makes the swap; the guest's proxy still never
+   lets a non-phantom credential through.*
 
 4. **nono's endpoint rules, per audience, in the broker's config, enforced by the
    proxy.** `audiences[].rules` is a list of `{ method, path }`: `method` an HTTP method or

@@ -3,14 +3,24 @@
 
 # ADR-0020: The jail's network is the guest's, bounded by nftables keyed by the sandbox uid
 
-**Status:** Accepted · **Date:** 2026-10-24 · **Amended:** 2026-10-31 (decision 1, no user
+**Status:** Implemented · **Date:** 2026-10-24 · **Implemented:** 2026-10-24 (roadmap 06:
+`crates/mediatore-guest/src/net.rs`, `jail.rs`; live on a libvirt member 2026-10-31) ·
+**Amended:** 2026-10-30 by [ADR-0025](0025-phantom-token-egress-proxy.md) decision 5
+(decisions 2 and 3: the sandbox uid's chain admits the proxy's loopback port, the proxy's
+own sockets carry the same uid, and a packet to that port from any other uid is dropped);
+2026-10-31 (decision 1, no user
 namespace); 2026-11-04 by [ADR-0028](0028-egress-gateway-envoy-with-spiffe-identity.md)
 decision 6 and [ADR-0027](0027-control-plane-relay-on-the-egress-gateway.md) decision 6
 (decisions 2 to 4: in an environment with egress gateways the destinations are the
 gateways' `sandbox` addresses and the broker through the control relay, by address, with
 no audience endpoint and no DNS rule; names are refused there, not resolved. Without a
 gateway the ruleset below stands, and the proxy dials the audiences' endpoints directly.
-`crates/mediatore-guest/src/net.rs`, `Shape`)
+`crates/mediatore-guest/src/net.rs`, `Shape`); 2026-11-04 by
+[ADR-0029](0029-the-pull-on-a-routeless-segment-and-the-pool-vms-root-rules.md)
+(decision 3's root-level rules and input chain, left to the image, are built:
+`image/host-table`); 2026-11-12 by
+[ADR-0036](0036-proc-inside-the-jail-the-workloads-own-processes-only.md) (the jail mounts
+a `/proc` of its own processes; nothing else about the jail changes)
 
 Roadmap 06, the network item. Implements mediatore's share of
 [ADR-0010](0010-no-inbound-to-sandboxes.md) (no inbound to sandboxes; in-guest nftables
@@ -76,7 +86,11 @@ come from, when the ruleset is loaded, and what happens when it cannot be.
    the input chain of ADR-0010's outline belong with the image, once its system users
    (DHCP, NTP, the SPIRE agent) are known; roadmap 06 keeps that item. `nft -f` applies
    the ruleset atomically; a stale table from an earlier claim is replaced in the same
-   transaction.
+   transaction. *Done 2026-11-04 by
+   [ADR-0029](0029-the-pull-on-a-routeless-segment-and-the-pool-vms-root-rules.md)
+   decisions 1 to 4: the image loads `inet mediatore_host` from the pool's own files before
+   the agent and the guest (`image/host-table`, `image/systemd/mediatore-host-nft.service`):
+   input and forward dropped, output to the gateways and the registries alone.*
 
 4. **Names are resolved by the guest at load time.** The set holds addresses, so the log
    and the ruleset's hash say exactly what was admitted. A destination that does not
@@ -113,10 +127,13 @@ come from, when the ruleset is loaded, and what happens when it cannot be.
   netlink and wants `CAP_NET_ADMIN` even to check.
 - The workload shares the VM's interfaces. It can open a listening socket; nothing reaches
   it, because ADR-0010 decision 1 is enforced by the segment, and the input chain is the
-  image item above. Recorded in the threat model.
+  image item above (built 2026-11-04, `image/host-table`, ADR-0029). Recorded in the
+  threat model.
 - DNS to the VM's resolvers is open for the sandbox uid, by name of any zone: a covert
   channel bounded by the resolver's logging and the claim's deadline, recorded as an
-  accepted risk until the egress proxy of roadmap 07 answers names itself.
+  accepted risk until the egress proxy of roadmap 07 answers names itself. (Only without
+  gateways: in the gateway shape the sandbox uid's chain has no DNS rule and names are
+  refused, ADR-0028 decision 6; `Shape` in `crates/mediatore-guest/src/net.rs`.)
 - Rejected: a namespace per jail with a `veth` pair and NAT (the uid is lost behind the
   translation, and the guest would carry a router); the relay socket of ADR-0010 decision
   5 as written (it rebuilds the mTLS client as a proxy, which is roadmap 07's design, with

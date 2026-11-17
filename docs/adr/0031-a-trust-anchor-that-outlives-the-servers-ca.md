@@ -3,7 +3,7 @@
 
 # ADR-0031: The agent's trust anchor outlives the server's CA: OpenBao's PKI as the upstream authority
 
-**Status:** Implemented · **Date:** 2026-11-07 (the homelab cluster's switch is roadmap 02's open item) · **Amended:** 2026-11-14 by [ADR-0037](0037-the-pool-fetches-its-spire-bundle-at-boot-through-the-relay.md) (decision 4: where the SPIRE bundle endpoint serves a web PKI certificate, the first-boot bundle is fetched through the relay, not baked; this ADR's upstream root stays the stronger option and the two coexist)
+**Status:** Implemented 2026-11-07; the homelab cluster switched 2026-11-08 (roadmap 02; the notes at the end) · **Date:** 2026-11-07 · **Amended:** 2026-11-14 by [ADR-0037](0037-the-pool-fetches-its-spire-bundle-at-boot-through-the-relay.md) (decision 4: where the SPIRE bundle endpoint serves a web PKI certificate, the first-boot bundle is fetched through the relay, not baked; this ADR's upstream root stays the stronger option and the two coexist)
 
 Roadmap 02 (the server) and roadmap 06 (the layer that carries the bundle). Amends
 [ADR-0027](0027-control-plane-relay-on-the-egress-gateway.md) decision 3 (what the bundle the
@@ -105,7 +105,7 @@ and the `root/sign-intermediate` path, which the SPIRE plugin uses.
    the server's own CA deliberately absent from it, and the node attests; a check reads
    `bundle show` and asserts its roots are the OpenBao root and nothing self-signed.
    `dev/kind/spire/` and the server configuration are the TPM attestation path, so the
-   tier runs on the build host before the change is handed back (`rules/testing.md`).
+   tier runs on the build host before the change is handed back (`.claude/rules/testing.md`).
 
 7. **Deployed as a component.** `deploy/spire-upstream/`: the `server.conf` fragment with
    the `UpstreamAuthority "vault"` block (address, mount, CA reference and role as
@@ -194,7 +194,7 @@ roadmap 02's open item and an operator's run.
   row for the first-boot window the rc.3 and rc.4 live runs hit, **R-7 revised** (the key
   on the server's volume is now a 24-hour intermediate's), **R-21 new** (OpenBao as a
   dependency of CA rotation).
-- **On the homelab cluster, 2026-11-08** (roadmap 02). The OpenBao of ADR-0004 was already
+- **On the homelab cluster, 2026-11-08** (roadmap 02). The OpenBao of ADR-0015 was already
   there, so the PKI mount, root, policy and role went beside notaio's transit key; the
   server is a Helm release there, so decision 7's component became the chart's
   `upstreamAuthority.vault` values with the same CA ConfigMap and projected token. Two

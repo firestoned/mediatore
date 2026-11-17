@@ -3,7 +3,15 @@
 
 # ADR-0012: One sqlx store over SQLite or PostgreSQL, refresh material sealed before it, rows swept into an audit table
 
-**Status:** Accepted · **Date:** 2026-10-14
+**Status:** Implemented · **Date:** 2026-10-14 · **Implemented:** 2026-10-14 (roadmap 05) ·
+**Amended:** 2026-11-01 by [ADR-0026](0026-notaio-bundles-verified-in-shadow.md) decision 5
+(a `policy_floors` table beside the claims) · **Superseded in part:** 2026-11-09 by
+[ADR-0034](0034-the-kubernetes-api-as-the-brokers-store.md) (the engine: decisions 1 and 2,
+the audit table of decision 4 and the SQL half of decision 5 are gone with sqlx, SQLite
+and PostgreSQL; the record is the `AgentSandbox` status, the session a Secret, the node a
+`SandboxNode`. What stands: decision 3, the sealed envelope; decision 6, the record as a
+copy; the retention window and the leader's sweep; the store conformance suite,
+`crates/mediatore-store/src/conformance.rs`)
 
 Roadmap 05. Builds on [ADR-0008](0008-agentsandbox-crd-owned-by-mediatore.md) (the
 request fields live on the `AgentSandbox` resource; the store keeps what cannot sit on a
@@ -101,7 +109,7 @@ refuses it after a reopen; a bound claim's entry is not declared twice after a r
 node that registered is found after a reopen; a sealed envelope opens only for its claim;
 a swept claim leaves an audit row and no claim row. R-5 is deleted. The fake is held to
 the real thing: any behaviour the SQL store has that `MemoryStore` lacks is added to
-`MemoryStore` in the same change (`rules/testing.md`).
+`MemoryStore` in the same change (`.claude/rules/testing.md`).
 
 **6. The record is still a copy.** ADR-0008 moved the request fields to the resource. The
 row keeps a copy of subject, audiences, workload and TTL so that `/v1/me` and `/v1/token`
@@ -109,6 +117,14 @@ answer from the store without a Kubernetes round trip on the sandbox path. The r
 is the source of truth: the reconciler writes the row from it and never the other way.
 
 ## Consequences
+
+*Superseded 2026-11-09 by [ADR-0034](0034-the-kubernetes-api-as-the-brokers-store.md):*
+none of the SQL artifacts below exist any more. `crates/mediatore-store/src` holds `lib.rs`
+(the trait and the memory store), `seal.rs` and `conformance.rs`; sqlx is not in the
+tree; the `store` section is `retention_secs`, `node_grace_secs` and `sealing`
+(`crates/mediatore/src/config.rs`); the Deployment reads no `MEDIATORE_STORE_URL` and the
+kind tiers run no PostgreSQL. The sealing, retention and restart-recovery consequences
+hold as ADR-0034 restates them.
 
 - `crates/mediatore-store` gains `SqlStore` (`src/sql.rs`), the migrations
   (`migrations/sqlite/`, `migrations/postgres/`), the `Sealed` envelope and `Sealer`
@@ -127,6 +143,8 @@ is the source of truth: the reconciler writes the row from it and never the othe
   sweep; a new boundary row covers the broker to database leg (credentials in a Secret,
   TLS `verify-full`, no plaintext refresh material at rest).
 - Roadmap 04 implements the transit sealer and the first caller of `Sealer`; until then
-  `LocalKeySealer` is tested and wired at startup but seals nothing.
+  `LocalKeySealer` is tested and wired at startup but seals nothing. (Done: the first
+  sealed plaintext is the delegated session of ADR-0013, 2026-10-14, and the transit
+  sealer is `TransitSealer`, ADR-0015, 2026-10-15.)
 - A second migration set is the price of one query set. A query that works on SQLite
   and not PostgreSQL is caught by the kind tier, not by `make check`.
