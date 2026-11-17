@@ -1057,7 +1057,10 @@ mod tests {
             };
             assert!(bad.validate().is_err(), "{seqs:?}");
         }
-        assert!(LogBatch::default().validate().is_ok(), "an empty batch is valid");
+        assert!(
+            LogBatch::default().validate().is_ok(),
+            "an empty batch is valid"
+        );
     }
 
     #[test]
@@ -1083,12 +1086,19 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(b.records[0].stream, LogStream::Stderr);
-        assert_eq!((b.dropped_stdout, b.dropped_stderr), (0, 0), "dropped counts default to 0");
+        assert_eq!(
+            (b.dropped_stdout, b.dropped_stderr),
+            (0, 0),
+            "dropped counts default to 0"
+        );
         assert_eq!(
             serde_json::to_value(LogEnd::ClaimEnded).unwrap(),
             serde_json::json!("claim_ended")
         );
-        assert_eq!(serde_json::to_value(LogEnd::Ttl).unwrap(), serde_json::json!("ttl"));
+        assert_eq!(
+            serde_json::to_value(LogEnd::Ttl).unwrap(),
+            serde_json::json!("ttl")
+        );
     }
 
     #[test]
