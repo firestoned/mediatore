@@ -514,7 +514,7 @@ async fn create_sandbox_in_the_default_namespace_is_byte_identical_to_before() {
             "workload": { "args": ["sh"], "image": "registry.internal:5000/sandbox:latest" },
         })
     );
-    assert_eq!(got["apiVersion"], "mediatore.io/v1alpha1");
+    assert_eq!(got["apiVersion"], "mediatore.io/v1beta1");
     assert_eq!(got["kind"], "AgentSandbox");
     assert!(
         got.get("status").is_none(),

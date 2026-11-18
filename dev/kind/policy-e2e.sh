@@ -77,7 +77,7 @@ wait_for() { # <seconds> <description> <command...>
 # check, as POST /v1/claims does.
 manifest() {
   cat <<YAML
-apiVersion: mediatore.io/v1alpha1
+apiVersion: mediatore.io/v1beta1
 kind: AgentSandbox
 metadata:
   name: $1

@@ -37,7 +37,7 @@ spec:
     - jsonPath: .metadata.creationTimestamp
       name: Age
       type: date
-    name: v1alpha1
+    name: v1beta1
     schema:
       openAPIV3Schema:
         description: "AgentSandbox is the record of one sandbox request (ADR-0008): mediatore creates and owns one VirtualMachineClaim for it, pins spec.subject to the caller at admission, and reports the claim's status plus whether the claim's registration entry is set."

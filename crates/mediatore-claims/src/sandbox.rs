@@ -131,7 +131,7 @@ impl From<RestartPolicy> for SandboxRestart {
 #[derive(CustomResource, Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[kube(
     group = "mediatore.io",
-    version = "v1alpha1",
+    version = "v1beta1",
     kind = "AgentSandbox",
     plural = "agentsandboxes",
     shortname = "asb",
@@ -1482,7 +1482,10 @@ mod tests {
     fn the_schema_requires_what_the_reconciler_assumes() {
         let crd = serde_json::to_value(AgentSandbox::crd()).unwrap();
         let v = &crd["spec"]["versions"][0];
-        assert_eq!(v["name"], "v1alpha1");
+        // ADR-0048: the one served and stored version.
+        assert_eq!(crd["spec"]["versions"].as_array().map(Vec::len), Some(1));
+        assert_eq!(v["name"], "v1beta1");
+        assert_eq!((&v["served"], &v["storage"]), (&json!(true), &json!(true)));
         assert!(
             v["subresources"]["status"].is_object(),
             "status subresource"
@@ -1516,28 +1519,6 @@ mod tests {
             spec["properties"]["poolSelector"]["properties"]["matchLabels"].is_object(),
             "poolSelector is a LabelSelector: {spec}"
         );
-        // ADR-0047 decision 1: optional, and exactly the strategies banlieue has, so an
-        // unknown one is refused by the API server before the reconciler runs.
-        assert!(
-            !required.contains(&"selection"),
-            "selection is optional (ADR-0047)"
-        );
-        let strategy = &spec["properties"]["selection"]["properties"]["strategy"];
-        let mut values: Vec<&str> = strategy
-            .get("enum")
-            .and_then(|e| e.as_array())
-            .map(|e| e.iter().filter_map(|v| v.as_str()).collect())
-            .or_else(|| {
-                strategy["oneOf"].as_array().map(|alts| {
-                    alts.iter()
-                        .flat_map(|a| a["enum"].as_array().into_iter().flatten())
-                        .filter_map(|v| v.as_str())
-                        .collect()
-                })
-            })
-            .unwrap_or_else(|| panic!("no enum on selection.strategy: {strategy}"));
-        values.sort_unstable();
-        assert_eq!(values, ["LongestReady", "MostAvailable", "Spread"]);
         let pool = v["additionalPrinterColumns"]
             .as_array()
             .unwrap()
@@ -1589,6 +1570,41 @@ mod tests {
     /// ADR-0046 decision 14: a create into a namespace that does not exist is the API server's
     /// 404, which is no refusal the broker names: it is `Api`, and the user API answers it with
     /// `500 internal` (`a_listed_namespace_that_does_not_exist_fails_the_create_and_parks_nothing`).
+    /// ADR-0047 decision 1: `selection` is optional and its `strategy` lists exactly the
+    /// strategies banlieue has, so an unknown one is refused by the API server before the
+    /// reconciler runs.
+    #[test]
+    fn the_schema_lists_banlieues_strategies_and_no_other() {
+        let crd = serde_json::to_value(AgentSandbox::crd()).unwrap();
+        let spec = &crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"];
+        let required: Vec<&str> = spec["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s.as_str().unwrap())
+            .collect();
+        assert!(
+            !required.contains(&"selection"),
+            "selection is optional (ADR-0047)"
+        );
+        let strategy = &spec["properties"]["selection"]["properties"]["strategy"];
+        let mut values: Vec<&str> = strategy
+            .get("enum")
+            .and_then(|e| e.as_array())
+            .map(|e| e.iter().filter_map(|v| v.as_str()).collect())
+            .or_else(|| {
+                strategy["oneOf"].as_array().map(|alts| {
+                    alts.iter()
+                        .flat_map(|a| a["enum"].as_array().into_iter().flatten())
+                        .filter_map(|v| v.as_str())
+                        .collect()
+                })
+            })
+            .unwrap_or_else(|| panic!("no enum on selection.strategy: {strategy}"));
+        values.sort_unstable();
+        assert_eq!(values, ["LongestReady", "MostAvailable", "Spread"]);
+    }
+
     #[test]
     fn a_404_from_the_api_server_is_the_catch_all_error() {
         let status = kube::core::Status::failure("namespaces \"team-a\" not found", "NotFound")
@@ -1615,7 +1631,7 @@ mod tests {
         let owner = &claim.owner_references()[0];
         assert_eq!(
             (owner.kind.as_str(), owner.api_version.as_str()),
-            ("AgentSandbox", "mediatore.io/v1alpha1")
+            ("AgentSandbox", "mediatore.io/v1beta1")
         );
         assert_eq!(owner.uid, SB_UID);
         assert_eq!(

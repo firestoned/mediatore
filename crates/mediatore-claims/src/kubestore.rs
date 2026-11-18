@@ -25,7 +25,7 @@ use k8s_openapi::ByteString;
 use k8s_openapi::api::core::v1::Secret;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{OwnerReference, Time};
 use kube::api::{DeleteParams, ListParams, Patch, PatchParams, PostParams};
-use kube::{Api, Client, CustomResource, ResourceExt};
+use kube::{Api, Client, CustomResource, Resource, ResourceExt};
 use mediatore_proto::{
     ClaimReport, LOG_SEGMENT_BYTES, LogBatch, LogEntry, LogGap, Provider, Subject, Workload,
     WorkloadExit,
@@ -943,7 +943,8 @@ fn owner_refs(home: &str, sb: &AgentSandbox) -> Option<Vec<OwnerReference>> {
 
 fn owner_of(sb: &AgentSandbox) -> OwnerReference {
     OwnerReference {
-        api_version: "mediatore.io/v1alpha1".into(),
+        // From the type, so the version cannot drift from the derive (ADR-0048 decision 3).
+        api_version: AgentSandbox::api_version(&()).into_owned(),
         kind: "AgentSandbox".into(),
         name: sb.name_any(),
         uid: sb.metadata.uid.clone().unwrap_or_default(),
@@ -1827,7 +1828,7 @@ mod tests {
                 return match (method, path.ends_with("/agentsandboxes")) {
                     ("GET", true) => (
                         200,
-                        serde_json::json!({"apiVersion": "mediatore.io/v1alpha1",
+                        serde_json::json!({"apiVersion": "mediatore.io/v1beta1",
                             "kind": "AgentSandboxList", "metadata": {"resourceVersion": "1"},
                             "items": st.sandboxes}),
                     ),
@@ -2391,7 +2392,7 @@ mod tests {
         seg.push(LogEntry::Record(log_record(42, "second")));
         seg.resource_version = Some("12".into());
         let owner = OwnerReference {
-            api_version: "mediatore.io/v1alpha1".into(),
+            api_version: "mediatore.io/v1beta1".into(),
             kind: "AgentSandbox".into(),
             name: "sb".into(),
             uid: sandbox_uid.to_string(),

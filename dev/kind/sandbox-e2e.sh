@@ -75,7 +75,7 @@ log_has() { broker_logs | grep -F "$1" | grep -qF "${2:-}"; }
 manifest() {
   local pool=${4-"poolRef: { name: e2e }"}
   cat <<YAML
-apiVersion: mediatore.io/v1alpha1
+apiVersion: mediatore.io/v1beta1
 kind: AgentSandbox
 metadata:
   name: $1

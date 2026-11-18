@@ -87,7 +87,7 @@ spec:
   matchConstraints:
     resourceRules:
       - apiGroups: ["mediatore.io"]
-        apiVersions: ["v1alpha1"]
+        apiVersions: ["v1beta1"]
         operations: ["CREATE", "UPDATE"]
         resources: ["agentsandboxes"]
   variables:

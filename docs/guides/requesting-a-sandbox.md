@@ -3,7 +3,8 @@
 
 # Requesting a sandbox
 
-A sandbox request is an `AgentSandbox` resource (`mediatore.io/v1alpha1`,
+A sandbox request is an `AgentSandbox` resource (`mediatore.io/v1beta1`,
+[ADR-0048](../adr/0048-agentsandbox-served-as-v1beta1.md);
 [ADR-0008](../adr/0008-agentsandbox-crd-owned-by-mediatore.md)). There are two ways to
 create one, and everything after creation is the same: mediatore creates and owns one
 `VirtualMachineClaim` for it, banlieue binds a warm pool member, mediatore declares the
@@ -115,7 +116,7 @@ resource). `selection: { strategy: Spread }` says how banlieue ranks the members
 `LongestReady`, `MostAvailable` and `Spread` is refused by the schema.
 
 ```yaml
-apiVersion: mediatore.io/v1alpha1
+apiVersion: mediatore.io/v1beta1
 kind: AgentSandbox
 metadata:
   name: ledgers-2026-10-14

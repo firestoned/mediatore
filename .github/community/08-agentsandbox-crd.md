@@ -4,7 +4,7 @@
 # 08: AgentSandbox CRD and reconciler
 
 **Status: done (2026-10-14).** Built [ADR-0008](../../docs/adr/0008-agentsandbox-crd-owned-by-mediatore.md):
-`AgentSandbox` (`mediatore.io/v1alpha1`) becomes the record of a sandbox request, reconciled
+`AgentSandbox` (`mediatore.io/v1beta1` since [ADR-0048](../../docs/adr/0048-agentsandbox-served-as-v1beta1.md), 2026-11-18; `v1alpha1` before) becomes the record of a sandbox request, reconciled
 by mediatore, which creates and owns the one `VirtualMachineClaim` behind it. The design came
 from banlieue's ADR-0055, which was never built there and is superseded by ADR-0008.
 
@@ -46,6 +46,12 @@ roadmap 05: the store keeps only what cannot sit on a custom resource.
       `--strategy` on `sandbox create`; the CRD re-rendered; the kind sandbox tier gains the
       `Spread` sandbox and the refused `Pack`. Lands with `banlieue-api` v0.5.10. The outcome
       is on the claim's `Bound` condition, not mirrored. Not yet run live
+- [x] [ADR-0048](../../docs/adr/0048-agentsandbox-served-as-v1beta1.md) (2026-11-18):
+      `mediatore.io/v1beta1`, the one served and stored version; the schema unchanged;
+      `v1alpha1` not served (a manifest naming it is refused by the API server); the admission
+      policy matches `v1beta1`; owner references from the type; the kind tiers' manifests and
+      the guides moved. Cut-over on a cluster with the old CRD: every sandbox gone, the CRD
+      deleted or its stored versions patched, then the base applied. Not yet applied live
 - [x] Reconciler on the roadmap 03 leader-elected loop (`Watcher::reconcile_sandbox`, a
       third `Controller` owning the claims): create the owned claim, write the record,
       mirror the status, `ready` only when the claim is `Bound` and the entry is set
