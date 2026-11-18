@@ -83,6 +83,12 @@ pub struct SandboxWorkload {
     /// ends the claim), `never` (any exit ends the claim).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restart: Option<SandboxRestart>,
+    /// The requester's opt-in to output capture (ADR-0045 decision 1, amended): `true` and
+    /// the guest tees, redacts and ships the workload's stdout and stderr to the broker, where
+    /// the subject reads them with `GET /v1/claims/{name}/logs`. Off by default; a sandbox
+    /// that opts in on a broker whose `logs` section is off is refused before any claim exists.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub logs: bool,
 }
 
 /// [`mediatore_proto::RestartPolicy`] as the resource spells it.
@@ -283,6 +289,7 @@ impl From<&SandboxWorkload> for Workload {
             image: w.image.clone(),
             args: w.args.clone(),
             restart: w.restart.map(RestartPolicy::from).unwrap_or_default(),
+            logs: w.logs,
         }
     }
 }
@@ -293,6 +300,7 @@ impl From<&Workload> for SandboxWorkload {
             image: w.image.clone(),
             args: w.args.clone(),
             restart: (!w.restart.is_always()).then(|| SandboxRestart::from(w.restart)),
+            logs: w.logs,
         }
     }
 }
@@ -580,6 +588,11 @@ impl Watcher {
         }
         if !self.cfg.issuers.iter().any(|i| i == &spec.subject.issuer) {
             return Some(format!("issuer {} is not configured", spec.subject.issuer));
+        }
+        // The requester asked for the workload's output and this broker stores none (ADR-0045
+        // decision 11): a claim that ran with its output dropped would be a silent no.
+        if spec.workload.logs && !self.cfg.logs_enabled {
+            return Some("workload.logs: output capture is not enabled on this broker".into());
         }
         // The guest would refuse the image at bind (ADR-0021), and a gateway-era pool
         // reaches its declared registries and no other (ADR-0029): say so here.
@@ -1151,6 +1164,7 @@ mod tests {
                     image: "ghcr.io/example/workload:1".into(),
                     args: vec!["sh".into()],
                     restart: None,
+                    logs: false,
                 },
                 policy_ref: None,
             },
@@ -1795,6 +1809,51 @@ mod tests {
                 "{want}: no record"
             );
         }
+    }
+
+    /// ADR-0045 decision 11: a sandbox that asks for its workload's output on a broker that
+    /// stores none is refused before any claim exists; with `logs.enabled` the same spec is
+    /// admitted.
+    #[tokio::test]
+    async fn a_sandbox_asking_for_its_output_is_refused_unless_the_broker_stores_it() {
+        let r = rig(cfg());
+        let mut sb = sandbox(true, false);
+        sb.spec.workload.logs = true;
+        r.claims.put_sandbox(sb.clone());
+        assert_eq!(
+            r.watcher.reconcile_sandbox(&sb).await.unwrap(),
+            Action::await_change()
+        );
+        let st = r
+            .claims
+            .sandbox("sandboxes", "sb-1")
+            .unwrap()
+            .status
+            .unwrap();
+        assert_eq!(st.phase, SandboxPhase::Failed);
+        assert_eq!(
+            st.reason.as_deref(),
+            Some("workload.logs: output capture is not enabled on this broker")
+        );
+        assert!(r.claims.claim("sandboxes", "sb-1").is_none(), "no claim");
+
+        let r = rig(WatcherConfig {
+            logs_enabled: true,
+            ..cfg()
+        });
+        r.claims.put_sandbox(sb.clone());
+        r.watcher.reconcile_sandbox(&sb).await.unwrap();
+        let held = r.claims.sandbox("sandboxes", "sb-1").unwrap();
+        assert_ne!(
+            held.status.as_ref().unwrap().phase,
+            SandboxPhase::Failed,
+            "with output storage on the opt-in is admitted: {:?}",
+            held.status.as_ref().unwrap().reason
+        );
+        assert!(
+            r.claims.claim("sandboxes", "sb-1").is_some(),
+            "the claim is created"
+        );
     }
 
     #[tokio::test]

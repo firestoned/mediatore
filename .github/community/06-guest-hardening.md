@@ -173,6 +173,18 @@
       the broker `POST /v1/me/exit` when the policy ends the claim, the broker recording
       the exit and releasing the claim as a delete does; `--restart` on `sandbox create`,
       the exit on `sandbox get`. The live run with the example agent: 2026-11-09, `docs/guides/testing.md` run 7
+- [x] The workload's output. Nothing captured what the jailed workload printed: a one-shot
+      agent's answer was readable only on the VM console. Done 2026-11-17 as
+      [ADR-0045](../../docs/adr/0045-a-sandbox-workloads-output-streamed-to-its-owner.md),
+      the capture a per-sandbox opt-in (`workload.logs`, `--logs`): `supervise::run` spawns
+      the jail with piped stdout and stderr when the claim asks, `logs.rs` redacts every line
+      in the VM (`redact.rs`: the phantom and every secret-bearing environment value literally
+      and encoded, JWTs, `Authorization` values and private keys by shape; best effort, the
+      ADR says why that bounds nothing), writes the redacted copy to the console, queues it
+      (1 MiB, drop-oldest, the loss counted and sent as a gap) and ships batches to
+      `POST /v1/me/logs` over the node SVID every two seconds or at 32 KiB, honouring `429`,
+      stopping on `501`, flushing for five seconds before the exit is reported. The broker and
+      CLI side is roadmap 08's item. Not yet run live on a Kairos VM
 - [ ] A tier that runs the guest under the image's own units on a Kairos VM, on the
       build host: the kind tiers run the guest in a pod with `--dev-skip-setup`, which is
       how six of the defects above reached a release candidate. The shape: the ISO built

@@ -297,6 +297,68 @@ What happens when your command exits before the deadline is the claim's `workloa
 non-zero exit and ends the claim on `0` (an agent that runs once), `never` ends the claim
 on any exit. The exit goes on the claim's record and the member is recycled.
 
+What your command prints is, by default, visible on the VM console and nowhere else. Opt the
+claim in with `--logs` (`workload.logs: true`;
+[ADR-0045](../adr/0045-a-sandbox-workloads-output-streamed-to-its-owner.md)) and the guest
+tees stdout and stderr, redacts each line before it leaves the VM (the phantom and every
+secret-bearing value it placed in the jail, literally and in their base64 and percent-encoded
+forms; JWTs, `Authorization` values and private-key PEM blocks by shape), and ships them to the
+broker in batches; `mediatore sandbox logs -f <name>` prints them as they arrive, stdout to
+stdout and stderr to stderr so `2>&1` merges them as a terminal would, and a plain `mediatore
+sandbox logs <name>` reads a finished one-shot workload's output for the retention window after
+it ended. The workload never waits for the broker: a slow or unreachable one costs the queue's
+oldest lines, which the reader sees as an explicit gap, never silence. Redaction is best effort
+and the broker keeps the newest `logs.max_bytes` (1 MiB by default) per claim; the exit code
+stays on `sandbox get`. The broker needs `logs.enabled: true`, or the claim is refused.
+
+### Reading the output
+
+```sh
+# Ask for the output when you create the sandbox. Without --logs nothing is captured.
+mediatore sandbox create --mediatore https://mediatore.sandbox.example --pool pool-a \
+  --audience api://trading-data --image ghcr.io/example/agent:1 --arg /agent --arg run --logs
+
+# Stream it as it arrives; the stream ends when the claim does.
+mediatore sandbox logs -f my-agent
+
+# After a one-shot workload has exited: the last 50 records, with the time the guest read each.
+mediatore sandbox logs --tail 50 --timestamps my-agent
+
+# Resume from a sequence number you saw earlier (every record carries one).
+mediatore sandbox logs --since 1200 my-agent
+
+# A sandbox declared as an AgentSandbox in another namespace.
+mediatore sandbox logs --namespace team-a -f my-agent
+```
+
+The CLI reads `GET /v1/claims/{name}/logs`, which any client with the session bearer can
+call directly. The body is NDJSON: a header line, then one line per record or gap in
+sequence, then an end line saying why the stream stopped (`client`, `claim_ended`, `ttl`).
+`?follow=true` holds the connection open and sends an empty line every 15 s as a keepalive;
+`?tail=N`, `?since=SEQ` and `?namespace=` match the flags above.
+
+```sh
+curl -sN -H "Authorization: Bearer $SESSION" \
+  "https://broker.sandbox.home.example/v1/claims/my-agent/logs?follow=true&tail=20"
+```
+
+Where it lives and for how long:
+
+- **In the cluster**, as a ring of Secrets in the broker's namespace, one per 64 KiB segment,
+  named `mediatore-logs-<claim uid>-<segment>` and labelled `mediatore.io/logs=segment`.
+  `kubectl -n mediatore get secrets -l mediatore.io/logs=segment` lists them; reading one
+  directly is break-glass and shows in the API server's audit log. Under `dev_mode` the
+  in-memory store keeps the same ring and loses it on restart.
+- **The newest `logs.max_bytes`** per claim (1 MiB by default, 64 KiB to 4 MiB). Older
+  records are dropped and the reader is told how many bytes went that way.
+- **For the claim's life, then `logs.retention_secs`** after it ends (default
+  `store.retention_secs`, one hour). The watcher's resync and the audit sweep remove rings
+  past that window and rings whose claim record is gone; deleting the `AgentSandbox` removes
+  them at once when it lives in the broker's namespace.
+- **Only the claim's subject** can read them through the broker. Nothing is stored unless
+  the requester passed `--logs` and the operator set `logs.enabled: true`
+  ([the store guide](the-store.md#workload-output) has the operator side).
+
 ## Interaction patterns
 
 Because nothing inbound reaches the VM, pick one of:
@@ -314,8 +376,11 @@ Because nothing inbound reaches the VM, pick one of:
    speaks HTTP/1.1; a WebSocket upgrade is not relayed, so a dial-out relay is a plain
    HTTPS API or a long poll.
 3. **Poll-the-broker.** The caller polls `GET /v1/claims/{name}` for phase and
-   deadline; that endpoint mirrors state but never carries workload output. Output
-   always travels via pattern 1 or 2.
+   deadline; that endpoint mirrors state but never carries workload output. With `--logs`
+   the caller can also read what the workload printed, `GET /v1/claims/{name}/logs`
+   (`mediatore sandbox logs`, [ADR-0045](../adr/0045-a-sandbox-workloads-output-streamed-to-its-owner.md)):
+   the answer of a one-shot agent, redacted in the VM and bounded in size and time, for the
+   owner alone. Structured results still travel via pattern 1 or 2.
 
 ## Status and caveats
 

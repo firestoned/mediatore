@@ -163,6 +163,10 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
             .map(|a| (a.name.clone(), a.inject_routes()))
             .collect(),
         inject_port: cfg.gateway_inject_port,
+        // A workload's output (ADR-0045 decision 11): the ring's cap when `logs.enabled`, else
+        // `None` and both routes fail closed with `501`.
+        logs: cfg.log_limits(),
+        log_limiter: mediatore_api::Limiter::per_second(1),
         store,
         spire,
         naming: naming.clone(),
@@ -317,6 +321,8 @@ async fn claim_watcher(
             reachable_registries: cfg.reachable_registries(),
             placed_registries: cfg.placed_registries(),
             retention: std::time::Duration::from_secs(cfg.store.retention_secs),
+            logs_enabled: cfg.logs.enabled,
+            logs_retention: cfg.log_retention(),
             egress_mode: cfg.policy.as_ref().map(|p| p.egress).unwrap_or_default(),
             delegated_audiences: cfg
                 .audiences

@@ -17,6 +17,7 @@ a restart.
 | The claim record: the SPIRE entry id, the bound node, the bind deadline, the revocation, the policy incarnation and bundle version the claim was created under, the guest's report, the workload's exit | `AgentSandbox.status.record`, written by the store alone (the reconciler's mirroring leaves it out of its patches) | the label `mediatore.io/claim-uid` (the claim's UID, the record's key) and `mediatore.io/node` (a digest of the bound node's SPIFFE ID) |
 | The sealed session: the delegated refresh token, sealed with the sandbox's UID | Secret `mediatore-session-<sandbox uid>` in the broker's own namespace, owned by the `AgentSandbox` when the sandboxes live there too (an owner reference cannot cross a namespace), deleted by the retention sweep otherwise; parked by `POST /v1/claims`, claimed by the reconciler when it writes the record, rotated in place at every mint, deleted on revocation | its name; the labels `mediatore.io/sandbox-uid` and `mediatore.io/session` (`parked` or `claimed`) |
 | The attested nodes: EK hash, the agent's SPIFFE ID, DMI UUID, hostname, provider, banned | `SandboxNode` in the broker's namespace, named by the EK hash | its name; the label `mediatore.io/dmi-uuid` for the clone check |
+| The workload's output, when the requester opted in with `workload.logs` ([ADR-0045](../adr/0045-a-sandbox-workloads-output-streamed-to-its-owner.md)): the redacted stdout and stderr lines, with their sequence numbers, and the gaps where the guest's queue overflowed | Secrets `mediatore-logs-<claim uid>-<segment>` in the broker's own namespace, 64 KiB of text each, owned by the `AgentSandbox` when it lives there too, the oldest deleted beyond `logs.max_bytes`; swept `logs.retention_secs` after the claim ended, or with the claim's audit sweep, or at once when the record is gone | the labels `mediatore.io/logs=segment`, `mediatore.io/claim-uid` and `mediatore.io/sandbox-uid` |
 | The version floor of each notaio policy ([ADR-0026](../adr/0026-notaio-bundles-verified-in-shadow.md) decision 5) | `PolicyFloor` in the broker's namespace, named `<policy namespace>.<policy name>` | its name; moved by compare-and-set on `resourceVersion`, so two replicas cannot move a floor down |
 
 The request fields (subject, audiences, workload, TTL, policy) are the `AgentSandbox`'s
@@ -30,6 +31,10 @@ store:
   node_grace_secs: 600   # a registered node is never collected before this (ADR-0039)
   sealing:               # the sealer for refresh material, below
     key_file: /etc/mediatore-sealing/key
+logs:                    # the workload output ring (ADR-0045), below; off by default
+  enabled: true
+  max_bytes: 1048576     # the newest output kept per claim; at least 65536, at most 4 MiB
+  retention_secs: 3600   # how long after the claim ended it is kept; default: store.retention_secs
 ```
 
 ## What survives a restart
@@ -152,6 +157,27 @@ created, bound-until and revoked timestamps, whether a report and an exit were r
 then the resource is deleted if nobody had, and the finalizer released. The envelope is
 never logged. The cluster's log pipeline keeps the lines; there is no audit table and
 nothing for mediatore to delete from.
+
+## Workload output
+
+A sandbox created with `workload.logs: true` (`--logs`;
+[ADR-0045](../adr/0045-a-sandbox-workloads-output-streamed-to-its-owner.md)) has what it
+prints shipped by the guest, already redacted, to `POST /v1/me/logs`, and the broker keeps it
+in a ring of Secrets in its own namespace: `mediatore-logs-<claim uid>-<segment>`, 64 KiB of
+record text per segment, the oldest segment deleted once the claim's total passes
+`logs.max_bytes` (default 1 MiB, ceiling 4 MiB, floor one segment; a value outside refuses to
+start). The reader is told how many bytes went that way. Secrets, not ConfigMaps, because the
+output may hold what redaction missed, so it takes the protection the session Secrets already
+have and needs no new verb in the broker's Role. The segments carry an owner reference to the
+`AgentSandbox` when the sandbox lives in the broker's namespace, so garbage collection takes
+them with it; otherwise the sweep does. They go `logs.retention_secs` after the claim ended
+(default `store.retention_secs`), with the claim's audit sweep, or at once when no record
+exists for them. `logs.enabled` is `false` by default: both routes answer `501` and a claim
+that opts in is refused at creation, so nothing is ever stored by surprise. Only the claim's
+subject reads the output through the broker, `GET /v1/claims/{name}/logs`; anyone with `get`
+on Secrets in the broker's namespace can read the segments directly, which is break-glass and
+visible in the API server's audit log. Under `dev_mode` the in-memory store keeps the same
+ring with the same cap and sweep rules.
 
 ## Nodes
 

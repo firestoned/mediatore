@@ -57,6 +57,7 @@ flowchart LR
     network-sandbox-segment["Sandbox Network Segment"]
     service-envoy-inject["envoy-inject (credential placement Envoy, ADR-0040)"]
     data-asset-os-credential-store["The requester's saved credential (OS credential store)"]
+    data-asset-workload-output["Workload output (the Secret ring)"]
     subgraph sg_system-mediatore [System Mediatore]
         service-mediatore-user-api
         service-mediatore-sandbox-api
@@ -137,6 +138,7 @@ flowchart LR
     actor-sandbox-user --> data-asset-os-credential-store
     service-guest-agent -->|HTTP| service-egress-proxy
     service-envoy-inject -->|HTTPS| ecosystem-oci-registry
+    service-mediatore-sandbox-api -->|HTTPS| data-asset-workload-output
 ```
 
 <sub>Source: nodes and relationships in `architecture.json`.</sub>

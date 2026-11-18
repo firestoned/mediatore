@@ -9,12 +9,14 @@
 //! session in a Secret, the nodes and floors as resources); `MemoryStore` is for `dev_mode`
 //! and tests, and the conformance suite pins the behaviour both must share. Refresh material enters the store only as a [`seal::Sealed`] envelope.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use jiff::Timestamp;
-use mediatore_proto::{ClaimReport, Provider, Subject, Workload, WorkloadExit};
+use mediatore_proto::{
+    ClaimReport, LogBatch, LogEntry, LogGap, Provider, Subject, Workload, WorkloadExit,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use uuid::Uuid;
@@ -204,9 +206,67 @@ pub struct PolicyFloor {
     pub issued_at: Timestamp,
 }
 
+/// What bounds a claim's stored output (ADR-0045 decision 4): the caller's configuration,
+/// passed with every append so the store itself holds no setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogLimits {
+    /// The newest record text kept per claim; the oldest records beyond it are dropped and
+    /// counted in [`LogChunk::truncated_before`].
+    pub max_bytes: usize,
+}
+
+/// What an append did (ADR-0045 decision 8: idempotent writes).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LogAppend {
+    /// Records stored.
+    pub stored: usize,
+    /// Records at or below the claim's highest stored `seq`, a retried batch, ignored.
+    pub ignored: usize,
+}
+
+/// A claim's stored output, or the part of it after a cursor.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LogChunk {
+    /// Bytes of record text the ring dropped from the front since the claim started.
+    pub truncated_before: u64,
+    /// Records and gaps, in sequence.
+    pub entries: Vec<LogEntry>,
+    /// The highest `seq` stored for the claim, whatever the cursor; `None` when nothing is.
+    pub last_seq: Option<u64>,
+}
+
+/// Storage of a workload's output (ADR-0045 decisions 4, 6, 7 and 8): a bounded ring per
+/// claim, written by the claim's node through the broker, read by the claim's owner, swept
+/// after the claim's retention. [`ClaimStore`] requires it, so the one store object serves
+/// both; the broker's `logs.enabled` decides whether anything is ever written.
+#[async_trait]
+pub trait LogStore: Send + Sync + 'static {
+    /// Append a batch to the ring of `rec`'s claim. Records at or below the highest stored
+    /// `seq` are ignored (a retried batch is a no-op). When at least one record is new and
+    /// the batch carries dropped counts, a [`LogEntry::Gap`] is stored before its records.
+    /// The oldest records beyond `limits.max_bytes` are dropped and counted. The batch is
+    /// the caller's to validate (`LogBatch::validate`); the store trusts its shape.
+    async fn append_logs(
+        &self,
+        rec: &ClaimRecord,
+        batch: &LogBatch,
+        limits: &LogLimits,
+    ) -> Result<LogAppend, StoreError>;
+    /// The claim's stored output: everything, or with `since` the records whose `seq` is
+    /// greater, together with the gaps immediately before the first of them. A claim with
+    /// nothing stored is an empty chunk, not an error.
+    async fn read_logs(&self, claim_uid: Uuid, since: Option<u64>) -> Result<LogChunk, StoreError>;
+    /// Remove the claim's output; nothing stored is success.
+    async fn delete_logs(&self, claim_uid: Uuid) -> Result<(), StoreError>;
+    /// Remove the output of every claim whose record is gone or ended
+    /// ([`ClaimRecord::ended_at`]) before `before` (ADR-0045 decision 7). Returns how many
+    /// claims' output went.
+    async fn sweep_logs(&self, before: Timestamp) -> Result<usize, StoreError>;
+}
+
 /// Storage contract.
 #[async_trait]
-pub trait ClaimStore: Send + Sync + 'static {
+pub trait ClaimStore: LogStore {
     /// Insert a new claim. Fails with `Conflict` if the UID exists.
     async fn put_claim(&self, rec: ClaimRecord) -> Result<(), StoreError>;
     /// Fetch by UID.
@@ -301,6 +361,127 @@ pub struct MemoryStore {
     nodes: RwLock<HashMap<String, NodeRecord>>,
     sessions: RwLock<HashMap<(Uuid, Option<String>), SessionRecord>>,
     floors: RwLock<HashMap<(String, String), PolicyFloor>>,
+    logs: RwLock<HashMap<Uuid, LogRing>>,
+}
+
+/// One claim's output in memory (ADR-0045 decision 11): the same cap, ownership and sweep
+/// rules as the Secret ring, so the fake is no more permissive than the real thing.
+#[derive(Debug, Default)]
+struct LogRing {
+    entries: VecDeque<LogEntry>,
+    /// Record text bytes in `entries`.
+    bytes: usize,
+    truncated_before: u64,
+    last_seq: Option<u64>,
+}
+
+impl LogRing {
+    /// Append the new records of `batch` (those above `last_seq`), the gap first when any is
+    /// new and bytes were dropped, then drop the oldest beyond `max_bytes`.
+    fn append(&mut self, batch: &LogBatch, max_bytes: usize) -> LogAppend {
+        let new: Vec<&mediatore_proto::LogRecord> = batch
+            .records
+            .iter()
+            .filter(|r| self.last_seq.is_none_or(|l| r.seq > l))
+            .collect();
+        let ignored = batch.records.len() - new.len();
+        if new.is_empty() {
+            return LogAppend { stored: 0, ignored };
+        }
+        if batch.dropped_stdout > 0 || batch.dropped_stderr > 0 {
+            self.entries.push_back(LogEntry::Gap(LogGap {
+                lost_stdout: batch.dropped_stdout,
+                lost_stderr: batch.dropped_stderr,
+            }));
+        }
+        for r in &new {
+            self.bytes += r.text.len();
+            self.last_seq = Some(r.seq);
+            self.entries.push_back(LogEntry::Record((*r).clone()));
+        }
+        while self.bytes > max_bytes {
+            let Some(front) = self.entries.pop_front() else {
+                break;
+            };
+            let n = front.text_bytes();
+            self.bytes -= n;
+            self.truncated_before += n as u64;
+        }
+        LogAppend {
+            stored: new.len(),
+            ignored,
+        }
+    }
+
+    /// Everything, or what follows `since` with the gaps right before it (see
+    /// [`LogStore::read_logs`]).
+    fn read(&self, since: Option<u64>) -> LogChunk {
+        let entries: Vec<LogEntry> = match since {
+            None => self.entries.iter().cloned().collect(),
+            Some(since) => {
+                let first = self
+                    .entries
+                    .iter()
+                    .position(|e| e.seq().is_some_and(|s| s > since));
+                match first {
+                    None => Vec::new(),
+                    Some(mut start) => {
+                        while start > 0 && self.entries[start - 1].seq().is_none() {
+                            start -= 1;
+                        }
+                        self.entries.iter().skip(start).cloned().collect()
+                    }
+                }
+            }
+        };
+        LogChunk {
+            truncated_before: self.truncated_before,
+            entries,
+            last_seq: self.last_seq,
+        }
+    }
+}
+
+#[async_trait]
+impl LogStore for MemoryStore {
+    async fn append_logs(
+        &self,
+        rec: &ClaimRecord,
+        batch: &LogBatch,
+        limits: &LogLimits,
+    ) -> Result<LogAppend, StoreError> {
+        let mut m = self.logs.write().await;
+        Ok(m.entry(rec.uid)
+            .or_default()
+            .append(batch, limits.max_bytes))
+    }
+
+    async fn read_logs(&self, claim_uid: Uuid, since: Option<u64>) -> Result<LogChunk, StoreError> {
+        Ok(self
+            .logs
+            .read()
+            .await
+            .get(&claim_uid)
+            .map(|r| r.read(since))
+            .unwrap_or_default())
+    }
+
+    async fn delete_logs(&self, claim_uid: Uuid) -> Result<(), StoreError> {
+        self.logs.write().await.remove(&claim_uid);
+        Ok(())
+    }
+
+    async fn sweep_logs(&self, before: Timestamp) -> Result<usize, StoreError> {
+        let claims = self.claims.read().await;
+        let mut logs = self.logs.write().await;
+        let n = logs.len();
+        logs.retain(|uid, _| {
+            claims
+                .get(uid)
+                .is_some_and(|rec| rec.ended_at().is_none_or(|e| e >= before))
+        });
+        Ok(n - logs.len())
+    }
 }
 
 impl MemoryStore {

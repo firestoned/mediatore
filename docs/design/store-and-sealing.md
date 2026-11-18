@@ -44,6 +44,23 @@ it yet) or `claimed` (the record has taken it), with the sandbox's UID and, for 
 labels. A `claimed` Secret is owned by the sandbox, so the cluster's garbage collector removes it with the sandbox;
 ownership is set only within the broker's own namespace, since an owner reference cannot cross one.
 
+## The workload output ring (ADR-0045)
+
+Beside the session Secrets, `KubeStore` keeps a sandbox workload's output when its requester
+opted in (`workload.logs`) and the broker's `logs.enabled` is on: the `LogStore` trait, which
+`ClaimStore` requires so the one store object serves both. Secrets
+`mediatore-logs-<claim uid>-<segment>` in the broker's namespace, 64 KiB of record text each
+(`entries`, NDJSON of `LogRecord` and `LogGap`), the segment's counters as annotations, labels
+`mediatore.io/logs=segment`, `mediatore.io/claim-uid` and `mediatore.io/sandbox-uid`, an
+owner reference to the `AgentSandbox` under the same rule as the session Secret. An append
+packs the new records into the open segment, rolls to a new one when full, and deletes the
+oldest beyond `logs.max_bytes`, counting what went; records at or below the highest stored
+sequence number are ignored, so a retried batch is a no-op. The limits come with every call
+(`LogLimits`), so the store holds no setting. The resync sweeps the segments of claims that
+ended `logs.retention_secs` ago or whose record is gone, and the audit sweep of a sandbox
+deletes its segments. The in-memory store keeps a `LogRing` per claim under the same rules;
+the conformance suite runs the cases against it.
+
 ## The sealing
 
 No secret enters the store in the clear. `Sealer` (`seal.rs`) turns plaintext into a `Sealed { key_id, nonce,

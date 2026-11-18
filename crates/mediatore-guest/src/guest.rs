@@ -12,13 +12,14 @@
 //! proxy dials its upstreams directly (ADR-0028's implementation notes).
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use mediatore_proto::{Me, NodeRegistered, NodeRegistration, Provider};
 use reqwest::Method;
 use uuid::Uuid;
 
 use crate::client::SandboxClient;
-use crate::{egress, identity, image, jail, net, ready, report, sandboxfs, supervise, user};
+use crate::{egress, identity, image, jail, logs, net, ready, report, sandboxfs, supervise, user};
 
 /// Seconds between registration retries while mediatore is unreachable.
 const REGISTER_RETRY_SECS: u64 = 5;
@@ -297,7 +298,7 @@ pub async fn run(args: GuestArgs) -> anyhow::Result<()> {
     tracing::info!(ek_hash = %reg.ek_hash, dmi = %reg.dmi_uuid, "node identity computed");
 
     // 2. Talk to mediatore. Fail closed without a transport identity.
-    let client = connect(&args).await?;
+    let client = Arc::new(connect(&args).await?);
     let registered = register(&client, &reg).await?;
     tracing::info!(node_id = %registered.node_id, "node registered");
     // Only now is this member ready for a claim (ADR-0019): attested (the SVID came from
@@ -383,7 +384,7 @@ async fn pull_image(
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)] // one straight line of steps, each logged; splitting it would hide the order
 async fn serve_claim(
     args: &GuestArgs,
-    client: &SandboxClient,
+    client: &Arc<SandboxClient>,
     me: &Me,
     username: &str,
     reference: &mediatore_proto::image::ImageReference,
@@ -601,7 +602,31 @@ async fn serve_claim(
         proxy_port: args.egress_proxy_port,
         phantom,
     };
-    let result = supervise::run(&spec, me.expires_at, &mut proxy, me.workload.restart).await;
+    // The workload's output, when the claim asked for it (ADR-0045 decision 1): tee'd,
+    // redacted (the phantom and every other credential the jail was given, decision 2) and
+    // shipped over the node SVID; without the opt-in the jail inherits the console as before.
+    let shipping = me.workload.logs.then(|| {
+        let queue = Arc::new(logs::Queue::default());
+        let capture = Arc::new(logs::Capture::new(spec.secret_values(), queue.clone()));
+        let sink: Arc<dyn logs::LogSink> = Arc::new(logs::BrokerSink::new(client.clone(), me.claim_uid));
+        let shipping = logs::Shipping::start(queue, sink, logs::ShipperConfig::default());
+        tracing::info!(claim_uid = %me.claim_uid, logs = true, "workload output captured, redacted and shipped to the broker (ADR-0045)");
+        (capture, shipping)
+    });
+    let result = supervise::run(
+        &spec,
+        me.expires_at,
+        &mut proxy,
+        me.workload.restart,
+        shipping.as_ref().map(|(c, _)| c),
+    )
+    .await;
+    // What is still queued goes before the exit is reported, bounded: the exit releases
+    // the claim and the broker drops a batch after it (ADR-0045 decision 8).
+    if let Some((_, shipping)) = shipping {
+        let flushed = shipping.flush(logs::FLUSH_TIMEOUT).await;
+        tracing::info!(claim_uid = %me.claim_uid, flushed, "workload output flushed");
+    }
     // The proxy ends with the claim, whichever way it ended.
     if let Err(e) = proxy.start_kill() {
         tracing::debug!(error = %e, "egress proxy already gone");

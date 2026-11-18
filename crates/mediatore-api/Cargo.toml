@@ -27,6 +27,8 @@ base64.workspace = true
 uuid.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
+# The NDJSON body of `GET /v1/claims/{name}/logs` is a channel drained as a stream (ADR-0045).
+futures.workspace = true
 
 [dev-dependencies]
 # The handler tests drive the real routers in process (`oneshot`), build a verified bundle for the

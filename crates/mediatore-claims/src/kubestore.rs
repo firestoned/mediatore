@@ -26,10 +26,14 @@ use k8s_openapi::api::core::v1::Secret;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{OwnerReference, Time};
 use kube::api::{DeleteParams, ListParams, Patch, PatchParams, PostParams};
 use kube::{Api, Client, CustomResource, ResourceExt};
-use mediatore_proto::{ClaimReport, Provider, Subject, Workload, WorkloadExit};
+use mediatore_proto::{
+    ClaimReport, LOG_SEGMENT_BYTES, LogBatch, LogEntry, LogGap, Provider, Subject, Workload,
+    WorkloadExit,
+};
 use mediatore_store::seal::Sealed;
 use mediatore_store::{
-    ClaimRecord, ClaimStore, DelegatedSession, NodeRecord, SessionRecord, StoreError,
+    ClaimRecord, ClaimStore, DelegatedSession, LogAppend, LogChunk, LogLimits, LogStore,
+    NodeRecord, SessionRecord, StoreError,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -51,6 +55,28 @@ pub const SESSION_LABEL: &str = "mediatore.io/session";
 pub const AUDIENCE_LABEL: &str = "mediatore.io/audience";
 /// The label carrying a node's DMI UUID on its `SandboxNode`.
 pub const DMI_LABEL: &str = "mediatore.io/dmi-uuid";
+/// The label marking a Secret as one segment of a claim's output ring (ADR-0045 decision 6);
+/// its value is [`LOGS_SEGMENT`]. The segment also carries [`CLAIM_UID_LABEL`] and, when the
+/// record has one, [`SANDBOX_UID_LABEL`].
+pub const LOGS_LABEL: &str = "mediatore.io/logs";
+/// The one value of [`LOGS_LABEL`].
+pub const LOGS_SEGMENT: &str = "segment";
+/// Annotation on a segment: its number in the ring.
+const SEGMENT_ANNOTATION: &str = "mediatore.io/segment";
+/// Annotation on a segment: the lowest record `seq` in it (absent when it holds no record).
+const FIRST_SEQ_ANNOTATION: &str = "mediatore.io/first-seq";
+/// Annotation on a segment: the highest record `seq` in it.
+const LAST_SEQ_ANNOTATION: &str = "mediatore.io/last-seq";
+/// Annotation on a segment: record text bytes in it.
+const BYTES_ANNOTATION: &str = "mediatore.io/bytes";
+/// Annotation on a segment: record text bytes the ring had dropped from its front when the
+/// segment was last written. The newest segment's value is the ring's truth; an older
+/// segment's is what it was then and may be stale.
+const TRUNCATED_ANNOTATION: &str = "mediatore.io/truncated-before";
+/// The data key holding a segment's entries, NDJSON, one [`LogEntry`] per line.
+const ENTRIES_KEY: &str = "entries";
+/// How many times a conflicting segment write is retried before it is an error.
+const SEGMENT_WRITE_ATTEMPTS: usize = 3;
 /// The rendered CRD files (`make crds`).
 pub const NODE_CRD_FILE_NAME: &str = "mediatore.io_sandboxnodes.yaml";
 /// See [`NODE_CRD_FILE_NAME`].
@@ -475,6 +501,124 @@ impl KubeStore {
         Ok(())
     }
 
+    /// The claim's segments, oldest first (ADR-0045 decision 6). A Secret under the label
+    /// that is not a well-formed segment is skipped.
+    async fn segments_of(&self, claim_uid: Uuid) -> Result<Vec<LogSegment>, StoreError> {
+        let list = self
+            .secrets()
+            .list(&ListParams::default().labels(&format!(
+                "{LOGS_LABEL}={LOGS_SEGMENT},{CLAIM_UID_LABEL}={claim_uid}"
+            )))
+            .await
+            .map_err(|e| backend(&e))?;
+        let mut segments: Vec<LogSegment> = list.items.iter().filter_map(segment_of).collect();
+        segments.sort_by_key(|s| s.number);
+        Ok(segments)
+    }
+
+    /// Delete the named segments of a claim; one already gone is fine.
+    async fn delete_segments(&self, claim_uid: Uuid, numbers: &[u32]) -> Result<(), StoreError> {
+        for n in numbers {
+            match self
+                .secrets()
+                .delete(&logs_segment_name(claim_uid, *n), &DeleteParams::default())
+                .await
+            {
+                Ok(_) => {}
+                Err(e) if is_not_found(&e) => {}
+                Err(e) => return Err(backend(&e)),
+            }
+        }
+        Ok(())
+    }
+
+    /// One attempt at appending `batch` (ADR-0045 decisions 4, 6 and 8): read the ring,
+    /// keep the records above its highest `seq`, pack, write the changed segments (a replace
+    /// on the open one by `resourceVersion`, creates for new ones), then drop the oldest
+    /// whole segments beyond the cap. `Err(Conflict)` when another replica wrote in between;
+    /// the caller reads again and retries.
+    async fn try_append(
+        &self,
+        rec: &ClaimRecord,
+        batch: &LogBatch,
+        limits: &LogLimits,
+    ) -> Result<LogAppend, StoreError> {
+        let mut segments = self.segments_of(rec.uid).await?;
+        let highest = segments.iter().rev().find_map(LogSegment::last_seq);
+        let new: Vec<&mediatore_proto::LogRecord> = batch
+            .records
+            .iter()
+            .filter(|r| highest.is_none_or(|h| r.seq > h))
+            .collect();
+        let ignored = batch.records.len() - new.len();
+        if new.is_empty() {
+            return Ok(LogAppend { stored: 0, ignored });
+        }
+        let mut entries = Vec::with_capacity(new.len() + 1);
+        if batch.dropped_stdout > 0 || batch.dropped_stderr > 0 {
+            entries.push(LogEntry::Gap(LogGap {
+                lost_stdout: batch.dropped_stdout,
+                lost_stderr: batch.dropped_stderr,
+            }));
+        }
+        entries.extend(new.iter().map(|r| LogEntry::Record((*r).clone())));
+        let changed = pack(&segments, entries);
+        // The ring as it will be: the unchanged older segments, then the changed ones.
+        let first_changed = changed[0].number;
+        segments.retain(|s| s.number < first_changed);
+        segments.extend(changed.iter().cloned());
+        let (gone, dropped) = trim(&segments, limits.max_bytes);
+        let truncated_before = segments.last().map_or(0, |s| s.truncated_before) + dropped;
+        // The owner: the sandbox, when it is in the broker's namespace (the session rule).
+        let owners = match rec.sandbox_uid {
+            Some(_) => match self.sandbox_for(rec).await {
+                Ok(sb) => owner_refs(&self.home, &sb),
+                Err(StoreError::NotFound(_)) => None,
+                Err(e) => return Err(e),
+            },
+            None => None,
+        };
+        let api = self.secrets();
+        for seg in &changed {
+            let mut seg = seg.clone();
+            seg.truncated_before = truncated_before;
+            let secret = segment_secret(rec, &seg, owners.clone());
+            let name = secret.name_any();
+            let result = if seg.resource_version.is_some() {
+                api.replace(&name, &PostParams::default(), &secret).await
+            } else {
+                api.create(&PostParams::default(), &secret).await
+            };
+            match result {
+                Ok(_) => {}
+                Err(e) if is_conflict(&e) => return Err(StoreError::Conflict(name)),
+                Err(e) => return Err(backend(&e)),
+            }
+        }
+        if !gone.is_empty() {
+            tracing::info!(
+                claim_uid = %rec.uid,
+                segments = gone.len(),
+                bytes = dropped,
+                truncated_before,
+                "output ring over its cap; oldest segments dropped (ADR-0045 decision 4)"
+            );
+            self.delete_segments(rec.uid, &gone).await?;
+        }
+        tracing::debug!(
+            claim_uid = %rec.uid,
+            records = new.len(),
+            ignored,
+            bytes = new.iter().map(|r| r.text.len()).sum::<usize>(),
+            segments = changed.len(),
+            "output appended"
+        );
+        Ok(LogAppend {
+            stored: new.len(),
+            ignored,
+        })
+    }
+
     /// Every sandbox carrying a record.
     async fn sandboxes_with_records(&self) -> Result<Vec<AgentSandbox>, StoreError> {
         Ok(self
@@ -512,6 +656,198 @@ pub fn session_name(sandbox_uid: Uuid) -> String {
 pub fn delegation_name(sandbox_uid: Uuid, audience: &str) -> String {
     let digest = hex::encode(Sha256::digest(audience.as_bytes()));
     format!("mediatore-session-{sandbox_uid}-{}", &digest[..16])
+}
+
+/// A segment Secret's name: the claim's UID and the segment's number in the ring.
+#[must_use]
+pub fn logs_segment_name(claim_uid: Uuid, segment: u32) -> String {
+    format!("mediatore-logs-{claim_uid}-{segment:06}")
+}
+
+/// One segment of a claim's output ring (ADR-0045 decision 6), as read from or about to be
+/// written to its Secret.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LogSegment {
+    /// Its number in the ring: higher is newer, the highest is the open one.
+    number: u32,
+    entries: Vec<LogEntry>,
+    /// Record text bytes in `entries`.
+    bytes: usize,
+    /// The ring's cumulative front drops when this segment was last written.
+    truncated_before: u64,
+    /// The Secret's `resourceVersion`, for the compare-and-set of a replace; `None` for a
+    /// segment not yet created.
+    resource_version: Option<String>,
+}
+
+impl LogSegment {
+    fn empty(number: u32, truncated_before: u64) -> Self {
+        Self {
+            number,
+            entries: Vec::new(),
+            bytes: 0,
+            truncated_before,
+            resource_version: None,
+        }
+    }
+
+    fn first_seq(&self) -> Option<u64> {
+        self.entries.iter().find_map(LogEntry::seq)
+    }
+
+    fn last_seq(&self) -> Option<u64> {
+        self.entries.iter().rev().find_map(LogEntry::seq)
+    }
+
+    fn push(&mut self, entry: LogEntry) {
+        self.bytes += entry.text_bytes();
+        self.entries.push(entry);
+    }
+}
+
+/// The segment a Secret holds; `None` for a Secret that is not a well-formed segment (it is
+/// then left alone by reads and found again by the sweep's label listing).
+fn segment_of(secret: &Secret) -> Option<LogSegment> {
+    let ann = secret.metadata.annotations.as_ref()?;
+    let number: u32 = ann.get(SEGMENT_ANNOTATION)?.parse().ok()?;
+    let truncated_before: u64 = ann
+        .get(TRUNCATED_ANNOTATION)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let text = secret
+        .data
+        .as_ref()
+        .and_then(|d| d.get(ENTRIES_KEY))
+        .map(|b| String::from_utf8_lossy(&b.0).into_owned())
+        .unwrap_or_default();
+    let mut seg = LogSegment::empty(number, truncated_before);
+    seg.resource_version
+        .clone_from(&secret.metadata.resource_version);
+    for line in text.lines().filter(|l| !l.is_empty()) {
+        let entry: LogEntry = serde_json::from_str(line).ok()?;
+        seg.push(entry);
+    }
+    Some(seg)
+}
+
+/// The Secret for a segment: labelled by the claim and the sandbox, owned by the sandbox
+/// when it shares the broker's namespace (the session Secret's rule), its entries as NDJSON.
+fn segment_secret(
+    rec: &ClaimRecord,
+    seg: &LogSegment,
+    owners: Option<Vec<OwnerReference>>,
+) -> Secret {
+    let mut text = String::new();
+    for e in &seg.entries {
+        if let Ok(line) = serde_json::to_string(e) {
+            text.push_str(&line);
+            text.push('\n');
+        }
+    }
+    let mut labels = BTreeMap::from([
+        (LOGS_LABEL.to_owned(), LOGS_SEGMENT.to_owned()),
+        (CLAIM_UID_LABEL.to_owned(), rec.uid.to_string()),
+    ]);
+    if let Some(sandbox_uid) = rec.sandbox_uid {
+        labels.insert(SANDBOX_UID_LABEL.to_owned(), sandbox_uid.to_string());
+    }
+    let mut annotations = BTreeMap::from([
+        (SEGMENT_ANNOTATION.to_owned(), seg.number.to_string()),
+        (BYTES_ANNOTATION.to_owned(), seg.bytes.to_string()),
+        (
+            TRUNCATED_ANNOTATION.to_owned(),
+            seg.truncated_before.to_string(),
+        ),
+    ]);
+    if let Some(f) = seg.first_seq() {
+        annotations.insert(FIRST_SEQ_ANNOTATION.to_owned(), f.to_string());
+    }
+    if let Some(l) = seg.last_seq() {
+        annotations.insert(LAST_SEQ_ANNOTATION.to_owned(), l.to_string());
+    }
+    let mut secret = Secret::default();
+    secret.metadata.name = Some(logs_segment_name(rec.uid, seg.number));
+    secret.metadata.labels = Some(labels);
+    secret.metadata.annotations = Some(annotations);
+    secret.metadata.owner_references = owners;
+    secret
+        .metadata
+        .resource_version
+        .clone_from(&seg.resource_version);
+    secret.type_ = Some("Opaque".into());
+    secret.data = Some(BTreeMap::from([(
+        ENTRIES_KEY.to_owned(),
+        ByteString(text.into_bytes()),
+    )]));
+    secret
+}
+
+/// Pack `entries` into the ring: the open segment (the last of `segments`, or a first one)
+/// takes them up to [`LOG_SEGMENT_BYTES`] of record text, then a new segment is opened for
+/// the rest, as often as needed. Returns the segments that changed or were created, oldest
+/// first; `truncated_before` is copied from the newest segment so every written one carries
+/// the ring's current count.
+fn pack(segments: &[LogSegment], entries: Vec<LogEntry>) -> Vec<LogSegment> {
+    let truncated_before = segments.last().map_or(0, |s| s.truncated_before);
+    let mut open = segments
+        .last()
+        .cloned()
+        .unwrap_or_else(|| LogSegment::empty(0, 0));
+    open.truncated_before = truncated_before;
+    let mut out = Vec::new();
+    for e in entries {
+        if open.bytes > 0 && open.bytes + e.text_bytes() > LOG_SEGMENT_BYTES {
+            let next = LogSegment::empty(open.number + 1, truncated_before);
+            out.push(std::mem::replace(&mut open, next));
+        }
+        open.push(e);
+    }
+    out.push(open);
+    out
+}
+
+/// Which of `segments` (oldest first, the newest last) the ring drops so the whole stays
+/// within `max_bytes`: whole segments from the front, never the newest. Returns their
+/// numbers and the record text bytes they held, which join `truncated_before`.
+fn trim(segments: &[LogSegment], max_bytes: usize) -> (Vec<u32>, u64) {
+    let mut total: usize = segments.iter().map(|s| s.bytes).sum();
+    let mut gone = Vec::new();
+    let mut dropped: u64 = 0;
+    for s in segments.iter().take(segments.len().saturating_sub(1)) {
+        if total <= max_bytes {
+            break;
+        }
+        total -= s.bytes;
+        dropped += s.bytes as u64;
+        gone.push(s.number);
+    }
+    (gone, dropped)
+}
+
+/// The cursor rule of `LogStore::read_logs`: everything, or the records after `since` with
+/// the gaps immediately before the first of them. The same rule as the memory ring's.
+fn after_cursor(entries: Vec<LogEntry>, since: Option<u64>) -> Vec<LogEntry> {
+    let Some(since) = since else {
+        return entries;
+    };
+    let Some(mut start) = entries
+        .iter()
+        .position(|e| e.seq().is_some_and(|s| s > since))
+    else {
+        return Vec::new();
+    };
+    while start > 0 && entries[start - 1].seq().is_none() {
+        start -= 1;
+    }
+    entries.into_iter().skip(start).collect()
+}
+
+/// The claim UID a segment Secret is labelled with.
+fn claim_uid_of_segment(secret: &Secret) -> Option<Uuid> {
+    secret
+        .labels()
+        .get(CLAIM_UID_LABEL)
+        .and_then(|v| Uuid::parse_str(v).ok())
 }
 
 fn backend(e: &kube::Error) -> StoreError {
@@ -813,6 +1149,91 @@ fn floor_spec_of(f: &mediatore_store::PolicyFloor) -> PolicyFloorSpec {
 }
 
 #[async_trait]
+impl LogStore for KubeStore {
+    async fn append_logs(
+        &self,
+        rec: &ClaimRecord,
+        batch: &LogBatch,
+        limits: &LogLimits,
+    ) -> Result<LogAppend, StoreError> {
+        let mut last = StoreError::Conflict(rec.uid.to_string());
+        for _ in 0..SEGMENT_WRITE_ATTEMPTS {
+            match self.try_append(rec, batch, limits).await {
+                Err(StoreError::Conflict(name)) => {
+                    tracing::debug!(claim_uid = %rec.uid, segment = %name, "segment write conflicted; reading the ring again");
+                    last = StoreError::Conflict(name);
+                }
+                other => return other,
+            }
+        }
+        Err(last)
+    }
+
+    async fn read_logs(&self, claim_uid: Uuid, since: Option<u64>) -> Result<LogChunk, StoreError> {
+        let segments = self.segments_of(claim_uid).await?;
+        let Some(newest) = segments.last() else {
+            return Ok(LogChunk::default());
+        };
+        let truncated_before = newest.truncated_before;
+        let last_seq = segments.iter().rev().find_map(LogSegment::last_seq);
+        let entries: Vec<LogEntry> = segments.into_iter().flat_map(|s| s.entries).collect();
+        Ok(LogChunk {
+            truncated_before,
+            entries: after_cursor(entries, since),
+            last_seq,
+        })
+    }
+
+    async fn delete_logs(&self, claim_uid: Uuid) -> Result<(), StoreError> {
+        let list = self
+            .secrets()
+            .list(&ListParams::default().labels(&format!(
+                "{LOGS_LABEL}={LOGS_SEGMENT},{CLAIM_UID_LABEL}={claim_uid}"
+            )))
+            .await
+            .map_err(|e| backend(&e))?;
+        for secret in &list.items {
+            match self
+                .secrets()
+                .delete(&secret.name_any(), &DeleteParams::default())
+                .await
+            {
+                Ok(_) => {}
+                Err(e) if is_not_found(&e) => {}
+                Err(e) => return Err(backend(&e)),
+            }
+        }
+        Ok(())
+    }
+
+    async fn sweep_logs(&self, before: Timestamp) -> Result<usize, StoreError> {
+        let list = self
+            .secrets()
+            .list(&ListParams::default().labels(&format!("{LOGS_LABEL}={LOGS_SEGMENT}")))
+            .await
+            .map_err(|e| backend(&e))?;
+        let claims: std::collections::BTreeSet<Uuid> =
+            list.items.iter().filter_map(claim_uid_of_segment).collect();
+        let mut swept = 0;
+        for claim_uid in claims {
+            let gone = match self.get_claim(claim_uid).await {
+                // The record is gone: an orphan ring (ADR-0045 decision 7).
+                Err(StoreError::NotFound(_)) => true,
+                Err(e) => return Err(e),
+                Ok(rec) => rec.ended_at().is_some_and(|e| e < before),
+            };
+            if !gone {
+                continue;
+            }
+            tracing::info!(%claim_uid, "stored output swept (ADR-0045 decision 7)");
+            self.delete_logs(claim_uid).await?;
+            swept += 1;
+        }
+        Ok(swept)
+    }
+}
+
+#[async_trait]
 impl ClaimStore for KubeStore {
     async fn put_claim(&self, rec: ClaimRecord) -> Result<(), StoreError> {
         let sb = self.sandbox_for(&rec).await?;
@@ -1012,6 +1433,9 @@ impl ClaimStore for KubeStore {
             if let Some(sandbox_uid) = rec.sandbox_uid {
                 self.delete_secrets_of(sandbox_uid).await?;
             }
+            // The output ring too (ADR-0045 decision 7): by the claim's label, so a segment
+            // written for a record without a sandbox UID goes as well.
+            self.delete_logs(rec.uid).await?;
             if sb.metadata.deletion_timestamp.is_none()
                 && let Err(e) = self
                     .sandboxes_of(&sb)
@@ -1297,6 +1721,7 @@ mod tests {
                     image: "registry.internal:5000/x:1".into(),
                     args: vec!["/bin/x".into()],
                     restart: None,
+                    logs: false,
                 },
                 policy_ref: None,
             },
@@ -1345,8 +1770,15 @@ mod tests {
                         .replace("%3D", "=")
                         .replace("%2C", ",")
                         .replace("%2F", "/");
-                    let _ = req.into_body().collect().await;
-                    let (code, body) = answer(&mut state.lock().unwrap(), &method, &path, &query);
+                    let sent: serde_json::Value = req
+                        .into_body()
+                        .collect()
+                        .await
+                        .ok()
+                        .and_then(|b| serde_json::from_slice(&b.to_bytes()).ok())
+                        .unwrap_or(serde_json::Value::Null);
+                    let (code, body) =
+                        answer(&mut state.lock().unwrap(), &method, &path, &query, sent);
                     state.lock().unwrap().log.push((method, path));
                     send.send_response(
                         Response::builder()
@@ -1370,11 +1802,20 @@ mod tests {
                 })
         }
 
+        fn conflict(what: &str) -> (u16, serde_json::Value) {
+            (
+                409,
+                serde_json::json!({"apiVersion": "v1", "kind": "Status", "status": "Failure",
+                    "reason": "Conflict", "code": 409, "message": what, "metadata": {}}),
+            )
+        }
+
         fn answer(
             st: &mut State,
             method: &str,
             path: &str,
             query: &str,
+            sent: serde_json::Value,
         ) -> (u16, serde_json::Value) {
             let selector = query
                 .split('&')
@@ -1400,6 +1841,44 @@ mod tests {
                     && (name.is_empty() || s["metadata"]["name"] == name)
             };
             match (method, name.is_empty()) {
+                // Create: the name from the body, one per name, resourceVersion 1.
+                ("POST", true) => {
+                    let mut secret = sent;
+                    secret["apiVersion"] = "v1".into();
+                    secret["kind"] = "Secret".into();
+                    secret["metadata"]["namespace"] = ns.into();
+                    let new_name = secret["metadata"]["name"].clone();
+                    if st.secrets.iter().any(|s| {
+                        s["metadata"]["namespace"] == ns && s["metadata"]["name"] == new_name
+                    }) {
+                        return conflict("already exists");
+                    }
+                    secret["metadata"]["resourceVersion"] = "1".into();
+                    st.secrets.push(secret.clone());
+                    (201, secret)
+                }
+                // Replace: compare-and-set on resourceVersion, then bump it.
+                ("PUT", false) => {
+                    let Some(i) = st.secrets.iter().position(at) else {
+                        return (
+                            404,
+                            serde_json::json!({"apiVersion": "v1", "kind": "Status", "status": "Failure",
+                                "reason": "NotFound", "code": 404, "message": "not found", "metadata": {}}),
+                        );
+                    };
+                    let current = st.secrets[i]["metadata"]["resourceVersion"].clone();
+                    if sent["metadata"]["resourceVersion"] != current {
+                        return conflict("the object has been modified");
+                    }
+                    let next: u64 = current.as_str().and_then(|v| v.parse().ok()).unwrap_or(0) + 1;
+                    let mut secret = sent;
+                    secret["apiVersion"] = "v1".into();
+                    secret["kind"] = "Secret".into();
+                    secret["metadata"]["namespace"] = ns.into();
+                    secret["metadata"]["resourceVersion"] = next.to_string().into();
+                    st.secrets[i] = secret.clone();
+                    (200, secret)
+                }
                 ("GET", true) => (
                     200,
                     serde_json::json!({"apiVersion": "v1", "kind": "SecretList",
@@ -1480,6 +1959,7 @@ mod tests {
                         image: "registry.internal:5000/x:1".into(),
                         args: vec!["/bin/x".into()],
                         restart: None,
+                        logs: false,
                     },
                     policy_ref: None,
                 },
@@ -1511,6 +1991,14 @@ mod tests {
             (Arc::new(Mutex::new(st)), claim)
         }
 
+        /// The names alone: a failure message never prints a Secret's data.
+        pub fn secret_names(st: &State) -> Vec<&str> {
+            st.secrets
+                .iter()
+                .filter_map(|s| s["metadata"]["name"].as_str())
+                .collect()
+        }
+
         pub fn assert_only_home_secrets(st: &State) {
             for (m, p) in &st.log {
                 if p.contains("/secrets") {
@@ -1530,7 +2018,7 @@ mod tests {
         let store = fake::store(&state);
         store.revoke_claim(claim, Timestamp::now()).await.unwrap();
         let st = state.lock().unwrap();
-        assert!(st.secrets.is_empty(), "left: {:?}", st.secrets);
+        assert!(st.secrets.is_empty(), "left: {:?}", fake::secret_names(&st));
         fake::assert_only_home_secrets(&st);
     }
 
@@ -1541,7 +2029,7 @@ mod tests {
         let swept = store.sweep(Timestamp::now()).await.unwrap();
         assert_eq!(swept, 1);
         let st = state.lock().unwrap();
-        assert!(st.secrets.is_empty(), "left: {:?}", st.secrets);
+        assert!(st.secrets.is_empty(), "left: {:?}", fake::secret_names(&st));
         fake::assert_only_home_secrets(&st);
     }
 
@@ -1589,6 +2077,7 @@ mod tests {
                     image: "registry.internal:5000/x:1".into(),
                     args: vec!["/bin/x".into()],
                     restart: Some(crate::sandbox::SandboxRestart::Never),
+                    logs: false,
                 },
                 policy_ref: None,
             },
@@ -1801,5 +2290,418 @@ mod tests {
             session_of(&secret).is_none(),
             "an unreadable instant is refused"
         );
+    }
+
+    // ---------- the output ring (ADR-0045 decision 6) ----------
+
+    fn log_record(seq: u64, text: &str) -> mediatore_proto::LogRecord {
+        mediatore_proto::LogRecord {
+            seq,
+            stream: mediatore_proto::LogStream::Stdout,
+            ts: Timestamp::from_second(1_700_000_000 + i64::try_from(seq).unwrap()).unwrap(),
+            text: text.into(),
+        }
+    }
+
+    fn log_batch(from: u64, to: u64, text: &str) -> LogBatch {
+        LogBatch {
+            records: (from..=to).map(|seq| log_record(seq, text)).collect(),
+            ..LogBatch::default()
+        }
+    }
+
+    fn seqs(entries: &[LogEntry]) -> Vec<u64> {
+        entries.iter().filter_map(LogEntry::seq).collect()
+    }
+
+    /// A record with the fields the ring reads: its UID, no sandbox yet.
+    fn test_record(uid: Uuid) -> ClaimRecord {
+        ClaimRecord {
+            uid,
+            name: "sandbox-abc".into(),
+            namespace: "sandboxes".into(),
+            subject: Subject {
+                issuer: "https://idp.example".into(),
+                id: "octocat".into(),
+                display: None,
+            },
+            entry_id: None,
+            node_id: None,
+            audiences: vec![],
+            workload: Workload {
+                image: "registry.internal:5000/x:1".into(),
+                args: vec![],
+                restart: mediatore_proto::RestartPolicy::Never,
+                logs: true,
+            },
+            ttl_seconds: 600,
+            refresh: None,
+            created_at: Timestamp::from_second(1_700_000_000).unwrap(),
+            expires_at: None,
+            revoked_at: None,
+            sandbox_uid: None,
+            policy_uid: None,
+            bundle_version: None,
+            report: None,
+            exit: None,
+            delegations: BTreeMap::new(),
+        }
+    }
+
+    fn segment_with(number: u32, records: &[(u64, usize)]) -> LogSegment {
+        let mut seg = LogSegment::empty(number, 0);
+        for (seq, len) in records {
+            seg.push(LogEntry::Record(log_record(*seq, &"x".repeat(*len))));
+        }
+        seg
+    }
+
+    #[test]
+    fn a_segments_name_carries_the_claim_and_a_zero_padded_number() {
+        let uid = Uuid::parse_str("7f9c24e8-3b12-4c3d-9e2a-1a2b3c4d5e6f").unwrap();
+        assert_eq!(
+            logs_segment_name(uid, 7),
+            "mediatore-logs-7f9c24e8-3b12-4c3d-9e2a-1a2b3c4d5e6f-000007"
+        );
+        assert!(
+            logs_segment_name(uid, 7) < logs_segment_name(uid, 10),
+            "names sort as numbers"
+        );
+        assert!(
+            logs_segment_name(uid, 0).len() <= 63,
+            "a Secret name within a DNS label"
+        );
+    }
+
+    #[test]
+    fn a_segment_round_trips_through_its_secret_with_the_labels_the_sweep_finds_it_by() {
+        let uid = Uuid::new_v4();
+        let sandbox_uid = Uuid::new_v4();
+        let mut rec = test_record(uid);
+        rec.sandbox_uid = Some(sandbox_uid);
+        let mut seg = LogSegment::empty(3, 4096);
+        seg.push(LogEntry::Gap(LogGap {
+            lost_stdout: 10,
+            lost_stderr: 0,
+        }));
+        seg.push(LogEntry::Record(log_record(41, "first")));
+        seg.push(LogEntry::Record(log_record(42, "second")));
+        seg.resource_version = Some("12".into());
+        let owner = OwnerReference {
+            api_version: "mediatore.io/v1alpha1".into(),
+            kind: "AgentSandbox".into(),
+            name: "sb".into(),
+            uid: sandbox_uid.to_string(),
+            controller: Some(true),
+            block_owner_deletion: Some(false),
+        };
+        let secret = segment_secret(&rec, &seg, Some(vec![owner.clone()]));
+        assert_eq!(secret.name_any(), logs_segment_name(uid, 3));
+        let labels = secret.labels();
+        assert_eq!(
+            labels.get(LOGS_LABEL).map(String::as_str),
+            Some(LOGS_SEGMENT)
+        );
+        assert_eq!(labels.get(CLAIM_UID_LABEL), Some(&uid.to_string()));
+        assert_eq!(
+            labels.get(SANDBOX_UID_LABEL),
+            Some(&sandbox_uid.to_string())
+        );
+        let ann = secret.annotations();
+        assert_eq!(ann.get(SEGMENT_ANNOTATION).map(String::as_str), Some("3"));
+        assert_eq!(
+            ann.get(FIRST_SEQ_ANNOTATION).map(String::as_str),
+            Some("41")
+        );
+        assert_eq!(ann.get(LAST_SEQ_ANNOTATION).map(String::as_str), Some("42"));
+        assert_eq!(ann.get(BYTES_ANNOTATION).map(String::as_str), Some("11"));
+        assert_eq!(
+            ann.get(TRUNCATED_ANNOTATION).map(String::as_str),
+            Some("4096")
+        );
+        assert_eq!(secret.metadata.owner_references, Some(vec![owner]));
+        assert_eq!(secret.type_.as_deref(), Some("Opaque"));
+        let text = String::from_utf8(secret.data.as_ref().unwrap()[ENTRIES_KEY].0.clone()).unwrap();
+        assert_eq!(text.lines().count(), 3, "one entry per line: {text}");
+        assert!(!text.contains('\u{2014}'));
+        assert_eq!(segment_of(&secret), Some(seg));
+        // A record without a sandbox UID labels no sandbox and owns nothing.
+        rec.sandbox_uid = None;
+        let secret = segment_secret(&rec, &LogSegment::empty(0, 0), None);
+        assert!(!secret.labels().contains_key(SANDBOX_UID_LABEL));
+        assert_eq!(secret.annotations().get(FIRST_SEQ_ANNOTATION), None);
+        assert_eq!(segment_of(&secret).map(|s| s.bytes), Some(0));
+        // Not a segment: a session Secret.
+        assert_eq!(segment_of(&Secret::default()), None);
+    }
+
+    #[test]
+    fn packing_fills_the_open_segment_then_rolls_to_new_ones_numbered_on() {
+        let kib = 1024;
+        let open = segment_with(4, &[(1, 60 * kib)]);
+        let older = segment_with(3, &[(0, LOG_SEGMENT_BYTES)]);
+        let entries: Vec<LogEntry> = (2..=6)
+            .map(|seq| LogEntry::Record(log_record(seq, &"y".repeat(30 * kib))))
+            .collect();
+        let changed = pack(&[older, open], entries);
+        let numbers: Vec<u32> = changed.iter().map(|s| s.number).collect();
+        assert_eq!(numbers, vec![4, 5, 6, 7], "the open one and three new");
+        assert_eq!(
+            seqs(&changed[0].entries),
+            vec![1],
+            "60 KiB + 30 KiB is over a segment"
+        );
+        assert_eq!(seqs(&changed[1].entries), vec![2, 3]);
+        assert_eq!(seqs(&changed[2].entries), vec![4, 5]);
+        assert_eq!(seqs(&changed[3].entries), vec![6]);
+        for s in &changed {
+            assert!(
+                s.bytes <= LOG_SEGMENT_BYTES,
+                "segment {} holds {}",
+                s.number,
+                s.bytes
+            );
+        }
+        // An empty ring starts at 0; a gap weighs nothing and never rolls a segment.
+        let changed = pack(
+            &[],
+            vec![
+                LogEntry::Gap(LogGap::default()),
+                LogEntry::Record(log_record(1, "a")),
+            ],
+        );
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].number, 0);
+        assert_eq!(changed[0].entries.len(), 2);
+        // A record larger than what is left opens a new segment, never splits.
+        let open = segment_with(0, &[(1, LOG_SEGMENT_BYTES - 1)]);
+        let changed = pack(&[open], vec![LogEntry::Record(log_record(2, "ab"))]);
+        assert_eq!(changed.len(), 2);
+        assert_eq!(seqs(&changed[1].entries), vec![2]);
+        // The newest segment's count is what every written one carries.
+        let mut open = segment_with(2, &[(1, 10)]);
+        open.truncated_before = 999;
+        let changed = pack(
+            &[segment_with(1, &[(0, 10)]), open],
+            vec![LogEntry::Record(log_record(2, "z"))],
+        );
+        assert!(changed.iter().all(|s| s.truncated_before == 999));
+    }
+
+    #[test]
+    fn the_ring_trims_whole_segments_from_the_front_and_never_the_newest() {
+        let segments = vec![
+            segment_with(0, &[(1, 100)]),
+            segment_with(1, &[(2, 200)]),
+            segment_with(2, &[(3, 300)]),
+        ];
+        assert_eq!(trim(&segments, 600), (vec![], 0), "within the cap: nothing");
+        assert_eq!(trim(&segments, 599), (vec![0], 100));
+        assert_eq!(trim(&segments, 499), (vec![0, 1], 300));
+        assert_eq!(
+            trim(&segments, 10),
+            (vec![0, 1], 300),
+            "the newest stays whatever the cap"
+        );
+        assert_eq!(trim(&segments[2..], 10), (vec![], 0));
+        assert_eq!(trim(&[], 10), (vec![], 0));
+    }
+
+    #[test]
+    fn the_cursor_rule_matches_the_memory_rings() {
+        let gap = LogEntry::Gap(LogGap {
+            lost_stdout: 1,
+            lost_stderr: 0,
+        });
+        let entries = vec![
+            LogEntry::Record(log_record(1, "a")),
+            gap.clone(),
+            LogEntry::Record(log_record(2, "b")),
+            LogEntry::Record(log_record(3, "c")),
+        ];
+        assert_eq!(after_cursor(entries.clone(), None), entries);
+        assert_eq!(
+            after_cursor(entries.clone(), Some(1)),
+            entries[1..].to_vec()
+        );
+        assert_eq!(
+            after_cursor(entries.clone(), Some(2)),
+            entries[3..].to_vec()
+        );
+        assert_eq!(after_cursor(entries.clone(), Some(3)), vec![]);
+        assert_eq!(
+            after_cursor(vec![gap], Some(0)),
+            vec![],
+            "a gap with nothing after it is not sent"
+        );
+    }
+
+    #[tokio::test]
+    async fn output_appended_through_the_api_server_reads_back_and_a_replay_is_ignored() {
+        let (state, claim) = fake::seed(false);
+        let store = fake::store(&state);
+        let rec = store.get_claim(claim).await.unwrap();
+        let limits = LogLimits {
+            max_bytes: mediatore_proto::DEFAULT_LOG_MAX_BYTES,
+        };
+        let done = store
+            .append_logs(&rec, &log_batch(1, 2, "hello"), &limits)
+            .await
+            .unwrap();
+        assert_eq!(
+            done,
+            LogAppend {
+                stored: 2,
+                ignored: 0
+            }
+        );
+        let mut lossy = log_batch(2, 4, "world");
+        lossy.dropped_stdout = 64;
+        let done = store.append_logs(&rec, &lossy, &limits).await.unwrap();
+        assert_eq!(
+            done,
+            LogAppend {
+                stored: 2,
+                ignored: 1
+            }
+        );
+        let chunk = store.read_logs(claim, None).await.unwrap();
+        assert_eq!(seqs(&chunk.entries), vec![1, 2, 3, 4]);
+        assert!(matches!(
+            chunk.entries[2],
+            LogEntry::Gap(LogGap {
+                lost_stdout: 64,
+                ..
+            })
+        ));
+        assert_eq!(chunk.last_seq, Some(4));
+        assert_eq!(chunk.truncated_before, 0);
+        let chunk = store.read_logs(claim, Some(2)).await.unwrap();
+        assert_eq!(seqs(&chunk.entries), vec![3, 4]);
+        assert!(matches!(chunk.entries[0], LogEntry::Gap(_)));
+        {
+            let st = state.lock().unwrap();
+            let segments: Vec<&serde_json::Value> = st
+                .secrets
+                .iter()
+                .filter(|s| s["metadata"]["labels"][LOGS_LABEL] == LOGS_SEGMENT)
+                .collect();
+            assert_eq!(segments.len(), 1, "a few lines fit one segment");
+            assert_eq!(
+                segments[0]["metadata"]["resourceVersion"], "2",
+                "created once, replaced once, by resourceVersion"
+            );
+            assert_eq!(
+                segments[0]["metadata"]["labels"][CLAIM_UID_LABEL],
+                claim.to_string()
+            );
+            assert_eq!(
+                segments[0]["metadata"]["ownerReferences"],
+                serde_json::Value::Null,
+                "the sandbox lives in the tenant namespace: nothing across namespaces owns the segment"
+            );
+            fake::assert_only_home_secrets(&st);
+        }
+        store.delete_logs(claim).await.unwrap();
+        assert_eq!(
+            store.read_logs(claim, None).await.unwrap().entries,
+            Vec::new()
+        );
+        store.delete_logs(claim).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_secret_ring_rolls_segments_and_drops_the_oldest_beyond_the_cap() {
+        let (state, claim) = fake::seed(false);
+        let store = fake::store(&state);
+        let rec = store.get_claim(claim).await.unwrap();
+        let limits = LogLimits {
+            max_bytes: 2 * LOG_SEGMENT_BYTES,
+        };
+        let kib = "k".repeat(1024);
+        let per = u64::try_from(LOG_SEGMENT_BYTES / 1024).unwrap();
+        for i in 0..3u64 {
+            let from = i * per + 1;
+            store
+                .append_logs(&rec, &log_batch(from, from + per - 1, &kib), &limits)
+                .await
+                .unwrap();
+        }
+        let chunk = store.read_logs(claim, None).await.unwrap();
+        assert_eq!(
+            chunk.truncated_before,
+            u64::try_from(LOG_SEGMENT_BYTES).unwrap()
+        );
+        assert_eq!(seqs(&chunk.entries).first().copied(), Some(per + 1));
+        assert_eq!(chunk.last_seq, Some(3 * per));
+        let st = state.lock().unwrap();
+        let names: Vec<String> = st
+            .secrets
+            .iter()
+            .filter(|s| s["metadata"]["labels"][LOGS_LABEL] == LOGS_SEGMENT)
+            .map(|s| s["metadata"]["name"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec![logs_segment_name(claim, 1), logs_segment_name(claim, 2)],
+            "segment 0 went"
+        );
+        assert!(
+            st.log
+                .iter()
+                .any(|(m, p)| m == "DELETE" && p.ends_with(&logs_segment_name(claim, 0))),
+            "deleted through the API: {:?}",
+            st.log
+        );
+    }
+
+    #[tokio::test]
+    async fn the_log_sweep_removes_orphan_and_ended_rings_and_the_audit_sweep_takes_the_ring_along()
+    {
+        // An orphan ring: a claim no sandbox carries.
+        let (state, claim) = fake::seed(true);
+        let store = fake::store(&state);
+        let rec = store.get_claim(claim).await.unwrap();
+        let limits = LogLimits {
+            max_bytes: mediatore_proto::DEFAULT_LOG_MAX_BYTES,
+        };
+        store
+            .append_logs(&rec, &log_batch(1, 1, "ended"), &limits)
+            .await
+            .unwrap();
+        let mut orphan = rec.clone();
+        orphan.uid = Uuid::new_v4();
+        orphan.sandbox_uid = None;
+        store
+            .append_logs(&orphan, &log_batch(1, 1, "orphan"), &limits)
+            .await
+            .unwrap();
+        // Nothing has ended before the dawn of time: only the orphan goes.
+        assert_eq!(store.sweep_logs(Timestamp::MIN).await.unwrap(), 1);
+        assert_eq!(
+            store.read_logs(orphan.uid, None).await.unwrap().entries,
+            Vec::new()
+        );
+        assert_eq!(
+            seqs(&store.read_logs(claim, None).await.unwrap().entries),
+            vec![1]
+        );
+        // The revoked record ended in 2026; now is after that.
+        assert_eq!(store.sweep_logs(Timestamp::now()).await.unwrap(), 1);
+        assert_eq!(
+            store.read_logs(claim, None).await.unwrap().entries,
+            Vec::new()
+        );
+        assert_eq!(store.sweep_logs(Timestamp::now()).await.unwrap(), 0);
+
+        // The audit sweep of a claim takes its segments with the session Secrets.
+        store
+            .append_logs(&rec, &log_batch(2, 2, "late"), &limits)
+            .await
+            .unwrap();
+        assert_eq!(store.sweep(Timestamp::now()).await.unwrap(), 1);
+        let st = state.lock().unwrap();
+        assert!(st.secrets.is_empty(), "left: {:?}", fake::secret_names(&st));
+        fake::assert_only_home_secrets(&st);
     }
 }

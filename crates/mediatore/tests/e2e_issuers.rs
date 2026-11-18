@@ -96,6 +96,8 @@ impl Harness {
         let state = Arc::new(AppState {
             inject: std::collections::BTreeMap::new(),
             inject_port: None,
+            logs: None,
+            log_limiter: Limiter::per_second(1),
             store: store.clone(),
             spire: Arc::new(MemoryEntries::default()),
             naming: Naming {
@@ -228,6 +230,7 @@ impl Harness {
                         image: "registry.internal:5000/sandbox:latest".into(),
                         args: vec![],
                         restart: mediatore_proto::RestartPolicy::Always,
+                        logs: false,
                     },
                     refresh_token: None,
                     policy_ref: None,
@@ -391,6 +394,8 @@ async fn claim_through_gate(gate: IssuerGate, groups: &[&str]) -> (u16, String) 
     let state = Arc::new(AppState {
         inject: std::collections::BTreeMap::new(),
         inject_port: None,
+        logs: None,
+        log_limiter: Limiter::per_second(1),
         store: MemoryStore::shared(),
         spire: Arc::new(MemoryEntries::default()),
         naming: Naming {
@@ -438,6 +443,7 @@ async fn claim_through_gate(gate: IssuerGate, groups: &[&str]) -> (u16, String) 
                 image: "registry.internal:5000/sandbox:latest".into(),
                 args: vec![],
                 restart: mediatore_proto::RestartPolicy::Always,
+                logs: false,
             },
             refresh_token: None,
             policy_ref: None,

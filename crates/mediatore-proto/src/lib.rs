@@ -174,6 +174,13 @@ pub struct Workload {
     /// decision 1); `always` when absent, which is what every guest did before.
     #[serde(default, skip_serializing_if = "RestartPolicy::is_always")]
     pub restart: RestartPolicy,
+    /// The requester's opt-in to output capture (ADR-0045 decision 1, amended): `true` and
+    /// the guest tees the workload's stdout and stderr, redacts them and ships them to the
+    /// broker, where the claim's owner reads them back. `false` (the default, left off the
+    /// wire) and the output lands on the VM console only, as every guest did before. A
+    /// claim that opts in on a broker whose `logs` section is off is refused at creation.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub logs: bool,
 }
 
 /// What the guest does when the workload exits before the claim's deadline (ADR-0033
@@ -300,12 +307,116 @@ pub enum LogEnd {
     Client,
 }
 
+/// Output the guest's queue dropped before the records that follow (ADR-0045 decision 8):
+/// stored and served in sequence as a line of its own, so a reader sees the gap where it is,
+/// never silence. Also written by the broker when its ring dropped stored records between two
+/// reads of a follower.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogGap {
+    /// Bytes of stdout lost before this point.
+    pub lost_stdout: u64,
+    /// Bytes of stderr lost before this point.
+    pub lost_stderr: u64,
+}
+
+/// One stored unit of a claim's output: a record, or a gap before the next one. Serialised
+/// untagged: a record has `seq`, a gap has `lost_stdout`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum LogEntry {
+    /// A line the guest shipped.
+    Record(LogRecord),
+    /// Output that was lost.
+    Gap(LogGap),
+}
+
+impl LogEntry {
+    /// Record text bytes, what the size limits count; a gap weighs nothing.
+    #[must_use]
+    pub fn text_bytes(&self) -> usize {
+        match self {
+            Self::Record(r) => r.text.len(),
+            Self::Gap(_) => 0,
+        }
+    }
+
+    /// The record's `seq`; a gap has none.
+    #[must_use]
+    pub fn seq(&self) -> Option<u64> {
+        match self {
+            Self::Record(r) => Some(r.seq),
+            Self::Gap(_) => None,
+        }
+    }
+}
+
+/// Last line of the user route's NDJSON answer (ADR-0045 decision 9): `{"end": true,
+/// "reason": ...}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogEndLine {
+    /// Always `true`; what marks the line.
+    pub end: bool,
+    /// Why the stream ended.
+    pub reason: LogEnd,
+}
+
+impl LogEndLine {
+    /// The end line for `reason`.
+    #[must_use]
+    pub const fn new(reason: LogEnd) -> Self {
+        Self { end: true, reason }
+    }
+}
+
+/// Every line `GET /v1/claims/{name}/logs` may send (ADR-0045 decision 9), as the CLI parses
+/// them: the header first, then records and gaps in sequence, the end line last. Between them
+/// a follower may receive an empty line every [`LOG_KEEPALIVE_SECS`] seconds, which is not a
+/// `LogLine` and is skipped by the reader. Untagged: each variant has a field no other has.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum LogLine {
+    /// First line.
+    Header(LogHeader),
+    /// A line of output.
+    Record(LogRecord),
+    /// Output that was lost.
+    Gap(LogGap),
+    /// Last line.
+    End(LogEndLine),
+}
+
 /// Largest single record text the broker accepts (ADR-0045 decision 9): the guest splits longer
 /// lines.
 pub const MAX_LOG_RECORD_BYTES: usize = 64 * 1024;
 
 /// Largest batch the broker accepts, as the sum of record texts (ADR-0045 decision 4).
 pub const MAX_LOG_BATCH_BYTES: usize = 256 * 1024;
+
+/// Default of `logs.max_bytes`: the newest output the broker keeps per claim (ADR-0045
+/// decision 4).
+pub const DEFAULT_LOG_MAX_BYTES: usize = 1024 * 1024;
+
+/// Hard ceiling of `logs.max_bytes`; a configuration above it is refused at start (ADR-0045
+/// decision 4).
+pub const LOG_MAX_BYTES_CEILING: usize = 4 * 1024 * 1024;
+
+/// One segment of the broker's ring (ADR-0045 decision 6): the most record text one stored
+/// object holds. Also the floor of `logs.max_bytes`, so the ring has at least one segment.
+pub const LOG_SEGMENT_BYTES: usize = 64 * 1024;
+
+/// Seconds between the empty keepalive lines of a `follow` read (ADR-0045 decision 9).
+pub const LOG_KEEPALIVE_SECS: u64 = 15;
+
+// The limits nest: a record fits a segment, a segment fits the default cap, the default fits
+// the ceiling, and a batch fits the default cap. Checked at compile time.
+const _: () = assert!(MAX_LOG_RECORD_BYTES <= LOG_SEGMENT_BYTES);
+const _: () = assert!(LOG_SEGMENT_BYTES <= DEFAULT_LOG_MAX_BYTES);
+const _: () = assert!(DEFAULT_LOG_MAX_BYTES <= LOG_MAX_BYTES_CEILING);
+const _: () = assert!(MAX_LOG_BATCH_BYTES <= DEFAULT_LOG_MAX_BYTES);
+
+/// Seconds a node waits before its next batch when the broker answered `429` (ADR-0045
+/// decision 4): one batch per second per claim, the `Retry-After` the broker sends.
+pub const LOG_RETRY_AFTER_SECS: u64 = 1;
 
 impl LogBatch {
     /// Total bytes of record text, what the size limits count.
@@ -1033,6 +1144,69 @@ pub struct ErrorBody {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_workloads_logs_opt_in_is_off_by_default_and_left_off_the_wire() {
+        let w: Workload = serde_json::from_value(serde_json::json!({
+            "image": "registry.internal:5000/sandbox:latest"
+        }))
+        .unwrap();
+        assert!(!w.logs, "ADR-0045: capture is opt-in");
+        let v = serde_json::to_value(&w).unwrap();
+        assert!(
+            v.get("logs").is_none(),
+            "an existing client's body is byte-identical: {v}"
+        );
+        let on: Workload = serde_json::from_value(serde_json::json!({
+            "image": "registry.internal:5000/sandbox:latest",
+            "logs": true
+        }))
+        .unwrap();
+        assert!(on.logs);
+        assert_eq!(
+            serde_json::to_value(&on).unwrap()["logs"],
+            serde_json::Value::Bool(true)
+        );
+    }
+
+    #[test]
+    fn every_log_line_round_trips_and_is_told_apart_untagged() {
+        let lines = vec![
+            LogLine::Header(LogHeader {
+                truncated_before: 12,
+                claim_phase: "Bound".into(),
+            }),
+            LogLine::Record(log_record(1, "hello")),
+            LogLine::Gap(LogGap {
+                lost_stdout: 4096,
+                lost_stderr: 0,
+            }),
+            LogLine::Record(log_record(2, "world")),
+            LogLine::End(LogEndLine::new(LogEnd::ClaimEnded)),
+        ];
+        for line in &lines {
+            let text = serde_json::to_string(line).unwrap();
+            let back: LogLine = serde_json::from_str(&text).unwrap();
+            assert_eq!(&back, line, "{text}");
+        }
+        assert_eq!(
+            serde_json::to_value(LogEndLine::new(LogEnd::Ttl)).unwrap(),
+            serde_json::json!({"end": true, "reason": "ttl"})
+        );
+        let entry: LogEntry = serde_json::from_str(r#"{"lost_stdout":1,"lost_stderr":2}"#).unwrap();
+        assert_eq!(
+            entry,
+            LogEntry::Gap(LogGap {
+                lost_stdout: 1,
+                lost_stderr: 2
+            })
+        );
+        assert_eq!(entry.text_bytes(), 0);
+        assert_eq!(entry.seq(), None);
+        let rec = LogEntry::Record(log_record(7, "abc"));
+        assert_eq!(rec.text_bytes(), 3);
+        assert_eq!(rec.seq(), Some(7));
+    }
+
     fn log_record(seq: u64, text: &str) -> LogRecord {
         LogRecord {
             seq,
@@ -1353,6 +1527,7 @@ mod tests {
                 image: "registry/sandbox:latest".into(),
                 args: vec![],
                 restart: RestartPolicy::Always,
+                logs: false,
             },
             refresh_token: None,
             policy_ref: None,
@@ -1377,6 +1552,7 @@ mod tests {
                 image: "registry/sandbox:latest".into(),
                 args: vec![],
                 restart: RestartPolicy::Always,
+                logs: false,
             },
             refresh_token: None,
             policy_ref: None,

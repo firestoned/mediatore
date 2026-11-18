@@ -165,6 +165,8 @@ impl Harness {
         let state = Arc::new(AppState {
             inject: std::collections::BTreeMap::new(),
             inject_port: None,
+            logs: None,
+            log_limiter: Limiter::per_second(1),
             store: store.clone(),
             spire: entries.clone(),
             naming: Naming {
@@ -248,6 +250,7 @@ impl Harness {
                     image: "registry.internal:5000/sandbox:latest".into(),
                     args: vec![],
                     restart: mediatore_proto::RestartPolicy::Always,
+                    logs: false,
                 },
                 refresh_token: refresh_token.map(|t| Secret(t.to_owned())),
                 policy_ref: None,

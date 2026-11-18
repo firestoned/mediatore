@@ -153,6 +153,22 @@ tells the broker, the exit (code or signal, restarts) goes on the record and `sa
 shows it, and the claim is released as a delete releases it: the member recycled, the
 tokens cut off. A one-shot agent is `--restart on-failure`.
 
+`spec.workload.logs` (`logs: true` in `workload` on `POST /v1/claims`, `--logs` on
+`mediatore sandbox create`; [ADR-0045](../adr/0045-a-sandbox-workloads-output-streamed-to-its-owner.md))
+is the opt-in to output capture: the guest tees what the workload prints to stdout and
+stderr, redacts it in the VM and ships it to the broker, and `mediatore sandbox logs <name>`
+(`-f` to follow, `--tail`, `--since`, `--timestamps`) reads it back, stdout lines to stdout and
+stderr lines to stderr, for the claim's life and for `logs.retention_secs` after it ends. Only
+the claim's subject can read it; a declarative requester has no token with that subject and
+cannot. Without the opt-in nothing is captured and the output lands on the VM console alone,
+as before. The broker must have `logs.enabled: true`
+([the store](the-store.md#workload-output)): a claim that opts in on one that does not is
+refused with `501 not_implemented` (declaratively, `Failed` with the reason). Redaction is best
+effort, not a guarantee: the guest removes the secrets it placed in the jail and whatever looks
+like a credential (a JWT, an `Authorization` value, a private key), and cannot catch a secret the
+workload transforms or one it fetched itself; the output is kept for a bounded time and only
+the newest `logs.max_bytes` (default 1 MiB) of it.
+
 ### What the comparison reports
 
 With a `policy` section configured, every sandbox carries a `PolicyConformant` condition:
