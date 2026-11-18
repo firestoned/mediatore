@@ -429,7 +429,7 @@ YAML
 node_registered() { node_logs | grep -qF "node registered"; }
 wait_for "$TIMEOUT" "'node registered' in the node pod log" node_registered
 "${KSA[@]}" create -f - >/dev/null <<YAML
-apiVersion: mediatore.io/v1alpha1
+apiVersion: mediatore.io/v1beta1
 kind: AgentSandbox
 metadata:
   name: sb-gw

@@ -67,7 +67,10 @@ need interactivity, the workload dials **out** (see
 2. Claim, naming the workload (an argument that starts with a dash goes in the `--arg=-p`
    form, or the CLI reads it as a flag of its own). `--pool` is optional: with neither it nor
    `--pool-selector key=value`, the claim is made across every pool in the sandbox namespace
-   ([ADR-0044](../adr/0044-a-sandbox-selects-its-pool-by-label.md)):
+   ([ADR-0044](../adr/0044-a-sandbox-selects-its-pool-by-label.md)). `--strategy spread` asks
+   banlieue for a member on a host where you hold the fewest sandboxes, `--strategy
+   most-available` for the host with the most Ready members; without the flag the member Ready
+   longest is taken ([ADR-0047](../adr/0047-a-sandbox-chooses-its-member-by-strategy.md)):
 
    ```bash
    # Dex: the CLI posts the claim with the session delegated

@@ -3,7 +3,8 @@
 
 # Requesting a sandbox
 
-A sandbox request is an `AgentSandbox` resource (`mediatore.io/v1alpha1`,
+A sandbox request is an `AgentSandbox` resource (`mediatore.io/v1beta1`,
+[ADR-0048](../adr/0048-agentsandbox-served-as-v1beta1.md);
 [ADR-0008](../adr/0008-agentsandbox-crd-owned-by-mediatore.md)). There are two ways to
 create one, and everything after creation is the same: mediatore creates and owns one
 `VirtualMachineClaim` for it, banlieue binds a warm pool member, mediatore declares the
@@ -40,6 +41,18 @@ the pools so labelled. Exactly one of the two: a body with neither or both is re
 came from, once the claim is bound. The CLI (`mediatore sandbox create`) takes `--pool <name>`
 or `--pool-selector key=value`; with neither it sends `pool_selector: {}` and says so, so a
 plain `sandbox create` claims across all the namespace's pools.
+
+Among the Ready members of the matched pools, banlieue picks one: current image revision
+first, then a healthy host, then the one Ready longest. `selection` says how to rank inside
+that order ([ADR-0047](../adr/0047-a-sandbox-chooses-its-member-by-strategy.md), banlieue ADR-0135):
+`"selection": { "strategy": "Spread" }` takes the member from the failure domain where you
+hold the fewest sandboxes, so yours do not share a host; `MostAvailable` takes from the domain
+with the most Ready members, so warm capacity drains evenly; `LongestReady` is the default and
+what an absent `selection` means. A strategy only reorders, never filters: a claim never waits
+while a Ready member exists. Any other value is refused (`422`), never read as a default. The
+CLI takes `--strategy longest-ready|most-available|spread`, and sends nothing without it. Which
+strategy chose the member, and from which domain, is on the claim's `Bound` condition
+(`kubectl get vmclaim <name> -o jsonpath='{.status.conditions[?(@.type=="Bound")].message}'`).
 
 An audience served from your own credential (`via: delegated`,
 [ADR-0035](../adr/0035-a-requesters-own-session-delegated-at-claim-time.md)) takes it in
@@ -98,10 +111,12 @@ Anything with `create` on `agentsandboxes` in a namespace can request a sandbox 
 GitOps repository, a CI job, an app-only service. The pool must live in the same
 namespace, named with `poolRef` or selected with `poolSelector` (a `LabelSelector` over the
 namespace's pools, `{}` for all of them; exactly one of the two, enforced by CEL on the
-resource).
+resource). `selection: { strategy: Spread }` says how banlieue ranks the members it may take
+([ADR-0047](../adr/0047-a-sandbox-chooses-its-member-by-strategy.md)); it is optional, and a value outside
+`LongestReady`, `MostAvailable` and `Spread` is refused by the schema.
 
 ```yaml
-apiVersion: mediatore.io/v1alpha1
+apiVersion: mediatore.io/v1beta1
 kind: AgentSandbox
 metadata:
   name: ledgers-2026-10-14

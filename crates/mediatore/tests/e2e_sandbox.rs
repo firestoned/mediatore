@@ -104,6 +104,7 @@ impl Harness {
                 namespace: None,
                 pool_ref: Some("pool-a".into()),
                 pool_selector: None,
+                selection: None,
                 ttl_seconds: 3600,
                 audiences: audiences.iter().map(|a| (*a).to_owned()).collect(),
                 workload: Workload {
@@ -355,6 +356,7 @@ async fn the_typed_empty_selector_arrives_as_any_pool() {
             namespace: None,
             pool_ref: None,
             pool_selector: Some(PoolSelector::default()),
+            selection: None,
             ttl_seconds: 60,
             audiences: vec![],
             workload: Workload {
@@ -397,6 +399,71 @@ async fn a_request_with_neither_or_both_pool_fields_is_refused_before_anything_i
         let body: ErrorBody = resp.json().await.expect("error body");
         assert_eq!(body.error, "invalid_pool", "{what}");
     }
+    assert_eq!(h.sandboxes.all().len(), 0);
+}
+
+// ----- ADR-0047: a sandbox chooses its member by strategy -------------------------------------
+
+/// A strategy lands on `spec.selection` in banlieue's spelling (ADR-0047 decisions 1 and 3);
+/// without one the spec has no `selection` at all (decision 2), so banlieue's default applies.
+#[tokio::test]
+async fn post_with_a_strategy_carries_it_to_the_sandbox_and_without_one_carries_none() {
+    let h = Harness::start(true).await;
+    let token = h.login("octocat");
+    let mut body = body_with_pool(serde_json::json!({ "pool_selector": {} }));
+    body["selection"] = serde_json::json!({ "strategy": "Spread" });
+    let resp = h.create_raw(&token, &body).await;
+    assert_eq!(resp.status(), 201);
+    let sb = &h.sandboxes.all()[0];
+    assert_eq!(
+        sb.spec.selection,
+        Some(banlieue_api::banlieue::ClaimSelection {
+            strategy: banlieue_api::banlieue::SelectionStrategy::Spread,
+        })
+    );
+    let spec = serde_json::to_value(&sb.spec).unwrap();
+    assert_eq!(
+        spec["selection"],
+        serde_json::json!({ "strategy": "Spread" }),
+        "got {spec}"
+    );
+
+    let plain = h
+        .create_raw(
+            &token,
+            &body_with_pool(serde_json::json!({ "pool_ref": "pool-a" })),
+        )
+        .await;
+    assert_eq!(plain.status(), 201);
+    let sb = h
+        .sandboxes
+        .all()
+        .into_iter()
+        .find(|s| s.spec.pool_ref.is_some())
+        .expect("the sandbox that named a pool");
+    assert!(sb.spec.selection.is_none());
+    let spec = serde_json::to_value(&sb.spec).unwrap();
+    assert!(
+        spec.get("selection").is_none(),
+        "absent, not defaulted: {spec}"
+    );
+}
+
+/// A strategy the broker does not know is refused before anything is created (ADR-0047
+/// decision 3): a parse error, never a default.
+#[tokio::test]
+async fn a_request_with_an_unknown_strategy_is_refused_before_anything_is_created() {
+    let h = Harness::start(true).await;
+    let token = h.login("octocat");
+    let mut body = body_with_pool(serde_json::json!({ "pool_ref": "pool-a" }));
+    body["selection"] = serde_json::json!({ "strategy": "Pack" });
+    let resp = h.create_raw(&token, &body).await;
+    assert_eq!(
+        resp.status(),
+        422,
+        "{}",
+        resp.text().await.unwrap_or_default()
+    );
     assert_eq!(h.sandboxes.all().len(), 0);
 }
 
@@ -447,7 +514,7 @@ async fn create_sandbox_in_the_default_namespace_is_byte_identical_to_before() {
             "workload": { "args": ["sh"], "image": "registry.internal:5000/sandbox:latest" },
         })
     );
-    assert_eq!(got["apiVersion"], "mediatore.io/v1alpha1");
+    assert_eq!(got["apiVersion"], "mediatore.io/v1beta1");
     assert_eq!(got["kind"], "AgentSandbox");
     assert!(
         got.get("status").is_none(),

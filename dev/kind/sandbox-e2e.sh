@@ -12,8 +12,11 @@
 # sandbox naming an audience outside the broker's configuration fails without a claim.
 # ADR-0044: a sandbox with `poolSelector: {}` is admitted and its claim carries the empty
 # selector and no `poolRef`, accepted by banlieue's own CRD rule; a sandbox with neither
-# field, or both, is refused by the API server before the reconciler sees it. No banlieue
-# controller runs: the claim's status is patched by hand, as in the watcher tier.
+# field, or both, is refused by the API server before the reconciler sees it. ADR-0047: a
+# sandbox with `selection: { strategy: Spread }` is admitted and its claim carries the
+# strategy as written, while one with a strategy banlieue does not have is refused by the
+# schema. No banlieue controller runs: the claim's status is patched by hand, as in the
+# watcher tier.
 #
 #   sandbox-e2e.sh <admin kubeconfig> <broker SA kubeconfig> <trust domain> <ek pem> <ek hash file>
 set -euo pipefail
@@ -72,7 +75,7 @@ log_has() { broker_logs | grep -F "$1" | grep -qF "${2:-}"; }
 manifest() {
   local pool=${4-"poolRef: { name: e2e }"}
   cat <<YAML
-apiVersion: mediatore.io/v1alpha1
+apiVersion: mediatore.io/v1beta1
 kind: AgentSandbox
 metadata:
   name: $1
@@ -290,10 +293,27 @@ YAML
 ); then fail "a claim with no pool was admitted by banlieue's CRD"; fi
 echo "$out" | grep -qF 'exactly one of poolRef or poolSelector' || fail "the claim was refused, but not by banlieue's CEL rule: $out"
 echo "refused: a claim with neither, by banlieue's own rule"
+echo "$ANY" | jq -e '.spec | has("selection") | not' >/dev/null || fail "a sandbox without a strategy produced a claim with one: $(echo "$ANY" | jq -c .spec)"
 "${K[@]}" -n "$NS" delete agentsandbox sb-any --wait=false >/dev/null
 any_gone() { [ -z "$(sandbox sb-any)" ]; }
 wait_for "$TIMEOUT" "agentsandbox sb-any gone" any_gone
 echo "sb-any: claim with poolSelector {} and no poolRef, Pool column blank while Pending; neither and both refused at admission; deleted"
+
+say "strategy (ADR-0047): a sandbox says how banlieue picks the member; the claim carries it as written; a strategy banlieue does not have is refused by the schema"
+manifest sb-spread octocat '[]' 'poolSelector: {}
+  selection: { strategy: Spread }' | admitted "the broker ServiceAccount asking for Spread" "${KSA[@]}" create -f -
+has_spread_claim() { "${K[@]}" -n "$NS" get virtualmachineclaim sb-spread >/dev/null 2>&1; }
+wait_for "$TIMEOUT" "claim sb-spread" has_spread_claim
+SPREAD=$("${K[@]}" -n "$NS" get virtualmachineclaim sb-spread -o json)
+echo "$SPREAD" | jq -e '.spec.selection == {"strategy": "Spread"}' >/dev/null || fail "the claim does not carry the strategy as written: $(echo "$SPREAD" | jq -c .spec)"
+if out=$(manifest sb-pack octocat '[]' 'poolSelector: {}
+  selection: { strategy: Pack }' | "${KSA[@]}" create -f - 2>&1); then fail "a sandbox with a strategy banlieue does not have was admitted"; fi
+echo "$out" | grep -qF 'Unsupported value' || fail "refused, but not by the schema's enum: $out"
+echo "refused: a sandbox asking for Pack, by the schema"
+"${K[@]}" -n "$NS" delete agentsandbox sb-spread --wait=false >/dev/null
+spread_gone() { [ -z "$(sandbox sb-spread)" ]; }
+wait_for "$TIMEOUT" "agentsandbox sb-spread gone" spread_gone
+echo "sb-spread: claim with selection.strategy Spread as written; Pack refused at admission; deleted"
 
 say "delete: the finalizer retracts the entry, deletes the claim, then lets the sandbox go"
 "${K[@]}" -n "$NS" delete agentsandbox sb-e2e --wait=false >/dev/null
@@ -314,4 +334,4 @@ archived() { broker_logs | grep -F "resync" | grep -qE 'archived=[1-9]'; }
 wait_for "$TIMEOUT" "a resync archiving at least one row" archived
 echo "archived at resync"
 
-say "PASS: ADR-0008, ADR-0034 and ADR-0044 hold against a real cluster (subject policy, owned claim and record on the resource, bind to Ready, a restart on the Kubernetes store, fail-closed audience, the pool selector and its exactly-one rule, finalizer, the retention sweep)"
+say "PASS: ADR-0008, ADR-0034, ADR-0044 and ADR-0047 hold against a real cluster (subject policy, owned claim and record on the resource, bind to Ready, a restart on the Kubernetes store, fail-closed audience, the pool selector and its exactly-one rule, the selection strategy carried as written, finalizer, the retention sweep)"

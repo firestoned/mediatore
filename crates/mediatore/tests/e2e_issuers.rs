@@ -224,6 +224,7 @@ impl Harness {
                     namespace: None,
                     pool_ref: Some("pool-a".into()),
                     pool_selector: None,
+                    selection: None,
                     ttl_seconds: 3600,
                     audiences: vec![AUDIENCE.into()],
                     workload: Workload {
@@ -437,6 +438,7 @@ async fn claim_through_gate(gate: IssuerGate, groups: &[&str]) -> (u16, String) 
             namespace: None,
             pool_ref: Some("pool-a".into()),
             pool_selector: None,
+            selection: None,
             ttl_seconds: 600,
             audiences: vec![AUDIENCE.into()],
             workload: Workload {

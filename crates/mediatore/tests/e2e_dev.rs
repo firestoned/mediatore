@@ -273,6 +273,7 @@ impl Harness {
                 namespace: None,
                 pool_ref: Some("pool-a".into()),
                 pool_selector: None,
+                selection: None,
                 ttl_seconds: 3600,
                 audiences: vec![AUDIENCE.into()],
                 workload: Workload {
@@ -299,6 +300,7 @@ impl Harness {
                 namespace: None,
                 pool_ref: Some("pool-a".into()),
                 pool_selector: None,
+                selection: None,
                 ttl_seconds: 3600,
                 audiences: vec![AUDIENCE.into()],
                 workload: Workload {
@@ -328,6 +330,7 @@ impl Harness {
                 namespace: None,
                 pool_ref: Some("pool-a".into()),
                 pool_selector: None,
+                selection: None,
                 ttl_seconds: 3600,
                 audiences: vec![AUDIENCE.into()],
                 workload: Workload {
@@ -661,6 +664,44 @@ async fn with_output_storage_off_everything_about_it_is_501() {
     assert_eq!(status, 501);
 }
 
+/// ADR-0047 decision 7: `dev_mode` has no pools and no hosts; a strategy is accepted, and the
+/// claim binds to the registered node as before.
+#[tokio::test]
+async fn dev_mode_accepts_a_strategy_and_binds_as_before() {
+    let h = Harness::start().await;
+    h.register_node().await;
+    let user_token = h.login("octocat");
+    let resp = h
+        .http
+        .post(format!("{}/v1/claims", h.user_url))
+        .bearer_auth(&user_token)
+        .json(&ClaimRequest {
+            namespace: None,
+            pool_ref: None,
+            pool_selector: Some(mediatore_proto::PoolSelector::default()),
+            selection: Some(mediatore_proto::Selection {
+                strategy: mediatore_proto::SelectionStrategy::Spread,
+            }),
+            ttl_seconds: 3600,
+            audiences: vec![AUDIENCE.into()],
+            workload: Workload {
+                image: "registry.internal:5000/sandbox:latest".into(),
+                args: vec![],
+                restart: mediatore_proto::RestartPolicy::Always,
+                logs: false,
+            },
+            refresh_token: None,
+            policy_ref: None,
+            delegations: vec![],
+        })
+        .send()
+        .await
+        .expect("create claim");
+    assert_eq!(resp.status(), 201);
+    let claim: ClaimResponse = resp.json().await.expect("claim body");
+    assert_eq!(claim.phase, mediatore_proto::ClaimPhase::Bound);
+}
+
 /// ADR-0045 decision 9: `follow` streams what arrives after the read started and ends when the
 /// claim does.
 #[tokio::test]
@@ -747,6 +788,7 @@ async fn a_one_shot_workload_ends_its_claim_at_the_broker() {
             namespace: None,
             pool_ref: Some("pool-a".into()),
             pool_selector: None,
+            selection: None,
             ttl_seconds: 3600,
             audiences: vec![AUDIENCE.into()],
             workload: Workload {
@@ -1230,6 +1272,7 @@ async fn a_token_for_another_audience_client_is_unauthorized() {
             namespace: None,
             pool_ref: Some("pool-a".into()),
             pool_selector: None,
+            selection: None,
             ttl_seconds: 3600,
             audiences: vec![],
             workload: Workload::default(),
@@ -1259,6 +1302,7 @@ async fn a_login_outside_the_required_group_is_forbidden() {
             namespace: None,
             pool_ref: Some("pool-a".into()),
             pool_selector: None,
+            selection: None,
             ttl_seconds: 3600,
             audiences: vec![],
             workload: Workload::default(),
@@ -1429,6 +1473,7 @@ async fn an_issuer_without_a_session_refuses_a_delegated_refresh_token() {
             namespace: None,
             pool_ref: Some("pool-a".into()),
             pool_selector: None,
+            selection: None,
             ttl_seconds: 3600,
             audiences: vec![AUDIENCE.into()],
             workload: Workload {
@@ -1455,6 +1500,7 @@ fn delegated_request(delegations: Vec<Delegation>, ttl_seconds: u32) -> ClaimReq
         namespace: None,
         pool_ref: Some("pool-a".into()),
         pool_selector: None,
+        selection: None,
         ttl_seconds,
         audiences: vec![AUDIENCE.into(), DELEGATED.into()],
         workload: Workload {

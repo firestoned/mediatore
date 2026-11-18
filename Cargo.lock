@@ -313,7 +313,7 @@ dependencies = [
 [[package]]
 name = "banlieue-api"
 version = "0.5.0"
-source = "git+https://github.com/firestoned/banlieue?tag=v0.5.9#069fc7e96439c3f423d068c2193f67ef43793768"
+source = "git+https://github.com/firestoned/banlieue?tag=v0.5.10#70833c6fe3ddd28e0bce1dfbdee81024d72ce6b4"
 dependencies = [
  "k8s-openapi",
  "kube",

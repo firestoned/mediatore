@@ -858,6 +858,49 @@ mod tests {
         );
     }
 
+    /// ADR-0047 decision 4: `--strategy` takes banlieue's three strategies in kebab case, is
+    /// absent by default, and refuses a value banlieue does not have.
+    #[test]
+    fn the_strategy_flag_is_one_of_three_or_absent() {
+        use mediatore_client::cli::{SandboxCmd, StrategyArg, UserCmd};
+        let base = [
+            "mediatore",
+            "sandbox",
+            "create",
+            "--mediatore",
+            "https://mediatore.sandbox.example",
+            "--image",
+            "registry.internal:5000/sandbox:latest",
+        ];
+        let with = |extra: &[&str]| parse(&[&base[..], extra].concat());
+        let none = with(&[]);
+        assert!(
+            matches!(
+                none,
+                Ok(Cmd::User(UserCmd::Sandbox(SandboxCmd::Create(ref a)))) if a.strategy.is_none()
+            ),
+            "{none:?}"
+        );
+        for (flag, want) in [
+            ("longest-ready", StrategyArg::LongestReady),
+            ("most-available", StrategyArg::MostAvailable),
+            ("spread", StrategyArg::Spread),
+        ] {
+            let parsed = with(&["--strategy", flag]);
+            assert!(
+                matches!(
+                    parsed,
+                    Ok(Cmd::User(UserCmd::Sandbox(SandboxCmd::Create(ref a)))) if a.strategy == Some(want)
+                ),
+                "{flag}: {parsed:?}"
+            );
+        }
+        assert!(
+            with(&["--strategy", "pack"]).is_err(),
+            "pack is not a strategy banlieue has"
+        );
+    }
+
     /// The jail mounts the path the node entry selects (ADR-0014 decision 5), so the two
     /// constants are one.
     #[test]

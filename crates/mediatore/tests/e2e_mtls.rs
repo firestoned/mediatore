@@ -225,6 +225,7 @@ impl Harness {
                 namespace: None,
                 pool_ref: Some("pool-a".into()),
                 pool_selector: None,
+                selection: None,
                 ttl_seconds: 3600,
                 audiences: vec![AUDIENCE.into()],
                 workload: Workload {
