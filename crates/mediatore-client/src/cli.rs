@@ -101,7 +101,7 @@ pub struct LoginArgs {
     pub login_hint: Option<String>,
     /// A PEM file with the CA that signs the issuer's certificate (private PKI); when
     /// given, nothing else is trusted
-    #[arg(long)]
+    #[arg(long, env = "MEDIATORE_CA_FILE")]
     pub ca_file: Option<PathBuf>,
     /// A scope to request (repeatable); the default set is `openid profile email groups
     /// offline_access`, which Dex, Auth0 and Entra take. Google takes no `offline_access`
@@ -577,6 +577,23 @@ mod tests {
         assert_eq!(a.redirect_host, "127.0.0.1");
         assert_eq!(a.redirect_path, "/callback");
         assert_eq!(parse(&["--redirect-port", "0"]).redirect_ports, vec![0]);
+    }
+
+    #[test]
+    fn login_reads_the_ca_file_from_the_same_variable_as_the_other_commands() {
+        use clap::Args as _;
+        let env_of = |cmd: clap::Command| {
+            cmd.get_arguments()
+                .find(|a| a.get_id() == "ca_file")
+                .and_then(|a| a.get_env().map(std::ffi::OsStr::to_owned))
+        };
+        let login = env_of(LoginArgs::augment_args(clap::Command::new("t")));
+        let target = env_of(Target::augment_args(clap::Command::new("t")));
+        assert_eq!(
+            target.as_deref(),
+            Some(std::ffi::OsStr::new("MEDIATORE_CA_FILE"))
+        );
+        assert_eq!(login, target, "login must honour MEDIATORE_CA_FILE too");
     }
 
     #[derive(Parser)]
