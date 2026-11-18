@@ -25,6 +25,9 @@ spec:
     - jsonPath: .status.poolRef.name
       name: Pool
       type: string
+    - jsonPath: .status.virtualMachineRef.name
+      name: VM
+      type: string
     - jsonPath: .status.phase
       name: Phase
       type: string
