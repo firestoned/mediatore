@@ -1991,6 +1991,14 @@ mod tests {
             (Arc::new(Mutex::new(st)), claim)
         }
 
+        /// The names alone: a failure message never prints a Secret's data.
+        pub fn secret_names(st: &State) -> Vec<&str> {
+            st.secrets
+                .iter()
+                .filter_map(|s| s["metadata"]["name"].as_str())
+                .collect()
+        }
+
         pub fn assert_only_home_secrets(st: &State) {
             for (m, p) in &st.log {
                 if p.contains("/secrets") {
@@ -2010,7 +2018,7 @@ mod tests {
         let store = fake::store(&state);
         store.revoke_claim(claim, Timestamp::now()).await.unwrap();
         let st = state.lock().unwrap();
-        assert!(st.secrets.is_empty(), "left: {:?}", st.secrets);
+        assert!(st.secrets.is_empty(), "left: {:?}", fake::secret_names(&st));
         fake::assert_only_home_secrets(&st);
     }
 
@@ -2021,7 +2029,7 @@ mod tests {
         let swept = store.sweep(Timestamp::now()).await.unwrap();
         assert_eq!(swept, 1);
         let st = state.lock().unwrap();
-        assert!(st.secrets.is_empty(), "left: {:?}", st.secrets);
+        assert!(st.secrets.is_empty(), "left: {:?}", fake::secret_names(&st));
         fake::assert_only_home_secrets(&st);
     }
 
@@ -2693,7 +2701,7 @@ mod tests {
             .unwrap();
         assert_eq!(store.sweep(Timestamp::now()).await.unwrap(), 1);
         let st = state.lock().unwrap();
-        assert!(st.secrets.is_empty(), "left: {:?}", st.secrets);
+        assert!(st.secrets.is_empty(), "left: {:?}", fake::secret_names(&st));
         fake::assert_only_home_secrets(&st);
     }
 }

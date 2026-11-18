@@ -4522,8 +4522,9 @@ mod tests {
             .lines()
             .find(|l| l.contains("workload output read") && !l.contains("ended"))
             .expect("the line before the first byte");
+        // The needles are never printed: a failure names the line, which carries no secret.
         for needle in [&rec.uid.to_string(), "alice", &rec.name, "tail=Some(1)"] {
-            assert!(start.contains(needle), "{needle} in {start}");
+            assert!(start.contains(needle), "a field is missing from {start}");
         }
         let end = logs
             .lines()
@@ -4536,7 +4537,7 @@ mod tests {
             "bytes_sent=",
             "duration_ms=",
         ] {
-            assert!(end.contains(needle), "{needle} in {end}");
+            assert!(end.contains(needle), "a field is missing from {end}");
         }
         assert!(
             !logs.contains(PRINTED) && !logs.contains("s3cret"),

@@ -311,6 +311,54 @@ oldest lines, which the reader sees as an explicit gap, never silence. Redaction
 and the broker keeps the newest `logs.max_bytes` (1 MiB by default) per claim; the exit code
 stays on `sandbox get`. The broker needs `logs.enabled: true`, or the claim is refused.
 
+### Reading the output
+
+```sh
+# Ask for the output when you create the sandbox. Without --logs nothing is captured.
+mediatore sandbox create --mediatore https://mediatore.sandbox.example --pool pool-a \
+  --audience api://trading-data --image ghcr.io/example/agent:1 --arg /agent --arg run --logs
+
+# Stream it as it arrives; the stream ends when the claim does.
+mediatore sandbox logs -f my-agent
+
+# After a one-shot workload has exited: the last 50 records, with the time the guest read each.
+mediatore sandbox logs --tail 50 --timestamps my-agent
+
+# Resume from a sequence number you saw earlier (every record carries one).
+mediatore sandbox logs --since 1200 my-agent
+
+# A sandbox declared as an AgentSandbox in another namespace.
+mediatore sandbox logs --namespace team-a -f my-agent
+```
+
+The CLI reads `GET /v1/claims/{name}/logs`, which any client with the session bearer can
+call directly. The body is NDJSON: a header line, then one line per record or gap in
+sequence, then an end line saying why the stream stopped (`client`, `claim_ended`, `ttl`).
+`?follow=true` holds the connection open and sends an empty line every 15 s as a keepalive;
+`?tail=N`, `?since=SEQ` and `?namespace=` match the flags above.
+
+```sh
+curl -sN -H "Authorization: Bearer $SESSION" \
+  "https://broker.sandbox.home.example/v1/claims/my-agent/logs?follow=true&tail=20"
+```
+
+Where it lives and for how long:
+
+- **In the cluster**, as a ring of Secrets in the broker's namespace, one per 64 KiB segment,
+  named `mediatore-logs-<claim uid>-<segment>` and labelled `mediatore.io/logs=segment`.
+  `kubectl -n mediatore get secrets -l mediatore.io/logs=segment` lists them; reading one
+  directly is break-glass and shows in the API server's audit log. Under `dev_mode` the
+  in-memory store keeps the same ring and loses it on restart.
+- **The newest `logs.max_bytes`** per claim (1 MiB by default, 64 KiB to 4 MiB). Older
+  records are dropped and the reader is told how many bytes went that way.
+- **For the claim's life, then `logs.retention_secs`** after it ends (default
+  `store.retention_secs`, one hour). The watcher's resync and the audit sweep remove rings
+  past that window and rings whose claim record is gone; deleting the `AgentSandbox` removes
+  them at once when it lives in the broker's namespace.
+- **Only the claim's subject** can read them through the broker. Nothing is stored unless
+  the requester passed `--logs` and the operator set `logs.enabled: true`
+  ([the store guide](the-store.md#workload-output) has the operator side).
+
 ## Interaction patterns
 
 Because nothing inbound reaches the VM, pick one of:
