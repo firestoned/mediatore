@@ -9,12 +9,15 @@
 use std::collections::BTreeMap;
 
 use jiff::{SignedDuration, Timestamp};
-use mediatore_proto::{Provider, Subject, Workload};
+use mediatore_proto::{
+    LogBatch, LogEntry, LogGap, LogRecord, LogStream, Provider, Subject, Workload,
+};
 use uuid::Uuid;
 
 use crate::seal::{LocalKeySealer, Sealer};
 use crate::{
-    ClaimRecord, ClaimStore, DelegatedSession, NodeRecord, PolicyFloor, SessionRecord, StoreError,
+    ClaimRecord, ClaimStore, DelegatedSession, LogLimits, NodeRecord, PolicyFloor, SessionRecord,
+    StoreError,
 };
 
 /// One `#[tokio::test]` per listed case, each over a fresh store from `$make`.
@@ -58,6 +61,14 @@ macro_rules! suite {
                 a_policy_floor_moves_only_from_what_is_held,
                 a_floor_written_under_another_policy_is_refused,
                 ping_answers,
+                appended_output_reads_back_in_sequence,
+                a_retried_batch_stores_nothing_and_is_counted_ignored,
+                an_overlapping_batch_stores_only_its_new_records,
+                a_gap_is_stored_before_a_batch_with_dropped_counts_and_not_for_a_replay,
+                the_ring_drops_the_oldest_and_counts_the_bytes_it_dropped,
+                a_read_since_a_cursor_returns_later_records_and_the_gap_right_before_them,
+                a_log_sweep_removes_gone_and_ended_claims_output_and_keeps_a_live_claims,
+                deleting_output_that_was_never_stored_is_fine,
             );
         }
     };
@@ -90,6 +101,7 @@ pub(crate) fn claim(uid: Uuid) -> ClaimRecord {
             image: "registry.internal:5000/sandbox/claude:latest".into(),
             args: vec!["/usr/bin/claude".into(), "-p".into(), "hello".into()],
             restart: mediatore_proto::RestartPolicy::OnFailure,
+            logs: false,
         },
         ttl_seconds: 3600,
         refresh: None,
@@ -767,4 +779,295 @@ pub(crate) async fn a_floor_written_under_another_policy_is_refused(s: &dyn Clai
 
 pub(crate) async fn ping_answers(s: &dyn ClaimStore) {
     s.ping().await.unwrap();
+}
+
+// ---------- the output ring (ADR-0045 decisions 4, 6, 7 and 8) ----------
+
+fn log_record(seq: u64, stream: LogStream, text: &str) -> LogRecord {
+    LogRecord {
+        seq,
+        stream,
+        ts: at(i64::try_from(seq).unwrap()),
+        text: text.into(),
+    }
+}
+
+/// A batch of stdout lines `from..=to`, each `text` repeated, no drops.
+fn batch(from: u64, to: u64, text: &str) -> LogBatch {
+    LogBatch {
+        records: (from..=to)
+            .map(|seq| log_record(seq, LogStream::Stdout, text))
+            .collect(),
+        ..LogBatch::default()
+    }
+}
+
+fn records_of(entries: &[LogEntry]) -> Vec<u64> {
+    entries.iter().filter_map(LogEntry::seq).collect()
+}
+
+/// Room for plenty: the default of the broker, far above what these cases store.
+const ROOMY: LogLimits = LogLimits {
+    max_bytes: mediatore_proto::DEFAULT_LOG_MAX_BYTES,
+};
+
+pub(crate) async fn appended_output_reads_back_in_sequence(s: &dyn ClaimStore) {
+    let uid = Uuid::new_v4();
+    let rec = claim(uid);
+    s.put_claim(rec.clone()).await.unwrap();
+    assert_eq!(
+        s.read_logs(uid, None).await.unwrap(),
+        crate::LogChunk::default(),
+        "nothing stored is an empty chunk, not an error"
+    );
+    let mut first = batch(1, 2, "hello");
+    first.records[1] = log_record(2, LogStream::Stderr, "oops");
+    let done = s.append_logs(&rec, &first, &ROOMY).await.unwrap();
+    assert_eq!(
+        done,
+        crate::LogAppend {
+            stored: 2,
+            ignored: 0
+        }
+    );
+    let done = s
+        .append_logs(&rec, &batch(3, 3, "bye"), &ROOMY)
+        .await
+        .unwrap();
+    assert_eq!(done.stored, 1);
+    let chunk = s.read_logs(uid, None).await.unwrap();
+    assert_eq!(chunk.truncated_before, 0);
+    assert_eq!(chunk.last_seq, Some(3));
+    assert_eq!(
+        chunk.entries,
+        vec![
+            LogEntry::Record(first.records[0].clone()),
+            LogEntry::Record(first.records[1].clone()),
+            LogEntry::Record(log_record(3, LogStream::Stdout, "bye")),
+        ],
+        "every field of a record, the stream included, in sequence"
+    );
+    // Another claim's output is another ring.
+    let other = Uuid::new_v4();
+    assert_eq!(s.read_logs(other, None).await.unwrap().entries, Vec::new());
+}
+
+pub(crate) async fn a_retried_batch_stores_nothing_and_is_counted_ignored(s: &dyn ClaimStore) {
+    let uid = Uuid::new_v4();
+    let rec = claim(uid);
+    s.put_claim(rec.clone()).await.unwrap();
+    let b = batch(1, 3, "line");
+    s.append_logs(&rec, &b, &ROOMY).await.unwrap();
+    let again = s.append_logs(&rec, &b, &ROOMY).await.unwrap();
+    assert_eq!(
+        again,
+        crate::LogAppend {
+            stored: 0,
+            ignored: 3
+        }
+    );
+    let chunk = s.read_logs(uid, None).await.unwrap();
+    assert_eq!(records_of(&chunk.entries), vec![1, 2, 3]);
+    assert_eq!(chunk.last_seq, Some(3));
+}
+
+pub(crate) async fn an_overlapping_batch_stores_only_its_new_records(s: &dyn ClaimStore) {
+    let uid = Uuid::new_v4();
+    let rec = claim(uid);
+    s.put_claim(rec.clone()).await.unwrap();
+    s.append_logs(&rec, &batch(1, 3, "a"), &ROOMY)
+        .await
+        .unwrap();
+    let done = s
+        .append_logs(&rec, &batch(2, 5, "b"), &ROOMY)
+        .await
+        .unwrap();
+    assert_eq!(
+        done,
+        crate::LogAppend {
+            stored: 2,
+            ignored: 2
+        }
+    );
+    let chunk = s.read_logs(uid, None).await.unwrap();
+    assert_eq!(records_of(&chunk.entries), vec![1, 2, 3, 4, 5]);
+    let texts: Vec<&str> = chunk
+        .entries
+        .iter()
+        .filter_map(|e| match e {
+            LogEntry::Record(r) => Some(r.text.as_str()),
+            LogEntry::Gap(_) => None,
+        })
+        .collect();
+    assert_eq!(
+        texts,
+        vec!["a", "a", "a", "b", "b"],
+        "the stored copy wins over a replay"
+    );
+}
+
+pub(crate) async fn a_gap_is_stored_before_a_batch_with_dropped_counts_and_not_for_a_replay(
+    s: &dyn ClaimStore,
+) {
+    let uid = Uuid::new_v4();
+    let rec = claim(uid);
+    s.put_claim(rec.clone()).await.unwrap();
+    s.append_logs(&rec, &batch(1, 1, "start"), &ROOMY)
+        .await
+        .unwrap();
+    let mut lossy = batch(2, 3, "after");
+    lossy.dropped_stdout = 4096;
+    lossy.dropped_stderr = 12;
+    s.append_logs(&rec, &lossy, &ROOMY).await.unwrap();
+    // The same batch again: no second gap.
+    let again = s.append_logs(&rec, &lossy, &ROOMY).await.unwrap();
+    assert_eq!(again.stored, 0);
+    let chunk = s.read_logs(uid, None).await.unwrap();
+    assert_eq!(
+        chunk.entries,
+        vec![
+            LogEntry::Record(log_record(1, LogStream::Stdout, "start")),
+            LogEntry::Gap(LogGap {
+                lost_stdout: 4096,
+                lost_stderr: 12,
+            }),
+            LogEntry::Record(log_record(2, LogStream::Stdout, "after")),
+            LogEntry::Record(log_record(3, LogStream::Stdout, "after")),
+        ]
+    );
+    assert_eq!(
+        chunk.truncated_before, 0,
+        "the guest's loss is a gap, not the ring's"
+    );
+}
+
+pub(crate) async fn the_ring_drops_the_oldest_and_counts_the_bytes_it_dropped(s: &dyn ClaimStore) {
+    let uid = Uuid::new_v4();
+    let rec = claim(uid);
+    s.put_claim(rec.clone()).await.unwrap();
+    // One segment's worth of output per batch, exactly: 64 records of 1 KiB.
+    let kib = "x".repeat(1024);
+    let segment = mediatore_proto::LOG_SEGMENT_BYTES;
+    let per_batch = u64::try_from(segment / 1024).unwrap();
+    let limits = LogLimits {
+        max_bytes: 2 * segment,
+    };
+    for i in 0..3u64 {
+        let from = i * per_batch + 1;
+        let b = batch(from, from + per_batch - 1, &kib);
+        assert_eq!(b.text_bytes(), segment);
+        s.append_logs(&rec, &b, &limits).await.unwrap();
+    }
+    let chunk = s.read_logs(uid, None).await.unwrap();
+    let kept: usize = chunk.entries.iter().map(LogEntry::text_bytes).sum();
+    assert!(
+        kept <= limits.max_bytes,
+        "{kept} bytes kept over a cap of {}",
+        limits.max_bytes
+    );
+    assert_eq!(
+        chunk.truncated_before,
+        u64::try_from(3 * segment - kept).unwrap(),
+        "what was dropped is counted exactly"
+    );
+    assert_eq!(
+        chunk.truncated_before,
+        u64::try_from(segment).unwrap(),
+        "the oldest segment's worth went"
+    );
+    assert_eq!(
+        records_of(&chunk.entries).first().copied(),
+        Some(per_batch + 1),
+        "the oldest records went first"
+    );
+    assert_eq!(chunk.last_seq, Some(3 * per_batch), "the newest stayed");
+}
+
+pub(crate) async fn a_read_since_a_cursor_returns_later_records_and_the_gap_right_before_them(
+    s: &dyn ClaimStore,
+) {
+    let uid = Uuid::new_v4();
+    let rec = claim(uid);
+    s.put_claim(rec.clone()).await.unwrap();
+    s.append_logs(&rec, &batch(1, 2, "a"), &ROOMY)
+        .await
+        .unwrap();
+    let mut lossy = batch(3, 4, "b");
+    lossy.dropped_stderr = 7;
+    s.append_logs(&rec, &lossy, &ROOMY).await.unwrap();
+    let chunk = s.read_logs(uid, Some(2)).await.unwrap();
+    assert_eq!(
+        chunk.entries,
+        vec![
+            LogEntry::Gap(LogGap {
+                lost_stdout: 0,
+                lost_stderr: 7,
+            }),
+            LogEntry::Record(log_record(3, LogStream::Stdout, "b")),
+            LogEntry::Record(log_record(4, LogStream::Stdout, "b")),
+        ],
+        "the gap that precedes the first new record comes with it"
+    );
+    let chunk = s.read_logs(uid, Some(3)).await.unwrap();
+    assert_eq!(records_of(&chunk.entries), vec![4]);
+    assert!(
+        !chunk.entries.iter().any(|e| matches!(e, LogEntry::Gap(_))),
+        "a gap before an already-read record is not repeated"
+    );
+    let chunk = s.read_logs(uid, Some(4)).await.unwrap();
+    assert!(chunk.entries.is_empty(), "nothing after the newest");
+    assert_eq!(
+        chunk.last_seq,
+        Some(4),
+        "the cursor does not hide the ring's state"
+    );
+}
+
+pub(crate) async fn a_log_sweep_removes_gone_and_ended_claims_output_and_keeps_a_live_claims(
+    s: &dyn ClaimStore,
+) {
+    // A claim whose record is gone: output appended, no record ever written.
+    let orphan = Uuid::new_v4();
+    s.append_logs(&claim(orphan), &batch(1, 1, "lost"), &ROOMY)
+        .await
+        .unwrap();
+    // One that ended before the retention.
+    let ended = Uuid::new_v4();
+    let mut rec = claim(ended);
+    rec.expires_at = Some(at(200));
+    s.put_claim(rec.clone()).await.unwrap();
+    s.append_logs(&rec, &batch(1, 1, "done"), &ROOMY)
+        .await
+        .unwrap();
+    // One still running.
+    let live = Uuid::new_v4();
+    let mut rec = claim(live);
+    rec.expires_at = Some(at(10_000));
+    s.put_claim(rec.clone()).await.unwrap();
+    s.append_logs(&rec, &batch(1, 1, "running"), &ROOMY)
+        .await
+        .unwrap();
+
+    assert_eq!(s.sweep_logs(at(1000)).await.unwrap(), 2);
+    assert_eq!(s.read_logs(orphan, None).await.unwrap().entries, Vec::new());
+    assert_eq!(s.read_logs(ended, None).await.unwrap().entries, Vec::new());
+    assert_eq!(
+        records_of(&s.read_logs(live, None).await.unwrap().entries),
+        vec![1]
+    );
+    // Already swept: nothing more.
+    assert_eq!(s.sweep_logs(at(1000)).await.unwrap(), 0);
+}
+
+pub(crate) async fn deleting_output_that_was_never_stored_is_fine(s: &dyn ClaimStore) {
+    let uid = Uuid::new_v4();
+    s.delete_logs(uid).await.unwrap();
+    let rec = claim(uid);
+    s.put_claim(rec.clone()).await.unwrap();
+    s.append_logs(&rec, &batch(1, 2, "x"), &ROOMY)
+        .await
+        .unwrap();
+    s.delete_logs(uid).await.unwrap();
+    assert_eq!(s.read_logs(uid, None).await.unwrap().entries, Vec::new());
+    s.delete_logs(uid).await.unwrap();
 }

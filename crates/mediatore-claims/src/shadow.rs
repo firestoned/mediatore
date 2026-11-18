@@ -297,6 +297,7 @@ mod tests {
                 image: "ghcr.io/example/workload:1".into(),
                 args: vec![],
                 restart: None,
+                logs: false,
             },
             policy_ref: policy.map(|name| LocalObjectReference { name: name.into() }),
         }

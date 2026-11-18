@@ -26,6 +26,7 @@ Every value in the example is a placeholder.
 | `watcher` | `resync_secs`, `resolve_timeout_secs`, `lease_duration_secs` | [Claims and reconcilers](claims-and-reconcilers.md) |
 | `store` | `retention_secs`, `node_grace_secs`, `sealing` (`key_file` or `transit`) | [The store and the sealing](store-and-sealing.md) |
 | `token` | `rate_per_minute`: the per-claim limit on `POST /v1/token` | [Broker API](broker-api.md) |
+| `logs` | `enabled` (default `false`), `max_bytes` (the newest output kept per claim, 64 KiB to 4 MiB, default 1 MiB), `retention_secs` (default `store.retention_secs`): the workload output ring of ADR-0045, written only for a sandbox that opted in with `workload.logs` | [The store and the sealing](store-and-sealing.md), [the store guide](../guides/the-store.md#workload-output) |
 | `policy` | `trusted_keys[]`, `namespaces[]`, `egress` (`shadow` or `enforce`) | [Policy](policy.md) |
 | `dev_mode` | `true` for a local run only | everywhere a peer identity could be read from a header |
 
@@ -82,6 +83,9 @@ policy:
     - { id: "notaio:v1", public_key: "<base64 of a 32-byte Ed25519 public key>" }
   namespaces: [sandboxes]
   egress: shadow
+logs:                                     # ADR-0045; off unless enabled
+  enabled: true
+  max_bytes: 1048576
 ```
 
 ## Who may claim where

@@ -12,6 +12,7 @@
 
 pub mod cli;
 pub mod delegate;
+pub mod logs;
 
 use std::path::{Path, PathBuf};
 
@@ -494,6 +495,46 @@ impl Api {
             );
         }
         Ok(resp.json().await?)
+    }
+
+    /// `GET /v1/claims/{name}/logs` (ADR-0045 decision 9): the workload's stored output as
+    /// NDJSON, to be read with [`logs::print_response`]. `?namespace=` as [`Self::get`]
+    /// sends it; `follow` only when true, `since` and `tail` only when given.
+    ///
+    /// # Errors
+    /// The request failing, or a non-success status (`501` when the broker stores no output,
+    /// `403` another subject's claim, `404` no such claim), with the broker's body.
+    pub async fn logs(
+        &self,
+        session: &Session,
+        name: &str,
+        namespace: Option<&str>,
+        query: &logs::LogsQuery,
+    ) -> anyhow::Result<reqwest::Response> {
+        let mut url = format!("{}/v1/claims/{name}/logs", self.base);
+        let mut params = vec![query.to_query()];
+        if let Some(ns) = namespace {
+            params.push(format!("namespace={}", encode(ns)));
+        }
+        let params: Vec<String> = params.into_iter().filter(|p| !p.is_empty()).collect();
+        if !params.is_empty() {
+            url.push('?');
+            url.push_str(&params.join("&"));
+        }
+        let resp = self
+            .http
+            .get(url)
+            .bearer_auth(&session.id_token)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            anyhow::bail!(
+                "mediatore: {} {}",
+                resp.status(),
+                resp.text().await.unwrap_or_default()
+            );
+        }
+        Ok(resp)
     }
 
     /// `DELETE /v1/claims/{name}`, with `?namespace=` when one is given (ADR-0046 decision 5).

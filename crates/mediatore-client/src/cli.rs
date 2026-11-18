@@ -2,9 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The user's subcommands of the one `mediatore` binary (ADR-0014): `login` at the issuer,
-//! then `sandbox create`, `sandbox get`, `sandbox delete` against mediatore's user API, and
-//! `session` to show what is logged in (ADR-0013).
+//! then `sandbox create`, `sandbox get`, `sandbox logs`, `sandbox delete` against mediatore's
+//! user API, and `session` to show what is logged in (ADR-0013).
 
+use std::io::Write as _;
 use std::path::PathBuf;
 
 use clap::{Args, Subcommand};
@@ -169,6 +170,32 @@ pub enum SandboxCmd {
         #[arg(long)]
         namespace: Option<String>,
     },
+    /// Print the workload's output (ADR-0045): a sandbox created with --logs. Redaction
+    /// happened in the VM and is best effort, not a guarantee; the output is kept for a
+    /// bounded time after the claim ends, then swept. stdout records go to stdout and
+    /// stderr records to stderr; the workload's exit code stays on `sandbox get`.
+    Logs {
+        /// Where and as whom.
+        #[command(flatten)]
+        target: Target,
+        /// The sandbox name
+        name: String,
+        /// The namespace to act in (ADR-0046); without it nothing is sent and the broker decides
+        #[arg(long)]
+        namespace: Option<String>,
+        /// Keep reading until the claim ends (Ctrl-C ends the read, not the claim)
+        #[arg(short = 'f', long)]
+        follow: bool,
+        /// Only the last N records
+        #[arg(long, value_name = "N")]
+        tail: Option<u64>,
+        /// Only records after this sequence number
+        #[arg(long, value_name = "SEQ")]
+        since: Option<u64>,
+        /// Prefix each record with the time the guest read it
+        #[arg(long)]
+        timestamps: bool,
+    },
 }
 
 /// Arguments of `sandbox create`.
@@ -219,6 +246,10 @@ pub struct CreateArgs {
     /// Read now, sent once with the claim, never kept (repeatable)
     #[arg(long = "delegate", value_name = "AUDIENCE=SOURCE")]
     pub delegate: Vec<String>,
+    /// Capture the workload's stdout and stderr, redacted in the VM, for `sandbox logs`
+    /// (ADR-0045); the broker must have logs enabled or the claim is refused
+    #[arg(long)]
+    pub logs: bool,
     /// Print the response as JSON
     #[arg(long)]
     pub json: bool,
@@ -284,6 +315,40 @@ pub async fn run(cmd: UserCmd) -> anyhow::Result<()> {
             let session = Session::load(&target.session.path()?)?;
             delete_claim(&target.api()?, &session, &name, namespace.as_deref()).await?;
             println!("{name} deleted");
+            Ok(())
+        }
+        UserCmd::Sandbox(SandboxCmd::Logs {
+            target,
+            name,
+            namespace,
+            follow,
+            tail,
+            since,
+            timestamps,
+        }) => {
+            let session = Session::load(&target.session.path()?)?;
+            let query = crate::logs::LogsQuery {
+                follow,
+                since,
+                tail,
+            };
+            let resp = target
+                .api()?
+                .logs(&session, &name, namespace.as_deref(), &query)
+                .await?;
+            // With --follow, Ctrl-C ends this process and so the read; the claim is untouched,
+            // the broker just sees the reader go.
+            let (stdout, stderr) = (std::io::stdout(), std::io::stderr());
+            let (mut out, mut err) = (stdout.lock(), stderr.lock());
+            let reason = crate::logs::print_response(resp, &mut out, &mut err, timestamps).await?;
+            out.flush()?;
+            if reason != mediatore_proto::LogEnd::ClaimEnded {
+                writeln!(
+                    err,
+                    "[log stream ended: {}]",
+                    serde_json::to_value(reason)?.as_str().unwrap_or("?")
+                )?;
+            }
             Ok(())
         }
         UserCmd::Session(file) => {
@@ -484,6 +549,7 @@ async fn create(args: CreateArgs) -> anyhow::Result<()> {
             image: args.image,
             args: args.args,
             restart: args.restart.into(),
+            logs: args.logs,
         },
         refresh_token: None,
         policy_ref: args.policy,
@@ -743,6 +809,7 @@ mod tests {
                 image: "registry.internal:5000/agent:1".into(),
                 args: vec![],
                 restart: mediatore_proto::RestartPolicy::Always,
+                logs: false,
             },
             refresh_token: None,
             policy_ref: None,
@@ -790,6 +857,143 @@ mod tests {
             SandboxCmd::Delete { namespace, .. } => assert!(namespace.is_none()),
             _ => panic!("delete"),
         }
+    }
+
+    #[test]
+    fn sandbox_logs_parses_its_flags_and_create_takes_logs() {
+        #[derive(Parser)]
+        struct S {
+            #[command(subcommand)]
+            cmd: SandboxCmd,
+        }
+        let m = "https://mediatore.example";
+        match S::try_parse_from([
+            "s",
+            "logs",
+            "--mediatore",
+            m,
+            "-f",
+            "--tail",
+            "20",
+            "--since",
+            "7",
+            "--timestamps",
+            "--namespace",
+            "infra",
+            "sb-1",
+        ])
+        .unwrap()
+        .cmd
+        {
+            SandboxCmd::Logs {
+                name,
+                namespace,
+                follow,
+                tail,
+                since,
+                timestamps,
+                ..
+            } => {
+                assert_eq!(name, "sb-1");
+                assert_eq!(namespace.as_deref(), Some("infra"));
+                assert!(follow && timestamps);
+                assert_eq!(tail, Some(20));
+                assert_eq!(since, Some(7));
+            }
+            _ => panic!("logs"),
+        }
+        match S::try_parse_from(["s", "logs", "--mediatore", m, "sb-1"])
+            .unwrap()
+            .cmd
+        {
+            SandboxCmd::Logs {
+                follow,
+                tail,
+                since,
+                timestamps,
+                ..
+            } => {
+                assert!(!follow && !timestamps);
+                assert_eq!((tail, since), (None, None));
+            }
+            _ => panic!("logs"),
+        }
+        match S::try_parse_from(["s", "create", "--mediatore", m, "--image", "i", "--logs"])
+            .unwrap()
+            .cmd
+        {
+            SandboxCmd::Create(a) => assert!(a.logs, "ADR-0045: the opt-in"),
+            _ => panic!("create"),
+        }
+        match S::try_parse_from(["s", "create", "--mediatore", m, "--image", "i"])
+            .unwrap()
+            .cmd
+        {
+            SandboxCmd::Create(a) => assert!(!a.logs, "off unless asked"),
+            _ => panic!("create"),
+        }
+    }
+
+    #[tokio::test]
+    async fn sandbox_logs_asks_the_logs_route_with_its_query_and_the_bearer() {
+        let body = concat!(
+            "{\"truncated_before\":0,\"claim_phase\":\"Bound\"}\n",
+            "{\"end\":true,\"reason\":\"claim_ended\"}\n"
+        );
+        let (url, h) = one_shot("200 OK", body).await;
+        let resp = Api::new(&url)
+            .unwrap()
+            .logs(
+                &session(),
+                "sb-1",
+                Some("infra"),
+                &crate::logs::LogsQuery {
+                    follow: true,
+                    since: Some(7),
+                    tail: Some(20),
+                },
+            )
+            .await
+            .unwrap();
+        let got = h.await.unwrap();
+        assert!(
+            got.starts_with(
+                "GET /v1/claims/sb-1/logs?follow=true&tail=20&since=7&namespace=infra "
+            ),
+            "{got}"
+        );
+        assert!(got.contains("authorization: Bearer id-token"), "{got}");
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let reason = crate::logs::print_response(resp, &mut out, &mut err, false)
+            .await
+            .unwrap();
+        assert_eq!(reason, mediatore_proto::LogEnd::ClaimEnded);
+        assert_eq!((out.len(), err.len()), (0, 0));
+
+        // Nothing set: no query at all.
+        let (url, h) = one_shot("200 OK", body).await;
+        Api::new(&url)
+            .unwrap()
+            .logs(&session(), "sb-1", None, &crate::logs::LogsQuery::default())
+            .await
+            .unwrap();
+        let got = h.await.unwrap();
+        assert!(got.starts_with("GET /v1/claims/sb-1/logs "), "{got}");
+
+        // A broker with logs off: the status is in the error, nothing is printed.
+        let (url, _h) = one_shot(
+            "501 Not Implemented",
+            r#"{"error":"not_implemented","detail":"logs are not enabled on this broker"}"#,
+        )
+        .await;
+        let e = Api::new(&url)
+            .unwrap()
+            .logs(&session(), "sb-1", None, &crate::logs::LogsQuery::default())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("501"), "{e}");
+        assert!(e.contains("not_implemented"), "{e}");
     }
 
     #[tokio::test]

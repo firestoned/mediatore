@@ -18,10 +18,11 @@ use jiff::SignedDuration;
 use mediatore_api::{AppState, Limiter, Namespaces};
 use mediatore_entra::{Backend, IssuerConfig, Validator};
 use mediatore_proto::{
-    ClaimEgress, ClaimRequest, ClaimResponse, Delegation, Endpoint, ErrorBody, Me, NodeRegistered,
-    NodeRegistration, TokenResponse, Workload,
+    ClaimEgress, ClaimRequest, ClaimResponse, Delegation, Endpoint, ErrorBody, LogBatch, LogEnd,
+    LogLine, LogRecord, LogStream, Me, NodeRegistered, NodeRegistration, TokenResponse, Workload,
 };
 use mediatore_spire::Naming;
+use mediatore_store::LogLimits;
 use mediatore_store::MemoryStore;
 use mediatore_store::seal::LocalKeySealer;
 use mediatore_sts::Sts;
@@ -130,6 +131,21 @@ impl Harness {
     }
 
     async fn start_with(namespaces: Namespaces) -> Self {
+        Self::start_opts(namespaces, None).await
+    }
+
+    /// A broker that stores a workload's output (ADR-0045 decision 11, `logs.enabled`).
+    async fn start_with_logs() -> Self {
+        Self::start_opts(
+            Namespaces::Single("sandboxes".into()),
+            Some(LogLimits {
+                max_bytes: mediatore_proto::DEFAULT_LOG_MAX_BYTES,
+            }),
+        )
+        .await
+    }
+
+    async fn start_opts(namespaces: Namespaces, logs: Option<LogLimits>) -> Self {
         let idp = FakeIdp::start().await;
         let sts = Sts::new(
             "https://mediatore.test",
@@ -141,6 +157,8 @@ impl Harness {
         let state = Arc::new(AppState {
             inject: std::collections::BTreeMap::new(),
             inject_port: None,
+            logs,
+            log_limiter: Limiter::per_second(1),
             store: MemoryStore::shared(),
             spire: Arc::new(mediatore_spire::MemoryEntries::default()),
             naming: Naming {
@@ -261,6 +279,7 @@ impl Harness {
                     image: image.into(),
                     args: vec![],
                     restart: mediatore_proto::RestartPolicy::Always,
+                    logs: false,
                 },
                 refresh_token: None,
                 policy_ref: None,
@@ -286,6 +305,7 @@ impl Harness {
                     image: "registry.internal:5000/sandbox:latest".into(),
                     args: vec![],
                     restart: mediatore_proto::RestartPolicy::Always,
+                    logs: false,
                 },
                 refresh_token: None,
                 policy_ref: None,
@@ -299,6 +319,67 @@ impl Harness {
         (status, body)
     }
 
+    /// `POST /v1/claims` with `workload.logs` as given and `restart: never` (ADR-0045 decision 1).
+    async fn create_claim_logs(&self, token: &str, logs: bool) -> reqwest::Response {
+        self.http
+            .post(format!("{}/v1/claims", self.user_url))
+            .bearer_auth(token)
+            .json(&ClaimRequest {
+                namespace: None,
+                pool_ref: Some("pool-a".into()),
+                pool_selector: None,
+                ttl_seconds: 3600,
+                audiences: vec![AUDIENCE.into()],
+                workload: Workload {
+                    image: "registry.internal:5000/sandbox:latest".into(),
+                    args: vec!["/usr/local/bin/agent".into(), "--once".into()],
+                    restart: mediatore_proto::RestartPolicy::Never,
+                    logs,
+                },
+                refresh_token: None,
+                policy_ref: None,
+                delegations: vec![],
+            })
+            .send()
+            .await
+            .expect("create claim")
+    }
+
+    /// `POST /v1/me/logs` as `peer`.
+    async fn post_logs(&self, peer: &str, batch: &LogBatch) -> reqwest::Response {
+        self.http
+            .post(format!("{}/v1/me/logs", self.sandbox_url))
+            .header(PEER_HEADER, peer)
+            .json(batch)
+            .send()
+            .await
+            .expect("post logs")
+    }
+
+    /// `GET /v1/claims/{name}/logs{query}` with `token`, the body parsed line by line (empty
+    /// keepalive lines skipped).
+    async fn read_logs(&self, token: &str, name: &str, query: &str) -> (u16, Vec<LogLine>) {
+        let resp = self
+            .http
+            .get(format!("{}/v1/claims/{name}/logs{query}", self.user_url))
+            .bearer_auth(token)
+            .send()
+            .await
+            .expect("read logs");
+        let status = resp.status().as_u16();
+        if status != 200 {
+            return (status, vec![]);
+        }
+        assert_eq!(
+            resp.headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("application/x-ndjson")
+        );
+        let text = resp.text().await.expect("ndjson body");
+        (status, parse_lines(&text))
+    }
+
     async fn token_for(&self, peer: &str, audience: &str) -> reqwest::Response {
         self.http
             .post(format!("{}/v1/token", self.sandbox_url))
@@ -310,6 +391,340 @@ impl Harness {
             .await
             .expect("token request")
     }
+}
+
+fn parse_lines(text: &str) -> Vec<LogLine> {
+    text.lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str::<LogLine>(l).unwrap_or_else(|e| panic!("{l}: {e}")))
+        .collect()
+}
+
+fn record(seq: u64, stream: LogStream, text: &str) -> LogRecord {
+    LogRecord {
+        seq,
+        stream,
+        ts: jiff::Timestamp::now(),
+        text: text.into(),
+    }
+}
+
+fn batch(records: Vec<LogRecord>) -> LogBatch {
+    LogBatch {
+        records,
+        ..LogBatch::default()
+    }
+}
+
+/// The `seq` of every record among `lines`, in order.
+fn seqs(lines: &[LogLine]) -> Vec<u64> {
+    lines
+        .iter()
+        .filter_map(|l| match l {
+            LogLine::Record(r) => Some(r.seq),
+            _ => None,
+        })
+        .collect()
+}
+
+fn end_reason(lines: &[LogLine]) -> Option<LogEnd> {
+    match lines.last() {
+        Some(LogLine::End(e)) => Some(e.reason),
+        _ => None,
+    }
+}
+
+/// ADR-0045 decisions 4, 5, 7, 8 and 9 over real listeners: the claim's node ships the
+/// workload's output in batches, the owner and nobody else reads it back in order, a retried
+/// batch changes nothing, the size, shape and rate limits refuse what they must, and the output
+/// of a released claim is still the owner's to read inside the retention window.
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one scripted scenario, front to back; splitting it would hide the order
+async fn a_workloads_output_is_shipped_by_its_node_and_read_by_its_owner_alone() {
+    let h = Harness::start_with_logs().await;
+    h.register_node().await;
+    let user_token = h.login("octocat");
+    let resp = h.create_claim_logs(&user_token, true).await;
+    assert_eq!(resp.status(), 201);
+    let claim: ClaimResponse = resp.json().await.expect("claim body");
+    let uid = claim.uid.expect("uid");
+    let me: Me = h
+        .http
+        .get(format!("{}/v1/me", h.sandbox_url))
+        .header(PEER_HEADER, node_svid())
+        .send()
+        .await
+        .expect("me")
+        .json()
+        .await
+        .expect("me body");
+    assert!(
+        me.workload.logs,
+        "the guest learns the opt-in from GET /v1/me"
+    );
+
+    // Nothing yet: a header, no record, and the stream ends by the client's choice.
+    let (status, lines) = h.read_logs(&user_token, &claim.name, "").await;
+    assert_eq!(status, 200);
+    assert!(
+        matches!(&lines[0], LogLine::Header(hd) if hd.truncated_before == 0 && hd.claim_phase == "Bound"),
+        "{lines:?}"
+    );
+    assert_eq!(seqs(&lines), Vec::<u64>::new());
+    assert_eq!(end_reason(&lines), Some(LogEnd::Client));
+
+    // The first batch is taken; the second within the second is told to wait.
+    let first = batch(vec![
+        record(1, LogStream::Stdout, "hello"),
+        record(2, LogStream::Stderr, "warning: something"),
+    ]);
+    let second = batch(vec![
+        record(3, LogStream::Stdout, "world"),
+        record(4, LogStream::Stdout, "done"),
+    ]);
+    assert_eq!(h.post_logs(&node_svid(), &first).await.status(), 204);
+    let resp = h.post_logs(&node_svid(), &second).await;
+    assert_eq!(resp.status(), 429, "one batch per second per claim");
+    assert_eq!(
+        resp.headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok()),
+        Some("1")
+    );
+    let body: ErrorBody = resp.json().await.expect("429 body");
+    assert_eq!(body.error, "too_many_batches");
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    assert_eq!(h.post_logs(&node_svid(), &second).await.status(), 204);
+
+    // A retried batch is a no-op (decision 8): the same output, once.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    assert_eq!(h.post_logs(&node_svid(), &second).await.status(), 204);
+    let (status, lines) = h.read_logs(&user_token, &claim.name, "").await;
+    assert_eq!(status, 200);
+    assert_eq!(seqs(&lines), vec![1, 2, 3, 4]);
+    assert!(
+        matches!(&lines[2], LogLine::Record(r) if r.stream == LogStream::Stderr && r.text == "warning: something")
+    );
+    assert_eq!(end_reason(&lines), Some(LogEnd::Client));
+    // `tail` and `since` (decision 9).
+    let (_, lines) = h.read_logs(&user_token, &claim.name, "?tail=1").await;
+    assert_eq!(seqs(&lines), vec![4]);
+    let (_, lines) = h.read_logs(&user_token, &claim.name, "?since=2").await;
+    assert_eq!(seqs(&lines), vec![3, 4]);
+
+    // Only the owner reads (decision 5).
+    let (status, _) = h.read_logs(&h.login("hexley"), &claim.name, "").await;
+    assert_eq!(status, 403, "another subject");
+    let resp = h
+        .http
+        .get(format!("{}/v1/claims/{}/logs", h.user_url, claim.name))
+        .send()
+        .await
+        .expect("no token");
+    assert_eq!(resp.status(), 401, "no token");
+    let resp = h
+        .http
+        .get(format!("{}/v1/claims/{}/logs", h.user_url, claim.name))
+        .header(PEER_HEADER, node_svid())
+        .send()
+        .await
+        .expect("node on the user route");
+    assert_eq!(resp.status(), 401, "a node identity is no bearer");
+    // Only the claim's node writes (decision 9).
+    let resp = h
+        .http
+        .post(format!("{}/v1/me/logs", h.sandbox_url))
+        .bearer_auth(&user_token)
+        .json(&first)
+        .send()
+        .await
+        .expect("user on the node route");
+    assert_eq!(resp.status(), 401, "a user token is no peer identity");
+    let resp = h.post_logs(&claim_svid(&uid), &first).await;
+    assert_eq!(resp.status(), 403, "a claim identity is not the node");
+
+    // The size and the shape (decisions 4 and 9).
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let big = batch(vec![
+        record(5, LogStream::Stdout, &"x".repeat(60 * 1024)),
+        record(6, LogStream::Stdout, &"x".repeat(60 * 1024)),
+        record(7, LogStream::Stdout, &"x".repeat(60 * 1024)),
+        record(8, LogStream::Stdout, &"x".repeat(60 * 1024)),
+        record(9, LogStream::Stdout, &"x".repeat(60 * 1024)),
+    ]);
+    let resp = h.post_logs(&node_svid(), &big).await;
+    assert_eq!(resp.status(), 413);
+    let body: ErrorBody = resp.json().await.expect("413 body");
+    assert_eq!(body.error, "batch_too_large");
+    let malformed = batch(vec![
+        record(6, LogStream::Stdout, "b"),
+        record(5, LogStream::Stdout, "a"),
+    ]);
+    let resp = h.post_logs(&node_svid(), &malformed).await;
+    assert_eq!(resp.status(), 400);
+    let body: ErrorBody = resp.json().await.expect("400 body");
+    assert_eq!(body.error, "invalid_log_batch");
+    let (_, lines) = h.read_logs(&user_token, &claim.name, "").await;
+    assert_eq!(seqs(&lines), vec![1, 2, 3, 4], "nothing refused was stored");
+
+    // The workload exits: the claim is released (ADR-0033) and the output stays readable.
+    let exit = mediatore_proto::GuestExit {
+        code: Some(0),
+        signal: None,
+        restarts: 0,
+    };
+    let resp = h
+        .http
+        .post(format!("{}/v1/me/exit", h.sandbox_url))
+        .header(PEER_HEADER, node_svid())
+        .json(&exit)
+        .send()
+        .await
+        .expect("exit");
+    assert_eq!(resp.status(), 204);
+    // A late batch, the guest flushing after the release: taken as 204 and dropped (decision 7).
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let late = batch(vec![record(5, LogStream::Stdout, "late")]);
+    assert_eq!(h.post_logs(&node_svid(), &late).await.status(), 204);
+    let (status, lines) = h.read_logs(&user_token, &claim.name, "").await;
+    assert_eq!(status, 200);
+    assert!(
+        matches!(&lines[0], LogLine::Header(hd) if hd.claim_phase == "Releasing"),
+        "{lines:?}"
+    );
+    assert_eq!(seqs(&lines), vec![1, 2, 3, 4], "the late batch was dropped");
+    assert_eq!(end_reason(&lines), Some(LogEnd::ClaimEnded));
+    let (status, _) = h.read_logs(&h.login("hexley"), &claim.name, "").await;
+    assert_eq!(
+        status, 403,
+        "a released claim's output is still the owner's alone"
+    );
+    // `follow` on an ended claim: the stored output, then the end.
+    let (status, lines) = h.read_logs(&user_token, &claim.name, "?follow=true").await;
+    assert_eq!(status, 200);
+    assert_eq!(seqs(&lines), vec![1, 2, 3, 4]);
+    assert_eq!(end_reason(&lines), Some(LogEnd::ClaimEnded));
+}
+
+/// ADR-0045 decision 1: capture is the requester's opt-in. A claim without it takes no output
+/// from its node, and the owner reads a header and an end line.
+#[tokio::test]
+async fn a_claim_that_did_not_opt_in_takes_no_output() {
+    let h = Harness::start_with_logs().await;
+    h.register_node().await;
+    let user_token = h.login("octocat");
+    let resp = h.create_claim_logs(&user_token, false).await;
+    assert_eq!(resp.status(), 201);
+    let claim: ClaimResponse = resp.json().await.expect("claim body");
+    let resp = h
+        .post_logs(
+            &node_svid(),
+            &batch(vec![record(1, LogStream::Stdout, "hello")]),
+        )
+        .await;
+    assert_eq!(resp.status(), 400);
+    let body: ErrorBody = resp.json().await.expect("400 body");
+    assert_eq!(body.error, "logs_not_requested");
+    let (status, lines) = h.read_logs(&user_token, &claim.name, "").await;
+    assert_eq!(status, 200);
+    assert_eq!(seqs(&lines), Vec::<u64>::new());
+    assert_eq!(end_reason(&lines), Some(LogEnd::Client));
+}
+
+/// ADR-0045 decision 11: with `logs.enabled` off, both routes are `501 not_implemented`, and a
+/// claim that opts in is refused with nothing created.
+#[tokio::test]
+async fn with_output_storage_off_everything_about_it_is_501() {
+    let h = Harness::start().await;
+    h.register_node().await;
+    let user_token = h.login("octocat");
+    let resp = h.create_claim_logs(&user_token, true).await;
+    assert_eq!(resp.status(), 501);
+    let body: ErrorBody = resp.json().await.expect("501 body");
+    assert_eq!(body.error, "not_implemented");
+    assert!(
+        body.detail.as_deref().unwrap_or_default().contains("logs"),
+        "{body:?}"
+    );
+    // Nothing was created: the node is still free, and the next claim binds to it.
+    let (status, claim) = h.create_claim(&user_token).await;
+    assert_eq!(status, 201);
+    assert_eq!(claim.phase, mediatore_proto::ClaimPhase::Bound);
+    let resp = h
+        .post_logs(
+            &node_svid(),
+            &batch(vec![record(1, LogStream::Stdout, "hello")]),
+        )
+        .await;
+    assert_eq!(resp.status(), 501);
+    let (status, _) = h.read_logs(&user_token, &claim.name, "").await;
+    assert_eq!(status, 501);
+}
+
+/// ADR-0045 decision 9: `follow` streams what arrives after the read started and ends when the
+/// claim does.
+#[tokio::test]
+async fn follow_streams_output_as_it_arrives_and_ends_with_the_claim() {
+    let h = Harness::start_with_logs().await;
+    h.register_node().await;
+    let user_token = h.login("octocat");
+    let resp = h.create_claim_logs(&user_token, true).await;
+    assert_eq!(resp.status(), 201);
+    let claim: ClaimResponse = resp.json().await.expect("claim body");
+    assert_eq!(
+        h.post_logs(
+            &node_svid(),
+            &batch(vec![record(1, LogStream::Stdout, "before the read")])
+        )
+        .await
+        .status(),
+        204
+    );
+    let http = h.http.clone();
+    let url = format!("{}/v1/claims/{}/logs?follow=true", h.user_url, claim.name);
+    let token = user_token.clone();
+    let follower = tokio::spawn(async move {
+        let resp = http
+            .get(url)
+            .bearer_auth(&token)
+            .send()
+            .await
+            .expect("follow");
+        assert_eq!(resp.status(), 200);
+        parse_lines(&resp.text().await.expect("stream to the end"))
+    });
+    // The read is under way; the node ships more, then the workload exits.
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    assert_eq!(
+        h.post_logs(
+            &node_svid(),
+            &batch(vec![record(2, LogStream::Stderr, "during the read")])
+        )
+        .await
+        .status(),
+        204
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+    let resp = h
+        .http
+        .post(format!("{}/v1/me/exit", h.sandbox_url))
+        .header(PEER_HEADER, node_svid())
+        .json(&mediatore_proto::GuestExit {
+            code: Some(0),
+            signal: None,
+            restarts: 0,
+        })
+        .send()
+        .await
+        .expect("exit");
+    assert_eq!(resp.status(), 204);
+    let lines = tokio::time::timeout(std::time::Duration::from_secs(20), follower)
+        .await
+        .expect("the follow ends with the claim")
+        .expect("follower task");
+    assert!(matches!(&lines[0], LogLine::Header(_)), "{lines:?}");
+    assert_eq!(seqs(&lines), vec![1, 2]);
+    assert_eq!(end_reason(&lines), Some(LogEnd::ClaimEnded));
 }
 
 /// The guest's report (ADR-0029 decision 5): the node identity reports for its claim, the
@@ -338,6 +753,7 @@ async fn a_one_shot_workload_ends_its_claim_at_the_broker() {
                 image: "registry.internal:5000/sandbox:latest".into(),
                 args: vec!["/usr/local/bin/agent".into(), "--once".into()],
                 restart: mediatore_proto::RestartPolicy::Never,
+                logs: false,
             },
             refresh_token: None,
             policy_ref: None,
@@ -1019,6 +1435,7 @@ async fn an_issuer_without_a_session_refuses_a_delegated_refresh_token() {
                 image: "registry.internal:5000/sandbox:latest".into(),
                 args: vec![],
                 restart: mediatore_proto::RestartPolicy::Always,
+                logs: false,
             },
             refresh_token: Some(mediatore_proto::Secret("rt-unwanted".into())),
             policy_ref: None,
@@ -1044,6 +1461,7 @@ fn delegated_request(delegations: Vec<Delegation>, ttl_seconds: u32) -> ClaimReq
             image: "registry.internal:5000/sandbox:latest".into(),
             args: vec![],
             restart: mediatore_proto::RestartPolicy::Always,
+            logs: false,
         },
         refresh_token: None,
         policy_ref: None,

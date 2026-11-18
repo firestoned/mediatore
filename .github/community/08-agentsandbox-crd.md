@@ -26,6 +26,19 @@ roadmap 05: the store keeps only what cannot sit on a custom resource.
       `mediatore sandbox create` takes `--pool` or `--pool-selector key=value`, and with
       neither sends the empty selector. Lands with the `banlieue-api` tag that carries
       banlieue ADR-0132
+- [x] [ADR-0045](../../docs/adr/0045-a-sandbox-workloads-output-streamed-to-its-owner.md) (2026-11-17):
+      `spec.workload.logs`, the requester's opt-in to output capture (one optional boolean,
+      default false, rendered by `make crds`); `POST /v1/me/logs` from the claim's node
+      (`400` for a malformed batch or a claim that did not opt in, `413`, `429` with
+      `Retry-After: 1`, `501` with `logs.enabled` off, a late batch `204`); the `LogStore`
+      trait required by `ClaimStore`, the memory ring and the Secret ring
+      (`mediatore-logs-<claim uid>-<segment>`, 64 KiB segments, `logs.max_bytes`, owner
+      reference to the sandbox, swept `logs.retention_secs` after the claim at resync and
+      with the audit sweep); `GET /v1/claims/{name}/logs` as NDJSON (`follow`, `since`,
+      `tail`) under the claim's subject and namespace checks, one audit line per read and
+      never the content; `--logs` on `sandbox create`, `mediatore sandbox logs`; a create
+      with `logs: true` on a broker with logs off is `501`, a declarative one `Failed` at
+      reconcile. The guest side is roadmap 06's item. Not yet run live
 - [x] Reconciler on the roadmap 03 leader-elected loop (`Watcher::reconcile_sandbox`, a
       third `Controller` owning the claims): create the owned claim, write the record,
       mirror the status, `ready` only when the claim is `Bound` and the entry is set

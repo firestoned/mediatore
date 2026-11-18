@@ -35,6 +35,8 @@ impl Harness {
         let state = Arc::new(AppState {
             inject: std::collections::BTreeMap::new(),
             inject_port: None,
+            logs: None,
+            log_limiter: Limiter::per_second(1),
             store: MemoryStore::shared(),
             spire: Arc::new(mediatore_spire::MemoryEntries::default()),
             naming: Naming {
@@ -108,6 +110,7 @@ impl Harness {
                     image: "registry.internal:5000/sandbox:latest".into(),
                     args: vec!["sh".into()],
                     restart: mediatore_proto::RestartPolicy::Always,
+                    logs: false,
                 },
                 refresh_token: None,
                 policy_ref: Some("agent".into()),
@@ -358,6 +361,7 @@ async fn the_typed_empty_selector_arrives_as_any_pool() {
                 image: "registry.internal:5000/sandbox:latest".into(),
                 args: vec![],
                 restart: mediatore_proto::RestartPolicy::Always,
+                logs: false,
             },
             refresh_token: None,
             policy_ref: None,

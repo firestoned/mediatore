@@ -9,8 +9,10 @@ use mediatore_api::Namespaces;
 use mediatore_entra::{Backend, IssuerConfig};
 use mediatore_proto::image::canonical_registry;
 use mediatore_proto::{
-    Endpoint, EndpointRule, GATEWAY_CREDENTIAL_MAX_TTL_SECS, HeaderPair, InjectRoute,
+    DEFAULT_LOG_MAX_BYTES, Endpoint, EndpointRule, GATEWAY_CREDENTIAL_MAX_TTL_SECS, HeaderPair,
+    InjectRoute, LOG_MAX_BYTES_CEILING, LOG_SEGMENT_BYTES,
 };
+use mediatore_store::LogLimits;
 use mediatore_store::seal::TransitConfig;
 use serde::Deserialize;
 
@@ -544,6 +546,40 @@ impl Default for StoreSection {
     }
 }
 
+/// A workload's output at the broker (ADR-0045 decisions 4 and 11): whether it is stored at
+/// all, how much of it, and for how long after the claim ends.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LogsSection {
+    /// Store and serve output (default `false`). Off, `POST /v1/me/logs` and
+    /// `GET /v1/claims/{name}/logs` answer `501 not_implemented`, a claim with
+    /// `workload.logs: true` is refused at creation, and the guest keeps the console copy.
+    #[serde(default)]
+    pub enabled: bool,
+    /// The newest output kept per claim, in bytes (default 1 MiB, ceiling 4 MiB, floor one
+    /// 64 KiB segment); the oldest records beyond it are dropped and counted.
+    #[serde(default = "default_log_max_bytes")]
+    pub max_bytes: usize,
+    /// Seconds a claim's output outlives the claim's end before the resync sweeps it. Default:
+    /// `store.retention_secs`, the ended claim's own window.
+    #[serde(default)]
+    pub retention_secs: Option<u64>,
+}
+
+fn default_log_max_bytes() -> usize {
+    DEFAULT_LOG_MAX_BYTES
+}
+
+impl Default for LogsSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_bytes: default_log_max_bytes(),
+            retention_secs: None,
+        }
+    }
+}
+
 /// `POST /v1/token` limits (ADR-0013 decision 5).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -603,6 +639,10 @@ pub struct Config {
     /// Token issuance limits (ADR-0013).
     #[serde(default)]
     pub token: TokenSection,
+    /// A workload's output, stored and served to its owner (ADR-0045 decisions 4 and 11).
+    /// Off by default: both routes answer `501` and a claim that opts in is refused.
+    #[serde(default)]
+    pub logs: LogsSection,
     /// notaio's policy bundles, in shadow (ADR-0026). Absent: none of it.
     #[serde(default)]
     pub policy: Option<PolicySection>,
@@ -990,6 +1030,7 @@ impl Config {
         if cfg.token.rate_per_minute == 0 {
             anyhow::bail!("token.rate_per_minute must be positive");
         }
+        cfg.check_logs()?;
         if let Some(i) = cfg
             .issuers
             .iter()
@@ -1063,6 +1104,15 @@ impl Config {
                 .unwrap_or_else(|e| format!("invalid ({e})"));
             tracing::info!(issuer = %issuer.url, gate = %form, "issuer gate in force");
         }
+        if self.logs.enabled {
+            tracing::info!(
+                max_bytes = self.logs.max_bytes,
+                retention_secs = self.log_retention().as_secs(),
+                "workload output stored and served to its owner (ADR-0045)"
+            );
+        } else {
+            tracing::info!("workload output not stored: logs.enabled is false (ADR-0045)");
+        }
         match self.namespaces() {
             Namespaces::Single(ns) => {
                 tracing::info!(namespaces = %format!("single open namespace {ns}"), "sandbox namespaces in force");
@@ -1080,6 +1130,44 @@ impl Config {
                 );
             }
         }
+    }
+
+    /// ADR-0045 decision 4: `logs.max_bytes` within its floor (one segment) and ceiling, checked
+    /// whether or not the feature is on, so a typo is found before the switch is flipped.
+    fn check_logs(&self) -> anyhow::Result<()> {
+        if self.logs.max_bytes > LOG_MAX_BYTES_CEILING {
+            anyhow::bail!(
+                "logs.max_bytes {} is over the ceiling of {LOG_MAX_BYTES_CEILING} bytes (ADR-0045 decision 4)",
+                self.logs.max_bytes
+            );
+        }
+        if self.logs.max_bytes < LOG_SEGMENT_BYTES {
+            anyhow::bail!(
+                "logs.max_bytes {} is under one segment of {LOG_SEGMENT_BYTES} bytes (ADR-0045 decision 6)",
+                self.logs.max_bytes
+            );
+        }
+        Ok(())
+    }
+
+    /// What bounds a claim's stored output, when output is stored at all (ADR-0045 decision 11):
+    /// `None` is the feature off, and the API fails closed on it.
+    #[must_use]
+    pub fn log_limits(&self) -> Option<LogLimits> {
+        self.logs.enabled.then_some(LogLimits {
+            max_bytes: self.logs.max_bytes,
+        })
+    }
+
+    /// How long a claim's output outlives the claim's end (ADR-0045 decision 4): `logs.retention_secs`,
+    /// or the ended claim's own window.
+    #[must_use]
+    pub fn log_retention(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(
+            self.logs
+                .retention_secs
+                .unwrap_or(self.store.retention_secs),
+        )
     }
 
     /// ADR-0026 decisions 2 and 3: at least one key, every key a well-formed Ed25519 key with
@@ -1603,6 +1691,47 @@ listen: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }
     }
 
     #[test]
+    fn output_storage_is_off_by_default_and_bounded_when_on() {
+        // ADR-0045 decision 11: nothing is stored unless the operator says so.
+        let cfg = Config::parse(&format!("{BASE}dev_mode: true\n")).unwrap();
+        assert!(!cfg.logs.enabled);
+        assert_eq!(cfg.log_limits(), None, "off: the API fails closed on None");
+        assert_eq!(cfg.logs.max_bytes, DEFAULT_LOG_MAX_BYTES);
+        assert_eq!(
+            cfg.log_retention().as_secs(),
+            cfg.store.retention_secs,
+            "the default retention is the ended claim's own window"
+        );
+        let cfg = Config::parse(&format!(
+            "{BASE}{SPIRE}logs: {{ enabled: true, max_bytes: 131072, retention_secs: 60 }}\n"
+        ))
+        .unwrap();
+        assert_eq!(cfg.log_limits(), Some(LogLimits { max_bytes: 131_072 }));
+        assert_eq!(cfg.log_retention().as_secs(), 60);
+        // Decision 4: a ceiling, and a floor of one segment, whether or not the feature is on.
+        for (max, needle) in [
+            (LOG_MAX_BYTES_CEILING + 1, "ceiling"),
+            (LOG_SEGMENT_BYTES - 1, "under one segment"),
+        ] {
+            let err = Config::parse(&format!("{BASE}{SPIRE}logs: {{ max_bytes: {max} }}\n"))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("logs.max_bytes") && err.contains(needle),
+                "{max}: {err}"
+            );
+        }
+        let cfg = Config::parse(&format!(
+            "{BASE}{SPIRE}logs: {{ enabled: true, max_bytes: {LOG_MAX_BYTES_CEILING} }}\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            cfg.logs.max_bytes, LOG_MAX_BYTES_CEILING,
+            "the ceiling itself is valid"
+        );
+    }
+
+    #[test]
     fn a_session_issuer_needs_a_sealing_key_and_the_rate_limit_is_positive() {
         let issuer = "issuers:
   - url: https://dex.home.example
@@ -1795,7 +1924,7 @@ listen: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }
                 .to_string();
             assert!(err.contains(why), "{err}");
         }
-        assert!(Config::parse(base).unwrap().registries.is_empty());
+        assert_eq!(Config::parse(base).unwrap().registries.len(), 0);
     }
 
     #[test]
@@ -2527,6 +2656,7 @@ listen: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }
             "watcher: { typo: 1 }\n".into(),
             "store: { typo: 1 }\n".into(),
             "token: { typo: 1 }\n".into(),
+            "logs: { typo: 1 }\n".into(),
             "registries: [{ host: ghcr.io, typo: 1 }]\n".into(),
             "sts: { issuer: https://m, kid: k, signing_key_file: /k, typo: 1 }\n".into(),
             "policy: { typo: 1 }\n".into(),

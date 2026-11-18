@@ -297,6 +297,20 @@ What happens when your command exits before the deadline is the claim's `workloa
 non-zero exit and ends the claim on `0` (an agent that runs once), `never` ends the claim
 on any exit. The exit goes on the claim's record and the member is recycled.
 
+What your command prints is, by default, visible on the VM console and nowhere else. Opt the
+claim in with `--logs` (`workload.logs: true`;
+[ADR-0045](../adr/0045-a-sandbox-workloads-output-streamed-to-its-owner.md)) and the guest
+tees stdout and stderr, redacts each line before it leaves the VM (the phantom and every
+secret-bearing value it placed in the jail, literally and in their base64 and percent-encoded
+forms; JWTs, `Authorization` values and private-key PEM blocks by shape), and ships them to the
+broker in batches; `mediatore sandbox logs -f <name>` prints them as they arrive, stdout to
+stdout and stderr to stderr so `2>&1` merges them as a terminal would, and a plain `mediatore
+sandbox logs <name>` reads a finished one-shot workload's output for the retention window after
+it ended. The workload never waits for the broker: a slow or unreachable one costs the queue's
+oldest lines, which the reader sees as an explicit gap, never silence. Redaction is best effort
+and the broker keeps the newest `logs.max_bytes` (1 MiB by default) per claim; the exit code
+stays on `sandbox get`. The broker needs `logs.enabled: true`, or the claim is refused.
+
 ## Interaction patterns
 
 Because nothing inbound reaches the VM, pick one of:
@@ -314,8 +328,11 @@ Because nothing inbound reaches the VM, pick one of:
    speaks HTTP/1.1; a WebSocket upgrade is not relayed, so a dial-out relay is a plain
    HTTPS API or a long poll.
 3. **Poll-the-broker.** The caller polls `GET /v1/claims/{name}` for phase and
-   deadline; that endpoint mirrors state but never carries workload output. Output
-   always travels via pattern 1 or 2.
+   deadline; that endpoint mirrors state but never carries workload output. With `--logs`
+   the caller can also read what the workload printed, `GET /v1/claims/{name}/logs`
+   (`mediatore sandbox logs`, [ADR-0045](../adr/0045-a-sandbox-workloads-output-streamed-to-its-owner.md)):
+   the answer of a one-shot agent, redacted in the VM and bounded in size and time, for the
+   owner alone. Structured results still travel via pattern 1 or 2.
 
 ## Status and caveats
 

@@ -151,11 +151,54 @@ impl JailSpec {
     pub fn env(&self) -> Vec<(String, String)> {
         vec![(PHANTOM_ENV.to_owned(), self.phantom.expose().to_owned())]
     }
+
+    /// Every environment value the guest places in the jail that bears a credential, for the
+    /// output redactor's literal set (ADR-0045 decision 2): today the phantom alone. A new
+    /// credential-bearing variable is added here in the same change that adds it to
+    /// [`Self::env`]; the unit test fails otherwise.
+    #[must_use]
+    pub fn secret_values(&self) -> Vec<String> {
+        vec![self.phantom.expose().to_owned()]
+    }
+}
+
+/// An environment key that bears a credential, by its name: redaction must know its value.
+#[must_use]
+pub fn is_credential_key(key: &str) -> bool {
+    let k = key.to_ascii_uppercase();
+    key == PHANTOM_ENV
+        || k.contains("TOKEN")
+        || k.contains("SECRET")
+        || k.contains("PASSWORD")
+        || k.contains("KEY")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_credential_bearing_environment_value_is_in_the_redaction_set() {
+        // ADR-0045 decision 2: a credential placed in the jail that the redactor does not
+        // know would leave the VM in the output. The phantom is the one there is today.
+        let spec = spec();
+        let secrets = spec.secret_values();
+        assert_ne!(secrets.len(), 0);
+        for (key, value) in spec.env() {
+            if is_credential_key(&key) {
+                assert!(
+                    secrets.contains(&value),
+                    "{key} bears a credential but its value is not in secret_values()"
+                );
+            }
+        }
+        assert!(secrets.contains(&phantom().expose().to_owned()));
+        assert!(is_credential_key(PHANTOM_ENV));
+        assert!(is_credential_key("AWS_SECRET_ACCESS_KEY"));
+        assert!(is_credential_key("db_password"));
+        assert!(!is_credential_key("HOME"));
+        assert!(!is_credential_key(PROXY_URL_ENV));
+    }
 
     fn phantom() -> Phantom {
         Phantom::parse("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff").unwrap()

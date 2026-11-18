@@ -26,6 +26,7 @@ never sits behind a TLS-ending proxy: it is exposed as a TLS passthrough so the 
 | `POST /v1/claims` | request a sandbox (below) |
 | `GET /v1/claims/{name}` | the sandbox's status, mirrored from its `AgentSandbox`; only its subject may read it, in a namespace the caller's groups admit (`?namespace=`, ADR-0046: a namespace they do not admit answers `404`, the same as no such sandbox) |
 | `DELETE /v1/claims/{name}` | delete the `AgentSandbox` (`?namespace=` as for `GET`); the reconciler's finalizer does the rest |
+| `GET /v1/claims/{name}/logs` | the workload's output, for a sandbox created with `workload.logs: true` (ADR-0045): NDJSON, a header, the records and gaps in sequence, an end line; `?follow=`, `?since=`, `?tail=`, `?namespace=` as for `GET`; the same subject and namespace checks; `501` unless the broker's `logs.enabled` |
 
 **Sandbox API** (`sandbox_router`)
 
@@ -36,6 +37,7 @@ never sits behind a TLS-ending proxy: it is exposed as a TLS passthrough so the 
 | `GET /v1/me` | the guest, as the node | the claim bound to that node: workload, routes, gateways, registry credential. The guest writes the routes to files for the egress proxy, which then needs no route of its own to read them |
 | `POST /v1/me/report` | the guest | what the VM found: the image digest, the ruleset's hash, the host table |
 | `POST /v1/me/exit` | the guest | the workload ended under its restart policy; the broker releases the claim |
+| `POST /v1/me/logs` | the guest, as the node | a batch of the workload's redacted output for a claim that opted in (ADR-0045): `204`, or `400` (malformed, or the claim did not opt in), `413`, `429` with `Retry-After: 1`, `501` unless `logs.enabled`; a node with no live claim is `204` and the batch dropped |
 | `POST /v1/token` | the egress proxy, as the claim | a token for one audience (below) |
 | `GET /v1/gateway/claims/{uid}` | a gateway only | what a claim may reach (the allowlist for tunnels) |
 | `POST /v1/gateway/claims/{uid}/credential` | a gateway only | the credential for a gateway-placed audience (ADR-0040) |

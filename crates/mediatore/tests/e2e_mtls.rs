@@ -65,6 +65,8 @@ fn state(idp: &FakeIdp, dev_mode: bool) -> Arc<AppState> {
     Arc::new(AppState {
         inject: std::collections::BTreeMap::new(),
         inject_port: None,
+        logs: None,
+        log_limiter: Limiter::per_second(1),
         store: MemoryStore::shared(),
         spire: Arc::new(mediatore_spire::MemoryEntries::default()),
         naming: Naming {
@@ -229,6 +231,7 @@ impl Harness {
                     image: "registry.internal:5000/sandbox:latest".into(),
                     args: vec![],
                     restart: mediatore_proto::RestartPolicy::Always,
+                    logs: false,
                 },
                 refresh_token: None,
                 policy_ref: None,

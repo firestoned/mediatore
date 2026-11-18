@@ -27,6 +27,7 @@ pub mod guest;
 mod identity;
 pub mod image;
 pub mod jail;
+pub mod logs;
 pub mod net;
 pub mod ready;
 pub mod redact;

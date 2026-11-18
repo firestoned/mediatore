@@ -173,6 +173,8 @@ impl Harness {
         let state = Arc::new(AppState {
             inject: std::collections::BTreeMap::new(),
             inject_port: None,
+            logs: None,
+            log_limiter: Limiter::per_second(1),
             store: MemoryStore::shared(),
             spire: Arc::new(mediatore_spire::MemoryEntries::default()),
             naming: Naming {
@@ -273,6 +275,7 @@ impl Harness {
                     image: "registry.internal:5000/sandbox:latest".into(),
                     args: vec!["/usr/bin/agent".into()],
                     restart: mediatore_proto::RestartPolicy::Always,
+                    logs: false,
                 },
                 refresh_token: None,
                 policy_ref: None,
@@ -574,6 +577,7 @@ async fn a_claim_naming_a_registry_the_pool_cannot_reach_is_refused_and_the_mirr
             image: image.into(),
             args: vec!["/usr/bin/agent".into()],
             restart: mediatore_proto::RestartPolicy::Always,
+            logs: false,
         },
         refresh_token: None,
         policy_ref: None,

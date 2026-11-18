@@ -152,6 +152,13 @@ spec:
                     description: OCI reference of the rootfs the guest agent unpacks into the jail.
                     minLength: 1
                     type: string
+                  logs:
+                    description: |-
+                      The requester's opt-in to output capture (ADR-0045 decision 1, amended): `true` and
+                      the guest tees, redacts and ships the workload's stdout and stderr to the broker, where
+                      the subject reads them with `GET /v1/claims/{name}/logs`. Off by default; a sandbox
+                      that opts in on a broker whose `logs` section is off is refused before any claim exists.
+                    type: boolean
                   restart:
                     description: "[`mediatore_proto::RestartPolicy`] as the resource spells it."
                     enum:

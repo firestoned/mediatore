@@ -20,6 +20,7 @@ transitions in sequence order. The flows modelled today, from the
 - **Node bootstrap: from EK certificate to node SVID** (`flow-node-bootstrap`)
 - **A policy bundle, verified and compared in shadow** (`flow-policy-shadow`)
 - **A private image pulled with the person&#x27;s own credential, which the VM never sees (ADR-0043)** (`flow-registry-pull-placed`)
+- **A one-shot workload&#x27;s output read back by its owner (ADR-0045)** (`flow-workload-output`)
 
 
 ## Claim a sandbox and act as the user
@@ -113,4 +114,23 @@ flowchart TD
 ```
 
 <sub>Source: flow `flow-registry-pull-placed` in `architecture.json`.</sub>
+
+
+## A one-shot workload&#x27;s output read back by its owner (ADR-0045)
+
+From the opt-in on the claim to the owner reading the finished workload's output: capture and redaction in the VM, batches over the node SVID, the Secret ring at the broker, the owner's NDJSON read, the sweep.
+
+```mermaid
+flowchart TD
+    t1["1. mediatore sandbox create --logs: the claim carries workload.logs: true; a broker with logs.enabled false refuses it 501 before anything is created."]
+    t2["2. GET /v1/me returns the workload with logs: true; the guest spawns nsjail with piped stdout and stderr, redacts each line in the VM, writes it through to the console and queues it with a sequence number."]
+    t3["3. POST /v1/me/logs every two seconds or at 32 KiB over the node SVID through the control relay; the broker checks the node is the claim's, the opt-in, the shape, the size and the rate."]
+    t4["4. The batch is appended to the claim's Secret ring; a retried batch is a no-op; the oldest segment goes when the cap is reached and the dropped bytes are counted."]
+    t5["5. The workload exits under its restart policy: the guest flushes the queue (five seconds at most), then POSTs /v1/me/exit and the claim is released (ADR-0033)."]
+    t6["6. mediatore sandbox logs <name>: the owner reads the stored output as NDJSON (stdout lines to stdout, stderr to stderr, a gap or a truncation one line on stderr) for the retention window after the claim ended; another subject is 403."]
+    t7["7. The leader's resync sweeps the segments logs.retention_secs after the claim ended, or at once when the record is gone; the AgentSandbox's garbage collection takes owned segments with it."]
+    t1 --> t2 --> t3 --> t4 --> t5 --> t6 --> t7
+```
+
+<sub>Source: flow `flow-workload-output` in `architecture.json`.</sub>
 

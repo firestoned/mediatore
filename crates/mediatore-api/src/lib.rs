@@ -40,14 +40,15 @@ use mediatore_proto::image::ImageReference;
 use mediatore_proto::{
     ClaimEgress, ClaimPhase, ClaimReport, ClaimRequest, ClaimResponse, Credential, Delegation,
     DelegationPlain, Endpoint, EndpointRule, ErrorBody, GatewayCredential,
-    GatewayCredentialRequest, GuestExit, GuestReport, HeaderPair, HostTable, InjectRoute, Me,
-    NodeRegistered, NodeRegistration, RegistryCredential, Route, Secret, TokenRequest,
-    TokenResponse, WorkloadExit, error_code,
+    GatewayCredentialRequest, GuestExit, GuestReport, HeaderPair, HostTable, InjectRoute,
+    LOG_KEEPALIVE_SECS, LOG_RETRY_AFTER_SECS, LogBatch, LogEnd, LogEndLine, LogEntry, LogGap,
+    LogHeader, MAX_LOG_BATCH_BYTES, Me, NodeRegistered, NodeRegistration, RegistryCredential,
+    Route, Secret, Subject, TokenRequest, TokenResponse, WorkloadExit, error_code,
 };
 use mediatore_spire::{EntryManager, Naming};
 use mediatore_store::seal::{SealError, Sealed, Sealer};
 use mediatore_store::{
-    ClaimRecord, ClaimStore, DelegatedSession, NodeRecord, SessionRecord, StoreError,
+    ClaimRecord, ClaimStore, DelegatedSession, LogLimits, NodeRecord, SessionRecord, StoreError,
 };
 use mediatore_sts::{MintRequest, Sts};
 use mediatore_tls::PeerSpiffeId;
@@ -132,6 +133,14 @@ pub struct AppState {
     /// `gateway_inject_port` (ADR-0040 decision 7): the port of the gateways' inject listener,
     /// carried on every route of a gateway-placed audience on `GET /v1/me`.
     pub inject_port: Option<u16>,
+    /// A workload's output at the broker (ADR-0045 decisions 4 and 11): the cap of each claim's
+    /// ring when `logs.enabled`, `None` when it is not. `None` fails closed: `POST /v1/me/logs`
+    /// and `GET /v1/claims/{name}/logs` answer `501`, and a claim with `workload.logs: true` is
+    /// refused at creation.
+    pub logs: Option<LogLimits>,
+    /// One batch per second per claim on `POST /v1/me/logs` (ADR-0045 decision 4), so a
+    /// workload cannot turn the broker into a write amplifier; `429` with `Retry-After` beyond it.
+    pub log_limiter: Limiter,
 }
 
 /// Which namespaces the user API serves and who may use each (ADR-0046 decisions 3 to 5).
@@ -249,7 +258,10 @@ impl Namespaces {
 /// the issuer rotates the refresh token and two concurrent issues must not both spend
 /// the same one. In process memory, per replica.
 pub struct Limiter {
-    per_minute: u32,
+    /// The bucket's capacity, also the burst.
+    cap: u32,
+    /// Seconds in which the bucket refills from empty to `cap`.
+    period_secs: f64,
     buckets: std::sync::Mutex<HashMap<Uuid, (f64, std::time::Instant)>>,
     locks: std::sync::Mutex<HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>>,
 }
@@ -263,8 +275,20 @@ impl Limiter {
     /// `per_minute` issues a minute per claim (at least 1).
     #[must_use]
     pub fn new(per_minute: u32) -> Self {
+        Self::with_period(per_minute, 60.0)
+    }
+
+    /// `per_second` calls a second per claim (at least 1), the burst the same: the shape of
+    /// the batch limit of ADR-0045 decision 4.
+    #[must_use]
+    pub fn per_second(per_second: u32) -> Self {
+        Self::with_period(per_second, 1.0)
+    }
+
+    fn with_period(cap: u32, period_secs: f64) -> Self {
         Self {
-            per_minute: per_minute.max(1),
+            cap: cap.max(1),
+            period_secs,
             buckets: std::sync::Mutex::new(HashMap::new()),
             locks: std::sync::Mutex::new(HashMap::new()),
         }
@@ -285,7 +309,7 @@ impl Limiter {
     /// Spend one issue for `claim_uid` if the bucket has it.
     pub fn allow(&self, claim_uid: Uuid) -> bool {
         let now = std::time::Instant::now();
-        let cap = f64::from(self.per_minute);
+        let cap = f64::from(self.cap);
         let mut buckets = self
             .buckets
             .lock()
@@ -294,7 +318,7 @@ impl Limiter {
             buckets.retain(|_, (_, last)| now.duration_since(*last) < BUCKET_IDLE);
         }
         let (tokens, last) = buckets.entry(claim_uid).or_insert((cap, now));
-        let refill = now.duration_since(*last).as_secs_f64() / 60.0 * cap;
+        let refill = now.duration_since(*last).as_secs_f64() / self.period_secs * cap;
         *tokens = (*tokens + refill).min(cap);
         *last = now;
         if *tokens >= 1.0 {
@@ -355,6 +379,18 @@ impl ApiError {
     }
     fn not_found(detail: impl Into<String>) -> Self {
         Self::new(StatusCode::NOT_FOUND, "not_found", Some(detail.into()))
+    }
+    /// The store could not be read: never a stale or partial success (ADR-0045 decision 7).
+    fn unavailable(detail: impl Into<String>) -> Self {
+        Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "store_unavailable",
+            Some(detail.into()),
+        )
+    }
+    /// The error code, for a refusal's audit line.
+    fn code(&self) -> &str {
+        &self.body.error
     }
 }
 
@@ -527,6 +563,14 @@ async fn create_claim(
         mediatore_proto::image::unreachable_registry(st.reachable_registries.as_ref(), &image)
     {
         return Err(ApiError::bad_request("unreachable_registry", reason));
+    }
+    // The requester asked for the workload's output and this broker stores none (ADR-0045
+    // decision 11): refused before anything exists, never a claim whose output is silently
+    // dropped.
+    if req.workload.logs && st.logs.is_none() {
+        return Err(ApiError::not_implemented(
+            "logs are not enabled on this broker",
+        ));
     }
     let session = session_for(&st, &validated, &req, &bearer_token).await?;
     let delegations = delegations_for(&st, &req)?;
@@ -1157,8 +1201,402 @@ pub fn user_router(state: Shared) -> Router {
         .route("/.well-known/jwks.json", get(jwks))
         .route("/v1/claims", post(create_claim))
         .route("/v1/claims/{name}", get(get_claim).delete(delete_claim))
+        .route("/v1/claims/{name}/logs", get(read_logs))
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state)
+}
+
+// ---------- the workload's output (ADR-0045) ----------
+
+/// `?follow=&since=&tail=&namespace=` on `GET /v1/claims/{name}/logs` (ADR-0045 decision 9).
+#[derive(serde::Deserialize, Default)]
+struct LogsQuery {
+    namespace: Option<String>,
+    #[serde(default)]
+    follow: bool,
+    since: Option<u64>,
+    tail: Option<usize>,
+}
+
+/// Between two reads of the store while following (ADR-0045 decision 9, amended: a bounded
+/// poll of the store, the guest's batch cadence, in place of a watch on the segments).
+const LOG_FOLLOW_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// One NDJSON line, terminated.
+fn ndjson_line<T: serde::Serialize>(value: &T) -> axum::body::Bytes {
+    let mut text = serde_json::to_vec(value).unwrap_or_default();
+    text.push(b'\n');
+    axum::body::Bytes::from(text)
+}
+
+/// The claim behind `GET /v1/claims/{name}/logs`: the same owner check as `GET
+/// /v1/claims/{name}` (ADR-0045 decision 5), the record (the claim UID the output is keyed by)
+/// and the phase the header reports. Outside `dev_mode` a sandbox whose claim never bound has
+/// no record and no output: `None`.
+async fn owned_record_for_logs(
+    st: &AppState,
+    headers: &HeaderMap,
+    namespace: Option<&str>,
+    name: &str,
+) -> Result<(Option<ClaimRecord>, ClaimPhase, Subject), ApiError> {
+    if st.dev_mode {
+        let rec = owned_claim(st, headers, namespace, name).await?;
+        let phase = phase_of(&rec);
+        let subject = rec.subject.clone();
+        return Ok((Some(rec), phase, subject));
+    }
+    let (namespace, sb) = owned_sandbox(st, headers, namespace, name).await?;
+    let phase = response_of(&sb).phase;
+    let subject = Subject::from(&sb.spec.subject);
+    match st.store.get_claim_by_name(&namespace, name).await {
+        Ok(rec) => Ok((Some(rec), phase, subject)),
+        Err(StoreError::NotFound(_)) => Ok((None, phase, subject)),
+        Err(e) => Err(ApiError::unavailable(e.to_string())),
+    }
+}
+
+/// Whether a claim's output can still grow: its record is live and bound.
+fn claim_has_ended(rec: &ClaimRecord, phase: ClaimPhase) -> bool {
+    rec.revoked_at.is_some() || matches!(phase, ClaimPhase::Releasing | ClaimPhase::Failed)
+}
+
+/// The last `n` records of `entries`, with the gaps among them (ADR-0045 decision 9, `tail`).
+fn tail_entries(entries: Vec<LogEntry>, n: usize) -> Vec<LogEntry> {
+    let records = entries.iter().filter(|e| e.seq().is_some()).count();
+    let mut skip = records.saturating_sub(n);
+    entries
+        .into_iter()
+        .skip_while(|e| {
+            if skip > 0 && e.seq().is_some() {
+                skip -= 1;
+                return true;
+            }
+            skip > 0
+        })
+        .collect()
+}
+
+/// One read's outgoing side: the channel the body drains, and what went down it for the audit
+/// line (decision 10): counts, never content.
+struct Outgoing {
+    tx: tokio::sync::mpsc::Sender<Result<axum::body::Bytes, std::convert::Infallible>>,
+    bytes: u64,
+    records: u64,
+}
+
+impl Outgoing {
+    /// Send one line; `false` once the reader is gone.
+    fn emit<T: serde::Serialize>(&mut self, value: &T) -> bool {
+        self.emit_raw(ndjson_line(value))
+    }
+
+    fn emit_raw(&mut self, line: axum::body::Bytes) -> bool {
+        self.bytes += line.len() as u64;
+        self.tx.try_send(Ok(line)).is_ok()
+    }
+
+    /// Send every entry, counting the records; `false` once the reader is gone.
+    fn emit_entries(&mut self, entries: &[LogEntry]) -> bool {
+        for e in entries {
+            if e.seq().is_some() {
+                self.records += 1;
+            }
+            if !self.emit(e) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// The last line, and why.
+    fn end(&mut self, reason: LogEnd) -> LogEnd {
+        self.emit(&LogEndLine::new(reason));
+        reason
+    }
+}
+
+/// `GET /v1/claims/{name}/logs` (ADR-0045 decisions 5, 7, 9 and 10): the claim's stored output
+/// to its owner, as NDJSON: a `LogHeader`, each record or gap on its own line, and a last line
+/// `{"end": true, "reason": ...}`. With `follow` the broker keeps reading the store every
+/// [`LOG_FOLLOW_POLL`] until the claim ends (`claim_ended`), its record is swept (`ttl`) or the
+/// reader goes (`client`, logged, not sent), with an empty line every [`LOG_KEEPALIVE_SECS`]
+/// of silence. Without it the stored output is sent and the stream ends: `claim_ended` for a
+/// claim that has ended, `client` for a live one, whose output may still grow.
+///
+/// Only the claim's owner reads (the same check as `GET /v1/claims/{name}`); there is no role
+/// that widens it. `501` when the broker stores no output, `503` when the store cannot be read.
+/// Every read is one audit line before the first byte and one at the end, with counts and never
+/// a byte of the output (decision 10).
+async fn read_logs(
+    State(st): State<Shared>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Query(q): Query<LogsQuery>,
+) -> Result<Response, ApiError> {
+    if st.logs.is_none() {
+        tracing::warn!(%name, reason = "not_implemented", "workload output read refused");
+        return Err(ApiError::not_implemented(
+            "logs are not enabled on this broker",
+        ));
+    }
+    let (rec, phase, subject) =
+        match owned_record_for_logs(&st, &headers, q.namespace.as_deref(), &name).await {
+            Ok(found) => found,
+            Err(e) => {
+                tracing::warn!(%name, reason = %e.code(), "workload output read refused");
+                return Err(e);
+            }
+        };
+    let claim_uid = rec.as_ref().map(|r| r.uid);
+    let shown_uid = claim_uid.map_or_else(|| "-".to_owned(), |u| u.to_string());
+    let started = std::time::Instant::now();
+    tracing::info!(
+        claim_uid = %shown_uid,
+        subject = %subject.id,
+        %name,
+        follow = q.follow,
+        since = ?q.since,
+        tail = ?q.tail,
+        "workload output read"
+    );
+    // The first read before the response starts, so a store that cannot be read is a `503`,
+    // never a stream that ends in nothing (decision 7).
+    let first = match claim_uid {
+        Some(uid) => st
+            .store
+            .read_logs(uid, q.since)
+            .await
+            .map_err(|e| ApiError::unavailable(e.to_string()))?,
+        None => mediatore_store::LogChunk::default(),
+    };
+    let (tx, rx) =
+        tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::convert::Infallible>>(32);
+    let state = st.clone();
+    tokio::spawn(async move {
+        let (reason, out) = stream_logs(&state, tx, rec, phase, first, &q).await;
+        tracing::info!(
+            claim_uid = %shown_uid,
+            subject = %subject.id,
+            %name,
+            bytes_sent = out.bytes,
+            records_sent = out.records,
+            duration_ms = started.elapsed().as_millis(),
+            reason = ?reason,
+            "workload output read ended"
+        );
+    });
+    let body = axum::body::Body::from_stream(futures::stream::unfold(rx, |mut rx| async {
+        rx.recv().await.map(|item| (item, rx))
+    }));
+    Ok(([(header::CONTENT_TYPE, "application/x-ndjson")], body).into_response())
+}
+
+/// The lines of one read, sent as produced; returns why it ended and what was sent.
+async fn stream_logs(
+    st: &AppState,
+    tx: tokio::sync::mpsc::Sender<Result<axum::body::Bytes, std::convert::Infallible>>,
+    rec: Option<ClaimRecord>,
+    phase: ClaimPhase,
+    first: mediatore_store::LogChunk,
+    q: &LogsQuery,
+) -> (LogEnd, Outgoing) {
+    let mut out = Outgoing {
+        tx,
+        bytes: 0,
+        records: 0,
+    };
+    let header = LogHeader {
+        truncated_before: first.truncated_before,
+        claim_phase: format!("{phase:?}"),
+    };
+    if !out.emit(&header) {
+        return (LogEnd::Client, out);
+    }
+    let entries = match q.tail {
+        Some(n) => tail_entries(first.entries, n),
+        None => first.entries,
+    };
+    if !out.emit_entries(&entries) {
+        return (LogEnd::Client, out);
+    }
+    let Some(rec) = rec else {
+        // No record: the claim never bound, nothing can arrive.
+        let reason = out.end(LogEnd::ClaimEnded);
+        return (reason, out);
+    };
+    let ended = claim_has_ended(&rec, phase);
+    if !q.follow || ended {
+        let reason = out.end(if ended {
+            LogEnd::ClaimEnded
+        } else {
+            LogEnd::Client
+        });
+        return (reason, out);
+    }
+    // Following: the cursor is the ring's highest seq, whatever `tail` cut.
+    let cursor = first.last_seq.or(q.since);
+    let reason = follow_logs(st, &mut out, rec, cursor, first.truncated_before).await;
+    (reason, out)
+}
+
+/// The `follow` loop (decision 9): read the store every [`LOG_FOLLOW_POLL`] from `cursor`, send
+/// what is new, end with the claim (`claim_ended`), with its record's sweep (`ttl`) or with the
+/// reader (`client`, not sent); an empty line every [`LOG_KEEPALIVE_SECS`] of silence.
+async fn follow_logs(
+    st: &AppState,
+    out: &mut Outgoing,
+    mut rec: ClaimRecord,
+    mut cursor: Option<u64>,
+    mut truncated: u64,
+) -> LogEnd {
+    let mut last_sent = std::time::Instant::now();
+    loop {
+        tokio::time::sleep(LOG_FOLLOW_POLL).await;
+        if out.tx.is_closed() {
+            return LogEnd::Client;
+        }
+        rec = match st.store.get_claim(rec.uid).await {
+            Ok(r) => r,
+            Err(StoreError::NotFound(_)) => {
+                // Swept while being followed: the retention ran out (decision 7).
+                return out.end(LogEnd::Ttl);
+            }
+            Err(e) => {
+                tracing::warn!(claim_uid = %rec.uid, error = %e, "store unreadable while following output");
+                continue;
+            }
+        };
+        let ended = claim_has_ended(&rec, phase_of(&rec));
+        let chunk = match st.store.read_logs(rec.uid, cursor).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(claim_uid = %rec.uid, error = %e, "store unreadable while following output");
+                continue;
+            }
+        };
+        // The ring dropped stored records since the last read, and the first new record is
+        // not the cursor's successor: records this follower never saw are gone. The count is
+        // what the ring dropped in between, an upper bound on what was missed.
+        let first_seq = chunk.entries.iter().find_map(LogEntry::seq);
+        if chunk.truncated_before > truncated
+            && let (Some(c), Some(f)) = (cursor, first_seq)
+            && f > c + 1
+        {
+            let gap = LogGap {
+                lost_stdout: chunk.truncated_before - truncated,
+                lost_stderr: 0,
+            };
+            if !out.emit(&LogEntry::Gap(gap)) {
+                return LogEnd::Client;
+            }
+            tracing::info!(claim_uid = %rec.uid, dropped = gap.lost_stdout, "a follower missed output the ring dropped");
+        }
+        truncated = chunk.truncated_before;
+        if !chunk.entries.is_empty() {
+            if !out.emit_entries(&chunk.entries) {
+                return LogEnd::Client;
+            }
+            last_sent = std::time::Instant::now();
+        }
+        if let Some(l) = chunk.last_seq {
+            cursor = Some(cursor.map_or(l, |c| c.max(l)));
+        }
+        if ended {
+            return out.end(LogEnd::ClaimEnded);
+        }
+        if last_sent.elapsed() >= std::time::Duration::from_secs(LOG_KEEPALIVE_SECS) {
+            if !out.emit_raw(axum::body::Bytes::from_static(b"\n")) {
+                return LogEnd::Client;
+            }
+            last_sent = std::time::Instant::now();
+        }
+    }
+}
+
+/// `POST /v1/me/logs` (ADR-0045 decisions 4, 8 and 9): the claim's node, over the node SVID,
+/// ships a batch of the workload's output, redacted in the VM. The broker re-validates the
+/// shape and the sizes and does not redact again: it cannot know which secrets the jail was
+/// given, so redaction is the guest's, before the output left the VM. A node with no live
+/// claim (the guest flushing after the claim ended) is `204` and the batch is dropped, as a
+/// late exit is. `501` when the broker stores no output; `400 logs_not_requested` for a claim
+/// that did not opt in; `413` over [`MAX_LOG_BATCH_BYTES`]; `429` with `Retry-After` beyond one
+/// batch a second. The text is never logged, only counts.
+async fn ingest_logs(
+    State(st): State<Shared>,
+    headers: HeaderMap,
+    peer: Option<Extension<PeerSpiffeId>>,
+    Json(body): Json<LogBatch>,
+) -> Result<Response, ApiError> {
+    let Some(limits) = st.logs else {
+        return Err(ApiError::not_implemented(
+            "logs are not enabled on this broker",
+        ));
+    };
+    let rec = match claim_of_node_peer(&st, &headers, peer.as_ref().map(|e| &e.0)).await {
+        Ok(rec) => rec,
+        Err(e) if e.status == StatusCode::NOT_FOUND => {
+            tracing::debug!("a node shipped output with no live claim bound; dropped");
+            return Ok(StatusCode::NO_CONTENT.into_response());
+        }
+        Err(e) => return Err(e),
+    };
+    if !rec.workload.logs {
+        return Err(ApiError::bad_request(
+            "logs_not_requested",
+            "this claim did not opt in to output capture (workload.logs)",
+        ));
+    }
+    body.validate()
+        .map_err(|e| ApiError::bad_request("invalid_log_batch", e))?;
+    let bytes = body.text_bytes();
+    if bytes > MAX_LOG_BATCH_BYTES {
+        return Err(ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "batch_too_large",
+            Some(format!(
+                "{bytes} bytes of record text, over the {MAX_LOG_BATCH_BYTES} limit"
+            )),
+        ));
+    }
+    if !st.log_limiter.allow(rec.uid) {
+        tracing::info!(claim_uid = %rec.uid, records = body.records.len(), bytes, "output batch rate-limited (ADR-0045 decision 4)");
+        return Ok((
+            StatusCode::TOO_MANY_REQUESTS,
+            [(header::RETRY_AFTER, LOG_RETRY_AFTER_SECS.to_string())],
+            Json(ErrorBody {
+                error: "too_many_batches".into(),
+                detail: Some("one batch per second per claim".into()),
+            }),
+        )
+            .into_response());
+    }
+    let before = st
+        .store
+        .read_logs(rec.uid, None)
+        .await
+        .map(|c| c.truncated_before)
+        .unwrap_or_default();
+    let outcome = st
+        .store
+        .append_logs(&rec, &body, &limits)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    if let Ok(after) = st.store.read_logs(rec.uid, None).await
+        && after.truncated_before > before
+    {
+        tracing::info!(claim_uid = %rec.uid, dropped = after.truncated_before - before, "output ring dropped its oldest records (ADR-0045 decision 4)");
+    }
+    tracing::debug!(
+        claim_uid = %rec.uid,
+        records = body.records.len(),
+        stored = outcome.stored,
+        ignored = outcome.ignored,
+        bytes,
+        dropped_stdout = body.dropped_stdout,
+        dropped_stderr = body.dropped_stderr,
+        "output batch stored"
+    );
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 // ---------- sandbox-facing ----------
@@ -2152,6 +2590,7 @@ pub fn sandbox_router(state: Shared) -> Router {
         .route("/v1/me", get(me))
         .route("/v1/me/report", post(report))
         .route("/v1/me/exit", post(exit))
+        .route("/v1/me/logs", post(ingest_logs))
         .route("/v1/token", post(token))
         .route("/v1/gateway/claims/{uid}", get(claim_egress))
         .route(
@@ -2177,6 +2616,21 @@ mod tests {
         assert!(
             Limiter::new(0).allow(a),
             "zero means one a minute, never none"
+        );
+    }
+
+    #[test]
+    fn the_per_second_limiter_takes_one_batch_and_refuses_the_next_within_the_second() {
+        // ADR-0045 decision 4: one batch per second per claim, the burst the same.
+        let l = Limiter::per_second(1);
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        assert!(l.allow(a));
+        assert!(!l.allow(a), "the second batch within the second is refused");
+        assert!(l.allow(b), "another claim has its own bucket");
+        assert!(
+            Limiter::per_second(0).allow(a),
+            "zero means one a second, never none"
         );
     }
 
@@ -2253,6 +2707,8 @@ mod tests {
             gateways: vec![],
             inject: BTreeMap::new(),
             inject_port: None,
+            logs: None,
+            log_limiter: Limiter::per_second(1),
         }
     }
 
@@ -3222,6 +3678,15 @@ mod tests {
     }
 
     async fn broker(namespaces: Namespaces, dev_mode: bool) -> Broker {
+        broker_with_logs(namespaces, dev_mode, None).await
+    }
+
+    /// [`broker`] with the output store on or off (ADR-0045 decision 11).
+    async fn broker_with_logs(
+        namespaces: Namespaces,
+        dev_mode: bool,
+        logs: Option<LogLimits>,
+    ) -> Broker {
         let idp = FakeIdp::start().await;
         let front = Arc::new(MemorySandboxes::default());
         let counting = Arc::new(Counting {
@@ -3244,6 +3709,7 @@ mod tests {
         }]);
         st.namespaces = namespaces;
         st.dev_mode = dev_mode;
+        st.logs = logs;
         if !dev_mode {
             st.sandboxes = Some(counting.clone());
         }
@@ -3994,6 +4460,111 @@ mod tests {
     }
 
     // ----- the audit line -----
+
+    /// ADR-0045 decision 10: a read of a workload's output is one line before the first byte
+    /// and one at the end, with the claim UID, the subject and counts, and never a byte of the
+    /// output; a refusal is one `warn` line with its reason.
+    #[tokio::test]
+    async fn a_read_of_workload_output_logs_the_claim_and_the_subject_and_never_the_text() {
+        const PRINTED: &str = "the-workload-printed-this-s3cret-looking-line";
+        capture_logs();
+        let b = broker_with_logs(
+            Namespaces::Single("sandboxes".into()),
+            true,
+            Some(LogLimits {
+                max_bytes: mediatore_proto::DEFAULT_LOG_MAX_BYTES,
+            }),
+        )
+        .await;
+        let mut rec = claim(&[], None);
+        rec.subject = Subject {
+            issuer: b.idp.issuer.clone(),
+            id: "alice".into(),
+            display: None,
+        };
+        rec.workload.logs = true;
+        let rec = stored(&b.st, rec).await;
+        let batch = LogBatch {
+            records: vec![mediatore_proto::LogRecord {
+                seq: 1,
+                stream: mediatore_proto::LogStream::Stdout,
+                ts: Timestamp::now(),
+                text: PRINTED.into(),
+            }],
+            ..LogBatch::default()
+        };
+        b.st.store
+            .append_logs(&rec, &batch, &b.st.logs.unwrap())
+            .await
+            .unwrap();
+        let token = b.token("alice", &[]);
+        let (status, _, text) = b
+            .user(
+                "GET",
+                &format!("/v1/claims/{}/logs?tail=1", rec.name),
+                &token,
+                &[],
+                serde_json::Value::Null,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        assert!(text.contains(PRINTED), "the owner gets the output: {text}");
+        // The end line is written by the streaming task: give it a moment.
+        let mut logs = String::new();
+        for _ in 0..50 {
+            logs = captured();
+            if logs.contains("workload output read ended") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let start = logs
+            .lines()
+            .find(|l| l.contains("workload output read") && !l.contains("ended"))
+            .expect("the line before the first byte");
+        for needle in [&rec.uid.to_string(), "alice", &rec.name, "tail=Some(1)"] {
+            assert!(start.contains(needle), "{needle} in {start}");
+        }
+        let end = logs
+            .lines()
+            .find(|l| l.contains("workload output read ended"))
+            .expect("the line at the end");
+        for needle in [
+            &rec.uid.to_string(),
+            "alice",
+            "records_sent=1",
+            "bytes_sent=",
+            "duration_ms=",
+        ] {
+            assert!(end.contains(needle), "{needle} in {end}");
+        }
+        assert!(
+            !logs.contains(PRINTED) && !logs.contains("s3cret"),
+            "no byte of the output reaches a log line"
+        );
+        assert!(!logs.contains(token.as_str()), "a token reached a log line");
+        // A refusal: another subject, one warn line with the reason.
+        let other = b.token("mallory", &[]);
+        let (status, _, _) = b
+            .user(
+                "GET",
+                &format!("/v1/claims/{}/logs", rec.name),
+                &other,
+                &[],
+                serde_json::Value::Null,
+            )
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let refused = captured()
+            .lines()
+            .find(|l| l.contains("workload output read refused"))
+            .map(str::to_owned)
+            .expect("a refusal line");
+        assert!(
+            refused.contains("WARN") && refused.contains("reason=forbidden"),
+            "{refused}"
+        );
+    }
 
     #[tokio::test]
     async fn a_create_logs_subject_namespace_and_decision_and_never_a_token() {

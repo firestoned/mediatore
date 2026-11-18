@@ -6,6 +6,7 @@
 //! tear everything down at the end.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use jiff::Timestamp;
 
@@ -13,10 +14,15 @@ use mediatore_proto::RestartPolicy;
 
 use crate::confine::EXIT_CONFINEMENT_REFUSED;
 use crate::jail::JailSpec;
+use crate::logs::Capture;
 use crate::{net, sandboxfs, user};
 
 /// Seconds to wait before restarting a crashed workload.
 const RESTART_DELAY_SECS: u64 = 2;
+
+/// `nsjail`'s flag for warnings and above only, added under output capture (ADR-0045
+/// decision 1) so its informational lines stay out of the workload's stderr records.
+pub const NSJAIL_QUIET: &str = "--quiet";
 
 /// What the supervisor does after the jail exits before the deadline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +90,11 @@ pub fn after_event(event: Event, policy: RestartPolicy) -> Next {
 /// Run `nsjail` with the spec's arguments until `expires_at`, restarting on exit as
 /// `policy` says, with the egress proxy `proxy` watched beside it.
 ///
+/// With `capture` (the claim opted in, ADR-0045 decision 1) the jail's stdout and stderr are
+/// pipes the capture's readers drain, redact, tee to the console and queue; the readers are
+/// drained to EOF after every exit before the next step. Without it the jail inherits the
+/// guest's stdio, as before.
+///
 /// Returns when the deadline passes (the running jail killed first; the proxy is the
 /// caller's to kill) or when the policy ends the claim on an exit. An error spawning the
 /// jail is returned immediately: a sandbox that cannot start must not linger half-built.
@@ -93,6 +104,7 @@ pub async fn run(
     expires_at: Timestamp,
     proxy: &mut tokio::process::Child,
     policy: RestartPolicy,
+    capture: Option<&Arc<Capture>>,
 ) -> anyhow::Result<Outcome> {
     let mut restarts: u32 = 0;
     loop {
@@ -102,11 +114,24 @@ pub async fn run(
             return Ok(Outcome::Deadline);
         };
 
-        let mut child = tokio::process::Command::new("nsjail")
-            .args(spec.to_args())
-            .envs(spec.env())
-            .spawn()?;
-        tracing::info!(pid = child.id(), user = %spec.user, "jail started");
+        let mut command = tokio::process::Command::new("nsjail");
+        command.args(spec.to_args()).envs(spec.env());
+        if capture.is_some() {
+            // nsjail writes its own diagnostics to its stderr, which under capture is the
+            // workload's stderr pipe: `--quiet` keeps its informational lines (the mounts,
+            // the pid) out of the owner's stream; its warnings and fatal messages (a
+            // refused mount, a confinement failure) still reach it, which is wanted.
+            command
+                .arg(NSJAIL_QUIET)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+        }
+        let mut child = command.spawn()?;
+        let readers = match capture {
+            Some(c) => Some(c.attach(&mut child)?),
+            None => None,
+        };
+        tracing::info!(pid = child.id(), user = %spec.user, logs = capture.is_some(), "jail started");
 
         let event = tokio::select! {
             status = child.wait() => Event::JailExited(status?),
@@ -120,9 +145,17 @@ pub async fn run(
                 tracing::info!("claim deadline reached; stopping the jail");
                 child.start_kill()?;
                 let _ = child.wait().await;
+                if let Some(r) = readers {
+                    r.drain().await;
+                }
                 return Ok(Outcome::Deadline);
             }
         };
+        // The pipes close with the jail; what is left in them is queued before anything
+        // else happens (ADR-0045 decision 8: the end of the output matters most).
+        if let Some(r) = readers {
+            r.drain().await;
+        }
         match (event, after_event(event, policy)) {
             (Event::ProxyExited(status), _) => {
                 tracing::error!(%status, "the egress proxy exited; the jail has no way out, not restarting");

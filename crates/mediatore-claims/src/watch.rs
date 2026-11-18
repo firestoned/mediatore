@@ -81,6 +81,12 @@ pub struct WatcherConfig {
     /// A node younger than this is never collected (ADR-0039): its registration may
     /// precede its VM's published endorsement certificate. `store.node_grace_secs`.
     pub node_grace: Duration,
+    /// `logs.enabled` (ADR-0045 decision 11): whether this broker stores a workload's output.
+    /// Off, a sandbox whose `workload.logs` is `true` is refused before any claim exists.
+    pub logs_enabled: bool,
+    /// `logs.retention` (ADR-0045 decision 4): how long a claim's stored output outlives the
+    /// claim's end before the resync sweeps it. Only read when `logs_enabled`.
+    pub logs_retention: Duration,
 }
 
 impl Default for WatcherConfig {
@@ -97,6 +103,8 @@ impl Default for WatcherConfig {
             egress_mode: crate::policy::EgressMode::default(),
             delegated_audiences: std::collections::BTreeSet::new(),
             node_grace: Duration::from_mins(10),
+            logs_enabled: false,
+            logs_retention: Duration::from_hours(1),
         }
     }
 }
@@ -573,6 +581,20 @@ impl Watcher {
             .unwrap_or(jiff::Timestamp::MIN);
         let archived = self.reconciler.store.sweep(before).await?;
         self.sweep_envelopes().await?;
+        // The stored output of ended and vanished claims (ADR-0045 decisions 4 and 7).
+        if self.config().logs_enabled {
+            let before = jiff::SignedDuration::try_from(self.config().logs_retention)
+                .ok()
+                .and_then(|d| jiff::Timestamp::now().checked_sub(d).ok())
+                .unwrap_or(jiff::Timestamp::MIN);
+            let logs = self.reconciler.store.sweep_logs(before).await?;
+            if logs > 0 {
+                tracing::info!(
+                    claims = logs,
+                    "stored workload output swept after its retention (ADR-0045)"
+                );
+            }
+        }
         self.declared
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -839,6 +861,7 @@ mod tests {
                 image: "ghcr.io/example/workload:1".into(),
                 args: vec!["sh".into()],
                 restart: mediatore_proto::RestartPolicy::Always,
+                logs: false,
             },
             ttl_seconds: 600,
             refresh: None,

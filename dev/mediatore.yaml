@@ -21,3 +21,9 @@ sts:
   issuer: https://mediatore.home.example
   kid: dev-1
   signing_key_file: dev/sts.pem
+# A workload's output, redacted in the VM and streamed to its owner (ADR-0045). Off by
+# default: a claim with `workload.logs: true` is refused and the routes answer 501. On, the
+# broker keeps the newest `max_bytes` per claim (default 1 MiB, ceiling 4 MiB) in Secrets
+# owned by the sandbox, for `retention_secs` after the claim ends (default: store.retention_secs).
+logs:
+  enabled: false
