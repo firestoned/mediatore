@@ -32,7 +32,9 @@ delegation available`).
 namespace map requires it), `--pool` (one pool by name) or `--pool-selector key=value` (repeatable, all must match;
 neither means every pool in the namespace, ADR-0044), `--ttl` (seconds), `--audience` (repeatable), `--image`, `--arg`
 (repeatable, the workload's argv; use `--arg=-c` for a value that starts with a dash), `--policy` (a notaio policy by
-name), `--restart` (`always`, the default, `on-failure` or `never`), and `--delegate` (below). `--mediatore` is the broker's URL and
+name), `--restart` (`always`, the default, `on-failure` or `never`), `--strategy` (`longest-ready`, `most-available` or
+`spread`, how banlieue ranks the Ready members it may take, ADR-0047; nothing is sent without it), and `--delegate`
+(below). `--mediatore` is the broker's URL and
 `--ca-file` a CA for a broker behind a private PKI (`MEDIATORE_CA_FILE`).
 
 **One login is good for one claim.** When the issuer requires a session, `create` hands the **refresh token** to the broker

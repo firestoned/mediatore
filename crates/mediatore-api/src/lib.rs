@@ -32,7 +32,7 @@ use jiff::{SignedDuration, Timestamp};
 use mediatore_claims::Reconciler;
 use mediatore_claims::sandbox::{
     AgentSandbox, AgentSandboxSpec, FrontDoorError, SandboxFrontDoor, SandboxSubject,
-    SandboxWorkload, label_selector_of,
+    SandboxWorkload, claim_selection_of, label_selector_of,
 };
 use mediatore_entra::{IdpError, Validated, Validator};
 use mediatore_proto::ek::is_ek_hash;
@@ -669,6 +669,13 @@ fn pool_of(req: &ClaimRequest) -> String {
     req.pool().map_or_else(|e| e.to_string(), |p| p.to_string())
 }
 
+/// Which strategy a request asks for, for the log line (ADR-0047 decision 5): the value as
+/// written, or `default` when absent. Strategies are not secrets.
+fn strategy_of(req: &ClaimRequest) -> String {
+    req.selection
+        .map_or_else(|| "default".to_owned(), |s| s.strategy.to_string())
+}
+
 /// `dev_mode`: the record written by the API itself and bound by the dev binder, no
 /// resource; the envelopes bind to the record's UID.
 // One argument over the limit: the resolved namespace joins the request's parts.
@@ -730,7 +737,7 @@ async fn dev_claim(
         })
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
-    tracing::info!(subject = %validated.subject.id, pool = %pool_of(req), %uid, "claim created");
+    tracing::info!(subject = %validated.subject.id, pool = %pool_of(req), strategy = %strategy_of(req), %uid, "claim created");
 
     // Dev binder: stands in for banlieue's claim controller and pool. A registered free
     // node is "Ready pool member"; binding is immediate.
@@ -951,6 +958,7 @@ async fn create_sandbox(
                 .clone()
                 .map(|name| LocalObjectReference { name }),
             pool_selector: req.pool_selector.as_ref().map(label_selector_of),
+            selection: req.selection.as_ref().map(claim_selection_of),
             ttl_seconds: req.ttl_seconds,
             audiences: req.audiences.clone(),
             workload: SandboxWorkload::from(&req.workload),
@@ -962,7 +970,7 @@ async fn create_sandbox(
     );
     sandbox.metadata.namespace = Some(namespace.to_owned());
     let created = front.create(sandbox).await?;
-    tracing::info!(subject = %validated.subject.id, pool = %pool_of(req), sandbox = %name, %namespace, "sandbox created");
+    tracing::info!(subject = %validated.subject.id, pool = %pool_of(req), strategy = %strategy_of(req), sandbox = %name, %namespace, "sandbox created");
     // ADR-0013 decision 2: the session is parked under the sandbox's UID, sealed with it,
     // before the caller hears back; a failure here undoes the resource. ADR-0035: each
     // delegation the same way, one Secret per audience.
@@ -3833,6 +3841,7 @@ mod tests {
             namespace: namespace.map(str::to_owned),
             pool_ref: pool_ref.map(str::to_owned),
             pool_selector,
+            selection: None,
             ttl_seconds: 600,
             audiences: vec![],
             workload: mediatore_proto::Workload {
@@ -4327,6 +4336,7 @@ mod tests {
                 subject: SandboxSubject::from(&subject()),
                 pool_ref: None,
                 pool_selector: Some(label_selector_of(&mediatore_proto::PoolSelector::default())),
+                selection: None,
                 ttl_seconds: 600,
                 audiences: vec![],
                 workload: SandboxWorkload::from(&mediatore_proto::Workload {

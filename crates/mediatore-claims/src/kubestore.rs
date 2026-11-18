@@ -1715,6 +1715,7 @@ mod tests {
                     name: "pool-a".into(),
                 }),
                 pool_selector: None,
+                selection: None,
                 ttl_seconds: 600,
                 audiences: vec![],
                 workload: crate::sandbox::SandboxWorkload {
@@ -1953,6 +1954,7 @@ mod tests {
                         name: "pool-a".into(),
                     }),
                     pool_selector: None,
+                    selection: None,
                     ttl_seconds: 600,
                     audiences: vec![],
                     workload: crate::sandbox::SandboxWorkload {
@@ -2071,6 +2073,7 @@ mod tests {
                     name: "pool-a".into(),
                 }),
                 pool_selector: None,
+                selection: None,
                 ttl_seconds: 600,
                 audiences: vec!["a".into()],
                 workload: crate::sandbox::SandboxWorkload {

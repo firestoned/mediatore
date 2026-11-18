@@ -252,6 +252,7 @@ impl Harness {
                 namespace: None,
                 pool_ref: Some("pool-a".into()),
                 pool_selector: None,
+                selection: None,
                 ttl_seconds: 3600,
                 audiences: vec![AUDIENCE.into()],
                 workload: Workload {
@@ -486,6 +487,7 @@ async fn the_dev_header_transport_reaches_a_dev_mode_broker() {
             namespace: None,
             pool_ref: Some("pool-a".into()),
             pool_selector: None,
+            selection: None,
             ttl_seconds: 3600,
             audiences: vec![AUDIENCE.into()],
             workload: Workload {

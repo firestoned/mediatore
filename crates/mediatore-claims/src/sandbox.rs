@@ -18,7 +18,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use banlieue_api::banlieue::{ClaimSubject, VirtualMachineClaim, VirtualMachineClaimSpec};
+use banlieue_api::banlieue::{
+    ClaimSelection, ClaimSubject, SelectionStrategy, VirtualMachineClaim, VirtualMachineClaimSpec,
+};
 use banlieue_api::common::{
     LabelSelector, LabelSelectorOperator, LabelSelectorRequirement, LocalObjectReference,
 };
@@ -165,6 +167,12 @@ pub struct AgentSandboxSpec {
     /// of this or `poolRef` (ADR-0044 decisions 1 and 2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pool_selector: Option<LabelSelector>,
+    /// How banlieue picks the member among the Ready ones of the matched pools (ADR-0047
+    /// decision 1; banlieue ADR-0135): `strategy` is `LongestReady`, `MostAvailable` or
+    /// `Spread`. Copied to the claim verbatim; absent stays absent, which is `LongestReady`,
+    /// the order every sandbox had before (decision 2). Immutable with the rest of the spec.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection: Option<ClaimSelection>,
     /// Lifetime in seconds, counted from bind; copied to the claim, which enforces it
     /// (decision 9).
     #[schemars(range(min = 1))]
@@ -408,6 +416,7 @@ pub fn claim_for(sb: &AgentSandbox) -> Result<VirtualMachineClaim, WatchError> {
         spec: VirtualMachineClaimSpec {
             pool_ref: sb.spec.pool_ref.clone(),
             pool_selector: sb.spec.pool_selector.clone(),
+            selection: sb.spec.selection.clone(),
             subject: ClaimSubject {
                 issuer: sb.spec.subject.issuer.clone(),
                 id: sb.spec.subject.id.clone(),
@@ -437,6 +446,40 @@ pub fn pool_of(spec: &AgentSandboxSpec) -> String {
         (None, Some(sel)) => PoolChoice::Selected(&pool_selector_of(sel)).to_string(),
         (None, None) => "<none>".into(),
         (Some(_), Some(_)) => "<both>".into(),
+    }
+}
+
+/// Which strategy a spec asks for, for a log line (ADR-0047 decision 5): the value as
+/// written, or `default` when absent (banlieue's `LongestReady`). Strategies are not secrets.
+#[must_use]
+pub fn strategy_of(spec: &AgentSandboxSpec) -> String {
+    spec.selection
+        .as_ref()
+        .map_or_else(|| "default".to_owned(), |s| s.strategy.to_string())
+}
+
+/// banlieue's `ClaimSelection` from the request's (ADR-0047 decision 3): the same shape, the
+/// same spelling.
+#[must_use]
+pub fn claim_selection_of(sel: &mediatore_proto::Selection) -> ClaimSelection {
+    ClaimSelection {
+        strategy: match sel.strategy {
+            mediatore_proto::SelectionStrategy::LongestReady => SelectionStrategy::LongestReady,
+            mediatore_proto::SelectionStrategy::MostAvailable => SelectionStrategy::MostAvailable,
+            mediatore_proto::SelectionStrategy::Spread => SelectionStrategy::Spread,
+        },
+    }
+}
+
+/// The request's `Selection` from banlieue's, the other way.
+#[must_use]
+pub fn selection_of(sel: &ClaimSelection) -> mediatore_proto::Selection {
+    mediatore_proto::Selection {
+        strategy: match sel.strategy {
+            SelectionStrategy::LongestReady => mediatore_proto::SelectionStrategy::LongestReady,
+            SelectionStrategy::MostAvailable => mediatore_proto::SelectionStrategy::MostAvailable,
+            SelectionStrategy::Spread => mediatore_proto::SelectionStrategy::Spread,
+        },
     }
 }
 
@@ -726,7 +769,7 @@ impl Watcher {
             }
             None => {
                 let created = self.claims.create_claim(claim_for(sb)?).await?;
-                tracing::info!(sandbox = %name, %namespace, subject = %sb.spec.subject.id, pool = %pool_of(&sb.spec), "claim created");
+                tracing::info!(sandbox = %name, %namespace, subject = %sb.spec.subject.id, pool = %pool_of(&sb.spec), strategy = %strategy_of(&sb.spec), "claim created");
                 created
             }
         };
@@ -1160,6 +1203,7 @@ mod tests {
                     name: "pool".into(),
                 }),
                 pool_selector: None,
+                selection: None,
                 ttl_seconds: 600,
                 audiences: vec!["api.example".into()],
                 workload: SandboxWorkload {
@@ -1472,6 +1516,28 @@ mod tests {
             spec["properties"]["poolSelector"]["properties"]["matchLabels"].is_object(),
             "poolSelector is a LabelSelector: {spec}"
         );
+        // ADR-0047 decision 1: optional, and exactly the strategies banlieue has, so an
+        // unknown one is refused by the API server before the reconciler runs.
+        assert!(
+            !required.contains(&"selection"),
+            "selection is optional (ADR-0047)"
+        );
+        let strategy = &spec["properties"]["selection"]["properties"]["strategy"];
+        let mut values: Vec<&str> = strategy
+            .get("enum")
+            .and_then(|e| e.as_array())
+            .map(|e| e.iter().filter_map(|v| v.as_str()).collect())
+            .or_else(|| {
+                strategy["oneOf"].as_array().map(|alts| {
+                    alts.iter()
+                        .flat_map(|a| a["enum"].as_array().into_iter().flatten())
+                        .filter_map(|v| v.as_str())
+                        .collect()
+                })
+            })
+            .unwrap_or_else(|| panic!("no enum on selection.strategy: {strategy}"));
+        values.sort_unstable();
+        assert_eq!(values, ["LongestReady", "MostAvailable", "Spread"]);
         let pool = v["additionalPrinterColumns"]
             .as_array()
             .unwrap()
@@ -1655,6 +1721,62 @@ mod tests {
             })
         );
         assert_eq!(pool_selector_of(&banlieue), req);
+    }
+
+    /// ADR-0047 decisions 1 and 2: a strategy is copied to the claim as it is, and an absent
+    /// one stays absent, so banlieue's own default applies and nothing written so far changes.
+    #[test]
+    fn a_strategy_is_copied_to_the_claim_verbatim_and_an_absent_one_stays_absent() {
+        let mut sb = sandbox(true, false);
+        assert!(sb.spec.selection.is_none());
+        let claim = claim_for(&sb).unwrap();
+        assert!(claim.spec.selection.is_none());
+        let json = serde_json::to_value(&claim.spec).unwrap();
+        assert!(json.get("selection").is_none(), "written as absent: {json}");
+        assert_eq!(strategy_of(&sb.spec), "default");
+
+        sb.spec.selection = Some(ClaimSelection {
+            strategy: SelectionStrategy::Spread,
+        });
+        let claim = claim_for(&sb).unwrap();
+        assert_eq!(claim.spec.selection, sb.spec.selection);
+        assert_eq!(claim.spec.strategy(), SelectionStrategy::Spread);
+        let json = serde_json::to_value(&claim.spec).unwrap();
+        assert_eq!(
+            json["selection"],
+            json!({ "strategy": "Spread" }),
+            "got {json}"
+        );
+        assert_eq!(strategy_of(&sb.spec), "Spread");
+    }
+
+    /// The request's strategy and banlieue's are one shape, both ways (ADR-0047 decision 3).
+    #[test]
+    fn the_request_strategy_and_banlieues_are_one_shape() {
+        for (ours, theirs) in [
+            (
+                mediatore_proto::SelectionStrategy::LongestReady,
+                SelectionStrategy::LongestReady,
+            ),
+            (
+                mediatore_proto::SelectionStrategy::MostAvailable,
+                SelectionStrategy::MostAvailable,
+            ),
+            (
+                mediatore_proto::SelectionStrategy::Spread,
+                SelectionStrategy::Spread,
+            ),
+        ] {
+            let sel = mediatore_proto::Selection { strategy: ours };
+            let claim = claim_selection_of(&sel);
+            assert_eq!(claim.strategy, theirs);
+            assert_eq!(selection_of(&claim), sel);
+            assert_eq!(
+                serde_json::to_value(&claim).unwrap(),
+                serde_json::to_value(sel).unwrap(),
+                "spelled the same on the claim and on the wire"
+            );
+        }
     }
 
     #[tokio::test]

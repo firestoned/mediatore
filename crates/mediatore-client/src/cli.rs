@@ -9,7 +9,7 @@ use std::io::Write as _;
 use std::path::PathBuf;
 
 use clap::{Args, Subcommand};
-use mediatore_proto::{ClaimRequest, PoolSelector, Workload};
+use mediatore_proto::{ClaimRequest, PoolSelector, Selection, SelectionStrategy, Workload};
 
 use crate::{Api, LoginOptions, Redirect, Session};
 
@@ -220,6 +220,12 @@ pub struct CreateArgs {
     /// --pool and without this, every pool in the namespace.
     #[arg(long = "pool-selector", value_name = "KEY=VALUE")]
     pub pool_selector: Vec<String>,
+    /// How banlieue picks the member among the Ready ones of the matched pools (ADR-0047):
+    /// longest-ready (banlieue's default when absent), most-available (the failure domain
+    /// with the most Ready members), spread (the domain where you hold the fewest members).
+    /// Without it nothing is sent
+    #[arg(long, value_enum)]
+    pub strategy: Option<StrategyArg>,
     /// Lifetime in seconds, counted from bind
     #[arg(long, default_value_t = 3600)]
     pub ttl: u32,
@@ -264,6 +270,34 @@ pub enum RestartArg {
     OnFailure,
     /// Any exit ends the claim
     Never,
+}
+
+/// `--strategy`, as clap takes it (ADR-0047 decision 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum StrategyArg {
+    /// The member Ready longest, wherever it runs (banlieue's default)
+    LongestReady,
+    /// From the failure domain with the most Ready members
+    MostAvailable,
+    /// From the failure domain where this subject holds the fewest members
+    Spread,
+}
+
+impl From<StrategyArg> for SelectionStrategy {
+    fn from(s: StrategyArg) -> Self {
+        match s {
+            StrategyArg::LongestReady => Self::LongestReady,
+            StrategyArg::MostAvailable => Self::MostAvailable,
+            StrategyArg::Spread => Self::Spread,
+        }
+    }
+}
+
+/// `--strategy` as the request carries it (ADR-0047 decisions 2 and 4): the strategy, or
+/// nothing at all, never a default the CLI invents.
+#[must_use]
+pub fn selection_of(strategy: Option<StrategyArg>) -> Option<Selection> {
+    strategy.map(|s| Selection { strategy: s.into() })
 }
 
 impl From<RestartArg> for mediatore_proto::RestartPolicy {
@@ -543,6 +577,7 @@ async fn create(args: CreateArgs) -> anyhow::Result<()> {
         namespace: args.namespace.clone(),
         pool_ref,
         pool_selector,
+        selection: selection_of(args.strategy),
         ttl_seconds: args.ttl,
         audiences: args.audiences,
         workload: Workload {
@@ -735,6 +770,27 @@ mod tests {
         }
     }
 
+    // ----- ADR-0047 decision 4: --strategy, or nothing sent --------------------------------------
+
+    #[test]
+    fn the_strategy_flag_maps_onto_banlieues_values_and_none_sends_nothing() {
+        assert_eq!(selection_of(None), None);
+        assert_eq!(
+            selection_of(Some(StrategyArg::Spread)),
+            Some(Selection {
+                strategy: SelectionStrategy::Spread
+            })
+        );
+        assert_eq!(
+            SelectionStrategy::from(StrategyArg::LongestReady),
+            SelectionStrategy::LongestReady
+        );
+        assert_eq!(
+            SelectionStrategy::from(StrategyArg::MostAvailable),
+            SelectionStrategy::MostAvailable
+        );
+    }
+
     #[test]
     fn an_unreadable_ca_file_is_named_in_the_error() {
         let err = target(&["--ca-file", "/nonexistent/ca.pem"])
@@ -820,6 +876,7 @@ mod tests {
             namespace: namespace.map(str::to_owned),
             pool_ref: None,
             pool_selector: Some(PoolSelector::default()),
+            selection: None,
             ttl_seconds: 60,
             audiences: vec![],
             workload: Workload {

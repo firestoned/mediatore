@@ -64,6 +64,8 @@ needs a claim identity checks the SPIFFE ID's shape (`/banlieue/claim/<uid>`), a
    namespace_required`) that the token's groups admit (`403`); with a single namespace every caller past the gate
    claims there. Nothing is parked for a refusal.
 3. **`invalid_pool`.** Exactly one of `pool_ref` and `pool_selector` (ADR-0044); neither is never read as "any pool".
+   `selection.strategy`, when present, is one of banlieue's `LongestReady`, `MostAvailable` and `Spread` or the body does
+   not parse (`422`, ADR-0047); absent stays absent on the sandbox and the claim.
 4. **`unknown_audience`.** Every audience the body names must be one the broker is configured to serve.
 5. **`invalid_workload_image`**, then **`unreachable_registry`.** The image must parse, and in an environment with
    gateways its registry must be one the pool reaches: a registry declared with a `reach`, or the host of a

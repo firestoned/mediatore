@@ -269,6 +269,7 @@ impl Harness {
                 namespace: None,
                 pool_ref: Some("pool-a".into()),
                 pool_selector: None,
+                selection: None,
                 ttl_seconds: 3600,
                 audiences: vec![AUDIENCE.into()],
                 workload: Workload {
@@ -571,6 +572,7 @@ async fn a_claim_naming_a_registry_the_pool_cannot_reach_is_refused_and_the_mirr
         namespace: None,
         pool_ref: Some("pool-a".into()),
         pool_selector: None,
+        selection: None,
         ttl_seconds: 3600,
         audiences: vec![AUDIENCE.into()],
         workload: Workload {

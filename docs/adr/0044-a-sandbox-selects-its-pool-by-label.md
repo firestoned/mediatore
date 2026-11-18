@@ -108,4 +108,7 @@ In Rust, `VirtualMachineClaimSpec.pool_ref` is now `Option<LocalObjectReference>
   or out of a selector. That principal can already edit the pool's template and image, so
   this adds no power (banlieue ADR-0132); the threat model records it.
 - **Not done here.** The CLI does not offer `matchExpressions`; selection across namespaces,
-  weighting and locality are banlieue's to decide first, and none is decided.
+  weighting and locality are banlieue's to decide first, and none is decided. *2026-11-18:*
+  banlieue ADR-0135 decided the ranking among the matched pools' members, and
+  [ADR-0047](0047-a-sandbox-chooses-its-member-by-strategy.md) carries that choice,
+  `spec.selection.strategy`, the same way this ADR carries the selector.

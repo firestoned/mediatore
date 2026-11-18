@@ -734,6 +734,47 @@ pub enum PoolChoiceError {
     EmptyName,
 }
 
+/// How banlieue ranks the Ready members of the matched pools when it picks one for the claim
+/// (ADR-0047 decision 3; banlieue ADR-0135): the proto crate's own copy of banlieue's
+/// `SelectionStrategy`, spelled as banlieue spells it so a body, a sandbox and a claim read
+/// the same. A strategy only reorders, never filters: no strategy leaves a claim `Pending`
+/// while a Ready member exists.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SelectionStrategy {
+    /// No placement preference: the member Ready longest, the order every claim had before
+    /// the field existed.
+    #[default]
+    LongestReady,
+    /// Take from the failure domain with the most Ready members, so warm capacity drains
+    /// evenly and no single domain runs dry first.
+    MostAvailable,
+    /// Take from the failure domain where this claim's subject holds the fewest members,
+    /// then as `MostAvailable`, so one subject's sandboxes do not share a host. Soft: a
+    /// claim never waits for a free domain.
+    Spread,
+}
+
+impl std::fmt::Display for SelectionStrategy {
+    /// The value as it is spelled on the wire and on the claim, for log lines.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::LongestReady => "LongestReady",
+            Self::MostAvailable => "MostAvailable",
+            Self::Spread => "Spread",
+        })
+    }
+}
+
+/// How a claim chooses among the Ready members it may take (ADR-0047 decision 3): the shape
+/// of banlieue's `ClaimSelection`, a struct so later knobs have somewhere to go. `{}` is the
+/// default strategy written down.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Selection {
+    /// The ranking to apply; `LongestReady` when absent.
+    #[serde(default)]
+    pub strategy: SelectionStrategy,
+}
+
 /// `POST /v1/claims` body, sent by a user or agent with an `IdP` bearer token.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClaimRequest {
@@ -751,6 +792,11 @@ pub struct ClaimRequest {
     /// `pool_ref`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pool_selector: Option<PoolSelector>,
+    /// `spec.selection` on the banlieue claim: how the member is picked among the Ready ones
+    /// (ADR-0047 decisions 2 and 3). Absent stays absent, which banlieue reads as
+    /// `LongestReady`; the broker writes no default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection: Option<Selection>,
     /// `spec.ttlSeconds` on the banlieue claim; a deadline counted from bind.
     pub ttl_seconds: u32,
     /// Downstream audiences the sandbox may request tokens for. Must be a subset of
@@ -1521,6 +1567,7 @@ mod tests {
         let req = ClaimRequest {
             pool_ref: Some("pool-a".into()),
             pool_selector: None,
+            selection: None,
             ttl_seconds: 3600,
             audiences: vec!["grafana.home.example".into()],
             workload: Workload {
@@ -1546,6 +1593,7 @@ mod tests {
         ClaimRequest {
             pool_ref: pool_ref.map(str::to_owned),
             pool_selector,
+            selection: None,
             ttl_seconds: 3600,
             audiences: vec![],
             workload: Workload {
@@ -1635,6 +1683,67 @@ mod tests {
             serde_json::from_str(r#"{"ttl_seconds":60,"workload":{"image":"r/i:1","args":[]}}"#)
                 .unwrap();
         assert_eq!(req.pool(), Err(PoolChoiceError::Neither));
+    }
+
+    // ----- ADR-0047: a sandbox chooses its member by strategy ---------------------------------------------------
+
+    /// The field is spelled as banlieue spells it, so a body, a sandbox and a claim read the
+    /// same (ADR-0047 decision 3), and it round-trips.
+    #[test]
+    fn a_strategy_round_trips_in_banlieues_spelling() {
+        for (s, name) in [
+            (SelectionStrategy::LongestReady, "LongestReady"),
+            (SelectionStrategy::MostAvailable, "MostAvailable"),
+            (SelectionStrategy::Spread, "Spread"),
+        ] {
+            let mut req = request_with(Some("pool-a"), None);
+            req.selection = Some(Selection { strategy: s });
+            let json = serde_json::to_value(&req).unwrap();
+            assert_eq!(
+                json["selection"],
+                serde_json::json!({ "strategy": name }),
+                "got {json}"
+            );
+            let back: ClaimRequest = serde_json::from_value(json).unwrap();
+            assert_eq!(back.selection, Some(Selection { strategy: s }));
+            assert_eq!(s.to_string(), name);
+        }
+    }
+
+    /// Absent stays absent (ADR-0047 decision 2): never serialised, never defaulted here;
+    /// `selection: {}` is the default strategy written down, as on the claim.
+    #[test]
+    fn an_absent_selection_is_not_sent_and_parses_back_absent() {
+        let req = request_with(Some("pool-a"), None);
+        assert_eq!(req.selection, None);
+        let json = serde_json::to_value(&req).unwrap();
+        assert!(json.get("selection").is_none(), "got {json}");
+        let back: ClaimRequest = serde_json::from_str(
+            r#"{"pool_ref":"pool-a","ttl_seconds":60,"workload":{"image":"r/i:1","args":[]}}"#,
+        )
+        .unwrap();
+        assert_eq!(back.selection, None);
+        let empty: ClaimRequest = serde_json::from_str(
+            r#"{"pool_ref":"pool-a","ttl_seconds":60,"workload":{"image":"r/i:1","args":[]},"selection":{}}"#,
+        )
+        .unwrap();
+        assert_eq!(empty.selection, Some(Selection::default()));
+        assert_eq!(
+            Selection::default().strategy,
+            SelectionStrategy::LongestReady
+        );
+    }
+
+    /// A strategy the broker does not know is a parse error, never a default (ADR-0047
+    /// decision 3).
+    #[test]
+    fn an_unknown_strategy_does_not_parse() {
+        let err = serde_json::from_str::<ClaimRequest>(
+            r#"{"pool_ref":"pool-a","ttl_seconds":60,"workload":{"image":"r/i:1","args":[]},"selection":{"strategy":"Pack"}}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("Pack"), "{err}");
     }
 
     // ----- ADR-0040: the gateway places an audience's credential -----------------------------------------------------

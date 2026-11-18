@@ -291,6 +291,7 @@ mod tests {
                 name: "pool".into(),
             }),
             pool_selector: None,
+            selection: None,
             ttl_seconds: 3600,
             audiences: audiences.iter().map(|a| (*a).to_owned()).collect(),
             workload: SandboxWorkload {

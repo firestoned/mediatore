@@ -39,6 +39,13 @@ roadmap 05: the store keeps only what cannot sit on a custom resource.
       never the content; `--logs` on `sandbox create`, `mediatore sandbox logs`; a create
       with `logs: true` on a broker with logs off is `501`, a declarative one `Failed` at
       reconcile. The guest side is roadmap 06's item. Not yet run live
+- [x] [ADR-0047](../../docs/adr/0047-a-sandbox-chooses-its-member-by-strategy.md) (2026-11-18):
+      `spec.selection.strategy` (`LongestReady`, `MostAvailable`, `Spread`; banlieue ADR-0135),
+      optional, banlieue's own type, copied verbatim to the claim, absent kept absent;
+      `selection` on `POST /v1/claims` (an unknown value is a parse error, `422`),
+      `--strategy` on `sandbox create`; the CRD re-rendered; the kind sandbox tier gains the
+      `Spread` sandbox and the refused `Pack`. Lands with `banlieue-api` v0.5.10. The outcome
+      is on the claim's `Bound` condition, not mirrored. Not yet run live
 - [x] Reconciler on the roadmap 03 leader-elected loop (`Watcher::reconcile_sandbox`, a
       third `Controller` owning the claims): create the owned claim, write the record,
       mirror the status, `ready` only when the claim is `Bound` and the entry is set

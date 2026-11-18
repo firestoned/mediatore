@@ -113,6 +113,23 @@ spec:
                       type: string
                     type: object
                 type: object
+              selection:
+                description: |-
+                  How banlieue picks the member among the Ready ones of the matched pools (ADR-0047
+                  decision 1; banlieue ADR-0135): `strategy` is `LongestReady`, `MostAvailable` or
+                  `Spread`. Copied to the claim verbatim; absent stays absent, which is `LongestReady`,
+                  the order every sandbox had before (decision 2). Immutable with the rest of the spec.
+                nullable: true
+                properties:
+                  strategy:
+                    default: LongestReady
+                    description: The ranking to apply. Defaults to `LongestReady`.
+                    enum:
+                    - LongestReady
+                    - MostAvailable
+                    - Spread
+                    type: string
+                type: object
               subject:
                 description: Who the sandbox is for.
                 properties:
