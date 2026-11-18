@@ -134,6 +134,8 @@ impl From<RestartPolicy> for SandboxRestart {
     // The pool the bound member came from, not `spec.poolRef`: a sandbox with a
     // `poolSelector` names no pool in its spec (ADR-0044 decision 5).
     printcolumn = r#"{"name":"Pool","type":"string","jsonPath":".status.poolRef.name"}"#,
+    // The bound member (`status.virtualMachineRef`), mirrored from the claim.
+    printcolumn = r#"{"name":"VM","type":"string","jsonPath":".status.virtualMachineRef.name"}"#,
     printcolumn = r#"{"name":"Phase","type":"string","jsonPath":".status.phase"}"#,
     printcolumn = r#"{"name":"Ready","type":"boolean","jsonPath":".status.ready"}"#,
     printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#
@@ -1465,6 +1467,16 @@ mod tests {
         assert_eq!(
             pool["jsonPath"], ".status.poolRef.name",
             "the pool bound from, not the one asked for (ADR-0044 decision 5)"
+        );
+        let vm = v["additionalPrinterColumns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "VM")
+            .expect("a VM column");
+        assert_eq!(
+            vm["jsonPath"], ".status.virtualMachineRef.name",
+            "the VirtualMachine the sandbox runs on, mirrored from the claim"
         );
         assert!(
             !required.contains(&"policyRef"),
