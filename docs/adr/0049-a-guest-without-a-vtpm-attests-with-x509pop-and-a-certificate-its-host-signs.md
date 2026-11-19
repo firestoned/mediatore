@@ -3,7 +3,7 @@
 
 # ADR-0049: A guest without a vTPM attests with `x509pop`, using a certificate its host signs for the guest's own key
 
-**Status:** Proposed · **Date:** 2026-11-18
+**Status:** Accepted · **Date:** 2026-11-19 · **Proposed:** 2026-11-18
 
 Builds on [ADR-0004](0004-spiffe-identity-scheme.md) (the identity scheme),
 [ADR-0006](0006-registration-entries-as-clusterstaticentry.md) (no SPIRE admin identity,
@@ -11,7 +11,7 @@ entries declared as `ClusterStaticEntry`) and [ADR-0018](0018-tpm-attestation-wi
 (the TPM attestor and the hypervisors' CAs as the trust bundle). Changes none of them: the
 TPM attestor stays the attestor of every guest that has a vTPM. This ADR adds the attestor
 for a guest that has none. banlieue's `firecracker` provider class
-(banlieue ADR-0137, ADR-0140 and ADR-0142, all Proposed) is that guest: Firecracker has no
+(banlieue ADR-0137, ADR-0140 and ADR-0142, all Accepted) is that guest: Firecracker has no
 TPM device, so there is no endorsement key to attest with.
 
 ## Context
@@ -137,7 +137,7 @@ certificate request body.
   ADR-0006. An agent restart works (`reattestable` is true), which `join_token` could not do.
 - The node entry's parent for this class is computed from two control-plane values: the
   issuer CN of the host's CA and the subject CN, the machine's UID. banlieue ADR-0143
-  (Proposed) designs both: the **administrator** asserts the host's CA on the Provider
+  (Accepted) designs both: the **administrator** asserts the host's CA on the Provider
   (`spec.attestation.hostCa`, a single certificate, never discovered from the host, as
   banlieue ADR-0049 Decision 10 requires for any trust anchor) and the machine's status
   publishes the subject (`attestationSubject`), mirrored onto the claim. Until they
@@ -154,6 +154,8 @@ certificate request body.
 - Threat model: a new trust anchor class (per-host signing CAs), a new vsock request path
   (bounded), and the removal of a server-side minting path that was never built. Pass due when
   implemented.
-- Not implemented. Open: the lifetime and renewal fraction; whether
+- Accepted, partly implemented: the control-plane side is in `crates/mediatore-spire/src/x509pop.rs`
+  (the agent ID, the CA common-name checks, node entry rendering beside the TPM one); the claim
+  watcher, the guest helper, the host signer and the image are not. Open: the lifetime and renewal fraction; whether
   to reuse the SKI as the subject for a key-bound ID (untested); RSA and ed25519 keys; the
   bundle-rendering check for unique CNs; how a host retires a CA without orphaning live guests.

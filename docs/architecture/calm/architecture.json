@@ -1342,6 +1342,7 @@
     "docs/adr/0045-a-sandbox-workloads-output-streamed-to-its-owner.md",
     "docs/adr/0046-who-may-claim-a-list-of-groups-and-a-namespace-to-groups-mapping.md",
     "docs/adr/0047-socket-families-and-io-uring-denied-to-the-workload-by-seccomp.md",
-    "docs/adr/0049-a-guest-without-a-vtpm-attests-with-x509pop-and-a-certificate-its-host-signs.md"
+    "docs/adr/0049-a-guest-without-a-vtpm-attests-with-x509pop-and-a-certificate-its-host-signs.md",
+    "docs/adr/0050-host-trust-anchors-roots-in-the-bundle-and-a-short-lived-intermediate-per-host.md"
   ]
 }
