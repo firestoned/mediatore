@@ -191,7 +191,7 @@ pub fn agent_id_for(naming: &Naming, att: &NodeAttestation) -> Result<String, Sp
 /// shapes and the admission policy stay as they are. A TPM node's is its EK hash. An x509pop
 /// node has no EK: its key is the hex SHA-256 of its agent ID.
 ///
-/// OPEN DESIGN QUESTION (ADR-0049 does not answer it): what the broker's node registration
+/// ADR-0049 Decision 7 records this rule. Not verified: what the broker's node registration
 /// compares for an x509pop node. This function is the one place to change it.
 pub fn node_key(naming: &Naming, att: &NodeAttestation) -> Result<String, SpireError> {
     match att {
