@@ -55,15 +55,63 @@ pub enum SealError {
     Unavailable(String),
 }
 
-/// Seals and unseals refresh material bound to a claim.
+/// What an envelope is for. The purpose is part of the binding, so an envelope sealed for one
+/// purpose never opens as another, whatever the claim and the key (ADR-0052 decision 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SealPurpose {
+    /// Delegated session material (ADR-0013, ADR-0035): bound to the bare claim UID, exactly as
+    /// before purposes existed, so every envelope already stored still opens.
+    Session,
+    /// A batch of a workload's stored output (ADR-0052): bound to a label and the claim UID.
+    Logs,
+}
+
+impl SealPurpose {
+    /// The binding bytes for `claim_uid`: the AEAD's associated data locally, the derivation
+    /// context at transit.
+    #[must_use]
+    pub fn context(self, claim_uid: Uuid) -> Vec<u8> {
+        match self {
+            Self::Session => claim_uid.as_bytes().to_vec(),
+            Self::Logs => {
+                let mut ctx = b"mediatore-logs\0".to_vec();
+                ctx.extend_from_slice(claim_uid.as_bytes());
+                ctx
+            }
+        }
+    }
+}
+
+/// Seals and unseals material bound to a claim and a purpose.
 #[async_trait]
 pub trait Sealer: Send + Sync + 'static {
     /// The id envelopes sealed here carry.
     fn key_id(&self) -> &str;
-    /// Seal `plaintext` for `claim_uid`.
-    async fn seal(&self, claim_uid: Uuid, plaintext: &[u8]) -> Result<Sealed, SealError>;
-    /// Open `sealed`, which must have been sealed for `claim_uid` under a key this sealer holds.
-    async fn unseal(&self, claim_uid: Uuid, sealed: &Sealed) -> Result<Vec<u8>, SealError>;
+    /// Seal `plaintext` for `claim_uid` and `purpose`.
+    async fn seal_with(
+        &self,
+        purpose: SealPurpose,
+        claim_uid: Uuid,
+        plaintext: &[u8],
+    ) -> Result<Sealed, SealError>;
+    /// Open `sealed`, which must have been sealed for `claim_uid` and `purpose` under a key
+    /// this sealer holds.
+    async fn unseal_with(
+        &self,
+        purpose: SealPurpose,
+        claim_uid: Uuid,
+        sealed: &Sealed,
+    ) -> Result<Vec<u8>, SealError>;
+    /// Seal session material for `claim_uid` ([`SealPurpose::Session`]).
+    async fn seal(&self, claim_uid: Uuid, plaintext: &[u8]) -> Result<Sealed, SealError> {
+        self.seal_with(SealPurpose::Session, claim_uid, plaintext)
+            .await
+    }
+    /// Open session material sealed for `claim_uid`.
+    async fn unseal(&self, claim_uid: Uuid, sealed: &Sealed) -> Result<Vec<u8>, SealError> {
+        self.unseal_with(SealPurpose::Session, claim_uid, sealed)
+            .await
+    }
 }
 
 /// AES-256-GCM under one key held in memory.
@@ -124,17 +172,18 @@ impl LocalKeySealer {
     }
 }
 
-fn aad(claim_uid: Uuid) -> [u8; 16] {
-    *claim_uid.as_bytes()
-}
-
 #[async_trait]
 impl Sealer for LocalKeySealer {
     fn key_id(&self) -> &str {
         &self.key_id
     }
 
-    async fn seal(&self, claim_uid: Uuid, plaintext: &[u8]) -> Result<Sealed, SealError> {
+    async fn seal_with(
+        &self,
+        purpose: SealPurpose,
+        claim_uid: Uuid,
+        plaintext: &[u8],
+    ) -> Result<Sealed, SealError> {
         let mut nonce = [0u8; NONCE_LEN];
         self.rng
             .fill(&mut nonce)
@@ -143,7 +192,7 @@ impl Sealer for LocalKeySealer {
         self.key
             .seal_in_place_append_tag(
                 Nonce::assume_unique_for_key(nonce),
-                Aad::from(aad(claim_uid)),
+                Aad::from(purpose.context(claim_uid)),
                 &mut buf,
             )
             .map_err(|_| SealError::Rejected)?;
@@ -154,7 +203,12 @@ impl Sealer for LocalKeySealer {
         })
     }
 
-    async fn unseal(&self, claim_uid: Uuid, sealed: &Sealed) -> Result<Vec<u8>, SealError> {
+    async fn unseal_with(
+        &self,
+        purpose: SealPurpose,
+        claim_uid: Uuid,
+        sealed: &Sealed,
+    ) -> Result<Vec<u8>, SealError> {
         if sealed.key_id != self.key_id {
             return Err(SealError::UnknownKey(sealed.key_id.clone()));
         }
@@ -168,7 +222,7 @@ impl Sealer for LocalKeySealer {
             .key
             .open_in_place(
                 Nonce::assume_unique_for_key(nonce),
-                Aad::from(aad(claim_uid)),
+                Aad::from(purpose.context(claim_uid)),
                 &mut buf,
             )
             .map_err(|_| SealError::Rejected)?;
@@ -248,7 +302,12 @@ impl Sealer for TransitSealer {
         &self.key_id
     }
 
-    async fn seal(&self, claim_uid: Uuid, plaintext: &[u8]) -> Result<Sealed, SealError> {
+    async fn seal_with(
+        &self,
+        purpose: SealPurpose,
+        claim_uid: Uuid,
+        plaintext: &[u8],
+    ) -> Result<Sealed, SealError> {
         use base64::Engine as _;
         let b64 = base64::engine::general_purpose::STANDARD;
         let reply = self
@@ -256,7 +315,7 @@ impl Sealer for TransitSealer {
                 "encrypt",
                 serde_json::json!({
                     "plaintext": b64.encode(plaintext),
-                    "context": b64.encode(aad(claim_uid)),
+                    "context": b64.encode(purpose.context(claim_uid)),
                 }),
             )
             .await?;
@@ -272,7 +331,12 @@ impl Sealer for TransitSealer {
         })
     }
 
-    async fn unseal(&self, claim_uid: Uuid, sealed: &Sealed) -> Result<Vec<u8>, SealError> {
+    async fn unseal_with(
+        &self,
+        purpose: SealPurpose,
+        claim_uid: Uuid,
+        sealed: &Sealed,
+    ) -> Result<Vec<u8>, SealError> {
         use base64::Engine as _;
         let b64 = base64::engine::general_purpose::STANDARD;
         if sealed.key_id != self.key_id {
@@ -285,7 +349,7 @@ impl Sealer for TransitSealer {
                 "decrypt",
                 serde_json::json!({
                     "ciphertext": ciphertext,
-                    "context": b64.encode(aad(claim_uid)),
+                    "context": b64.encode(purpose.context(claim_uid)),
                 }),
             )
             .await?;
@@ -346,6 +410,43 @@ mod tests {
         let b = s.seal(uid, b"x").await.unwrap();
         assert_ne!(a.nonce, b.nonce);
         assert_ne!(a.ciphertext, b.ciphertext);
+    }
+
+    #[tokio::test]
+    async fn a_log_blob_and_a_session_envelope_never_open_as_each_other() {
+        let uid = Uuid::new_v4();
+        let s = sealer(1);
+        let blob = s.seal_with(SealPurpose::Logs, uid, b"output").await.unwrap();
+        assert_eq!(
+            s.unseal_with(SealPurpose::Logs, uid, &blob).await.unwrap(),
+            b"output"
+        );
+        // The same claim and key, the other purpose: refused, both ways.
+        assert!(matches!(
+            s.unseal_with(SealPurpose::Session, uid, &blob).await,
+            Err(SealError::Rejected)
+        ));
+        assert!(matches!(s.unseal(uid, &blob).await, Err(SealError::Rejected)));
+        let session = s.seal(uid, b"refresh").await.unwrap();
+        assert!(matches!(
+            s.unseal_with(SealPurpose::Logs, uid, &session).await,
+            Err(SealError::Rejected)
+        ));
+        // And a blob stays bound to its claim.
+        assert!(matches!(
+            s.unseal_with(SealPurpose::Logs, Uuid::new_v4(), &blob).await,
+            Err(SealError::Rejected)
+        ));
+    }
+
+    #[test]
+    fn the_session_context_is_the_bare_claim_uid_so_stored_sessions_still_open() {
+        let uid = Uuid::new_v4();
+        assert_eq!(SealPurpose::Session.context(uid), uid.as_bytes().to_vec());
+        let logs = SealPurpose::Logs.context(uid);
+        assert!(logs.starts_with(b"mediatore-logs\0"));
+        assert!(logs.ends_with(uid.as_bytes()));
+        assert_ne!(logs, SealPurpose::Session.context(uid));
     }
 
     #[test]

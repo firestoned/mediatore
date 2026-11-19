@@ -3,7 +3,7 @@
 
 # ADR-0045: A sandbox workload's output, redacted in the VM and streamed to its owner
 
-**Status:** Accepted and implemented 2026-11-17 (proposed the same day; amended at implementation: the capture is a per-sandbox opt-in, `workload.logs`, beside the broker's `logs.enabled`, and decisions 2, 9, 11 and 12 say what was built where it differs from the proposal) · **Date:** 2026-11-17
+**Status:** Accepted and implemented 2026-11-17; decision 6's storage is amended by [ADR-0052](0052-a-sandbox-workloads-stored-output-sealed-per-batch-with-the-transit-key.md) (Accepted 2026-11-19: the segments are sealed per batch with the transit key) and so is R-39's reasoning; the rest stands (proposed the same day; amended at implementation: the capture is a per-sandbox opt-in, `workload.logs`, beside the broker's `logs.enabled`, and decisions 2, 9, 11 and 12 say what was built where it differs from the proposal) · **Date:** 2026-11-17
 
 Roadmap 06 (the guest) and roadmap 08 (the `AgentSandbox` CRD). Adds routes to both APIs
 beside `POST /v1/me/exit` ([ADR-0033](0033-a-one-shot-workload-the-restart-policy-and-the-claim-released-when-it-is-done.md))
