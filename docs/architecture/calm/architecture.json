@@ -167,7 +167,7 @@
       "unique-id": "service-sandbox-workload",
       "node-type": "service",
       "name": "Jailed Workload",
-      "description": "Runs under nsjail as the per-subject user in a read-only rootfs unpacked from the claim's image onto a per-claim tmpfs (ADR-0021), with only the binary mounted in and /work writable, in the VM's network namespace behind an nftables chain keyed by its uid (ADR-0020); and under Landlock, applied by its own process before the first instruction of the workload (mediatore jail-exec, ADR-0024): writes only to /work, /tmp and the home whatever the image's file modes say, TCP connect to the egress proxy's loopback port and no other, no TCP bind, signals and abstract sockets scoped to the jail, inherited by every child. Holds no credential: since ADR-0025 the Workload API socket is not mounted, the broker is unreachable, and the jail's environment carries MEDIATORE_EGRESS_PROXY (http://127.0.0.1:3128) and MEDIATORE_TOKEN, a phantom the proxy swaps for the real token on the way out. The binary stays mounted read-only for jail-exec (ADR-0014, ADR-0024)."
+      "description": "Runs under nsjail as the per-subject user in a read-only rootfs unpacked from the claim's image onto a per-claim tmpfs (ADR-0021), with only the binary mounted in and /work writable, in the VM's network namespace behind an nftables chain keyed by its uid (ADR-0020); and under Landlock, applied by its own process before the first instruction of the workload (mediatore jail-exec, ADR-0024): writes only to /work, /tmp and the home whatever the image's file modes say, TCP connect to the egress proxy's loopback port and no other, no TCP bind, signals and abstract sockets scoped to the jail, inherited by every child. Proposed, not yet built (ADR-0047): a third layer in the same process, a seccomp filter applied after Landlock that refuses every socket family but AF_UNIX, AF_INET and AF_INET6, any inet socket that is not a stream, and io_uring, so a vsock, a UDP socket or an io_uring socket operation no longer depends on the nftables chain or on a dropped capability. Holds no credential: since ADR-0025 the Workload API socket is not mounted, the broker is unreachable, and the jail's environment carries MEDIATORE_EGRESS_PROXY (http://127.0.0.1:3128) and MEDIATORE_TOKEN, a phantom the proxy swaps for the real token on the way out. The binary stays mounted read-only for jail-exec (ADR-0014, ADR-0024)."
     },
     {
       "unique-id": "service-egress-proxy",
@@ -1280,6 +1280,7 @@
     "docs/adr/0043-a-persons-registry-credential-is-placed-at-the-gateway-the-vm-never-sees-it.md",
     "docs/adr/0044-a-sandbox-selects-its-pool-by-label.md",
     "docs/adr/0045-a-sandbox-workloads-output-streamed-to-its-owner.md",
-    "docs/adr/0046-who-may-claim-a-list-of-groups-and-a-namespace-to-groups-mapping.md"
+    "docs/adr/0046-who-may-claim-a-list-of-groups-and-a-namespace-to-groups-mapping.md",
+    "docs/adr/0047-socket-families-and-io-uring-denied-to-the-workload-by-seccomp.md"
   ]
 }

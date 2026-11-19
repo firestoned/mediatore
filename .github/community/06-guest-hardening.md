@@ -84,6 +84,20 @@
       had been "a real seccomp policy for nsjail": a syscall allowlist per arbitrary image
       is not writable and says nothing about paths or ports; a seccomp layer on top is a
       later item only if a threat needs it
+- [ ] A seccomp filter on the workload's socket families and `io_uring`, the third layer
+      in the jail after nftables and Landlock. Proposed 2026-11-18 as
+      [ADR-0047](../../docs/adr/0047-socket-families-and-io-uring-denied-to-the-workload-by-seccomp.md):
+      `jail-exec` refuses every socket family but `AF_UNIX`, `AF_INET` and `AF_INET6`
+      (`AF_VSOCK`, `AF_PACKET` and `AF_NETLINK` are the ones nothing else names), any inet
+      socket that is not a stream (the workload's own UDP, in both network shapes), and
+      `io_uring`, with exit 125 when the filter cannot load. This is the "later item if a
+      threat needs it" of ADR-0024 decision 5: a denylist of three things, the same for
+      every image, not the per-image syscall allowlist ADR-0024 rejected. Open: the
+      carrier (nsjail's `--seccomp_string` first, `seccompiler` if Kafel cannot mask the
+      socket type), whether `AF_NETLINK` with `NETLINK_ROUTE` must stay open for some
+      runtimes, and whether the providers already refuse a guest vsock. Next: unit tests
+      and the ignored live test in `crates/mediatore/tests/jail_exec_live.rs` first, then
+      the threat-model pass
 - [x] `GuestReady` (banlieue ADR-0043) emitted after the SPIRE healthcheck so Ready
       means attested (runbook 2.5). Done 2026-10-24 as
       [ADR-0019](../../docs/adr/0019-guestready-after-attestation-and-registration.md):
