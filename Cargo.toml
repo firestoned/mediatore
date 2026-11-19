@@ -86,6 +86,9 @@ hyper-util   = { version = "0.1", features = ["server-auto", "server-graceful", 
 # keyring feature is off: no secret store in the guest. nono-proxy and nono-cli are not used
 # (they pull ring).
 nono         = { version = "=0.81.0", default-features = false }
+# The jail's third layer (ADR-0051): a seccomp-bpf denylist compiled and loaded in `jail-exec`.
+seccompiler  = { version = "0.5", default-features = false }
+libc         = "0.2"
 arc-swap     = "1"
 # Envoy's external authorization over gRPC (ADR-0028 decision 4): the gateway's authorizer
 # serves Envoy's own Check call, Envoy's protos from envoy-types, tonic as the spiffe crate

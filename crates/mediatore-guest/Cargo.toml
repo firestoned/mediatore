@@ -48,6 +48,10 @@ tracing-subscriber.workspace = true
 socket2.workspace = true
 # Landlock for the jail's inner layer, applied by `jail-exec` (ADR-0024); Linux's LSM.
 nono.workspace = true
+# The seccomp denylist applied after Landlock by `jail-exec` (ADR-0051): Apache-2.0 OR BSD-3-Clause,
+# rust-vmm, no TLS and no `ring`; `libc` for the syscall numbers it compiles against.
+seccompiler.workspace = true
+libc.workspace = true
 
 [dev-dependencies]
 mediatore-testkit.workspace = true

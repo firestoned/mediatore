@@ -33,6 +33,7 @@ pub mod ready;
 pub mod redact;
 pub mod report;
 pub mod sandboxfs;
+pub mod seccomp;
 mod supervise;
 pub mod token;
 mod user;

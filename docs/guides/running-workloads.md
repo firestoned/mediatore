@@ -273,6 +273,7 @@ under nsjail as the per-subject user. The jail gives it:
 | The VM's network, for every uid (with egress gateways) | TCP to the three gateways' data and relay ports and to the registries on the segment, loopback and established traffic, nothing else out and nothing in: the image's host table, loaded before the agent and the guest ([ADR-0029](../adr/0029-the-pull-on-a-routeless-segment-and-the-pool-vms-root-rules.md)); your image must live in a registry the operator declared reachable, or the claim is refused with `unreachable_registry` |
 | The VM's network, filtered by the sandbox uid | TCP to the proxy on loopback, and for the proxy's own sockets (the same uid) either the environment's gateways and the broker through their control relay, by address and with no DNS at all, or, in an environment without gateways, the broker, the `egress` endpoints and DNS to the VM's resolvers; everything else the uid sends is logged (`mediatore-sandbox drop:`) and dropped, and a packet to the proxy's port from any other uid is dropped ([ADR-0020](../adr/0020-jail-network-nftables-keyed-by-sandbox-uid.md), [ADR-0025](../adr/0025-phantom-token-egress-proxy.md), [ADR-0028](../adr/0028-egress-gateway-envoy-with-spiffe-identity.md) decision 6) |
 | Landlock, applied before your argv runs | What `nsjail` execs is `mediatore jail-exec`, which confines its own process and then execs your command: writes only to `/work`, `/tmp` and `$HOME` whatever your image's file modes say, TCP `connect()` only to the proxy's port, no `bind()`, signals and abstract sockets scoped to the jail; inherited by every process you start. A write elsewhere fails with `EACCES`, a listener fails at `bind()`, a direct connection to anything fails too ([ADR-0024](../adr/0024-landlock-inside-the-jail.md)) |
+| A seccomp filter, applied after Landlock | Your process may open `AF_UNIX` sockets and TCP (stream) sockets over IPv4 and IPv6 and nothing else: `socket(AF_VSOCK)`, `AF_NETLINK` and `AF_PACKET` fail with `EAFNOSUPPORT`, a UDP or raw socket fails with `EPERM` (so the libc resolver cannot resolve a name: use numeric addresses or `/etc/hosts`; the proxy resolves for you), and `io_uring_setup` fails with `EPERM`, so a runtime that probes for `io_uring` falls back to `epoll` ([ADR-0051](../adr/0051-socket-families-and-io-uring-denied-to-the-workload-by-seccomp.md)). Inherited by every process you start |
 
 No socket, no token files, no baked-in secrets, and no network beyond the proxy and,
 through it, the endpoints the claim's audiences declare (`audiences[].egress` in the
@@ -317,6 +318,26 @@ it stores the output sealed: each batch is encrypted with the broker's OpenBao t
 before it is written, so a copy of etcd or a `get secrets` shows ciphertext
 ([ADR-0052](../adr/0052-a-sandbox-workloads-stored-output-sealed-per-batch-with-the-transit-key.md)).
 If OpenBao is unreachable a read answers `503`; retry it.
+
+### When a socket or `io_uring` call fails in the jail
+
+The seccomp filter ([ADR-0051](../adr/0051-socket-families-and-io-uring-denied-to-the-workload-by-seccomp.md))
+is on for every claim and has no setting: no flag, environment variable or claim field relaxes it.
+What it looks like from inside, and what to do:
+
+| You see | Cause | What to do |
+| --- | --- | --- |
+| `socket: Address family not supported by protocol` (`EAFNOSUPPORT`) | A family other than `AF_UNIX`, `AF_INET` or `AF_INET6`: `AF_VSOCK`, `AF_NETLINK`, `AF_PACKET`, `AF_ALG` and the rest | Nothing in the workload needs these. If a runtime enumerates interfaces with `getifaddrs` (some Go and Java runtimes), that is `AF_NETLINK`: it is denied outright today (ADR-0051 open question 2), so avoid the call or tell the operator |
+| `Operation not permitted` (`EPERM`) opening a UDP or raw socket, or a name that will not resolve (`getaddrinfo`, `Temporary failure in name resolution`) | The jail refuses every inet socket that is not a stream, so the libc resolver, which speaks UDP to port 53, cannot run | Use numeric addresses or `/etc/hosts`. Name the proxy by its loopback address (`$MEDIATORE_EGRESS_PROXY`); the proxy resolves hosts for you, outside the jail |
+| `io_uring_setup: Operation not permitted` | `io_uring` is refused | Runtimes that probe for it (libuv, tokio, recent Node and Python event loops) fall back to `epoll` by themselves; one that requires `io_uring` cannot run here |
+| `mount`, `unshare`, `setns`, `bpf`, `perf_event_open` or `userfaultfd` fail with `EPERM` | Refused; already out of reach without capabilities, now independently of them | Not available to a workload |
+
+To confirm the filter is the cause, ask the operator for the member's journal
+(`journalctl -u mediatore-guest`): the jail's line reads `confinement applied; exec ...
+seccomp_filters=2` when the filter is on. On the VM, `grep Seccomp /proc/<workload pid>/status`
+shows `Seccomp: 2` and `Seccomp_filters: 2` for the workload and every process it starts. A claim
+whose filter cannot load ends with exit 125 and the output `confinement refused`; it never runs
+without it.
 
 ### Reading the output
 

@@ -84,20 +84,21 @@
       had been "a real seccomp policy for nsjail": a syscall allowlist per arbitrary image
       is not writable and says nothing about paths or ports; a seccomp layer on top is a
       later item only if a threat needs it
-- [ ] A seccomp filter on the workload's socket families and `io_uring`, the third layer
-      in the jail after nftables and Landlock. Proposed 2026-11-18 as
-      [ADR-0051](../../docs/adr/0051-socket-families-and-io-uring-denied-to-the-workload-by-seccomp.md):
-      `jail-exec` refuses every socket family but `AF_UNIX`, `AF_INET` and `AF_INET6`
-      (`AF_VSOCK`, `AF_PACKET` and `AF_NETLINK` are the ones nothing else names), any inet
-      socket that is not a stream (the workload's own UDP, in both network shapes), and
-      `io_uring`, with exit 125 when the filter cannot load. This is the "later item if a
-      threat needs it" of ADR-0024 decision 5: a denylist of three things, the same for
-      every image, not the per-image syscall allowlist ADR-0024 rejected. Open: the
-      carrier (nsjail's `--seccomp_string` first, `seccompiler` if Kafel cannot mask the
-      socket type), whether `AF_NETLINK` with `NETLINK_ROUTE` must stay open for some
-      runtimes, and whether the providers already refuse a guest vsock. Next: unit tests
-      and the ignored live test in `crates/mediatore/tests/jail_exec_live.rs` first, then
-      the threat-model pass
+- [x] A seccomp filter on the workload's socket families and `io_uring`, the third layer
+      in the jail after nftables and Landlock. Done 2026-11-19 as
+      [ADR-0051](../../docs/adr/0051-socket-families-and-io-uring-denied-to-the-workload-by-seccomp.md)
+      (proposed 2026-11-18): `jail-exec` installs it after Landlock and before the argv
+      (`crates/mediatore-guest/src/seccomp.rs`, `confine.rs`), refusing every socket family
+      but `AF_UNIX`, `AF_INET` and `AF_INET6` with `EAFNOSUPPORT` (`AF_VSOCK`, `AF_PACKET` and
+      `AF_NETLINK` are the ones nothing else names), any inet socket that is not a stream (the
+      workload's own UDP, in both network shapes) and `io_uring` with `EPERM`, and a filter
+      that cannot load is exit 125. A denylist of three things, the same for every image,
+      not the per-image syscall allowlist ADR-0024 rejected. The carrier is `seccompiler`
+      (`nono` 0.81.0 has no custom denylist; the policy is data, unit-tested on every
+      platform), the kernel behaviour proven by the ignored live test in
+      `crates/mediatore/tests/jail_exec_live.rs`. Open: `AF_NETLINK` is denied outright, with
+      `NETLINK_ROUTE` the exception to add if an image's runtime needs it
+      (`getifaddrs`), and whether the providers already refuse a guest vsock
 - [x] `GuestReady` (banlieue ADR-0043) emitted after the SPIRE healthcheck so Ready
       means attested (runbook 2.5). Done 2026-10-24 as
       [ADR-0019](../../docs/adr/0019-guestready-after-attestation-and-registration.md):

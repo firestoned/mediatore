@@ -272,7 +272,13 @@ is a plan pinned by unit tests in `crates/mediatore-guest/src/confine.rs` and `j
 every platform. Whether the kernel enforces it is the question an ignored test answers by
 running the real `mediatore jail-exec` around a probe: a write inside a granted directory
 succeeds and one outside fails, a TCP connect to a granted port succeeds and to another
-fails, a bind fails, and a run with no port is refused with exit 125. It needs Linux with
+fails, a bind fails, and a run with no port is refused with exit 125. The same run proves
+the seccomp layer ([ADR-0051](../adr/0051-socket-families-and-io-uring-denied-to-the-workload-by-seccomp.md)):
+`AF_VSOCK`, `AF_NETLINK` and `AF_PACKET` fail with `EAFNOSUPPORT`, a UDP or raw inet socket and
+`io_uring_setup` fail with `EPERM`, a non-blocking inet stream socket and `AF_UNIX` work, and a
+forked child keeps the filter. On a pool member the same layer shows in the guest's journal as
+`seccomp_filters=2` on the jail's `confinement applied; exec` line. The policy itself is pinned on every platform by
+`crates/mediatore-guest/src/seccomp.rs`. It needs Linux with
 Landlock (6.7 or later for the ports; Debian 13 is 6.12) and `python3`, and it fails
 rather than skips anywhere else:
 
