@@ -10,6 +10,9 @@ publish.workspace = true
 
 [dependencies]
 mediatore-proto.workspace = true
+sha2.workspace = true
+hex.workspace = true
+x509-cert.workspace = true   # the per-host CA bundle's common names (ADR-0049)
 async-trait.workspace = true
 futures.workspace = true
 kube.workspace = true
@@ -22,6 +25,7 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+rcgen = { workspace = true, features = ["pem"] }   # PEM output for the CA-bundle fixtures
 tower-test.workspace = true
 http.workspace = true
 http-body-util.workspace = true

@@ -25,10 +25,10 @@ use kube::{Client, CustomResource};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::x509pop::{NodeAttestation, node_entry_spec};
 use crate::{
-    CLAIM_UID_LABEL, EntryKind, EntryManager, EntryRef, GUEST_AGENT_PATH, KIND_LABEL, MANAGED_BY,
-    MANAGED_BY_LABEL, Naming, SpireError, claim_entry_name, node_entry_name, validate_ek_hash,
-    validate_unix_user,
+    CLAIM_UID_LABEL, EntryKind, EntryManager, EntryRef, KIND_LABEL, MANAGED_BY, MANAGED_BY_LABEL,
+    Naming, SpireError, claim_entry_name, validate_ek_hash, validate_unix_user,
 };
 
 /// `spec` of `spire.spiffe.io/v1alpha1` `ClusterStaticEntry`, the fields mediatore uses.
@@ -284,16 +284,10 @@ type EventStream = BoxStream<'static, Result<Event<ClusterStaticEntry>, watcher:
 #[async_trait]
 impl EntryManager for KubeEntryManager {
     async fn ensure_node_entry(&self, ek_hash: &str) -> Result<String, SpireError> {
-        validate_ek_hash(ek_hash)?;
-        let name = node_entry_name(ek_hash);
-        let spec = ClusterStaticEntrySpec {
-            spiffe_id: self.naming.node_id(ek_hash),
-            parent_id: self.naming.agent_id(ek_hash),
-            selectors: vec!["unix:uid:0".into(), format!("unix:path:{GUEST_AGENT_PATH}")],
-            class_name: Some(self.cfg.class_name.clone()),
-            x509_svid_ttl: None,
-            hint: Some("node".into()),
+        let attestation = NodeAttestation::Tpm {
+            ek_hash: ek_hash.to_owned(),
         };
+        let (name, spec) = node_entry_spec(&self.naming, &attestation, &self.cfg.class_name)?;
         self.declare(&name, Self::labels(EntryKind::Node, None), spec)
             .await
     }
@@ -375,6 +369,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
+    use crate::node_entry_name;
 
     const EK: &str = "72c566555391e835a15c522680b51ec3b840561ed70af5605a5ae4835f040ee8";
     const TD: &str = "sandbox.test";
