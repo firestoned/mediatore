@@ -8,6 +8,10 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+# No doctests in this workspace: skip the rustdoc pass `cargo test` would run for none.
+[lib]
+doctest = false
+
 [dependencies]
 serde.workspace = true
 uuid.workspace = true

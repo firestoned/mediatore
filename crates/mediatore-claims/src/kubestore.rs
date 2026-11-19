@@ -17,13 +17,13 @@
 //! [`ClaimStore::sweep`] runs past the retention window; the sweep logs the audit line,
 //! deletes the resource if nobody has, and releases the finalizer.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use async_trait::async_trait;
 use jiff::Timestamp;
 use k8s_openapi::ByteString;
 use k8s_openapi::api::core::v1::Secret;
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::{OwnerReference, Time};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference, Time};
 use kube::api::{DeleteParams, ListParams, Patch, PatchParams, PostParams};
 use kube::{Api, Client, CustomResource, Resource, ResourceExt};
 use mediatore_proto::{
@@ -77,6 +77,9 @@ const TRUNCATED_ANNOTATION: &str = "mediatore.io/truncated-before";
 const ENTRIES_KEY: &str = "entries";
 /// How many times a conflicting segment write is retried before it is an error.
 const SEGMENT_WRITE_ATTEMPTS: usize = 3;
+/// How many location hints [`KubeStore`] keeps before it forgets them all: a forgotten hint
+/// costs one list, never an answer.
+const LOCATED_MAX: usize = 4096;
 /// The rendered CRD files (`make crds`).
 pub const NODE_CRD_FILE_NAME: &str = "mediatore.io_sandboxnodes.yaml";
 /// See [`NODE_CRD_FILE_NAME`].
@@ -221,13 +224,23 @@ pub struct KubeStore {
     /// the session Secrets, `SandboxNode` and `PolicyFloor` live here, where the RBAC of
     /// `deploy/base` reaches and which exists before any sandbox does.
     home: String,
+    /// Where the sandbox of a claim was last found, `(namespace, name)` by claim UID: a
+    /// hint, never state. It only chooses which read is tried first; what it names is read
+    /// from the API server and checked again on every use (see
+    /// [`KubeStore::sandbox_of_claim`]), and a hint that no longer holds is dropped for the
+    /// label list, which decides. Per replica, lost on restart, bounded by [`LOCATED_MAX`].
+    located: std::sync::Mutex<HashMap<Uuid, (String, String)>>,
 }
 
 impl KubeStore {
     /// Over `client`, keeping what is not a sandbox in the client's default namespace.
     pub fn new(client: Client) -> Self {
         let home = client.default_namespace().to_owned();
-        Self { client, home }
+        Self {
+            client,
+            home,
+            located: std::sync::Mutex::new(HashMap::new()),
+        }
     }
 
     /// The broker's own namespace, where the Secrets, nodes and floors are kept.
@@ -249,15 +262,62 @@ impl KubeStore {
         }
     }
 
+    /// One namespace, for a read by name.
+    fn sandboxes_in(&self, namespace: &str) -> Api<AgentSandbox> {
+        Api::namespaced(self.client.clone(), namespace)
+    }
+
+    /// The location hint for claim `uid`, if one is kept. The lock is never held across an
+    /// await: the hint is copied out.
+    fn hint_of(&self, uid: Uuid) -> Option<(String, String)> {
+        self.located.lock().ok()?.get(&uid).cloned()
+    }
+
+    /// Keep where the sandbox of claim `uid` was found.
+    fn remember(&self, uid: Uuid, sb: &AgentSandbox) {
+        let (Some(namespace), Some(name)) = (sb.namespace(), sb.metadata.name.clone()) else {
+            return;
+        };
+        if let Ok(mut located) = self.located.lock() {
+            if located.len() >= LOCATED_MAX && !located.contains_key(&uid) {
+                located.clear();
+            }
+            located.insert(uid, (namespace, name));
+        }
+    }
+
+    /// Drop the hint for claim `uid`.
+    fn forget(&self, uid: Uuid) {
+        if let Ok(mut located) = self.located.lock() {
+            located.remove(&uid);
+        }
+    }
+
     /// The sandbox a new record is for: by its UID when the record carries one, else by
     /// name, in whichever namespace it lives.
+    ///
+    /// A record with a sandbox UID names its sandbox too, so one read by name in the
+    /// record's namespace is tried first and taken only when the object there has that UID;
+    /// anything else (no such object, another UID) is left to the list over every namespace.
     async fn sandbox_for(&self, rec: &ClaimRecord) -> Result<AgentSandbox, StoreError> {
+        let uid = rec.sandbox_uid.map(|u| u.to_string());
+        if let Some(uid) = &uid
+            && !rec.name.is_empty()
+            && !rec.namespace.is_empty()
+            && let Some(sb) = self
+                .sandboxes_in(&rec.namespace)
+                .get_opt(&rec.name)
+                .await
+                .map_err(|e| backend(&e))?
+            && sb.metadata.uid.as_deref() == Some(uid.as_str())
+        {
+            return Ok(sb);
+        }
         let list = self
             .all_sandboxes()
             .list(&ListParams::default())
             .await
             .map_err(|e| backend(&e))?;
-        let uid = rec.sandbox_uid.map(|u| u.to_string());
         list.items
             .into_iter()
             .find(|sb| match &uid {
@@ -280,16 +340,45 @@ impl KubeStore {
     }
 
     /// The sandbox carrying the record of claim `uid`, by its label.
+    ///
+    /// Where the sandbox was found last time is tried first, as one read by name; the object
+    /// read is taken only when it passes the list's own two tests, the label and the record
+    /// ([`carries_claim`]). A sandbox that is gone, relabelled or replaced by another of the
+    /// same name fails them, the hint is dropped and the label list over every namespace
+    /// decides, as it always did.
+    ///
+    /// The read by name answers what the list would because at most one sandbox carries a
+    /// given claim UID: the UID is that of the one `VirtualMachineClaim` a sandbox owns
+    /// (`claim_for`: named after the sandbox, in its namespace, controlled by it), the API
+    /// server gives no two objects the same UID, and [`ClaimStore::put_claim`] refuses both
+    /// a sandbox that already has a record and a UID that already has a sandbox. The hint
+    /// itself only ever comes from the list's answer.
     async fn sandbox_of_claim(&self, uid: Uuid) -> Result<AgentSandbox, StoreError> {
+        if let Some((namespace, name)) = self.hint_of(uid) {
+            let hinted = self
+                .sandboxes_in(&namespace)
+                .get_opt(&name)
+                .await
+                .map_err(|e| backend(&e))?;
+            if let Some(sb) = hinted
+                && carries_claim(&sb, uid)
+            {
+                return Ok(sb);
+            }
+            self.forget(uid);
+        }
         let list = self
             .all_sandboxes()
             .list(&ListParams::default().labels(&format!("{CLAIM_UID_LABEL}={uid}")))
             .await
             .map_err(|e| backend(&e))?;
-        list.items
+        let sb = list
+            .items
             .into_iter()
             .find(|sb| record_status_of(sb).is_some_and(|r| r.claim_uid == uid.to_string()))
-            .ok_or_else(|| StoreError::NotFound(uid.to_string()))
+            .ok_or_else(|| StoreError::NotFound(uid.to_string()))?;
+        self.remember(uid, &sb);
+        Ok(sb)
     }
 
     /// The record on `sb`, with its envelope from the session Secret.
@@ -333,31 +422,42 @@ impl KubeStore {
     }
 
     /// Write `status.record` for `sb` from `rec`, and the labels the lookups need.
+    ///
+    /// A patch that would set nothing is not sent: the labels patch when `sb`, as read,
+    /// already carries every label it would set with the same value, the status patch when
+    /// `sb`'s `status.record` already equals the one it would write. The accepted
+    /// difference: a writer whose copy equals what it just read no longer re-sends a no-op
+    /// patch.
     async fn write_record(&self, sb: &AgentSandbox, rec: &ClaimRecord) -> Result<(), StoreError> {
         let name = sb.name_any();
         let name = name.as_str();
-        let mut labels = serde_json::Map::new();
-        labels.insert(CLAIM_UID_LABEL.into(), rec.uid.to_string().into());
+        let mut labels: BTreeMap<&str, String> = BTreeMap::new();
+        labels.insert(CLAIM_UID_LABEL, rec.uid.to_string());
         if let Some(node) = &rec.node_id {
-            labels.insert(NODE_LABEL.into(), node_label(node).into());
+            labels.insert(NODE_LABEL, node_label(node));
         }
-        self.sandboxes_of(sb)
-            .patch(
-                name,
-                &PatchParams::default(),
-                &Patch::Merge(serde_json::json!({ "metadata": { "labels": labels } })),
-            )
-            .await
-            .map_err(|e| backend(&e))?;
+        let carried = sb.labels();
+        if !labels.iter().all(|(k, v)| carried.get(*k) == Some(v)) {
+            self.sandboxes_of(sb)
+                .patch(
+                    name,
+                    &PatchParams::default(),
+                    &Patch::Merge(serde_json::json!({ "metadata": { "labels": labels } })),
+                )
+                .await
+                .map_err(|e| backend(&e))?;
+        }
         let record = record_status_from(rec);
-        self.sandboxes_of(sb)
-            .patch_status(
-                name,
-                &PatchParams::default(),
-                &Patch::Merge(serde_json::json!({ "status": { "record": record } })),
-            )
-            .await
-            .map_err(|e| backend(&e))?;
+        if record_status_of(sb) != Some(&record) {
+            self.sandboxes_of(sb)
+                .patch_status(
+                    name,
+                    &PatchParams::default(),
+                    &Patch::Merge(serde_json::json!({ "status": { "record": record } })),
+                )
+                .await
+                .map_err(|e| backend(&e))?;
+        }
         Ok(())
     }
 
@@ -425,17 +525,32 @@ impl KubeStore {
         let existing = api.get_opt(&name).await.map_err(|e| backend(&e))?;
         match (envelope_write(sealed.is_some(), existing.is_some()), sealed) {
             (EnvelopeWrite::Replace, Some(sealed)) => {
-                let mut metadata = serde_json::json!({ "labels": { SESSION_LABEL: "claimed" } });
-                if let Some(owners) = owner_refs(&self.home, sb) {
-                    metadata["ownerReferences"] = serde_json::json!(owners);
-                }
-                let patch = serde_json::json!({
-                    "metadata": metadata,
-                    "data": envelope_data(sealed),
+                let owners = owner_refs(&self.home, sb);
+                // Everything the patch would set, already there on the Secret just read: the
+                // envelope, the `claimed` label and (when the sandbox owns it) the owner
+                // references. Then the patch is not sent, the same accepted difference as
+                // `write_record`'s; any one of them differing sends the whole patch.
+                let unchanged = existing.as_ref().is_some_and(|held| {
+                    envelope_of(held).as_ref() == Some(sealed)
+                        && held.labels().get(SESSION_LABEL).map(String::as_str) == Some("claimed")
+                        && owners
+                            .as_ref()
+                            .is_none_or(|o| held.metadata.owner_references.as_ref() == Some(o))
                 });
-                api.patch(&name, &PatchParams::default(), &Patch::Merge(patch))
-                    .await
-                    .map_err(|e| backend(&e))?;
+                if !unchanged {
+                    let mut metadata =
+                        serde_json::json!({ "labels": { SESSION_LABEL: "claimed" } });
+                    if let Some(owners) = owners {
+                        metadata["ownerReferences"] = serde_json::json!(owners);
+                    }
+                    let patch = serde_json::json!({
+                        "metadata": metadata,
+                        "data": envelope_data(sealed),
+                    });
+                    api.patch(&name, &PatchParams::default(), &Patch::Merge(patch))
+                        .await
+                        .map_err(|e| backend(&e))?;
+                }
             }
             (EnvelopeWrite::Create, Some(sealed)) => {
                 let mut secret = session_secret(
@@ -516,6 +631,50 @@ impl KubeStore {
         Ok(segments)
     }
 
+    /// What `read_logs` answers after cursor `since` when the ring holds nothing newer, from
+    /// the segments' metadata alone (no entry is downloaded); `None` when there is something
+    /// newer or when the metadata cannot say, and the full read then answers.
+    ///
+    /// The annotations are written with the entries, in the one object, by
+    /// [`segment_secret`], and `seq` rises strictly through the ring (the batch's shape and
+    /// the append's filter), so the last `seq` of the newest segment holding a record is the
+    /// ring's highest. With that at or below the cursor the full read returns no entry, the
+    /// newest segment's `truncated_before` and that `seq`; an empty ring is the default
+    /// chunk. A Secret under the label whose annotations are missing or unreadable is not
+    /// guessed at: the full read decides what it is.
+    async fn idle_chunk(
+        &self,
+        claim_uid: Uuid,
+        since: u64,
+    ) -> Result<Option<LogChunk>, StoreError> {
+        let list = self
+            .secrets()
+            .list_metadata(&ListParams::default().labels(&format!(
+                "{LOGS_LABEL}={LOGS_SEGMENT},{CLAIM_UID_LABEL}={claim_uid}"
+            )))
+            .await
+            .map_err(|e| backend(&e))?;
+        let mut heads = Vec::with_capacity(list.items.len());
+        for item in &list.items {
+            let Some(head) = segment_head_of(&item.metadata) else {
+                return Ok(None);
+            };
+            heads.push(head);
+        }
+        heads.sort_by_key(|h| h.number);
+        let Some(newest) = heads.last() else {
+            return Ok(Some(LogChunk::default()));
+        };
+        if heads.iter().any(|h| h.last_seq.is_some_and(|l| l > since)) {
+            return Ok(None);
+        }
+        Ok(Some(LogChunk {
+            truncated_before: newest.truncated_before,
+            entries: Vec::new(),
+            last_seq: heads.iter().rev().find_map(|h| h.last_seq),
+        }))
+    }
+
     /// Delete the named segments of a claim; one already gone is fine.
     async fn delete_segments(&self, claim_uid: Uuid, numbers: &[u32]) -> Result<(), StoreError> {
         for n in numbers {
@@ -570,13 +729,16 @@ impl KubeStore {
         let (gone, dropped) = trim(&segments, limits.max_bytes);
         let truncated_before = segments.last().map_or(0, |s| s.truncated_before) + dropped;
         // The owner: the sandbox, when it is in the broker's namespace (the session rule).
-        let owners = match rec.sandbox_uid {
-            Some(_) => match self.sandbox_for(rec).await {
+        // A record elsewhere is not looked up at all: its namespace is its sandbox's own
+        // (`record_from`), and `owner_refs` is `None` for any sandbox outside `home`.
+        let owners = if rec.sandbox_uid.is_some() && rec.namespace == self.home {
+            match self.sandbox_for(rec).await {
                 Ok(sb) => owner_refs(&self.home, &sb),
                 Err(StoreError::NotFound(_)) => None,
                 Err(e) => return Err(e),
-            },
-            None => None,
+            }
+        } else {
+            None
         };
         let api = self.secrets();
         for seg in &changed {
@@ -634,6 +796,23 @@ impl KubeStore {
 #[must_use]
 pub fn record_status_of(sb: &AgentSandbox) -> Option<&RecordStatus> {
     sb.status.as_ref()?.record.as_ref()
+}
+
+/// Whether `sb` is the sandbox of claim `uid` as the label lookup means it: it carries the
+/// claim's label with that value, and its record is that claim's.
+fn carries_claim(sb: &AgentSandbox, uid: Uuid) -> bool {
+    let uid = uid.to_string();
+    sb.labels().get(CLAIM_UID_LABEL) == Some(&uid)
+        && record_status_of(sb).is_some_and(|r| r.claim_uid == uid)
+}
+
+/// The record on `sb` as its status alone gives it: no envelope is read, so `refresh` and
+/// `delegations` are empty. For the callers that read neither (the sweeps).
+fn head_of(sb: &AgentSandbox) -> Result<ClaimRecord, StoreError> {
+    let Some(status) = record_status_of(sb) else {
+        return Err(StoreError::NotFound(sb.name_any()));
+    };
+    record_from(sb, status)
 }
 
 /// The label value for a node's SPIFFE ID: the first 32 hex characters of its SHA-256,
@@ -842,12 +1021,43 @@ fn after_cursor(entries: Vec<LogEntry>, since: Option<u64>) -> Vec<LogEntry> {
     entries.into_iter().skip(start).collect()
 }
 
-/// The claim UID a segment Secret is labelled with.
-fn claim_uid_of_segment(secret: &Secret) -> Option<Uuid> {
-    secret
-        .labels()
+/// The claim UID a segment Secret is labelled with, from its metadata.
+fn claim_uid_of_segment(meta: &ObjectMeta) -> Option<Uuid> {
+    meta.labels
+        .as_ref()?
         .get(CLAIM_UID_LABEL)
         .and_then(|v| Uuid::parse_str(v).ok())
+}
+
+/// What a segment's annotations say of it, without its entries.
+struct SegmentHead {
+    /// Its number in the ring.
+    number: u32,
+    /// The ring's cumulative front drops when it was last written.
+    truncated_before: u64,
+    /// The highest record `seq` in it; `None` when it holds no record.
+    last_seq: Option<u64>,
+}
+
+/// The head of a segment from its metadata; `None` when an annotation [`segment_secret`]
+/// always writes is missing or does not parse, or when the two `seq` annotations disagree
+/// on whether the segment holds a record.
+fn segment_head_of(meta: &ObjectMeta) -> Option<SegmentHead> {
+    let ann = meta.annotations.as_ref()?;
+    let number: u32 = ann.get(SEGMENT_ANNOTATION)?.parse().ok()?;
+    let truncated_before: u64 = ann.get(TRUNCATED_ANNOTATION)?.parse().ok()?;
+    let last_seq: Option<u64> = match ann.get(LAST_SEQ_ANNOTATION) {
+        Some(v) => Some(v.parse().ok()?),
+        None => None,
+    };
+    if ann.contains_key(FIRST_SEQ_ANNOTATION) != last_seq.is_some() {
+        return None;
+    }
+    Some(SegmentHead {
+        number,
+        truncated_before,
+        last_seq,
+    })
 }
 
 fn backend(e: &kube::Error) -> StoreError {
@@ -1171,6 +1381,13 @@ impl LogStore for KubeStore {
     }
 
     async fn read_logs(&self, claim_uid: Uuid, since: Option<u64>) -> Result<LogChunk, StoreError> {
+        // A follower's poll usually finds nothing new: the segments' metadata says so
+        // without the ring being downloaded.
+        if let Some(since) = since
+            && let Some(chunk) = self.idle_chunk(claim_uid, since).await?
+        {
+            return Ok(chunk);
+        }
         let segments = self.segments_of(claim_uid).await?;
         let Some(newest) = segments.last() else {
             return Ok(LogChunk::default());
@@ -1208,16 +1425,25 @@ impl LogStore for KubeStore {
     }
 
     async fn sweep_logs(&self, before: Timestamp) -> Result<usize, StoreError> {
+        // The labels are all that is read of the segments: their metadata, not their entries.
         let list = self
             .secrets()
-            .list(&ListParams::default().labels(&format!("{LOGS_LABEL}={LOGS_SEGMENT}")))
+            .list_metadata(&ListParams::default().labels(&format!("{LOGS_LABEL}={LOGS_SEGMENT}")))
             .await
             .map_err(|e| backend(&e))?;
-        let claims: std::collections::BTreeSet<Uuid> =
-            list.items.iter().filter_map(claim_uid_of_segment).collect();
+        let claims: std::collections::BTreeSet<Uuid> = list
+            .items
+            .iter()
+            .filter_map(|s| claim_uid_of_segment(&s.metadata))
+            .collect();
         let mut swept = 0;
         for claim_uid in claims {
-            let gone = match self.get_claim(claim_uid).await {
+            // When the claim ended is on the status: no envelope is read for it.
+            let head = self
+                .sandbox_of_claim(claim_uid)
+                .await
+                .and_then(|sb| head_of(&sb));
+            let gone = match head {
                 // The record is gone: an orphan ring (ADR-0045 decision 7).
                 Err(StoreError::NotFound(_)) => true,
                 Err(e) => return Err(e),
@@ -1258,13 +1484,18 @@ impl ClaimStore for KubeStore {
         namespace: &str,
         name: &str,
     ) -> Result<ClaimRecord, StoreError> {
-        // By name in that namespace only: the newest sandbox of that name carrying a record.
+        // By name in that namespace only: one read of the one object that name can be there,
+        // taken when it carries the claim label, as the listing of recorded sandboxes
+        // required. No object, or one without the label, is not found.
+        if namespace.is_empty() || name.is_empty() {
+            return Err(StoreError::NotFound(name.to_owned()));
+        }
         let sb = self
-            .sandboxes_with_records()
-            .await?
-            .into_iter()
-            .filter(|sb| sb.name_any() == name && sb.namespace().as_deref() == Some(namespace))
-            .max_by_key(|sb| sb.metadata.creation_timestamp.clone().map(|t| t.0))
+            .sandboxes_in(namespace)
+            .get_opt(name)
+            .await
+            .map_err(|e| backend(&e))?
+            .filter(|sb| sb.labels().contains_key(CLAIM_UID_LABEL))
             .ok_or_else(|| StoreError::NotFound(name.to_owned()))?;
         self.record_of(&sb).await
     }
@@ -1410,7 +1641,9 @@ impl ClaimStore for KubeStore {
     async fn sweep(&self, before: Timestamp) -> Result<usize, StoreError> {
         let mut swept = 0;
         for sb in self.sandboxes_with_records().await? {
-            let Ok(rec) = self.record_of(&sb).await else {
+            // From the status alone: the sweep reads neither the envelope nor a delegation,
+            // it deletes their Secrets by label.
+            let Ok(rec) = head_of(&sb) else {
                 continue;
             };
             if rec.ended_at().is_none_or(|e| e >= before) {
@@ -1465,6 +1698,8 @@ impl ClaimStore for KubeStore {
                 Err(e) if is_not_found(&e) => {}
                 Err(e) => return Err(backend(&e)),
             }
+            // The sandbox is going: where it was is no longer worth trying first.
+            self.forget(rec.uid);
             swept += 1;
         }
         Ok(swept)
@@ -1570,44 +1805,32 @@ impl ClaimStore for KubeStore {
 
     async fn sweep_sessions(&self, before: Timestamp) -> Result<usize, StoreError> {
         let now = Timestamp::now();
+        // Every session Secret in one list, parked or claimed; the label's value says which
+        // rule applies, and a value that is neither is left alone.
         let list = self
             .secrets()
-            .list(&ListParams::default().labels(&format!("{SESSION_LABEL}=parked")))
+            .list(&ListParams::default().labels(SESSION_LABEL))
             .await
             .map_err(|e| backend(&e))?;
         let mut swept = 0;
         for secret in &list.items {
+            let state = secret.labels().get(SESSION_LABEL).map(String::as_str);
             let Some(session) = session_of(secret) else {
                 continue;
             };
-            // Old (the grace period) or expired (ADR-0043 decision 4); the same rule as the in-memory store.
-            if session.created_at >= before && session.expires_at.is_none_or(|e| e > now) {
-                continue;
-            }
-            match self
-                .secrets()
-                .delete(&secret.name_any(), &DeleteParams::default())
-                .await
-            {
-                Ok(_) => swept += 1,
-                Err(e) if is_not_found(&e) => {}
-                Err(e) => return Err(backend(&e)),
-            }
-        }
-        // A bound claim's envelopes (relabelled `claimed` when the record took them) go when they expire, not at the
-        // claim's end: no secret is stored past its expiry (the operator's rule, ADR-0043 decision 4). The record
-        // reads each envelope by name and skips a missing one, so the delegation is simply gone from it. The
-        // age rule does not apply: a long claim's envelope is old and still wanted.
-        let claimed = self
-            .secrets()
-            .list(&ListParams::default().labels(&format!("{SESSION_LABEL}=claimed")))
-            .await
-            .map_err(|e| backend(&e))?;
-        for secret in &claimed.items {
-            let Some(session) = session_of(secret) else {
-                continue;
+            let expired = session.expires_at.is_some_and(|e| e <= now);
+            let due = match state {
+                // Old (the grace period) or expired (ADR-0043 decision 4); the same rule as the in-memory store.
+                Some("parked") => session.created_at < before || expired,
+                // A bound claim's envelopes (relabelled `claimed` when the record took them) go when they expire,
+                // not at the claim's end: no secret is stored past its expiry (the operator's rule, ADR-0043
+                // decision 4). The record reads each envelope by name and skips a missing one, so the delegation
+                // is simply gone from it. The age rule does not apply: a long claim's envelope is old and still
+                // wanted.
+                Some("claimed") => expired,
+                _ => false,
             };
-            if session.expires_at.is_none_or(|e| e > now) {
+            if !due {
                 continue;
             }
             match self
@@ -1739,8 +1962,12 @@ mod tests {
         );
     }
 
-    /// A fake Kubernetes API for the Secret tests: sandboxes in a tenant namespace, Secrets in
-    /// the broker's home namespace, every request recorded.
+    /// A fake Kubernetes API for the store's tests: sandboxes in a tenant namespace, Secrets
+    /// in the broker's home namespace, every request recorded. It answers as the API server
+    /// does where the store depends on it: a read by name honours the namespace and the name
+    /// and is a 404 for an unknown one, a list honours its namespace and label selector, a
+    /// merge patch is applied (the status only through the status subresource), a delete
+    /// waits on finalizers, and a metadata-only list carries no data.
     mod fake {
         use super::*;
         use http::{Request, Response};
@@ -1755,7 +1982,10 @@ mod tests {
         pub struct State {
             pub sandboxes: Vec<serde_json::Value>,
             pub secrets: Vec<serde_json::Value>,
+            /// Every request, in order: the verb and the path.
             pub log: Vec<(String, String)>,
+            /// The paths of the lists that asked for metadata only.
+            pub metadata_lists: Vec<String>,
         }
 
         pub fn store(state: &Arc<Mutex<State>>) -> KubeStore {
@@ -1772,6 +2002,12 @@ mod tests {
                         .replace("%3D", "=")
                         .replace("%2C", ",")
                         .replace("%2F", "/");
+                    // What `Api::list_metadata` asks for (a `PartialObjectMetadataList`).
+                    let partial = req
+                        .headers()
+                        .get(http::header::ACCEPT)
+                        .and_then(|v| v.to_str().ok())
+                        .is_some_and(|a| a.contains("as=PartialObjectMetadataList"));
                     let sent: serde_json::Value = req
                         .into_body()
                         .collect()
@@ -1779,9 +2015,20 @@ mod tests {
                         .ok()
                         .and_then(|b| serde_json::from_slice(&b.to_bytes()).ok())
                         .unwrap_or(serde_json::Value::Null);
-                    let (code, body) =
-                        answer(&mut state.lock().unwrap(), &method, &path, &query, sent);
-                    state.lock().unwrap().log.push((method, path));
+                    let call = Call {
+                        method: &method,
+                        path: &path,
+                        query: &query,
+                        partial,
+                    };
+                    let (code, body) = answer(&mut state.lock().unwrap(), &call, sent);
+                    {
+                        let mut st = state.lock().unwrap();
+                        if partial {
+                            st.metadata_lists.push(path.clone());
+                        }
+                        st.log.push((method, path));
+                    }
                     send.send_response(
                         Response::builder()
                             .status(code)
@@ -1794,47 +2041,193 @@ mod tests {
             KubeStore::new(Client::new(svc, HOME))
         }
 
-        fn matches(secret: &serde_json::Value, selector: &str) -> bool {
+        /// One request, as `answer` reads it.
+        struct Call<'a> {
+            method: &'a str,
+            path: &'a str,
+            query: &'a str,
+            partial: bool,
+        }
+
+        fn matches(object: &serde_json::Value, selector: &str) -> bool {
             selector
                 .split(',')
                 .filter(|c| !c.is_empty())
                 .all(|c| match c.split_once('=') {
-                    Some((k, v)) => secret["metadata"]["labels"][k] == v,
-                    None => secret["metadata"]["labels"].get(c).is_some(),
+                    Some((k, v)) => object["metadata"]["labels"][k] == v,
+                    None => object["metadata"]["labels"].get(c).is_some(),
                 })
         }
 
-        fn conflict(what: &str) -> (u16, serde_json::Value) {
+        fn status(code: u16, reason: &str, message: &str) -> (u16, serde_json::Value) {
             (
-                409,
+                code,
                 serde_json::json!({"apiVersion": "v1", "kind": "Status", "status": "Failure",
-                    "reason": "Conflict", "code": 409, "message": what, "metadata": {}}),
+                    "reason": reason, "code": code, "message": message, "metadata": {}}),
             )
+        }
+
+        fn conflict(what: &str) -> (u16, serde_json::Value) {
+            status(409, "Conflict", what)
+        }
+
+        fn not_found() -> (u16, serde_json::Value) {
+            status(404, "NotFound", "not found")
+        }
+
+        /// A JSON merge patch (RFC 7396): objects merge, `null` removes, anything else
+        /// replaces.
+        fn merge(target: &mut serde_json::Value, patch: &serde_json::Value) {
+            let Some(patch) = patch.as_object() else {
+                *target = patch.clone();
+                return;
+            };
+            if !target.is_object() {
+                *target = serde_json::json!({});
+            }
+            if let Some(map) = target.as_object_mut() {
+                for (k, v) in patch {
+                    if v.is_null() {
+                        map.remove(k);
+                    } else {
+                        merge(map.entry(k.clone()).or_insert(serde_json::Value::Null), v);
+                    }
+                }
+            }
         }
 
         fn answer(
             st: &mut State,
-            method: &str,
-            path: &str,
-            query: &str,
+            call: &Call<'_>,
             sent: serde_json::Value,
         ) -> (u16, serde_json::Value) {
-            let selector = query
+            let selector = call
+                .query
                 .split('&')
                 .find_map(|p| p.strip_prefix("labelSelector="))
                 .unwrap_or("");
-            if path.contains("/agentsandboxes") {
-                let sb = st.sandboxes[0].clone();
-                return match (method, path.ends_with("/agentsandboxes")) {
-                    ("GET", true) => (
-                        200,
-                        serde_json::json!({"apiVersion": "mediatore.io/v1beta1",
-                            "kind": "AgentSandboxList", "metadata": {"resourceVersion": "1"},
-                            "items": st.sandboxes}),
-                    ),
-                    _ => (200, sb),
-                };
+            if call.path.contains("/agentsandboxes") {
+                answer_sandbox(st, call, selector, &sent)
+            } else {
+                answer_secret(st, call, selector, sent)
             }
+        }
+
+        /// `AgentSandbox`: every namespace or one for a list, one namespace and one name for
+        /// anything else, `/status` for the status subresource.
+        fn answer_sandbox(
+            st: &mut State,
+            call: &Call<'_>,
+            selector: &str,
+            sent: &serde_json::Value,
+        ) -> (u16, serde_json::Value) {
+            let (head, tail) = call
+                .path
+                .split_once("/agentsandboxes")
+                .unwrap_or((call.path, ""));
+            let ns = head.split_once("/namespaces/").map(|(_, ns)| ns);
+            let tail = tail.trim_start_matches('/');
+            let (name, subresource) = match tail.strip_suffix("/status") {
+                Some(name) => (name, true),
+                None => (tail, false),
+            };
+            let in_ns =
+                |s: &serde_json::Value| ns.is_none_or(|ns| s["metadata"]["namespace"] == ns);
+            if name.is_empty() {
+                if call.method != "GET" {
+                    return status(500, "InternalError", "unexpected request on the collection");
+                }
+                let items: Vec<&serde_json::Value> = st
+                    .sandboxes
+                    .iter()
+                    .filter(|s| in_ns(s) && matches(s, selector))
+                    .collect();
+                return (
+                    200,
+                    serde_json::json!({"apiVersion": "mediatore.io/v1beta1",
+                        "kind": "AgentSandboxList", "metadata": {"resourceVersion": "1"},
+                        "items": items}),
+                );
+            }
+            // A named sandbox is read in its namespace; there is no such route without one.
+            let found = ns.and_then(|_| {
+                st.sandboxes
+                    .iter()
+                    .position(|s| in_ns(s) && s["metadata"]["name"] == name)
+            });
+            let Some(i) = found else {
+                return not_found();
+            };
+            match call.method {
+                "GET" => (200, st.sandboxes[i].clone()),
+                "PATCH" => {
+                    // The status moves through its subresource alone, and nothing else does.
+                    if subresource {
+                        merge(&mut st.sandboxes[i]["status"], &sent["status"]);
+                    } else {
+                        let mut patch = sent.clone();
+                        if let Some(map) = patch.as_object_mut() {
+                            map.remove("status");
+                        }
+                        merge(&mut st.sandboxes[i], &patch);
+                    }
+                    let sb = st.sandboxes[i].clone();
+                    let released = sb["metadata"]["finalizers"]
+                        .as_array()
+                        .is_none_or(Vec::is_empty);
+                    if released && !sb["metadata"]["deletionTimestamp"].is_null() {
+                        st.sandboxes.remove(i);
+                    }
+                    (200, sb)
+                }
+                "DELETE" => {
+                    // Held by a finalizer: marked, and gone when the last one is released.
+                    let finalized = st.sandboxes[i]["metadata"]["finalizers"]
+                        .as_array()
+                        .is_some_and(|f| !f.is_empty());
+                    if finalized {
+                        st.sandboxes[i]["metadata"]["deletionTimestamp"] =
+                            "2026-01-02T00:00:00Z".into();
+                        (200, st.sandboxes[i].clone())
+                    } else {
+                        (200, st.sandboxes.remove(i))
+                    }
+                }
+                _ => status(500, "InternalError", "unexpected request on a sandbox"),
+            }
+        }
+
+        /// What a metadata-only list returns of an object: its metadata, no data.
+        fn partial_of(object: &serde_json::Value) -> serde_json::Value {
+            serde_json::json!({"apiVersion": "meta.k8s.io/v1", "kind": "PartialObjectMetadata",
+                "metadata": object["metadata"]})
+        }
+
+        /// Apply a merge patch to a stored Secret and return it as it then is.
+        fn patch_secret(
+            held: &mut serde_json::Value,
+            patch: &serde_json::Value,
+        ) -> serde_json::Value {
+            let mut secret = held.clone();
+            merge(&mut secret, patch);
+            if secret != *held {
+                let current = secret["metadata"]["resourceVersion"]
+                    .as_str()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(0);
+                secret["metadata"]["resourceVersion"] = (current + 1).to_string().into();
+                held.clone_from(&secret);
+            }
+            secret
+        }
+
+        fn answer_secret(
+            st: &mut State,
+            call: &Call<'_>,
+            selector: &str,
+            sent: serde_json::Value,
+        ) -> (u16, serde_json::Value) {
+            let (method, path) = (call.method, call.path);
             let rest = path.strip_prefix("/api/v1/namespaces/").unwrap_or("");
             let (ns, rest) = rest.split_once("/secrets").unwrap_or(("", ""));
             let name = rest.trim_start_matches('/');
@@ -1862,11 +2255,7 @@ mod tests {
                 // Replace: compare-and-set on resourceVersion, then bump it.
                 ("PUT", false) => {
                     let Some(i) = st.secrets.iter().position(at) else {
-                        return (
-                            404,
-                            serde_json::json!({"apiVersion": "v1", "kind": "Status", "status": "Failure",
-                                "reason": "NotFound", "code": 404, "message": "not found", "metadata": {}}),
-                        );
+                        return not_found();
                     };
                     let current = st.secrets[i]["metadata"]["resourceVersion"].clone();
                     if sent["metadata"]["resourceVersion"] != current {
@@ -1881,19 +2270,35 @@ mod tests {
                     st.secrets[i] = secret.clone();
                     (200, secret)
                 }
-                ("GET", true) => (
-                    200,
-                    serde_json::json!({"apiVersion": "v1", "kind": "SecretList",
-                        "metadata": {"resourceVersion": "1"},
-                        "items": st.secrets.iter().filter(|s| at(s) && matches(s, selector)).collect::<Vec<_>>()}),
-                ),
+                // A merge patch; one that changes nothing leaves the resourceVersion alone.
+                ("PATCH", false) => {
+                    let Some(i) = st.secrets.iter().position(at) else {
+                        return not_found();
+                    };
+                    (200, patch_secret(&mut st.secrets[i], &sent))
+                }
+                ("GET", true) => {
+                    let found = st.secrets.iter().filter(|s| at(s) && matches(s, selector));
+                    if call.partial {
+                        let items: Vec<serde_json::Value> = found.map(partial_of).collect();
+                        (
+                            200,
+                            serde_json::json!({"apiVersion": "meta.k8s.io/v1",
+                                "kind": "PartialObjectMetadataList",
+                                "metadata": {"resourceVersion": "1"}, "items": items}),
+                        )
+                    } else {
+                        let items: Vec<&serde_json::Value> = found.collect();
+                        (
+                            200,
+                            serde_json::json!({"apiVersion": "v1", "kind": "SecretList",
+                                "metadata": {"resourceVersion": "1"}, "items": items}),
+                        )
+                    }
+                }
                 ("GET" | "DELETE", false) => {
                     let Some(i) = st.secrets.iter().position(at) else {
-                        return (
-                            404,
-                            serde_json::json!({"apiVersion": "v1", "kind": "Status", "status": "Failure",
-                                "reason": "NotFound", "code": 404, "message": "not found", "metadata": {}}),
-                        );
+                        return not_found();
                     };
                     let found = if method == "DELETE" {
                         st.secrets.remove(i)
@@ -1902,15 +2307,19 @@ mod tests {
                     };
                     (200, found)
                 }
-                _ => (
-                    500,
-                    serde_json::json!({"apiVersion": "v1", "kind": "Status", "status": "Failure",
-                        "code": 500, "message": format!("unexpected {method} {path}"), "metadata": {}}),
-                ),
+                _ => status(500, "InternalError", "unexpected request on a Secret"),
             }
         }
 
-        fn home_secret(sandbox: Uuid, audience: Option<&str>) -> serde_json::Value {
+        /// A session Secret in the home namespace, as the API server would hold it: the
+        /// issuer's (`audience` `None`) or a delegation's, in the `state` its label says.
+        pub fn session(
+            sandbox: Uuid,
+            audience: Option<&str>,
+            state: &str,
+            created_at: Timestamp,
+            expires_at: Option<Timestamp>,
+        ) -> serde_json::Value {
             let mut v = serde_json::to_value(session_secret(
                 &SessionRecord {
                     sandbox_uid: sandbox,
@@ -1925,17 +2334,71 @@ mod tests {
                         nonce: vec![1],
                         ciphertext: vec![2],
                     },
-                    created_at: Timestamp::now(),
+                    created_at,
                     audience: audience.map(str::to_owned),
-                    expires_at: None,
+                    expires_at,
                 },
-                "claimed",
+                state,
             ))
             .unwrap();
             v["apiVersion"] = "v1".into();
             v["kind"] = "Secret".into();
             v["metadata"]["namespace"] = HOME.into();
+            v["metadata"]["resourceVersion"] = "1".into();
             v
+        }
+
+        fn home_secret(sandbox: Uuid, audience: Option<&str>) -> serde_json::Value {
+            session(sandbox, audience, "claimed", Timestamp::now(), None)
+        }
+
+        /// The UID of the one seeded sandbox.
+        pub fn sandbox_uid(st: &State) -> Uuid {
+            Uuid::parse_str(st.sandboxes[0]["metadata"]["uid"].as_str().unwrap()).unwrap()
+        }
+
+        /// How many requests listed sandboxes (a GET on the collection, in every namespace
+        /// or in one).
+        pub fn sandbox_lists(st: &State) -> usize {
+            st.log
+                .iter()
+                .filter(|(m, p)| m == "GET" && p.ends_with("/agentsandboxes"))
+                .count()
+        }
+
+        /// How many requests read one sandbox by name.
+        pub fn sandbox_gets(st: &State) -> usize {
+            st.log
+                .iter()
+                .filter(|(m, p)| {
+                    m == "GET" && p.contains("/agentsandboxes/") && !p.ends_with("/status")
+                })
+                .count()
+        }
+
+        /// How many requests listed Secrets, in full or as metadata.
+        pub fn secret_lists(st: &State) -> usize {
+            st.log
+                .iter()
+                .filter(|(m, p)| m == "GET" && p.ends_with("/secrets"))
+                .count()
+        }
+
+        /// How many requests read one Secret by name.
+        pub fn secret_gets(st: &State) -> usize {
+            st.log
+                .iter()
+                .filter(|(m, p)| m == "GET" && p.contains("/secrets/"))
+                .count()
+        }
+
+        /// The paths that were patched, in order.
+        pub fn patched(st: &State) -> Vec<&str> {
+            st.log
+                .iter()
+                .filter(|(m, _)| m == "PATCH")
+                .map(|(_, p)| p.as_str())
+                .collect()
         }
 
         /// A sandbox in the tenant namespace with a record, its session Secret and one
@@ -1989,7 +2452,7 @@ mod tests {
                     home_secret(sandbox, None),
                     home_secret(sandbox, Some("api.example")),
                 ],
-                log: vec![],
+                ..State::default()
             };
             (Arc::new(Mutex::new(st)), claim)
         }
@@ -2038,11 +2501,392 @@ mod tests {
 
     #[tokio::test]
     async fn a_lookup_by_name_reads_only_its_namespace() {
-        let (state, _claim) = fake::seed(false);
+        let (state, claim) = fake::seed(false);
+        // The same name in another namespace, the record of another claim.
+        let other = Uuid::new_v4();
+        {
+            let mut st = state.lock().unwrap();
+            let mut twin = st.sandboxes[0].clone();
+            twin["metadata"]["namespace"] = "team-c".into();
+            twin["metadata"]["uid"] = Uuid::new_v4().to_string().into();
+            twin["metadata"]["labels"][CLAIM_UID_LABEL] = other.to_string().into();
+            twin["status"]["record"]["claimUid"] = other.to_string().into();
+            twin["status"]["record"]["refresh"] = false.into();
+            twin["status"]["record"]["delegations"] = serde_json::json!([]);
+            st.sandboxes.push(twin);
+        }
         let store = fake::store(&state);
-        assert!(store.get_claim_by_name("team-b", "sb-1").await.is_err());
+        assert!(matches!(
+            store.get_claim_by_name("team-b", "sb-1").await,
+            Err(StoreError::NotFound(_))
+        ));
         let rec = store.get_claim_by_name(fake::TENANT, "sb-1").await.unwrap();
         assert_eq!(rec.namespace, fake::TENANT);
+        assert!(rec.uid == claim, "the tenant's record, not its namesake's");
+        let rec = store.get_claim_by_name("team-c", "sb-1").await.unwrap();
+        assert_eq!(rec.namespace, "team-c");
+        assert!(
+            rec.uid == other,
+            "the namesake's record in its own namespace"
+        );
+        let st = state.lock().unwrap();
+        assert_eq!(
+            fake::sandbox_lists(&st),
+            0,
+            "a lookup by name lists nothing"
+        );
+        assert_eq!(fake::sandbox_gets(&st), 3, "one read by name per lookup");
+    }
+
+    #[tokio::test]
+    async fn a_lookup_by_name_wants_the_claim_label_and_a_record() {
+        // What the listing of recorded sandboxes required: no label, not found.
+        let (state, _claim) = fake::seed(false);
+        state.lock().unwrap().sandboxes[0]["metadata"]["labels"] = serde_json::json!({});
+        let store = fake::store(&state);
+        assert!(matches!(
+            store.get_claim_by_name(fake::TENANT, "sb-1").await,
+            Err(StoreError::NotFound(_))
+        ));
+        // The label without a record: not found either.
+        let (state, _claim) = fake::seed(false);
+        state.lock().unwrap().sandboxes[0]["status"] = serde_json::json!({});
+        let store = fake::store(&state);
+        assert!(matches!(
+            store.get_claim_by_name(fake::TENANT, "sb-1").await,
+            Err(StoreError::NotFound(_))
+        ));
+        assert!(matches!(
+            store.get_claim_by_name(fake::TENANT, "").await,
+            Err(StoreError::NotFound(_))
+        ));
+    }
+
+    /// The seeded sandbox before any record: no label, no status, no Secret.
+    fn unrecorded(state: &std::sync::Mutex<fake::State>) {
+        let mut st = state.lock().unwrap();
+        st.sandboxes[0]["metadata"]["labels"] = serde_json::json!({});
+        st.sandboxes[0]["status"] = serde_json::json!({});
+        st.secrets.clear();
+    }
+
+    #[tokio::test]
+    async fn a_new_record_finds_its_sandbox_by_name_and_checks_the_uid() {
+        let (state, _seeded) = fake::seed(false);
+        unrecorded(&state);
+        let sandbox = fake::sandbox_uid(&state.lock().unwrap());
+        let store = fake::store(&state);
+        let claim = Uuid::new_v4();
+        let mut rec = test_record(claim);
+        rec.name = "sb-1".into();
+        rec.namespace = fake::TENANT.into();
+        rec.sandbox_uid = Some(sandbox);
+        store.put_claim(rec.clone()).await.unwrap();
+        {
+            let st = state.lock().unwrap();
+            assert_eq!(fake::sandbox_gets(&st), 1, "the sandbox, by name");
+            assert_eq!(
+                fake::sandbox_lists(&st),
+                1,
+                "only the check that no sandbox carries the claim yet"
+            );
+            assert_eq!(fake::patched(&st).len(), 2, "the labels and the status");
+        }
+        let back = store.get_claim(claim).await.unwrap();
+        assert_eq!(back.name, "sb-1");
+        assert!(back.sandbox_uid == Some(sandbox), "the record's sandbox");
+        assert!(matches!(
+            store.put_claim(rec).await,
+            Err(StoreError::Conflict(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_new_record_under_another_name_is_still_found_by_uid_and_a_wrong_uid_never_is() {
+        let (state, _seeded) = fake::seed(false);
+        unrecorded(&state);
+        let sandbox = fake::sandbox_uid(&state.lock().unwrap());
+        let store = fake::store(&state);
+        // The name is taken by a sandbox of another UID: not that one.
+        let mut stranger = test_record(Uuid::new_v4());
+        stranger.name = "sb-1".into();
+        stranger.namespace = fake::TENANT.into();
+        stranger.sandbox_uid = Some(Uuid::new_v4());
+        assert!(matches!(
+            store.put_claim(stranger).await,
+            Err(StoreError::NotFound(_))
+        ));
+        assert!(
+            state.lock().unwrap().sandboxes[0]["status"]["record"].is_null(),
+            "nothing was written to the sandbox of that name"
+        );
+        // The record names its sandbox wrongly: the list over every namespace finds the UID.
+        let claim = Uuid::new_v4();
+        let mut rec = test_record(claim);
+        rec.name = "renamed".into();
+        rec.namespace = "elsewhere".into();
+        rec.sandbox_uid = Some(sandbox);
+        store.put_claim(rec).await.unwrap();
+        assert_eq!(store.get_claim(claim).await.unwrap().name, "sb-1");
+    }
+
+    #[tokio::test]
+    async fn a_second_read_of_a_claim_reads_its_sandbox_by_name_and_lists_nothing() {
+        let (state, claim) = fake::seed(false);
+        let store = fake::store(&state);
+        let first = store.get_claim(claim).await.unwrap();
+        {
+            let st = state.lock().unwrap();
+            assert_eq!(fake::sandbox_lists(&st), 1, "found by its label once");
+            assert_eq!(fake::sandbox_gets(&st), 0);
+        }
+        let second = store.get_claim(claim).await.unwrap();
+        assert!(first.uid == second.uid && first.name == second.name);
+        assert!(first.refresh == second.refresh, "the same envelope");
+        let st = state.lock().unwrap();
+        assert_eq!(fake::sandbox_lists(&st), 1, "no second list");
+        assert_eq!(fake::sandbox_gets(&st), 1, "one read by name");
+    }
+
+    #[tokio::test]
+    async fn a_hint_whose_sandbox_is_gone_or_relabelled_falls_back_to_the_list() {
+        // Deleted: the list says not found.
+        let (state, claim) = fake::seed(false);
+        let store = fake::store(&state);
+        store.get_claim(claim).await.unwrap();
+        state.lock().unwrap().sandboxes.clear();
+        assert!(matches!(
+            store.get_claim(claim).await,
+            Err(StoreError::NotFound(_))
+        ));
+        assert_eq!(fake::sandbox_lists(&state.lock().unwrap()), 2);
+
+        // The label removed: not found, as the selector would have it.
+        let (state, claim) = fake::seed(false);
+        let store = fake::store(&state);
+        store.get_claim(claim).await.unwrap();
+        state.lock().unwrap().sandboxes[0]["metadata"]["labels"] = serde_json::json!({});
+        assert!(matches!(
+            store.get_claim(claim).await,
+            Err(StoreError::NotFound(_))
+        ));
+        assert_eq!(fake::sandbox_lists(&state.lock().unwrap()), 2);
+
+        // The name now another claim's sandbox, the claim on a sandbox elsewhere: the list
+        // returns that one.
+        let (state, claim) = fake::seed(false);
+        let store = fake::store(&state);
+        store.get_claim(claim).await.unwrap();
+        {
+            let mut st = state.lock().unwrap();
+            let mut moved = st.sandboxes[0].clone();
+            moved["metadata"]["name"] = "sb-2".into();
+            moved["metadata"]["namespace"] = "team-c".into();
+            let other = Uuid::new_v4().to_string();
+            st.sandboxes[0]["metadata"]["labels"][CLAIM_UID_LABEL] = other.clone().into();
+            st.sandboxes[0]["status"]["record"]["claimUid"] = other.into();
+            st.sandboxes.push(moved);
+        }
+        let rec = store.get_claim(claim).await.unwrap();
+        assert_eq!(rec.name, "sb-2");
+        assert_eq!(rec.namespace, "team-c");
+        assert_eq!(fake::sandbox_lists(&state.lock().unwrap()), 2);
+        // And the new place is the hint from here on.
+        store.get_claim(claim).await.unwrap();
+        assert_eq!(fake::sandbox_lists(&state.lock().unwrap()), 2);
+    }
+
+    #[tokio::test]
+    async fn an_update_that_changes_nothing_patches_nothing() {
+        let (state, claim) = fake::seed(false);
+        let store = fake::store(&state);
+        let rec = store.get_claim(claim).await.unwrap();
+        assert!(rec.refresh.is_some() && rec.delegations.len() == 1);
+        store.update_claim(rec).await.unwrap();
+        let st = state.lock().unwrap();
+        assert_eq!(
+            fake::patched(&st).len(),
+            0,
+            "neither the labels, the status nor a Secret"
+        );
+        assert_eq!(st.secrets.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn an_update_with_a_new_envelope_patches_the_session_secret_alone() {
+        let (state, claim) = fake::seed(false);
+        let sandbox = fake::sandbox_uid(&state.lock().unwrap());
+        let store = fake::store(&state);
+        let mut rec = store.get_claim(claim).await.unwrap();
+        let rotated = Sealed {
+            key_id: "k1".into(),
+            nonce: vec![3],
+            ciphertext: vec![4],
+        };
+        rec.refresh = Some(rotated.clone());
+        store.update_claim(rec).await.unwrap();
+        {
+            let st = state.lock().unwrap();
+            let patched = fake::patched(&st);
+            assert_eq!(patched.len(), 1, "one patch");
+            assert!(
+                patched[0].ends_with(&format!("/secrets/{}", session_name(sandbox))),
+                "the issuer's session Secret"
+            );
+        }
+        let back = store.get_claim(claim).await.unwrap();
+        assert!(back.refresh == Some(rotated), "the new envelope is stored");
+        assert_eq!(back.delegations.len(), 1, "the delegation is untouched");
+    }
+
+    #[tokio::test]
+    async fn an_update_that_changes_the_record_patches_the_status_and_a_new_node_the_labels() {
+        let (state, claim) = fake::seed(false);
+        let store = fake::store(&state);
+        let mut rec = store.get_claim(claim).await.unwrap();
+        rec.entry_id = Some("entry-1".into());
+        store.update_claim(rec.clone()).await.unwrap();
+        {
+            let st = state.lock().unwrap();
+            let patched = fake::patched(&st);
+            assert_eq!(patched.len(), 1);
+            assert!(patched[0].ends_with("/agentsandboxes/sb-1/status"));
+        }
+        let node = "spiffe://sandbox.test/spire/agent/tpm/aaaa";
+        rec.node_id = Some(node.into());
+        store.update_claim(rec).await.unwrap();
+        let st = state.lock().unwrap();
+        let patched = fake::patched(&st);
+        assert_eq!(patched.len(), 3, "the labels, then the status");
+        assert!(patched[1].ends_with("/agentsandboxes/sb-1"));
+        assert_eq!(
+            st.sandboxes[0]["metadata"]["labels"][NODE_LABEL],
+            node_label(node)
+        );
+        assert_eq!(st.sandboxes[0]["status"]["record"]["entryId"], "entry-1");
+        assert_eq!(st.sandboxes[0]["status"]["record"]["nodeId"], node);
+    }
+
+    #[tokio::test]
+    async fn the_sweeps_read_no_envelope_and_the_log_sweep_lists_metadata_only() {
+        let (state, claim) = fake::seed(true);
+        let store = fake::store(&state);
+        let rec = store.get_claim(claim).await.unwrap();
+        let limits = LogLimits {
+            max_bytes: mediatore_proto::DEFAULT_LOG_MAX_BYTES,
+        };
+        store
+            .append_logs(&rec, &log_batch(1, 1, "ended"), &limits)
+            .await
+            .unwrap();
+        {
+            let mut st = state.lock().unwrap();
+            st.log.clear();
+            st.metadata_lists.clear();
+        }
+        // The revoked record ended in 2026: nothing before the dawn of time, all of it now.
+        assert_eq!(store.sweep_logs(Timestamp::MIN).await.unwrap(), 0);
+        {
+            let st = state.lock().unwrap();
+            assert_eq!(fake::secret_gets(&st), 0, "no Secret is read by name");
+            assert_eq!(st.metadata_lists.len(), 1, "the segments, as metadata only");
+            assert_eq!(fake::secret_lists(&st), 1, "and nothing else is listed");
+        }
+        assert_eq!(store.sweep_logs(Timestamp::now()).await.unwrap(), 1);
+        assert_eq!(fake::secret_gets(&state.lock().unwrap()), 0);
+        // The audit sweep: the same record, its Secrets deleted by label, none read.
+        assert_eq!(store.sweep(Timestamp::now()).await.unwrap(), 1);
+        let st = state.lock().unwrap();
+        assert_eq!(fake::secret_gets(&st), 0, "no envelope is read to sweep");
+        assert!(st.secrets.is_empty(), "its Secrets are deleted");
+        assert!(st.sandboxes.is_empty(), "deleted, its finalizer released");
+    }
+
+    #[tokio::test]
+    async fn a_swept_claim_is_not_found_again() {
+        let (state, claim) = fake::seed(true);
+        let store = fake::store(&state);
+        store.get_claim(claim).await.unwrap();
+        assert_eq!(store.sweep(Timestamp::now()).await.unwrap(), 1);
+        let before = fake::sandbox_gets(&state.lock().unwrap());
+        assert!(matches!(
+            store.get_claim(claim).await,
+            Err(StoreError::NotFound(_))
+        ));
+        assert_eq!(
+            fake::sandbox_gets(&state.lock().unwrap()),
+            before,
+            "the hint went with the sandbox: the list answers"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_session_sweep_lists_once_and_keeps_each_states_rule() {
+        let (state, _claim) = fake::seed(false);
+        let now = Timestamp::now();
+        let ago = |seconds: i64| Timestamp::from_second(now.as_second() - seconds).unwrap();
+        let later = Timestamp::from_second(now.as_second() + 3600).unwrap();
+        let (old_parked, fresh_parked, expired_parked) =
+            (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let (expired_claimed, live_claimed, odd) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        {
+            let mut st = state.lock().unwrap();
+            st.secrets
+                .push(fake::session(old_parked, None, "parked", ago(7200), None));
+            st.secrets
+                .push(fake::session(fresh_parked, None, "parked", ago(60), None));
+            st.secrets.push(fake::session(
+                expired_parked,
+                Some("api.example"),
+                "parked",
+                ago(60),
+                Some(ago(1)),
+            ));
+            st.secrets.push(fake::session(
+                expired_claimed,
+                Some("api.example"),
+                "claimed",
+                ago(7200),
+                Some(ago(1)),
+            ));
+            st.secrets.push(fake::session(
+                live_claimed,
+                Some("api.example"),
+                "claimed",
+                ago(7200),
+                Some(later),
+            ));
+            // Neither parked nor claimed: left alone, whatever its age and expiry.
+            st.secrets.push(fake::session(
+                odd,
+                Some("api.example"),
+                "other",
+                ago(7200),
+                Some(ago(1)),
+            ));
+        }
+        let store = fake::store(&state);
+        assert_eq!(store.sweep_sessions(ago(3600)).await.unwrap(), 3);
+        let st = state.lock().unwrap();
+        assert_eq!(fake::secret_lists(&st), 1, "one list for both states");
+        let names = fake::secret_names(&st);
+        let gone = [
+            session_name(old_parked),
+            delegation_name(expired_parked, "api.example"),
+            delegation_name(expired_claimed, "api.example"),
+        ];
+        let kept = [
+            session_name(fresh_parked),
+            delegation_name(live_claimed, "api.example"),
+            delegation_name(odd, "api.example"),
+        ];
+        assert!(gone.iter().all(|n| !names.contains(&n.as_str())));
+        assert!(kept.iter().all(|n| names.contains(&n.as_str())));
+        assert_eq!(
+            st.secrets.len(),
+            5,
+            "the seeded claim's two old envelopes without an expiry stay too"
+        );
     }
 
     #[test]
@@ -2657,6 +3501,202 @@ mod tests {
             "deleted through the API: {:?}",
             st.log
         );
+    }
+
+    #[tokio::test]
+    async fn output_of_a_sandbox_beside_the_broker_is_owned_by_it_after_one_read_by_name() {
+        let (state, claim) = fake::seed(false);
+        state.lock().unwrap().sandboxes[0]["metadata"]["namespace"] = fake::HOME.into();
+        let sandbox = fake::sandbox_uid(&state.lock().unwrap());
+        let store = fake::store(&state);
+        let rec = store.get_claim(claim).await.unwrap();
+        assert_eq!(rec.namespace, fake::HOME);
+        let limits = LogLimits {
+            max_bytes: mediatore_proto::DEFAULT_LOG_MAX_BYTES,
+        };
+        store
+            .append_logs(&rec, &log_batch(1, 2, "hello"), &limits)
+            .await
+            .unwrap();
+        let st = state.lock().unwrap();
+        assert_eq!(
+            fake::sandbox_lists(&st),
+            1,
+            "the claim's lookup; the append lists no sandbox"
+        );
+        assert_eq!(fake::sandbox_gets(&st), 1, "the owner, by name");
+        let segment = st
+            .secrets
+            .iter()
+            .find(|s| s["metadata"]["labels"][LOGS_LABEL] == LOGS_SEGMENT)
+            .expect("a segment");
+        assert!(
+            segment["metadata"]["ownerReferences"][0]["uid"] == sandbox.to_string(),
+            "owned by the sandbox in the broker's namespace"
+        );
+        assert_eq!(
+            segment["metadata"]["ownerReferences"][0]["kind"],
+            "AgentSandbox"
+        );
+    }
+
+    #[tokio::test]
+    async fn output_of_a_sandbox_elsewhere_looks_no_sandbox_up() {
+        let (state, claim) = fake::seed(false);
+        let store = fake::store(&state);
+        let rec = store.get_claim(claim).await.unwrap();
+        assert_eq!(rec.namespace, fake::TENANT);
+        let limits = LogLimits {
+            max_bytes: mediatore_proto::DEFAULT_LOG_MAX_BYTES,
+        };
+        state.lock().unwrap().log.clear();
+        store
+            .append_logs(&rec, &log_batch(1, 2, "hello"), &limits)
+            .await
+            .unwrap();
+        let st = state.lock().unwrap();
+        let sandbox_requests = st
+            .log
+            .iter()
+            .filter(|(_, p)| p.contains("/agentsandboxes"))
+            .count();
+        assert_eq!(
+            sandbox_requests, 0,
+            "nothing across namespaces owns a segment: no sandbox is read for it"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_idle_followers_poll_lists_segment_metadata_and_downloads_nothing() {
+        let (state, claim) = fake::seed(false);
+        let store = fake::store(&state);
+        let rec = store.get_claim(claim).await.unwrap();
+        let limits = LogLimits {
+            max_bytes: mediatore_proto::DEFAULT_LOG_MAX_BYTES,
+        };
+        store
+            .append_logs(&rec, &log_batch(1, 3, "line"), &limits)
+            .await
+            .unwrap();
+        let nothing_new = LogChunk {
+            truncated_before: 0,
+            entries: Vec::new(),
+            last_seq: Some(3),
+        };
+        let clear = || {
+            let mut st = state.lock().unwrap();
+            st.log.clear();
+            st.metadata_lists.clear();
+        };
+        // At the cursor, and with a cursor past the ring: nothing new, one metadata list.
+        for since in [3, 9] {
+            clear();
+            assert_eq!(
+                store.read_logs(claim, Some(since)).await.unwrap(),
+                nothing_new
+            );
+            let st = state.lock().unwrap();
+            assert_eq!(st.log.len(), 1, "one request");
+            assert_eq!(st.metadata_lists.len(), 1, "for metadata only");
+        }
+        // A claim with no ring: the default chunk, from the same one list.
+        clear();
+        assert_eq!(
+            store.read_logs(Uuid::new_v4(), Some(0)).await.unwrap(),
+            LogChunk::default()
+        );
+        assert_eq!(state.lock().unwrap().log.len(), 1);
+        // Something new: the metadata says so and the ring is read.
+        clear();
+        let chunk = store.read_logs(claim, Some(2)).await.unwrap();
+        assert_eq!(seqs(&chunk.entries), vec![3]);
+        assert_eq!(state.lock().unwrap().log.len(), 2);
+        // A segment whose annotations do not say: the full read answers, not a guess.
+        {
+            let mut st = state.lock().unwrap();
+            let segment = st
+                .secrets
+                .iter_mut()
+                .find(|s| s["metadata"]["labels"][LOGS_LABEL] == LOGS_SEGMENT)
+                .expect("a segment");
+            segment["metadata"]["annotations"]
+                .as_object_mut()
+                .unwrap()
+                .remove(TRUNCATED_ANNOTATION);
+        }
+        clear();
+        assert_eq!(store.read_logs(claim, Some(3)).await.unwrap(), nothing_new);
+        let st = state.lock().unwrap();
+        assert_eq!(st.log.len(), 2, "the metadata, then the ring itself");
+        assert_eq!(st.metadata_lists.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_poll_after_a_cursor_answers_what_the_full_read_and_the_cursor_rule_give() {
+        // A ring with a gap in it, in one segment.
+        let (state, claim) = fake::seed(false);
+        let store = fake::store(&state);
+        let rec = store.get_claim(claim).await.unwrap();
+        let limits = LogLimits {
+            max_bytes: mediatore_proto::DEFAULT_LOG_MAX_BYTES,
+        };
+        store
+            .append_logs(&rec, &log_batch(1, 2, "hello"), &limits)
+            .await
+            .unwrap();
+        let mut lossy = log_batch(3, 4, "world");
+        lossy.dropped_stdout = 64;
+        store.append_logs(&rec, &lossy, &limits).await.unwrap();
+        let full = store.read_logs(claim, None).await.unwrap();
+        assert_eq!(seqs(&full.entries), vec![1, 2, 3, 4]);
+        for since in 0..=5u64 {
+            let want = LogChunk {
+                truncated_before: full.truncated_before,
+                entries: after_cursor(full.entries.clone(), Some(since)),
+                last_seq: full.last_seq,
+            };
+            assert_eq!(
+                store.read_logs(claim, Some(since)).await.unwrap(),
+                want,
+                "since {since}"
+            );
+        }
+
+        // A ring that rolled and dropped its oldest segment: `truncated_before` is the
+        // newest segment's, on the idle path as on the full one.
+        let (state, claim) = fake::seed(false);
+        let store = fake::store(&state);
+        let rec = store.get_claim(claim).await.unwrap();
+        let limits = LogLimits {
+            max_bytes: 2 * LOG_SEGMENT_BYTES,
+        };
+        let kib = "k".repeat(1024);
+        let per = u64::try_from(LOG_SEGMENT_BYTES / 1024).unwrap();
+        for i in 0..3u64 {
+            let from = i * per + 1;
+            store
+                .append_logs(&rec, &log_batch(from, from + per - 1, &kib), &limits)
+                .await
+                .unwrap();
+        }
+        let full = store.read_logs(claim, None).await.unwrap();
+        assert_eq!(
+            full.truncated_before,
+            u64::try_from(LOG_SEGMENT_BYTES).unwrap()
+        );
+        for since in [0, per, 2 * per, 3 * per - 1, 3 * per, 3 * per + 1] {
+            let got = store.read_logs(claim, Some(since)).await.unwrap();
+            assert_eq!(got.truncated_before, full.truncated_before);
+            assert_eq!(got.last_seq, full.last_seq);
+            assert!(
+                got.entries == after_cursor(full.entries.clone(), Some(since)),
+                "the entries after {since}"
+            );
+        }
+        state.lock().unwrap().metadata_lists.clear();
+        let idle = store.read_logs(claim, Some(3 * per)).await.unwrap();
+        assert_eq!(idle.entries.len(), 0);
+        assert_eq!(state.lock().unwrap().metadata_lists.len(), 1);
     }
 
     #[tokio::test]

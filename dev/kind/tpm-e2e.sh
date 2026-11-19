@@ -211,10 +211,18 @@ cp "$UPSTREAM_ROOT" "$VTPM/bundle.pem"
 echo "the server's bundle is the OpenBao root and nothing else ($(fingerprints "$UPSTREAM_ROOT" | sed 's/.*=//' | cut -c1-23)…); the agent starts from that root"
 # The two placeholders, and the port: a VM reaches the server on 8081 where the operator
 # exposes it; a pod reaches the Service, which maps 443 to the pod's 8081.
+# The bundle: the image's agent.conf names the file its boot-time fetch writes, in the SPIFFE
+# format (ADR-0037). This tier has no bundle endpoint, so it does what agent.conf prescribes
+# for such a deployment: a PEM file, trust_bundle_path pointed at it, trust_bundle_format
+# dropped. The file is the ConfigMap's bundle.pem, mounted beside agent.conf.
 sed -e "s#spire-server.sandbox.home.example#spire-server.$SPIRE_NS#" -e "s#sandbox.home.example#$TD#" \
-  -e 's#server_port = "8081"#server_port = "443"#' image/spire/agent.conf > "$VTPM/agent.conf"
+  -e 's#server_port = "8081"#server_port = "443"#' \
+  -e 's#trust_bundle_path = "/run/spire/bundle.json"#trust_bundle_path = "/etc/spire/bundle.pem"#' \
+  -e '/^ *trust_bundle_format = /d' image/spire/agent.conf > "$VTPM/agent.conf"
 grep -q "trust_domain = \"$TD\"" "$VTPM/agent.conf" || fail "the trust domain placeholder was not replaced"
 grep -q 'server_port = "443"' "$VTPM/agent.conf" || fail "the server port was not replaced"
+grep -q 'trust_bundle_path = "/etc/spire/bundle.pem"' "$VTPM/agent.conf" || fail "the trust bundle path was not pointed at the mounted PEM"
+! grep -qE '^ *trust_bundle_format *=' "$VTPM/agent.conf" || fail "the SPIFFE bundle format was left on a PEM bundle"
 "${K[@]}" -n "$NS" create configmap tpm-agent --from-file=agent.conf="$VTPM/agent.conf" --from-file=bundle.pem="$VTPM/bundle.pem" >/dev/null
 echo "bundle: the upstream root ($(grep -c 'BEGIN CERTIFICATE' "$VTPM/bundle.pem") certificate); agent.conf for $TD at spire-server.$SPIRE_NS:443; plugin $PLUGIN_IMG"
 

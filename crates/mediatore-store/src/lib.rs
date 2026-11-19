@@ -451,9 +451,19 @@ impl LogStore for MemoryStore {
         limits: &LogLimits,
     ) -> Result<LogAppend, StoreError> {
         let mut m = self.logs.write().await;
-        Ok(m.entry(rec.uid)
-            .or_default()
-            .append(batch, limits.max_bytes))
+        let ring = m.entry(rec.uid).or_default();
+        let before = ring.truncated_before;
+        let outcome = ring.append(batch, limits.max_bytes);
+        if ring.truncated_before > before {
+            // The same event `KubeStore` logs: counts, never a byte of the output.
+            tracing::info!(
+                claim_uid = %rec.uid,
+                dropped = ring.truncated_before - before,
+                truncated_before = ring.truncated_before,
+                "output ring over its cap; oldest records dropped (ADR-0045 decision 4)"
+            );
+        }
+        Ok(outcome)
     }
 
     async fn read_logs(&self, claim_uid: Uuid, since: Option<u64>) -> Result<LogChunk, StoreError> {

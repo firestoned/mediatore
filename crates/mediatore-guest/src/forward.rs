@@ -118,6 +118,8 @@ impl Dialer {
         match self {
             Self::Direct => {
                 let tcp = TcpStream::connect((authority.host.as_str(), authority.port)).await?;
+                // A failure only costs latency (Nagle against delayed ACKs on a streamed answer).
+                let _ = tcp.set_nodelay(true);
                 Ok(Dialed {
                     conn: Box::new(tcp),
                     via: None,
@@ -301,6 +303,8 @@ impl Forwarder {
         let tcp = TcpStream::connect((to.host.as_str(), to.port))
             .await
             .map_err(|e| Attempt::Failed(format!("connect: {e}")))?;
+        // A failure only costs latency (Nagle against delayed ACKs on a streamed answer).
+        let _ = tcp.set_nodelay(true);
         // SNI carries no trust (ADR-0007 decision 5): the gateway is verified by its
         // SPIFFE ID, so the name is a placeholder.
         let name = ServerName::try_from("gateway").map_err(|e| Attempt::Failed(e.to_string()))?;

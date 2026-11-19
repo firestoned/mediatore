@@ -153,6 +153,10 @@ struct IdpState {
     exchanges: usize,
     refresh_scopes: Vec<String>,
     down: bool,
+    /// How many times the discovery document was served.
+    discovery_fetches: usize,
+    /// How many times the JWKS was served.
+    jwks_fetches: usize,
 }
 
 impl IdpState {
@@ -630,11 +634,13 @@ impl FakeIdp {
             verify: test_decoding_key(),
             state: state.clone(),
         };
+        let (discovery_seen, jwks_seen) = (state.clone(), state.clone());
         let app = axum::Router::new()
             .route(
                 "/.well-known/openid-configuration",
                 axum::routing::get(move || {
                     let d = discovery.clone();
+                    discovery_seen.lock().unwrap().discovery_fetches += 1;
                     async move { axum::Json(d) }
                 }),
             )
@@ -642,6 +648,7 @@ impl FakeIdp {
                 "/jwks",
                 axum::routing::get(move || {
                     let j = jwks.clone();
+                    jwks_seen.lock().unwrap().jwks_fetches += 1;
                     async move { axum::Json(j) }
                 }),
             )
@@ -806,6 +813,24 @@ impl FakeIdp {
     #[must_use]
     pub fn refresh_scopes(&self) -> Vec<String> {
         self.state.lock().unwrap().refresh_scopes.clone()
+    }
+
+    /// How many times the discovery document was served so far.
+    ///
+    /// # Panics
+    /// On a poisoned lock; this is test scaffolding.
+    #[must_use]
+    pub fn discovery_fetches(&self) -> usize {
+        self.state.lock().unwrap().discovery_fetches
+    }
+
+    /// How many times the JWKS was served so far.
+    ///
+    /// # Panics
+    /// On a poisoned lock; this is test scaffolding.
+    #[must_use]
+    pub fn jwks_fetches(&self) -> usize {
+        self.state.lock().unwrap().jwks_fetches
     }
 
     /// How many refresh grants succeeded so far.

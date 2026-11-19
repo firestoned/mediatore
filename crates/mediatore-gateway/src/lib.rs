@@ -43,14 +43,22 @@ pub mod serve;
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use futures::StreamExt as _;
 use jiff::Timestamp;
 use mediatore_proto::{ClaimEgress, Endpoint, HeaderPair, InjectRoute, Secret};
 use mediatore_spire::Naming;
 use uuid::Uuid;
 
 use crate::broker::{Allowlists, Answer, AskError, CredentialAnswer, Credentials};
+
+/// How many claims [`Authorizer::sweep`] asks the broker about at once. Each ask is its own mutual TLS
+/// connection with its own timeout, so one at a time lets a long list of claims, or a broker that answers
+/// nothing, stretch a sweep past `sweep_every`, and with it the time a released claim's credential stays in
+/// memory (ADR-0040 decision 5). Bounded, so a sweep is never a burst of connections at the broker.
+const SWEEP_CONCURRENCY: usize = 8;
 
 /// The cache's bounds.
 #[derive(Debug, Clone)]
@@ -640,7 +648,8 @@ impl Authorizer {
     /// past it, and a request is not needed to notice the release: every credential past its own bound goes, then
     /// the broker is asked about each claim that still holds one, and a claim the broker no longer knows is
     /// forgotten with its routes and credentials. A broker that cannot be reached or refuses is not a release: what
-    /// is kept stays until its own bound, as a check would serve it. Returns how many claims were forgotten.
+    /// is kept stays until its own bound, as a check would serve it. At most `SWEEP_CONCURRENCY` claims are
+    /// asked about at once. Returns how many claims were forgotten.
     pub async fn sweep(&self) -> usize {
         let tick = Instant::now();
         lock(&self.credentials).retain(|_, e| e.valid_until > tick);
@@ -648,21 +657,26 @@ impl Authorizer {
             .keys()
             .map(|(uid, _)| *uid)
             .collect();
-        let mut forgotten = 0;
-        for uid in claims {
-            match self.source.ask(uid).await {
-                Ok(Answer::Gone) => {
-                    self.forget_claim(uid);
-                    forgotten += 1;
-                    tracing::info!(claim_uid = %uid, "claim released; its routes and credentials are gone from memory");
+        let forgotten = AtomicUsize::new(0);
+        let forgotten_ref = &forgotten;
+        // Each claim's ask and its outcome stand alone: nothing is shared between two claims but the tables' own
+        // short locks, which are never held across the ask.
+        futures::stream::iter(claims)
+            .for_each_concurrent(SWEEP_CONCURRENCY, |uid| async move {
+                match self.source.ask(uid).await {
+                    Ok(Answer::Gone) => {
+                        self.forget_claim(uid);
+                        forgotten_ref.fetch_add(1, Ordering::Relaxed);
+                        tracing::info!(claim_uid = %uid, "claim released; its routes and credentials are gone from memory");
+                    }
+                    Ok(Answer::Found(answer)) => {
+                        self.admit(uid, answer, Instant::now());
+                    }
+                    Err(_) => {}
                 }
-                Ok(Answer::Found(answer)) => {
-                    self.admit(uid, answer, Instant::now());
-                }
-                Err(_) => {}
-            }
-        }
-        forgotten
+            })
+            .await;
+        forgotten.into_inner()
     }
 
     /// Run [`Self::sweep`] every `sweep_every` until the task is dropped.
@@ -738,8 +752,6 @@ fn split_host_port(authority: &str) -> Option<(String, Option<u16>)> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
     use super::*;
 
     const TD: &str = "sandbox.test";
@@ -1434,6 +1446,73 @@ mod tests {
             1,
             "nothing left to ask about, so the broker is not asked"
         );
+    }
+
+    /// Every claim is live. Counts the asks in flight, the most there ever were at once, and which claims were
+    /// asked about.
+    struct Gauged {
+        in_flight: AtomicUsize,
+        peak: AtomicUsize,
+        asked: std::sync::Mutex<Vec<Uuid>>,
+        delay: Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl Allowlists for Gauged {
+        async fn ask(&self, uid: Uuid) -> Result<Answer, AskError> {
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(now, Ordering::SeqCst);
+            self.asked.lock().unwrap().push(uid);
+            tokio::time::sleep(self.delay).await;
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            Ok(found_inject(vec![route("x-api-key")], 600))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sweep_asks_about_every_claim_and_never_more_than_its_bound_at_once() {
+        // ADR-0040 decision 5: a released claim's credential is gone within `sweep_every`, which one slow ask per
+        // claim in turn would not hold to. The asks overlap, up to a bound and never past it.
+        let src = Arc::new(Gauged {
+            in_flight: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+            asked: std::sync::Mutex::new(Vec::new()),
+            delay: Duration::from_millis(10),
+        });
+        let creds = ScriptedCreds::new(vec![credential("x-api-key", 200)]);
+        let a = Authorizer::new(TD, src.clone(), CacheConfig::default()).with_credentials(creds);
+        let claims: BTreeSet<Uuid> = (0..SWEEP_CONCURRENCY * 2 + 3)
+            .map(|_| Uuid::new_v4())
+            .collect();
+        for uid in &claims {
+            assert!(
+                inject(&a, *uid).await.verdict.is_ok(),
+                "each claim's first check is allowed"
+            );
+        }
+        assert_eq!(a.cached_credentials(), claims.len());
+        assert_eq!(
+            src.peak.load(Ordering::SeqCst),
+            1,
+            "the checks came one at a time"
+        );
+        src.asked.lock().unwrap().clear();
+
+        assert_eq!(a.sweep().await, 0, "every claim is live");
+
+        let asked = src.asked.lock().unwrap().clone();
+        assert_eq!(asked.len(), claims.len(), "one ask per claim");
+        assert!(
+            asked.into_iter().collect::<BTreeSet<Uuid>>() == claims,
+            "every claim that holds a credential was asked about"
+        );
+        assert_eq!(
+            src.peak.load(Ordering::SeqCst),
+            SWEEP_CONCURRENCY,
+            "the asks overlap up to the bound and never past it"
+        );
+        assert_eq!(src.in_flight.load(Ordering::SeqCst), 0);
+        assert_eq!(a.cached_credentials(), claims.len(), "and nothing was lost");
     }
 
     #[tokio::test]

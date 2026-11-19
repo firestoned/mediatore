@@ -262,14 +262,44 @@ pub struct Limiter {
     cap: u32,
     /// Seconds in which the bucket refills from empty to `cap`.
     period_secs: f64,
-    buckets: std::sync::Mutex<HashMap<Uuid, (f64, std::time::Instant)>>,
-    locks: std::sync::Mutex<HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>>,
+    buckets: std::sync::Mutex<Pruned<(f64, std::time::Instant)>>,
+    locks: std::sync::Mutex<Pruned<Arc<tokio::sync::Mutex<()>>>>,
+}
+
+/// A per-claim table and when it was last pruned, under one mutex.
+struct Pruned<V> {
+    map: HashMap<Uuid, V>,
+    last_pruned: std::time::Instant,
+}
+
+impl<V> Pruned<V> {
+    fn new(now: std::time::Instant) -> Self {
+        Self {
+            map: HashMap::new(),
+            last_pruned: now,
+        }
+    }
+
+    /// Whether to prune now: past [`BUCKET_PRUNE_AT`] entries and [`BUCKET_PRUNE_EVERY`] since
+    /// the last prune, which it records. A table that stays over the threshold after a prune
+    /// (every entry still live) is then walked once an interval, not on every call.
+    fn prune_due(&mut self, now: std::time::Instant) -> bool {
+        if self.map.len() <= BUCKET_PRUNE_AT
+            || now.saturating_duration_since(self.last_pruned) < BUCKET_PRUNE_EVERY
+        {
+            return false;
+        }
+        self.last_pruned = now;
+        true
+    }
 }
 
 /// Buckets idle this long are dropped when the table is pruned.
 const BUCKET_IDLE: std::time::Duration = std::time::Duration::from_secs(600);
 /// Prune the table past this many claims.
 const BUCKET_PRUNE_AT: usize = 4096;
+/// The least time between two prunes of one table.
+const BUCKET_PRUNE_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl Limiter {
     /// `per_minute` issues a minute per claim (at least 1).
@@ -286,39 +316,55 @@ impl Limiter {
     }
 
     fn with_period(cap: u32, period_secs: f64) -> Self {
+        let now = std::time::Instant::now();
         Self {
             cap: cap.max(1),
             period_secs,
-            buckets: std::sync::Mutex::new(HashMap::new()),
-            locks: std::sync::Mutex::new(HashMap::new()),
+            buckets: std::sync::Mutex::new(Pruned::new(now)),
+            locks: std::sync::Mutex::new(Pruned::new(now)),
         }
     }
 
     /// The lock a refresh for `claim_uid` runs under.
     pub fn refresh_lock(&self, claim_uid: Uuid) -> Arc<tokio::sync::Mutex<()>> {
+        self.refresh_lock_at(claim_uid, std::time::Instant::now())
+    }
+
+    /// [`Self::refresh_lock`] at `now`, which only the prune reads.
+    fn refresh_lock_at(
+        &self,
+        claim_uid: Uuid,
+        now: std::time::Instant,
+    ) -> Arc<tokio::sync::Mutex<()>> {
         let mut locks = self
             .locks
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if locks.len() > BUCKET_PRUNE_AT {
-            locks.retain(|_, l| Arc::strong_count(l) > 1);
+        if locks.prune_due(now) {
+            locks.map.retain(|_, l| Arc::strong_count(l) > 1);
         }
-        locks.entry(claim_uid).or_default().clone()
+        locks.map.entry(claim_uid).or_default().clone()
     }
 
     /// Spend one issue for `claim_uid` if the bucket has it.
     pub fn allow(&self, claim_uid: Uuid) -> bool {
-        let now = std::time::Instant::now();
+        self.allow_at(claim_uid, std::time::Instant::now())
+    }
+
+    /// [`Self::allow`] at `now`.
+    fn allow_at(&self, claim_uid: Uuid, now: std::time::Instant) -> bool {
         let cap = f64::from(self.cap);
         let mut buckets = self
             .buckets
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if buckets.len() > BUCKET_PRUNE_AT {
-            buckets.retain(|_, (_, last)| now.duration_since(*last) < BUCKET_IDLE);
+        if buckets.prune_due(now) {
+            buckets
+                .map
+                .retain(|_, (_, last)| now.saturating_duration_since(*last) < BUCKET_IDLE);
         }
-        let (tokens, last) = buckets.entry(claim_uid).or_insert((cap, now));
-        let refill = now.duration_since(*last).as_secs_f64() / self.period_secs * cap;
+        let (tokens, last) = buckets.map.entry(claim_uid).or_insert((cap, now));
+        let refill = now.saturating_duration_since(*last).as_secs_f64() / self.period_secs * cap;
         *tokens = (*tokens + refill).min(cap);
         *last = now;
         if *tokens >= 1.0 {
@@ -1294,22 +1340,27 @@ struct Outgoing {
 
 impl Outgoing {
     /// Send one line; `false` once the reader is gone.
-    fn emit<T: serde::Serialize>(&mut self, value: &T) -> bool {
-        self.emit_raw(ndjson_line(value))
+    async fn emit<T: serde::Serialize>(&mut self, value: &T) -> bool {
+        // Serialised before the first await: the future holds the line, not the value.
+        let line = ndjson_line(value);
+        self.emit_raw(line).await
     }
 
-    fn emit_raw(&mut self, line: axum::body::Bytes) -> bool {
+    /// Send one raw line, waiting for room in the channel: a full channel is a reader that
+    /// has not caught up, not a reader that left. `false` only once the receiver is dropped,
+    /// which is the body being dropped, which is the reader gone.
+    async fn emit_raw(&mut self, line: axum::body::Bytes) -> bool {
         self.bytes += line.len() as u64;
-        self.tx.try_send(Ok(line)).is_ok()
+        self.tx.send(Ok(line)).await.is_ok()
     }
 
     /// Send every entry, counting the records; `false` once the reader is gone.
-    fn emit_entries(&mut self, entries: &[LogEntry]) -> bool {
+    async fn emit_entries(&mut self, entries: &[LogEntry]) -> bool {
         for e in entries {
             if e.seq().is_some() {
                 self.records += 1;
             }
-            if !self.emit(e) {
+            if !self.emit(e).await {
                 return false;
             }
         }
@@ -1317,8 +1368,8 @@ impl Outgoing {
     }
 
     /// The last line, and why.
-    fn end(&mut self, reason: LogEnd) -> LogEnd {
-        self.emit(&LogEndLine::new(reason));
+    async fn end(&mut self, reason: LogEnd) -> LogEnd {
+        self.emit(&LogEndLine::new(reason)).await;
         reason
     }
 }
@@ -1417,28 +1468,30 @@ async fn stream_logs(
         truncated_before: first.truncated_before,
         claim_phase: format!("{phase:?}"),
     };
-    if !out.emit(&header) {
+    if !out.emit(&header).await {
         return (LogEnd::Client, out);
     }
     let entries = match q.tail {
         Some(n) => tail_entries(first.entries, n),
         None => first.entries,
     };
-    if !out.emit_entries(&entries) {
+    if !out.emit_entries(&entries).await {
         return (LogEnd::Client, out);
     }
     let Some(rec) = rec else {
         // No record: the claim never bound, nothing can arrive.
-        let reason = out.end(LogEnd::ClaimEnded);
+        let reason = out.end(LogEnd::ClaimEnded).await;
         return (reason, out);
     };
     let ended = claim_has_ended(&rec, phase);
     if !q.follow || ended {
-        let reason = out.end(if ended {
-            LogEnd::ClaimEnded
-        } else {
-            LogEnd::Client
-        });
+        let reason = out
+            .end(if ended {
+                LogEnd::ClaimEnded
+            } else {
+                LogEnd::Client
+            })
+            .await;
         return (reason, out);
     }
     // Following: the cursor is the ring's highest seq, whatever `tail` cut.
@@ -1467,7 +1520,7 @@ async fn follow_logs(
             Ok(r) => r,
             Err(StoreError::NotFound(_)) => {
                 // Swept while being followed: the retention ran out (decision 7).
-                return out.end(LogEnd::Ttl);
+                return out.end(LogEnd::Ttl).await;
             }
             Err(e) => {
                 tracing::warn!(claim_uid = %rec.uid, error = %e, "store unreadable while following output");
@@ -1494,14 +1547,14 @@ async fn follow_logs(
                 lost_stdout: chunk.truncated_before - truncated,
                 lost_stderr: 0,
             };
-            if !out.emit(&LogEntry::Gap(gap)) {
+            if !out.emit(&LogEntry::Gap(gap)).await {
                 return LogEnd::Client;
             }
             tracing::info!(claim_uid = %rec.uid, dropped = gap.lost_stdout, "a follower missed output the ring dropped");
         }
         truncated = chunk.truncated_before;
         if !chunk.entries.is_empty() {
-            if !out.emit_entries(&chunk.entries) {
+            if !out.emit_entries(&chunk.entries).await {
                 return LogEnd::Client;
             }
             last_sent = std::time::Instant::now();
@@ -1510,10 +1563,10 @@ async fn follow_logs(
             cursor = Some(cursor.map_or(l, |c| c.max(l)));
         }
         if ended {
-            return out.end(LogEnd::ClaimEnded);
+            return out.end(LogEnd::ClaimEnded).await;
         }
         if last_sent.elapsed() >= std::time::Duration::from_secs(LOG_KEEPALIVE_SECS) {
-            if !out.emit_raw(axum::body::Bytes::from_static(b"\n")) {
+            if !out.emit_raw(axum::body::Bytes::from_static(b"\n")).await {
                 return LogEnd::Client;
             }
             last_sent = std::time::Instant::now();
@@ -1578,22 +1631,13 @@ async fn ingest_logs(
         )
             .into_response());
     }
-    let before = st
-        .store
-        .read_logs(rec.uid, None)
-        .await
-        .map(|c| c.truncated_before)
-        .unwrap_or_default();
+    // The store logs a ring that dropped its oldest records (decision 4): it knows without
+    // reading the ring again.
     let outcome = st
         .store
         .append_logs(&rec, &body, &limits)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
-    if let Ok(after) = st.store.read_logs(rec.uid, None).await
-        && after.truncated_before > before
-    {
-        tracing::info!(claim_uid = %rec.uid, dropped = after.truncated_before - before, "output ring dropped its oldest records (ADR-0045 decision 4)");
-    }
     tracing::debug!(
         claim_uid = %rec.uid,
         records = body.records.len(),
@@ -2640,6 +2684,55 @@ mod tests {
             Limiter::per_second(0).allow(a),
             "zero means one a second, never none"
         );
+    }
+
+    #[test]
+    fn the_tables_are_pruned_past_the_threshold_and_no_more_than_once_an_interval() {
+        let l = Limiter::new(3);
+        let size = |l: &Limiter| l.locks.lock().unwrap().map.len();
+        let fill = |l: &Limiter, at: std::time::Instant| {
+            for _ in 0..=BUCKET_PRUNE_AT {
+                // The handle is dropped at once: nothing holds the lock, it may be pruned.
+                drop(l.refresh_lock_at(Uuid::new_v4(), at));
+            }
+        };
+        let t0 = l.locks.lock().unwrap().last_pruned;
+        fill(&l, t0);
+        assert_eq!(size(&l), BUCKET_PRUNE_AT + 1, "over the threshold");
+        drop(l.refresh_lock_at(Uuid::new_v4(), t0));
+        assert_eq!(
+            size(&l),
+            BUCKET_PRUNE_AT + 2,
+            "within the interval nothing is pruned"
+        );
+        let t1 = t0 + BUCKET_PRUNE_EVERY;
+        let held = l.refresh_lock_at(Uuid::new_v4(), t1);
+        assert_eq!(size(&l), 1, "the interval passed: the unheld locks went");
+        fill(&l, t1);
+        assert_eq!(
+            size(&l),
+            BUCKET_PRUNE_AT + 2,
+            "over the threshold again, and the prune waits for its interval"
+        );
+        drop(l.refresh_lock_at(Uuid::new_v4(), t1 + BUCKET_PRUNE_EVERY));
+        assert_eq!(size(&l), 2, "the held lock survives the next prune");
+        drop(held);
+
+        // The buckets: an idle one goes with the prune, and never before its interval.
+        let b = Limiter::new(3);
+        let buckets = |b: &Limiter| b.buckets.lock().unwrap().map.len();
+        let t0 = b.buckets.lock().unwrap().last_pruned;
+        for _ in 0..=BUCKET_PRUNE_AT {
+            assert!(b.allow_at(Uuid::new_v4(), t0));
+        }
+        assert!(b.allow_at(Uuid::new_v4(), t0 + BUCKET_PRUNE_EVERY));
+        assert_eq!(
+            buckets(&b),
+            BUCKET_PRUNE_AT + 2,
+            "a prune that finds no idle bucket drops none"
+        );
+        assert!(b.allow_at(Uuid::new_v4(), t0 + BUCKET_IDLE + BUCKET_PRUNE_EVERY));
+        assert_eq!(buckets(&b), 1, "the idle buckets went with the prune");
     }
 
     // ---------- ADR-0040: the gateway places an audience's credential ----------
@@ -4574,6 +4667,81 @@ mod tests {
         assert!(
             refused.contains("WARN") && refused.contains("reason=forbidden"),
             "{refused}"
+        );
+    }
+
+    /// ADR-0045 decision 9: a read sends every stored record and then the end line, however
+    /// many there are. The lines go down a bounded channel; a full channel is a reader that
+    /// has not caught up, never a reader that left.
+    #[tokio::test]
+    async fn a_read_of_more_lines_than_the_channel_holds_sends_them_all_and_the_end_line() {
+        const RECORDS: u64 = 40;
+        let b = broker_with_logs(
+            Namespaces::Single("sandboxes".into()),
+            true,
+            Some(LogLimits {
+                max_bytes: mediatore_proto::DEFAULT_LOG_MAX_BYTES,
+            }),
+        )
+        .await;
+        let mut rec = claim(&[], None);
+        rec.subject = Subject {
+            issuer: b.idp.issuer.clone(),
+            id: "alice".into(),
+            display: None,
+        };
+        rec.workload.logs = true;
+        let rec = stored(&b.st, rec).await;
+        let batch = LogBatch {
+            records: (1..=RECORDS)
+                .map(|seq| mediatore_proto::LogRecord {
+                    seq,
+                    stream: mediatore_proto::LogStream::Stdout,
+                    ts: Timestamp::now(),
+                    text: format!("output line {seq}"),
+                })
+                .collect(),
+            ..LogBatch::default()
+        };
+        b.st.store
+            .append_logs(&rec, &batch, &b.st.logs.unwrap())
+            .await
+            .unwrap();
+        let token = b.token("alice", &[]);
+        let (status, _, text) = b
+            .user(
+                "GET",
+                &format!("/v1/claims/{}/logs", rec.name),
+                &token,
+                &[],
+                serde_json::Value::Null,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        let lines: Vec<serde_json::Value> = text
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str(l).expect("every line is JSON"))
+            .collect();
+        let seqs: Vec<u64> = lines
+            .iter()
+            .filter_map(|l| l.get("seq").and_then(serde_json::Value::as_u64))
+            .collect();
+        assert_eq!(
+            seqs,
+            (1..=RECORDS).collect::<Vec<u64>>(),
+            "every stored record is sent, in order"
+        );
+        let last = lines.last().expect("at least the end line");
+        assert_eq!(
+            last.get("end").and_then(serde_json::Value::as_bool),
+            Some(true),
+            "the stream ends with its end line"
+        );
+        assert_eq!(
+            lines.len(),
+            seqs.len() + 2,
+            "the header, the records and the end line"
         );
     }
 

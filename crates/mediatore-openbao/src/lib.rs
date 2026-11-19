@@ -74,6 +74,14 @@ pub enum Error {
 /// How long before its lease ends a token is exchanged again.
 const TOKEN_RENEW_MARGIN: Duration = Duration::from_secs(60);
 
+/// How long a connection to `OpenBao` may take to open. One that does not open is an outage
+/// ([`Error::Unavailable`]), never a call that waits for ever.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long one call may take from the request to the last byte of the answer. Every call
+/// here is one small request and one small answer (a login, a transit operation).
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+
 struct Token {
     value: String,
     expires_at: Instant,
@@ -119,6 +127,15 @@ impl Client {
     /// Build the client over `ca_file` (or the public roots) and log in once, so a wrong
     /// URL, CA, token file or role fails here. The caller probes the key it needs.
     pub async fn connect(cfg: &TransitConfig) -> Result<Self, Error> {
+        Self::connect_with_timeouts(cfg, CONNECT_TIMEOUT, REQUEST_TIMEOUT).await
+    }
+
+    /// [`Self::connect`] with the timeouts given, so a test need not wait out the real ones.
+    async fn connect_with_timeouts(
+        cfg: &TransitConfig,
+        connect: Duration,
+        request: Duration,
+    ) -> Result<Self, Error> {
         mediatore_proto::tls::ensure_provider();
         let tls = match &cfg.ca_file {
             Some(path) => {
@@ -131,6 +148,8 @@ impl Client {
         };
         let http = reqwest::Client::builder()
             .tls_backend_preconfigured(tls)
+            .connect_timeout(connect)
+            .timeout(request)
             .build()
             .map_err(|e| Error::Config(format!("client: {e}")))?;
         let client = Self {
@@ -291,5 +310,46 @@ mod tests {
             "permission denied; and more"
         );
         assert_eq!(openbao_errors("not json"), "not json");
+    }
+
+    /// A listener that accepts every connection and never answers: an `OpenBao` that is up
+    /// at the socket and away above it.
+    async fn silent_listener() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let held = tokio::spawn(async move {
+            let mut sockets = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                sockets.push(socket);
+            }
+        });
+        (url, held)
+    }
+
+    #[tokio::test]
+    async fn an_openbao_that_never_answers_is_unavailable_within_the_timeout() {
+        let (url, held) = silent_listener().await;
+        // A private directory, removed when dropped: never the shared temp dir.
+        let dir = tempfile::tempdir().unwrap();
+        let token_file = dir.path().join("token.jwt");
+        std::fs::write(&token_file, "not-a-real-token").unwrap();
+        let cfg: TransitConfig = serde_json::from_value(serde_json::json!({
+            "url": url, "key": "mediatore", "role": "mediatore", "token_file": token_file,
+        }))
+        .unwrap();
+        let started = Instant::now();
+        let out =
+            Client::connect_with_timeouts(&cfg, Duration::from_secs(5), Duration::from_millis(200))
+                .await;
+        let waited = started.elapsed();
+        held.abort();
+        assert!(
+            matches!(out, Err(Error::Unavailable(_))),
+            "a call that timed out is an outage, not a refusal"
+        );
+        assert!(
+            waited < Duration::from_secs(5),
+            "the call ended with its timeout, it did not wait for an answer"
+        );
     }
 }

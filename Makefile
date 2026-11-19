@@ -4,7 +4,7 @@
 # All CI logic lives here (rules/github-workflows.md): workflows install tools
 # and call these targets, and every target runs identically locally.
 
-.PHONY: all help fmt fmt-check lint test deny audit check ci-preempt sbom dist dist-e2e image guest-image guest-image-check crds e2e live-admission-test release-assets release-assets-test dist-darwin set-version set-version-test \
+.PHONY: all help fmt fmt-check lint test deny audit check ci-preempt sbom dist dist-e2e dist-chmod image guest-image guest-image-check crds e2e live-admission-test release-assets release-assets-test dist-darwin set-version set-version-test \
         kind-install kind-create kind-delete kind-down kind-spire kind-deploy kind-up \
         kind-images kind-dex kind-openbao kind-broker kind-banlieue-crds kind-e2e-entries kind-e2e-mtls kind-e2e-watcher kind-e2e-sandbox \
         kind-e2e-dex kind-e2e kind-e2e-ci kind-e2e-logs \
@@ -25,6 +25,12 @@ KIND_SA_KUBECONFIG := $(KIND_DIR)/mediatore-sa.yaml
 KIND_VTPM_DIR      := $(KIND_DIR)/vtpm
 # What kind-e2e-ci runs; the TPM tier is run by hand where the host has the vtpm proxy module.
 KIND_E2E_SUITES    ?= kind-e2e
+# Empty (the default): the kind targets compile what they need, kind-images building dist/
+# first and the fixture helpers going through `cargo run`. Set (KIND_PREBUILT=1, what CI's
+# shards pass after downloading the kind-build job's dist/ and `make dist-chmod`): dist/ is
+# taken as it is, on a linux/amd64 host, kind-images builds nothing and the helpers run
+# from dist/, so a shard whose suites compile no test needs no Rust toolchain.
+KIND_PREBUILT      ?=
 KIND_KUBECTL       := kubectl --kubeconfig $(KIND_KUBECONFIG)
 # SPIRE in kind comes from manifests rendered once (`make kind-spire-render`, the only
 # target that runs helm) from the same distribution and versions as the homelab, into
@@ -45,9 +51,17 @@ KIND_OPENBAO_ADDR   := https://mediatore-openbao.banlieue-system.svc:8200
 # are loaded into the cluster with `kind load`, never pulled, never pushed.
 CONTAINER_CLI      ?= docker
 MUSL_TARGET        := x86_64-unknown-linux-musl
+# The cargo profile `dist` and `dist-e2e` build with. `release` is what ships; `dist-fast`
+# (Cargo.toml) is the same with parallel codegen, for a kind loop on a build host.
+DIST_PROFILE       ?= release
 KIND_IMAGE         := ghcr.io/firestoned/mediatore:kind
 # Test-only: the binary plus the testkit's dex-driver, for the Dex tier's user-side pod.
 KIND_E2E_IMAGE     := localhost/mediatore-e2e:kind
+# The testkit binaries `make dist-e2e` builds: the two the e2e image carries, and the
+# fixture helpers the kind targets run on the host (certificates, banlieue's CRDs, the EK).
+DIST_E2E_BINS      := dex-driver gateway-probe tls-fixture banlieue-crds ek-fixture
+# $(call testkit,<bin>,<args>): a testkit helper, through cargo or prebuilt from dist/ (KIND_PREBUILT).
+testkit             = $(if $(KIND_PREBUILT),./dist/$(1)$(if $(2), $(2)),cargo run -q -p mediatore-testkit --bin $(1)$(if $(2), -- $(2)))
 # notaio in kind (ADR-0026), installed from its release manifests as an operator would:
 # the version, and the SHA-256 of each manifest from the release's checksums.sha256
 # (itself sigstore-signed; `cosign verify-blob` by hand after a bump, notaio's install
@@ -92,7 +106,7 @@ audit: ## cargo-audit advisory scan (CI uses the security-scan composite action)
 
 check: fmt lint test deny ## The pre-commit gate: fmt + clippy + test + deny
 
-ci-preempt: ## Cancel the CI runs CI_PREEMPT_EVENT supersedes (push: the PR runs; release: main's runs); needs gh and GH_REPO
+ci-preempt: ## Cancel the CI runs CI_PREEMPT_EVENT supersedes (push: the runs of the PR that GITHUB_SHA merged; release: main's runs); needs gh and GH_REPO
 	./scripts/ci-preempt.sh $(CI_PREEMPT_EVENT)
 
 # ----- Supply chain ----------------------------------------------------------
@@ -105,9 +119,9 @@ sbom: ## Generate CycloneDX SBOM(s) for the workspace (*.cdx.json per crate)
 # ----- Artifacts ---------------------------------------------------------------
 
 dist: ## The one static musl binary into dist/ (ADR-0014): what the server image copies with BINARY_FROM=host and what the VM image bakes in
-	cargo build --release --target $(MUSL_TARGET) -p mediatore
+	cargo build --profile $(DIST_PROFILE) --target $(MUSL_TARGET) -p mediatore
 	@mkdir -p dist
-	cp target/$(MUSL_TARGET)/release/mediatore dist/
+	cp target/$(MUSL_TARGET)/$(DIST_PROFILE)/mediatore dist/
 
 dist-darwin: ## The CLI for a Mac (the same binary, every role) into dist/mediatore-darwin-arm64; runs on a macOS arm64 host, native, no cross-compile
 	@test "$$(uname -s)-$$(uname -m)" = "Darwin-arm64" || { echo "dist-darwin runs on a macOS arm64 host, this is $$(uname -s)-$$(uname -m)"; exit 1; }
@@ -115,10 +129,16 @@ dist-darwin: ## The CLI for a Mac (the same binary, every role) into dist/mediat
 	@mkdir -p dist
 	cp target/release/mediatore dist/mediatore-darwin-arm64
 
-dist-e2e: ## The testkit's dex-driver and gateway-probe (musl) into dist/, for the test-only e2e image
-	cargo build --release --target $(MUSL_TARGET) -p mediatore-testkit --bin dex-driver --bin gateway-probe
+dist-e2e: ## The testkit's dex-driver and gateway-probe (musl) into dist/, for the test-only e2e image, and its fixture helpers (tls-fixture, banlieue-crds, ek-fixture), for KIND_PREBUILT
+	cargo build --profile $(DIST_PROFILE) --target $(MUSL_TARGET) -p mediatore-testkit $(addprefix --bin ,$(DIST_E2E_BINS))
 	@mkdir -p dist
-	cp target/$(MUSL_TARGET)/release/dex-driver target/$(MUSL_TARGET)/release/gateway-probe dist/
+	cp $(addprefix target/$(MUSL_TARGET)/$(DIST_PROFILE)/,$(DIST_E2E_BINS)) dist/
+
+# An Actions artifact drops mode bits, and COPY keeps what it finds: a job that downloaded
+# dist/ runs this before an image build with BINARY_FROM=host or a kind tier with KIND_PREBUILT.
+dist-chmod: ## Restore the executable bit on dist/mediatore and the dist-e2e binaries present (all of them required with KIND_PREBUILT), after a CI artifact download
+	@test -f dist/mediatore || { echo "dist/mediatore missing: download the artifact into dist/ (or make dist) first"; exit 1; }
+	chmod +x dist/mediatore $(if $(KIND_PREBUILT),$(addprefix dist/,$(DIST_E2E_BINS)),$(wildcard $(addprefix dist/,$(DIST_E2E_BINS))))
 
 image: ## Build the server container image locally (the binary is compiled inside the image)
 	$(CONTAINER_CLI) build -t ghcr.io/firestoned/mediatore:dev .
@@ -301,8 +321,9 @@ release-assets-test: ## Prove release-assets pins the three images by digest, ke
 
 # The binary reports the release's version (`mediatore --version`, clap's `version` reads
 # CARGO_PKG_VERSION). The workspace version is set from the tag in every job that compiles
-# the binary (the musl and darwin builds, both images), so the tag, the four binaries and
-# the SBOMs agree; release-assets refuses a binary that reports anything else.
+# the binary (the musl and darwin builds; the three images copy the musl build), so the
+# tag, the two binaries and the SBOMs agree; release-assets refuses a binary that reports
+# anything else.
 VERSION_FILE ?= Cargo.toml
 
 set-version: ## Set [workspace.package] version in VERSION_FILE to VERSION; fails if the file does not then say so
@@ -422,7 +443,7 @@ kind-deploy: kind-create ## Apply the broker's CRD, ServiceAccount, RBAC and adm
 
 kind-up: kind-create kind-spire kind-deploy ## Cluster + SPIRE + the broker's identity, ready for the live tests
 
-kind-images: kind-create dist dist-e2e ## The server image (the shipped Dockerfile's runtime stage over dist/) and the test-only e2e image, loaded into the cluster; the node and workload pods run the server image too (ADR-0014)
+kind-images: kind-create $(if $(KIND_PREBUILT),,dist dist-e2e) ## The server image (the shipped Dockerfile's runtime stage over dist/) and the test-only e2e image, loaded into the cluster; the node and workload pods run the server image too (ADR-0014); KIND_PREBUILT=1 takes dist/ as it is
 	$(CONTAINER_CLI) build --build-arg BINARY_FROM=host -t $(KIND_IMAGE) .
 	$(CONTAINER_CLI) build -f dev/kind/Dockerfile.e2e -t $(KIND_E2E_IMAGE) .
 	@# One image per call: under the podman provider a multi-image load ends up with one manifest.
@@ -431,7 +452,7 @@ kind-images: kind-create dist dist-e2e ## The server image (the shipped Dockerfi
 
 kind-dex: kind-create ## Dex over TLS with a glauth directory behind it (ADR-0013), and the broker's STS signing key, minted by this target
 	@$(KIND_KUBECTL) get ns banlieue-system >/dev/null 2>&1 || $(KIND_KUBECTL) create ns banlieue-system
-	cargo run -q -p mediatore-testkit --bin tls-fixture -- --out-dir $(KIND_DIR)/dex --dns mediatore-dex.banlieue-system.svc
+	$(call testkit,tls-fixture,--out-dir $(KIND_DIR)/dex --dns mediatore-dex.banlieue-system.svc)
 	$(KIND_KUBECTL) -n banlieue-system create secret generic mediatore-dex-tls --from-file=$(KIND_DIR)/dex/server.pem --from-file=$(KIND_DIR)/dex/server-key.pem --dry-run=client -o yaml | $(KIND_KUBECTL) apply -f -
 	$(KIND_KUBECTL) -n banlieue-system create configmap mediatore-dex-ca --from-file=$(KIND_DIR)/dex/ca.pem --dry-run=client -o yaml | $(KIND_KUBECTL) apply -f -
 	$(KIND_KUBECTL) -n banlieue-system create configmap mediatore-glauth-config --from-file=dev/kind/dex/glauth.cfg --dry-run=client -o yaml | $(KIND_KUBECTL) apply -f -
@@ -447,7 +468,7 @@ kind-openbao: kind-create ## OpenBao over TLS (ADR-0015, ADR-0031): minted certi
 	@$(KIND_KUBECTL) get ns banlieue-system >/dev/null 2>&1 || $(KIND_KUBECTL) create ns banlieue-system
 	@# Minted once per cluster: a new certificate would need a new pod, and in-memory storage would start over, with the root the SPIRE server chains to (ADR-0031).
 	@if ! $(KIND_KUBECTL) -n banlieue-system get secret mediatore-openbao-tls >/dev/null 2>&1; then \
-	  cargo run -q -p mediatore-testkit --bin tls-fixture -- --out-dir $(KIND_DIR)/openbao --dns mediatore-openbao.banlieue-system.svc --dns localhost && \
+	  $(call testkit,tls-fixture,--out-dir $(KIND_DIR)/openbao --dns mediatore-openbao.banlieue-system.svc --dns localhost) && \
 	  $(KIND_KUBECTL) -n banlieue-system create secret generic mediatore-openbao-tls --from-file=$(KIND_DIR)/openbao/server.pem --from-file=$(KIND_DIR)/openbao/server-key.pem && \
 	  $(KIND_KUBECTL) -n banlieue-system create configmap mediatore-openbao-ca --from-file=$(KIND_DIR)/openbao/ca.pem && \
 	  rm -f $(KIND_DIR)/openbao/init.json; \
@@ -471,11 +492,11 @@ kind-e2e-mtls: kind-broker ## ADR-0007 live: broker SVID over the CSI driver, ag
 	./dev/kind/mtls-e2e.sh $(KIND_KUBECONFIG) $(SPIRE_TRUST_DOMAIN)
 
 kind-banlieue-crds: kind-create ## banlieue's VirtualMachine and VirtualMachineClaim CRDs, rendered from the pinned banlieue-api, applied
-	cargo run -q -p mediatore-testkit --bin banlieue-crds > $(KIND_DIR)/banlieue-crds.json
+	$(call testkit,banlieue-crds) > $(KIND_DIR)/banlieue-crds.json
 	@# A nullable enum carries `null`, which kubectl's client-side check refuses and the API server's structural validation accepts (banlieue applies the same file).
 	$(KIND_KUBECTL) apply --validate=false -f $(KIND_DIR)/banlieue-crds.json
-	cargo run -q -p mediatore-testkit --bin ek-fixture > $(KIND_DIR)/ek.pem
-	cargo run -q -p mediatore-testkit --bin ek-fixture -- --hash > $(KIND_DIR)/ek.hash
+	$(call testkit,ek-fixture) > $(KIND_DIR)/ek.pem
+	$(call testkit,ek-fixture,--hash) > $(KIND_DIR)/ek.hash
 
 kind-e2e-watcher: kind-banlieue-crds kind-broker ## ADR-0011 live: the Lease, a member's certificate becoming a node entry, a claim without a record binding nothing
 	@# The controllers must start against existing CRDs: a broker that came up before them backs off for minutes.
@@ -495,7 +516,7 @@ kind-e2e-policy: kind-banlieue-crds kind-broker kind-notaio ## ADR-0026 live: no
 	./dev/kind/policy-e2e.sh $(KIND_KUBECONFIG) $(KIND_SA_KUBECONFIG) $(KIND_DIR)
 
 kind-gateway: kind-broker gateway-render-check ## The egress gateway in kind (ADR-0028): Envoy from its official image, pinned by digest in dev/kind/gateway, on the gateway SVID over SDS, mediatore gateway beside it, and the TLS destination the tier reaches through it (its certificate minted here)
-	cargo run -q -p mediatore-testkit --bin tls-fixture -- --out-dir $(KIND_DIR)/gateway --dns destination.mediatore-e2e-gateway.svc.cluster.local
+	$(call testkit,tls-fixture,--out-dir $(KIND_DIR)/gateway --dns destination.mediatore-e2e-gateway.svc.cluster.local)
 	@$(KIND_KUBECTL) get ns mediatore-e2e-gateway >/dev/null 2>&1 || $(KIND_KUBECTL) create ns mediatore-e2e-gateway
 	$(KIND_KUBECTL) -n mediatore-e2e-gateway create secret generic destination-tls --from-file=$(KIND_DIR)/gateway/server.pem --from-file=$(KIND_DIR)/gateway/server-key.pem --dry-run=client -o yaml | $(KIND_KUBECTL) apply -f -
 	$(KIND_KUBECTL) apply -k dev/kind/gateway

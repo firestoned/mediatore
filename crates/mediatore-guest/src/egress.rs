@@ -514,21 +514,43 @@ impl Placement {
     }
 }
 
+/// One audience's credential and its expiry, behind the lock that makes its fetch single flight.
+type TokenSlot = Arc<tokio::sync::Mutex<Option<(Placement, Timestamp)>>>;
+
 /// Credentials by audience, replaced [`REFRESH_MARGIN_SECS`] before they expire. One
-/// fetch at a time: two requests arriving together do not both spend the claim's rate limit.
+/// fetch at a time per audience: two requests arriving together for the same audience do not
+/// both spend the claim's rate limit, and a request for an audience whose credential is fresh
+/// does not wait behind another audience's fetch. The audiences are the ones the claim's
+/// routes name ([`Proxy::handle`] takes the audience from the route, never from the request),
+/// so there are no more slots than routes.
 #[derive(Default)]
 struct TokenCache {
-    tokens: tokio::sync::Mutex<HashMap<String, (Placement, Timestamp)>>,
+    slots: std::sync::Mutex<HashMap<String, TokenSlot>>,
 }
 
 impl TokenCache {
+    /// The slot for `audience`, made on first use. The map's lock is held for the lookup and
+    /// nothing else, never across an await.
+    fn slot(&self, audience: &str) -> TokenSlot {
+        // A panic under this lock leaves the map as it was: a slot is inserted whole or not at all.
+        let mut slots = self
+            .slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(slot) = slots.get(audience) {
+            return slot.clone();
+        }
+        slots.entry(audience.to_owned()).or_default().clone()
+    }
+
     async fn placement(
         &self,
         source: &dyn TokenSource,
         audience: &str,
     ) -> anyhow::Result<Placement> {
-        let mut tokens = self.tokens.lock().await;
-        if let Some((placed, expires_at)) = tokens.get(audience)
+        let slot = self.slot(audience);
+        let mut held = slot.lock().await;
+        if let Some((placed, expires_at)) = held.as_ref()
             && expires_at.duration_since(Timestamp::now())
                 > SignedDuration::from_secs(REFRESH_MARGIN_SECS)
         {
@@ -537,7 +559,7 @@ impl TokenCache {
         let fresh = source.token(audience).await?;
         tracing::info!(audience, expires_at = %fresh.expires_at, header = fresh.header.as_deref().unwrap_or("authorization"), "token fetched for the proxy");
         let placed = Placement::from_response(&fresh)?;
-        tokens.insert(audience.to_owned(), (placed.clone(), fresh.expires_at));
+        *held = Some((placed.clone(), fresh.expires_at));
         Ok(placed)
     }
 }
@@ -680,6 +702,8 @@ impl Proxy {
     pub async fn serve(self: Arc<Self>, listener: TcpListener) -> anyhow::Result<()> {
         loop {
             let (stream, _) = listener.accept().await?;
+            // A failure only costs latency (Nagle against delayed ACKs on a streamed answer).
+            let _ = stream.set_nodelay(true);
             let proxy = self.clone();
             tokio::spawn(async move {
                 let service = hyper::service::service_fn(move |req| {
@@ -791,6 +815,8 @@ impl Proxy {
     ) -> anyhow::Result<()> {
         loop {
             let (stream, _) = listener.accept().await?;
+            // A failure only costs latency (Nagle against delayed ACKs on a streamed answer).
+            let _ = stream.set_nodelay(true);
             let proxy = self.clone();
             let host = host.clone();
             tokio::spawn(async move {
@@ -1771,6 +1797,178 @@ mod tests {
             })
             .is_err(),
             "a value the wire cannot carry is an error, never forwarded bare"
+        );
+    }
+
+    /// A token source that counts its fetches per audience. Each fetch gives way once, so
+    /// requests that arrive together do overlap; a fetch for `held` waits inside the source
+    /// until `release`, having said so on `entered`.
+    struct Fetches {
+        by_audience: Mutex<HashMap<String, usize>>,
+        /// How long a token it hands out is good for.
+        ttl: SignedDuration,
+        /// How many fetches fail before one answers.
+        failures: AtomicUsize,
+        held: Option<&'static str>,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    impl Fetches {
+        fn new() -> Self {
+            Self {
+                by_audience: Mutex::new(HashMap::new()),
+                ttl: SignedDuration::from_mins(10),
+                failures: AtomicUsize::new(0),
+                held: None,
+                entered: tokio::sync::Notify::new(),
+                release: tokio::sync::Notify::new(),
+            }
+        }
+
+        fn fetched(&self, audience: &str) -> usize {
+            self.by_audience
+                .lock()
+                .unwrap()
+                .get(audience)
+                .copied()
+                .unwrap_or(0)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TokenSource for Fetches {
+        async fn token(&self, audience: &str) -> anyhow::Result<TokenResponse> {
+            *self
+                .by_audience
+                .lock()
+                .unwrap()
+                .entry(audience.to_owned())
+                .or_default() += 1;
+            if self.held == Some(audience) {
+                self.entered.notify_one();
+                self.release.notified().await;
+            } else {
+                tokio::task::yield_now().await;
+            }
+            // One test task drives the source: load then subtract cannot race.
+            if self.failures.load(Ordering::SeqCst) > 0 {
+                self.failures.fetch_sub(1, Ordering::SeqCst);
+                anyhow::bail!("the broker is away");
+            }
+            Ok(TokenResponse {
+                access_token: format!("token-for-{audience}"),
+                token_type: "Bearer".into(),
+                expires_at: Timestamp::now() + self.ttl,
+                audience: audience.into(),
+                subject: mediatore_proto::Subject {
+                    issuer: "https://idp.example".into(),
+                    id: "octocat".into(),
+                    display: None,
+                },
+                header: None,
+                extra_headers: vec![],
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn requests_arriving_together_for_one_audience_fetch_its_token_once() {
+        // The claim's rate limit: single flight per audience.
+        let cache = TokenCache::default();
+        let src = Fetches::new();
+        let (a, b, c, d) = tokio::join!(
+            cache.placement(&src, "github"),
+            cache.placement(&src, "github"),
+            cache.placement(&src, "github"),
+            cache.placement(&src, "github"),
+        );
+        for placed in [a, b, c, d] {
+            assert!(
+                placed.is_ok_and(|p| p.value.as_bytes() == b"Bearer token-for-github"),
+                "every request is given the one token"
+            );
+        }
+        assert_eq!(src.fetched("github"), 1, "four requests, one fetch");
+        assert!(cache.placement(&src, "github").await.is_ok());
+        assert_eq!(
+            src.fetched("github"),
+            1,
+            "and it is served again while fresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fresh_token_is_served_while_another_audiences_fetch_is_still_out() {
+        let cache = TokenCache::default();
+        let src = Fetches {
+            held: Some("slow"),
+            ..Fetches::new()
+        };
+        assert!(cache.placement(&src, "fresh").await.is_ok());
+        assert_eq!(src.fetched("fresh"), 1);
+
+        // The fetch for `slow` is driven until it is inside the source, and left there.
+        let slow = cache.placement(&src, "slow");
+        tokio::pin!(slow);
+        tokio::select! {
+            biased;
+            _ = &mut slow => panic!("the held fetch must not finish before it is released"),
+            () = src.entered.notified() => {}
+        }
+
+        // One poll is all a fresh token needs: nothing it waits for is held by the other audience.
+        let served = tokio::select! {
+            biased;
+            placed = cache.placement(&src, "fresh") => placed,
+            () = std::future::ready(()) => {
+                panic!("a fresh token waited behind another audience's fetch")
+            }
+        };
+        assert!(
+            served.is_ok_and(|p| p.value.as_bytes() == b"Bearer token-for-fresh"),
+            "the cached token is the one served"
+        );
+        assert_eq!(src.fetched("fresh"), 1, "and it was not fetched again");
+
+        src.release.notify_one();
+        assert!(slow.await.is_ok(), "the held fetch ends once released");
+        assert_eq!(src.fetched("slow"), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_fetch_caches_nothing_and_fails_the_request() {
+        let cache = TokenCache::default();
+        let src = Fetches {
+            failures: AtomicUsize::new(1),
+            ..Fetches::new()
+        };
+        assert!(
+            cache.placement(&src, "github").await.is_err(),
+            "no token, no placement: the request fails closed"
+        );
+        assert!(
+            cache.placement(&src, "github").await.is_ok(),
+            "the next request asks again"
+        );
+        assert_eq!(src.fetched("github"), 2, "the failure was not cached");
+        assert!(cache.placement(&src, "github").await.is_ok());
+        assert_eq!(src.fetched("github"), 2);
+    }
+
+    #[tokio::test]
+    async fn a_token_inside_the_refresh_margin_is_fetched_again() {
+        let cache = TokenCache::default();
+        let src = Fetches {
+            ttl: SignedDuration::from_secs(REFRESH_MARGIN_SECS - 1),
+            ..Fetches::new()
+        };
+        assert!(cache.placement(&src, "github").await.is_ok());
+        assert!(cache.placement(&src, "github").await.is_ok());
+        assert_eq!(
+            src.fetched("github"),
+            2,
+            "a token about to expire is not served from the cache"
         );
     }
 
