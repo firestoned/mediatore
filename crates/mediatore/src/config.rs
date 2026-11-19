@@ -554,10 +554,13 @@ pub struct LogsSection {
     /// Store and serve output (default `false`). Off, `POST /v1/me/logs` and
     /// `GET /v1/claims/{name}/logs` answer `501 not_implemented`, a claim with
     /// `workload.logs: true` is refused at creation, and the guest keeps the console copy.
+    /// On, it needs `store.sealing`: the output is sealed per batch before it is stored and
+    /// is never kept in clear (ADR-0052).
     #[serde(default)]
     pub enabled: bool,
-    /// The newest output kept per claim, in bytes (default 1 MiB, ceiling 4 MiB, floor one
-    /// 64 KiB segment); the oldest records beyond it are dropped and counted.
+    /// The newest output kept per claim, in bytes of record text plus 256 bytes per stored
+    /// batch (default 1 MiB, ceiling 4 MiB, floor one 64 KiB segment); the oldest whole
+    /// segments beyond it are dropped and their text counted (ADR-0045, ADR-0052).
     #[serde(default = "default_log_max_bytes")]
     pub max_bytes: usize,
     /// Seconds a claim's output outlives the claim's end before the resync sweeps it. Default:
@@ -1135,6 +1138,13 @@ impl Config {
     /// ADR-0045 decision 4: `logs.max_bytes` within its floor (one segment) and ceiling, checked
     /// whether or not the feature is on, so a typo is found before the switch is flipped.
     fn check_logs(&self) -> anyhow::Result<()> {
+        // ADR-0052 decision 5: output is sealed before it is stored, so storing it needs a
+        // sealer. dev_mode keeps its in-memory ring (memory, not a store at rest).
+        if self.logs.enabled && !self.dev_mode && self.store.sealing.is_none() {
+            anyhow::bail!(
+                "logs.enabled needs store.sealing (key_file or transit): workload output is sealed per batch before it is stored and is never kept in clear (ADR-0052)"
+            );
+        }
         if self.logs.max_bytes > LOG_MAX_BYTES_CEILING {
             anyhow::bail!(
                 "logs.max_bytes {} is over the ceiling of {LOG_MAX_BYTES_CEILING} bytes (ADR-0045 decision 4)",
@@ -1661,6 +1671,36 @@ listen: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }
     class_name: spire-server-spire
 ";
 
+    /// A sealer, as `store.sealing` configures one.
+    const SEALED: &str = "store: { sealing: { key_file: /k } }\n";
+
+    /// ADR-0052 decision 5: stored output is sealed, so keeping it needs a sealer; there is no
+    /// option to keep it in clear. Off, nothing is asked of the operator.
+    #[test]
+    fn stored_output_needs_a_sealer_and_never_falls_back_to_clear() {
+        let err = Config::parse(&format!("{BASE}{SPIRE}logs: {{ enabled: true }}\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("logs.enabled")
+                && err.contains("store.sealing")
+                && err.contains("ADR-0052"),
+            "{err}"
+        );
+        // A sealer makes it valid, either kind.
+        Config::parse(&format!("{BASE}{SPIRE}{SEALED}logs: {{ enabled: true }}\n")).unwrap();
+        Config::parse(&format!(
+            "{BASE}{SPIRE}store:\n  sealing:\n    transit: {{ url: https://openbao.home.example:8200, key: mediatore, role: mediatore }}\nlogs: {{ enabled: true }}\n"
+        ))
+        .unwrap();
+        // Off needs nothing; dev_mode keeps its in-memory ring, which is not a store at rest.
+        Config::parse(&format!("{BASE}{SPIRE}logs: {{ enabled: false }}\n")).unwrap();
+        Config::parse(&format!(
+            "{BASE}dev_mode: true\nlogs: {{ enabled: true }}\n"
+        ))
+        .unwrap();
+    }
+
     #[test]
     fn the_store_has_nothing_to_point_at_and_any_retention_is_valid() {
         // ADR-0034: the Kubernetes API outside dev_mode, memory under it; no URL anywhere.
@@ -1703,7 +1743,7 @@ listen: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }
             "the default retention is the ended claim's own window"
         );
         let cfg = Config::parse(&format!(
-            "{BASE}{SPIRE}logs: {{ enabled: true, max_bytes: 131072, retention_secs: 60 }}\n"
+            "{BASE}{SPIRE}{SEALED}logs: {{ enabled: true, max_bytes: 131072, retention_secs: 60 }}\n"
         ))
         .unwrap();
         assert_eq!(cfg.log_limits(), Some(LogLimits { max_bytes: 131_072 }));
@@ -1722,7 +1762,7 @@ listen: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }
             );
         }
         let cfg = Config::parse(&format!(
-            "{BASE}{SPIRE}logs: {{ enabled: true, max_bytes: {LOG_MAX_BYTES_CEILING} }}\n"
+            "{BASE}{SPIRE}{SEALED}logs: {{ enabled: true, max_bytes: {LOG_MAX_BYTES_CEILING} }}\n"
         ))
         .unwrap();
         assert_eq!(

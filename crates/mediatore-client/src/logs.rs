@@ -129,6 +129,11 @@ impl<'a, O: Write, E: Write> LogPrinter<'a, O, E> {
                     LogStream::Stderr => writeln!(self.err, "{prefix}{}", r.text)?,
                 }
             }
+            LogLine::Gap(g) if g.unreadable > 0 => writeln!(
+                self.err,
+                "[{} bytes of output stored here could not be read and are not shown]",
+                g.unreadable
+            )?,
             LogLine::Gap(g) => writeln!(
                 self.err,
                 "[{} bytes of stdout and {} bytes of stderr lost before this point]",
@@ -197,6 +202,7 @@ mod tests {
             serde_json::to_string(&LogLine::Gap(LogGap {
                 lost_stdout: 4096,
                 lost_stderr: 12,
+                unreadable: 0,
             }))
             .unwrap(),
             record(9, LogStream::Stdout, "last"),

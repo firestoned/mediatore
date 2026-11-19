@@ -18,6 +18,7 @@
 //! deletes the resource if nobody has, and releases the finalizer.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use jiff::Timestamp;
@@ -30,7 +31,7 @@ use mediatore_proto::{
     ClaimReport, LOG_SEGMENT_BYTES, LogBatch, LogEntry, LogGap, Provider, Subject, Workload,
     WorkloadExit,
 };
-use mediatore_store::seal::Sealed;
+use mediatore_store::seal::{SealError, SealPurpose, Sealed, Sealer};
 use mediatore_store::{
     ClaimRecord, ClaimStore, DelegatedSession, LogAppend, LogChunk, LogLimits, LogStore,
     NodeRecord, SessionRecord, StoreError,
@@ -73,8 +74,23 @@ const BYTES_ANNOTATION: &str = "mediatore.io/bytes";
 /// segment was last written. The newest segment's value is the ring's truth; an older
 /// segment's is what it was then and may be stale.
 const TRUNCATED_ANNOTATION: &str = "mediatore.io/truncated-before";
-/// The data key holding a segment's entries, NDJSON, one [`LogEntry`] per line.
+/// The data key holding a segment's entries: sealed blobs (ADR-0052), NDJSON, one [`SealedBlob`]
+/// per line.
 const ENTRIES_KEY: &str = "entries";
+/// Annotation on a segment that marks its format (ADR-0052 decision 3): present with
+/// [`SEAL_FORMAT`] on a segment whose `entries` are sealed blobs. A segment without it is
+/// never served as the claim's output.
+const SEAL_ANNOTATION: &str = "mediatore.io/seal";
+/// The one value of [`SEAL_ANNOTATION`].
+const SEAL_FORMAT: &str = "v1";
+/// How many transit calls one read keeps in flight (ADR-0052 decision 4).
+const OPEN_CONCURRENCY: usize = 4;
+/// What one sealed blob costs in the Secret beyond its record text: the line's keys, the key
+/// id, the nonce and the transit envelope's header and base64. Counted into a segment's and the
+/// ring's weight so that a flood of tiny batches (a line a second) rolls segments and is
+/// trimmed, rather than growing one Secret toward the object cap or one claim's ring without
+/// bound (ADR-0052). `logs.max_bytes` is therefore text plus this per batch.
+const BLOB_OVERHEAD: usize = 256;
 /// How many times a conflicting segment write is retried before it is an error.
 const SEGMENT_WRITE_ATTEMPTS: usize = 3;
 /// How many location hints [`KubeStore`] keeps before it forgets them all: a forgotten hint
@@ -230,6 +246,9 @@ pub struct KubeStore {
     /// [`KubeStore::sandbox_of_claim`]), and a hint that no longer holds is dropped for the
     /// label list, which decides. Per replica, lost on restart, bounded by [`LOCATED_MAX`].
     located: std::sync::Mutex<HashMap<Uuid, (String, String)>>,
+    /// What seals a claim's stored output (ADR-0052). Without one the store refuses to write
+    /// or read output: it is never kept in clear.
+    log_sealer: Option<Arc<dyn Sealer>>,
 }
 
 impl KubeStore {
@@ -240,7 +259,24 @@ impl KubeStore {
             client,
             home,
             located: std::sync::Mutex::new(HashMap::new()),
+            log_sealer: None,
         }
+    }
+
+    /// Seal the claims' stored output with `sealer` (ADR-0052 decision 1).
+    #[must_use]
+    pub fn with_log_sealer(mut self, sealer: Arc<dyn Sealer>) -> Self {
+        self.log_sealer = Some(sealer);
+        self
+    }
+
+    /// The sealer of the output, or the refusal when there is none.
+    fn sealer(&self) -> Result<&Arc<dyn Sealer>, StoreError> {
+        self.log_sealer.as_ref().ok_or_else(|| {
+            StoreError::Backend(
+                "no sealer configured: workload output is never kept in clear".into(),
+            )
+        })
     }
 
     /// The broker's own namespace, where the Secrets, nodes and floors are kept.
@@ -691,17 +727,20 @@ impl KubeStore {
         Ok(())
     }
 
-    /// One attempt at appending `batch` (ADR-0045 decisions 4, 6 and 8): read the ring,
-    /// keep the records above its highest `seq`, pack, write the changed segments (a replace
-    /// on the open one by `resourceVersion`, creates for new ones), then drop the oldest
-    /// whole segments beyond the cap. `Err(Conflict)` when another replica wrote in between;
-    /// the caller reads again and retries.
+    /// One attempt at appending `batch` (ADR-0045 decisions 4, 6 and 8; ADR-0052 decisions 1
+    /// and 3): read the ring (its clear headers, nothing unsealed), keep the records above its
+    /// highest `seq`, plan which segments take them, seal what each takes as one blob, and
+    /// only then write: a replace on the open segment by `resourceVersion`, creates for new
+    /// ones, then drop the oldest whole segments beyond the cap. A sealer that cannot answer
+    /// fails the call before anything is written. `Err(Conflict)` when another replica wrote
+    /// in between; the caller reads again and retries.
     async fn try_append(
         &self,
         rec: &ClaimRecord,
         batch: &LogBatch,
         limits: &LogLimits,
     ) -> Result<LogAppend, StoreError> {
+        let sealer = self.sealer()?;
         let mut segments = self.segments_of(rec.uid).await?;
         let highest = segments.iter().rev().find_map(LogSegment::last_seq);
         let new: Vec<&mediatore_proto::LogRecord> = batch
@@ -711,17 +750,32 @@ impl KubeStore {
             .collect();
         let ignored = batch.records.len() - new.len();
         if new.is_empty() {
-            return Ok(LogAppend { stored: 0, ignored });
+            return Ok(LogAppend {
+                stored: 0,
+                ignored,
+                dropped: 0,
+            });
         }
         let mut entries = Vec::with_capacity(new.len() + 1);
         if batch.dropped_stdout > 0 || batch.dropped_stderr > 0 {
             entries.push(LogEntry::Gap(LogGap {
                 lost_stdout: batch.dropped_stdout,
                 lost_stderr: batch.dropped_stderr,
+                unreadable: 0,
             }));
         }
         entries.extend(new.iter().map(|r| LogEntry::Record((*r).clone())));
-        let changed = pack(&segments, entries);
+        let mut changed = Vec::new();
+        for planned in plan(&segments, entries) {
+            if planned.new.is_empty() {
+                continue;
+            }
+            let mut seg = planned.segment;
+            let blob = seal_blob(sealer.as_ref(), rec.uid, &planned.new).await?;
+            seg.bytes += blob.bytes;
+            seg.blobs.push(blob);
+            changed.push(seg);
+        }
         // The ring as it will be: the unchanged older segments, then the changed ones.
         let first_changed = changed[0].number;
         segments.retain(|s| s.number < first_changed);
@@ -773,11 +827,90 @@ impl KubeStore {
             ignored,
             bytes = new.iter().map(|r| r.text.len()).sum::<usize>(),
             segments = changed.len(),
-            "output appended"
+            "output appended, sealed per batch (ADR-0052)"
         );
         Ok(LogAppend {
             stored: new.len(),
             ignored,
+            dropped,
+        })
+    }
+
+    /// The claim's stored output after `since`, unsealing only the blobs that can hold it
+    /// (ADR-0052 decision 4): a blob whose clear header ends at or below the cursor is
+    /// skipped; with `tail` the newest blobs are opened first and the walk stops once enough
+    /// records are in hand; at most [`OPEN_CONCURRENCY`] calls are in flight and the order is
+    /// kept. A sealer that cannot answer fails the read; a blob that does not open, and a
+    /// segment that is not in the sealed format, become a gap and are never served.
+    async fn read_sealed(
+        &self,
+        claim_uid: Uuid,
+        since: Option<u64>,
+        tail: Option<usize>,
+    ) -> Result<LogChunk, StoreError> {
+        let segments = self.segments_of(claim_uid).await?;
+        let Some(newest) = segments.last() else {
+            return Ok(LogChunk::default());
+        };
+        let sealer = self.sealer()?;
+        let truncated_before = newest.truncated_before;
+        let last_seq = segments.iter().rev().find_map(LogSegment::last_seq);
+        // What each segment contributes, oldest first.
+        let mut work: Vec<Work<'_>> = Vec::new();
+        for seg in &segments {
+            if seg.unreadable {
+                work.push(Work::Unreadable(seg.bytes));
+                continue;
+            }
+            for blob in &seg.blobs {
+                if since.is_some_and(|c| blob.last.is_some_and(|l| l <= c)) {
+                    continue;
+                }
+                work.push(Work::Blob(blob));
+            }
+        }
+        let opened: Vec<Vec<LogEntry>> = match tail {
+            None => {
+                // In order, [`OPEN_CONCURRENCY`] at a time.
+                let mut all = Vec::with_capacity(work.len());
+                for group in work.chunks(OPEN_CONCURRENCY) {
+                    let mut got = futures::future::try_join_all(
+                        group.iter().map(|w| w.open(sealer.as_ref(), claim_uid)),
+                    )
+                    .await?;
+                    all.append(&mut got);
+                }
+                all
+            }
+            Some(n) => {
+                // Newest first, a few at a time, until `n` records could be in hand.
+                let mut newest_first: Vec<Vec<LogEntry>> = Vec::new();
+                let mut records = 0usize;
+                for group in work.rchunks(OPEN_CONCURRENCY) {
+                    let mut got = futures::future::try_join_all(
+                        group
+                            .iter()
+                            .rev()
+                            .map(|w| w.open(sealer.as_ref(), claim_uid)),
+                    )
+                    .await?;
+                    for entries in &got {
+                        records += entries.iter().filter(|e| e.seq().is_some()).count();
+                    }
+                    newest_first.append(&mut got);
+                    if records >= n {
+                        break;
+                    }
+                }
+                newest_first.reverse();
+                newest_first
+            }
+        };
+        let entries: Vec<LogEntry> = opened.into_iter().flatten().collect();
+        Ok(LogChunk {
+            truncated_before,
+            entries: after_cursor(entries, since),
+            last_seq,
         })
     }
 
@@ -843,49 +976,235 @@ pub fn logs_segment_name(claim_uid: Uuid, segment: u32) -> String {
     format!("mediatore-logs-{claim_uid}-{segment:06}")
 }
 
-/// One segment of a claim's output ring (ADR-0045 decision 6), as read from or about to be
-/// written to its Secret.
+/// One sealed batch inside a segment (ADR-0052 decision 3). The header is in clear: the
+/// sequence range of the records it holds (what lets the broker append, skip and count
+/// without a transit call) and their text bytes (what `logs.max_bytes` counts). Everything
+/// else, the text, the stream and the timestamp, is in `sealed`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SealedBlob {
+    /// The lowest record `seq` sealed in it; `None` for a blob of a gap alone.
+    first: Option<u64>,
+    /// The highest record `seq` sealed in it.
+    last: Option<u64>,
+    /// Record text bytes sealed in it.
+    bytes: usize,
+    sealed: Sealed,
+}
+
+/// A [`SealedBlob`] as one line of a segment's `entries`. The ciphertext is kept as the text
+/// transit returns (`vault:v1:...`) and as `b64:` and base64 for a sealer whose output is
+/// not text.
+#[derive(Serialize, Deserialize)]
+struct BlobLine {
+    first: Option<u64>,
+    last: Option<u64>,
+    bytes: usize,
+    key_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    nonce: String,
+    ciphertext: String,
+}
+
+impl SealedBlob {
+    fn to_line(&self) -> BlobLine {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let ct = &self.sealed.ciphertext;
+        let ciphertext = match std::str::from_utf8(ct) {
+            Ok(text) if text.starts_with("vault:") => text.to_owned(),
+            _ => format!("b64:{}", b64.encode(ct)),
+        };
+        BlobLine {
+            first: self.first,
+            last: self.last,
+            bytes: self.bytes,
+            key_id: self.sealed.key_id.clone(),
+            nonce: b64.encode(&self.sealed.nonce),
+            ciphertext,
+        }
+    }
+
+    fn from_line(line: BlobLine) -> Option<Self> {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let ciphertext = match line.ciphertext.strip_prefix("b64:") {
+            Some(rest) => b64.decode(rest).ok()?,
+            None => line.ciphertext.into_bytes(),
+        };
+        Some(Self {
+            first: line.first,
+            last: line.last,
+            bytes: line.bytes,
+            sealed: Sealed {
+                key_id: line.key_id,
+                nonce: b64.decode(line.nonce).ok()?,
+                ciphertext,
+            },
+        })
+    }
+}
+
+/// One segment of a claim's output ring (ADR-0045 decision 6; ADR-0052 decision 3), as read
+/// from or about to be written to its Secret.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LogSegment {
     /// Its number in the ring: higher is newer, the highest is the open one.
     number: u32,
-    entries: Vec<LogEntry>,
-    /// Record text bytes in `entries`.
+    /// The sealed batches, oldest first.
+    blobs: Vec<SealedBlob>,
+    /// Record text bytes in the segment: the sum of the blobs' for a sealed segment, the
+    /// annotation's for one that is not readable.
     bytes: usize,
     /// The ring's cumulative front drops when this segment was last written.
     truncated_before: u64,
     /// The Secret's `resourceVersion`, for the compare-and-set of a replace; `None` for a
     /// segment not yet created.
     resource_version: Option<String>,
+    /// Not in the sealed format (no marker, or lines that are not blobs): counted, trimmed
+    /// and swept like any segment, but never served and never appended to.
+    unreadable: bool,
+    /// The sequence range the Secret's annotations claim, used only when `unreadable`.
+    annotated: (Option<u64>, Option<u64>),
 }
 
 impl LogSegment {
     fn empty(number: u32, truncated_before: u64) -> Self {
         Self {
             number,
-            entries: Vec::new(),
+            blobs: Vec::new(),
             bytes: 0,
             truncated_before,
             resource_version: None,
+            unreadable: false,
+            annotated: (None, None),
         }
     }
 
+    /// What the segment weighs against the cap: its record text and [`BLOB_OVERHEAD`] per
+    /// sealed blob.
+    fn weight(&self) -> usize {
+        self.bytes + BLOB_OVERHEAD * self.blobs.len()
+    }
+
     fn first_seq(&self) -> Option<u64> {
-        self.entries.iter().find_map(LogEntry::seq)
+        if self.unreadable {
+            return self.annotated.0;
+        }
+        self.blobs.iter().find_map(|b| b.first)
     }
 
     fn last_seq(&self) -> Option<u64> {
-        self.entries.iter().rev().find_map(LogEntry::seq)
+        if self.unreadable {
+            return self.annotated.1;
+        }
+        self.blobs.iter().rev().find_map(|b| b.last)
     }
+}
 
-    fn push(&mut self, entry: LogEntry) {
-        self.bytes += entry.text_bytes();
-        self.entries.push(entry);
+/// What a read does with one piece of the ring.
+enum Work<'a> {
+    /// A sealed blob to open.
+    Blob(&'a SealedBlob),
+    /// A segment that is not in the sealed format: `bytes` of text that is not served.
+    Unreadable(usize),
+}
+
+impl Work<'_> {
+    async fn open(
+        &self,
+        sealer: &dyn Sealer,
+        claim_uid: Uuid,
+    ) -> Result<Vec<LogEntry>, StoreError> {
+        match self {
+            Self::Blob(blob) => open_blob(sealer, claim_uid, blob).await,
+            Self::Unreadable(bytes) => Ok(vec![unreadable_gap(*bytes)]),
+        }
+    }
+}
+
+fn unreadable_gap(bytes: usize) -> LogEntry {
+    LogEntry::Gap(LogGap {
+        lost_stdout: 0,
+        lost_stderr: 0,
+        unreadable: bytes as u64,
+    })
+}
+
+fn seal_error(e: SealError) -> StoreError {
+    match e {
+        SealError::Unavailable(why) => StoreError::Unavailable(format!("sealer: {why}")),
+        other => StoreError::Backend(format!("sealer: {other}")),
+    }
+}
+
+/// Seal `entries` as one blob for `claim_uid` (ADR-0052 decision 1): the entries as NDJSON,
+/// bound to the claim and the output's purpose.
+async fn seal_blob(
+    sealer: &dyn Sealer,
+    claim_uid: Uuid,
+    entries: &[LogEntry],
+) -> Result<SealedBlob, StoreError> {
+    let mut plain = Vec::new();
+    for e in entries {
+        serde_json::to_writer(&mut plain, e).map_err(|e| StoreError::Backend(e.to_string()))?;
+        plain.push(b'\n');
+    }
+    let envelope = sealer
+        .seal_with(SealPurpose::Logs, claim_uid, &plain)
+        .await
+        .map_err(seal_error)?;
+    Ok(SealedBlob {
+        first: entries.iter().find_map(LogEntry::seq),
+        last: entries.iter().rev().find_map(LogEntry::seq),
+        bytes: entries.iter().map(LogEntry::text_bytes).sum(),
+        sealed: envelope,
+    })
+}
+
+/// Open a blob (ADR-0052 decision 4). An outage is an error (the read is a `503`); a blob
+/// that does not authenticate for this claim, or whose clear header disagrees with what it
+/// holds, is a gap of its `bytes` and is logged by claim and never by content.
+async fn open_blob(
+    sealer: &dyn Sealer,
+    claim_uid: Uuid,
+    blob: &SealedBlob,
+) -> Result<Vec<LogEntry>, StoreError> {
+    let plain = match sealer
+        .unseal_with(SealPurpose::Logs, claim_uid, &blob.sealed)
+        .await
+    {
+        Ok(plain) => plain,
+        Err(SealError::Unavailable(why)) => {
+            return Err(StoreError::Unavailable(format!("sealer: {why}")));
+        }
+        Err(e) => {
+            tracing::warn!(%claim_uid, reason = %e, "an output blob did not open; served as a gap");
+            return Ok(vec![unreadable_gap(blob.bytes)]);
+        }
+    };
+    let parsed: Option<Vec<LogEntry>> = std::str::from_utf8(&plain).ok().and_then(|text| {
+        text.lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str(l).ok())
+            .collect()
+    });
+    match parsed {
+        Some(entries)
+            if entries.iter().find_map(LogEntry::seq) == blob.first
+                && entries.iter().rev().find_map(LogEntry::seq) == blob.last =>
+        {
+            Ok(entries)
+        }
+        _ => {
+            tracing::warn!(%claim_uid, "an output blob's header disagrees with what it holds; served as a gap");
+            Ok(vec![unreadable_gap(blob.bytes)])
+        }
     }
 }
 
 /// The segment a Secret holds; `None` for a Secret that is not a well-formed segment (it is
-/// then left alone by reads and found again by the sweep's label listing).
+/// then left alone by reads and found again by the sweep's label listing). One that is a
+/// segment but not in the sealed format is returned `unreadable`.
 fn segment_of(secret: &Secret) -> Option<LogSegment> {
     let ann = secret.metadata.annotations.as_ref()?;
     let number: u32 = ann.get(SEGMENT_ANNOTATION)?.parse().ok()?;
@@ -893,32 +1212,56 @@ fn segment_of(secret: &Secret) -> Option<LogSegment> {
         .get(TRUNCATED_ANNOTATION)
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
+    let mut seg = LogSegment::empty(number, truncated_before);
+    seg.resource_version
+        .clone_from(&secret.metadata.resource_version);
     let text = secret
         .data
         .as_ref()
         .and_then(|d| d.get(ENTRIES_KEY))
         .map(|b| String::from_utf8_lossy(&b.0).into_owned())
         .unwrap_or_default();
-    let mut seg = LogSegment::empty(number, truncated_before);
-    seg.resource_version
-        .clone_from(&secret.metadata.resource_version);
-    for line in text.lines().filter(|l| !l.is_empty()) {
-        let entry: LogEntry = serde_json::from_str(line).ok()?;
-        seg.push(entry);
+    let blobs: Option<Vec<SealedBlob>> =
+        if ann.get(SEAL_ANNOTATION).map(String::as_str) == Some(SEAL_FORMAT) {
+            text.lines()
+                .filter(|l| !l.is_empty())
+                .map(|l| {
+                    serde_json::from_str::<BlobLine>(l)
+                        .ok()
+                        .and_then(SealedBlob::from_line)
+                })
+                .collect()
+        } else {
+            None
+        };
+    if let Some(blobs) = blobs {
+        seg.bytes = blobs.iter().map(|b| b.bytes).sum();
+        seg.blobs = blobs;
+    } else {
+        seg.unreadable = true;
+        seg.bytes = ann
+            .get(BYTES_ANNOTATION)
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        seg.annotated = (
+            ann.get(FIRST_SEQ_ANNOTATION).and_then(|v| v.parse().ok()),
+            ann.get(LAST_SEQ_ANNOTATION).and_then(|v| v.parse().ok()),
+        );
     }
     Some(seg)
 }
 
 /// The Secret for a segment: labelled by the claim and the sandbox, owned by the sandbox
-/// when it shares the broker's namespace (the session Secret's rule), its entries as NDJSON.
+/// when it shares the broker's namespace (the session Secret's rule), its entries the
+/// sealed blobs, one per line, marked with the format.
 fn segment_secret(
     rec: &ClaimRecord,
     seg: &LogSegment,
     owners: Option<Vec<OwnerReference>>,
 ) -> Secret {
     let mut text = String::new();
-    for e in &seg.entries {
-        if let Ok(line) = serde_json::to_string(e) {
+    for b in &seg.blobs {
+        if let Ok(line) = serde_json::to_string(&b.to_line()) {
             text.push_str(&line);
             text.push('\n');
         }
@@ -933,6 +1276,7 @@ fn segment_secret(
     let mut annotations = BTreeMap::from([
         (SEGMENT_ANNOTATION.to_owned(), seg.number.to_string()),
         (BYTES_ANNOTATION.to_owned(), seg.bytes.to_string()),
+        (SEAL_ANNOTATION.to_owned(), SEAL_FORMAT.to_owned()),
         (
             TRUNCATED_ANNOTATION.to_owned(),
             seg.truncated_before.to_string(),
@@ -961,42 +1305,66 @@ fn segment_secret(
     secret
 }
 
-/// Pack `entries` into the ring: the open segment (the last of `segments`, or a first one)
-/// takes them up to [`LOG_SEGMENT_BYTES`] of record text, then a new segment is opened for
-/// the rest, as often as needed. Returns the segments that changed or were created, oldest
-/// first; `truncated_before` is copied from the newest segment so every written one carries
-/// the ring's current count.
-fn pack(segments: &[LogSegment], entries: Vec<LogEntry>) -> Vec<LogSegment> {
+/// A segment of the ring and the entries the next append puts into it.
+struct Planned {
+    /// The segment as it stands (its sealed blobs so far), carrying the ring's current
+    /// `truncated_before`.
+    segment: LogSegment,
+    /// The entries this append adds to it: at most [`LOG_SEGMENT_BYTES`] of record text, so
+    /// they seal as one blob.
+    new: Vec<LogEntry>,
+}
+
+/// Plan the append of `entries` to the ring: the open segment (the last of `segments`, or a
+/// first one, or a new one when the last is not readable) takes them up to
+/// [`LOG_SEGMENT_BYTES`] of record text, then a new segment is opened for the rest, as often
+/// as needed. Returns the segments that change, oldest first, each with what it takes;
+/// `truncated_before` is copied from the newest segment so every written one carries the
+/// ring's current count.
+fn plan(segments: &[LogSegment], entries: Vec<LogEntry>) -> Vec<Planned> {
     let truncated_before = segments.last().map_or(0, |s| s.truncated_before);
-    let mut open = segments
-        .last()
-        .cloned()
-        .unwrap_or_else(|| LogSegment::empty(0, 0));
+    let mut open = match segments.last() {
+        Some(last) if !last.unreadable => last.clone(),
+        Some(last) => LogSegment::empty(last.number + 1, truncated_before),
+        None => LogSegment::empty(0, 0),
+    };
     open.truncated_before = truncated_before;
+    let mut taken: Vec<LogEntry> = Vec::new();
     let mut out = Vec::new();
     for e in entries {
-        if open.bytes > 0 && open.bytes + e.text_bytes() > LOG_SEGMENT_BYTES {
+        // The open segment as it would be: its weight, the entries taken so far and the one
+        // blob they will seal into.
+        let taken_text = taken.iter().map(LogEntry::text_bytes).sum::<usize>();
+        let in_open = open.weight() + taken_text + BLOB_OVERHEAD;
+        if (open.weight() > 0 || taken_text > 0) && in_open + e.text_bytes() > LOG_SEGMENT_BYTES {
             let next = LogSegment::empty(open.number + 1, truncated_before);
-            out.push(std::mem::replace(&mut open, next));
+            out.push(Planned {
+                segment: std::mem::replace(&mut open, next),
+                new: std::mem::take(&mut taken),
+            });
         }
-        open.push(e);
+        taken.push(e);
     }
-    out.push(open);
+    out.push(Planned {
+        segment: open,
+        new: taken,
+    });
     out
 }
 
 /// Which of `segments` (oldest first, the newest last) the ring drops so the whole stays
-/// within `max_bytes`: whole segments from the front, never the newest. Returns their
-/// numbers and the record text bytes they held, which join `truncated_before`.
+/// within `max_bytes` of weight (text and the per-blob overhead): whole segments from the
+/// front, never the newest. Returns their numbers and the record text bytes they held, which
+/// join `truncated_before`: the owner is told text, not overhead.
 fn trim(segments: &[LogSegment], max_bytes: usize) -> (Vec<u32>, u64) {
-    let mut total: usize = segments.iter().map(|s| s.bytes).sum();
+    let mut total: usize = segments.iter().map(LogSegment::weight).sum();
     let mut gone = Vec::new();
     let mut dropped: u64 = 0;
     for s in segments.iter().take(segments.len().saturating_sub(1)) {
         if total <= max_bytes {
             break;
         }
-        total -= s.bytes;
+        total -= s.weight();
         dropped += s.bytes as u64;
         gone.push(s.number);
     }
@@ -1382,24 +1750,24 @@ impl LogStore for KubeStore {
 
     async fn read_logs(&self, claim_uid: Uuid, since: Option<u64>) -> Result<LogChunk, StoreError> {
         // A follower's poll usually finds nothing new: the segments' metadata says so
-        // without the ring being downloaded.
+        // without the ring being downloaded or a blob opened.
         if let Some(since) = since
             && let Some(chunk) = self.idle_chunk(claim_uid, since).await?
         {
             return Ok(chunk);
         }
-        let segments = self.segments_of(claim_uid).await?;
-        let Some(newest) = segments.last() else {
-            return Ok(LogChunk::default());
-        };
-        let truncated_before = newest.truncated_before;
-        let last_seq = segments.iter().rev().find_map(LogSegment::last_seq);
-        let entries: Vec<LogEntry> = segments.into_iter().flat_map(|s| s.entries).collect();
-        Ok(LogChunk {
-            truncated_before,
-            entries: after_cursor(entries, since),
-            last_seq,
-        })
+        self.read_sealed(claim_uid, since, None).await
+    }
+
+    async fn read_logs_tail(
+        &self,
+        claim_uid: Uuid,
+        since: Option<u64>,
+        n: usize,
+    ) -> Result<LogChunk, StoreError> {
+        let mut chunk = self.read_sealed(claim_uid, since, Some(n)).await?;
+        chunk.entries = mediatore_store::tail_entries(chunk.entries, n);
+        Ok(chunk)
     }
 
     async fn delete_logs(&self, claim_uid: Uuid) -> Result<(), StoreError> {
@@ -1914,6 +2282,7 @@ impl ClaimStore for KubeStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
     #[test]
     fn a_released_claims_envelope_secret_is_deleted_not_blanked() {
@@ -1988,7 +2357,15 @@ mod tests {
             pub metadata_lists: Vec<String>,
         }
 
+        /// A store over the fake API server, sealing output with a local key.
         pub fn store(state: &Arc<Mutex<State>>) -> KubeStore {
+            store_unsealed(state).with_log_sealer(Arc::new(
+                mediatore_store::seal::LocalKeySealer::new([7; 32]),
+            ))
+        }
+
+        /// The same, with no sealer: what a broker without `store.sealing` would hold.
+        pub fn store_unsealed(state: &Arc<Mutex<State>>) -> KubeStore {
             let (svc, mut handle) = tower_test::mock::pair::<Request<Body>, Response<Body>>();
             let state = Arc::clone(state);
             tokio::spawn(async move {
@@ -3196,12 +3573,116 @@ mod tests {
         }
     }
 
-    fn segment_with(number: u32, records: &[(u64, usize)]) -> LogSegment {
+    /// A segment that holds `bytes` of record text, whose last record is `last_seq`, with no
+    /// blobs: what the planner and the trim read.
+    fn segment_with(number: u32, bytes: usize, last_seq: u64) -> LogSegment {
         let mut seg = LogSegment::empty(number, 0);
-        for (seq, len) in records {
-            seg.push(LogEntry::Record(log_record(*seq, &"x".repeat(*len))));
-        }
+        seg.bytes = bytes;
+        seg.blobs.push(SealedBlob {
+            first: Some(last_seq),
+            last: Some(last_seq),
+            bytes,
+            sealed: Sealed {
+                key_id: "k".into(),
+                nonce: vec![],
+                ciphertext: b"x".to_vec(),
+            },
+        });
         seg
+    }
+
+    fn local_sealer() -> Arc<dyn Sealer> {
+        Arc::new(mediatore_store::seal::LocalKeySealer::new([7; 32]))
+    }
+
+    /// A sealer that counts its calls and can be told to be down.
+    struct Probe {
+        inner: mediatore_store::seal::LocalKeySealer,
+        seals: std::sync::atomic::AtomicUsize,
+        unseals: std::sync::atomic::AtomicUsize,
+        down: std::sync::atomic::AtomicBool,
+    }
+
+    impl Probe {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                inner: mediatore_store::seal::LocalKeySealer::new([7; 32]),
+                seals: std::sync::atomic::AtomicUsize::new(0),
+                unseals: std::sync::atomic::AtomicUsize::new(0),
+                down: std::sync::atomic::AtomicBool::new(false),
+            })
+        }
+
+        fn set_down(&self, down: bool) {
+            self.down.store(down, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn unseals(&self) -> usize {
+            self.unseals.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn seals(&self) -> usize {
+            self.seals.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl Sealer for Probe {
+        fn key_id(&self) -> &str {
+            self.inner.key_id()
+        }
+
+        async fn seal_with(
+            &self,
+            purpose: SealPurpose,
+            claim_uid: Uuid,
+            plaintext: &[u8],
+        ) -> Result<Sealed, SealError> {
+            if self.down.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(SealError::Unavailable("connection refused".into()));
+            }
+            self.seals.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.seal_with(purpose, claim_uid, plaintext).await
+        }
+
+        async fn unseal_with(
+            &self,
+            purpose: SealPurpose,
+            claim_uid: Uuid,
+            sealed: &Sealed,
+        ) -> Result<Vec<u8>, SealError> {
+            if self.down.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(SealError::Unavailable("connection refused".into()));
+            }
+            self.unseals
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.unseal_with(purpose, claim_uid, sealed).await
+        }
+    }
+
+    /// The segment Secrets the fake API server holds, oldest first.
+    fn segment_secrets(state: &Arc<Mutex<fake::State>>) -> Vec<serde_json::Value> {
+        let st = state.lock().unwrap();
+        let mut v: Vec<serde_json::Value> = st
+            .secrets
+            .iter()
+            .filter(|s| s["metadata"]["labels"][LOGS_LABEL] == LOGS_SEGMENT)
+            .cloned()
+            .collect();
+        v.sort_by_key(|s| s["metadata"]["name"].as_str().unwrap().to_owned());
+        v
+    }
+
+    /// What the API server holds in a segment's `entries`, decoded from the Secret's base64.
+    fn entries_text(secret: &serde_json::Value) -> String {
+        use base64::Engine as _;
+        let b64 = secret["data"][ENTRIES_KEY].as_str().unwrap();
+        String::from_utf8(
+            base64::engine::general_purpose::STANDARD
+                .decode(b64)
+                .unwrap(),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -3221,19 +3702,28 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_segment_round_trips_through_its_secret_with_the_labels_the_sweep_finds_it_by() {
+    #[tokio::test]
+    async fn a_segment_round_trips_through_its_secret_with_the_labels_the_sweep_finds_it_by() {
         let uid = Uuid::new_v4();
         let sandbox_uid = Uuid::new_v4();
         let mut rec = test_record(uid);
         rec.sandbox_uid = Some(sandbox_uid);
+        let sealer = local_sealer();
         let mut seg = LogSegment::empty(3, 4096);
-        seg.push(LogEntry::Gap(LogGap {
-            lost_stdout: 10,
-            lost_stderr: 0,
-        }));
-        seg.push(LogEntry::Record(log_record(41, "first")));
-        seg.push(LogEntry::Record(log_record(42, "second")));
+        for entries in [
+            vec![
+                LogEntry::Gap(LogGap {
+                    lost_stdout: 10,
+                    ..LogGap::default()
+                }),
+                LogEntry::Record(log_record(41, "alpha-line")),
+            ],
+            vec![LogEntry::Record(log_record(42, "beta-line"))],
+        ] {
+            let blob = seal_blob(sealer.as_ref(), uid, &entries).await.unwrap();
+            seg.bytes += blob.bytes;
+            seg.blobs.push(blob);
+        }
         seg.resource_version = Some("12".into());
         let owner = OwnerReference {
             api_version: "mediatore.io/v1beta1".into(),
@@ -3258,11 +3748,16 @@ mod tests {
         let ann = secret.annotations();
         assert_eq!(ann.get(SEGMENT_ANNOTATION).map(String::as_str), Some("3"));
         assert_eq!(
+            ann.get(SEAL_ANNOTATION).map(String::as_str),
+            Some(SEAL_FORMAT),
+            "the format is marked"
+        );
+        assert_eq!(
             ann.get(FIRST_SEQ_ANNOTATION).map(String::as_str),
             Some("41")
         );
         assert_eq!(ann.get(LAST_SEQ_ANNOTATION).map(String::as_str), Some("42"));
-        assert_eq!(ann.get(BYTES_ANNOTATION).map(String::as_str), Some("11"));
+        assert_eq!(ann.get(BYTES_ANNOTATION).map(String::as_str), Some("19"));
         assert_eq!(
             ann.get(TRUNCATED_ANNOTATION).map(String::as_str),
             Some("4096")
@@ -3270,9 +3765,27 @@ mod tests {
         assert_eq!(secret.metadata.owner_references, Some(vec![owner]));
         assert_eq!(secret.type_.as_deref(), Some("Opaque"));
         let text = String::from_utf8(secret.data.as_ref().unwrap()[ENTRIES_KEY].0.clone()).unwrap();
-        assert_eq!(text.lines().count(), 3, "one entry per line: {text}");
+        assert_eq!(text.lines().count(), 2, "one sealed blob per line: {text}");
+        for needle in ["alpha-line", "beta-line", "stdout", "\"text\"", "\"ts\""] {
+            assert!(
+                !text.contains(needle),
+                "{needle} must not be in the stored text: {text}"
+            );
+        }
         assert!(!text.contains('\u{2014}'));
-        assert_eq!(segment_of(&secret), Some(seg));
+        assert_eq!(segment_of(&secret), Some(seg.clone()));
+        // And what comes back out of the blobs is what went in.
+        let opened = open_blob(sealer.as_ref(), uid, &seg.blobs[0])
+            .await
+            .unwrap();
+        assert_eq!(seqs(&opened), vec![41]);
+        assert!(matches!(
+            opened[0],
+            LogEntry::Gap(LogGap {
+                lost_stdout: 10,
+                ..
+            })
+        ));
         // A record without a sandbox UID labels no sandbox and owns nothing.
         rec.sandbox_uid = None;
         let secret = segment_secret(&rec, &LogSegment::empty(0, 0), None);
@@ -3284,65 +3797,105 @@ mod tests {
     }
 
     #[test]
-    fn packing_fills_the_open_segment_then_rolls_to_new_ones_numbered_on() {
+    fn a_segment_not_in_the_sealed_format_is_unreadable_and_keeps_its_counts() {
+        let uid = Uuid::new_v4();
+        let rec = test_record(uid);
+        let mut secret = segment_secret(&rec, &LogSegment::empty(2, 0), None);
+        let ann = secret.metadata.annotations.as_mut().unwrap();
+        ann.remove(SEAL_ANNOTATION);
+        ann.insert(BYTES_ANNOTATION.into(), "321".into());
+        ann.insert(FIRST_SEQ_ANNOTATION.into(), "5".into());
+        ann.insert(LAST_SEQ_ANNOTATION.into(), "9".into());
+        secret.data = Some(BTreeMap::from([(
+            ENTRIES_KEY.to_owned(),
+            ByteString(b"{\"seq\":5,\"stream\":\"stdout\",\"ts\":\"2026-01-01T00:00:00Z\",\"text\":\"plain\"}\n".to_vec()),
+        )]));
+        let seg = segment_of(&secret).unwrap();
+        assert!(seg.unreadable, "no marker: never served");
+        assert!(seg.blobs.is_empty(), "its lines are not parsed as output");
+        assert_eq!(
+            (seg.bytes, seg.first_seq(), seg.last_seq()),
+            (321, Some(5), Some(9))
+        );
+        // A marked segment whose lines are not blobs is the same.
+        let mut marked = segment_secret(&rec, &LogSegment::empty(2, 0), None);
+        marked.data = Some(BTreeMap::from([(
+            ENTRIES_KEY.to_owned(),
+            ByteString(b"not a blob\n".to_vec()),
+        )]));
+        assert!(segment_of(&marked).unwrap().unreadable);
+    }
+
+    #[test]
+    fn planning_fills_the_open_segment_then_rolls_to_new_ones_numbered_on() {
         let kib = 1024;
-        let open = segment_with(4, &[(1, 60 * kib)]);
-        let older = segment_with(3, &[(0, LOG_SEGMENT_BYTES)]);
+        let open = segment_with(4, 60 * kib, 1);
+        let older = segment_with(3, LOG_SEGMENT_BYTES, 0);
         let entries: Vec<LogEntry> = (2..=6)
             .map(|seq| LogEntry::Record(log_record(seq, &"y".repeat(30 * kib))))
             .collect();
-        let changed = pack(&[older, open], entries);
-        let numbers: Vec<u32> = changed.iter().map(|s| s.number).collect();
-        assert_eq!(numbers, vec![4, 5, 6, 7], "the open one and three new");
+        let planned: Vec<Planned> = plan(&[older, open], entries)
+            .into_iter()
+            .filter(|p| !p.new.is_empty())
+            .collect();
+        let numbers: Vec<u32> = planned.iter().map(|p| p.segment.number).collect();
         assert_eq!(
-            seqs(&changed[0].entries),
-            vec![1],
-            "60 KiB + 30 KiB is over a segment"
+            numbers,
+            vec![5, 6, 7],
+            "60 KiB + 30 KiB is over a segment: three new"
         );
-        assert_eq!(seqs(&changed[1].entries), vec![2, 3]);
-        assert_eq!(seqs(&changed[2].entries), vec![4, 5]);
-        assert_eq!(seqs(&changed[3].entries), vec![6]);
-        for s in &changed {
+        assert_eq!(seqs(&planned[0].new), vec![2, 3]);
+        assert_eq!(seqs(&planned[1].new), vec![4, 5]);
+        assert_eq!(seqs(&planned[2].new), vec![6]);
+        for p in &planned {
+            let added: usize = p.new.iter().map(LogEntry::text_bytes).sum();
             assert!(
-                s.bytes <= LOG_SEGMENT_BYTES,
-                "segment {} holds {}",
-                s.number,
-                s.bytes
+                p.segment.bytes + added <= LOG_SEGMENT_BYTES,
+                "segment {} would hold {}: one blob of at most 64 KiB",
+                p.segment.number,
+                p.segment.bytes + added
             );
         }
         // An empty ring starts at 0; a gap weighs nothing and never rolls a segment.
-        let changed = pack(
+        let planned = plan(
             &[],
             vec![
                 LogEntry::Gap(LogGap::default()),
                 LogEntry::Record(log_record(1, "a")),
             ],
         );
-        assert_eq!(changed.len(), 1);
-        assert_eq!(changed[0].number, 0);
-        assert_eq!(changed[0].entries.len(), 2);
+        assert_eq!(planned.len(), 1);
+        assert_eq!(planned[0].segment.number, 0);
+        assert_eq!(planned[0].new.len(), 2);
         // A record larger than what is left opens a new segment, never splits.
-        let open = segment_with(0, &[(1, LOG_SEGMENT_BYTES - 1)]);
-        let changed = pack(&[open], vec![LogEntry::Record(log_record(2, "ab"))]);
-        assert_eq!(changed.len(), 2);
-        assert_eq!(seqs(&changed[1].entries), vec![2]);
+        let open = segment_with(0, LOG_SEGMENT_BYTES - 1, 1);
+        let planned = plan(&[open], vec![LogEntry::Record(log_record(2, "ab"))]);
+        let with_new: Vec<&Planned> = planned.iter().filter(|p| !p.new.is_empty()).collect();
+        assert_eq!(with_new.len(), 1);
+        assert_eq!(with_new[0].segment.number, 1);
         // The newest segment's count is what every written one carries.
-        let mut open = segment_with(2, &[(1, 10)]);
+        let mut open = segment_with(2, 10, 1);
         open.truncated_before = 999;
-        let changed = pack(
-            &[segment_with(1, &[(0, 10)]), open],
+        let planned = plan(
+            &[segment_with(1, 10, 0), open],
             vec![LogEntry::Record(log_record(2, "z"))],
         );
-        assert!(changed.iter().all(|s| s.truncated_before == 999));
+        assert!(planned.iter().all(|p| p.segment.truncated_before == 999));
+        // A newest segment that is not readable is never appended to: the ring goes on after it.
+        let mut foreign = segment_with(5, 100, 9);
+        foreign.unreadable = true;
+        let planned = plan(&[foreign], vec![LogEntry::Record(log_record(10, "n"))]);
+        assert_eq!(planned[0].segment.number, 6);
     }
 
     #[test]
     fn the_ring_trims_whole_segments_from_the_front_and_never_the_newest() {
-        let segments = vec![
-            segment_with(0, &[(1, 100)]),
-            segment_with(1, &[(2, 200)]),
-            segment_with(2, &[(3, 300)]),
-        ];
+        let bare = |number: u32, bytes: usize| {
+            let mut s = LogSegment::empty(number, 0);
+            s.bytes = bytes;
+            s
+        };
+        let segments = vec![bare(0, 100), bare(1, 200), bare(2, 300)];
         assert_eq!(trim(&segments, 600), (vec![], 0), "within the cap: nothing");
         assert_eq!(trim(&segments, 599), (vec![0], 100));
         assert_eq!(trim(&segments, 499), (vec![0, 1], 300));
@@ -3360,6 +3913,7 @@ mod tests {
         let gap = LogEntry::Gap(LogGap {
             lost_stdout: 1,
             lost_stderr: 0,
+            unreadable: 0,
         });
         let entries = vec![
             LogEntry::Record(log_record(1, "a")),
@@ -3400,7 +3954,8 @@ mod tests {
             done,
             LogAppend {
                 stored: 2,
-                ignored: 0
+                ignored: 0,
+                dropped: 0
             }
         );
         let mut lossy = log_batch(2, 4, "world");
@@ -3410,7 +3965,8 @@ mod tests {
             done,
             LogAppend {
                 stored: 2,
-                ignored: 1
+                ignored: 1,
+                dropped: 0
             }
         );
         let chunk = store.read_logs(claim, None).await.unwrap();
@@ -3476,11 +4032,21 @@ mod tests {
                 .unwrap();
         }
         let chunk = store.read_logs(claim, None).await.unwrap();
-        assert_eq!(
-            chunk.truncated_before,
-            u64::try_from(LOG_SEGMENT_BYTES).unwrap()
+        // Whole segments went from the front, counted in text bytes; a segment holds a little
+        // under 64 KiB of text since each sealed batch is counted with its overhead.
+        let dropped = usize::try_from(chunk.truncated_before).unwrap();
+        assert!(
+            dropped > 0 && dropped < usize::try_from(3 * per).unwrap() * 1024,
+            "something went, not everything: {dropped}"
         );
-        assert_eq!(seqs(&chunk.entries).first().copied(), Some(per + 1));
+        assert_eq!(dropped % 1024, 0, "whole records: {dropped}");
+        let got = seqs(&chunk.entries);
+        assert_eq!(
+            got.first().copied(),
+            Some(u64::try_from(dropped / 1024).unwrap() + 1),
+            "the tail starts where the dropped text ended"
+        );
+        assert!(got.windows(2).all(|w| w[1] == w[0] + 1), "contiguous");
         assert_eq!(chunk.last_seq, Some(3 * per));
         let st = state.lock().unwrap();
         let names: Vec<String> = st
@@ -3489,10 +4055,9 @@ mod tests {
             .filter(|s| s["metadata"]["labels"][LOGS_LABEL] == LOGS_SEGMENT)
             .map(|s| s["metadata"]["name"].as_str().unwrap().to_owned())
             .collect();
-        assert_eq!(
-            names,
-            vec![logs_segment_name(claim, 1), logs_segment_name(claim, 2)],
-            "segment 0 went"
+        assert!(
+            !names.contains(&logs_segment_name(claim, 0)),
+            "segment 0 went: {names:?}"
         );
         assert!(
             st.log
@@ -3680,10 +4245,12 @@ mod tests {
                 .unwrap();
         }
         let full = store.read_logs(claim, None).await.unwrap();
-        assert_eq!(
-            full.truncated_before,
-            u64::try_from(LOG_SEGMENT_BYTES).unwrap()
-        );
+        // Whole segments went from the front. Each sealed batch is counted with its overhead
+        // (ADR-0052), so a segment holds a little under 64 KiB of text and the dropped count
+        // is not exactly one segment of it: what matters here is that it is non-zero, whole
+        // records, and the same on the idle path below.
+        assert!(full.truncated_before > 0, "the front was dropped");
+        assert_eq!(full.truncated_before % 1024, 0, "whole records");
         for since in [0, per, 2 * per, 3 * per - 1, 3 * per, 3 * per + 1] {
             let got = store.read_logs(claim, Some(since)).await.unwrap();
             assert_eq!(got.truncated_before, full.truncated_before);
@@ -3747,5 +4314,358 @@ mod tests {
         let st = state.lock().unwrap();
         assert!(st.secrets.is_empty(), "left: {:?}", fake::secret_names(&st));
         fake::assert_only_home_secrets(&st);
+    }
+
+    #[tokio::test]
+    async fn the_api_server_holds_ciphertext_and_clear_sequence_ranges_and_nothing_printed() {
+        const PRINTED: &str = "the-workload-printed-this-looking-for-a-needle-9f3a";
+        let (state, claim) = fake::seed(false);
+        let store = fake::store(&state);
+        let rec = store.get_claim(claim).await.unwrap();
+        let limits = LogLimits {
+            max_bytes: mediatore_proto::DEFAULT_LOG_MAX_BYTES,
+        };
+        store
+            .append_logs(&rec, &log_batch(1, 3, PRINTED), &limits)
+            .await
+            .unwrap();
+        let segments = segment_secrets(&state);
+        assert_eq!(segments.len(), 1);
+        let text = entries_text(&segments[0]);
+        assert!(!text.contains(PRINTED), "no printed text at rest: {text}");
+        assert!(!text.contains("stdout"), "no stream at rest: {text}");
+        assert_eq!(text.lines().count(), 1, "one batch, one sealed blob");
+        let line: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+        assert_eq!(
+            (line["first"].as_u64(), line["last"].as_u64()),
+            (Some(1), Some(3)),
+            "the sequence range is in clear"
+        );
+        assert_eq!(line["bytes"].as_u64(), Some(3 * PRINTED.len() as u64));
+        assert_eq!(
+            segments[0]["metadata"]["annotations"][SEAL_ANNOTATION],
+            SEAL_FORMAT
+        );
+        // And it reads back for its owner.
+        let chunk = store.read_logs(claim, None).await.unwrap();
+        assert_eq!(seqs(&chunk.entries), vec![1, 2, 3]);
+        assert!(matches!(&chunk.entries[0], LogEntry::Record(r) if r.text == PRINTED));
+    }
+
+    #[tokio::test]
+    async fn a_read_unseals_only_the_blobs_that_can_hold_what_it_asks_for() {
+        let (state, claim) = fake::seed(false);
+        let probe = Probe::new();
+        let store = fake::store(&state).with_log_sealer(probe.clone());
+        let rec = store.get_claim(claim).await.unwrap();
+        let limits = LogLimits {
+            max_bytes: mediatore_proto::DEFAULT_LOG_MAX_BYTES,
+        };
+        for from in [1, 11, 21, 31, 41, 51] {
+            store
+                .append_logs(&rec, &log_batch(from, from + 9, "line"), &limits)
+                .await
+                .unwrap();
+        }
+        assert_eq!(probe.seals(), 6, "one transit call per batch");
+        assert_eq!(probe.unseals(), 0, "ingest never opens a blob");
+        store.read_logs(claim, None).await.unwrap();
+        assert_eq!(probe.unseals(), 6, "a full read opens each blob once");
+        let before = probe.unseals();
+        let chunk = store.read_logs(claim, Some(50)).await.unwrap();
+        assert_eq!(seqs(&chunk.entries), (51..=60).collect::<Vec<_>>());
+        assert_eq!(
+            probe.unseals() - before,
+            1,
+            "a cursor skips the blobs behind it"
+        );
+        let before = probe.unseals();
+        let chunk = store.read_logs_tail(claim, None, 5).await.unwrap();
+        assert_eq!(seqs(&chunk.entries), (56..=60).collect::<Vec<_>>());
+        assert!(
+            probe.unseals() - before <= OPEN_CONCURRENCY,
+            "a tail opens from the newest and stops: {}",
+            probe.unseals() - before
+        );
+        let chunk = store.read_logs_tail(claim, Some(40), 100).await.unwrap();
+        assert_eq!(seqs(&chunk.entries), (41..=60).collect::<Vec<_>>());
+    }
+
+    /// A workload printing a line a second makes one tiny blob a second. Each blob costs about
+    /// [`BLOB_OVERHEAD`] bytes of Secret beyond its text, so a segment is rolled and the ring
+    /// trimmed by that weight too, not by text alone: neither one Secret nor one claim's ring
+    /// grows without bound on batches of a byte.
+    #[tokio::test]
+    async fn a_flood_of_tiny_batches_rolls_segments_and_is_trimmed_by_weight_not_text_alone() {
+        let (state, claim) = fake::seed(false);
+        let store = fake::store(&state);
+        let rec = store.get_claim(claim).await.unwrap();
+        let limits = LogLimits {
+            max_bytes: LOG_SEGMENT_BYTES,
+        };
+        let per_segment = LOG_SEGMENT_BYTES / BLOB_OVERHEAD;
+        let batches = u64::try_from(4 * per_segment).unwrap();
+        for seq in 1..=batches {
+            store
+                .append_logs(&rec, &log_batch(seq, seq, "x"), &limits)
+                .await
+                .unwrap();
+        }
+        let segments = segment_secrets(&state);
+        for seg in &segments {
+            let lines = entries_text(seg).lines().count();
+            assert!(
+                lines <= per_segment,
+                "a segment holds at most {per_segment} blobs of overhead, not {lines}"
+            );
+            assert!(
+                entries_text(seg).len() <= 2 * LOG_SEGMENT_BYTES,
+                "a Secret stays far under the object cap"
+            );
+        }
+        assert!(
+            segments.len() <= 2,
+            "a cap of one segment's weight keeps at most the newest two: {}",
+            segments.len()
+        );
+        let chunk = store.read_logs(claim, None).await.unwrap();
+        assert!(
+            chunk.truncated_before > 0,
+            "the front was dropped and counted"
+        );
+        assert_eq!(chunk.last_seq, Some(batches));
+        // What the owner reads is a contiguous tail, ending at the newest line.
+        let got = seqs(&chunk.entries);
+        assert_eq!(got.last().copied(), Some(batches));
+        assert!(got.windows(2).all(|w| w[1] == w[0] + 1));
+    }
+
+    #[tokio::test]
+    async fn a_sealer_outage_fails_the_write_and_the_read_and_stores_nothing_in_clear() {
+        let (state, claim) = fake::seed(false);
+        let probe = Probe::new();
+        let store = fake::store(&state).with_log_sealer(probe.clone());
+        let rec = store.get_claim(claim).await.unwrap();
+        let limits = LogLimits {
+            max_bytes: mediatore_proto::DEFAULT_LOG_MAX_BYTES,
+        };
+        store
+            .append_logs(&rec, &log_batch(1, 2, "kept"), &limits)
+            .await
+            .unwrap();
+        probe.set_down(true);
+        let written = state.lock().unwrap().log.len();
+        let err = store
+            .append_logs(&rec, &log_batch(3, 4, "refused"), &limits)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Unavailable(_)), "{err:?}");
+        assert_eq!(
+            state
+                .lock()
+                .unwrap()
+                .log
+                .iter()
+                .skip(written)
+                .filter(|(m, _)| m != "GET")
+                .count(),
+            0,
+            "nothing was written while the sealer was down"
+        );
+        let err = store.read_logs(claim, None).await.unwrap_err();
+        assert!(matches!(err, StoreError::Unavailable(_)), "{err:?}");
+        let err = store.read_logs_tail(claim, None, 1).await.unwrap_err();
+        assert!(matches!(err, StoreError::Unavailable(_)), "{err:?}");
+        // The retry the guest makes after it is back is accepted once, idempotently.
+        probe.set_down(false);
+        store
+            .append_logs(&rec, &log_batch(3, 4, "refused"), &limits)
+            .await
+            .unwrap();
+        let again = store
+            .append_logs(&rec, &log_batch(3, 4, "refused"), &limits)
+            .await
+            .unwrap();
+        assert_eq!((again.stored, again.ignored), (0, 2));
+        assert_eq!(
+            seqs(&store.read_logs(claim, None).await.unwrap().entries),
+            vec![1, 2, 3, 4]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_store_without_a_sealer_neither_writes_nor_reads_output() {
+        let (state, claim) = fake::seed(false);
+        let sealed = fake::store(&state);
+        let rec = sealed.get_claim(claim).await.unwrap();
+        let limits = LogLimits {
+            max_bytes: mediatore_proto::DEFAULT_LOG_MAX_BYTES,
+        };
+        sealed
+            .append_logs(&rec, &log_batch(1, 1, "x"), &limits)
+            .await
+            .unwrap();
+        let bare = fake::store_unsealed(&state);
+        assert!(
+            bare.append_logs(&rec, &log_batch(2, 2, "y"), &limits)
+                .await
+                .is_err(),
+            "never kept in clear"
+        );
+        assert!(bare.read_logs(claim, None).await.is_err());
+        assert_eq!(
+            segment_secrets(&state).len(),
+            1,
+            "and nothing new was written"
+        );
+        // A claim with nothing stored is still an empty read, sealer or not.
+        let other = fake::store_unsealed(&state)
+            .read_logs(Uuid::new_v4(), None)
+            .await
+            .unwrap();
+        assert_eq!(other.entries, Vec::new());
+    }
+
+    /// A claim with an open ring of two sealed batches (seq 1 to 2, then 3 to 4).
+    async fn two_batches() -> (
+        Arc<Mutex<fake::State>>,
+        Uuid,
+        KubeStore,
+        ClaimRecord,
+        LogLimits,
+    ) {
+        let (state, claim) = fake::seed(false);
+        let store = fake::store(&state);
+        let rec = store.get_claim(claim).await.unwrap();
+        let limits = LogLimits {
+            max_bytes: mediatore_proto::DEFAULT_LOG_MAX_BYTES,
+        };
+        for (from, to, text) in [(1, 2, "mine"), (3, 4, "mine-too")] {
+            store
+                .append_logs(&rec, &log_batch(from, to, text), &limits)
+                .await
+                .unwrap();
+        }
+        (state, claim, store, rec, limits)
+    }
+
+    /// Put `secret` where the fake API server lists it, as a writer of the Secret would.
+    fn plant(state: &Arc<Mutex<fake::State>>, secret: &Secret) {
+        let mut json = serde_json::to_value(secret).unwrap();
+        json["metadata"]["namespace"] = fake::HOME.into();
+        state.lock().unwrap().secrets.push(json);
+    }
+
+    #[tokio::test]
+    async fn a_blob_whose_clear_header_was_relabelled_is_a_gap_never_served() {
+        use base64::Engine as _;
+        let (state, claim, store, _rec, _limits) = two_batches().await;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        {
+            let mut st = state.lock().unwrap();
+            let seg = st
+                .secrets
+                .iter_mut()
+                .find(|s| s["metadata"]["labels"][LOGS_LABEL] == LOGS_SEGMENT)
+                .unwrap();
+            let text = String::from_utf8(
+                b64.decode(seg["data"][ENTRIES_KEY].as_str().unwrap())
+                    .unwrap(),
+            )
+            .unwrap();
+            let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
+            lines[1] = lines[1]
+                .replace("\"first\":3", "\"first\":30")
+                .replace("\"last\":4", "\"last\":40");
+            seg["data"][ENTRIES_KEY] =
+                serde_json::Value::String(b64.encode(format!("{}\n", lines.join("\n"))));
+        }
+        let chunk = store.read_logs(claim, None).await.unwrap();
+        assert_eq!(
+            seqs(&chunk.entries),
+            vec![1, 2],
+            "the relabelled blob is not served"
+        );
+        assert!(
+            matches!(chunk.entries.last(), Some(LogEntry::Gap(g)) if g.unreadable == 16),
+            "it is a gap of its bytes: {:?}",
+            chunk.entries.last()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_blob_sealed_for_another_claim_and_moved_here_is_a_gap_never_served() {
+        let (state, claim, store, rec, _limits) = two_batches().await;
+        let foreign = seal_blob(
+            local_sealer().as_ref(),
+            Uuid::new_v4(),
+            &[LogEntry::Record(log_record(5, "from-elsewhere"))],
+        )
+        .await
+        .unwrap();
+        let mut seg = LogSegment::empty(1, 0);
+        seg.bytes = foreign.bytes;
+        seg.blobs.push(foreign);
+        let mut secret = segment_secret(&rec, &seg, None);
+        secret.metadata.resource_version = None;
+        plant(&state, &secret);
+        let chunk = store.read_logs(claim, None).await.unwrap();
+        assert!(
+            !format!("{:?}", chunk.entries).contains("from-elsewhere"),
+            "another claim's output is never served: {:?}",
+            chunk.entries
+        );
+        assert!(
+            chunk
+                .entries
+                .iter()
+                .any(|e| matches!(e, LogEntry::Gap(g) if g.unreadable == 14)),
+            "it is told as a gap of its bytes: {:?}",
+            chunk.entries
+        );
+        assert_eq!(seqs(&chunk.entries), vec![1, 2, 3, 4], "the rest is intact");
+    }
+
+    #[tokio::test]
+    async fn a_plaintext_segment_is_a_gap_and_the_ring_goes_on_after_it() {
+        let (state, claim, store, rec, limits) = two_batches().await;
+        let mut plain = segment_secret(&rec, &LogSegment::empty(2, 0), None);
+        let ann = plain.metadata.annotations.as_mut().unwrap();
+        ann.remove(SEAL_ANNOTATION);
+        ann.insert(BYTES_ANNOTATION.into(), "9".into());
+        ann.insert(LAST_SEQ_ANNOTATION.into(), "5".into());
+        plain.data = Some(BTreeMap::from([(
+            ENTRIES_KEY.to_owned(),
+            ByteString(
+                b"{\"seq\":5,\"stream\":\"stdout\",\"ts\":\"2026-01-01T00:00:00Z\",\"text\":\"in-the-clear\"}\n"
+                    .to_vec(),
+            ),
+        )]));
+        plant(&state, &plain);
+        let chunk = store.read_logs(claim, None).await.unwrap();
+        assert!(
+            !format!("{:?}", chunk.entries).contains("in-the-clear"),
+            "{:?}",
+            chunk.entries
+        );
+        assert!(
+            chunk
+                .entries
+                .iter()
+                .any(|e| matches!(e, LogEntry::Gap(g) if g.unreadable == 9))
+        );
+        store
+            .append_logs(&rec, &log_batch(6, 6, "next"), &limits)
+            .await
+            .unwrap();
+        let names: Vec<String> = segment_secrets(&state)
+            .iter()
+            .map(|s| s["metadata"]["name"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            names.last().unwrap(),
+            &logs_segment_name(claim, 3),
+            "a new segment after the plaintext one: {names:?}"
+        );
     }
 }
