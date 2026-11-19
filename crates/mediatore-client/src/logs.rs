@@ -6,7 +6,13 @@
 //! records to another, so a shell can split them as it would a terminal's; a truncation or a
 //! gap is one line on the error writer. Redaction happened in the VM and is best effort; the
 //! CLI only prints what the broker stored.
+//!
+//! The text is the workload's, and the store and the broker stand between the guest (which
+//! neutralises control characters before it queues a line) and this terminal, so the reader
+//! escapes them again ([`escape_controls`]) unless `--raw` asks for the stored text as it is.
 
+use std::borrow::Cow;
+use std::fmt::Write as _;
 use std::io::Write;
 
 use mediatore_proto::{LogEnd, LogLine, LogStream};
@@ -41,6 +47,42 @@ impl LogsQuery {
     }
 }
 
+/// Whether `c` is written out as an escape: every C0 control but tab, DEL, and the C1 range
+/// (U+0080 to U+009F). That is Unicode's `Cc` category less the tab.
+fn is_escaped(c: char) -> bool {
+    c != '\t' && c.is_control()
+}
+
+/// `text` with every control character but the tab replaced by its visible spelling, the one
+/// the guest uses: `\x1b` (backslash, `x`, two lowercase hex digits) for a C0 control or DEL,
+/// `\u{9b}` for a C1 control. Everything else is kept, so text the guest already neutralised
+/// comes through unchanged. Borrowed when there is nothing to do.
+///
+/// A record's text was chosen by the workload: an ESC starts a terminal sequence (OSC 52
+/// writes the reader's clipboard), a carriage return overwrites what was printed before it,
+/// and a newline would start a line that looks like a record of its own.
+#[must_use]
+pub fn escape_controls(text: &str) -> Cow<'_, str> {
+    let Some(first) = text.find(is_escaped) else {
+        return Cow::Borrowed(text);
+    };
+    let mut out = String::with_capacity(text.len() + 16);
+    out.push_str(&text[..first]);
+    for c in text[first..].chars() {
+        if !is_escaped(c) {
+            out.push(c);
+            continue;
+        }
+        // Writing to a String does not fail.
+        let _ = if c.is_ascii() {
+            write!(out, "\\x{:02x}", u32::from(c))
+        } else {
+            write!(out, "\\u{{{:x}}}", u32::from(c))
+        };
+    }
+    Cow::Owned(out)
+}
+
 /// An incremental reader of the NDJSON stream: fed chunks as they arrive, it prints each
 /// complete line and reports the end line when it comes. A chunk boundary inside a line is
 /// reassembled; empty keepalive lines are skipped.
@@ -48,6 +90,8 @@ pub struct LogPrinter<'a, O: Write, E: Write> {
     out: &'a mut O,
     err: &'a mut E,
     timestamps: bool,
+    /// Print record text as stored, control characters included (`--raw`).
+    raw: bool,
     buf: Vec<u8>,
     /// Lines seen so far, for error messages (the line itself is never echoed: it may carry
     /// what redaction missed).
@@ -56,15 +100,26 @@ pub struct LogPrinter<'a, O: Write, E: Write> {
 
 impl<'a, O: Write, E: Write> LogPrinter<'a, O, E> {
     /// Print stdout records to `out`, stderr records and the gap and truncation notes to
-    /// `err`; `timestamps` prefixes each record with the broker's RFC 3339 time.
+    /// `err`; `timestamps` prefixes each record with the broker's RFC 3339 time. Control
+    /// characters in a record's text are escaped ([`escape_controls`]) unless [`Self::raw`]
+    /// turns that off.
     pub fn new(out: &'a mut O, err: &'a mut E, timestamps: bool) -> Self {
         Self {
             out,
             err,
             timestamps,
+            raw: false,
             buf: Vec::new(),
             lines: 0,
         }
+    }
+
+    /// With `true`, print record text exactly as the broker stored it: for output piped to a
+    /// file, not for a terminal.
+    #[must_use]
+    pub fn raw(mut self, raw: bool) -> Self {
+        self.raw = raw;
+        self
     }
 
     /// Consume one chunk of the body. Returns the end reason once the end line is read;
@@ -124,9 +179,14 @@ impl<'a, O: Write, E: Write> LogPrinter<'a, O, E> {
                 } else {
                     String::new()
                 };
+                let text = if self.raw {
+                    Cow::Borrowed(r.text.as_str())
+                } else {
+                    escape_controls(&r.text)
+                };
                 match r.stream {
-                    LogStream::Stdout => writeln!(self.out, "{prefix}{}", r.text)?,
-                    LogStream::Stderr => writeln!(self.err, "{prefix}{}", r.text)?,
+                    LogStream::Stdout => writeln!(self.out, "{prefix}{text}")?,
+                    LogStream::Stderr => writeln!(self.err, "{prefix}{text}")?,
                 }
             }
             LogLine::Gap(g) if g.unreadable > 0 => writeln!(
@@ -145,7 +205,7 @@ impl<'a, O: Write, E: Write> LogPrinter<'a, O, E> {
     }
 }
 
-/// Read a broker's answer to the end, printing as it comes.
+/// Read a broker's answer to the end, printing as it comes; `raw` as [`LogPrinter::raw`].
 ///
 /// # Errors
 /// The body failing mid-way, a malformed line, or a stream cut before its end line.
@@ -154,8 +214,9 @@ pub async fn print_response<O: Write, E: Write>(
     out: &mut O,
     err: &mut E,
     timestamps: bool,
+    raw: bool,
 ) -> anyhow::Result<LogEnd> {
-    let mut printer = LogPrinter::new(out, err, timestamps);
+    let mut printer = LogPrinter::new(out, err, timestamps).raw(raw);
     while let Some(chunk) = resp.chunk().await? {
         if let Some(end) = printer.feed(&chunk)? {
             return Ok(end);
@@ -291,6 +352,115 @@ mod tests {
             String::from_utf8(err).unwrap(),
             "[777 bytes of older output dropped by the broker]\n"
         );
+    }
+
+    // ----- control characters in record text (red-team review 2026-11-19, A-10) -----
+
+    /// What a workload would send to take over a terminal: a clipboard write (OSC 52, ended
+    /// by BEL), a colour, a carriage return, a C1 CSI, a newline inside the record.
+    const HOSTILE: &str = "\x1b]52;c;aGk=\x07\x1b[31mred\rover\u{9b}2J\nforged";
+    const HOSTILE_ESCAPED: &str = "\\x1b]52;c;aGk=\\x07\\x1b[31mred\\x0dover\\u{9b}2J\\x0aforged";
+
+    /// What is printed as it is: a tab, text outside ASCII, a redaction marker.
+    const PLAIN: &str = "tab\tkept caf\u{e9} \u{65e5}\u{672c} [REDACTED]";
+
+    fn hostile_stream() -> String {
+        [
+            header(0),
+            record(1, LogStream::Stdout, HOSTILE),
+            record(2, LogStream::Stderr, HOSTILE),
+            record(3, LogStream::Stdout, PLAIN),
+            end(LogEnd::ClaimEnded),
+        ]
+        .join("\n")
+            + "\n"
+    }
+
+    #[test]
+    fn escape_controls_spells_out_every_control_but_the_tab() {
+        assert_eq!(escape_controls(HOSTILE), HOSTILE_ESCAPED);
+        assert_eq!(
+            escape_controls("\0\x08\x7f\u{80}\u{9f}"),
+            "\\x00\\x08\\x7f\\u{80}\\u{9f}"
+        );
+        for c in (0..=0x1f_u32).chain(0x7f..=0x9f) {
+            let c = char::from_u32(c).unwrap();
+            let got = escape_controls(&format!("a{c}b")).into_owned();
+            assert_eq!(
+                got.chars().any(char::is_control),
+                c == '\t',
+                "U+{:04X}",
+                u32::from(c)
+            );
+        }
+        for kept in [
+            "",
+            "plain",
+            "a\tb",
+            "caf\u{e9} \u{1f980} a\u{a0}b",
+            "<3>text",
+            "[REDACTED]",
+            HOSTILE_ESCAPED,
+        ] {
+            let got = escape_controls(kept);
+            assert!(matches!(got, Cow::Borrowed(_)), "{kept:?} was rewritten");
+            assert_eq!(got, kept);
+        }
+    }
+
+    #[test]
+    fn control_characters_in_a_record_are_escaped_on_both_writers() {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let mut p = LogPrinter::new(&mut out, &mut err, false);
+        assert_eq!(
+            p.feed(hostile_stream().as_bytes()).unwrap(),
+            Some(LogEnd::ClaimEnded)
+        );
+        let (out, err) = (
+            String::from_utf8(out).unwrap(),
+            String::from_utf8(err).unwrap(),
+        );
+        assert_eq!(out, format!("{HOSTILE_ESCAPED}\n{PLAIN}\n"));
+        assert_eq!(err, format!("{HOSTILE_ESCAPED}\n"));
+        // One line per record: nothing the workload sent starts a line of its own.
+        assert_eq!(out.lines().count(), 2);
+        assert!(
+            !out.chars()
+                .chain(err.chars())
+                .any(|c| c != '\n' && c != '\t' && c.is_control())
+        );
+    }
+
+    #[test]
+    fn timestamps_stay_in_front_of_an_escaped_record() {
+        let text = [
+            record(1, LogStream::Stdout, "\rspoofed"),
+            end(LogEnd::ClaimEnded),
+        ]
+        .join("\n");
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let mut p = LogPrinter::new(&mut out, &mut err, true);
+        p.feed(text.as_bytes()).unwrap();
+        assert_eq!(p.finish().unwrap(), LogEnd::ClaimEnded);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "2023-11-14T22:13:20Z \\x0dspoofed\n"
+        );
+    }
+
+    #[test]
+    fn raw_prints_the_stored_text_as_it_is() {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let mut p = LogPrinter::new(&mut out, &mut err, false).raw(true);
+        assert_eq!(
+            p.feed(hostile_stream().as_bytes()).unwrap(),
+            Some(LogEnd::ClaimEnded)
+        );
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!("{HOSTILE}\n{PLAIN}\n")
+        );
+        assert_eq!(String::from_utf8(err).unwrap(), format!("{HOSTILE}\n"));
     }
 
     #[test]

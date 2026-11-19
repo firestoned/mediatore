@@ -45,6 +45,7 @@ macro_rules! suite {
                 a_name_in_one_namespace_is_not_found_in_another,
                 an_old_claim_record_reads_as_the_fallback_namespace,
                 update_replaces_and_needs_an_existing_row,
+                an_update_over_a_released_claim_writes_nothing,
                 revoke_is_idempotent_and_drops_the_refresh_envelope,
                 revoke_of_an_unknown_claim_is_not_found,
                 claim_by_node_finds_only_the_newest_live_claim,
@@ -56,6 +57,8 @@ macro_rules! suite {
                 a_session_is_taken_once_deleted_on_demand_and_swept_when_stale,
                 an_envelope_is_swept_when_it_expires_and_not_only_when_it_is_old,
                 a_bound_claims_delegation_is_removed_when_it_expires,
+                a_parked_issuer_session_is_swept_when_it_expires,
+                a_live_claims_session_outlasts_the_sweep_and_an_ended_claims_does_not,
                 delegations_are_parked_per_audience_and_revocation_empties_them,
                 a_policy_floor_round_trips_to_the_nanosecond,
                 a_policy_floor_moves_only_from_what_is_held,
@@ -284,6 +287,55 @@ pub(crate) async fn update_replaces_and_needs_an_existing_row(s: &dyn ClaimStore
 
     let err = s.update_claim(claim(Uuid::new_v4())).await.unwrap_err();
     assert!(matches!(err, StoreError::NotFound(_)), "{err}");
+}
+
+/// A released record is final. A writer that read its copy before the release (a guest's report, a refresh, a bind)
+/// and writes it afterwards must not bring the claim back: `revoked_at` stays, and neither the refresh envelope
+/// nor a delegation is stored again.
+pub(crate) async fn an_update_over_a_released_claim_writes_nothing(s: &dyn ClaimStore) {
+    let (uid, sandbox_uid) = (Uuid::new_v4(), Uuid::new_v4());
+    let mut rec = claim(uid);
+    rec.sandbox_uid = Some(sandbox_uid);
+    rec.expires_at = Some(at(3600));
+    rec.refresh = Some(sealer().seal(sandbox_uid, b"dex-refresh").await.unwrap());
+    rec.delegations.insert(
+        "github".into(),
+        DelegatedSession {
+            envelope: sealer()
+                .seal(sandbox_uid, b"{\"token\":\"gh\"}")
+                .await
+                .unwrap(),
+            expires_at: None,
+        },
+    );
+    s.put_claim(rec).await.unwrap();
+
+    // The copy a slow writer holds: read while the claim was live, refresh material and all.
+    let mut stale = s.get_claim(uid).await.unwrap();
+    let carried = stale.refresh.is_some() && stale.delegations.len() == 1;
+    assert!(carried, "the copy read before the release carries both");
+    s.revoke_claim(uid, at(5)).await.unwrap();
+
+    stale.entry_id = Some("entry".into());
+    let refused = matches!(s.update_claim(stale).await, Err(StoreError::Conflict(_)));
+    assert!(refused, "an update over a released claim is a conflict");
+
+    let got = s.get_claim(uid).await.unwrap();
+    assert_eq!(
+        got.revoked_at,
+        Some(at(5)),
+        "still released, at the same instant"
+    );
+    assert!(!got.is_live(at(0)));
+    assert!(got.refresh.is_none(), "no refresh material came back");
+    assert!(got.delegations.is_empty(), "no delegation came back");
+    assert!(got.entry_id.is_none(), "no field of the stale copy landed");
+    // Nor as a session for the sandbox to be taken again.
+    assert!(s.take_session(sandbox_uid).await.unwrap().is_none());
+    assert!(
+        s.take_delegations(sandbox_uid).await.unwrap().is_empty(),
+        "no delegation is left to take"
+    );
 }
 
 pub(crate) async fn revoke_is_idempotent_and_drops_the_refresh_envelope(s: &dyn ClaimStore) {
@@ -659,6 +711,82 @@ pub(crate) async fn a_bound_claims_delegation_is_removed_when_it_expires(s: &dyn
         .cloned()
         .collect();
     assert_eq!(kept, vec!["later".to_string(), "open".to_string()]);
+}
+
+/// The issuer's session is an envelope like any other: parked with an expiry (the claim's creation plus its TTL), it
+/// goes when that passes, whatever its age, so one whose sandbox never got a record is not kept for the grace period.
+pub(crate) async fn a_parked_issuer_session_is_swept_when_it_expires(s: &dyn ClaimStore) {
+    let (expired_uid, later_uid) = (Uuid::new_v4(), Uuid::new_v4());
+    // Both created after the cutoff below, so the age rule removes neither.
+    let mut expired = parked(expired_uid, None, b"dex-refresh", Some(at(160))).await;
+    expired.created_at = at(100);
+    let mut later = parked(
+        later_uid,
+        None,
+        b"dex-refresh",
+        Some(Timestamp::now() + SignedDuration::from_hours(1)),
+    )
+    .await;
+    later.created_at = at(100);
+    s.put_session(expired).await.unwrap();
+    s.put_session(later.clone()).await.unwrap();
+
+    assert_eq!(
+        s.sweep_sessions(at(50)).await.unwrap(),
+        1,
+        "the issuer's session past its expiry goes; the one with time left stays"
+    );
+    assert!(s.take_session(expired_uid).await.unwrap().is_none());
+    let kept = s.take_session(later_uid).await.unwrap() == Some(later);
+    assert!(
+        kept,
+        "the session with time left is still there, expiry and all"
+    );
+}
+
+/// The other half of the rule: a claim's own session is kept for as long as the claim may issue, however long ago
+/// it was delegated, so a bound claim refreshes to its deadline and an unbound one waits with its session; once the
+/// claim has ended, nothing of it is stored any more.
+pub(crate) async fn a_live_claims_session_outlasts_the_sweep_and_an_ended_claims_does_not(
+    s: &dyn ClaimStore,
+) {
+    let (bound, waiting, ended) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    let now = Timestamp::now();
+    for (uid, expires_at) in [
+        (bound, Some(now + SignedDuration::from_hours(1))),
+        (waiting, None),
+        (ended, Some(now - SignedDuration::from_secs(1))),
+    ] {
+        let mut rec = claim(uid);
+        rec.name = format!("sandbox-{uid}");
+        // Created long before any cutoff a sweep is given.
+        rec.created_at = at(0);
+        rec.expires_at = expires_at;
+        rec.refresh = Some(sealer().seal(uid, b"dex-refresh").await.unwrap());
+        rec.delegations.insert(
+            "open".into(),
+            DelegatedSession {
+                envelope: sealer().seal(uid, b"{\"token\":\"c\"}").await.unwrap(),
+                expires_at: None,
+            },
+        );
+        s.put_claim(rec).await.unwrap();
+    }
+
+    assert_eq!(
+        s.sweep_sessions(now).await.unwrap(),
+        2,
+        "the ended claim's session and its delegation, nothing of a live claim"
+    );
+    for uid in [bound, waiting] {
+        let got = s.get_claim(uid).await.unwrap();
+        let kept = got.refresh.is_some() && got.delegations.len() == 1;
+        assert!(kept, "a claim that may still issue keeps its envelopes");
+    }
+    let got = s.get_claim(ended).await.unwrap();
+    let emptied = got.refresh.is_none() && got.delegations.is_empty();
+    assert!(emptied, "a claim past its deadline keeps none");
+    assert_eq!(s.sweep_sessions(now).await.unwrap(), 0, "and only once");
 }
 
 /// A session parked for `sandbox_uid`: the issuer's (`audience` `None`) or a delegation's.

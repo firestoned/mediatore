@@ -47,3 +47,6 @@ and placed by the proxy). The three later ones are never an issuer's backend.
 - The `sts` backend is usable at work for services that validate JWTs, reducing Entra app
   registrations.
 - mediatore is a single point of trust; see the threat model for mitigations.
+- *Added 2026-11-19:* an `sts` token lives for the shortest of fifteen minutes, its own
+  audience's `max_ttl` and the time left on the claim, and no backend states an expiry later
+  than the claim's.

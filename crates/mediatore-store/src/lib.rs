@@ -316,7 +316,9 @@ pub trait ClaimStore: LogStore {
         namespace: &str,
         name: &str,
     ) -> Result<ClaimRecord, StoreError>;
-    /// Replace an existing claim record.
+    /// Replace an existing claim record. A released record is final: an update of one is a
+    /// `Conflict` and writes nothing, so a writer holding a copy read before the release can
+    /// neither clear `revoked_at` nor put back the envelopes the release dropped.
     async fn update_claim(&self, rec: ClaimRecord) -> Result<(), StoreError>;
     /// Mark revoked and drop the refresh envelope; idempotent (the first timestamp wins).
     async fn revoke_claim(&self, uid: Uuid, at: Timestamp) -> Result<(), StoreError>;
@@ -354,7 +356,10 @@ pub trait ClaimStore: LogStore {
     /// Remove every session parked for `sandbox_uid`, the issuer's and the delegations;
     /// nothing to remove is fine.
     async fn delete_session(&self, sandbox_uid: Uuid) -> Result<(), StoreError>;
-    /// Remove every session delegated before `before`. Returns how many.
+    /// Remove every parked session delegated before `before`, every envelope past its expiry
+    /// (the issuer's session included, parked or on a record; a live claim's is kept to the
+    /// claim's own deadline), and every envelope still on a record whose claim has ended.
+    /// Returns how many.
     async fn sweep_sessions(&self, before: Timestamp) -> Result<usize, StoreError>;
     /// The floor held for a policy, if one was ever recorded.
     async fn get_policy_floor(
@@ -583,8 +588,17 @@ impl ClaimStore for MemoryStore {
 
     async fn update_claim(&self, rec: ClaimRecord) -> Result<(), StoreError> {
         let mut m = self.claims.write().await;
-        if !m.contains_key(&rec.uid) {
+        let Some(held) = m.get(&rec.uid) else {
             return Err(StoreError::NotFound(rec.uid.to_string()));
+        };
+        // A released record is final, the same rule as `KubeStore`: the copy in `rec` may
+        // have been read before the release, and writing it would clear `revoked_at` and put
+        // the refresh material back. Checked and written under the one lock.
+        if held.revoked_at.is_some() {
+            return Err(StoreError::Conflict(format!(
+                "claim {} is released",
+                rec.uid
+            )));
         }
         m.insert(rec.uid, rec);
         Ok(())
@@ -729,8 +743,15 @@ impl ClaimStore for MemoryStore {
         // (the operator's rule, ADR-0043 decision 4), which can be before the claim ends.
         for rec in self.claims.write().await.values_mut() {
             let held = rec.delegations.len();
-            rec.delegations
-                .retain(|_, d| d.expires_at.is_none_or(|e| e > now));
+            if rec.is_live(now) {
+                rec.delegations
+                    .retain(|_, d| d.expires_at.is_none_or(|e| e > now));
+            } else {
+                // An ended claim (revoked, or past its deadline) keeps no envelope, the issuer's session included:
+                // `KubeStore` deletes the Secrets of one. A live claim's session stays, however old it is.
+                swept += usize::from(rec.refresh.take().is_some());
+                rec.delegations.clear();
+            }
             swept += held - rec.delegations.len();
         }
         Ok(swept)

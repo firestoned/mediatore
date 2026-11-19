@@ -3,7 +3,10 @@
 
 //! Jail supervision: run the workload until the claim's deadline, restart it as its
 //! restart policy says (ADR-0033), end the claim when the egress proxy goes (ADR-0025),
-//! tear everything down at the end.
+//! tear everything down at the end. Killing `nsjail` is not the end of the workload (it is
+//! pid 1 of the jail's PID namespace and can clear its parent-death signal), so wherever
+//! the jail is killed every process of the sandbox uid is killed after it, and the
+//! teardown removes the ruleset only once none is left.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -62,6 +65,72 @@ pub enum Event {
     ProxyExited(std::process::ExitStatus),
 }
 
+/// What the teardown may remove, decided by whether a process of the sandbox uid is still
+/// alive after the kill.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cleanup {
+    /// Nobody is left: the ruleset and the user go, as ADR-0020 decision 6 says.
+    Everything,
+    /// A process of the uid survived (or the process table could not be read): the ruleset
+    /// stays loaded, so the survivor keeps its network bound, and the user stays, so its
+    /// uid is not freed for another name. The VM is destroyed with the claim anyway.
+    KeepRulesetAndUser,
+}
+
+impl Cleanup {
+    /// Whether the uid-keyed table may be deleted.
+    #[must_use]
+    pub fn unloads_ruleset(self) -> bool {
+        self == Self::Everything
+    }
+
+    /// Whether the sandbox user may be removed.
+    #[must_use]
+    pub fn removes_user(self) -> bool {
+        self == Self::Everything
+    }
+}
+
+/// The teardown's decision: survivors mean the ruleset and the user stay.
+#[must_use]
+pub fn cleanup_after(survivors: bool) -> Cleanup {
+    if survivors {
+        Cleanup::KeepRulesetAndUser
+    } else {
+        Cleanup::Everything
+    }
+}
+
+/// Kill every process of the sandbox user except `spare` and wait for them to be gone
+/// (`user::kill_all`); whether any is left. Not knowing (no uid for the name, a process
+/// table that cannot be read) counts as survivors: the teardown fails closed on it. Logs
+/// the count alone, never a command line or an environment.
+async fn kill_sandbox_processes(username: &str, spare: Option<u32>) -> bool {
+    let uid = match user::uid(username).await {
+        Ok(uid) => uid,
+        Err(e) => {
+            tracing::error!(user = username, error = %e, "no uid for the sandbox user; its processes cannot be told apart, assuming some are alive");
+            return true;
+        }
+    };
+    match user::kill_all(uid, spare).await {
+        Ok(0) => false,
+        Ok(survivors) => {
+            tracing::error!(
+                user = username,
+                uid,
+                survivors,
+                "processes of the sandbox user are still alive after SIGKILL"
+            );
+            true
+        }
+        Err(e) => {
+            tracing::error!(user = username, uid, error = %e, "could not look for the sandbox user's processes, assuming some are alive");
+            true
+        }
+    }
+}
+
 /// The decision for an exit status of the jail under `policy` (ADR-0033 decision 1): the
 /// confinement refusal stops the claim whatever the policy; otherwise `always` restarts,
 /// `on-failure` restarts a non-zero exit and is done on `0`, `never` is done on any exit.
@@ -95,8 +164,9 @@ pub fn after_event(event: Event, policy: RestartPolicy) -> Next {
 /// drained to EOF after every exit before the next step. Without it the jail inherits the
 /// guest's stdio, as before.
 ///
-/// Returns when the deadline passes (the running jail killed first; the proxy is the
-/// caller's to kill) or when the policy ends the claim on an exit. An error spawning the
+/// Returns when the deadline passes (the running jail killed first, then every other
+/// process of the sandbox user but the proxy, which is the caller's to kill once the output
+/// is flushed) or when the policy ends the claim on an exit. An error spawning the
 /// jail is returned immediately: a sandbox that cannot start must not linger half-built.
 /// The proxy exiting is an error too.
 pub async fn run(
@@ -139,12 +209,17 @@ pub async fn run(
                 let status = status?;
                 child.start_kill()?;
                 let _ = child.wait().await;
+                // The proxy is reaped: `id()` is `None`, nobody is spared.
+                kill_sandbox_processes(&spec.user, proxy.id()).await;
                 Event::ProxyExited(status)
             }
             () = tokio::time::sleep(remaining) => {
                 tracing::info!("claim deadline reached; stopping the jail");
                 child.start_kill()?;
                 let _ = child.wait().await;
+                // Before the drain: a survivor holds the pipes open. The proxy is spared
+                // here and stopped by the caller; the teardown looks again without it.
+                kill_sandbox_processes(&spec.user, proxy.id()).await;
                 if let Some(r) = readers {
                     r.drain().await;
                 }
@@ -180,11 +255,22 @@ pub async fn run(
     }
 }
 
-/// Best-effort teardown: drop the ruleset, unmount the sandbox tmpfs (ADR-0021), wipe
-/// whatever is left under the root when there was no mount, and remove the user. Failures
-/// are logged, never fatal; the VM is about to be destroyed anyway.
+/// Best-effort teardown: kill whatever still runs as the sandbox user (the caller has
+/// stopped the egress proxy by now, so nothing is spared), drop the ruleset, unmount the
+/// sandbox tmpfs (ADR-0021), wipe whatever is left under the root when there was no mount,
+/// and remove the user. With a survivor the ruleset and the user stay ([`cleanup_after`]);
+/// the unmount is still tried, lazily. Failures are logged, never fatal; the VM is about to
+/// be destroyed anyway.
 pub async fn teardown(sandbox_root: &Path, username: &str) {
-    net::unload().await;
+    let cleanup = cleanup_after(kill_sandbox_processes(username, None).await);
+    if cleanup.unloads_ruleset() {
+        net::unload().await;
+    } else {
+        tracing::error!(
+            user = username,
+            "the sandbox ruleset stays loaded and the user stays: a process of the uid may still be alive"
+        );
+    }
     match sandboxfs::is_mounted(sandbox_root) {
         Ok(true) => sandboxfs::unmount(sandbox_root).await,
         Ok(false) => {}
@@ -200,10 +286,12 @@ pub async fn teardown(sandbox_root: &Path, username: &str) {
             }
         }
     }
-    if let Err(e) = user::remove(username).await {
+    if cleanup.removes_user()
+        && let Err(e) = user::remove(username).await
+    {
         tracing::warn!(user = username, error = %e, "could not remove sandbox user");
     }
-    tracing::info!(user = username, "teardown complete");
+    tracing::info!(user = username, ?cleanup, "teardown complete");
 }
 
 #[cfg(test)]
@@ -257,6 +345,24 @@ mod tests {
         assert_eq!(after_exit(ExitStatus::from_raw(0), never), Next::Done);
         assert_eq!(after_exit(ExitStatus::from_raw(1 << 8), never), Next::Done);
         assert_eq!(after_exit(ExitStatus::from_raw(9), never), Next::Done);
+    }
+
+    #[test]
+    fn survivors_mean_the_ruleset_and_the_user_stay() {
+        let kept = cleanup_after(true);
+        assert_eq!(kept, Cleanup::KeepRulesetAndUser);
+        assert!(
+            !kept.unloads_ruleset(),
+            "a live process of the uid keeps its network bound"
+        );
+        assert!(!kept.removes_user(), "a uid in use is not freed");
+    }
+
+    #[test]
+    fn with_nobody_left_the_teardown_removes_everything() {
+        let all = cleanup_after(false);
+        assert_eq!(all, Cleanup::Everything);
+        assert!(all.unloads_ruleset() && all.removes_user());
     }
 
     #[test]

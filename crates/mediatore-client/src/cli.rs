@@ -44,6 +44,11 @@ pub struct Target {
     /// given, nothing else is trusted
     #[arg(long, env = "MEDIATORE_CA_FILE")]
     pub ca_file: Option<PathBuf>,
+    /// Send the login and anything delegated to a plain http user API on another host (a
+    /// test cluster with no TLS in front of the broker); without it only https, or http to
+    /// this machine, is accepted
+    #[arg(long, env = "MEDIATORE_ALLOW_PLAIN_HTTP")]
+    pub allow_plain_http: bool,
     /// The session file.
     #[command(flatten)]
     pub session: SessionFile,
@@ -52,6 +57,9 @@ pub struct Target {
 impl Target {
     /// The user API client for this target, with `--ca-file` as its only trust when given.
     pub fn api(&self) -> anyhow::Result<Api> {
+        if self.allow_plain_http && self.ca_file.is_none() {
+            return Api::plain_http(&self.mediatore);
+        }
         match &self.ca_file {
             Some(p) => {
                 let pem = std::fs::read(p)
@@ -195,6 +203,11 @@ pub enum SandboxCmd {
         /// Prefix each record with the time the guest read it
         #[arg(long)]
         timestamps: bool,
+        /// Print the output exactly as stored. Without it, control characters (escape
+        /// sequences, carriage returns) are written out as text such as \x1b, so the
+        /// workload cannot drive this terminal; use --raw only when writing to a file
+        #[arg(long)]
+        raw: bool,
     },
 }
 
@@ -359,6 +372,7 @@ pub async fn run(cmd: UserCmd) -> anyhow::Result<()> {
             tail,
             since,
             timestamps,
+            raw,
         }) => {
             let session = Session::load(&target.session.path()?)?;
             let query = crate::logs::LogsQuery {
@@ -374,7 +388,8 @@ pub async fn run(cmd: UserCmd) -> anyhow::Result<()> {
             // the broker just sees the reader go.
             let (stdout, stderr) = (std::io::stdout(), std::io::stderr());
             let (mut out, mut err) = (stdout.lock(), stderr.lock());
-            let reason = crate::logs::print_response(resp, &mut out, &mut err, timestamps).await?;
+            let reason =
+                crate::logs::print_response(resp, &mut out, &mut err, timestamps, raw).await?;
             out.flush()?;
             if reason != mediatore_proto::LogEnd::ClaimEnded {
                 writeln!(
@@ -710,6 +725,18 @@ mod tests {
     }
 
     #[test]
+    fn a_plain_http_user_api_on_another_host_is_taken_only_when_asked_for_by_name() {
+        let plain = ["t", "--mediatore", "http://mediatore.example:8080"];
+        let refused = T::try_parse_from(plain).unwrap().target;
+        assert!(!refused.allow_plain_http);
+        assert!(refused.api().is_err());
+        let mut asked = plain.to_vec();
+        asked.push("--allow-plain-http");
+        let allowed = T::try_parse_from(asked).unwrap().target;
+        assert!(allowed.api().is_ok());
+    }
+
+    #[test]
     fn the_user_api_commands_take_a_ca_file() {
         assert!(target(&[]).ca_file.is_none());
         let t = target(&["--ca-file", "/etc/ca.pem"]);
@@ -952,6 +979,7 @@ mod tests {
             "--since",
             "7",
             "--timestamps",
+            "--raw",
             "--namespace",
             "infra",
             "sb-1",
@@ -966,11 +994,13 @@ mod tests {
                 tail,
                 since,
                 timestamps,
+                raw,
                 ..
             } => {
                 assert_eq!(name, "sb-1");
                 assert_eq!(namespace.as_deref(), Some("infra"));
                 assert!(follow && timestamps);
+                assert!(raw, "A-10: the opt-out of the client's escaping");
                 assert_eq!(tail, Some(20));
                 assert_eq!(since, Some(7));
             }
@@ -985,9 +1015,11 @@ mod tests {
                 tail,
                 since,
                 timestamps,
+                raw,
                 ..
             } => {
                 assert!(!follow && !timestamps);
+                assert!(!raw, "escaped unless asked");
                 assert_eq!((tail, since), (None, None));
             }
             _ => panic!("logs"),
@@ -1038,7 +1070,7 @@ mod tests {
         );
         assert!(got.contains("authorization: Bearer id-token"), "{got}");
         let (mut out, mut err) = (Vec::new(), Vec::new());
-        let reason = crate::logs::print_response(resp, &mut out, &mut err, false)
+        let reason = crate::logs::print_response(resp, &mut out, &mut err, false, false)
             .await
             .unwrap();
         assert_eq!(reason, mediatore_proto::LogEnd::ClaimEnded);

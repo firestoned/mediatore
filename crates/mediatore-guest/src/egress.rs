@@ -28,8 +28,10 @@
 //! gateway_refused`, none reachable `502 gateway_unreachable`; a route with nowhere to be sent
 //! refuses the proxy at start, so it is never tunnelled or given a token instead.
 //!
-//! Refusals: `404` for a host outside the routes, `403` for a request outside the audience's
-//! rules, `401` for an `Authorization` that is not the phantom (the workload has no credential
+//! Refusals: `405` for a `TRACE` or a `CONNECT`, `404` for a host outside the routes, `400` for
+//! a path that is not canonical (a `.` or `..` segment, an empty one, a backslash, an encoded
+//! dot, slash or backslash: the rules match the path as sent), `403` for a request outside the
+//! audience's rules, `401` for an `Authorization` that is not the phantom (the workload has no credential
 //! of its own this layer carries), `502` when the token or the upstream cannot be had. A
 //! request with no `Authorization` is forwarded bare; `502` with `gateway_refused` when the
 //! gateway answered the tunnel with the environment's no (the authorizer's code is logged),
@@ -369,6 +371,13 @@ pub fn judge<'a>(
 /// each route's `credential_header`, ADR-0032 decision 3) is read on every route; a value
 /// that is not the phantom is `401`, the phantom in any of them is the phantom presented.
 ///
+/// Two refusals come before any route is consulted and hold on every kind of route: a
+/// `TRACE` or a `CONNECT` is `405` (this proxy forwards requests, it opens no tunnel for the
+/// workload, and an upstream that echoes a request would hand the placed credential back),
+/// and a path that is not in its one canonical spelling
+/// ([`mediatore_proto::path_is_canonical`]) is `400`, since the rules are globs over the
+/// path as sent and the path is forwarded as sent. The query is not part of that check.
+///
 /// # Errors
 /// The refusal the workload gets.
 pub fn judge_headers<'a>(
@@ -378,6 +387,12 @@ pub fn judge_headers<'a>(
     path_and_query: &str,
     headers: &http::HeaderMap,
 ) -> Result<Forward<'a>, Refusal> {
+    if method == Method::TRACE || method == Method::CONNECT {
+        return Err(Refusal::new(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "method_not_allowed",
+        ));
+    }
     let rest = path_and_query
         .strip_prefix('/')
         .ok_or(Refusal::new(StatusCode::BAD_REQUEST, "bad_request"))?;
@@ -397,6 +412,9 @@ pub fn judge_headers<'a>(
         format!("/{tail}")
     };
     let path = path_and_query.split('?').next().unwrap_or("/");
+    if !mediatore_proto::path_is_canonical(path) {
+        return Err(Refusal::new(StatusCode::BAD_REQUEST, "bad_request"));
+    }
     if !route.admits(method.as_str(), path) {
         return Err(Refusal::new(StatusCode::FORBIDDEN, "outside_rules"));
     }
@@ -2045,6 +2063,132 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.status, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn a_path_that_is_not_canonical_is_400_on_every_route_whatever_its_rules_admit() {
+        let wide = |credential: Credential| Route {
+            credential,
+            inject_port: (credential == Credential::Gateway).then_some(8444),
+            ..route("wide", "host.home.example:443", &[("*", "/**")])
+        };
+        let p = phantom();
+        for credential in [Credential::Token, Credential::None, Credential::Gateway] {
+            let r = Routes::new(vec![
+                wide(credential),
+                route(
+                    "narrow",
+                    "narrow.home.example:443",
+                    &[("GET", "/allowed/**")],
+                ),
+                route("open", "open.home.example:443", &[]),
+            ])
+            .unwrap();
+            for path in [
+                "/host.home.example/allowed/../other",
+                "/host.home.example/allowed/%2e%2e/other",
+                "/host.home.example/allowed/%2E%2e/other",
+                "/host.home.example/allowed/./other",
+                "/host.home.example/a%2fb",
+                "/host.home.example/a%2Fb",
+                "/host.home.example/a%5cb",
+                "/host.home.example/a\\b",
+                "/host.home.example/a//b",
+                "/host.home.example//a",
+                "/host.home.example/a%zz",
+                "/host.home.example/allowed/../other?x=1",
+                "/narrow.home.example/allowed/../../user/emails",
+                "/narrow.home.example/allowed/%2e%2e/%2e%2e/user/emails",
+                "/open.home.example/a/../b",
+            ] {
+                assert_eq!(
+                    judge(&r, &p, &Method::GET, path, None).unwrap_err(),
+                    Refusal::new(StatusCode::BAD_REQUEST, "bad_request"),
+                    "{path:?} on a {credential:?} route"
+                );
+            }
+            // The same rule admits the canonical spellings.
+            for path in [
+                "/host.home.example/allowed/other",
+                "/host.home.example/allowed/other/",
+                "/host.home.example/a%20b/c%2Bd",
+                "/host.home.example",
+                "/host.home.example/",
+            ] {
+                assert!(
+                    judge(&r, &p, &Method::GET, path, None).is_ok(),
+                    "{path:?} on a {credential:?} route"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_canonical_path_check_does_not_read_the_query() {
+        let r = Routes::new(vec![route(
+            "wide",
+            "host.home.example:443",
+            &[("*", "/**")],
+        )])
+        .unwrap();
+        let p = phantom();
+        for path_and_query in [
+            "/host.home.example/allowed?next=../other",
+            "/host.home.example/allowed?next=%2e%2e%2fother&x=a\\b",
+            "/host.home.example/allowed/?a=//b&c=%zz",
+            "/host.home.example?next=/../x",
+        ] {
+            let f = judge(&r, &p, &Method::GET, path_and_query, None)
+                .unwrap_or_else(|e| panic!("{path_and_query:?} refused: {}", e.code));
+            assert!(
+                path_and_query.ends_with(f.path_and_query.trim_start_matches('/')),
+                "the query goes upstream as it came: {path_and_query:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn trace_and_connect_are_405_on_every_route_before_anything_else_is_read() {
+        let r = routes();
+        let p = phantom();
+        for method in [Method::TRACE, Method::CONNECT] {
+            for path in [
+                // a route without rules, which admits every other method
+                "/192.0.2.10/anything",
+                // a route with rules
+                "/git.home.example/platform/x",
+                // no route at all, and not even a path
+                "/evil.example/x",
+                "x",
+            ] {
+                assert_eq!(
+                    judge(&r, &p, &method, path, None).unwrap_err(),
+                    Refusal::new(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed"),
+                    "{method} {path:?}"
+                );
+            }
+        }
+        let wide = Routes::new(vec![route(
+            "wide",
+            "host.home.example:443",
+            &[("*", "/**")],
+        )])
+        .unwrap();
+        let with_phantom = format!("Bearer {}", p.expose());
+        assert_eq!(
+            judge(
+                &wide,
+                &p,
+                &Method::TRACE,
+                "/host.home.example/x",
+                Some(with_phantom.as_bytes())
+            )
+            .unwrap_err()
+            .status,
+            StatusCode::METHOD_NOT_ALLOWED,
+            "a rule naming every method does not name TRACE"
+        );
+        assert!(judge(&wide, &p, &Method::OPTIONS, "/host.home.example/x", None).is_ok());
     }
 
     #[test]

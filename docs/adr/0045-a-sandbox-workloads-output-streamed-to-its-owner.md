@@ -234,7 +234,13 @@ leaves the VM.
    with idempotent writes and bounded, counted loss; it is not a durable log, and the guide
    says so.
 
-9. **The wire, and the CLI.**
+9. **The wire, and the CLI.** *Amended 2026-11-19: output is the workload's, so its control
+   characters are data and never instructions to a terminal or a journal. After redaction and
+   before both the console copy and the queue, the guest writes every control character but
+   the tab out as text (`\x1b`, `\u{9b}`), and the limits apply to the text as escaped; the
+   console copy starts with `workload: `, written by the guest, so a line cannot open with a
+   journal priority or pass for the guest's own. The CLI escapes again when it prints, and
+   `mediatore sandbox logs --raw` turns that second pass off for output sent to a file.*
    - **Node API (node SVID, `crates/mediatore-proto`, `crates/mediatore-api`):**
      `POST /v1/me/logs` with `LogBatch { records: Vec<LogRecord>, dropped_stdout: u64,
      dropped_stderr: u64 }` and `LogRecord { seq: u64, stream: LogStream (stdout|stderr),

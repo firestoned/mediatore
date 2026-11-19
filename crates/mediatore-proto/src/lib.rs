@@ -520,12 +520,47 @@ pub struct EndpointRule {
     pub path: String,
 }
 
+/// The most segments a request path may have and still be matched against a rule: a longer
+/// path matches nothing, so the work one request costs the matcher is bounded by a constant
+/// and not by what the workload chose to send. Far above any path an API names.
+pub const MAX_PATH_SEGMENTS: usize = 64;
+
 impl EndpointRule {
-    /// Whether `method` and `path` (no query) are admitted by this rule.
+    /// Whether `method` and `path` (no query) are admitted by this rule. A path of more than
+    /// [`MAX_PATH_SEGMENTS`] segments is admitted by no rule.
     #[must_use]
     pub fn matches(&self, method: &str, path: &str) -> bool {
-        (self.method == "*" || self.method.eq_ignore_ascii_case(method))
-            && glob_matches(&segments(&self.path), &segments(path))
+        if self.method != "*" && !self.method.eq_ignore_ascii_case(method) {
+            return false;
+        }
+        let path = segments(path);
+        path.len() <= MAX_PATH_SEGMENTS && glob_matches(&segments(&self.path), &path)
+    }
+
+    /// Check the rule's path glob as configuration: at most one `**` segment (two or more
+    /// say nothing one does not, and cost the matcher more on a path the workload chooses),
+    /// and at most [`MAX_PATH_SEGMENTS`] segments, since a longer pattern without a `**`
+    /// could match nothing. The broker's config check calls this for every rule.
+    ///
+    /// # Errors
+    /// A description of what the path glob breaks.
+    pub fn validate(&self) -> Result<(), String> {
+        let pattern = segments(&self.path);
+        let wildcards = pattern.iter().filter(|s| **s == "**").count();
+        if wildcards > 1 {
+            return Err(format!(
+                "path glob {:?} has {wildcards} `**` segments; at most one is allowed",
+                self.path
+            ));
+        }
+        if pattern.len() > MAX_PATH_SEGMENTS {
+            return Err(format!(
+                "path glob {:?} has {} segments; at most {MAX_PATH_SEGMENTS} are allowed",
+                self.path,
+                pattern.len()
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -535,18 +570,82 @@ fn segments(path: &str) -> Vec<&str> {
 }
 
 /// Segment-wise glob: `*` matches exactly one segment, `**` zero or more, anything else
-/// matches itself.
+/// matches itself. One pass per pattern segment over the path, so the cost is the product of
+/// the two lengths whatever the pattern holds: nothing backtracks.
 fn glob_matches(pattern: &[&str], path: &[&str]) -> bool {
-    match pattern.split_first() {
-        None => path.is_empty(),
-        Some((&"**", rest)) => (0..=path.len()).any(|skip| glob_matches(rest, &path[skip..])),
-        Some((&"*", rest)) => path
-            .split_first()
-            .is_some_and(|(_, tail)| glob_matches(rest, tail)),
-        Some((lit, rest)) => path
-            .split_first()
-            .is_some_and(|(head, tail)| head == lit && glob_matches(rest, tail)),
+    // `reach[j]`: the pattern segments taken so far match exactly the first `j` of the path.
+    let mut reach = vec![false; path.len() + 1];
+    reach[0] = true;
+    for seg in pattern {
+        let mut next = vec![false; path.len() + 1];
+        if *seg == "**" {
+            let mut any = false;
+            for (slot, reached) in next.iter_mut().zip(&reach) {
+                any |= *reached;
+                *slot = any;
+            }
+        } else {
+            for (j, head) in path.iter().enumerate() {
+                next[j + 1] = reach[j] && (*seg == "*" || seg == head);
+            }
+        }
+        reach = next;
     }
+    reach[path.len()]
+}
+
+/// Whether a request path (no query) is in the one spelling the rules can be trusted on.
+/// The rules are globs over the path as sent, and the path is forwarded as sent, so a path
+/// the upstream would resolve to another one walks around a rule with the credential
+/// attached. Both enforcement points, the guest's egress proxy and the gateway's inject
+/// authorizer, refuse a path this refuses before any rule is consulted.
+///
+/// Refused: a path that does not start with `/`; a `.` or `..` segment; an empty segment
+/// other than the one a trailing slash leaves (`//`); a backslash; a control character;
+/// a `%` not followed by two hex digits; and an escape that decodes to a dot, a slash, a
+/// backslash or a control character (`%2e`, `%2f`, `%5c`, `%00`, in either case). Every
+/// other escape (`%20`, `%2B`) and any other character, ASCII or not, is left to the rules.
+#[must_use]
+pub fn path_is_canonical(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix('/') else {
+        return false;
+    };
+    if path.chars().any(|c| c == '\\' || c.is_control()) || !escapes_are_plain(path.as_bytes()) {
+        return false;
+    }
+    let mut segs = rest.split('/').peekable();
+    while let Some(seg) = segs.next() {
+        let last = segs.peek().is_none();
+        if seg == "." || seg == ".." || (seg.is_empty() && !last) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Whether every `%` starts a well-formed escape that decodes to none of the bytes
+/// [`path_is_canonical`] refuses in their encoded form.
+fn escapes_are_plain(path: &[u8]) -> bool {
+    let hex = |b: u8| char::from(b).to_digit(16);
+    let mut i = 0;
+    while i < path.len() {
+        if path[i] != b'%' {
+            i += 1;
+            continue;
+        }
+        let (Some(hi), Some(lo)) = (
+            path.get(i + 1).copied().and_then(hex),
+            path.get(i + 2).copied().and_then(hex),
+        ) else {
+            return false;
+        };
+        let decoded = hi * 16 + lo;
+        if matches!(decoded, 0x2e | 0x2f | 0x5c | 0x7f) || decoded < 0x20 {
+            return false;
+        }
+        i += 3;
+    }
+    true
 }
 
 /// What the egress proxy puts in place of the phantom on a route (ADR-0025 decision 8).
@@ -2074,6 +2173,159 @@ mod tests {
         for bad in ["", "-a", "a-", "Team", "a.b", "a_b", "a b", &"a".repeat(64)] {
             assert!(!is_dns_label(bad), "{bad}");
         }
+    }
+
+    // ----- Red-team review 2026-11-19: canonical paths and bounded globs -------------------------------------------
+
+    #[test]
+    fn an_ordinary_path_is_canonical() {
+        for path in [
+            "/",
+            "/v1/messages",
+            "/v1/messages/",
+            "/platform/services.git/info/refs",
+            "/a%20b/c%2Bd",
+            "/a%7Eb",
+            "/caf\u{e9}/\u{65e5}\u{672c}",
+            "/a.b/..c/c../.../.hidden",
+            "/a~b/c;d=e/f:g/@h/i,j",
+        ] {
+            assert!(path_is_canonical(path), "{path:?} is refused");
+        }
+    }
+
+    #[test]
+    fn a_dot_segment_is_not_canonical() {
+        for path in [
+            "/..", "/.", "/a/..", "/a/../b", "/a/./b", "/a/b/.", "/../a", "/a/../",
+        ] {
+            assert!(!path_is_canonical(path), "{path:?} is admitted");
+        }
+    }
+
+    #[test]
+    fn an_encoded_dot_slash_or_backslash_is_not_canonical_in_either_case() {
+        for path in [
+            "/a/%2e%2e/b",
+            "/a/%2E%2E/b",
+            "/a/.%2e/b",
+            "/a/%2e/b",
+            "/a/b%2ejson",
+            "/a%2fb",
+            "/a%2Fb",
+            "/a/..%2fb",
+            "/a%5cb",
+            "/a%5Cb",
+            "/a/..%5c..%5cb",
+        ] {
+            assert!(!path_is_canonical(path), "{path:?} is admitted");
+        }
+    }
+
+    #[test]
+    fn a_backslash_an_empty_segment_or_a_relative_path_is_not_canonical() {
+        for path in [
+            "/a\\b",
+            "/a\\..\\b",
+            "\\a",
+            "//",
+            "//a",
+            "/a//b",
+            "/a//",
+            "",
+            "a/b",
+            "*",
+        ] {
+            assert!(!path_is_canonical(path), "{path:?} is admitted");
+        }
+    }
+
+    #[test]
+    fn a_malformed_escape_is_not_canonical() {
+        for path in [
+            "/a%",
+            "/a%2",
+            "/a%zz",
+            "/a%2g/b",
+            "/%",
+            "/a%+1",
+            "/a%\u{e9}9",
+        ] {
+            assert!(!path_is_canonical(path), "{path:?} is admitted");
+        }
+    }
+
+    #[test]
+    fn a_control_character_raw_or_encoded_is_not_canonical() {
+        for path in [
+            "/a\0b",
+            "/a\nb",
+            "/a\rb",
+            "/a\tb",
+            "/a\u{7f}b",
+            "/a\u{85}b",
+            "/a%00b",
+            "/a%0ab",
+            "/a%0D%0Ab",
+            "/a%7fb",
+        ] {
+            assert!(!path_is_canonical(path), "{path:?} is admitted");
+        }
+    }
+
+    #[test]
+    fn a_rule_with_more_than_one_double_star_is_refused_at_validation() {
+        for path in [
+            "/",
+            "/v1/messages",
+            "/api/**",
+            "/**/notes",
+            "/a/*/b/*/c",
+            "/**",
+        ] {
+            assert_eq!(rule("GET", path).validate(), Ok(()), "{path:?}");
+        }
+        for path in ["/**/**", "/a/**/b/**", "/**/a/**/b/**"] {
+            let err = rule("GET", path).validate().unwrap_err();
+            assert!(err.contains("`**`"), "{path:?}: {err}");
+        }
+        // `**` inside a segment is a literal, not a wildcard, so it does not count.
+        assert_eq!(rule("GET", "/a**/b**").validate(), Ok(()));
+        let long = "/a".repeat(MAX_PATH_SEGMENTS + 1);
+        assert!(rule("GET", &long).validate().is_err());
+        assert_eq!(
+            rule("GET", &"/a".repeat(MAX_PATH_SEGMENTS)).validate(),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_path_of_more_segments_than_the_cap_matches_no_rule() {
+        let at_cap = "/a".repeat(MAX_PATH_SEGMENTS);
+        let over = "/a".repeat(MAX_PATH_SEGMENTS + 1);
+        for pattern in ["/**", "/a/**", "/**/a"] {
+            assert!(rule("GET", pattern).matches("GET", &at_cap), "{pattern:?}");
+            assert!(!rule("GET", pattern).matches("GET", &over), "{pattern:?}");
+        }
+        assert!(
+            !inject_route(vec![rule("*", "/**")]).admits("GET", &over),
+            "a route admits nothing its rules do not"
+        );
+    }
+
+    #[test]
+    fn a_glob_with_several_double_stars_still_means_what_it_says_and_does_not_backtrack() {
+        // The matcher is linear in each of the pattern and the path, so a rule that slipped
+        // past validation costs a request nothing more.
+        assert!(rule("GET", "/**/a/**/b").matches("GET", "/x/a/y/z/b"));
+        assert!(rule("GET", "/**/a/**/b").matches("GET", "/a/b"));
+        assert!(!rule("GET", "/**/a/**/b").matches("GET", "/b/a"));
+        assert!(rule("GET", "/**/**").matches("GET", "/"));
+        assert!(rule("GET", "/*/**/*").matches("GET", "/a/b"));
+        assert!(!rule("GET", "/*/**/*").matches("GET", "/a"));
+        let hostile = "/**/x".repeat(16);
+        let path = "/a".repeat(MAX_PATH_SEGMENTS);
+        assert!(!rule("GET", &hostile).matches("GET", &path));
     }
 
     #[test]

@@ -1,0 +1,81 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+#
+# Who may write an AgentSandbox's status: the broker, and nobody else.
+#
+# The status is not a report somebody may correct. It carries the claim record
+# (ADR-0034): `status.record` is what the broker's store reads back as the
+# claim, and `status.claimUid` and `status.claimRef` are what the reconciler
+# takes as its own earlier decisions. Whoever writes it can say a sandbox is
+# bound, ready or revoked, and can name a claim that belongs to somebody else.
+#
+# The base RBAC gives `agentsandboxes/status` to the broker's ServiceAccount
+# alone (deploy/base/rbac.yaml). RBAC is additive, though: a namespace Role
+# written with `agentsandboxes/*`, or `*` on the group, hands the subresource
+# to a tenant without anyone meaning to. This policy holds whatever a Role
+# grants: a write to the status subresource from any other principal is
+# refused at admission, in the API server, by CEL (no webhook).
+#
+# No exemptions, both deliberate:
+#
+#   the garbage collector and the namespace controller delete objects and
+#   edit metadata; neither writes a status, so neither needs one.
+#
+#   cluster administrators. A member of `system:masters` is not subject to
+#   admission at all, so naming the group here would add nothing. Any other
+#   administrator who must repair a status by hand removes the binding below
+#   for the time it takes, which the API server's audit log records.
+#
+# The ServiceAccount is matched by its full username, as the policy on the
+# broker's registration entries does (clusterstaticentry-mediatore.yaml). An
+# overlay that renames the ServiceAccount or moves it to another namespace
+# must patch the name in every policy, or the broker's own status writes are
+# refused: sandboxes then stay Pending with the denial in the broker's log,
+# which is the failure to look for.
+#
+# Requires Kubernetes 1.30+ (ValidatingAdmissionPolicy GA).
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: mediatore-agentsandbox-status
+  labels:
+    app.kubernetes.io/name: mediatore
+    app.kubernetes.io/component: admission
+spec:
+  failurePolicy: Fail
+  # Every served version, by name (ADR-0049 decision 3): a served version left out would
+  # be ungoverned. Kept equal to the CRD's served versions by a unit test in
+  # crates/mediatore-claims/src/sandbox.rs; never `*`.
+  #
+  # The subresource is named on its own: a rule on `agentsandboxes` does not
+  # match `agentsandboxes/status`. UPDATE covers update, patch and apply; a
+  # status subresource has no CREATE or DELETE.
+  matchConstraints:
+    matchPolicy: Equivalent
+    resourceRules:
+      - apiGroups: ["mediatore.io"]
+        apiVersions: ["v1alpha1", "v1beta1"]
+        operations: ["UPDATE"]
+        resources: ["agentsandboxes/status"]
+  # No matchConditions: every write of the subresource is checked.
+  validations:
+    - expression: "request.userInfo.username == 'system:serviceaccount:banlieue-system:mediatore'"
+      messageExpression: >-
+        'the status of an AgentSandbox is written by mediatore alone (it'
+        + ' carries the claim record), and you are authenticated as '
+        + request.userInfo.username
+        + '. Nothing in it is yours to set: delete the AgentSandbox to'
+        + ' release it, or make a new one.'
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: mediatore-agentsandbox-status
+  labels:
+    app.kubernetes.io/name: mediatore
+    app.kubernetes.io/component: admission
+spec:
+  policyName: mediatore-agentsandbox-status
+  # Bound everywhere: no matchResources, so no namespace is left out.
+  validationActions: ["Deny"]

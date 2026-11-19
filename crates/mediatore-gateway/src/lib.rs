@@ -120,6 +120,13 @@ pub enum Refusal {
     /// The broker would not place the credential (`403`), answered for another audience than
     /// the one asked, or answered one that has already expired.
     CredentialRefused,
+    /// An inject question whose path is not in its one canonical spelling
+    /// ([`mediatore_proto::path_is_canonical`]): a `.` or `..` segment, an empty one, a
+    /// backslash, an encoded dot, slash or backslash. The rules match the path as sent, so
+    /// such a path is refused before any rule is read. Envoy normalises the path ahead of the
+    /// check on the inject listener; this is the second line, and the same refusal the guest
+    /// proxy makes.
+    BadPath,
 }
 
 impl Refusal {
@@ -136,6 +143,7 @@ impl Refusal {
             Self::BrokerRefused => "broker_refused",
             Self::NotInject => "not_inject",
             Self::CredentialRefused => "credential_refused",
+            Self::BadPath => "bad_path",
         }
     }
 }
@@ -344,6 +352,10 @@ impl Authorizer {
         let Some((name, port)) = split_host_port(host) else {
             return refuse(Some(uid), None, Refusal::BadAuthority);
         };
+        let path = path.split(['?', '#']).next().unwrap_or_default();
+        if !mediatore_proto::path_is_canonical(path) {
+            return refuse(Some(uid), None, Refusal::BadPath);
+        }
         let (routes, _) = self.entry_view(uid, |e| e.inject.clone()).await;
         let routes = match routes {
             Ok(r) => r,
@@ -353,7 +365,6 @@ impl Authorizer {
             return refuse(Some(uid), None, Refusal::NotAllowed);
         };
         let audience = Some(route.audience.clone());
-        let path = path.split(['?', '#']).next().unwrap_or_default();
         if !route.admits(method, path) {
             return refuse(Some(uid), audience, Refusal::NotAllowed);
         }
@@ -1247,7 +1258,7 @@ mod tests {
                 claim(uid),
                 "POST",
                 "api.anthropic.example",
-                "/v1/messages/../models",
+                "/v1/messages/batches",
                 Refusal::NotAllowed,
             ),
         ] {
@@ -1267,6 +1278,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_inject_check_refuses_a_path_that_is_not_canonical_before_anyone_is_asked() {
+        let creds = ScriptedCreds::new(vec![credential("x-api-key", 200)]);
+        let wide = InjectRoute {
+            rules: vec![EndpointRule {
+                method: "*".into(),
+                path: "/**".into(),
+            }],
+            ..route("x-api-key")
+        };
+        let src = Scripted::new(vec![Ok(found_inject(vec![wide], 600))]);
+        let a = Authorizer::new(TD, src.clone(), CacheConfig::default())
+            .with_credentials(creds.clone());
+        let uid = Uuid::new_v4();
+        for path in [
+            "/v1/messages/../models",
+            "/v1/messages/%2e%2e/models",
+            "/v1/messages/%2E%2E/models",
+            "/v1/./messages",
+            "/v1/a%2fb",
+            "/v1/a%5Cb",
+            "/v1/a\\b",
+            "/v1//messages",
+            "/v1/messages//",
+            "/v1/a%zz",
+            "/v1/messages/../models?x=1",
+            "v1/messages",
+            "",
+        ] {
+            let d = a
+                .authorize_inject(&claim(uid), "POST", "api.anthropic.example", path)
+                .await;
+            assert_eq!(d.verdict.map(|_| ()), Err(Refusal::BadPath), "{path:?}");
+            assert_eq!(d.audience, None, "{path:?}");
+        }
+        assert_eq!(Refusal::BadPath.code(), "bad_path");
+        assert_eq!(
+            src.asks.load(Ordering::SeqCst),
+            0,
+            "no refused path reached the broker"
+        );
+        assert_eq!(creds.asks.load(Ordering::SeqCst), 0);
+        // The same wide rule admits the canonical spelling.
+        let d = a
+            .authorize_inject(&claim(uid), "POST", "api.anthropic.example", "/v1/models")
+            .await;
+        assert!(d.verdict.is_ok());
+    }
+
+    #[tokio::test]
     async fn the_host_compares_without_case_a_missing_port_is_443_and_the_query_is_not_the_path() {
         let creds = ScriptedCreds::new(vec![credential("x-api-key", 200)]);
         let (a, _) = injector("x-api-key", creds, CacheConfig::default());
@@ -1278,7 +1338,8 @@ mod tests {
                 "api.anthropic.example",
                 "/v1/messages?beta=true&x=/v1/models",
             ),
-            ("api.anthropic.example", "/v1/messages//"),
+            ("api.anthropic.example", "/v1/messages/"),
+            ("api.anthropic.example", "/v1/messages?next=../models#a//b"),
         ] {
             let d = a.authorize_inject(&claim(uid), "post", host, path).await;
             assert!(

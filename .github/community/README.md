@@ -25,6 +25,7 @@ board is [`ROADMAPS.md`](../../ROADMAPS.md) at the repo root.
 | 12 | [12-claude-end-to-end.md](12-claude-end-to-end.md) | Every configuration the path to the Anthropic API depends on: Dex, SPIRE, notaio, the policies, the broker, the gateways |
 | 13 | [13-declarative-agentsandbox-credentials.md](13-declarative-agentsandbox-credentials.md) | How a resource a requester applies can carry a person's own credential without it sitting in the cluster in the clear: four options, a recommendation, the questions. Design only |
 | 14 | [14-secret-expiry-at-the-ttl.md](14-secret-expiry-at-the-ttl.md) | A stored secret removed right on its TTL, not up to a poll interval after: the envelope stays in Kubernetes, five ways to drive its deletion, a spike to choose. Spike only |
+| 15 | [15-observability.md](15-observability.md) | OTLP traces and metrics for every component under sixteen invariants: no secret in a signal, no new listener or route, push only over SVID mutual TLS, off by default, never on the request path |
 
 Dependency shape: 01 unblocks 02 (the agents need something to present SVIDs
-to) and 03–05 build on both; 06 needs 02; 07 builds on 04; 08 builds on 03 and narrows 05; 09 builds on 05 and 08; 10 needs 02 and 06's image work, and 07 builds on 10.
+to) and 03–05 build on both; 06 needs 02; 07 builds on 04; 08 builds on 03 and narrows 05; 09 builds on 05 and 08; 10 needs 02 and 06's image work, and 07 builds on 10; 15 needs 01, 05 and 10.

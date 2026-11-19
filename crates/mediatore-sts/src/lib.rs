@@ -7,6 +7,8 @@
 //! work for internal services that validate JWTs against a JWKS. Tokens carry an RFC 8693
 //! `act` claim naming the sandbox (its claim SVID) as the actor and the person as `sub`.
 
+use std::collections::BTreeMap;
+
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use jiff::{SignedDuration, Timestamp};
@@ -74,7 +76,7 @@ pub struct MintRequest<'a> {
     pub audience: &'a str,
     /// Group memberships carried through from the upstream token.
     pub groups: Vec<String>,
-    /// Requested lifetime; capped by [`Sts::max_ttl`].
+    /// Requested lifetime; capped by [`Sts::max_ttl_for`] the audience.
     pub ttl: SignedDuration,
 }
 
@@ -93,6 +95,8 @@ pub struct Sts {
     kid: String,
     key: EncodingKey,
     max_ttl: SignedDuration,
+    /// Per audience, a maximum of its own below `max_ttl` ([`Sts::with_audience_max_ttl`]).
+    audience_max_ttl: BTreeMap<String, SignedDuration>,
     jwks: serde_json::Value,
 }
 
@@ -150,8 +154,31 @@ impl Sts {
             kid,
             key,
             max_ttl,
+            audience_max_ttl: BTreeMap::new(),
             jwks,
         })
+    }
+
+    /// Bound tokens for `audience` to `max_ttl` (the audience's own `max_ttl` from the
+    /// configuration), whatever the other audiences allow. A value above the issuer's
+    /// maximum changes nothing: the lower of the two applies.
+    #[must_use]
+    pub fn with_audience_max_ttl(
+        mut self,
+        audience: impl Into<String>,
+        max_ttl: SignedDuration,
+    ) -> Self {
+        self.audience_max_ttl.insert(audience.into(), max_ttl);
+        self
+    }
+
+    /// Maximum lifetime of a token for `audience`: its own maximum when it has one, never
+    /// above [`Self::max_ttl`].
+    #[must_use]
+    pub fn max_ttl_for(&self, audience: &str) -> SignedDuration {
+        self.audience_max_ttl
+            .get(audience)
+            .map_or(self.max_ttl, |own| (*own).min(self.max_ttl))
     }
 
     /// Issuer URL as written into `iss`.
@@ -172,12 +199,19 @@ impl Sts {
         &self.jwks
     }
 
-    /// Mint a token. `now` is injectable for tests.
+    /// Mint a token that expires `req.ttl` after `now`. `now` is the caller's when it has
+    /// already measured the lifetime against a deadline of its own (a claim's), and
+    /// injectable for tests.
+    ///
+    /// # Errors
+    /// [`StsError::TtlTooLong`] when `req.ttl` is above [`Self::max_ttl_for`] the audience;
+    /// [`StsError::Encode`] when signing fails.
     pub fn mint_at(&self, req: &MintRequest<'_>, now: Timestamp) -> Result<Minted, StsError> {
-        if req.ttl > self.max_ttl {
+        let max = self.max_ttl_for(req.audience);
+        if req.ttl > max {
             return Err(StsError::TtlTooLong {
                 requested: req.ttl.as_secs(),
-                max: self.max_ttl.as_secs(),
+                max: max.as_secs(),
             });
         }
         let expires_at = now + req.ttl;
@@ -250,6 +284,75 @@ MUX5AKaxsGDNBXbbUOvRmJfjaSyiqtitNnd5Zd7UoxcUu0EiVY9OuHW2
             ttl: SignedDuration::from_hours(2),
         };
         assert!(matches!(sts.mint(&req), Err(StsError::TtlTooLong { .. })));
+    }
+
+    #[test]
+    fn an_audience_with_a_maximum_of_its_own_is_held_to_it_and_the_others_are_not() {
+        let sts = test_sts()
+            .with_audience_max_ttl("short", SignedDuration::from_mins(2))
+            .with_audience_max_ttl("generous", SignedDuration::from_hours(2));
+        assert_eq!(sts.max_ttl_for("short"), SignedDuration::from_mins(2));
+        assert_eq!(sts.max_ttl_for("grafana"), SignedDuration::from_mins(15));
+        assert_eq!(
+            sts.max_ttl_for("generous"),
+            SignedDuration::from_mins(15),
+            "never above the issuer's maximum"
+        );
+        let subject = Subject {
+            issuer: "https://dex.test".into(),
+            id: "octocat".into(),
+            display: None,
+        };
+        let request = |audience: &'static str, ttl: SignedDuration| MintRequest {
+            subject: &subject,
+            actor_spiffe_id: "spiffe://td/banlieue/claim/x",
+            claim_uid: Uuid::new_v4(),
+            audience,
+            groups: vec![],
+            ttl,
+        };
+        let five = SignedDuration::from_mins(5);
+        assert!(matches!(
+            sts.mint(&request("short", five)),
+            Err(StsError::TtlTooLong { max: 120, .. })
+        ));
+        assert!(sts.mint(&request("grafana", five)).is_ok());
+        assert!(
+            sts.mint(&request("short", SignedDuration::from_mins(2)))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_token_expires_ttl_after_the_instant_it_is_minted_at() {
+        let sts = test_sts();
+        let subject = Subject {
+            issuer: "https://dex.test".into(),
+            id: "octocat".into(),
+            display: None,
+        };
+        let req = MintRequest {
+            subject: &subject,
+            actor_spiffe_id: "spiffe://td/banlieue/claim/x",
+            claim_uid: Uuid::new_v4(),
+            audience: "grafana",
+            groups: vec![],
+            ttl: SignedDuration::from_secs(60),
+        };
+        let now = Timestamp::now();
+        let m = sts.mint_at(&req, now).unwrap();
+        assert_eq!(m.expires_at, now + SignedDuration::from_secs(60));
+
+        let jwk = &sts.jwks()["keys"][0];
+        let key = jsonwebtoken::DecodingKey::from_ec_components(
+            jwk["x"].as_str().unwrap(),
+            jwk["y"].as_str().unwrap(),
+        )
+        .unwrap();
+        let mut validation = jsonwebtoken::Validation::new(Algorithm::ES256);
+        validation.set_audience(&["grafana"]);
+        let data = jsonwebtoken::decode::<serde_json::Value>(&m.token, &key, &validation).unwrap();
+        assert_eq!(data.claims["exp"], m.expires_at.as_second());
     }
 
     #[test]

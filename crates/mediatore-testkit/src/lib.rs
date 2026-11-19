@@ -554,6 +554,7 @@ fn identity(
             "aud": client_id,
             "sub": format!("auth0|{login}"),
             "email": format!("{login}@example.com"),
+            "email_verified": true,
             AUTH0_GROUPS_CLAIM: groups,
         }),
     }

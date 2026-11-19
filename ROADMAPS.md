@@ -24,6 +24,7 @@ the same commit that changes a roadmap item's state.
 | 12 | The end-to-end flow to the Anthropic API (Dex, SPIRE, notaio, the policies, the broker, the gateways) | 🔶 in progress | [12-claude-end-to-end.md](.github/community/12-claude-end-to-end.md) |
 | 13 | Declarative `AgentSandbox` and a person's credential (design; ADR-0043 is its sibling for the registry pull) | ⛔ not started | [13-declarative-agentsandbox-credentials.md](.github/community/13-declarative-agentsandbox-credentials.md) |
 | 14 | A stored secret expires right on its TTL (a spike: the envelope stays in Kubernetes, how its deletion is driven) | ⛔ not started | [14-secret-expiry-at-the-ttl.md](.github/community/14-secret-expiry-at-the-ttl.md) |
+| 15 | Observability (OpenTelemetry) that never weakens security or speed | ⛔ not started | [15-observability.md](.github/community/15-observability.md) |
 
 Statuses: ✅ done · 🔶 in progress · ⛔ not started · 📄 reference doc.
 ADRs are separate and live in [`docs/adr/`](docs/adr/).

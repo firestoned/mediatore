@@ -257,7 +257,8 @@ needs on a real cluster.
 kubectl apply -n banlieue-system -f deploy/base/crds -f deploy/base/serviceaccount.yaml \
   -f deploy/base/rbac.yaml -f deploy/base/clusterspiffeid.yaml \
   -f deploy/base/admission/clusterstaticentry-mediatore.yaml \
-  -f deploy/base/admission/agentsandbox-subject.yaml
+  -f deploy/base/admission/agentsandbox-subject.yaml \
+  -f deploy/base/admission/agentsandbox-status.yaml
 MEDIATORE_LIVE_KUBECONFIG=~/.kube/core.yaml \
 MEDIATORE_LIVE_TRUST_DOMAIN=sandbox.home.example \
 MEDIATORE_LIVE_CLASS_NAME=spire-server-spire \

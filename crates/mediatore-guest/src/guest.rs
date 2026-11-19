@@ -84,8 +84,8 @@ pub struct GuestArgs {
     #[arg(long, env = "MEDIATORE_REGISTRY_CA", value_name = "PEM")]
     pub registry_ca: Option<PathBuf>,
     /// A PEM of CA certificates the egress proxy trusts beside the Mozilla roots for the hosts a
-    /// policy bundle lists (direct egress): the operator's private PKI, such as the RBC bundle
-    /// the image already carries. Without it only publicly trusted hosts verify
+    /// policy bundle lists (direct egress): an operator's private CA bundle (the public image
+    /// carries none). Without it only publicly trusted hosts verify
     #[arg(long, env = "MEDIATORE_EGRESS_CA", value_name = "PEM")]
     pub egress_ca: Option<PathBuf>,
     /// The lowest TLS version the egress proxy offers those hosts: `1.3` (the default) or

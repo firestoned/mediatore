@@ -504,8 +504,15 @@ impl KubeStore {
         let Some(sandbox_uid) = rec.sandbox_uid else {
             return Ok(());
         };
-        self.write_one_envelope(sb, rec, sandbox_uid, None, rec.refresh.as_ref(), None)
-            .await?;
+        self.write_one_envelope(
+            sb,
+            rec,
+            sandbox_uid,
+            None,
+            rec.refresh.as_ref(),
+            Some(session_expiry(rec)),
+        )
+        .await?;
         // The delegations the record carries, then the Secrets of any it no longer does.
         for (audience, d) in &rec.delegations {
             self.write_one_envelope(
@@ -562,26 +569,45 @@ impl KubeStore {
         match (envelope_write(sealed.is_some(), existing.is_some()), sealed) {
             (EnvelopeWrite::Replace, Some(sealed)) => {
                 let owners = owner_refs(&self.home, sb);
-                // Everything the patch would set, already there on the Secret just read: the
-                // envelope, the `claimed` label and (when the sandbox owns it) the owner
-                // references. Then the patch is not sent, the same accepted difference as
-                // `write_record`'s; any one of them differing sends the whole patch.
-                let unchanged = existing.as_ref().is_some_and(|held| {
-                    envelope_of(held).as_ref() == Some(sealed)
-                        && held.labels().get(SESSION_LABEL).map(String::as_str) == Some("claimed")
-                        && owners
+                // The issuer session's expiry only ever moves later here: it was parked with
+                // the claim's creation plus its TTL, and the bind starts the claim's clock
+                // after that, so the Secret follows the record's deadline (and one written
+                // before it had an expiry gets one). A delegation's is the caller's and is
+                // written once, when it is parked.
+                let later = expires_at.filter(|wanted| {
+                    audience.is_none()
+                        && existing
                             .as_ref()
-                            .is_none_or(|o| held.metadata.owner_references.as_ref() == Some(o))
+                            .and_then(expiry_of)
+                            .is_none_or(|held| held < *wanted)
                 });
+                // Everything the patch would set, already there on the Secret just read: the
+                // envelope, the `claimed` label, (when the sandbox owns it) the owner
+                // references and the expiry. Then the patch is not sent, the same accepted
+                // difference as `write_record`'s; any one of them differing sends the whole
+                // patch.
+                let unchanged = later.is_none()
+                    && existing.as_ref().is_some_and(|held| {
+                        envelope_of(held).as_ref() == Some(sealed)
+                            && held.labels().get(SESSION_LABEL).map(String::as_str)
+                                == Some("claimed")
+                            && owners
+                                .as_ref()
+                                .is_none_or(|o| held.metadata.owner_references.as_ref() == Some(o))
+                    });
                 if !unchanged {
                     let mut metadata =
                         serde_json::json!({ "labels": { SESSION_LABEL: "claimed" } });
                     if let Some(owners) = owners {
                         metadata["ownerReferences"] = serde_json::json!(owners);
                     }
+                    let mut data = envelope_data(sealed);
+                    if let Some(later) = later {
+                        data["expires_at"] = expiry_data(later);
+                    }
                     let patch = serde_json::json!({
                         "metadata": metadata,
-                        "data": envelope_data(sealed),
+                        "data": data,
                     });
                     api.patch(&name, &PatchParams::default(), &Patch::Merge(patch))
                         .await
@@ -1565,6 +1591,30 @@ fn envelope_data(sealed: &Sealed) -> serde_json::Value {
     })
 }
 
+/// When the issuer session's envelope stops being stored (ADR-0043 decision 4, the rule the
+/// delegations already follow): the claim's creation plus its TTL, as the API parks it, and
+/// from the bind on the record's own deadline, which is later by the time the claim waited.
+/// Never earlier than the deadline, so a bound claim refreshes to the end of its TTL.
+fn session_expiry(rec: &ClaimRecord) -> Timestamp {
+    let by_ttl = rec.created_at + jiff::SignedDuration::from_secs(i64::from(rec.ttl_seconds));
+    rec.expires_at
+        .map_or(by_ttl, |deadline| deadline.max(by_ttl))
+}
+
+/// The `expires_at` of a session Secret, if it carries one that reads.
+fn expiry_of(secret: &Secret) -> Option<Timestamp> {
+    let raw = secret.data.as_ref()?.get("expires_at")?;
+    std::str::from_utf8(&raw.0).ok()?.parse().ok()
+}
+
+/// `expires_at` as a merge patch of a Secret's `data` spells it.
+fn expiry_data(expires_at: Timestamp) -> serde_json::Value {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD
+        .encode(expires_at.to_string())
+        .into()
+}
+
 fn envelope_of(secret: &Secret) -> Option<Sealed> {
     let data = secret.data.as_ref()?;
     let key_id = String::from_utf8(data.get("key_id")?.0.clone()).ok()?;
@@ -1869,9 +1919,25 @@ impl ClaimStore for KubeStore {
     }
 
     async fn update_claim(&self, rec: ClaimRecord) -> Result<(), StoreError> {
+        // The sandbox is read here, now, and its record decides: a released claim is final.
+        // `rec` may be a copy read before the release (a guest's report, a refresh, a bind),
+        // and writing it would create again the session and delegation Secrets the release
+        // deleted and clear `revokedAt`. So nothing is written, neither Secret nor status.
+        //
+        // Not closed: a release landing between this read and the writes below. That takes
+        // a compare-and-set on the resource's `resourceVersion`, a change to the storage
+        // contract that needs its ADR; until then the envelope sweep deletes what such a
+        // write leaves on a released record (`sweep_sessions`).
         let sb = self.sandbox_of_claim(rec.uid).await?;
-        self.write_envelope(&sb, &rec).await?;
-        self.write_record(&sb, &rec).await
+        if record_status_of(&sb).is_some_and(|held| held.revoked_at.is_some()) {
+            return Err(StoreError::Conflict(format!(
+                "claim {} is released",
+                rec.uid
+            )));
+        }
+        // The status first: a refused or failed status write then leaves no Secret behind.
+        self.write_record(&sb, &rec).await?;
+        self.write_envelope(&sb, &rec).await
     }
 
     async fn revoke_claim(&self, uid: Uuid, at: Timestamp) -> Result<(), StoreError> {
@@ -2180,6 +2246,20 @@ impl ClaimStore for KubeStore {
             .list(&ListParams::default().labels(SESSION_LABEL))
             .await
             .map_err(|e| backend(&e))?;
+        if list.items.is_empty() {
+            return Ok(0);
+        }
+        // Every sandbox, by UID, with the record its status carries (no envelope is read). Listed after the Secrets,
+        // so the sandbox of every Secret above, created before its Secret was, is in this list unless it is gone.
+        let sandboxes: HashMap<Uuid, Option<ClaimRecord>> = self
+            .all_sandboxes()
+            .list(&ListParams::default())
+            .await
+            .map_err(|e| backend(&e))?
+            .items
+            .iter()
+            .filter_map(|sb| Some((sandbox_uid_of(sb)?, head_of(sb).ok())))
+            .collect();
         let mut swept = 0;
         for secret in &list.items {
             let state = secret.labels().get(SESSION_LABEL).map(String::as_str);
@@ -2187,15 +2267,30 @@ impl ClaimStore for KubeStore {
                 continue;
             };
             let expired = session.expires_at.is_some_and(|e| e <= now);
+            let sandbox = sandboxes.get(&session.sandbox_uid);
+            let record = sandbox.and_then(Option::as_ref);
+            // No sandbox answers for it any more (deleted with no release seen, and in another namespace no owner
+            // reference collects the Secret), and it is older than the grace period, the parked sessions' own: a
+            // Secret that young is left for the next pass, whatever a list that raced its sandbox's creation says.
+            let orphan = sandbox.is_none() && session.created_at < before;
+            // The claim may still issue: not released, and unbound or before its deadline.
+            let live = record.is_some_and(|r| r.is_live(now));
+            // The claim is over. Its release deleted these; one that is here all the same (the delete failed, the
+            // deadline passed with no release, or a writer raced the release, see `update_claim`) goes now.
+            let ended = record.is_some_and(|r| !r.is_live(now));
             let due = match state {
-                // Old (the grace period) or expired (ADR-0043 decision 4); the same rule as the in-memory store.
+                // Old (the grace period, which an orphan is past too) or expired (ADR-0043 decision 4); the same
+                // rule as the in-memory store.
                 Some("parked") => session.created_at < before || expired,
                 // A bound claim's envelopes (relabelled `claimed` when the record took them) go when they expire,
                 // not at the claim's end: no secret is stored past its expiry (the operator's rule, ADR-0043
                 // decision 4). The record reads each envelope by name and skips a missing one, so the delegation
                 // is simply gone from it. The age rule does not apply: a long claim's envelope is old and still
-                // wanted.
-                Some("claimed") => expired,
+                // wanted. The issuer's session is the one exception to the expiry: a live claim's is kept whatever
+                // the Secret says, so no stale or early expiry on it ends a claim's refreshes before its deadline.
+                Some("claimed") => {
+                    orphan || ended || (expired && (session.audience.is_some() || !live))
+                }
                 _ => false,
             };
             if !due {
@@ -2725,8 +2820,31 @@ mod tests {
             v
         }
 
+        /// The issuer's session carries the expiry the seeded record gives it (created
+        /// 2026-01-01T00:00:00Z, 600 s, not bound); the delegation carries none.
         fn home_secret(sandbox: Uuid, audience: Option<&str>) -> serde_json::Value {
-            session(sandbox, audience, "claimed", Timestamp::now(), None)
+            let expires_at: Option<Timestamp> = audience
+                .is_none()
+                .then(|| "2026-01-01T00:10:00Z".parse().expect("a timestamp"));
+            session(sandbox, audience, "claimed", Timestamp::now(), expires_at)
+        }
+
+        /// A sandbox of UID `uid` beside the seeded one, with no record.
+        pub fn bare_sandbox(st: &State, name: &str, uid: Uuid) -> serde_json::Value {
+            let mut sb = st.sandboxes[0].clone();
+            sb["metadata"] = serde_json::json!({
+                "name": name, "namespace": TENANT, "uid": uid.to_string(),
+            });
+            if let Some(map) = sb.as_object_mut() {
+                map.remove("status");
+            }
+            sb
+        }
+
+        /// The expiry the stored Secret `name` carries, if it carries one.
+        pub fn expiry(st: &State, name: &str) -> Option<Timestamp> {
+            let held = st.secrets.iter().find(|s| s["metadata"]["name"] == name)?;
+            expiry_of(&serde_json::from_value::<Secret>(held.clone()).ok()?)
         }
 
         /// The UID of the one seeded sandbox.
@@ -3241,11 +3359,16 @@ mod tests {
                 ago(7200),
                 Some(ago(1)),
             ));
+            // The claimed ones belong to sandboxes that are there, so it is the expiry that decides.
+            let expired_sb = fake::bare_sandbox(&st, "sb-2", expired_claimed);
+            let live_sb = fake::bare_sandbox(&st, "sb-3", live_claimed);
+            st.sandboxes.extend([expired_sb, live_sb]);
         }
         let store = fake::store(&state);
         assert_eq!(store.sweep_sessions(ago(3600)).await.unwrap(), 3);
         let st = state.lock().unwrap();
         assert_eq!(fake::secret_lists(&st), 1, "one list for both states");
+        assert_eq!(fake::sandbox_lists(&st), 1, "and one of the sandboxes");
         let names = fake::secret_names(&st);
         let gone = [
             session_name(old_parked),
@@ -3262,8 +3385,199 @@ mod tests {
         assert_eq!(
             st.secrets.len(),
             5,
-            "the seeded claim's two old envelopes without an expiry stay too"
+            "the seeded claim's two envelopes stay too: its delegation has no expiry, and its session is a live claim's"
         );
+    }
+
+    #[tokio::test]
+    async fn the_session_sweep_removes_what_no_sandbox_answers_for_once_past_the_grace() {
+        // A sandbox deleted with no release seen (and, in another namespace, no owner reference to collect its
+        // Secrets) leaves claimed Secrets nothing else removes. The grace is the parked sessions' own.
+        let (state, _claim) = fake::seed(false);
+        let now = Timestamp::now();
+        let ago = |seconds: i64| Timestamp::from_second(now.as_second() - seconds).unwrap();
+        let later = Timestamp::from_second(now.as_second() + 3600).unwrap();
+        let (gone, young) = (Uuid::new_v4(), Uuid::new_v4());
+        {
+            let mut st = state.lock().unwrap();
+            st.secrets
+                .push(fake::session(gone, None, "claimed", ago(7200), Some(later)));
+            st.secrets.push(fake::session(
+                gone,
+                Some("api.example"),
+                "claimed",
+                ago(7200),
+                None,
+            ));
+            // No sandbox either, but within the grace: the next pass decides.
+            st.secrets
+                .push(fake::session(young, None, "claimed", ago(60), Some(later)));
+        }
+        let store = fake::store(&state);
+        assert_eq!(store.sweep_sessions(ago(3600)).await.unwrap(), 2);
+        let st = state.lock().unwrap();
+        assert_eq!(fake::sandbox_lists(&st), 1, "the sandboxes are listed once");
+        assert_eq!(fake::secret_gets(&st), 0, "no Secret is read by name");
+        let names = fake::secret_names(&st);
+        let gone = [session_name(gone), delegation_name(gone, "api.example")];
+        assert!(gone.iter().all(|n| !names.contains(&n.as_str())));
+        assert!(names.contains(&session_name(young).as_str()));
+        assert_eq!(
+            st.secrets.len(),
+            3,
+            "the seeded claim's two and the young one"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_live_claims_session_outlasts_its_stored_expiry_and_an_ended_claims_goes() {
+        // The seeded session Secret expired in January. Its claim may still issue, so the sweep keeps it: unbound,
+        // then bound with its deadline ahead. Once the deadline has passed, nothing of the claim is stored.
+        let (state, _claim) = fake::seed(false);
+        let store = fake::store(&state);
+        let now = Timestamp::now();
+        let at = |seconds: i64| Timestamp::from_second(now.as_second() + seconds).unwrap();
+        assert_eq!(store.sweep_sessions(at(-3600)).await.unwrap(), 0);
+        state.lock().unwrap().sandboxes[0]["status"]["record"]["expiresAt"] =
+            at(600).to_string().into();
+        assert_eq!(store.sweep_sessions(at(-3600)).await.unwrap(), 0);
+        assert_eq!(state.lock().unwrap().secrets.len(), 2);
+        state.lock().unwrap().sandboxes[0]["status"]["record"]["expiresAt"] =
+            at(-1).to_string().into();
+        assert_eq!(store.sweep_sessions(at(-3600)).await.unwrap(), 2);
+        let emptied = state.lock().unwrap().secrets.is_empty();
+        assert!(emptied, "the session and the delegation of an ended claim");
+    }
+
+    #[tokio::test]
+    async fn the_session_sweep_removes_a_released_claims_secrets() {
+        // What a writer racing the release can still leave (see `update_claim`), or a delete that failed: claimed
+        // Secrets under a record that says released. The release meant them gone; the sweep makes it so.
+        let (state, _claim) = fake::seed(true);
+        let store = fake::store(&state);
+        let cutoff = Timestamp::now() - jiff::SignedDuration::from_hours(1);
+        assert_eq!(store.sweep_sessions(cutoff).await.unwrap(), 2);
+        let emptied = state.lock().unwrap().secrets.is_empty();
+        assert!(emptied, "nothing is stored for a released claim");
+    }
+
+    #[tokio::test]
+    async fn an_update_over_a_released_claim_creates_no_secret_and_patches_nothing() {
+        let (state, claim) = fake::seed(false);
+        let store = fake::store(&state);
+        // The copy a slow writer holds: read while the claim was live, envelopes and all.
+        let mut held = store.get_claim(claim).await.unwrap();
+        let carried = held.refresh.is_some() && held.delegations.len() == 1;
+        assert!(carried, "the copy read before the release carries both");
+        store.revoke_claim(claim, Timestamp::now()).await.unwrap();
+        let gone = state.lock().unwrap().secrets.is_empty();
+        assert!(gone, "the release deleted the secrets");
+        state.lock().unwrap().log.clear();
+
+        held.entry_id = Some("entry-1".into());
+        let refused = matches!(store.update_claim(held).await, Err(StoreError::Conflict(_)));
+        assert!(refused, "an update over a released claim is a conflict");
+        let st = state.lock().unwrap();
+        assert!(st.secrets.is_empty(), "no Secret is created again");
+        let read_only = st.log.iter().all(|(method, _)| method == "GET");
+        assert!(read_only, "neither a create, a patch nor a delete was sent");
+        let record = &st.sandboxes[0]["status"]["record"];
+        assert!(record["revokedAt"].is_string(), "still released");
+        assert!(
+            record["entryId"].is_null(),
+            "no field of the stale copy landed"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_update_writes_the_status_before_the_secrets() {
+        // A status write that fails must leave no Secret behind, so it goes first.
+        let (state, claim) = fake::seed(false);
+        let store = fake::store(&state);
+        let mut rec = store.get_claim(claim).await.unwrap();
+        rec.entry_id = Some("entry-1".into());
+        rec.refresh = Some(Sealed {
+            key_id: "k1".into(),
+            nonce: vec![3],
+            ciphertext: vec![4],
+        });
+        store.update_claim(rec).await.unwrap();
+        let st = state.lock().unwrap();
+        let patched = fake::patched(&st);
+        assert_eq!(patched.len(), 2, "the status and the session Secret");
+        let status_first = patched[0].ends_with("/agentsandboxes/sb-1/status");
+        assert!(status_first, "the status is patched first");
+        let secret_second = patched[1].contains("/secrets/");
+        assert!(secret_second, "the Secret after it");
+    }
+
+    #[test]
+    fn the_issuer_sessions_expiry_is_never_before_the_claims_deadline() {
+        let mut rec = test_record(Uuid::new_v4());
+        let by_ttl = rec.created_at + jiff::SignedDuration::from_secs(600);
+        assert_eq!(
+            session_expiry(&rec),
+            by_ttl,
+            "not bound: creation plus the TTL"
+        );
+        // Bound after a wait: the clock started at the bind, and the session lasts to its end.
+        let deadline = by_ttl + jiff::SignedDuration::from_secs(90);
+        rec.expires_at = Some(deadline);
+        assert_eq!(session_expiry(&rec), deadline);
+        // A deadline before creation plus the TTL never shortens it below what was parked.
+        rec.expires_at = Some(by_ttl - jiff::SignedDuration::from_secs(90));
+        assert_eq!(session_expiry(&rec), by_ttl);
+    }
+
+    #[tokio::test]
+    async fn a_bind_moves_the_issuer_sessions_expiry_to_the_claims_deadline() {
+        let (state, claim) = fake::seed(false);
+        let sandbox = fake::sandbox_uid(&state.lock().unwrap());
+        let store = fake::store(&state);
+        let mut rec = store.get_claim(claim).await.unwrap();
+        let deadline = Timestamp::from_second(Timestamp::now().as_second() + 600).unwrap();
+        rec.expires_at = Some(deadline);
+        store.update_claim(rec).await.unwrap();
+        {
+            let st = state.lock().unwrap();
+            assert_eq!(
+                fake::expiry(&st, &session_name(sandbox)),
+                Some(deadline),
+                "the session is kept to the claim's deadline"
+            );
+            assert_eq!(
+                fake::expiry(&st, &delegation_name(sandbox, "api.example")),
+                None,
+                "a delegation's expiry is the caller's, and is left alone"
+            );
+            assert_eq!(fake::patched(&st).len(), 2, "the status, then the Secret");
+        }
+        // The record as it now reads asks for nothing more.
+        let again = store.get_claim(claim).await.unwrap();
+        store.update_claim(again).await.unwrap();
+        assert_eq!(fake::patched(&state.lock().unwrap()).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_session_secret_created_for_a_record_carries_the_claims_expiry() {
+        // The Secret is gone (swept, or the session never was parked under this name) and the record carries an
+        // envelope: the Secret created for it is not open-ended.
+        let (state, claim) = fake::seed(false);
+        let sandbox = fake::sandbox_uid(&state.lock().unwrap());
+        let name = session_name(sandbox);
+        let store = fake::store(&state);
+        let mut rec = store.get_claim(claim).await.unwrap();
+        state
+            .lock()
+            .unwrap()
+            .secrets
+            .retain(|s| s["metadata"]["name"] != name.as_str());
+        let deadline = Timestamp::from_second(Timestamp::now().as_second() + 600).unwrap();
+        rec.expires_at = Some(deadline);
+        store.update_claim(rec).await.unwrap();
+        let st = state.lock().unwrap();
+        assert_eq!(st.secrets.len(), 2, "created again beside the delegation");
+        assert_eq!(fake::expiry(&st, &name), Some(deadline));
     }
 
     #[test]

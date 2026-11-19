@@ -27,9 +27,13 @@ every asset verifies offline:
 
 ```sh
 # <version> is the release, v0.3.0 at the time of writing.
-gh release download v<version> --repo firestoned/mediatore --pattern 'mediatore-<version>*' --pattern checksums.sha256
+gh release download v<version> --repo firestoned/mediatore --pattern 'mediatore-<version>*' --pattern checksums.sha256 | tee
 shasum -a 256 -c checksums.sha256
-gh attestation verify mediatore-<version>.yaml --repo firestoned/mediatore
+# The attestation must come from the Build workflow, run for this release's tag: the
+# repository alone would also accept a file attested by any other workflow or ref in it.
+gh attestation verify mediatore-<version>.yaml --repo firestoned/mediatore \
+  --signer-workflow firestoned/mediatore/.github/workflows/build.yaml \
+  --source-ref refs/tags/v<version> | tee
 # kustomization.yaml of your overlay:
 #   resources:
 #     - https://github.com/firestoned/mediatore/releases/download/v<version>/mediatore-<version>.yaml
@@ -93,8 +97,10 @@ URL, your CIDRs. Edit:
   addresses for the API server, the node CIDR for the kubelet's probe, and the
   issuer's namespace or addresses;
 - `ingress.yaml`: the ingress class and hostname, if not Tailscale's;
-- `kustomization.yaml`: the image tag, pinned to a digest or a `sha-<commit>` tag of
+- `kustomization.yaml`: the server image's digest, the one the release's
+  `mediatore-<version>.yaml` carries for
   [the published image](https://github.com/firestoned/mediatore/pkgs/container/mediatore).
+  The example carries a placeholder digest of zeros, so an unedited copy pulls nothing.
 
 `kubectl kustomize ~/.config/mediatore/core` renders the whole thing; read it once.
 
@@ -235,8 +241,21 @@ after the layer was built, which both rc.3 and rc.4 ran into). And
 
 ```sh
 make dist && make guest-image BINARY_FROM=host && make guest-image-check   # or pull a release by digest
-gh attestation verify oci://ghcr.io/firestoned/mediatore-guest@sha256:<digest> --repo firestoned/mediatore
+# A release's image: attested by the Build workflow, run for that release's tag.
+gh attestation verify oci://ghcr.io/firestoned/mediatore-guest@sha256:<digest> --repo firestoned/mediatore \
+  --signer-workflow firestoned/mediatore/.github/workflows/build.yaml \
+  --source-ref refs/tags/v<version> | tee
+# The keyless Cosign signature, pinned to the same workflow and tag (escape the dots of
+# <version> in the expression).
+cosign verify ghcr.io/firestoned/mediatore-guest@sha256:<digest> \
+  --certificate-identity-regexp '^https://github\.com/firestoned/mediatore/\.github/workflows/build\.yaml@refs/tags/v<version>$' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
+
+The same two commands verify the server image (`ghcr.io/firestoned/mediatore`) and the
+gateway image of step 7 (`ghcr.io/firestoned/mediatore-gateway`). An image built from a
+merge to `main` rather than a release verifies with `--source-ref refs/heads/main` and
+`@refs/heads/main$`.
 
 Pool VMs become SPIRE agents with their vTPM ([ADR-0018](../adr/0018-tpm-attestation-with-the-spiffe-plugin.md)).
 On the server side it is a kustomize component, `deploy/spire-tpm`, that your SPIRE

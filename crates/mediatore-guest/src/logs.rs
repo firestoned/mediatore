@@ -6,7 +6,8 @@
 //! stdio as before and nothing here runs.
 //!
 //! Two readers drain the jail's stdout and stderr pipes line by line, redact each line
-//! ([`crate::redact`], decision 2), write it through to the VM console (the operator's view is
+//! ([`crate::redact`], decision 2; a line over [`RAW_LINE_CAP`] in pieces, with the end of each
+//! piece held back unredacted until the next is read, so a secret across a cut is seen whole), write it through to the VM console (the operator's view is
 //! unchanged) and queue it as a [`LogRecord`] with a per-claim `seq`. A batcher posts the queue
 //! to `POST /v1/me/logs` every [`ShipperConfig::interval`] or at [`ShipperConfig::batch_bytes`],
 //! whichever comes first. The workload never waits for mediatore: the readers only touch the
@@ -15,8 +16,16 @@
 //! at-least-once with idempotent writes at the broker: a retried batch keeps its `seq` range.
 //!
 //! Nothing here logs record text or a token: the lines say `claim_uid`, counts and statuses.
+//!
+//! The workload chooses its output, so a redacted line is neutralised before it goes anywhere
+//! ([`neutralise_controls`]: no control character reaches the VM journal or the owner's
+//! terminal as itself), and the console copy starts with [`CONSOLE_PREFIX`], which the guest
+//! writes, so no workload line begins with a syslog priority (`<3>`) or passes for a line of
+//! the guest's own log.
 
+use std::borrow::Cow;
 use std::collections::VecDeque;
+use std::fmt::Write as _;
 use std::io::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -34,9 +43,15 @@ use crate::redact::Redactor;
 
 /// Record text the guest queues before it drops the oldest (ADR-0045 decision 8).
 pub const QUEUE_MAX_BYTES: usize = 1024 * 1024;
-/// A raw line is cut here before redaction, so a workload writing without newlines cannot grow
-/// the guest's memory; the cut lands in the queue as a line of its own.
+/// A raw line is cut here, so a workload writing without newlines cannot grow the guest's
+/// memory; each piece lands in the queue as a line of its own. The cut is not where redaction
+/// stops: the end of a piece ([`Redactor::redact_head`] says how much) stays in memory in front
+/// of what is read next, so at most this and that held-back end are buffered at once.
 pub const RAW_LINE_CAP: usize = 4 * MAX_LOG_RECORD_BYTES;
+/// What every console copy of a workload line starts with. The guest writes it, the workload
+/// cannot: a line that begins with `<3>` or with a forged timestamp and level is, in the
+/// journal, visibly the workload's.
+pub const CONSOLE_PREFIX: &str = "workload: ";
 /// How long the guest waits for the readers to see EOF once the jail exited.
 pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long the flush at workload exit may take, before `POST /v1/me/exit` (decision 8).
@@ -242,62 +257,154 @@ impl Capture {
     }
 
     /// Read `reader` to EOF as `stream`: each line redacted, written to the console, split at
-    /// [`MAX_LOG_RECORD_BYTES`] and queued. A last line without its newline counts.
+    /// [`MAX_LOG_RECORD_BYTES`] and queued. A last line without its newline counts. A line
+    /// over [`RAW_LINE_CAP`] is redacted and queued in pieces, the unredacted end of each
+    /// piece kept in front of the next read.
     pub async fn read_stream<R: AsyncRead + Unpin>(&self, reader: R, stream: LogStream) {
         let mut reader = BufReader::new(reader);
         let mut redactor = self.redactor();
+        // What a cut held back of the line being read (`held` bytes, unredacted), then what
+        // is read after it.
         let mut raw = Vec::new();
+        let mut held = 0;
         loop {
-            raw.clear();
-            match read_line_bounded(&mut reader, &mut raw, RAW_LINE_CAP).await {
-                Ok(0) => return,
-                Ok(_) => {}
+            let limit = held + RAW_LINE_CAP;
+            let read = match read_line_bounded(&mut reader, &mut raw, limit).await {
+                Ok(n) => n,
                 Err(e) => {
                     tracing::debug!(?stream, error = %e, "output pipe closed with an error");
-                    return;
+                    0
                 }
-            }
-            if raw.last() == Some(&b'\n') {
-                raw.pop();
-                if raw.last() == Some(&b'\r') {
-                    raw.pop();
-                }
-            }
-            let line = String::from_utf8_lossy(&raw);
-            let Some(redacted) = redactor.redact_line(&line) else {
-                continue;
             };
-            if self.tee_console {
-                tee(stream, &redacted);
+            if read == 0 {
+                // The pipe closed: what a cut held back is the end of its line.
+                if !raw.is_empty()
+                    && let Some(redacted) = redactor.redact_line(&String::from_utf8_lossy(&raw))
+                {
+                    self.emit(stream, &redacted);
+                }
+                return;
             }
-            for text in split_record(&redacted, MAX_LOG_RECORD_BYTES) {
-                let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
-                self.queue.push(LogRecord {
-                    seq,
-                    stream,
-                    ts: Timestamp::now(),
-                    text,
-                });
+            if raw.last() == Some(&b'\n') || raw.len() < limit {
+                // The whole line, or the end of one that was cut.
+                if raw.last() == Some(&b'\n') {
+                    raw.pop();
+                    if raw.last() == Some(&b'\r') {
+                        raw.pop();
+                    }
+                }
+                if let Some(redacted) = redactor.redact_line(&String::from_utf8_lossy(&raw)) {
+                    self.emit(stream, &redacted);
+                }
+                raw.clear();
+                held = 0;
+                continue;
             }
+            // Cut before its end. A char split by the cut waits for its other bytes.
+            let (redacted, rest) = {
+                let whole = raw.len() - incomplete_utf8_suffix(&raw);
+                let piece = String::from_utf8_lossy(&raw[..whole]);
+                let (redacted, covered) = redactor.redact_head(&piece);
+                let mut rest = piece.as_bytes()[covered..].to_vec();
+                rest.extend_from_slice(&raw[whole..]);
+                (redacted, rest)
+            };
+            if let Some(redacted) = redacted {
+                self.emit(stream, &redacted);
+            }
+            raw = rest;
+            held = raw.len();
+        }
+    }
+
+    /// One redacted line, or piece of an overlong one: its control characters neutralised
+    /// ([`neutralise_controls`]), then to the console behind [`CONSOLE_PREFIX`], and to the
+    /// queue in records of at most [`MAX_LOG_RECORD_BYTES`]. The split comes after the
+    /// escaping, which lengthens a line, so the record limit holds on what is queued.
+    fn emit(&self, stream: LogStream, redacted: &str) {
+        let safe = neutralise_controls(redacted);
+        if self.tee_console {
+            tee(stream, &safe);
+        }
+        for text in split_record(&safe, MAX_LOG_RECORD_BYTES) {
+            let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
+            self.queue.push(LogRecord {
+                seq,
+                stream,
+                ts: Timestamp::now(),
+                text,
+            });
         }
     }
 }
 
-/// The console copy: the guest's stdout for the workload's stdout, stderr for stderr.
+/// How many bytes at the end of `bytes` are the start of a UTF-8 char whose other bytes have
+/// not been read yet: 0 to 3.
+fn incomplete_utf8_suffix(bytes: &[u8]) -> usize {
+    for back in 1..=bytes.len().min(3) {
+        let b = bytes[bytes.len() - back];
+        // Not a continuation byte: the last char starts here, whole or not.
+        if b & 0xC0 != 0x80 {
+            let needs = match b {
+                0xC0..=0xDF => 2,
+                0xE0..=0xEF => 3,
+                0xF0..=0xF7 => 4,
+                _ => 1,
+            };
+            return if needs > back { back } else { 0 };
+        }
+    }
+    0
+}
+
+/// Whether `c` is written out as an escape: every C0 control but tab, DEL, and the C1 range
+/// (U+0080 to U+009F). That is Unicode's `Cc` category less the tab.
+fn is_neutralised(c: char) -> bool {
+    c != '\t' && c.is_control()
+}
+
+/// `line` with every control character but the tab replaced by its visible spelling: `\x1b`
+/// (backslash, `x`, two lowercase hex digits) for a C0 control or DEL, `\u{9b}` for a C1
+/// control. Everything else, the backslash included, is kept as it is, so the result holds no
+/// control character and a second pass changes nothing. Borrowed when there is nothing to do.
+///
+/// The workload chooses these bytes: an ESC starts a terminal sequence (OSC 52 writes the
+/// reader's clipboard), a carriage return overwrites what was printed before it, and a newline
+/// inside a record would start a line of the workload's choosing.
+#[must_use]
+pub fn neutralise_controls(line: &str) -> Cow<'_, str> {
+    let Some(first) = line.find(is_neutralised) else {
+        return Cow::Borrowed(line);
+    };
+    let mut out = String::with_capacity(line.len() + 16);
+    out.push_str(&line[..first]);
+    for c in line[first..].chars() {
+        if !is_neutralised(c) {
+            out.push(c);
+            continue;
+        }
+        // Writing to a String does not fail.
+        let _ = if c.is_ascii() {
+            write!(out, "\\x{:02x}", u32::from(c))
+        } else {
+            write!(out, "\\u{{{:x}}}", u32::from(c))
+        };
+    }
+    Cow::Owned(out)
+}
+
+/// The console copy of one neutralised line: [`CONSOLE_PREFIX`], the line, a newline.
+fn console_line(line: &str) -> String {
+    format!("{CONSOLE_PREFIX}{line}\n")
+}
+
+/// The console copy: the guest's stdout for the workload's stdout, stderr for stderr, each
+/// line in one write.
 fn tee(stream: LogStream, line: &str) {
+    let line = console_line(line);
     let _ = match stream {
-        LogStream::Stdout => {
-            let out = std::io::stdout();
-            let mut out = out.lock();
-            out.write_all(line.as_bytes())
-                .and_then(|()| out.write_all(b"\n"))
-        }
-        LogStream::Stderr => {
-            let err = std::io::stderr();
-            let mut err = err.lock();
-            err.write_all(line.as_bytes())
-                .and_then(|()| err.write_all(b"\n"))
-        }
+        LogStream::Stdout => std::io::stdout().lock().write_all(line.as_bytes()),
+        LogStream::Stderr => std::io::stderr().lock().write_all(line.as_bytes()),
     };
 }
 
@@ -626,6 +733,106 @@ mod tests {
         assert!(got.iter().all(|r| r.text.len() <= MAX_LOG_RECORD_BYTES));
     }
 
+    // ----- a secret across the raw cut (red-team review 2026-11-19, G-9) -----
+
+    /// The queue's text for one stream, joined in order.
+    fn joined(q: &Queue) -> String {
+        let got = records(q);
+        assert!(got.iter().all(|r| r.text.len() <= MAX_LOG_RECORD_BYTES));
+        got.into_iter().map(|r| r.text).collect()
+    }
+
+    #[tokio::test]
+    async fn a_secret_across_the_raw_cut_is_redacted() {
+        // The cut falls inside the secret: after its first byte, in its middle, before its last.
+        for before in [1, 20, PHANTOM.len() - 1] {
+            let c = capture();
+            let pad = "x".repeat(RAW_LINE_CAP - before);
+            let line = format!("{pad}{PHANTOM} tail\n");
+            c.read_stream(line.as_bytes(), LogStream::Stdout).await;
+            let text = joined(&c.queue());
+            let leaked = text.contains(&PHANTOM[..before]) || text.contains(&PHANTOM[before..]);
+            assert!(
+                !leaked,
+                "part of the secret crossed the cut, {before} bytes before it"
+            );
+            let intact = text == format!("{pad}{} tail", crate::redact::REDACTED);
+            assert!(
+                intact,
+                "nothing else was lost or changed, {before} bytes before the cut"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_secret_across_a_later_cut_or_at_the_end_of_the_pipe_is_redacted() {
+        // No newline at all: three cuts, the secret across the third, the pipe closing after.
+        let c = capture();
+        let pad = "x ".repeat(3 * RAW_LINE_CAP / 2 - 10);
+        let input = format!("{pad}{PHANTOM}");
+        c.read_stream(input.as_bytes(), LogStream::Stderr).await;
+        let text = joined(&c.queue());
+        let leaked = text.contains(&PHANTOM[..8]) || text.contains(&PHANTOM[20..]);
+        assert!(!leaked, "part of the secret crossed a cut");
+        let intact = text == format!("{pad}{}", crate::redact::REDACTED);
+        assert!(intact, "nothing else was lost or changed");
+
+        // An `Authorization` value across the cut, with no secret known.
+        let c = Arc::new(Capture::new(Vec::new(), Arc::new(Queue::default())).without_console());
+        let pad = "x".repeat(RAW_LINE_CAP - 30);
+        let line = format!("{pad} Authorization: Bearer abc123def456ghi789 tail\n");
+        c.read_stream(line.as_bytes(), LogStream::Stdout).await;
+        let text = joined(&c.queue());
+        let intact = text
+            == format!(
+                "{pad} Authorization: Bearer {} tail",
+                crate::redact::REDACTED
+            );
+        assert!(intact, "the value was cut in two and let through");
+    }
+
+    #[tokio::test]
+    async fn a_char_split_by_the_raw_cut_is_read_whole() {
+        let c = capture();
+        let line = format!("{}\u{20ac}\u{20ac} end\n", "x".repeat(RAW_LINE_CAP - 1));
+        c.read_stream(line.as_bytes(), LogStream::Stdout).await;
+        let text = joined(&c.queue());
+        assert!(!text.contains('\u{FFFD}'), "the char at the cut was broken");
+        assert!(text.ends_with("x\u{20ac}\u{20ac} end"));
+        assert_eq!(text.len(), line.len() - 1);
+    }
+
+    #[test]
+    fn the_start_of_a_char_at_the_end_of_a_read_is_told_from_a_whole_one() {
+        assert_eq!(incomplete_utf8_suffix(b""), 0);
+        assert_eq!(incomplete_utf8_suffix(b"abc"), 0);
+        assert_eq!(incomplete_utf8_suffix("a\u{e9}".as_bytes()), 0);
+        assert_eq!(incomplete_utf8_suffix("a\u{20ac}".as_bytes()), 0);
+        assert_eq!(incomplete_utf8_suffix("a\u{1f600}".as_bytes()), 0);
+        assert_eq!(incomplete_utf8_suffix(&"a\u{e9}".as_bytes()[..2]), 1);
+        assert_eq!(incomplete_utf8_suffix(&"a\u{20ac}".as_bytes()[..2]), 1);
+        assert_eq!(incomplete_utf8_suffix(&"a\u{20ac}".as_bytes()[..3]), 2);
+        assert_eq!(incomplete_utf8_suffix(&"a\u{1f600}".as_bytes()[..4]), 3);
+        // Bytes that are no char at all are left to the lossy decoding.
+        assert_eq!(incomplete_utf8_suffix(b"a\xff"), 0);
+        assert_eq!(incomplete_utf8_suffix(b"\x80\x80\x80"), 0);
+    }
+
+    #[tokio::test]
+    async fn a_line_many_times_the_raw_cap_keeps_only_the_held_back_end_between_reads() {
+        let c = Arc::new(
+            Capture::new(
+                vec![PHANTOM.to_owned()],
+                Arc::new(Queue::new(8 * RAW_LINE_CAP, usize::MAX)),
+            )
+            .without_console(),
+        );
+        let line = "y".repeat(5 * RAW_LINE_CAP + 10);
+        c.read_stream(line.as_bytes(), LogStream::Stdout).await;
+        let text = joined(&c.queue());
+        assert_eq!(text.len(), line.len(), "nothing lost, just cut");
+    }
+
     #[test]
     fn a_split_lands_on_char_boundaries() {
         let text = "é".repeat(5); // 10 bytes
@@ -881,6 +1088,157 @@ mod tests {
         for b in &posted {
             assert!(b.text_bytes() <= mediatore_proto::MAX_LOG_BATCH_BYTES);
             assert!(b.validate().is_ok());
+        }
+    }
+
+    // ----- control characters in workload output (red-team review 2026-11-19, A-10 / G-8) -----
+
+    #[test]
+    fn escape_csi_and_osc_sequences_are_written_out() {
+        assert_eq!(neutralise_controls("\x1b"), "\\x1b");
+        assert_eq!(
+            neutralise_controls("\x1b[31mred\x1b[0m"),
+            "\\x1b[31mred\\x1b[0m"
+        );
+        // OSC 52 (a clipboard write), ended by BEL and by ST.
+        assert_eq!(
+            neutralise_controls("\x1b]52;c;aGk=\x07"),
+            "\\x1b]52;c;aGk=\\x07"
+        );
+        assert_eq!(
+            neutralise_controls("\x1b]0;title\x1b\\"),
+            "\\x1b]0;title\\x1b\\"
+        );
+        // The same introducers as single C1 characters.
+        assert_eq!(
+            neutralise_controls("\u{9b}31m \u{9d}52;c;aGk=\u{9c}"),
+            "\\u{9b}31m \\u{9d}52;c;aGk=\\u{9c}"
+        );
+    }
+
+    #[test]
+    fn every_control_but_the_tab_is_neutralised() {
+        for c in (0..=0x1f_u32).chain(0x7f..=0x9f) {
+            let c = char::from_u32(c).unwrap();
+            let got = neutralise_controls(&format!("a{c}b")).into_owned();
+            if c == '\t' {
+                assert_eq!(got, "a\tb");
+                continue;
+            }
+            assert!(
+                !got.chars().any(char::is_control),
+                "U+{:04X} left as itself",
+                u32::from(c)
+            );
+            assert!(got.starts_with("a\\") && got.ends_with('b'));
+        }
+        assert_eq!(neutralise_controls("\0"), "\\x00");
+        assert_eq!(neutralise_controls("\x07"), "\\x07");
+        assert_eq!(neutralise_controls("\x7f"), "\\x7f");
+        assert_eq!(neutralise_controls("\u{80}\u{9f}"), "\\u{80}\\u{9f}");
+        assert_eq!(
+            neutralise_controls("progress 10%\rprogress 99%"),
+            "progress 10%\\x0dprogress 99%"
+        );
+        assert_eq!(neutralise_controls("one\ntwo"), "one\\x0atwo");
+    }
+
+    #[test]
+    fn ordinary_text_is_borrowed_unchanged() {
+        for line in [
+            "",
+            "plain",
+            "col\tcol",
+            "caf\u{e9} \u{65e5}\u{672c}\u{8a9e} \u{1f980}",
+            "a\u{a0}b",
+            "<3>looks like a priority",
+            "C:\\x1b is only text",
+            "token=[REDACTED] Bearer [REDACTED]",
+        ] {
+            let got = neutralise_controls(line);
+            assert!(matches!(got, Cow::Borrowed(_)), "{line:?} was rewritten");
+            assert_eq!(got, line);
+        }
+        assert_eq!(
+            crate::redact::REDACTED,
+            neutralise_controls(crate::redact::REDACTED)
+        );
+    }
+
+    #[test]
+    fn neutralising_twice_changes_nothing() {
+        let once = neutralise_controls("\x1b[2J\u{9b}H\r<3>x\x07").into_owned();
+        assert_eq!(neutralise_controls(&once), once);
+    }
+
+    #[test]
+    fn the_console_copy_starts_with_the_guests_prefix() {
+        // A syslog priority, and a line shaped like the guest's own log: neither starts the
+        // console line.
+        for forged in [
+            "<3>disk failure",
+            "2026-01-01T00:00:00Z  INFO mediatore: claim bound",
+        ] {
+            let line = console_line(&neutralise_controls(forged));
+            assert_eq!(line, format!("{CONSOLE_PREFIX}{forged}\n"));
+            assert!(!line.starts_with('<'));
+        }
+        // A newline the workload smuggled in does not start a console line of its own.
+        let line = console_line(&neutralise_controls("ok\r\n<3>forged"));
+        assert_eq!(line, "workload: ok\\x0d\\x0a<3>forged\n");
+        assert_eq!(line.matches('\n').count(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_queue_holds_neutralised_text_and_keeps_redaction() {
+        let c = capture();
+        let input =
+            format!("\x1b]52;c;{PHANTOM}\x07 tab\there \u{9b}2J caf\u{e9}\n<3>next\rline\n");
+        c.read_stream(input.as_bytes(), LogStream::Stdout).await;
+        let got = records(&c.queue());
+        assert_eq!(got.len(), 2);
+        assert!(!got[0].text.contains(PHANTOM), "the secret was queued");
+        assert_eq!(
+            got[0].text,
+            format!(
+                "\\x1b]52;c;{}\\x07 tab\there \\u{{9b}}2J caf\u{e9}",
+                crate::redact::REDACTED
+            )
+        );
+        assert_eq!(got[1].text, "<3>next\\x0dline");
+    }
+
+    #[tokio::test]
+    async fn the_record_and_batch_limits_hold_after_escaping() {
+        // Every byte becomes four: a line under the record limit becomes four records' worth,
+        // and one over the raw cap more than the default queue keeps (it would drop its oldest
+        // and count them), so this queue is larger and the sum can be checked.
+        let batch_bytes = ShipperConfig::default().batch_bytes;
+        for len in [MAX_LOG_RECORD_BYTES - 1, RAW_LINE_CAP + 10] {
+            let queue = Arc::new(Queue::new(8 * QUEUE_MAX_BYTES, batch_bytes));
+            let c = Capture::new(vec![PHANTOM.to_owned()], queue).without_console();
+            let mut line = "\x1b".repeat(len);
+            line.push('\n');
+            c.read_stream(line.as_bytes(), LogStream::Stdout).await;
+            let q = c.queue();
+            let mut total = 0;
+            let mut seq = 0;
+            loop {
+                let batch = q.take_batch(batch_bytes);
+                if batch.records.is_empty() {
+                    break;
+                }
+                assert!(batch.validate().is_ok());
+                assert!(batch.text_bytes() <= mediatore_proto::MAX_LOG_BATCH_BYTES);
+                for r in &batch.records {
+                    assert!(r.text.len() <= MAX_LOG_RECORD_BYTES);
+                    assert!(!r.text.chars().any(char::is_control));
+                    assert_eq!(r.seq, seq + 1);
+                    seq = r.seq;
+                    total += r.text.len();
+                }
+            }
+            assert_eq!(total, 4 * len, "nothing lost to the escaping");
         }
     }
 

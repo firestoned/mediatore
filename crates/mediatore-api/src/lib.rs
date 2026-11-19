@@ -530,12 +530,35 @@ pub fn sandbox_authorizer(naming: Naming) -> mediatore_tls::Authorizer {
 // ---------- user-facing ----------
 
 /// Validate the caller's bearer token.
+///
+/// The answer to a caller who is not yet anyone carries fixed text only: the validator's
+/// error names the issuer's discovery URL and quotes the HTTP and JWT libraries, and that goes
+/// to the log. An issuer that did not answer is `503 upstream_unavailable` (the caller's token
+/// may be good; try again), a token that did not validate is `401`.
 async fn caller(st: &AppState, headers: &HeaderMap) -> Result<Validated, ApiError> {
     let token = bearer(headers)?;
     st.validator.validate(token).await.map_err(|e| match e {
-        mediatore_entra::IdpError::Forbidden(d) => ApiError::forbidden(d),
-        mediatore_entra::IdpError::NotImplemented(w) => ApiError::not_implemented(w),
-        other => ApiError::unauthorized(other.to_string()),
+        IdpError::Forbidden(d) => ApiError::forbidden(d),
+        IdpError::NotImplemented(w) => ApiError::not_implemented(w),
+        IdpError::Upstream(why) => {
+            tracing::warn!(error = %why, "login refused: the identity provider did not answer");
+            ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "upstream_unavailable",
+                Some("the identity provider did not answer".to_owned()),
+            )
+        }
+        IdpError::Credential(why) => {
+            tracing::error!(error = %why, "login refused: the broker's issuer configuration is unusable");
+            ApiError::internal("the broker could not validate the token")
+        }
+        // Whatever an unauthenticated caller sent: said at `debug`, so it cannot fill the log.
+        refused @ (IdpError::UnknownIssuer
+        | IdpError::Invalid(_)
+        | IdpError::SessionRevoked(_)) => {
+            tracing::debug!(error = %refused, "login refused: the bearer token did not validate");
+            ApiError::unauthorized("invalid token")
+        }
     })
 }
 
@@ -1095,7 +1118,9 @@ async fn park_delegations(
     Ok(())
 }
 
-/// Seal `token` with the sandbox's UID and park it until the reconciler creates the record.
+/// Seal `token` with the sandbox's UID and park it until the reconciler creates the record. Parked with an expiry
+/// like a delegation (ADR-0043 decision 4): the claim's creation plus its TTL, so the sweep removes the envelope
+/// of a sandbox that never got a record. Once the claim is bound the store keeps it to the claim's own deadline.
 async fn park_session(
     st: &AppState,
     sealer: &dyn Sealer,
@@ -1110,18 +1135,20 @@ async fn park_session(
         .and_then(|u| Uuid::parse_str(u).ok())
         .ok_or_else(|| anyhow::anyhow!("the created sandbox has no UUID uid"))?;
     let refresh = sealer.seal(sandbox_uid, token.0.as_bytes()).await?;
+    let created_at = Timestamp::now();
+    let expires_at = parked_expiry(None, created_at, created.spec.ttl_seconds);
     st.store
         .put_session(SessionRecord {
             sandbox_uid,
             subject: validated.subject.clone(),
             issuer: validated.issuer.url.clone(),
             refresh,
-            created_at: Timestamp::now(),
+            created_at,
             audience: None,
-            expires_at: None,
+            expires_at: Some(expires_at),
         })
         .await?;
-    tracing::info!(%sandbox_uid, subject = %validated.subject.id, "session parked");
+    tracing::info!(%sandbox_uid, subject = %validated.subject.id, %expires_at, "session parked");
     Ok(())
 }
 
@@ -1150,10 +1177,23 @@ fn response_of(sb: &AgentSandbox) -> ClaimResponse {
     }
 }
 
+/// The `{name}` of a claims route, checked from the string alone before anything is asked
+/// about it. A sandbox's name is an RFC 1123 label; anything else (a `/`, a `?`, a `%`) would
+/// choose the path and the query of a Kubernetes API request made with the broker's own
+/// account. Refused as a name nobody has (`404`), and never echoed.
+fn require_sandbox_name(name: &str) -> Result<(), ApiError> {
+    if mediatore_proto::is_dns_label(name) {
+        Ok(())
+    } else {
+        Err(NsDenied::NotFound.into_error())
+    }
+}
+
 /// Fetch a sandbox by name in its namespace and require the caller to be in that namespace's
-/// groups and to be its subject (ADR-0046 decision 5). A namespace the caller may not use is
-/// `404`, before any read; a sandbox that does not exist and one that belongs to someone else
-/// are told apart (404 / 403): the names are random and the subject check is the control.
+/// groups and to be its subject (ADR-0046 decision 5). A name that is not an RFC 1123 label
+/// and a namespace the caller may not use are `404`, before any read; a sandbox that does not
+/// exist and one that belongs to someone else are told apart (404 / 403): the names are random
+/// and the subject check is the control.
 async fn owned_sandbox(
     st: &AppState,
     headers: &HeaderMap,
@@ -1161,6 +1201,7 @@ async fn owned_sandbox(
     name: &str,
 ) -> Result<(String, AgentSandbox), ApiError> {
     let validated = caller(st, headers).await?;
+    require_sandbox_name(name)?;
     let namespace = resolve_existing(st, &validated, namespace)?;
     let Some(front) = st.sandboxes.as_ref() else {
         return Err(ApiError::not_implemented(
@@ -1187,6 +1228,7 @@ async fn owned_claim(
     name: &str,
 ) -> Result<ClaimRecord, ApiError> {
     let validated = caller(st, headers).await?;
+    require_sandbox_name(name)?;
     let namespace = resolve_existing(st, &validated, namespace)?;
     let rec = st
         .store
@@ -1729,6 +1771,22 @@ async fn claim_of_node_peer(
         })
 }
 
+/// The per-claim limit on what a node writes to its claim's record with `POST /v1/me/report`:
+/// each is a store write and a log line, so it spends from the claim's bucket, the one
+/// `POST /v1/token` spends from, and is `429 rate_limited` beyond it. `POST /v1/me/exit` is
+/// not limited: the guest sends it once, a refused one would leave the claim to its deadline,
+/// and it releases the claim, so a second one finds no live claim.
+fn node_report_allowed(st: &AppState, claim_uid: Uuid) -> Result<(), ApiError> {
+    if st.limiter.allow(claim_uid) {
+        return Ok(());
+    }
+    Err(ApiError::new(
+        StatusCode::TOO_MANY_REQUESTS,
+        "rate_limited",
+        Some("too many reports for this claim".to_owned()),
+    ))
+}
+
 /// `POST /v1/me/exit` (ADR-0033 decision 2): the guest, over the node SVID, says the
 /// workload exited and its restart policy ends the claim. The exit goes on the record (and
 /// the audit line with it), and the claim is released as `DELETE /v1/claims/{name}` releases
@@ -1791,6 +1849,7 @@ async fn report(
     Json(body): Json<GuestReport>,
 ) -> Result<StatusCode, ApiError> {
     let mut rec = claim_of_node_peer(&st, &headers, peer.as_ref().map(|e| &e.0)).await?;
+    node_report_allowed(&st, rec.uid)?;
     body.validate()
         .map_err(|e| ApiError::bad_request("invalid_report", e))?;
     if body.host_table == HostTable::Missing {
@@ -2314,6 +2373,36 @@ fn backend_of(st: &AppState, audience: &str) -> &'static str {
     }
 }
 
+/// A claim outlives the configuration it was made under: an operator who removes an issuer
+/// (a compromised one, say) or an audience expects the claims that rest on it to get nothing
+/// more. The issuer the claim's subject logged in at, when it is still configured and the
+/// audience still is; `403` otherwise, before any backend is looked at.
+fn still_configured<'a>(
+    st: &'a AppState,
+    rec: &ClaimRecord,
+    audience: &str,
+    claim_uid: Uuid,
+) -> Result<&'a mediatore_entra::IssuerConfig, ApiError> {
+    let Some(issuer) = st.validator.issuer_named(&rec.subject.issuer) else {
+        tracing::warn!(%claim_uid, %audience, issuer = %rec.subject.issuer, "token refused: the claim's issuer is no longer configured");
+        return Err(ApiError::forbidden(
+            "the claim's issuer is no longer configured",
+        ));
+    };
+    if !st.audiences.iter().any(|a| a == audience) {
+        tracing::warn!(%claim_uid, %audience, "token refused: the audience is no longer configured");
+        return Err(ApiError::forbidden("the audience is no longer configured"));
+    }
+    Ok(issuer)
+}
+
+/// A credential's stated expiry, never later than the claim's own deadline: nothing the
+/// broker hands out for a claim is said to outlive it. A claim with no deadline (never bound)
+/// has nothing to clamp to.
+fn within_claim(expires_at: Timestamp, claim_end: Option<Timestamp>) -> Timestamp {
+    claim_end.map_or(expires_at, |end| expires_at.min(end))
+}
+
 /// A claim's credential for `audience`, once the claim has passed its gate: the one
 /// per-backend code (delegated, secret, Entra On-Behalf-Of, STS) that `POST /v1/token` and the
 /// gateway's credential route both run (ADR-0040 decision 2). `actor` is the SPIFFE ID the
@@ -2327,6 +2416,11 @@ async fn issue_token(
     audience: String,
     placement: Placement,
 ) -> Result<TokenResponse, ApiError> {
+    // Before any backend, the operator's `via: secret` included: nothing is handed to a claim
+    // whose issuer or audience has left the configuration.
+    let issuer = still_configured(st, &rec, &audience, claim_uid)?;
+    // No backend states an expiry later than the claim's own deadline.
+    let claim_end = rec.expires_at;
     // ADR-0035: the caller's own credential, opened from the record's envelope for this
     // audience, handed with the header it goes in; it dies with the credential, the claim or
     // `max_ttl`, whichever is first.
@@ -2339,39 +2433,42 @@ async fn issue_token(
         if placement == Placement::Proxy {
             tracing::info!(%claim_uid, %audience, subject = %rec.subject.id, backend = "secret", header = %sec.header, "token issued");
         }
-        return Ok(sec.response(audience, rec.subject));
+        let mut answer = sec.response(audience, rec.subject);
+        answer.expires_at = within_claim(answer.expires_at, claim_end);
+        return Ok(answer);
     }
     // ADR-0013 decision 4, ADR-0016 decision 2: a session issuer's record is refreshed
     // upstream first, for the audience's resource. One refresh at a time per claim, over
     // the record as it is once the lock is held: the previous one may have rotated the
     // envelope, or released the claim.
     let obo = st.obo_audiences.iter().any(|a| a == &audience);
-    let issuer = st.validator.issuer_named(&rec.subject.issuer);
-    if obo && issuer.is_none_or(|i| i.entra.is_none()) {
+    if obo && issuer.entra.is_none() {
         return Err(ApiError::forbidden(
             "audience is served On-Behalf-Of and this claim has no Entra session",
         ));
     }
-    let fresh = match issuer {
-        Some(issuer) if issuer.session.is_some() || issuer.entra.is_some() => {
-            let lock = st.limiter.refresh_lock(claim_uid);
-            let _held = lock.lock().await;
-            let rec = st
-                .store
-                .get_claim(claim_uid)
-                .await
-                .map_err(|_| ApiError::forbidden("unknown claim"))?;
-            if !rec.is_live(Timestamp::now()) {
-                return Err(ApiError::forbidden("claim revoked or expired"));
-            }
-            refresh_session(st, &rec, issuer, &audience, obo).await?
+    let fresh = if issuer.session.is_some() || issuer.entra.is_some() {
+        let lock = st.limiter.refresh_lock(claim_uid);
+        let _held = lock.lock().await;
+        let rec = st
+            .store
+            .get_claim(claim_uid)
+            .await
+            .map_err(|_| ApiError::forbidden("unknown claim"))?;
+        if !rec.is_live(Timestamp::now()) {
+            return Err(ApiError::forbidden("claim revoked or expired"));
         }
-        _ => Fresh {
+        refresh_session(st, &rec, issuer, &audience, obo).await?
+    } else {
+        Fresh {
             groups: vec![],
             obo: None,
-        },
+        }
     };
     if let Some((token, expires_at)) = fresh.obo {
+        // Entra's token lives as long as Entra says; what the proxy is told to keep it for
+        // ends with the claim.
+        let expires_at = within_claim(expires_at, claim_end);
         if placement == Placement::Proxy {
             tracing::info!(%claim_uid, %audience, subject = %rec.subject.id, %expires_at, "token issued on behalf of the subject");
         }
@@ -2388,15 +2485,29 @@ async fn issue_token(
     let Some(sts) = st.sts.as_ref() else {
         return Err(ApiError::not_implemented("sts backend not configured"));
     };
+    // The first of fifteen minutes, this audience's own maximum and the time the claim has
+    // left, measured and minted at the same instant so the token's `exp` is never past the
+    // claim's deadline.
+    let now = Timestamp::now();
+    let mut ttl = SignedDuration::from_mins(15).min(sts.max_ttl_for(&audience));
+    if let Some(end) = claim_end {
+        ttl = ttl.min(end.duration_since(now));
+    }
+    if ttl <= SignedDuration::ZERO {
+        return Err(ApiError::forbidden("claim revoked or expired"));
+    }
     let minted = sts
-        .mint(&MintRequest {
-            subject: &rec.subject,
-            actor_spiffe_id: actor,
-            claim_uid,
-            audience: &audience,
-            groups: fresh.groups,
-            ttl: SignedDuration::from_mins(15).min(sts.max_ttl()),
-        })
+        .mint_at(
+            &MintRequest {
+                subject: &rec.subject,
+                actor_spiffe_id: actor,
+                claim_uid,
+                audience: &audience,
+                groups: fresh.groups,
+                ttl,
+            },
+            now,
+        )
         .map_err(|e| ApiError::internal(e.to_string()))?;
     if placement == Placement::Proxy {
         tracing::info!(%claim_uid, %audience, subject = %rec.subject.id, "token issued");
@@ -2781,7 +2892,7 @@ mod tests {
             store: mediatore_store::MemoryStore::shared(),
             spire: Arc::new(mediatore_spire::MemoryEntries::default()),
             naming: naming(),
-            validator: Validator::new(vec![]),
+            validator: Validator::new(vec![subject_issuer()]),
             sts: None,
             audiences: vec![],
             obo_audiences: vec![],
@@ -2896,6 +3007,24 @@ mod tests {
             issuer: "https://idp.example".into(),
             id: "octocat".into(),
             display: None,
+        }
+    }
+
+    /// The issuer [`subject`] logged in at, as the configuration names it. No session, so an
+    /// issue asks nothing upstream.
+    fn subject_issuer() -> IssuerConfig {
+        IssuerConfig {
+            url: subject().issuer,
+            backend: Backend::Sts,
+            client_id: "mediatore".into(),
+            subject_claim: "preferred_username".into(),
+            required_group: None,
+            required_groups: None,
+            allow_any_authenticated: true,
+            session: None,
+            ca_file: None,
+            entra: None,
+            groups_claim: None,
         }
     }
 
@@ -3118,6 +3247,40 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn the_issuers_session_is_parked_with_the_claims_ttl_as_its_expiry() {
+        // The issuer's session is an envelope like a delegation: parked open-ended, the sweep would never remove
+        // it when its sandbox went away without a release.
+        let st = base_state();
+        let sealer = mediatore_store::seal::LocalKeySealer::new([7; 32]);
+        let mut created = sandbox_in("team-a", "sb-1");
+        let sandbox_uid = Uuid::new_v4();
+        created.metadata.uid = Some(sandbox_uid.to_string());
+        let ttl = SignedDuration::from_secs(i64::from(created.spec.ttl_seconds));
+        let validated = Validated {
+            subject: subject(),
+            issuer: subject_issuer(),
+            groups: vec![],
+            expires_at: Timestamp::now(),
+        };
+        let token = Secret("refresh-material-placeholder".into());
+        let before = Timestamp::now();
+        park_session(&st, &sealer, &created, &validated, &token)
+            .await
+            .expect("parked");
+        let after = Timestamp::now();
+        let parked = st.store.take_session(sandbox_uid).await.unwrap();
+        let is_the_issuers = parked.as_ref().is_some_and(|s| s.audience.is_none());
+        assert!(is_the_issuers, "one session, the issuer's");
+        let bounded = parked
+            .and_then(|s| s.expires_at)
+            .is_some_and(|e| e >= before + ttl && e <= after + ttl);
+        assert!(
+            bounded,
+            "stored until the claim's creation plus its TTL, no longer"
+        );
+    }
+
     #[test]
     fn a_basic_token_is_a_user_a_colon_and_a_secret_with_no_control_character() {
         assert_eq!(basic_parts("alice:s3cret"), Ok(("alice", "s3cret")));
@@ -3242,6 +3405,203 @@ mod tests {
             assert_eq!(status, StatusCode::FORBIDDEN, "{a}");
             assert_eq!(code(&body), error_code::NOT_PLACED_AT_GATEWAY, "{a}");
         }
+    }
+
+    // ----- a credential never outlives its claim, an STS token never its audience's maximum -----
+
+    /// A claim for `audiences` with a minute left, stored, and when it ends.
+    async fn claim_with_a_minute_left(st: &Shared, audiences: &[&str]) -> (ClaimRecord, Timestamp) {
+        let dies_at = Timestamp::now() + SignedDuration::from_secs(60);
+        let mut rec = claim(audiences, None);
+        rec.expires_at = Some(dies_at);
+        (stored(st, rec).await, dies_at)
+    }
+
+    /// The `expires_at` of a `200` from `POST /v1/token`; the body is never printed.
+    async fn issued_until(st: &Shared, rec: &ClaimRecord, audience: &str) -> Timestamp {
+        let (status, body, _) = token_for(st, rec, audience).await;
+        assert_eq!(status, StatusCode::OK, "{audience}");
+        let answer: TokenResponse = serde_json::from_value(body).expect("a token response");
+        answer.expires_at
+    }
+
+    #[tokio::test]
+    async fn an_sts_token_expires_no_later_than_a_claim_with_a_minute_left() {
+        let st: Shared = Arc::new(placed_state());
+        let (rec, dies_at) = claim_with_a_minute_left(&st, &["grafana-sts", "sts-gw"]).await;
+        let expires_at = issued_until(&st, &rec, "grafana-sts").await;
+        assert!(expires_at <= dies_at, "the token outlives its claim");
+        assert!(
+            expires_at > Timestamp::now(),
+            "and it is still a usable one"
+        );
+        // The same minting code behind the gateway's route.
+        let (status, body, _) = ask(&st, rec.uid, Some(&gateway_peer()), "sts-gw").await;
+        assert_eq!(status, StatusCode::OK);
+        let c: GatewayCredential = serde_json::from_value(body).unwrap();
+        assert!(c.expires_at <= dies_at, "the credential outlives its claim");
+    }
+
+    #[tokio::test]
+    async fn an_operator_secrets_expiry_is_clamped_to_the_claims() {
+        let st: Shared = Arc::new(placed_state());
+        let (rec, dies_at) = claim_with_a_minute_left(&st, &["grafana", "anthropic"]).await;
+        assert!(issued_until(&st, &rec, "grafana").await <= dies_at);
+        let (status, body, _) = ask(&st, rec.uid, Some(&gateway_peer()), "anthropic").await;
+        assert_eq!(status, StatusCode::OK);
+        let c: GatewayCredential = serde_json::from_value(body).unwrap();
+        assert!(c.expires_at <= dies_at, "the credential outlives its claim");
+        // A claim with longer left than the audience's `max_ttl` is told `max_ttl`, as before.
+        let mut long = claim(&["grafana"], None);
+        long.expires_at = Some(Timestamp::now() + SignedDuration::from_hours(1));
+        let long = stored(&st, long).await;
+        let expires_at = issued_until(&st, &long, "grafana").await;
+        assert!(expires_at > Timestamp::now() + SignedDuration::from_mins(14));
+        assert!(expires_at <= Timestamp::now() + SignedDuration::from_mins(15));
+    }
+
+    #[tokio::test]
+    async fn an_audiences_own_maximum_bounds_its_sts_token_beside_a_longer_one() {
+        let mut st = placed_state();
+        st.audiences.push("other-sts".into());
+        st.sts = st
+            .sts
+            .map(|sts| sts.with_audience_max_ttl("grafana-sts", SignedDuration::from_mins(2)));
+        let st: Shared = Arc::new(st);
+        let rec = stored(&st, claim(&["grafana-sts", "other-sts"], None)).await;
+        let short = issued_until(&st, &rec, "grafana-sts").await;
+        assert!(short <= Timestamp::now() + SignedDuration::from_mins(2));
+        let other = issued_until(&st, &rec, "other-sts").await;
+        assert!(
+            other > Timestamp::now() + SignedDuration::from_mins(10),
+            "the other audience keeps the longer lifetime"
+        );
+        assert!(other <= Timestamp::now() + SignedDuration::from_mins(15));
+    }
+
+    // ----- what an unauthenticated caller is told -----
+
+    /// `GET /v1/claims/sandbox-x` on the user router with `bearer`.
+    async fn as_user(st: &Shared, bearer: &str) -> (StatusCode, serde_json::Value, String) {
+        let req = Request::builder()
+            .method("GET")
+            .uri("/v1/claims/sandbox-x")
+            .header("authorization", format!("Bearer {bearer}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = user_router(st.clone()).oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        (
+            status,
+            serde_json::from_str(&text).unwrap_or(serde_json::Value::Null),
+            text,
+        )
+    }
+
+    #[tokio::test]
+    async fn an_issuer_outage_at_login_is_503_and_says_nothing_of_the_issuer() {
+        // An issuer on a port nothing listens on: its discovery fetch is refused at once.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let down = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let mut issuer = subject_issuer();
+        issuer.url.clone_from(&down);
+        let mut st = base_state();
+        st.validator = Validator::new(vec![issuer]);
+        let st: Shared = Arc::new(st);
+        let bearer = mediatore_testkit::mint(
+            &down,
+            serde_json::json!({ "aud": "mediatore", "preferred_username": "octocat" }),
+        );
+        let (status, body, text) = as_user(&st, &bearer).await;
+        assert_eq!(
+            (status, code(&body)),
+            (StatusCode::SERVICE_UNAVAILABLE, "upstream_unavailable")
+        );
+        assert_eq!(body["detail"], "the identity provider did not answer");
+        for internal in [
+            "127.0.0.1",
+            "openid-configuration",
+            "discovery",
+            "error sending",
+        ] {
+            assert!(
+                !text.contains(internal),
+                "the answer carries the validator's own error text"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bearer_that_does_not_validate_is_401_with_fixed_text() {
+        let st: Shared = Arc::new(base_state());
+        let elsewhere = mediatore_testkit::mint(
+            "https://elsewhere.example",
+            serde_json::json!({ "aud": "mediatore", "preferred_username": "octocat" }),
+        );
+        for bearer in ["not-a-jwt", "a.b.c", elsewhere.as_str()] {
+            let (status, body, _) = as_user(&st, bearer).await;
+            assert_eq!(
+                (status, code(&body)),
+                (StatusCode::UNAUTHORIZED, "unauthorized")
+            );
+            assert_eq!(body["detail"], "invalid token");
+        }
+    }
+
+    // ----- the node's writes to its claim are rate limited -----
+
+    #[tokio::test]
+    async fn a_burst_of_reports_from_a_node_is_rate_limited_per_claim_and_its_exit_is_not() {
+        let mut st = placed_state();
+        st.limiter = Limiter::new(2);
+        let st: Shared = Arc::new(st);
+        let node = st.naming.node_id("ek1");
+        st.store
+            .put_node(NodeRecord {
+                ek_hash: "ek1".into(),
+                node_id: node.clone(),
+                dmi_uuid: Uuid::new_v4(),
+                hostname: "pool-1".into(),
+                provider: None,
+                banned: false,
+                registered_at: Timestamp::now(),
+            })
+            .await
+            .unwrap();
+        let rec = stored(&st, claim(&["grafana"], Some(node.clone()))).await;
+        let report = serde_json::to_value(GuestReport {
+            image_digest: format!("sha256:{}", "a".repeat(64)),
+            sandbox_ruleset_sha256: "b".repeat(64),
+            host_table: HostTable::NotLoaded,
+        })
+        .unwrap();
+        for _ in 0..2 {
+            let (status, ..) =
+                call(&st, "POST", "/v1/me/report", Some(&node), report.clone()).await;
+            assert_eq!(status, StatusCode::NO_CONTENT);
+        }
+        let (status, body, _) = call(&st, "POST", "/v1/me/report", Some(&node), report).await;
+        assert_eq!(
+            (status, code(&body)),
+            (StatusCode::TOO_MANY_REQUESTS, "rate_limited")
+        );
+        // The exit is sent once and must land: a spent bucket does not refuse it.
+        let (status, ..) = call(
+            &st,
+            "POST",
+            "/v1/me/exit",
+            Some(&node),
+            serde_json::json!({ "code": 0, "restarts": 0 }),
+        )
+        .await;
+        assert_ne!(status, StatusCode::TOO_MANY_REQUESTS);
+        let ended = st.store.get_claim(rec.uid).await.expect("the claim");
+        assert!(ended.exit.is_some());
     }
 
     #[tokio::test]
@@ -3481,6 +3841,89 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["access_token"], "grafana-key");
+    }
+
+    // ----- a claim whose issuer or audience left the configuration -----
+
+    /// `POST /v1/token` as the claim's own identity.
+    async fn token_for(
+        st: &Shared,
+        rec: &ClaimRecord,
+        audience: &str,
+    ) -> (StatusCode, serde_json::Value, String) {
+        call(
+            st,
+            "POST",
+            "/v1/token",
+            Some(&naming().claim_id(rec.uid)),
+            serde_json::json!({ "audience": audience }),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_claim_whose_issuer_left_the_configuration_gets_no_credential_from_any_backend() {
+        // The claim was made while its issuer was configured, and issues.
+        let configured: Shared = Arc::new(placed_state());
+        let rec = stored(
+            &configured,
+            claim(&["anthropic", "grafana", "grafana-sts"], None),
+        )
+        .await;
+        for a in ["grafana", "grafana-sts"] {
+            assert_eq!(
+                token_for(&configured, &rec, a).await.0,
+                StatusCode::OK,
+                "{a}"
+            );
+        }
+        // The operator removes the issuer: the same record, in the same store, gets nothing.
+        let mut st = placed_state();
+        st.store = configured.store.clone();
+        st.validator = Validator::new(vec![]);
+        let st: Shared = Arc::new(st);
+        // The operator's secret, the STS, and the secret the gateway places.
+        for a in ["grafana", "grafana-sts"] {
+            let (status, body, text) = token_for(&st, &rec, a).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{a}: {body}");
+            assert_eq!(code(&body), "forbidden", "{a}");
+            assert!(body.get("access_token").is_none(), "{a}");
+            assert!(!text.contains("grafana-key"), "{a}");
+        }
+        let (status, body, text) = ask(&st, rec.uid, Some(&gateway_peer()), "anthropic").await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(code(&body), "forbidden");
+        assert!(!text.contains(SECRET_VALUE));
+    }
+
+    #[tokio::test]
+    async fn a_claim_naming_an_audience_that_left_the_configuration_gets_no_credential() {
+        let configured: Shared = Arc::new(placed_state());
+        let rec = stored(
+            &configured,
+            claim(&["anthropic", "grafana", "grafana-sts"], None),
+        )
+        .await;
+        // The operator removes three audiences; the record still names them. `grafana` leaves
+        // with its secret, so what is left to serve it is the STS, which must not mint;
+        // `anthropic` leaves the list alone, so the secret is still at hand and must not be
+        // given.
+        let mut st = placed_state();
+        st.store = configured.store.clone();
+        st.audiences.retain(|a| a == "claude" || a == "sts-gw");
+        st.secrets.remove("grafana");
+        let st: Shared = Arc::new(st);
+        for a in ["grafana", "grafana-sts"] {
+            let (status, body, text) = token_for(&st, &rec, a).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{a}: {body}");
+            assert_eq!(code(&body), "forbidden", "{a}");
+            assert!(body.get("access_token").is_none(), "{a}");
+            assert!(!text.contains("grafana-key"), "{a}");
+        }
+        let (status, body, text) = ask(&st, rec.uid, Some(&gateway_peer()), "anthropic").await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(code(&body), "forbidden");
+        assert!(!text.contains(SECRET_VALUE));
     }
 
     // ----- what the guest and the gateway are told -----
@@ -4384,6 +4827,79 @@ mod tests {
             assert_eq!(code(&u.1), "not_found");
             assert_eq!(u.0, a.0);
             assert_eq!(code(&u.1), code(&a.1));
+        }
+    }
+
+    /// Path segments that decode to something other than an RFC 1123 label: a `/`, a `?`, a
+    /// `%`, uppercase, a leading hyphen, and one byte over the longest label.
+    fn not_sandbox_names() -> Vec<String> {
+        vec![
+            "a%2Fb".to_owned(),
+            "..%2F..%2Fsecrets".to_owned(),
+            "a%3Fwatch=1".to_owned(),
+            "a%25b".to_owned(),
+            "Sandbox-X".to_owned(),
+            "-sandbox".to_owned(),
+            "a".repeat(64),
+        ]
+    }
+
+    #[tokio::test]
+    async fn a_name_that_is_not_a_dns_label_is_404_and_never_reaches_the_front_door() {
+        let b = broker_with_logs(
+            tenant_map(),
+            false,
+            Some(LogLimits {
+                max_bytes: mediatore_proto::DEFAULT_LOG_MAX_BYTES,
+            }),
+        )
+        .await;
+        let t = b.token("alice", &[TEAM_A]);
+        created(&b.create(&t, Some("team-a")).await);
+        for name in not_sandbox_names() {
+            let logs = format!("/v1/claims/{name}/logs?namespace=team-a");
+            let answers = [
+                b.get(&t, &name, Some("team-a")).await,
+                b.delete(&t, &name, Some("team-a")).await,
+                b.user("GET", &logs, &t, &[], serde_json::Value::Null).await,
+            ];
+            for (status, body, _) in &answers {
+                assert_eq!(*status, StatusCode::NOT_FOUND, "{name}");
+                assert_eq!(code(body), "not_found", "{name}");
+                assert_eq!(body["detail"], "no such sandbox", "{name}");
+            }
+        }
+        // No name at all is no route.
+        let empty = b
+            .user(
+                "GET",
+                "/v1/claims/?namespace=team-a",
+                &t,
+                &[],
+                serde_json::Value::Null,
+            )
+            .await;
+        assert_eq!(empty.0, StatusCode::NOT_FOUND);
+        assert_eq!(b.reads(), 0, "no read is issued for a name that is not one");
+        assert_eq!(b.front.all().len(), 1, "the claim is still there");
+        // A caller with no token learns nothing from the name: `401` first.
+        let anonymous = b.get("not-a-token", "a%2Fb", Some("team-a")).await;
+        assert_eq!(anonymous.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn dev_mode_refuses_a_name_that_is_not_a_dns_label_the_same_way() {
+        let b = broker(Namespaces::Single("sandboxes".into()), true).await;
+        let t = b.token("alice", &[]);
+        for name in not_sandbox_names() {
+            for (status, body, _) in [
+                b.get(&t, &name, None).await,
+                b.delete(&t, &name, None).await,
+            ] {
+                assert_eq!(status, StatusCode::NOT_FOUND, "{name}");
+                assert_eq!(code(&body), "not_found", "{name}");
+                assert_eq!(body["detail"], "no such sandbox", "{name}");
+            }
         }
     }
 
