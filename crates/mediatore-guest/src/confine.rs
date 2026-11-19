@@ -4,7 +4,8 @@
 //! The inner layer of the jail (ADR-0024): `mediatore jail-exec`, what `nsjail` execs as
 //! the sandbox user. It builds the workload's capability set from its arguments, applies
 //! it to itself with Landlock through the `nono` library (irreversible, inherited by every
-//! child) and execs the workload's argv. A refusal exits with
+//! child), then a seccomp denylist of socket families and `io_uring` (ADR-0051, see
+//! [`crate::seccomp`]), and execs the workload's argv. A refusal exits with
 //! [`EXIT_CONFINEMENT_REFUSED`], which the supervisor treats as fatal for the claim, never
 //! as a crash to restart.
 
@@ -181,9 +182,16 @@ pub fn run(args: &JailExecArgs) -> JailExecError {
     if let Err(e) = nono::Sandbox::apply_landlock(&caps) {
         return JailExecError::Refused(anyhow::anyhow!("{e}"));
     }
+    // After Landlock and before the exec, so the one binary is never confined by a rule meant
+    // for the workload; a filter that cannot load is a refusal like Landlock's (ADR-0051).
+    let seccomp_filters = match crate::seccomp::apply() {
+        Ok(n) => n,
+        Err(e) => return JailExecError::Refused(e),
+    };
     tracing::info!(
         writable = ?plan.writable,
         connect_ports = ?plan.connect_ports,
+        seccomp_filters,
         "confinement applied; exec"
     );
     let argv0 = args.argv[0].clone();

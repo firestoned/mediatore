@@ -3,7 +3,7 @@
 
 # ADR-0051: Socket families and io_uring denied to the workload by a seccomp filter
 
-**Status:** Proposed · **Date:** 2026-11-18
+**Status:** Accepted, implemented 2026-11-19 · **Date:** 2026-11-18
 
 Roadmap 06, the confinement item. Adds a third layer inside the jail of
 [ADR-0020](0020-jail-network-nftables-keyed-by-sandbox-uid.md) (nftables keyed by uid) and
@@ -76,12 +76,21 @@ the image runs.
    - `io_uring_setup`, `io_uring_enter` and `io_uring_register`.
    - `bpf`, `userfaultfd`, `perf_event_open`, `kexec_load`, `init_module`,
      `finit_module`, `delete_module`, `mount`, `umount2`, `pivot_root`, `setns`,
-     `unshare`, `open_by_handle_at` and `ptrace` of a process outside the jail's own
-     (the last is already out of reach under the `subset=pid` `/proc` of
-     [ADR-0036](0036-proc-inside-the-jail-the-workloads-own-processes-only.md); listed
-     so the filter does not depend on that). Everything on this line is already refused by a
+     `unshare` and `open_by_handle_at`. Everything on this line is already refused by a
      dropped capability or by Landlock; the filter makes each refusal independent of
-     the other two layers, which is its whole purpose.
+     the other two layers, which is its whole purpose. **`ptrace` is not on the list
+     (amended at implementation):** a filter cannot tell a process of the jail from
+     another, and refusing it outright would break a debugger on the workload's own
+     children. It stays with the PID namespace and the `subset=pid` `/proc` of
+     [ADR-0036](0036-proc-inside-the-jail-the-workloads-own-processes-only.md), and Yama's
+     scope behind them.
+   - Two filters, installed in turn, so the two errnos do not depend on the kernel's
+     precedence between filters: the family filter (`EAFNOSUPPORT`) and the rest
+     (`EPERM`). Their matches are disjoint (a unit test walks every family and type).
+     The type is compared under the kernel's own `SOCK_TYPE_MASK` (`0xf`), which is the
+     `SOCK_NONBLOCK | SOCK_CLOEXEC` masking and stricter: every value but `SOCK_STREAM`
+     is refused. A process of another ABI (the 32-bit compat entry) is refused by the
+     filter's architecture check.
    - Anything else is allowed (`DEFAULT ALLOW`). This is deliberate: a default-deny
      policy needs a syscall table per runtime and image, which ADR-0024 refused.
 
@@ -100,6 +109,14 @@ the image runs.
 
    The choice is made by the first red test: whichever carrier passes the live test
    below with the least new surface is the one.
+
+   **Chosen 2026-11-19: `seccompiler` 0.5 (option 2), called from `jail-exec`.** `nono`
+   0.81.0 has no custom denylist (its seccomp is the network fallback and the supervisor's
+   mediation, `SeccompOpts`), and the live test runs `jail-exec` directly, not under
+   `nsjail`, so a Kafel string passed to `nsjail` would not be the filter that test proves.
+   The policy is data in `crates/mediatore-guest/src/seccomp.rs` (`Filter`, `Rule`, `Cond`,
+   an evaluator the unit tests drive on every platform), compiled and installed on Linux
+   only, `default-features = false`, plus `libc` for the syscall numbers.
 
 4. **Fail closed, with the same exit.** A kernel without seccomp-bpf, or a filter that
    fails to load, is an error before the argv and exits 125 (ADR-0024 decision 4): no
@@ -185,10 +202,11 @@ inherits all of it. A run where the filter cannot load exits 125.
 
 ## Open questions
 
-1. Does the `nono` library expose a seccomp filter on Linux at the pinned `=0.81.0`? The
-   ADR does not depend on the answer (decision 3) but the first commit should check
-   `cargo doc` before choosing the carrier.
-2. Is there a workload class in the community docs that opens `AF_NETLINK` for a
+1. *Answered 2026-11-19.* `nono` 0.81.0 does not expose a custom denylist; the carrier is
+   `seccompiler` (decision 3). Not covered by the live test: a run where the filter cannot
+   load exiting 125 (no kernel here can be made to refuse it on demand); the path is the
+   same `JailExecError::Refused` as Landlock's, pinned by that type's unit test.
+2. *Still open: `AF_NETLINK` is denied outright today.* Is there a workload class in the community docs that opens `AF_NETLINK` for a
    non-privileged read (`getifaddrs`, some Go and Java runtimes enumerate interfaces
    this way)? If so, the filter allows `AF_NETLINK` with `NETLINK_ROUTE` only
    (`socket` third argument), and that exception is spelled out here before

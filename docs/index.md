@@ -31,6 +31,8 @@ the component that finishes the story.
 
 ## Where to start
 
+- [Locking down a sandbox VM's network](guides/sandbox-network-lockdown.md): the best practice that a VM reaches only its own
+  segment's gateway and no other sandbox, in the guest's cloud-config, and how to check it.
 - [Running workloads on a claimed VM](guides/running-workloads.md): the user, OBO-agent and
   app-only paths, end to end.
 - [The research agent, front to back](guides/research-agent-walkthrough.md): one agent
