@@ -121,6 +121,8 @@ pub async fn serve(
             },
             () = &mut shutdown => break,
         };
+        // A failure only costs latency (Nagle against delayed ACKs on a streamed answer).
+        let _ = tcp.set_nodelay(true);
         let acceptor = TlsAcceptor::from(configs.current());
         let router = router.clone();
         let watcher = graceful.watcher();

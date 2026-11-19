@@ -31,7 +31,7 @@ on:
 
 # A newer run of the same event on the same ref cancels the older one (a second push to
 # the PR, the next merge to main); a release is never cancelled. Across events, a merge
-# to main cancels the PR runs and a release cancels main's: the preempt job below.
+# to main cancels the merged PR's runs and a release cancels main's: the preempt job below.
 concurrency:
   group: build-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name != 'release' }}
@@ -43,11 +43,13 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # A runner builds once: incremental state only slows the build and bloats the cache.
+  CARGO_INCREMENTAL: "0"
   RUST_BACKTRACE: 1
 
 jobs:
   # ───────────────────────────────────────────────────────────────────────────
-  # Preempt: a merge to main cancels the PR runs still going, a release cancels
+  # Preempt: a merge to main cancels the merged PR's runs still going, a release cancels
   # main's, so a hot fix is not queued behind work it supersedes. Nothing waits
   # on this job; it only frees runners (scripts/ci-preempt.sh).
   # ───────────────────────────────────────────────────────────────────────────
@@ -58,6 +60,7 @@ jobs:
     permissions:
       contents: read
       actions: write # cancel the superseded runs
+      pull-requests: read # which PR the pushed commit merged
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -216,7 +219,9 @@ jobs:
   dist:
     name: 🦀 Static Binary (musl)
     runs-on: ubuntu-latest
-    needs: [test]
+    # Beside test, not behind it: nothing here is published. The image jobs, which copy
+    # this binary and push, wait on test and clippy themselves.
+    needs: [license-check, verify-commits]
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -272,7 +277,9 @@ jobs:
   dist-darwin:
     name: 🍎 CLI (darwin/arm64)
     runs-on: macos-15
-    needs: [test]
+    # Beside test, as dist: release-assets, the one consumer, waits on the image jobs
+    # and so on test and clippy.
+    needs: [license-check, verify-commits]
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -301,14 +308,15 @@ jobs:
           if-no-files-found: error
 
   # ───────────────────────────────────────────────────────────────────────────
-  # Server image — builds on every event, pushes + signs + SBOMs on non-PR.
+  # Server image: assembled on every event from the dist job's binary, pushed + signed
+  # + SBOM'd on non-PR.
   # linux/amd64 only for now: arm64 follows banlieue's staged-binary pattern
   # once there is a release to justify it.
   # ───────────────────────────────────────────────────────────────────────────
   docker:
     name: 🐳 Server Image
     runs-on: ubuntu-latest
-    needs: [test, clippy]
+    needs: [test, clippy, dist]
     permissions:
       contents: read
       packages: write # GHCR push (non-PR only)
@@ -319,12 +327,16 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # The binary reports the release's version; fails if Cargo.toml then disagrees.
-      - name: Set the workspace version (release)
-        if: github.event_name == 'release'
-        env:
-          TAG: ${{ github.event.release.tag_name }}
-        run: make set-version VERSION="${TAG#v}"
+      # The image carries the dist job's binary (BINARY_FROM=host): one compile per run,
+      # the same file the release attaches, the release's version stamped in by that job.
+      - name: Download the binary
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: mediatore-linux-amd64-musl
+          path: dist
+
+      - name: Restore the executable bit (artifacts drop it)
+        run: make dist-chmod
 
       - name: Set up Docker (login + buildx)
         uses: firestoned/github-actions/docker/setup-docker@f52366c4f57f0110012035ac1bcd0bee4075b3e9 # v1.4.0
@@ -358,8 +370,10 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: BINARY_FROM=host
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Written by main alone: a PR reads main's cache and spends none of the quota.
+          cache-to: ${{ github.event_name == 'push' && 'type=gha,mode=max' || '' }}
           sbom: true
           provenance: true
 
@@ -395,7 +409,7 @@ jobs:
   guest-image:
     name: 🖥️ Sandbox VM Image
     runs-on: ubuntu-latest
-    needs: [test, clippy]
+    needs: [test, clippy, dist]
     permissions:
       contents: read
       packages: write # GHCR push (non-PR only)
@@ -406,12 +420,16 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # The binary reports the release's version; fails if Cargo.toml then disagrees.
-      - name: Set the workspace version (release)
-        if: github.event_name == 'release'
-        env:
-          TAG: ${{ github.event.release.tag_name }}
-        run: make set-version VERSION="${TAG#v}"
+      # The image carries the dist job's binary (BINARY_FROM=host): one compile per run,
+      # the same file the release attaches, the release's version stamped in by that job.
+      - name: Download the binary
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: mediatore-linux-amd64-musl
+          path: dist
+
+      - name: Restore the executable bit (artifacts drop it)
+        run: make dist-chmod
 
       - name: Set up Docker (login + buildx)
         uses: firestoned/github-actions/docker/setup-docker@f52366c4f57f0110012035ac1bcd0bee4075b3e9 # v1.4.0
@@ -446,8 +464,10 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.guest_meta.outputs.tags }}
           labels: ${{ steps.guest_meta.outputs.labels }}
+          build-args: BINARY_FROM=host
           cache-from: type=gha,scope=guest
-          cache-to: type=gha,mode=max,scope=guest
+          # Written by main alone: a PR reads main's cache and spends none of the quota.
+          cache-to: ${{ github.event_name == 'push' && 'type=gha,mode=max,scope=guest' || '' }}
           sbom: ${{ github.event_name != 'pull_request' }}
           provenance: ${{ github.event_name != 'pull_request' }}
 
@@ -488,7 +508,7 @@ jobs:
   gateway-image:
     name: 🚪 Gateway VM Image
     runs-on: ubuntu-latest
-    needs: [test, clippy]
+    needs: [test, clippy, dist]
     permissions:
       contents: read
       packages: write # GHCR push (non-PR only)
@@ -499,12 +519,16 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # The binary reports the release's version; fails if Cargo.toml then disagrees.
-      - name: Set the workspace version (release)
-        if: github.event_name == 'release'
-        env:
-          TAG: ${{ github.event.release.tag_name }}
-        run: make set-version VERSION="${TAG#v}"
+      # The image carries the dist job's binary (BINARY_FROM=host): one compile per run,
+      # the same file the release attaches, the release's version stamped in by that job.
+      - name: Download the binary
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: mediatore-linux-amd64-musl
+          path: dist
+
+      - name: Restore the executable bit (artifacts drop it)
+        run: make dist-chmod
 
       - name: Set up Docker (login + buildx)
         uses: firestoned/github-actions/docker/setup-docker@f52366c4f57f0110012035ac1bcd0bee4075b3e9 # v1.4.0
@@ -539,8 +563,10 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.gateway_meta.outputs.tags }}
           labels: ${{ steps.gateway_meta.outputs.labels }}
+          build-args: BINARY_FROM=host
           cache-from: type=gha,scope=gateway
-          cache-to: type=gha,mode=max,scope=gateway
+          # Written by main alone: a PR reads main's cache and spends none of the quota.
+          cache-to: ${{ github.event_name == 'push' && 'type=gha,mode=max,scope=gateway' || '' }}
           sbom: ${{ github.event_name != 'pull_request' }}
           provenance: ${{ github.event_name != 'pull_request' }}
 

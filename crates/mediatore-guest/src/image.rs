@@ -28,6 +28,10 @@ const DOCKER_MANIFEST_LIST: &str = "application/vnd.docker.distribution.manifest
 /// What `Accept` says on a manifest request: both families, image and index.
 const ACCEPT: &str = "application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json";
 
+/// How much of a blob is gathered in memory before it is written to its staged file: 1 MiB, so a layer costs
+/// one write per mebibyte and not one per network chunk.
+const BLOB_WRITE_BUFFER: usize = 1 << 20;
+
 /// The platform the guest selects from an index: `linux` and this machine's architecture
 /// in the registry's spelling.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -699,7 +703,13 @@ impl Puller {
             d.digest,
             resp.status()
         );
-        let mut file = tokio::fs::File::create(dest).await?;
+        // Buffered: a network chunk is a few kibibytes, and each write to the file is a hop to the blocking pool.
+        // The flush below empties the buffer into the file before the size and the digest are judged; on an
+        // error the buffer is dropped with what it holds, and the file is removed.
+        let mut file = tokio::io::BufWriter::with_capacity(
+            BLOB_WRITE_BUFFER,
+            tokio::fs::File::create(dest).await?,
+        );
         let mut hasher = Sha256::new();
         let mut size = 0u64;
         let result: anyhow::Result<()> = async {

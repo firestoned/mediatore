@@ -20,7 +20,7 @@ on:
     - cron: '23 7 * * 0'
 
 # A newer run of the same event on the same ref cancels the older one (a second push to
-# the PR, the next merge to main). Across events, a merge to main cancels the PR runs and
+# the PR, the next merge to main). Across events, a merge to main cancels the merged PR's runs and
 # a release cancels main's: the preempt job in build.yaml (scripts/ci-preempt.sh).
 concurrency:
   group: codeql-${{ github.event_name }}-${{ github.ref }}

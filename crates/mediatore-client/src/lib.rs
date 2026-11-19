@@ -201,10 +201,15 @@ struct TokenReply {
     refresh_token: Option<String>,
 }
 
+/// How long a connection to the broker or the issuer may take to open. There is no limit on
+/// the whole request: `logs --follow` holds one answer open for as long as the claim runs.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 fn http() -> anyhow::Result<reqwest::Client> {
     mediatore_proto::tls::ensure_provider();
     Ok(reqwest::Client::builder()
         .tls_backend_preconfigured(mediatore_proto::tls::https_client_config())
+        .connect_timeout(CONNECT_TIMEOUT)
         .build()?)
 }
 
@@ -212,6 +217,7 @@ fn http() -> anyhow::Result<reqwest::Client> {
 fn http_with_ca(pem: &[u8]) -> anyhow::Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
         .tls_backend_preconfigured(mediatore_proto::tls::https_client_config_with_ca(pem)?)
+        .connect_timeout(CONNECT_TIMEOUT)
         .build()?)
 }
 

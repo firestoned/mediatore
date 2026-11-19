@@ -7,6 +7,21 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 publish.workspace = true
+# The hermetic integration tests are one binary (tests/e2e.rs names each file as a module):
+# eleven binaries each linked the whole graph. The live tests stay their own, addressed by name.
+autotests = false
+
+[[test]]
+name = "e2e"
+path = "tests/e2e.rs"
+
+[[test]]
+name = "live_entra"
+path = "tests/live_entra.rs"
+
+[[test]]
+name = "jail_exec_live"
+path = "tests/jail_exec_live.rs"
 
 [[bin]]
 name = "mediatore"
