@@ -234,6 +234,15 @@
       "node-type": "data-asset",
       "name": "Workload output (the Secret ring)",
       "description": "ADR-0045: the redacted stdout and stderr of a sandbox whose requester opted in (workload.logs: true), as the broker keeps it: a ring of Secrets in the broker's own namespace, mediatore-logs-<claim uid>-<segment>, 64 KiB of record text per segment, labelled mediatore.io/logs=segment with the claim and sandbox UIDs, owned by the AgentSandbox when it shares the namespace, capped at logs.max_bytes per claim (default 1 MiB, ceiling 4 MiB; the oldest segment dropped and the dropped bytes counted), swept by the leader's resync logs.retention_secs after the claim ended (default: store.retention_secs). Each stored unit is a LogRecord {seq, stream, ts, text} or a LogGap {lost_stdout, lost_stderr}. Readable through the broker by the claim's owner alone (the same subject check as GET /v1/claims/{name}); a cluster administrator can read the Secrets directly, which is break-glass (threat model R-39). Redaction happened in the VM and is best effort (R-38): the ring is a Secret, not a ConfigMap, because it may hold what redaction missed. In memory under dev_mode with the same cap, cursor and sweep rules (LogRing, crates/mediatore-store). Nothing is stored for a sandbox that did not opt in or on a broker with logs.enabled false."
+    },
+    {
+      "unique-id": "data-asset-host-signing-ca-bundle",
+      "node-type": "data-asset",
+      "name": "Per-host signing CA bundle (x509pop trust anchors, ADR-0049)",
+      "description": "Decided, not built (ADR-0049, Proposed). The x509pop NodeAttestor's ca_bundle_path on the SPIRE server: one CA certificate per host whose guests have no vTPM, each created at the host's install and held (key included) only by that host's provider; the certificate is public and an operator adds it to the bundle when onboarding the host, never discovered from the host. Controls: (1) every CA in the bundle has a UNIQUE, operator-chosen common name and the bundle's rendering refuses a duplicate (mediatore-spire refuse_duplicate_common_names), because the agent ID is issuer-qualified and a duplicate removes the confinement; (2) the server's agent_path_template is /x509pop/{{ .Issuer.CommonName }}/{{ .Subject.CommonName }}, giving the agent ID spiffe://<td>/spire/agent/x509pop/<issuer CN>/<subject CN>, stable across certificate renewal and declarable before the guest boots, with both common names restricted to the path-segment alphabet (mediatore-spire x509pop_agent_id); (3) the host's signer ignores the CSR subject and sets the subject CN to the VM's UID, basicConstraints CA:FALSE (the server does not enforce it) and keyUsage digitalSignature (the server requires it), with a bounded validity; (4) a compromised host can speak only for its own guests, under its own CA's name; (5) retiring a CA revokes every identity it signed at the agents' next re-attestation. No SPIRE admin identity and no join token: mediatore still only declares ClusterStaticEntry (ADR-0006). The TPM attestor and its EK CA bundle (ADR-0018) are unchanged and stay the attestor of every guest with a vTPM.",
+      "metadata": {
+        "status": "planned"
+      }
     }
   ],
   "relationships": [
@@ -981,6 +990,57 @@
       "metadata": {
         "status": "implemented"
       }
+    },
+    {
+      "unique-id": "rel-spire-agent-server-x509pop",
+      "description": "Decided, not built (ADR-0049): node attestation of a guest with no vTPM (the banlieue firecracker provider class) by the x509pop attestor instead of the TPM one. The in-guest agent proves possession of the private key of a certificate its host signed for the guest's own key (EC P-256, the key never leaves the guest) and that chains to a CA in the per-host bundle; the agent ID is spiffe://<td>/spire/agent/x509pop/<issuer CN>/<subject CN>. The agent re-attests at about half its SVID lifetime and does not outlive its certificate (fail closed). Same transport as rel-spire-agent-server; keeps rel-spire-agent-server for every guest with a vTPM.",
+      "relationship-type": {
+        "connects": {
+          "source": {
+            "node": "service-spire-agent"
+          },
+          "destination": {
+            "node": "service-spire-server"
+          }
+        }
+      },
+      "protocol": "TLS",
+      "metadata": {
+        "status": "planned"
+      }
+    },
+    {
+      "unique-id": "rel-spire-server-host-signing-ca-bundle",
+      "description": "Decided, not built (ADR-0049): the SPIRE server reads the per-host CA bundle as the x509pop attestor's static trust anchor; a leaf signed by a CA outside the bundle is refused, and a server-side call per guest is never made.",
+      "relationship-type": {
+        "interacts": {
+          "actor": "service-spire-server",
+          "nodes": [
+            "data-asset-host-signing-ca-bundle"
+          ]
+        }
+      },
+      "metadata": {
+        "status": "planned"
+      }
+    },
+    {
+      "unique-id": "rel-watcher-entries-x509pop",
+      "description": "Decided, not built (ADR-0049, ADR-0006 unchanged): for a guest attested by x509pop the watcher declares the node entry (mediatore-node-<...>) as a ClusterStaticEntry whose parent is spiffe://<td>/spire/agent/x509pop/<issuer CN>/<subject CN>, selected by an explicit attestation method (tpm or x509pop), never guessed from the data present. The issuer CN is the host's CA name the administrator asserts on the Provider (spec.attestation.hostCa) and the subject CN is the machine's UID published on its status (attestationSubject), both control-plane facts available before the guest boots; both are validated against the path-segment alphabet before any request. Same RBAC and admission policy as rel-watcher-entries; no admin SVID, no token minting.",
+      "relationship-type": {
+        "connects": {
+          "source": {
+            "node": "service-mediatore-watcher"
+          },
+          "destination": {
+            "node": "service-kubernetes-api"
+          }
+        }
+      },
+      "protocol": "HTTPS",
+      "metadata": {
+        "status": "planned"
+      }
     }
   ],
   "flows": [
@@ -1281,6 +1341,7 @@
     "docs/adr/0044-a-sandbox-selects-its-pool-by-label.md",
     "docs/adr/0045-a-sandbox-workloads-output-streamed-to-its-owner.md",
     "docs/adr/0046-who-may-claim-a-list-of-groups-and-a-namespace-to-groups-mapping.md",
-    "docs/adr/0047-socket-families-and-io-uring-denied-to-the-workload-by-seccomp.md"
+    "docs/adr/0047-socket-families-and-io-uring-denied-to-the-workload-by-seccomp.md",
+    "docs/adr/0049-a-guest-without-a-vtpm-attests-with-x509pop-and-a-certificate-its-host-signs.md"
   ]
 }

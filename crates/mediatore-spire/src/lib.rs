@@ -16,6 +16,7 @@
 //! validates inputs exactly as the real one does.
 
 pub mod kube;
+pub mod x509pop;
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;

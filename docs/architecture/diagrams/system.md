@@ -21,6 +21,7 @@ the diagram shows the *target* architecture so contributors and users have
 one canonical picture, and labels such a node with its status. The nodes so
 marked today, if any:
 
+- `data-asset-host-signing-ca-bundle` (planned)
 
 ```mermaid
 flowchart LR
@@ -58,6 +59,7 @@ flowchart LR
     service-envoy-inject["envoy-inject (credential placement Envoy, ADR-0040)"]
     data-asset-os-credential-store["The requester's saved credential (OS credential store)"]
     data-asset-workload-output["Workload output (the Secret ring)"]
+    data-asset-host-signing-ca-bundle["Per-host signing CA bundle (x509pop trust anchors, ADR-0049) (planned)"]
     subgraph sg_system-mediatore [System Mediatore]
         service-mediatore-user-api
         service-mediatore-sandbox-api
@@ -139,6 +141,9 @@ flowchart LR
     service-guest-agent -->|HTTP| service-egress-proxy
     service-envoy-inject -->|HTTPS| ecosystem-oci-registry
     service-mediatore-sandbox-api -->|HTTPS| data-asset-workload-output
+    service-spire-agent -->|TLS| service-spire-server
+    service-spire-server --> data-asset-host-signing-ca-bundle
+    service-mediatore-watcher -->|HTTPS| service-kubernetes-api
 ```
 
 <sub>Source: nodes and relationships in `architecture.json`.</sub>
