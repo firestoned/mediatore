@@ -131,6 +131,24 @@ closes. The request is capped (the prototype's was 363 bytes); a non-EC-P-256 ke
 oversized request or a malformed CSR is refused without a reply. The provider never logs a
 certificate request body.
 
+### 7. The node key is the SHA-256 of the agent ID
+
+ADR-0006's entry names, SPIFFE IDs and the admission policy all take a 64 lowercase hex "node
+key", which for a TPM node is its EK hash. An `x509pop` node has no EK, so its key is the hex
+SHA-256 of its agent ID (`x509pop/<issuer CN>/<subject CN>`). It is deterministic, has the
+shape the admission policy already accepts, changes only when the issuer or subject CN does
+(not on renewal), and is computed in one function (`node_key` in `x509pop.rs`), so a
+different rule is a one-function change. The agent ID itself stays the entry's parent; the
+key only names things.
+
+Checked against the broker (`register_node` in `crates/mediatore-api/src/lib.rs`): it
+compares the peer's node SPIFFE ID with `naming.node_id(key)`, which this key satisfies. It
+then derives the stored agent ID with `naming.agent_id(key)`, which hard-codes the TPM path
+(`/spire/agent/tpm/<key>`), and `bind` in `mediatore-claims` does the same. For an `x509pop`
+node that agent ID is wrong, so its claim lookup would miss. The registration needs to carry
+the attestation; [ADR-0050](0050-host-trust-anchors-roots-in-the-bundle-and-a-short-lived-intermediate-per-host.md)
+Decision 6 (Proposed) designs that, so it is not built here.
+
 ## Consequences
 
 - A Firecracker guest has a node identity with no new privileged component and no change to
@@ -158,4 +176,7 @@ certificate request body.
   (the agent ID, the CA common-name checks, node entry rendering beside the TPM one); the claim
   watcher, the guest helper, the host signer and the image are not. Open: the lifetime and renewal fraction; whether
   to reuse the SKI as the subject for a key-bound ID (untested); RSA and ed25519 keys; the
-  bundle-rendering check for unique CNs; how a host retires a CA without orphaning live guests.
+  bundle-rendering check for unique CNs (the check exists as `refuse_duplicate_common_names`;
+  mediatore has no bundle-rendering code, the bundle is a deploy file, and ADR-0050 moves
+  uniqueness to the issuer); how a host retires a CA without orphaning live guests;
+  the registration and agent-ID derivation for an `x509pop` node (Decision 7, ADR-0050).
