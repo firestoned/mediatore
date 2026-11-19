@@ -384,7 +384,8 @@ mod tests {
             for rule in &filter.rules {
                 assert!(syscall_nr(rule.syscall).is_some(), "{}", rule.syscall);
             }
-            assert!(!compile(filter).unwrap().is_empty());
+            let program = compile(filter).unwrap();
+            assert_ne!(program.len(), 0, "a compiled filter has instructions");
         }
     }
 
