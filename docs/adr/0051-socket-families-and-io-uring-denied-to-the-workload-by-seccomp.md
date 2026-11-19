@@ -1,7 +1,7 @@
 <!-- Copyright (c) 2026 Erick Bourgeois, mediatore -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# ADR-0047: Socket families and io_uring denied to the workload by a seccomp filter
+# ADR-0051: Socket families and io_uring denied to the workload by a seccomp filter
 
 **Status:** Proposed · **Date:** 2026-11-18
 

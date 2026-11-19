@@ -86,7 +86,7 @@
       later item only if a threat needs it
 - [ ] A seccomp filter on the workload's socket families and `io_uring`, the third layer
       in the jail after nftables and Landlock. Proposed 2026-11-18 as
-      [ADR-0047](../../docs/adr/0047-socket-families-and-io-uring-denied-to-the-workload-by-seccomp.md):
+      [ADR-0051](../../docs/adr/0051-socket-families-and-io-uring-denied-to-the-workload-by-seccomp.md):
       `jail-exec` refuses every socket family but `AF_UNIX`, `AF_INET` and `AF_INET6`
       (`AF_VSOCK`, `AF_PACKET` and `AF_NETLINK` are the ones nothing else names), any inet
       socket that is not a stream (the workload's own UDP, in both network shapes), and
