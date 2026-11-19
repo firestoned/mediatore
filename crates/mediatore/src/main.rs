@@ -129,8 +129,8 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
     if cfg.dev_mode {
         tracing::warn!("dev_mode: peer identity from header, in-memory entries, no mTLS");
     }
-    let store = store(&cfg, client.as_ref())?;
     let sealer = sealer(&cfg).await?;
+    let store = store(&cfg, client.as_ref(), sealer.clone())?;
     let sandboxes = sandbox_front(&cfg, client.as_ref())?;
 
     let sts = match &cfg.sts {
@@ -389,9 +389,18 @@ async fn broker_identity(
 /// the record, wherever the sandbox lives; the Secrets, `SandboxNode` and `PolicyFloor` in
 /// the broker's own namespace); in memory under `dev_mode`, where there is no cluster and
 /// nothing survives a restart.
-fn store(cfg: &Config, client: Option<&kube::Client>) -> anyhow::Result<Arc<dyn ClaimStore>> {
+fn store(
+    cfg: &Config,
+    client: Option<&kube::Client>,
+    sealer: Option<Arc<dyn Sealer>>,
+) -> anyhow::Result<Arc<dyn ClaimStore>> {
     if let Some(client) = client {
-        let store = KubeStore::new(client.clone());
+        let mut store = KubeStore::new(client.clone());
+        // A workload's stored output is sealed per batch with the same sealer as the sessions
+        // (ADR-0052); without one the store refuses to keep any.
+        if let Some(sealer) = sealer {
+            store = store.with_log_sealer(sealer);
+        }
         tracing::info!(
             namespace = store.namespace(),
             retention_secs = cfg.store.retention_secs,

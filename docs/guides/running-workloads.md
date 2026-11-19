@@ -312,7 +312,11 @@ sandbox logs <name>` reads a finished one-shot workload's output for the retenti
 it ended. The workload never waits for the broker: a slow or unreachable one costs the queue's
 oldest lines, which the reader sees as an explicit gap, never silence. Redaction is best effort
 and the broker keeps the newest `logs.max_bytes` (1 MiB by default) per claim; the exit code
-stays on `sandbox get`. The broker needs `logs.enabled: true`, or the claim is refused.
+stays on `sandbox get`. The broker needs `logs.enabled: true`, or the claim is refused, and
+it stores the output sealed: each batch is encrypted with the broker's OpenBao transit key
+before it is written, so a copy of etcd or a `get secrets` shows ciphertext
+([ADR-0052](../adr/0052-a-sandbox-workloads-stored-output-sealed-per-batch-with-the-transit-key.md)).
+If OpenBao is unreachable a read answers `503`; retry it.
 
 ### Reading the output
 

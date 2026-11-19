@@ -284,6 +284,25 @@ impl TransitSealer {
                 sealer.key_id
             )));
         }
+        // The output's context (ADR-0052 decision 2): it round-trips, holds for its own claim
+        // only, and does not open as a session envelope.
+        let blob = sealer.seal_with(SealPurpose::Logs, probe, b"probe").await?;
+        if sealer.unseal_with(SealPurpose::Logs, probe, &blob).await? != b"probe" {
+            return Err(SealError::Key(
+                "transit probe did not round-trip for the output's context".into(),
+            ));
+        }
+        if sealer
+            .unseal_with(SealPurpose::Logs, Uuid::new_v4(), &blob)
+            .await
+            .is_ok()
+            || sealer.unseal(probe, &blob).await.is_ok()
+        {
+            return Err(SealError::Key(format!(
+                "transit key {} does not bind the output's context",
+                sealer.key_id
+            )));
+        }
         Ok(sealer)
     }
 
@@ -416,7 +435,10 @@ mod tests {
     async fn a_log_blob_and_a_session_envelope_never_open_as_each_other() {
         let uid = Uuid::new_v4();
         let s = sealer(1);
-        let blob = s.seal_with(SealPurpose::Logs, uid, b"output").await.unwrap();
+        let blob = s
+            .seal_with(SealPurpose::Logs, uid, b"output")
+            .await
+            .unwrap();
         assert_eq!(
             s.unseal_with(SealPurpose::Logs, uid, &blob).await.unwrap(),
             b"output"
@@ -426,7 +448,10 @@ mod tests {
             s.unseal_with(SealPurpose::Session, uid, &blob).await,
             Err(SealError::Rejected)
         ));
-        assert!(matches!(s.unseal(uid, &blob).await, Err(SealError::Rejected)));
+        assert!(matches!(
+            s.unseal(uid, &blob).await,
+            Err(SealError::Rejected)
+        ));
         let session = s.seal(uid, b"refresh").await.unwrap();
         assert!(matches!(
             s.unseal_with(SealPurpose::Logs, uid, &session).await,
@@ -434,7 +459,8 @@ mod tests {
         ));
         // And a blob stays bound to its claim.
         assert!(matches!(
-            s.unseal_with(SealPurpose::Logs, Uuid::new_v4(), &blob).await,
+            s.unseal_with(SealPurpose::Logs, Uuid::new_v4(), &blob)
+                .await,
             Err(SealError::Rejected)
         ));
     }

@@ -317,6 +317,16 @@ pub struct LogGap {
     pub lost_stdout: u64,
     /// Bytes of stderr lost before this point.
     pub lost_stderr: u64,
+    /// Bytes of output stored here that the broker could not serve: a sealed batch that did
+    /// not open for this claim, or a segment not in the sealed format (ADR-0052 decision 4).
+    /// Zero, and absent on the wire, for a gap of the guest's own.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub unreadable: u64,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde's `skip_serializing_if` passes a reference
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 /// One stored unit of a claim's output: a record, or a gap before the next one. Serialised
@@ -1225,6 +1235,7 @@ mod tests {
             LogLine::Gap(LogGap {
                 lost_stdout: 4096,
                 lost_stderr: 0,
+                unreadable: 0,
             }),
             LogLine::Record(log_record(2, "world")),
             LogLine::End(LogEndLine::new(LogEnd::ClaimEnded)),
@@ -1243,7 +1254,8 @@ mod tests {
             entry,
             LogEntry::Gap(LogGap {
                 lost_stdout: 1,
-                lost_stderr: 2
+                lost_stderr: 2,
+                unreadable: 0,
             })
         );
         assert_eq!(entry.text_bytes(), 0);

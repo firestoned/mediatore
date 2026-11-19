@@ -123,12 +123,12 @@ home and its proof.
    (`logs.retention_secs`) or with their `AgentSandbox`. No reader of both formats is
    written.
 
-7. **The read path is asynchronous end to end (a defect fixed in the same change).** The live run
+7. **The read path is asynchronous end to end (a defect also fixed on `main` by #142 while this change was written).** The live run
    also found that the owner's read of a stored ring larger than 31 records ended early: the
    response was built through a bounded channel of 32 with `try_send`, and a full channel was
    taken for a departed reader (`records_sent=32 reason=Client`). Unsealing makes the read loop
-   await anyway, so the sends become `send().await` with backpressure, and `Closed` (the reader
-   went) is told apart from a slow reader. The proof is a test that stores more than 32 records
+   await anyway, so the sends become `send().await` with backpressure (the same fix landed on `main` in #142, and the
+   two were reconciled at rebase), and `Closed` (the reader went) is told apart from a slow reader. The proof is a test that stores more than 32 records
    and reads all of them, and that a slow reader still gets every record in order.
 
 ## Consequences

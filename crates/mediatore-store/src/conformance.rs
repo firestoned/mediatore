@@ -827,7 +827,8 @@ pub(crate) async fn appended_output_reads_back_in_sequence(s: &dyn ClaimStore) {
         done,
         crate::LogAppend {
             stored: 2,
-            ignored: 0
+            ignored: 0,
+            dropped: 0
         }
     );
     let done = s
@@ -863,7 +864,8 @@ pub(crate) async fn a_retried_batch_stores_nothing_and_is_counted_ignored(s: &dy
         again,
         crate::LogAppend {
             stored: 0,
-            ignored: 3
+            ignored: 3,
+            dropped: 0
         }
     );
     let chunk = s.read_logs(uid, None).await.unwrap();
@@ -886,7 +888,8 @@ pub(crate) async fn an_overlapping_batch_stores_only_its_new_records(s: &dyn Cla
         done,
         crate::LogAppend {
             stored: 2,
-            ignored: 2
+            ignored: 2,
+            dropped: 0
         }
     );
     let chunk = s.read_logs(uid, None).await.unwrap();
@@ -930,6 +933,7 @@ pub(crate) async fn a_gap_is_stored_before_a_batch_with_dropped_counts_and_not_f
             LogEntry::Gap(LogGap {
                 lost_stdout: 4096,
                 lost_stderr: 12,
+                unreadable: 0,
             }),
             LogEntry::Record(log_record(2, LogStream::Stdout, "after")),
             LogEntry::Record(log_record(3, LogStream::Stdout, "after")),
@@ -1002,6 +1006,7 @@ pub(crate) async fn a_read_since_a_cursor_returns_later_records_and_the_gap_righ
             LogEntry::Gap(LogGap {
                 lost_stdout: 0,
                 lost_stderr: 7,
+                unreadable: 0,
             }),
             LogEntry::Record(log_record(3, LogStream::Stdout, "b")),
             LogEntry::Record(log_record(4, LogStream::Stdout, "b")),

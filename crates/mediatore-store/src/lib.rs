@@ -39,6 +39,10 @@ pub enum StoreError {
     /// Backend failure.
     #[error("backend: {0}")]
     Backend(String),
+    /// A dependency of the store did not answer (the sealer's `OpenBao`, ADR-0052): an outage,
+    /// to be retried, never a refusal. The API answers `503`.
+    #[error("unavailable: {0}")]
+    Unavailable(String),
 }
 
 /// What a record written before ADR-0046 reads as: the single namespace the broker had
@@ -222,6 +226,9 @@ pub struct LogAppend {
     pub stored: usize,
     /// Records at or below the claim's highest stored `seq`, a retried batch, ignored.
     pub ignored: usize,
+    /// Bytes of record text the ring dropped from the front to stay within its cap, counted
+    /// in whole segments (ADR-0045 decision 4). What the caller logs; no read is needed.
+    pub dropped: u64,
 }
 
 /// A claim's stored output, or the part of it after a cursor.
@@ -233,6 +240,24 @@ pub struct LogChunk {
     pub entries: Vec<LogEntry>,
     /// The highest `seq` stored for the claim, whatever the cursor; `None` when nothing is.
     pub last_seq: Option<u64>,
+}
+
+/// The last `n` records of `entries`, with the gaps after the first of them kept (a gap is
+/// stored before the records it precedes, so one that sits among the kept records stays).
+#[must_use]
+pub fn tail_entries(entries: Vec<LogEntry>, n: usize) -> Vec<LogEntry> {
+    let records = entries.iter().filter(|e| e.seq().is_some()).count();
+    let mut skip = records.saturating_sub(n);
+    entries
+        .into_iter()
+        .skip_while(|e| {
+            if skip > 0 && e.seq().is_some() {
+                skip -= 1;
+                return true;
+            }
+            skip > 0
+        })
+        .collect()
 }
 
 /// Storage of a workload's output (ADR-0045 decisions 4, 6, 7 and 8): a bounded ring per
@@ -256,6 +281,19 @@ pub trait LogStore: Send + Sync + 'static {
     /// greater, together with the gaps immediately before the first of them. A claim with
     /// nothing stored is an empty chunk, not an error.
     async fn read_logs(&self, claim_uid: Uuid, since: Option<u64>) -> Result<LogChunk, StoreError>;
+    /// [`read_logs`](Self::read_logs) cut to the last `n` records (and the gaps among them).
+    /// A store that must pay to read each stored piece overrides it to read from the newest;
+    /// the default reads everything and cuts (ADR-0052 decision 4).
+    async fn read_logs_tail(
+        &self,
+        claim_uid: Uuid,
+        since: Option<u64>,
+        n: usize,
+    ) -> Result<LogChunk, StoreError> {
+        let mut chunk = self.read_logs(claim_uid, since).await?;
+        chunk.entries = tail_entries(chunk.entries, n);
+        Ok(chunk)
+    }
     /// Remove the claim's output; nothing stored is success.
     async fn delete_logs(&self, claim_uid: Uuid) -> Result<(), StoreError>;
     /// Remove the output of every claim whose record is gone or ended
@@ -386,14 +424,20 @@ impl LogRing {
             .collect();
         let ignored = batch.records.len() - new.len();
         if new.is_empty() {
-            return LogAppend { stored: 0, ignored };
+            return LogAppend {
+                stored: 0,
+                ignored,
+                dropped: 0,
+            };
         }
         if batch.dropped_stdout > 0 || batch.dropped_stderr > 0 {
             self.entries.push_back(LogEntry::Gap(LogGap {
                 lost_stdout: batch.dropped_stdout,
                 lost_stderr: batch.dropped_stderr,
+                unreadable: 0,
             }));
         }
+        let before = self.truncated_before;
         for r in &new {
             self.bytes += r.text.len();
             self.last_seq = Some(r.seq);
@@ -410,6 +454,7 @@ impl LogRing {
         LogAppend {
             stored: new.len(),
             ignored,
+            dropped: self.truncated_before - before,
         }
     }
 

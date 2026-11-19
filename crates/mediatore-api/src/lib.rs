@@ -1314,20 +1314,14 @@ fn claim_has_ended(rec: &ClaimRecord, phase: ClaimPhase) -> bool {
     rec.revoked_at.is_some() || matches!(phase, ClaimPhase::Releasing | ClaimPhase::Failed)
 }
 
-/// The last `n` records of `entries`, with the gaps among them (ADR-0045 decision 9, `tail`).
-fn tail_entries(entries: Vec<LogEntry>, n: usize) -> Vec<LogEntry> {
-    let records = entries.iter().filter(|e| e.seq().is_some()).count();
-    let mut skip = records.saturating_sub(n);
-    entries
-        .into_iter()
-        .skip_while(|e| {
-            if skip > 0 && e.seq().is_some() {
-                skip -= 1;
-                return true;
-            }
-            skip > 0
-        })
-        .collect()
+/// A store error as the API answers it: an outage of something the store depends on (the
+/// sealer's `OpenBao`, ADR-0052) is `503`, which the guest retries and the owner can retry;
+/// anything else is `500`.
+fn store_error(e: StoreError) -> ApiError {
+    match e {
+        StoreError::Unavailable(_) => ApiError::unavailable(e.to_string()),
+        other => ApiError::internal(other.to_string()),
+    }
 }
 
 /// One read's outgoing side: the channel the body drains, and what went down it for the audit
@@ -1420,14 +1414,13 @@ async fn read_logs(
     );
     // The first read before the response starts, so a store that cannot be read is a `503`,
     // never a stream that ends in nothing (decision 7).
-    let first = match claim_uid {
-        Some(uid) => st
-            .store
-            .read_logs(uid, q.since)
-            .await
-            .map_err(|e| ApiError::unavailable(e.to_string()))?,
-        None => mediatore_store::LogChunk::default(),
-    };
+    let first = match (claim_uid, q.tail) {
+        // With a tail the store reads from the newest, so a long ring is not unsealed whole.
+        (Some(uid), Some(n)) => st.store.read_logs_tail(uid, q.since, n).await,
+        (Some(uid), None) => st.store.read_logs(uid, q.since).await,
+        (None, _) => Ok(mediatore_store::LogChunk::default()),
+    }
+    .map_err(|e| ApiError::unavailable(e.to_string()))?;
     let (tx, rx) =
         tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::convert::Infallible>>(32);
     let state = st.clone();
@@ -1472,7 +1465,7 @@ async fn stream_logs(
         return (LogEnd::Client, out);
     }
     let entries = match q.tail {
-        Some(n) => tail_entries(first.entries, n),
+        Some(n) => mediatore_store::tail_entries(first.entries, n),
         None => first.entries,
     };
     if !out.emit_entries(&entries).await {
@@ -1546,6 +1539,7 @@ async fn follow_logs(
             let gap = LogGap {
                 lost_stdout: chunk.truncated_before - truncated,
                 lost_stderr: 0,
+                unreadable: 0,
             };
             if !out.emit(&LogEntry::Gap(gap)).await {
                 return LogEnd::Client;
@@ -1637,7 +1631,7 @@ async fn ingest_logs(
         .store
         .append_logs(&rec, &body, &limits)
         .await
-        .map_err(|e| ApiError::internal(e.to_string()))?;
+        .map_err(store_error)?;
     tracing::debug!(
         claim_uid = %rec.uid,
         records = body.records.len(),
@@ -4563,6 +4557,74 @@ mod tests {
     }
 
     // ----- the audit line -----
+
+    /// ADR-0052 decision 7 (a defect the first live run found): the stored output is sent
+    /// through a channel the body drains, and a stored ring larger than the channel was cut
+    /// where the channel filled and reported as a departed reader.
+    #[tokio::test]
+    async fn a_read_of_more_records_than_the_channel_holds_returns_every_one() {
+        let b = broker_with_logs(
+            Namespaces::Single("sandboxes".into()),
+            true,
+            Some(LogLimits {
+                max_bytes: mediatore_proto::DEFAULT_LOG_MAX_BYTES,
+            }),
+        )
+        .await;
+        let mut rec = claim(&[], None);
+        rec.subject = Subject {
+            issuer: b.idp.issuer.clone(),
+            id: "alice".into(),
+            display: None,
+        };
+        rec.workload.logs = true;
+        let rec = stored(&b.st, rec).await;
+        let batch = LogBatch {
+            records: (1..=500u64)
+                .map(|seq| mediatore_proto::LogRecord {
+                    seq,
+                    stream: mediatore_proto::LogStream::Stdout,
+                    ts: Timestamp::now(),
+                    text: format!("line-{seq}"),
+                })
+                .collect(),
+            ..LogBatch::default()
+        };
+        b.st.store
+            .append_logs(&rec, &batch, &b.st.logs.unwrap())
+            .await
+            .unwrap();
+        let token = b.token("alice", &[]);
+        let (status, _, text) = b
+            .user(
+                "GET",
+                &format!("/v1/claims/{}/logs", rec.name),
+                &token,
+                &[],
+                serde_json::Value::Null,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        let lines: Vec<&str> = text.lines().filter(|l| !l.is_empty()).collect();
+        let records: Vec<&&str> = lines.iter().filter(|l| l.contains("\"seq\"")).collect();
+        assert_eq!(records.len(), 500, "every record, not the first 31");
+        assert!(records[499].contains("line-500"));
+        assert!(
+            lines.last().unwrap().contains("\"end\""),
+            "the stream ends with its end line: {}",
+            lines.last().unwrap()
+        );
+    }
+
+    /// ADR-0052 decision 4: a store that cannot reach its sealer is a `503` the owner can
+    /// retry, and the guest's retry on ingest, never a `500` and never a partial answer.
+    #[test]
+    fn a_store_outage_is_a_503_and_other_store_errors_are_not() {
+        let outage = store_error(StoreError::Unavailable("sealer: connection refused".into()));
+        assert_eq!(outage.status, StatusCode::SERVICE_UNAVAILABLE);
+        let other = store_error(StoreError::Backend("boom".into()));
+        assert_eq!(other.status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
 
     /// ADR-0045 decision 10: a read of a workload's output is one line before the first byte
     /// and one at the end, with the claim UID, the subject and counts, and never a byte of the
