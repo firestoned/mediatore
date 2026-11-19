@@ -363,25 +363,47 @@ fn render_crd(
     ))
 }
 
-/// The CRD as `deploy/base/crds/` carries it.
-pub fn crd_yaml() -> Result<String, serde_saphyr::ser::Error> {
-    let mut options = serde_saphyr::SerializerOptions::default();
-    // Long descriptions stay on one line, as serde_yaml wrote them.
-    options.folded_wrap_chars = 1 << 20;
+/// The served name `AgentSandbox` had before ADR-0048, still served beside the type's own
+/// (ADR-0049 decision 1).
+pub const DEPRECATED_VERSION: &str = "v1alpha1";
+
+/// The `AgentSandbox` CRD with both served versions (ADR-0049 decisions 1 and 2): the
+/// type's own (`v1beta1`, stored) and [`DEPRECATED_VERSION`], a copy of it under the old
+/// name, served, not stored, deprecated. One schema by construction, so conversion is `None`.
+#[must_use]
+pub fn crd()
+-> k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition {
     let mut crd = AgentSandbox::crd();
-    // kube-derive puts a placeholder here; the schema's own description is the type's.
-    if let Some(schema) = crd
-        .spec
-        .versions
-        .iter_mut()
-        .filter_map(|v| v.schema.as_mut())
-        .find_map(|s| s.open_api_v3_schema.as_mut())
+    // kube-derive puts a placeholder here; the schema's own description is the type's. Set
+    // before the copy, so both versions carry it.
+    if let Some(schema) = crd.spec.versions[0]
+        .schema
+        .as_mut()
+        .and_then(|s| s.open_api_v3_schema.as_mut())
     {
         schema.description = Some(
             "AgentSandbox is the record of one sandbox request (ADR-0008): mediatore creates and owns one VirtualMachineClaim for it, pins spec.subject to the caller at admission, and reports the claim's status plus whether the claim's registration entry is set."
                 .into(),
         );
     }
+    let mut alpha = crd.spec.versions[0].clone();
+    alpha.name = DEPRECATED_VERSION.into();
+    alpha.storage = false;
+    alpha.deprecated = Some(true);
+    alpha.deprecation_warning = Some(format!(
+        "mediatore.io/{DEPRECATED_VERSION} AgentSandbox is deprecated; use {} (ADR-0049)",
+        AgentSandbox::api_version(&())
+    ));
+    crd.spec.versions.insert(0, alpha);
+    crd
+}
+
+/// The CRD as `deploy/base/crds/` carries it.
+pub fn crd_yaml() -> Result<String, serde_saphyr::ser::Error> {
+    let mut options = serde_saphyr::SerializerOptions::default();
+    // Long descriptions stay on one line, as serde_yaml wrote them.
+    options.folded_wrap_chars = 1 << 20;
+    let mut crd = crd();
     crate::crd_formats::strip_unsupported_formats(&mut crd);
     let body = serde_saphyr::to_string_with_options(&crd, options)?;
     Ok(format!(
@@ -1478,11 +1500,87 @@ mod tests {
         }
     }
 
+    /// ADR-0049 decisions 1 and 2: the CRD serves `v1alpha1` and `v1beta1`, stores `v1beta1`,
+    /// converts by `None`, and the two versions are the same schema, columns and
+    /// subresources, `v1alpha1` deprecated with a warning naming `v1beta1`.
+    #[test]
+    fn both_versions_are_served_with_one_schema() {
+        let crd = serde_json::to_value(crd()).unwrap();
+        let versions = crd["spec"]["versions"].as_array().unwrap();
+        let names: Vec<&str> = versions.iter().filter_map(|v| v["name"].as_str()).collect();
+        assert_eq!(names, ["v1alpha1", "v1beta1"]);
+        let (alpha, beta) = (&versions[0], &versions[1]);
+        assert_eq!(
+            (&alpha["served"], &alpha["storage"]),
+            (&json!(true), &json!(false))
+        );
+        assert_eq!(
+            (&beta["served"], &beta["storage"]),
+            (&json!(true), &json!(true))
+        );
+        assert_eq!(alpha["deprecated"], json!(true));
+        assert!(
+            alpha["deprecationWarning"]
+                .as_str()
+                .is_some_and(|w| w.contains("mediatore.io/v1beta1")),
+            "the warning names the version to move to"
+        );
+        assert!(beta.get("deprecated").is_none_or(|d| d == &json!(false)));
+        for key in ["schema", "additionalPrinterColumns", "subresources"] {
+            assert_eq!(alpha[key], beta[key], "{key} differs between the versions");
+        }
+        // No webhook: identical schemas convert by rewriting apiVersion alone.
+        assert!(
+            crd["spec"]["conversion"].is_null()
+                || crd["spec"]["conversion"]["strategy"] == json!("None")
+        );
+        // What the broker reads and writes is the stored version.
+        assert_eq!(AgentSandbox::version(&()), "v1beta1");
+    }
+
+    /// ADR-0049 decision 3: the subject policy governs every served version, named
+    /// explicitly, so no version reaches the API server unpinned.
+    #[test]
+    fn the_admission_policy_matches_every_served_version() {
+        let path = format!(
+            "{}/../../deploy/base/admission/agentsandbox-subject.yaml",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let docs: Vec<serde_json::Value> =
+            serde_saphyr::from_multiple(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let policy = docs
+            .iter()
+            .find(|d| d["kind"] == "ValidatingAdmissionPolicy")
+            .expect("the policy");
+        let constraints = &policy["spec"]["matchConstraints"];
+        assert_eq!(constraints["matchPolicy"], "Equivalent");
+        let rules = constraints["resourceRules"].as_array().unwrap();
+        assert_eq!(rules.len(), 1);
+        let mut matched: Vec<&str> = rules[0]["apiVersions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        matched.sort_unstable();
+        let crd = crd();
+        let mut served: Vec<&str> = crd
+            .spec
+            .versions
+            .iter()
+            .filter(|v| v.served)
+            .map(|v| v.name.as_str())
+            .collect();
+        served.sort_unstable();
+        assert_eq!(matched, served);
+    }
+
     #[test]
     fn the_schema_requires_what_the_reconciler_assumes() {
         let crd = serde_json::to_value(AgentSandbox::crd()).unwrap();
         let v = &crd["spec"]["versions"][0];
-        // ADR-0048: the one served and stored version.
+        // ADR-0048: the type's one version, served and stored. The CRD adds `v1alpha1` as a
+        // copy of it at render time (ADR-0049, `both_versions_are_served_with_one_schema`).
         assert_eq!(crd["spec"]["versions"].as_array().map(Vec::len), Some(1));
         assert_eq!(v["name"], "v1beta1");
         assert_eq!((&v["served"], &v["storage"]), (&json!(true), &json!(true)));

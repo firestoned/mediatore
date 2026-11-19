@@ -4,7 +4,7 @@
 # 08: AgentSandbox CRD and reconciler
 
 **Status: done (2026-10-14).** Built [ADR-0008](../../docs/adr/0008-agentsandbox-crd-owned-by-mediatore.md):
-`AgentSandbox` (`mediatore.io/v1beta1` since [ADR-0048](../../docs/adr/0048-agentsandbox-served-as-v1beta1.md), 2026-11-18; `v1alpha1` before) becomes the record of a sandbox request, reconciled
+`AgentSandbox` (`mediatore.io/v1beta1` since [ADR-0048](../../docs/adr/0048-agentsandbox-served-as-v1beta1.md), 2026-11-18; `v1alpha1` before, and still served beside it, deprecated, since [ADR-0049](../../docs/adr/0049-agentsandbox-served-as-v1alpha1-and-v1beta1.md)) becomes the record of a sandbox request, reconciled
 by mediatore, which creates and owns the one `VirtualMachineClaim` behind it. The design came
 from banlieue's ADR-0055, which was never built there and is superseded by ADR-0008.
 
@@ -50,8 +50,14 @@ roadmap 05: the store keeps only what cannot sit on a custom resource.
       `mediatore.io/v1beta1`, the one served and stored version; the schema unchanged;
       `v1alpha1` not served (a manifest naming it is refused by the API server); the admission
       policy matches `v1beta1`; owner references from the type; the kind tiers' manifests and
-      the guides moved. Cut-over on a cluster with the old CRD: every sandbox gone, the CRD
-      deleted or its stored versions patched, then the base applied. Not yet applied live
+      the guides moved. Not yet applied live. Decision 1 and the cut-over amended by ADR-0049
+- [x] [ADR-0049](../../docs/adr/0049-agentsandbox-served-as-v1alpha1-and-v1beta1.md) (2026-11-18):
+      `v1alpha1` served again beside `v1beta1`, deprecated with a warning naming `v1beta1`,
+      a copy of the one type's version made at render time (`sandbox::crd()`), conversion
+      `None`, `v1beta1` stored; the admission policy names both versions, kept equal to the
+      served ones by a unit test; the cut-over is a plain apply. The kind sandbox tier creates
+      a `v1alpha1` sandbox (policy, warning, read as `v1beta1`, claim owned through `v1beta1`,
+      spec frozen). Not yet applied live
 - [x] Reconciler on the roadmap 03 leader-elected loop (`Watcher::reconcile_sandbox`, a
       third `Controller` owning the claims): create the owned claim, write the record,
       mirror the status, `ready` only when the claim is `Bound` and the entry is set

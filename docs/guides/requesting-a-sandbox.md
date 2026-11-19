@@ -4,7 +4,8 @@
 # Requesting a sandbox
 
 A sandbox request is an `AgentSandbox` resource (`mediatore.io/v1beta1`,
-[ADR-0048](../adr/0048-agentsandbox-served-as-v1beta1.md);
+[ADR-0048](../adr/0048-agentsandbox-served-as-v1beta1.md); `mediatore.io/v1alpha1` is still
+served as the same object, deprecated, [ADR-0049](../adr/0049-agentsandbox-served-as-v1alpha1-and-v1beta1.md);
 [ADR-0008](../adr/0008-agentsandbox-crd-owned-by-mediatore.md)). There are two ways to
 create one, and everything after creation is the same: mediatore creates and owns one
 `VirtualMachineClaim` for it, banlieue binds a warm pool member, mediatore declares the
