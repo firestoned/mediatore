@@ -3,7 +3,7 @@
 
 # ADR-0048: AgentSandbox is served as v1beta1
 
-**Status:** Accepted and implemented 2026-11-18 (proposed the same day; `mediatore.io/v1beta1` the one served and stored version, `v1alpha1` no longer served) · **Date:** 2026-11-18
+**Status:** Accepted and implemented 2026-11-18 (proposed the same day; `mediatore.io/v1beta1` the one served and stored version, `v1alpha1` no longer served) · **Date:** 2026-11-18 · **Amended:** 2026-11-18, decisions 1 and 3 and the cut-over: `v1alpha1` is served again beside `v1beta1`, deprecated, the same schema ([ADR-0049](0049-agentsandbox-served-as-v1alpha1-and-v1beta1.md))
 
 Roadmap 08 (the `AgentSandbox` CRD). Amends
 [ADR-0008](0008-agentsandbox-crd-owned-by-mediatore.md) decision 1 (the group and version).

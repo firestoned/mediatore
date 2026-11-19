@@ -216,5 +216,6 @@ nav:
       - "ADR-0046: Who may claim: a list of groups, and a mapping from namespaces to groups": adr/0046-who-may-claim-a-list-of-groups-and-a-namespace-to-groups-mapping.md
       - "ADR-0047: A sandbox chooses its member by strategy": adr/0047-a-sandbox-chooses-its-member-by-strategy.md
       - "ADR-0048: AgentSandbox is served as v1beta1": adr/0048-agentsandbox-served-as-v1beta1.md
+      - "ADR-0049: AgentSandbox is served as v1alpha1 and v1beta1": adr/0049-agentsandbox-served-as-v1alpha1-and-v1beta1.md
   - Security:
       - Threat model: security/threat-model.md

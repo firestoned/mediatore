@@ -17,7 +17,7 @@ the same commit that changes a roadmap item's state.
 | 05 | Persistent store (ADR-0012; the Kubernetes API as the store, ADR-0034) | 🔶 in progress (ADR-0039's live proof: a recycled pool with the `SandboxNode` register settling at the pool's size, once a release carries it) | [05-persistent-store.md](.github/community/05-persistent-store.md) |
 | 06 | Guest completion + hardening | 🔶 in progress | [06-guest-hardening.md](.github/community/06-guest-hardening.md) |
 | 07 | Credential-injecting egress proxy | 🔶 in progress | [07-egress-proxy.md](.github/community/07-egress-proxy.md) |
-| 08 | AgentSandbox CRD and reconciler (ADR-0008; ADR-0045's broker and CLI side, 2026-11-17; ADR-0047's `spec.selection` and ADR-0048's `v1beta1`, 2026-11-18) | ✅ done | [08-agentsandbox-crd.md](.github/community/08-agentsandbox-crd.md) |
+| 08 | AgentSandbox CRD and reconciler (ADR-0008; ADR-0045's broker and CLI side, 2026-11-17; ADR-0047's `spec.selection`, ADR-0048's `v1beta1` and ADR-0049's `v1alpha1` beside it, 2026-11-18) | ✅ done | [08-agentsandbox-crd.md](.github/community/08-agentsandbox-crd.md) |
 | 09 | notaio bundles, verified in shadow (ADR-0026) | ✅ done | [09-notaio-bundles-in-shadow.md](.github/community/09-notaio-bundles-in-shadow.md) |
 | 10 | Egress gateway (Envoy, SPIFFE identity, ADR-0028) | ✅ done | [10-egress-gateway.md](.github/community/10-egress-gateway.md) |
 | 11 | A policy's direct egress at the gateway (ADR-0030) | 🔶 in progress | [11-policy-egress-at-the-gateway.md](.github/community/11-policy-egress-at-the-gateway.md) |

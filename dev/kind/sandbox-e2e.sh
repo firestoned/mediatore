@@ -15,7 +15,9 @@
 # field, or both, is refused by the API server before the reconciler sees it. ADR-0047: a
 # sandbox with `selection: { strategy: Spread }` is admitted and its claim carries the
 # strategy as written, while one with a strategy banlieue does not have is refused by the
-# schema. No banlieue controller runs: the claim's status is patched by hand, as in the
+# schema. ADR-0049: a sandbox written as `v1alpha1` is governed by the same subject policy,
+# answered with the deprecation warning, read back as `v1beta1`, owns its claim through
+# `v1beta1`, and its spec is frozen through either name. No banlieue controller runs: the claim's status is patched by hand, as in the
 # watcher tier.
 #
 #   sandbox-e2e.sh <admin kubeconfig> <broker SA kubeconfig> <trust domain> <ek pem> <ek hash file>
@@ -315,6 +317,29 @@ spread_gone() { [ -z "$(sandbox sb-spread)" ]; }
 wait_for "$TIMEOUT" "agentsandbox sb-spread gone" spread_gone
 echo "sb-spread: claim with selection.strategy Spread as written; Pack refused at admission; deleted"
 
+say "v1alpha1 (ADR-0049): the deprecated name is served, governed by the same policy, and is the same object as v1beta1"
+alpha() { manifest "$@" | sed 's#^apiVersion: mediatore.io/v1beta1$#apiVersion: mediatore.io/v1alpha1#'; }
+alpha sb-alpha-stranger octocat '[]' | grep -qx 'apiVersion: mediatore.io/v1alpha1' || fail "the v1alpha1 manifest does not name v1alpha1"
+alpha sb-alpha-stranger octocat '[]' | denied "an impersonated stranger naming octocat as v1alpha1" "${K[@]}" --as=stranger create -f -
+out=$(alpha sb-alpha octocat '[]' | "${KSA[@]}" create -f - 2>&1) || fail "the broker ServiceAccount's v1alpha1 sandbox was refused: $out"
+echo "$out" | grep -qF 'deprecated; use mediatore.io/v1beta1' || fail "no deprecation warning naming v1beta1: $out"
+echo "admitted, with the deprecation warning: the broker ServiceAccount naming octocat as v1alpha1"
+[ "$("${K[@]}" -n "$NS" get agentsandboxes.v1beta1.mediatore.io sb-alpha -o jsonpath='{.apiVersion}')" = mediatore.io/v1beta1 ] \
+  || fail "sb-alpha is not readable as v1beta1"
+has_alpha_claim() { "${K[@]}" -n "$NS" get virtualmachineclaim sb-alpha >/dev/null 2>&1; }
+wait_for "$TIMEOUT" "claim sb-alpha" has_alpha_claim
+"${K[@]}" -n "$NS" get virtualmachineclaim sb-alpha -o json \
+  | jq -e '.metadata.ownerReferences[0] | .kind == "AgentSandbox" and .apiVersion == "mediatore.io/v1beta1"' >/dev/null \
+  || fail "the claim of a v1alpha1 sandbox is not owned through v1beta1"
+if out=$("${K[@]}" -n "$NS" patch agentsandboxes.v1alpha1.mediatore.io sb-alpha --type=merge -p '{"spec":{"ttlSeconds":1200}}' 2>&1); then
+  fail "spec.ttlSeconds changed through v1alpha1; the spec must be immutable"
+fi
+echo "$out" | grep -q 'spec is immutable' || fail "the v1alpha1 patch was refused, but not by the policy: $out"
+"${K[@]}" -n "$NS" delete agentsandbox sb-alpha --wait=false >/dev/null
+alpha_gone() { [ -z "$(sandbox sb-alpha)" ]; }
+wait_for "$TIMEOUT" "agentsandbox sb-alpha gone" alpha_gone
+echo "sb-alpha: created as v1alpha1, read as v1beta1, its claim owned through v1beta1, the spec frozen through either name; deleted"
+
 say "delete: the finalizer retracts the entry, deletes the claim, then lets the sandbox go"
 "${K[@]}" -n "$NS" delete agentsandbox sb-e2e --wait=false >/dev/null
 claim_gone() { ! "${K[@]}" -n "$NS" get virtualmachineclaim sb-e2e >/dev/null 2>&1; }
@@ -334,4 +359,4 @@ archived() { broker_logs | grep -F "resync" | grep -qE 'archived=[1-9]'; }
 wait_for "$TIMEOUT" "a resync archiving at least one row" archived
 echo "archived at resync"
 
-say "PASS: ADR-0008, ADR-0034, ADR-0044 and ADR-0047 hold against a real cluster (subject policy, owned claim and record on the resource, bind to Ready, a restart on the Kubernetes store, fail-closed audience, the pool selector and its exactly-one rule, the selection strategy carried as written, finalizer, the retention sweep)"
+say "PASS: ADR-0008, ADR-0034, ADR-0044, ADR-0047 and ADR-0049 hold against a real cluster (subject policy, owned claim and record on the resource, bind to Ready, a restart on the Kubernetes store, fail-closed audience, the pool selector and its exactly-one rule, the selection strategy carried as written, v1alpha1 served as the same object, finalizer, the retention sweep)"

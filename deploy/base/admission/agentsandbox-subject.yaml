@@ -84,10 +84,14 @@ spec:
   paramKind:
     apiVersion: v1
     kind: ConfigMap
+  # Every served version, by name (ADR-0049 decision 3): a served version left out would
+  # be ungoverned. Kept equal to the CRD's served versions by a unit test in
+  # crates/mediatore-claims/src/sandbox.rs; never `*`.
   matchConstraints:
+    matchPolicy: Equivalent
     resourceRules:
       - apiGroups: ["mediatore.io"]
-        apiVersions: ["v1beta1"]
+        apiVersions: ["v1alpha1", "v1beta1"]
         operations: ["CREATE", "UPDATE"]
         resources: ["agentsandboxes"]
   variables:

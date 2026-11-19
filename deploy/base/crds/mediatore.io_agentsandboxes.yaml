@@ -37,6 +37,388 @@ spec:
     - jsonPath: .metadata.creationTimestamp
       name: Age
       type: date
+    deprecated: true
+    deprecationWarning: mediatore.io/v1alpha1 AgentSandbox is deprecated; use mediatore.io/v1beta1 (ADR-0049)
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: "AgentSandbox is the record of one sandbox request (ADR-0008): mediatore creates and owns one VirtualMachineClaim for it, pins spec.subject to the caller at admission, and reports the claim's status plus whether the claim's registration entry is set."
+        properties:
+          spec:
+            description: |-
+              The request mediatore already accepts on `POST /v1/claims`, as a resource (decision 7).
+              Immutable after creation: the admission policy in
+              `deploy/base/admission/agentsandbox-subject.yaml` freezes it.
+            properties:
+              audiences:
+                default: []
+                description: |-
+                  Downstream audiences the sandbox may request tokens for. Each must be one mediatore
+                  is configured to serve; otherwise the sandbox fails before any claim exists.
+                items:
+                  type: string
+                type: array
+              policyRef:
+                description: |-
+                  The notaio `SandboxPolicy` this sandbox is under, in this namespace (ADR-0026
+                  decision 6). Optional while the bundle is read in shadow: a sandbox without one is
+                  reported, never refused, and naming one grants nothing yet. The claim record keeps
+                  the policy's uid and the bundle version current when the claim was created.
+                nullable: true
+                properties:
+                  name:
+                    type: string
+                required:
+                - name
+                type: object
+              poolRef:
+                description: |-
+                  The `VirtualMachinePool` to claim from, in this namespace; copied to the claim.
+                  Exactly one of this or `poolSelector` (ADR-0044 decision 1).
+                nullable: true
+                properties:
+                  name:
+                    type: string
+                required:
+                - name
+                type: object
+              poolSelector:
+                description: |-
+                  Any `VirtualMachinePool` in this namespace whose labels match, `{}` for all of them;
+                  copied to the claim, which picks among their members (banlieue ADR-0132). Exactly one
+                  of this or `poolRef` (ADR-0044 decisions 1 and 2).
+                nullable: true
+                properties:
+                  matchExpressions:
+                    items:
+                      properties:
+                        key:
+                          type: string
+                        operator:
+                          enum:
+                          - In
+                          - NotIn
+                          - Exists
+                          - DoesNotExist
+                          type: string
+                        values:
+                          items:
+                            type: string
+                          type: array
+                      required:
+                      - key
+                      - operator
+                      type: object
+                    type: array
+                  matchLabels:
+                    additionalProperties:
+                      type: string
+                    type: object
+                type: object
+              selection:
+                description: |-
+                  How banlieue picks the member among the Ready ones of the matched pools (ADR-0047
+                  decision 1; banlieue ADR-0135): `strategy` is `LongestReady`, `MostAvailable` or
+                  `Spread`. Copied to the claim verbatim; absent stays absent, which is `LongestReady`,
+                  the order every sandbox had before (decision 2). Immutable with the rest of the spec.
+                nullable: true
+                properties:
+                  strategy:
+                    default: LongestReady
+                    description: The ranking to apply. Defaults to `LongestReady`.
+                    enum:
+                    - LongestReady
+                    - MostAvailable
+                    - Spread
+                    type: string
+                type: object
+              subject:
+                description: Who the sandbox is for.
+                properties:
+                  display:
+                    description: Human-readable name, informational only.
+                    nullable: true
+                    type: string
+                  id:
+                    description: |-
+                      Raw subject identifier as the issuer spells it (Entra `oid`, GitHub login via Dex).
+                      Pinned to the caller at admission (decision 5).
+                    minLength: 1
+                    type: string
+                  issuer:
+                    description: |-
+                      OIDC issuer URL, byte-for-byte as it appears in `iss`. Must be one of the issuers
+                      mediatore is configured with (decision 7).
+                    minLength: 1
+                    type: string
+                required:
+                - id
+                - issuer
+                type: object
+              ttlSeconds:
+                description: |-
+                  Lifetime in seconds, counted from bind; copied to the claim, which enforces it
+                  (decision 9).
+                minimum: 1.0
+                type: integer
+              workload:
+                description: What to run.
+                properties:
+                  args:
+                    default: []
+                    description: Command and arguments to exec inside the jail.
+                    items:
+                      type: string
+                    type: array
+                  image:
+                    description: OCI reference of the rootfs the guest agent unpacks into the jail.
+                    minLength: 1
+                    type: string
+                  logs:
+                    description: |-
+                      The requester's opt-in to output capture (ADR-0045 decision 1, amended): `true` and
+                      the guest tees, redacts and ships the workload's stdout and stderr to the broker, where
+                      the subject reads them with `GET /v1/claims/{name}/logs`. Off by default; a sandbox
+                      that opts in on a broker whose `logs` section is off is refused before any claim exists.
+                    type: boolean
+                  restart:
+                    description: "[`mediatore_proto::RestartPolicy`] as the resource spells it."
+                    enum:
+                    - always
+                    - on-failure
+                    - never
+                    nullable: true
+                    type: string
+                required:
+                - image
+                type: object
+            required:
+            - subject
+            - ttlSeconds
+            - workload
+            type: object
+            x-kubernetes-validations:
+            - message: "a sandbox takes exactly one of poolRef or poolSelector; use poolSelector: {} for any pool in the namespace"
+              rule: has(self.poolRef) != has(self.poolSelector)
+          status:
+            description: "What the reconciler reports: the claim's status, plus the one fact only mediatore knows."
+            nullable: true
+            properties:
+              addresses:
+                description: The member's addresses, from the claim.
+                items:
+                  type: string
+                type: array
+              boundAt:
+                description: From the claim.
+                format: date-time
+                nullable: true
+                type: string
+              claimRef:
+                description: The owned claim, set once it has been created; never cleared.
+                nullable: true
+                properties:
+                  name:
+                    type: string
+                required:
+                - name
+                type: object
+              claimUid:
+                description: "The claim's UID: the claim identity's key (ADR-0004, ADR-0011 decision 1)."
+                nullable: true
+                type: string
+              conditions:
+                description: |-
+                  `PolicyConformant` (ADR-0026 decision 7): `True` when the broker's configuration
+                  allows this sandbox nothing its policy's bundle does not, `False` with the gaps'
+                  codes in the message, `Unknown` while the bundles of this namespace have not been
+                  read yet. Absent without a `policy` section.
+                items:
+                  description: Condition contains details for one aspect of the current state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: lastTransitionTime is the last time the condition transitioned from one status to another. This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: message is a human readable message indicating details about the transition. This may be an empty string.
+                      type: string
+                    observedGeneration:
+                      description: observedGeneration represents the .metadata.generation that the condition was set based upon. For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date with respect to the current state of the instance.
+                      format: int64
+                      type: integer
+                    reason:
+                      description: reason contains a programmatic identifier indicating the reason for the condition's last transition. Producers of specific condition types may define expected values and meanings for this field, and whether the values are considered a guaranteed API. The value should be a CamelCase string. This field may not be empty.
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              entrySet:
+                default: false
+                description: The claim's registration entry is set on the SPIRE server (ADR-0006 decision 5).
+                type: boolean
+              expiresAt:
+                description: "From the claim: when banlieue destroys the member."
+                format: date-time
+                nullable: true
+                type: string
+              observedGeneration:
+                description: The generation this status was computed from.
+                format: int64
+                nullable: true
+                type: integer
+              phase:
+                default: Pending
+                description: Mirrored from the claim.
+                enum:
+                - Pending
+                - Bound
+                - Releasing
+                - Failed
+                type: string
+              poolRef:
+                description: |-
+                  The pool the bound member came from, from the claim (ADR-0044 decision 5): the one
+                  place a sandbox made with `spec.poolSelector` says which pool supplied its VM.
+                nullable: true
+                properties:
+                  name:
+                    type: string
+                required:
+                - name
+                type: object
+              ready:
+                default: false
+                description: "`phase == Bound && entry_set` (decision 11)."
+                type: boolean
+              reason:
+                description: Why the sandbox is `Failed`, when it is.
+                nullable: true
+                type: string
+              record:
+                description: |-
+                  The claim record (ADR-0034 decision 1): the store's part of the status, written by
+                  `KubeStore` alone and never by the reconciler's mirroring, which leaves it out of
+                  its patches.
+                nullable: true
+                properties:
+                  bundleVersion:
+                    description: The bundle version then.
+                    minimum: 0.0
+                    nullable: true
+                    type: integer
+                  claimUid:
+                    description: The claim's UID (banlieue's `VirtualMachineClaim`), the key of the record.
+                    type: string
+                  createdAt:
+                    description: When the record was created.
+                    format: date-time
+                    type: string
+                  delegations:
+                    description: |-
+                      The caller's delegated credentials (ADR-0035), one Secret each: the audience and
+                      when the bearer dies; the envelopes are the Secrets'.
+                    items:
+                      description: "One delegated credential on the record (ADR-0035): which audience, until when."
+                      properties:
+                        audience:
+                          description: The audience the credential is for.
+                          type: string
+                        expiresAt:
+                          description: When the bearer dies, if the caller said.
+                          format: date-time
+                          nullable: true
+                          type: string
+                      required:
+                      - audience
+                      type: object
+                    type: array
+                  entryId:
+                    description: The SPIRE registration entry, once created.
+                    nullable: true
+                    type: string
+                  exit:
+                    description: The workload's exit (ADR-0033 decision 2), as `WorkloadExit` serialises.
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true
+                  expiresAt:
+                    description: The bind deadline, once bound.
+                    format: date-time
+                    nullable: true
+                    type: string
+                  nodeId:
+                    description: The bound node's SPIFFE ID, once known.
+                    nullable: true
+                    type: string
+                  policyUid:
+                    description: The notaio policy's incarnation the record was created under (ADR-0026 decision 6).
+                    nullable: true
+                    type: string
+                  refresh:
+                    default: false
+                    description: Whether a sealed refresh envelope is held for the claim (in the sandbox's Secret).
+                    type: boolean
+                  report:
+                    description: The guest's report (ADR-0029 decision 5), as `ClaimReport` serialises.
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true
+                  revokedAt:
+                    description: Set on release or revocation; a revoked claim never issues again.
+                    format: date-time
+                    nullable: true
+                    type: string
+                required:
+                - claimUid
+                - createdAt
+                type: object
+              virtualMachineRef:
+                description: The bound member, from the claim.
+                nullable: true
+                properties:
+                  name:
+                    type: string
+                required:
+                - name
+                type: object
+            type: object
+        required:
+        - spec
+        title: AgentSandbox
+        type: object
+    served: true
+    storage: false
+    subresources:
+      status: {}
+  - additionalPrinterColumns:
+    - jsonPath: .spec.subject.id
+      name: Subject
+      type: string
+    - jsonPath: .status.poolRef.name
+      name: Pool
+      type: string
+    - jsonPath: .status.virtualMachineRef.name
+      name: VM
+      type: string
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .status.ready
+      name: Ready
+      type: boolean
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
     name: v1beta1
     schema:
       openAPIV3Schema:
