@@ -7,6 +7,12 @@
 //! gap is one line on the error writer. Redaction happened in the VM and is best effort; the
 //! CLI only prints what the broker stored.
 //!
+//! A record is a line, or a piece of one (`partial`, ADR-0045 decision 9 as amended
+//! 2026-11-20): the guest ships the start of a line that has not ended. The reader writes a
+//! piece without a newline and its continuation without a second prefix, so the pieces join
+//! into the line the workload wrote, and it ends an open line before anything else is
+//! printed, so the two streams never mix inside a line.
+//!
 //! The text is the workload's, and the store and the broker stand between the guest (which
 //! neutralises control characters before it queues a line) and this terminal, so the reader
 //! escapes them again ([`escape_controls`]) unless `--raw` asks for the stored text as it is.
@@ -15,7 +21,7 @@ use std::borrow::Cow;
 use std::fmt::Write as _;
 use std::io::Write;
 
-use mediatore_proto::{LogEnd, LogLine, LogStream};
+use mediatore_proto::{LogEnd, LogLine, LogRecord, LogStream};
 
 /// What `GET /v1/claims/{name}/logs` takes.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -96,6 +102,8 @@ pub struct LogPrinter<'a, O: Write, E: Write> {
     /// Lines seen so far, for error messages (the line itself is never echoed: it may carry
     /// what redaction missed).
     lines: usize,
+    /// The stream whose last record was `partial`: its line is open, with no newline yet.
+    open: Option<LogStream>,
 }
 
 impl<'a, O: Write, E: Write> LogPrinter<'a, O, E> {
@@ -111,6 +119,7 @@ impl<'a, O: Write, E: Write> LogPrinter<'a, O, E> {
             raw: false,
             buf: Vec::new(),
             lines: 0,
+            open: None,
         }
     }
 
@@ -139,13 +148,16 @@ impl<'a, O: Write, E: Write> LogPrinter<'a, O, E> {
     }
 
     /// The body ended: a last line without a terminator is read; without an end line the
-    /// stream was cut and the reader says so.
+    /// stream was cut and the reader says so. Either way a line left open by a `partial`
+    /// record is ended.
     ///
     /// # Errors
     /// A malformed last line, or a stream that ended with no end line.
     pub fn finish(&mut self) -> anyhow::Result<LogEnd> {
         let rest = std::mem::take(&mut self.buf);
-        if let Some(end) = self.line(&rest)? {
+        let last = self.line(&rest);
+        self.close_open()?;
+        if let Some(end) = last? {
             return Ok(end);
         }
         anyhow::bail!(
@@ -166,6 +178,7 @@ impl<'a, O: Write, E: Write> LogPrinter<'a, O, E> {
         match parsed {
             LogLine::Header(h) => {
                 if h.truncated_before > 0 {
+                    self.close_open()?;
                     writeln!(
                         self.err,
                         "[{} bytes of older output dropped by the broker]",
@@ -173,35 +186,77 @@ impl<'a, O: Write, E: Write> LogPrinter<'a, O, E> {
                     )?;
                 }
             }
-            LogLine::Record(r) => {
-                let prefix = if self.timestamps {
-                    format!("{} ", r.ts)
+            LogLine::Record(r) => self.record(&r)?,
+            LogLine::Gap(g) => {
+                // What was lost may be the rest of the open line: it ends here.
+                self.close_open()?;
+                if g.unreadable > 0 {
+                    writeln!(
+                        self.err,
+                        "[{} bytes of output stored here could not be read and are not shown]",
+                        g.unreadable
+                    )?;
                 } else {
-                    String::new()
-                };
-                let text = if self.raw {
-                    Cow::Borrowed(r.text.as_str())
-                } else {
-                    escape_controls(&r.text)
-                };
-                match r.stream {
-                    LogStream::Stdout => writeln!(self.out, "{prefix}{text}")?,
-                    LogStream::Stderr => writeln!(self.err, "{prefix}{text}")?,
+                    writeln!(
+                        self.err,
+                        "[{} bytes of stdout and {} bytes of stderr lost before this point]",
+                        g.lost_stdout, g.lost_stderr
+                    )?;
                 }
             }
-            LogLine::Gap(g) if g.unreadable > 0 => writeln!(
-                self.err,
-                "[{} bytes of output stored here could not be read and are not shown]",
-                g.unreadable
-            )?,
-            LogLine::Gap(g) => writeln!(
-                self.err,
-                "[{} bytes of stdout and {} bytes of stderr lost before this point]",
-                g.lost_stdout, g.lost_stderr
-            )?,
-            LogLine::End(e) => return Ok(Some(e.reason)),
+            LogLine::End(e) => {
+                self.close_open()?;
+                return Ok(Some(e.reason));
+            }
         }
         Ok(None)
+    }
+
+    /// Print one record. A whole line gets its prefix and a newline. A `partial` record gets
+    /// no newline and is flushed, so it shows now; the record that continues it on the same
+    /// stream gets no prefix, so the pieces read as the one line they were. A record of the
+    /// other stream ends the open line first.
+    fn record(&mut self, r: &LogRecord) -> anyhow::Result<()> {
+        let continues = self.open == Some(r.stream);
+        if !continues {
+            self.close_open()?;
+        }
+        let prefix = if self.timestamps && !continues {
+            format!("{} ", r.ts)
+        } else {
+            String::new()
+        };
+        let text = if self.raw {
+            Cow::Borrowed(r.text.as_str())
+        } else {
+            escape_controls(&r.text)
+        };
+        let end = if r.partial { "" } else { "\n" };
+        match r.stream {
+            LogStream::Stdout => write!(self.out, "{prefix}{text}{end}")?,
+            LogStream::Stderr => write!(self.err, "{prefix}{text}{end}")?,
+        }
+        if r.partial {
+            // No newline came to flush a line-buffered terminal.
+            match r.stream {
+                LogStream::Stdout => self.out.flush()?,
+                LogStream::Stderr => self.err.flush()?,
+            }
+            self.open = Some(r.stream);
+        } else {
+            self.open = None;
+        }
+        Ok(())
+    }
+
+    /// End the line a `partial` record left open, if there is one: a newline on its writer.
+    fn close_open(&mut self) -> anyhow::Result<()> {
+        match self.open.take() {
+            Some(LogStream::Stdout) => writeln!(self.out)?,
+            Some(LogStream::Stderr) => writeln!(self.err)?,
+            None => {}
+        }
+        Ok(())
     }
 }
 
@@ -228,7 +283,7 @@ pub async fn print_response<O: Write, E: Write>(
 #[cfg(test)]
 mod tests {
     use jiff::Timestamp;
-    use mediatore_proto::{LogEndLine, LogGap, LogHeader, LogRecord};
+    use mediatore_proto::{LogEndLine, LogGap, LogHeader};
 
     use super::*;
 
@@ -238,6 +293,19 @@ mod tests {
             stream,
             ts: Timestamp::from_second(1_700_000_000).unwrap(),
             text: text.into(),
+            partial: false,
+        }))
+        .unwrap()
+    }
+
+    /// A record that says its line goes on.
+    fn piece(seq: u64, stream: LogStream, text: &str) -> String {
+        serde_json::to_string(&LogLine::Record(LogRecord {
+            seq,
+            stream,
+            ts: Timestamp::from_second(1_700_000_000).unwrap(),
+            text: text.into(),
+            partial: true,
         }))
         .unwrap()
     }
@@ -461,6 +529,119 @@ mod tests {
             format!("{HOSTILE}\n{PLAIN}\n")
         );
         assert_eq!(String::from_utf8(err).unwrap(), format!("{HOSTILE}\n"));
+    }
+
+    // ----- a line in pieces (ADR-0045 decision 9, amended 2026-11-20) -----
+
+    /// What both writers got for `lines`, each ended by a newline, and the end reason.
+    fn printed(lines: &[String], timestamps: bool, raw: bool) -> (String, String, LogEnd) {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let mut p = LogPrinter::new(&mut out, &mut err, timestamps).raw(raw);
+        let reason = p
+            .feed((lines.join("\n") + "\n").as_bytes())
+            .unwrap()
+            .expect("an end line");
+        (
+            String::from_utf8(out).unwrap(),
+            String::from_utf8(err).unwrap(),
+            reason,
+        )
+    }
+
+    #[test]
+    fn the_pieces_of_a_line_join_into_one_line_with_one_prefix() {
+        let lines = [
+            header(0),
+            piece(1, LogStream::Stdout, "Thinking"),
+            piece(2, LogStream::Stdout, "..."),
+            record(3, LogStream::Stdout, " done"),
+            record(4, LogStream::Stdout, "next line"),
+            end(LogEnd::ClaimEnded),
+        ];
+        let (out, err, reason) = printed(&lines, false, false);
+        assert_eq!(out, "Thinking... done\nnext line\n");
+        assert!(err.is_empty(), "nothing for the error writer: {err}");
+        assert_eq!(reason, LogEnd::ClaimEnded);
+        // With timestamps: once, in front of the line, not in front of each piece.
+        let (out, _, _) = printed(&lines, true, false);
+        assert_eq!(
+            out,
+            "2023-11-14T22:13:20Z Thinking... done\n2023-11-14T22:13:20Z next line\n"
+        );
+    }
+
+    #[test]
+    fn a_record_of_the_other_stream_ends_an_open_line_first() {
+        let lines = [
+            piece(1, LogStream::Stdout, "half of a line"),
+            record(2, LogStream::Stderr, "warn: careful"),
+            record(3, LogStream::Stdout, " and its end"),
+            piece(4, LogStream::Stderr, "an open error"),
+            record(5, LogStream::Stdout, "out again"),
+            end(LogEnd::ClaimEnded),
+        ];
+        let (out, err, _) = printed(&lines, true, false);
+        // The open stdout line is ended before stderr prints, and what follows it on stdout
+        // is a line of its own, with its own prefix.
+        assert_eq!(
+            out,
+            "2023-11-14T22:13:20Z half of a line\n2023-11-14T22:13:20Z  and its end\n2023-11-14T22:13:20Z out again\n"
+        );
+        assert_eq!(
+            err,
+            "2023-11-14T22:13:20Z warn: careful\n2023-11-14T22:13:20Z an open error\n"
+        );
+    }
+
+    #[test]
+    fn a_gap_ends_an_open_line_before_its_note() {
+        let lines = [
+            piece(1, LogStream::Stderr, "cut off"),
+            serde_json::to_string(&LogLine::Gap(LogGap {
+                lost_stdout: 0,
+                lost_stderr: 9,
+                unreadable: 0,
+            }))
+            .unwrap(),
+            record(7, LogStream::Stderr, "after"),
+            end(LogEnd::ClaimEnded),
+        ];
+        let (out, err, _) = printed(&lines, false, false);
+        assert!(out.is_empty(), "nothing on stdout: {out}");
+        assert_eq!(
+            err,
+            "cut off\n[0 bytes of stdout and 9 bytes of stderr lost before this point]\nafter\n"
+        );
+    }
+
+    #[test]
+    fn the_end_of_the_stream_ends_an_open_line() {
+        // An end line.
+        let lines = [piece(1, LogStream::Stdout, "prompt> "), end(LogEnd::Client)];
+        let (out, _, reason) = printed(&lines, false, false);
+        assert_eq!(out, "prompt> \n");
+        assert_eq!(reason, LogEnd::Client);
+        // A stream cut before its end line: still an error, and the line is still ended.
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let mut p = LogPrinter::new(&mut out, &mut err, false);
+        p.feed(format!("{}\n", piece(1, LogStream::Stderr, "cut")).as_bytes())
+            .unwrap();
+        assert!(p.finish().is_err(), "no end line");
+        assert_eq!(String::from_utf8(err).unwrap(), "cut\n");
+        assert!(out.is_empty(), "nothing on stdout");
+    }
+
+    #[test]
+    fn raw_joins_pieces_the_same_way_and_escaping_applies_to_each_piece() {
+        let lines = [
+            piece(1, LogStream::Stdout, "\x1b[31mred"),
+            record(2, LogStream::Stdout, "\rover"),
+            end(LogEnd::ClaimEnded),
+        ];
+        let (out, _, _) = printed(&lines, false, true);
+        assert_eq!(out, "\x1b[31mred\rover\n");
+        let (out, _, _) = printed(&lines, false, false);
+        assert_eq!(out, "\\x1b[31mred\\x0dover\n");
     }
 
     #[test]

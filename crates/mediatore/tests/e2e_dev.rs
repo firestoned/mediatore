@@ -177,7 +177,8 @@ impl Harness {
             inject: std::collections::BTreeMap::new(),
             inject_port: None,
             logs,
-            log_limiter: Limiter::per_second(1),
+            log_limiter: Limiter::per_second(2),
+            log_wakes: mediatore_api::LogWakes::default(),
             accept_plain_gateway_identity: false,
             scopes,
             store: MemoryStore::shared(),
@@ -430,6 +431,7 @@ fn record(seq: u64, stream: LogStream, text: &str) -> LogRecord {
         stream,
         ts: jiff::Timestamp::now(),
         text: text.into(),
+        partial: false,
     }
 }
 
@@ -497,7 +499,8 @@ async fn a_workloads_output_is_shipped_by_its_node_and_read_by_its_owner_alone()
     assert_eq!(seqs(&lines), Vec::<u64>::new());
     assert_eq!(end_reason(&lines), Some(LogEnd::Client));
 
-    // The first batch is taken; the second within the second is told to wait.
+    // Two batches are taken (ADR-0045 decision 4, amended 2026-11-20); the third within the
+    // second is told to wait.
     let first = batch(vec![
         record(1, LogStream::Stdout, "hello"),
         record(2, LogStream::Stderr, "warning: something"),
@@ -507,8 +510,9 @@ async fn a_workloads_output_is_shipped_by_its_node_and_read_by_its_owner_alone()
         record(4, LogStream::Stdout, "done"),
     ]);
     assert_eq!(h.post_logs(&node_svid(), &first).await.status(), 204);
+    assert_eq!(h.post_logs(&node_svid(), &second).await.status(), 204);
     let resp = h.post_logs(&node_svid(), &second).await;
-    assert_eq!(resp.status(), 429, "one batch per second per claim");
+    assert_eq!(resp.status(), 429, "two batches per second per claim");
     assert_eq!(
         resp.headers()
             .get("retry-after")
@@ -517,10 +521,13 @@ async fn a_workloads_output_is_shipped_by_its_node_and_read_by_its_owner_alone()
     );
     let body: ErrorBody = resp.json().await.expect("429 body");
     assert_eq!(body.error, "too_many_batches");
-    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-    assert_eq!(h.post_logs(&node_svid(), &second).await.status(), 204);
+    assert_eq!(
+        body.detail.as_deref(),
+        Some("two batches per second per claim")
+    );
 
-    // A retried batch is a no-op (decision 8): the same output, once.
+    // After the wait the same batch is taken, and a retried batch is a no-op (decision 8):
+    // the same output, once.
     tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
     assert_eq!(h.post_logs(&node_svid(), &second).await.status(), 204);
     let (status, lines) = h.read_logs(&user_token, &claim.name, "").await;
@@ -628,6 +635,156 @@ async fn a_workloads_output_is_shipped_by_its_node_and_read_by_its_owner_alone()
     assert_eq!(status, 200);
     assert_eq!(seqs(&lines), vec![1, 2, 3, 4]);
     assert_eq!(end_reason(&lines), Some(LogEnd::ClaimEnded));
+}
+
+/// The guest's side of the output path, posting to the harness as the claim's node: what
+/// `BrokerSink` does over the node SVID, here over the dev header.
+struct NodeSink {
+    http: reqwest::Client,
+    url: String,
+}
+
+#[async_trait::async_trait]
+impl mediatore_guest::logs::LogSink for NodeSink {
+    async fn post(&self, batch: &LogBatch) -> anyhow::Result<mediatore_guest::logs::PostOutcome> {
+        let resp = self
+            .http
+            .post(&self.url)
+            .header(PEER_HEADER, node_svid())
+            .json(batch)
+            .send()
+            .await?;
+        let retry_after = resp
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok());
+        Ok(mediatore_guest::logs::classify(
+            resp.status().as_u16(),
+            retry_after,
+        ))
+    }
+}
+
+/// The next record of a followed stream, read as it arrives: the header and the keepalives
+/// are skipped. `buf` keeps what a chunk held beyond the line returned.
+async fn next_record(resp: &mut reqwest::Response, buf: &mut Vec<u8>) -> LogRecord {
+    loop {
+        while let Some(nl) = buf.iter().position(|b| *b == b'\n') {
+            let line: Vec<u8> = buf.drain(..=nl).collect();
+            if line.iter().all(u8::is_ascii_whitespace) {
+                continue;
+            }
+            match serde_json::from_slice::<LogLine>(&line).expect("a log line") {
+                LogLine::Record(r) => return r,
+                LogLine::Header(_) | LogLine::Gap(_) => {}
+                LogLine::End(e) => panic!("the stream ended: {:?}", e.reason),
+            }
+        }
+        let chunk = resp
+            .chunk()
+            .await
+            .expect("the follow stream")
+            .expect("the stream stays open while the claim lives");
+        buf.extend_from_slice(&chunk);
+    }
+}
+
+/// ADR-0045 decisions 1 and 9, amended 2026-11-20, front to back over real listeners: bytes
+/// the workload writes to its pipe are read by the guest's reader, posted on the leading edge
+/// by its batcher, stored by the broker, and sent to a follower the ingest woke, well inside
+/// the two seconds the follower's poll alone would have taken. A line that does not end is
+/// seen too, as a partial record, and the record that ends it is whole.
+#[tokio::test]
+async fn output_written_in_the_guest_reaches_a_follower_well_inside_the_poll() {
+    use mediatore_guest::logs::{Capture, Queue, ShipperConfig, Shipping};
+    use tokio::io::AsyncWriteExt as _;
+
+    /// Well inside the follower's two-second poll, with room for a busy test host.
+    const PROMPT: std::time::Duration = std::time::Duration::from_millis(1000);
+
+    let h = Harness::start_with_logs().await;
+    h.register_node().await;
+    let user_token = h.login("octocat");
+    let resp = h.create_claim_logs(&user_token, true).await;
+    assert_eq!(resp.status(), 201);
+    let claim: ClaimResponse = resp.json().await.expect("claim body");
+
+    // The owner follows first: the stream opens on an empty ring.
+    let mut follow = h
+        .http
+        .get(format!(
+            "{}/v1/claims/{}/logs?follow=true",
+            h.user_url, claim.name
+        ))
+        .bearer_auth(&user_token)
+        .send()
+        .await
+        .expect("follow");
+    assert_eq!(follow.status(), 200);
+    let mut buf = Vec::new();
+    // Past the follower's first read, so only a wake or the poll can bring what follows.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // The guest's side: a pipe for the workload's stdout, the reader, the queue, the batcher.
+    let queue = Arc::new(Queue::default());
+    let capture = Arc::new(Capture::new(Vec::new(), queue.clone()).without_console());
+    let sink = Arc::new(NodeSink {
+        http: h.http.clone(),
+        url: format!("{}/v1/me/logs", h.sandbox_url),
+    });
+    let shipping = Shipping::start(queue, sink, ShipperConfig::default());
+    let (mut pipe, read_end) = tokio::io::duplex(64 * 1024);
+    let reader = tokio::spawn(async move {
+        capture.read_stream(read_end, LogStream::Stdout).await;
+    });
+
+    // A whole line.
+    let written = std::time::Instant::now();
+    pipe.write_all(b"first line\n").await.expect("write");
+    let got = next_record(&mut follow, &mut buf).await;
+    let took = written.elapsed();
+    assert_eq!(got.text, "first line");
+    assert!(!got.partial, "a whole line");
+    assert!(took < PROMPT, "a line took {took:?} to reach its follower");
+
+    // A line that does not end: its start arrives as a partial, less the end the redactor
+    // holds back, and its end as a record that is not one.
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    let start = "s".repeat(1000);
+    let written = std::time::Instant::now();
+    pipe.write_all(start.as_bytes()).await.expect("write");
+    let head = next_record(&mut follow, &mut buf).await;
+    let took = written.elapsed();
+    assert!(head.partial, "the line has not ended");
+    assert!(
+        !head.text.is_empty() && start.starts_with(&head.text),
+        "the start of the line, {} bytes of it",
+        head.text.len()
+    );
+    assert!(
+        took < PROMPT,
+        "a partial took {took:?} to reach its follower"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    pipe.write_all(b" and its end\n").await.expect("write");
+    let tail = next_record(&mut follow, &mut buf).await;
+    assert!(!tail.partial, "the record that ends the line");
+    assert_eq!(
+        format!("{}{}", head.text, tail.text),
+        format!("{start} and its end")
+    );
+    assert_eq!(
+        (head.stream, tail.stream),
+        (LogStream::Stdout, LogStream::Stdout)
+    );
+
+    drop(pipe);
+    reader.await.expect("the reader ends with its pipe");
+    assert!(
+        shipping.flush(std::time::Duration::from_secs(5)).await,
+        "nothing left to post"
+    );
 }
 
 /// ADR-0045 decision 1: capture is the requester's opt-in. A claim without it takes no output

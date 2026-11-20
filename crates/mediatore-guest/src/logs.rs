@@ -8,9 +8,14 @@
 //! Two readers drain the jail's stdout and stderr pipes line by line, redact each line
 //! ([`crate::redact`], decision 2; a line over [`RAW_LINE_CAP`] in pieces, with the end of each
 //! piece held back unredacted until the next is read, so a secret across a cut is seen whole), write it through to the VM console (the operator's view is
-//! unchanged) and queue it as a [`LogRecord`] with a per-claim `seq`. A batcher posts the queue
-//! to `POST /v1/me/logs` every [`ShipperConfig::interval`] or at [`ShipperConfig::batch_bytes`],
-//! whichever comes first. The workload never waits for mediatore: the readers only touch the
+//! unchanged) and queue it as a [`LogRecord`] with a per-claim `seq`. A newline or a bare
+//! carriage return ends a line. A line that has not ended is not held for ever (decision 1,
+//! amended 2026-11-20): after [`PARTIAL_IDLE`] with nothing more read, what the redactor lets
+//! go of it is queued as a record marked `partial`, the same way and with the same held-back
+//! end as a cut at the raw cap, and the record that ends the line is not marked. A batcher
+//! posts the queue to `POST /v1/me/logs` on the leading edge: at once when
+//! [`ShipperConfig::min_gap`] has passed since the last post began, otherwise when it has, or
+//! at [`ShipperConfig::batch_bytes`]. The workload never waits for mediatore: the readers only touch the
 //! queue under a mutex, and a queue over its cap drops its oldest records and counts the bytes,
 //! which travel with the next batch so the reader sees the gap (decision 8). Delivery is
 //! at-least-once with idempotent writes at the broker: a retried batch keeps its `seq` range.
@@ -52,6 +57,12 @@ pub const RAW_LINE_CAP: usize = 4 * MAX_LOG_RECORD_BYTES;
 /// cannot: a line that begins with `<3>` or with a forged timestamp and level is, in the
 /// journal, visibly the workload's.
 pub const CONSOLE_PREFIX: &str = "workload: ";
+/// How long a reader that holds the start of a line waits for more of it before it queues
+/// what the redactor lets go, as a `partial` record (ADR-0045 decision 1, amended 2026-11-20).
+/// The end of what it holds ([`Redactor::hold_back`] bytes at least) still waits for more bytes
+/// or for the end of the line, so a secret written in two halves with a pause between them is
+/// seen whole.
+pub const PARTIAL_IDLE: Duration = Duration::from_millis(150);
 /// How long the guest waits for the readers to see EOF once the jail exited.
 pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long the flush at workload exit may take, before `POST /v1/me/exit` (decision 8).
@@ -64,6 +75,8 @@ pub struct Queue {
     max_bytes: usize,
     /// Signalled when the queued text crosses the batcher's threshold.
     full: Notify,
+    /// Signalled at every push: what wakes a batcher that had nothing to post.
+    pushed: Notify,
     threshold: usize,
 }
 
@@ -89,6 +102,7 @@ impl Queue {
             inner: Mutex::new(QueueInner::default()),
             max_bytes,
             full: Notify::new(),
+            pushed: Notify::new(),
             threshold,
         }
     }
@@ -117,9 +131,15 @@ impl Queue {
         }
         let wake = q.bytes >= self.threshold;
         drop(q);
+        self.pushed.notify_one();
         if wake {
             self.full.notify_one();
         }
+    }
+
+    /// Whether the queued text is at the batcher's threshold: a post is due whatever the gap.
+    fn over_threshold(&self) -> bool {
+        self.lock().bytes >= self.threshold
     }
 
     /// Take the next batch: records from the front up to `batch_bytes` of text (at least one,
@@ -177,6 +197,44 @@ pub struct Capture {
     queue: Arc<Queue>,
     /// Write every redacted line through to the guest's own stdio (the VM console).
     tee_console: bool,
+    /// How long a reader waits on a line that has not ended ([`PARTIAL_IDLE`]).
+    partial_idle: Duration,
+}
+
+/// One stream's line in progress: the redactor, whose state spans lines (a private key block),
+/// and the bytes read of the line that have not been queued.
+struct Line {
+    redactor: Redactor,
+    /// Unredacted bytes of the line: what the redactor held back of the pieces already
+    /// queued, then what was read after.
+    raw: Vec<u8>,
+    /// How many bytes at the start of `raw` the redactor has already been offered and held
+    /// back. More than that must be read before the line is offered again.
+    offered: usize,
+    /// A piece of this line was queued as `partial`: a record that is not must end it.
+    open: bool,
+}
+
+/// When a read gives up on a line that has not ended: once `idle` has passed with nothing
+/// read, and only while the buffer holds more than the `offered` bytes the redactor has
+/// already seen (offering it the same bytes again would let nothing more go).
+#[derive(Debug, Clone, Copy)]
+struct Quiet {
+    offered: usize,
+    idle: Duration,
+}
+
+/// What one read of a stream came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step {
+    /// A terminator was read (a newline or a carriage return), not kept.
+    Ended,
+    /// The buffer reached its cap before the line ended.
+    Cut,
+    /// A line is in progress and nothing more arrived for the idle time.
+    Idle,
+    /// The pipe closed.
+    Eof,
 }
 
 /// The two reader tasks of one jail; [`Readers::drain`] waits for both to see EOF.
@@ -209,7 +267,15 @@ impl Capture {
             seq: AtomicU64::new(0),
             queue,
             tee_console: true,
+            partial_idle: PARTIAL_IDLE,
         }
+    }
+
+    /// Wait `idle`, not [`PARTIAL_IDLE`], on a line that has not ended: for tests.
+    #[must_use]
+    pub fn with_partial_idle(mut self, idle: Duration) -> Self {
+        self.partial_idle = idle;
+        self
     }
 
     /// For tests: queue only, nothing written to the test's stdio.
@@ -257,84 +323,111 @@ impl Capture {
     }
 
     /// Read `reader` to EOF as `stream`: each line redacted, written to the console, split at
-    /// [`MAX_LOG_RECORD_BYTES`] and queued. A last line without its newline counts. A line
-    /// over [`RAW_LINE_CAP`] is redacted and queued in pieces, the unredacted end of each
-    /// piece kept in front of the next read.
+    /// [`MAX_LOG_RECORD_BYTES`] and queued. A newline or a bare carriage return ends a line
+    /// (`\r\n` is one terminator), and a last line without one counts. A line over
+    /// [`RAW_LINE_CAP`], and one that has not ended after the idle time ([`PARTIAL_IDLE`]), is
+    /// redacted and queued in pieces marked `partial`, the unredacted end of each piece kept
+    /// in front of the next read.
     pub async fn read_stream<R: AsyncRead + Unpin>(&self, reader: R, stream: LogStream) {
         let mut reader = BufReader::new(reader);
-        let mut redactor = self.redactor();
-        // What a cut held back of the line being read (`held` bytes, unredacted), then what
-        // is read after it.
-        let mut raw = Vec::new();
-        let mut held = 0;
+        let mut line = Line {
+            redactor: self.redactor(),
+            raw: Vec::new(),
+            offered: 0,
+            open: false,
+        };
+        // The last terminator was a carriage return: a newline right after it is its other half.
+        let mut after_cr = false;
         loop {
-            let limit = held + RAW_LINE_CAP;
-            let read = match read_line_bounded(&mut reader, &mut raw, limit).await {
-                Ok(n) => n,
+            let quiet = Quiet {
+                offered: line.offered,
+                idle: self.partial_idle,
+            };
+            let limit = line.offered + RAW_LINE_CAP;
+            let step = read_step(&mut reader, &mut line.raw, limit, quiet, &mut after_cr).await;
+            match step {
+                Ok(Step::Ended) => self.end_line(stream, &mut line),
+                Ok(Step::Cut | Step::Idle) => self.emit_head(stream, &mut line),
+                Ok(Step::Eof) => break,
                 Err(e) => {
                     tracing::debug!(?stream, error = %e, "output pipe closed with an error");
-                    0
+                    break;
                 }
-            };
-            if read == 0 {
-                // The pipe closed: what a cut held back is the end of its line.
-                if !raw.is_empty()
-                    && let Some(redacted) = redactor.redact_line(&String::from_utf8_lossy(&raw))
-                {
-                    self.emit(stream, &redacted);
-                }
-                return;
             }
-            if raw.last() == Some(&b'\n') || raw.len() < limit {
-                // The whole line, or the end of one that was cut.
-                if raw.last() == Some(&b'\n') {
-                    raw.pop();
-                    if raw.last() == Some(&b'\r') {
-                        raw.pop();
-                    }
-                }
-                if let Some(redacted) = redactor.redact_line(&String::from_utf8_lossy(&raw)) {
-                    self.emit(stream, &redacted);
-                }
-                raw.clear();
-                held = 0;
-                continue;
-            }
-            // Cut before its end. A char split by the cut waits for its other bytes.
-            let (redacted, rest) = {
-                let whole = raw.len() - incomplete_utf8_suffix(&raw);
-                let piece = String::from_utf8_lossy(&raw[..whole]);
-                let (redacted, covered) = redactor.redact_head(&piece);
-                let mut rest = piece.as_bytes()[covered..].to_vec();
-                rest.extend_from_slice(&raw[whole..]);
-                (redacted, rest)
-            };
-            if let Some(redacted) = redacted {
-                self.emit(stream, &redacted);
-            }
-            raw = rest;
-            held = raw.len();
+        }
+        // The pipe closed: what is left is the end of its line.
+        if !line.raw.is_empty() || line.open {
+            self.end_line(stream, &mut line);
         }
     }
 
-    /// One redacted line, or piece of an overlong one: its control characters neutralised
+    /// The end of a line: what is left of it redacted and queued as a record that is not
+    /// `partial`. A line whose end the redactor drops (the rest of a private key block, of a
+    /// value already replaced) still gets its last record when pieces of it were queued, an
+    /// empty one, so a reader never joins the next line to it.
+    fn end_line(&self, stream: LogStream, line: &mut Line) {
+        let redacted = line
+            .redactor
+            .redact_line(&String::from_utf8_lossy(&line.raw));
+        if let Some(text) = redacted {
+            self.emit(stream, &text, false);
+        } else if line.open {
+            self.push_record(stream, String::new(), false);
+        }
+        line.raw.clear();
+        line.offered = 0;
+        line.open = false;
+    }
+
+    /// A line cut before its end, at the raw cap or by the idle time: what the redactor lets
+    /// go ([`Redactor::redact_head`]) is queued as a `partial` record, and what it holds back
+    /// stays, unredacted and in memory only, in front of what is read next. A char split by
+    /// the cut waits for its other bytes.
+    fn emit_head(&self, stream: LogStream, line: &mut Line) {
+        let (redacted, rest) = {
+            let whole = line.raw.len() - incomplete_utf8_suffix(&line.raw);
+            let piece = String::from_utf8_lossy(&line.raw[..whole]);
+            let (redacted, covered) = line.redactor.redact_head(&piece);
+            let mut rest = piece.as_bytes()[covered..].to_vec();
+            rest.extend_from_slice(&line.raw[whole..]);
+            (redacted, rest)
+        };
+        if let Some(text) = redacted {
+            self.emit(stream, &text, true);
+            line.open = true;
+        }
+        line.offered = rest.len();
+        line.raw = rest;
+    }
+
+    /// One redacted line, or piece of one: its control characters neutralised
     /// ([`neutralise_controls`]), then to the console behind [`CONSOLE_PREFIX`], and to the
     /// queue in records of at most [`MAX_LOG_RECORD_BYTES`]. The split comes after the
-    /// escaping, which lengthens a line, so the record limit holds on what is queued.
-    fn emit(&self, stream: LogStream, redacted: &str) {
+    /// escaping, which lengthens a line, so the record limit holds on what is queued. Every
+    /// record but the last is marked `partial`; the last is too when the line goes on after
+    /// this piece, which is what the caller says with `partial`.
+    fn emit(&self, stream: LogStream, redacted: &str, partial: bool) {
         let safe = neutralise_controls(redacted);
         if self.tee_console {
             tee(stream, &safe);
         }
-        for text in split_record(&safe, MAX_LOG_RECORD_BYTES) {
-            let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
-            self.queue.push(LogRecord {
-                seq,
-                stream,
-                ts: Timestamp::now(),
-                text,
-            });
+        let pieces = split_record(&safe, MAX_LOG_RECORD_BYTES);
+        let last = pieces.len().saturating_sub(1);
+        for (i, text) in pieces.into_iter().enumerate() {
+            self.push_record(stream, text, partial || i < last);
         }
+    }
+
+    /// Queue one record under the next `seq`.
+    fn push_record(&self, stream: LogStream, text: String, partial: bool) {
+        let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
+        self.queue.push(LogRecord {
+            seq,
+            stream,
+            ts: Timestamp::now(),
+            text,
+            partial,
+        });
     }
 }
 
@@ -408,30 +501,51 @@ fn tee(stream: LogStream, line: &str) {
     };
 }
 
-/// Read up to and including the next `\n`, or `cap` bytes, or EOF. Returns the bytes read.
-async fn read_line_bounded<R: AsyncBufRead + Unpin>(
+/// Read into `buf` up to the next terminator (a `\n` or a `\r`, consumed and not kept), or
+/// until `buf` holds `cap` bytes, or EOF. While `buf` holds more than `quiet.offered` bytes,
+/// give up once nothing arrives for `quiet.idle` ([`Step::Idle`]); what was read stays in
+/// `buf` and the next call goes on from there.
+/// `after_cr` carries one fact between calls: the last terminator was a `\r`, so a `\n` that
+/// comes first is the other half of that terminator and is dropped.
+async fn read_step<R: AsyncBufRead + Unpin>(
     reader: &mut R,
     buf: &mut Vec<u8>,
     cap: usize,
-) -> std::io::Result<usize> {
-    let mut total = 0;
+    quiet: Quiet,
+    after_cr: &mut bool,
+) -> std::io::Result<Step> {
     loop {
-        let avail = reader.fill_buf().await?;
+        // The idle time starts again at every read: it measures silence, not the line's age.
+        let avail = if buf.len() > quiet.offered {
+            let Ok(filled) = tokio::time::timeout(quiet.idle, reader.fill_buf()).await else {
+                return Ok(Step::Idle);
+            };
+            filled?
+        } else {
+            reader.fill_buf().await?
+        };
         if avail.is_empty() {
-            return Ok(total);
+            return Ok(Step::Eof);
         }
-        if let Some(i) = avail.iter().position(|b| *b == b'\n') {
-            buf.extend_from_slice(&avail[..=i]);
+        if *after_cr {
+            *after_cr = false;
+            if avail[0] == b'\n' {
+                reader.consume(1);
+                continue;
+            }
+        }
+        if let Some(i) = avail.iter().position(|b| matches!(*b, b'\n' | b'\r')) {
+            *after_cr = avail[i] == b'\r';
+            buf.extend_from_slice(&avail[..i]);
             reader.consume(i + 1);
-            return Ok(total + i + 1);
+            return Ok(Step::Ended);
         }
         let room = cap.saturating_sub(buf.len());
         let take = room.min(avail.len());
         buf.extend_from_slice(&avail[..take]);
         reader.consume(take);
-        total += take;
         if buf.len() >= cap {
-            return Ok(total);
+            return Ok(Step::Cut);
         }
     }
 }
@@ -459,7 +573,8 @@ pub fn split_record(text: &str, max: usize) -> Vec<String> {
 pub enum PostOutcome {
     /// `204`: stored (or a known replay).
     Accepted,
-    /// `429`: one batch per second per claim; wait this long and send the same batch again.
+    /// `429`: over the broker's batches per second for the claim; wait this long and send the
+    /// same batch again.
     RetryAfter(Duration),
     /// `501` or `404`: this broker stores no output; stop shipping, keep the console copy.
     Off,
@@ -531,8 +646,11 @@ pub fn classify(status: u16, retry_after_secs: Option<u64>) -> PostOutcome {
 /// The batcher's timings (ADR-0045 decisions 1 and 8).
 #[derive(Debug, Clone, Copy)]
 pub struct ShipperConfig {
-    /// Post at least this often while anything is queued.
-    pub interval: Duration,
+    /// The least time between the starts of two posts (ADR-0045 decision 1, amended
+    /// 2026-11-20). A record queued when this long has passed since the last post began is
+    /// posted at once; one queued sooner waits for the rest of it, so nothing queued waits
+    /// longer than this for its post to begin, and sustained output is posted this often.
+    pub min_gap: Duration,
     /// Post as soon as this much record text is queued.
     pub batch_bytes: usize,
     /// First wait after a transport failure, doubled each time up to `backoff_max`.
@@ -544,7 +662,7 @@ pub struct ShipperConfig {
 impl Default for ShipperConfig {
     fn default() -> Self {
         Self {
-            interval: Duration::from_secs(2),
+            min_gap: Duration::from_millis(500),
             batch_bytes: 32 * 1024,
             backoff_min: Duration::from_secs(1),
             backoff_max: Duration::from_secs(30),
@@ -591,8 +709,8 @@ impl Shipping {
     }
 }
 
-/// The batcher loop: wait for the interval, the threshold or the stop; take a batch; post it
-/// until the broker takes it or refuses it; on stop, drain and leave.
+/// The batcher loop: wait until a post is due ([`wait_for_post`]); take a batch; post it until
+/// the broker takes it or refuses it ([`deliver`]); on stop, drain and leave.
 async fn run(
     queue: Arc<Queue>,
     sink: Arc<dyn LogSink>,
@@ -601,56 +719,101 @@ async fn run(
     off: Arc<AtomicBool>,
 ) {
     let mut backoff = cfg.backoff_min;
+    // When the last post began; nothing was posted yet.
+    let mut began: Option<tokio::time::Instant> = None;
+    let mut stopping = false;
     loop {
-        let stopping = *stopped.borrow();
         if !stopping {
-            tokio::select! {
-                () = tokio::time::sleep(cfg.interval) => {}
-                () = queue.full.notified() => {}
-                _ = stopped.changed() => {}
-            }
+            stopping = wait_for_post(&queue, &cfg, began, &mut stopped).await;
         }
         if queue.is_empty() {
-            if *stopped.borrow() {
+            if stopping {
                 return;
             }
             continue;
         }
+        began = Some(tokio::time::Instant::now());
         let batch = queue.take_batch(cfg.batch_bytes);
-        loop {
-            match sink.post(&batch).await {
-                Ok(PostOutcome::Accepted) => {
-                    backoff = cfg.backoff_min;
-                    break;
-                }
-                Ok(PostOutcome::RetryAfter(wait)) => {
-                    tracing::debug!(
-                        wait_secs = wait.as_secs(),
-                        "log batch rate limited; retrying the same batch"
-                    );
-                    tokio::time::sleep(wait).await;
-                }
-                Ok(PostOutcome::Off) => {
-                    off.store(true, Ordering::SeqCst);
-                    tracing::info!(
-                        "the broker stores no workload output (not enabled, or an older release); the console copy stays"
-                    );
-                    return;
-                }
-                Ok(PostOutcome::Refused(status)) => {
-                    tracing::warn!(
-                        status,
-                        records = batch.records.len(),
-                        bytes = batch.text_bytes(),
-                        "the broker refused a log batch; those records are lost"
-                    );
-                    break;
-                }
-                Err(e) => {
-                    tracing::debug!(error = %e, wait_secs = backoff.as_secs(), "log batch did not reach the broker; retrying");
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(cfg.backoff_max);
-                }
+        if !deliver(sink.as_ref(), &batch, &cfg, &mut backoff).await {
+            off.store(true, Ordering::SeqCst);
+            tracing::info!(
+                "the broker stores no workload output (not enabled, or an older release); the console copy stays"
+            );
+            return;
+        }
+    }
+}
+
+/// Wait until the next post is due, on the leading edge (ADR-0045 decision 1, amended
+/// 2026-11-20): with nothing queued, until a record is; then until [`ShipperConfig::min_gap`]
+/// has passed since the last post `began`, which is no wait at all when it already has, or
+/// until the queue is at its threshold. Returns `true` when the stop was asked instead (or the
+/// [`Shipping`] is gone): the caller drains without waiting.
+async fn wait_for_post(
+    queue: &Queue,
+    cfg: &ShipperConfig,
+    began: Option<tokio::time::Instant>,
+    stopped: &mut watch::Receiver<bool>,
+) -> bool {
+    if *stopped.borrow() {
+        return true;
+    }
+    if queue.is_empty() {
+        tokio::select! {
+            () = queue.pushed.notified() => {}
+            _ = stopped.changed() => return true,
+        }
+    }
+    let Some(began) = began else {
+        return false;
+    };
+    let due = began + cfg.min_gap;
+    while !queue.over_threshold() {
+        tokio::select! {
+            () = tokio::time::sleep_until(due) => return false,
+            () = queue.full.notified() => {}
+            _ = stopped.changed() => return true,
+        }
+    }
+    false
+}
+
+/// Post `batch` until the broker takes it or refuses it: a `429` waits what it says and sends
+/// the same batch again, a transport failure backs off and does the same. Returns `false`
+/// when the broker stores no output and shipping must stop.
+async fn deliver(
+    sink: &dyn LogSink,
+    batch: &LogBatch,
+    cfg: &ShipperConfig,
+    backoff: &mut Duration,
+) -> bool {
+    loop {
+        match sink.post(batch).await {
+            Ok(PostOutcome::Accepted) => {
+                *backoff = cfg.backoff_min;
+                return true;
+            }
+            Ok(PostOutcome::RetryAfter(wait)) => {
+                tracing::debug!(
+                    wait_secs = wait.as_secs(),
+                    "log batch rate limited; retrying the same batch"
+                );
+                tokio::time::sleep(wait).await;
+            }
+            Ok(PostOutcome::Off) => return false,
+            Ok(PostOutcome::Refused(status)) => {
+                tracing::warn!(
+                    status,
+                    records = batch.records.len(),
+                    bytes = batch.text_bytes(),
+                    "the broker refused a log batch; those records are lost"
+                );
+                return true;
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, wait_secs = backoff.as_secs(), "log batch did not reach the broker; retrying");
+                tokio::time::sleep(*backoff).await;
+                *backoff = (*backoff * 2).min(cfg.backoff_max);
             }
         }
     }
@@ -865,6 +1028,7 @@ mod tests {
             stream,
             ts: Timestamp::UNIX_EPOCH,
             text: text.to_owned(),
+            partial: false,
         }
     }
 
@@ -912,6 +1076,8 @@ mod tests {
     struct Scripted {
         outcomes: Mutex<VecDeque<Result<PostOutcome, String>>>,
         posted: Mutex<Vec<LogBatch>>,
+        /// When each post arrived.
+        at: Mutex<Vec<tokio::time::Instant>>,
     }
 
     impl Scripted {
@@ -919,7 +1085,12 @@ mod tests {
             Arc::new(Self {
                 outcomes: Mutex::new(script.into()),
                 posted: Mutex::new(Vec::new()),
+                at: Mutex::new(Vec::new()),
             })
+        }
+
+        fn posted_at(&self) -> Vec<tokio::time::Instant> {
+            self.at.lock().unwrap().clone()
         }
 
         fn posted(&self) -> Vec<LogBatch> {
@@ -931,6 +1102,7 @@ mod tests {
     impl LogSink for Scripted {
         async fn post(&self, batch: &LogBatch) -> anyhow::Result<PostOutcome> {
             self.posted.lock().unwrap().push(batch.clone());
+            self.at.lock().unwrap().push(tokio::time::Instant::now());
             match self.outcomes.lock().unwrap().pop_front() {
                 Some(Ok(o)) => Ok(o),
                 Some(Err(e)) => Err(anyhow::anyhow!(e)),
@@ -941,7 +1113,7 @@ mod tests {
 
     fn fast() -> ShipperConfig {
         ShipperConfig {
-            interval: Duration::from_millis(20),
+            min_gap: Duration::from_millis(20),
             batch_bytes: 32 * 1024,
             backoff_min: Duration::from_millis(10),
             backoff_max: Duration::from_millis(40),
@@ -1026,7 +1198,7 @@ mod tests {
         let sink = Scripted::new(vec![]);
         let q = Arc::new(Queue::default());
         let cfg = ShipperConfig {
-            interval: Duration::from_secs(3600),
+            min_gap: Duration::from_secs(3600),
             ..fast()
         };
         let s = Shipping::start(q.clone(), sink.clone(), cfg);
@@ -1055,11 +1227,11 @@ mod tests {
         q.push(record(1, LogStream::Stdout, &"a".repeat(60)));
         q.push(record(2, LogStream::Stderr, &"b".repeat(60)));
         let cfg = ShipperConfig {
-            interval: Duration::from_secs(3600),
+            min_gap: Duration::from_secs(3600),
             ..fast()
         };
+        // The first post does not wait: nothing was posted before it.
         let s = Shipping::start(q.clone(), sink.clone(), cfg);
-        q.full.notify_one();
         settle().await;
         q.push(record(3, LogStream::Stdout, "c"));
         assert!(s.flush(Duration::from_secs(1)).await);
@@ -1193,7 +1365,7 @@ mod tests {
     async fn the_queue_holds_neutralised_text_and_keeps_redaction() {
         let c = capture();
         let input =
-            format!("\x1b]52;c;{PHANTOM}\x07 tab\there \u{9b}2J caf\u{e9}\n<3>next\rline\n");
+            format!("\x1b]52;c;{PHANTOM}\x07 tab\there \u{9b}2J caf\u{e9}\n<3>next\x08line\n");
         c.read_stream(input.as_bytes(), LogStream::Stdout).await;
         let got = records(&c.queue());
         assert_eq!(got.len(), 2);
@@ -1205,7 +1377,7 @@ mod tests {
                 crate::redact::REDACTED
             )
         );
-        assert_eq!(got[1].text, "<3>next\\x0dline");
+        assert_eq!(got[1].text, "<3>next\\x08line");
     }
 
     #[tokio::test]
@@ -1240,6 +1412,282 @@ mod tests {
             }
             assert_eq!(total, 4 * len, "nothing lost to the escaping");
         }
+    }
+
+    // ----- output as it is written (ADR-0045 decision 1, amended 2026-11-20) -----
+
+    /// The readers' idle time in these tests, and a writer's pause, far longer than it.
+    const IDLE: Duration = Duration::from_millis(20);
+    const PAUSE: Duration = Duration::from_millis(250);
+
+    /// [`capture`] whose readers wait [`IDLE`] on a line that has not ended.
+    fn capture_idle() -> Arc<Capture> {
+        Arc::new(
+            Capture::new(vec![PHANTOM.to_owned()], Arc::new(Queue::default()))
+                .without_console()
+                .with_partial_idle(IDLE),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_carriage_return_ends_a_record_and_crlf_is_one_terminator() {
+        let c = capture();
+        c.read_stream(&b"10%\r50%\r100%\r\ndone\n\rtail"[..], LogStream::Stdout)
+            .await;
+        let got = records(&c.queue());
+        let texts: Vec<&str> = got.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(texts, vec!["10%", "50%", "100%", "done", "", "tail"]);
+        assert!(got.iter().all(|r| !r.partial), "each of them ended");
+        assert!(
+            !got.iter().any(|r| r.text.chars().any(char::is_control)),
+            "no terminator is kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_crlf_split_between_two_reads_is_still_one_terminator() {
+        use tokio::io::AsyncWriteExt as _;
+        let c = capture_idle();
+        let (mut tx, rx) = tokio::io::duplex(1024);
+        let queue = c.queue();
+        let writer = async move {
+            tx.write_all(b"first\r").await.unwrap();
+            tokio::time::sleep(PAUSE).await;
+            let early = queue.len();
+            tx.write_all(b"\nsecond\n").await.unwrap();
+            drop(tx);
+            early
+        };
+        let ((), early) = tokio::join!(c.read_stream(rx, LogStream::Stdout), writer);
+        assert_eq!(early, 1, "the carriage return ended the record at once");
+        let texts: Vec<String> = records(&c.queue()).into_iter().map(|r| r.text).collect();
+        assert_eq!(texts, vec!["first".to_owned(), "second".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn a_line_that_has_not_ended_is_queued_as_a_partial_after_the_idle_time() {
+        use tokio::io::AsyncWriteExt as _;
+        let c = capture_idle();
+        let hold = c.redactor().hold_back();
+        let start = "x".repeat(1000);
+        let (mut tx, rx) = tokio::io::duplex(64 * 1024);
+        let queue = c.queue();
+        let written = start.clone();
+        let writer = async move {
+            tx.write_all(written.as_bytes()).await.unwrap();
+            tokio::time::sleep(PAUSE).await;
+            let early = queue.take_batch(usize::MAX).records;
+            tx.write_all(b" and its end\n").await.unwrap();
+            drop(tx);
+            early
+        };
+        let ((), early) = tokio::join!(c.read_stream(rx, LogStream::Stdout), writer);
+        assert_eq!(early.len(), 1, "the start went before the end was written");
+        assert!(early[0].partial, "and says the line goes on");
+        assert_eq!(
+            early[0].text.len(),
+            1000 - hold,
+            "all of it but the held-back end"
+        );
+        let rest = records(&c.queue());
+        assert_eq!(rest.len(), 1);
+        assert!(!rest[0].partial, "the record that ends the line is whole");
+        assert_eq!(rest[0].seq, early[0].seq + 1);
+        assert_eq!(
+            format!("{}{}", early[0].text, rest[0].text),
+            format!("{start} and its end")
+        );
+        assert!(
+            early
+                .iter()
+                .chain(&rest)
+                .all(|r| r.text.len() <= MAX_LOG_RECORD_BYTES && r.stream == LogStream::Stdout)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unterminated_line_shorter_than_the_hold_back_waits_for_its_end() {
+        use tokio::io::AsyncWriteExt as _;
+        let c = capture_idle();
+        let (mut tx, rx) = tokio::io::duplex(1024);
+        let queue = c.queue();
+        let writer = async move {
+            tx.write_all(b"enter a value: ").await.unwrap();
+            tokio::time::sleep(PAUSE).await;
+            let early = queue.len();
+            tx.write_all(b"forty-two\n").await.unwrap();
+            drop(tx);
+            early
+        };
+        let ((), early) = tokio::join!(c.read_stream(rx, LogStream::Stdout), writer);
+        assert_eq!(early, 0, "all of it is inside what the redactor holds back");
+        let got = records(&c.queue());
+        assert_eq!(got.len(), 1);
+        assert!(!got[0].partial, "one whole line");
+        assert_eq!(got[0].text, "enter a value: forty-two");
+    }
+
+    #[tokio::test]
+    async fn a_secret_written_in_two_halves_across_an_idle_pause_is_redacted() {
+        use tokio::io::AsyncWriteExt as _;
+        let c = capture_idle();
+        let pad = "x".repeat(600);
+        let half = PHANTOM.len() / 2;
+        let (mut tx, rx) = tokio::io::duplex(64 * 1024);
+        let queue = c.queue();
+        let before = format!("{pad}{}", &PHANTOM[..half]);
+        let after = format!("{} tail\n", &PHANTOM[half..]);
+        let writer = async move {
+            tx.write_all(before.as_bytes()).await.unwrap();
+            tokio::time::sleep(PAUSE).await;
+            let early = queue.len();
+            tx.write_all(after.as_bytes()).await.unwrap();
+            drop(tx);
+            early
+        };
+        let ((), early) = tokio::join!(c.read_stream(rx, LogStream::Stderr), writer);
+        assert_eq!(early, 1, "a partial went out during the pause");
+        let got = records(&c.queue());
+        let marks: Vec<bool> = got.iter().map(|r| r.partial).collect();
+        assert_eq!(marks, vec![true, false]);
+        let text: String = got.into_iter().map(|r| r.text).collect();
+        let leaked = text.contains(&PHANTOM[..half]) || text.contains(&PHANTOM[half..]);
+        assert!(!leaked, "half of the secret crossed the idle pause");
+        let intact = text == format!("{pad}{} tail", crate::redact::REDACTED);
+        assert!(intact, "nothing else was lost or changed");
+    }
+
+    #[tokio::test]
+    async fn a_cut_at_the_raw_cap_and_a_split_at_the_record_limit_are_marked_partial() {
+        // Over the raw cap: every record of the line but the one that ends it.
+        let c = capture();
+        let input = format!("{}\nnext\n", "y".repeat(RAW_LINE_CAP + 10));
+        c.read_stream(input.as_bytes(), LogStream::Stdout).await;
+        let got = records(&c.queue());
+        assert!(got.iter().all(|r| r.text.len() <= MAX_LOG_RECORD_BYTES));
+        let (whole, cut) = got.split_last().expect("the line after it");
+        assert_eq!(whole.text, "next");
+        assert!(!whole.partial, "a whole line is not a partial");
+        let (end, pieces) = cut.split_last().expect("the end of the long line");
+        assert!(pieces.len() >= 4, "{} pieces", pieces.len());
+        assert!(
+            pieces.iter().all(|r| r.partial),
+            "every piece before the end says the line goes on"
+        );
+        assert!(!end.partial, "the piece that ends the line does not");
+        let total: usize = cut.iter().map(|r| r.text.len()).sum();
+        assert_eq!(total, RAW_LINE_CAP + 10, "nothing lost, just cut");
+
+        // Under the raw cap and over the record limit: the split marks its first piece.
+        let c = capture();
+        let input = format!("{}\n", "z".repeat(MAX_LOG_RECORD_BYTES + 100));
+        c.read_stream(input.as_bytes(), LogStream::Stderr).await;
+        let got = records(&c.queue());
+        let marks: Vec<bool> = got.iter().map(|r| r.partial).collect();
+        assert_eq!(marks, vec![true, false]);
+        assert_eq!(got[0].text.len(), MAX_LOG_RECORD_BYTES);
+        assert_eq!(got[1].text.len(), 100);
+    }
+
+    #[tokio::test]
+    async fn a_lone_record_after_an_idle_period_is_posted_without_waiting_the_gap() {
+        let gap = Duration::from_millis(300);
+        let sink = Scripted::new(vec![]);
+        let q = Arc::new(Queue::default());
+        let cfg = ShipperConfig {
+            min_gap: gap,
+            ..fast()
+        };
+        let s = Shipping::start(q.clone(), sink.clone(), cfg);
+        // The very first record: nothing was posted before it.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        q.push(record(1, LogStream::Stdout, "a"));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(sink.posted().len(), 1, "the first record did not wait");
+        // Nothing for longer than the gap, then one more: it leaves at once too.
+        tokio::time::sleep(gap + Duration::from_millis(100)).await;
+        let pushed = tokio::time::Instant::now();
+        q.push(record(2, LogStream::Stdout, "b"));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let at = sink.posted_at();
+        assert_eq!(at.len(), 2, "a record after an idle period did not wait");
+        assert!(
+            at[1].duration_since(pushed) < gap,
+            "posted before a gap could have passed"
+        );
+        assert!(s.flush(Duration::from_secs(1)).await);
+    }
+
+    #[tokio::test]
+    async fn a_burst_is_posted_at_most_once_per_gap_and_waits_no_longer_than_it() {
+        let gap = Duration::from_millis(400);
+        // What a timer and a busy test host may add or take.
+        let slack = Duration::from_millis(100);
+        let sink = Scripted::new(vec![]);
+        let q = Arc::new(Queue::default());
+        let cfg = ShipperConfig {
+            min_gap: gap,
+            ..fast()
+        };
+        let s = Shipping::start(q.clone(), sink.clone(), cfg);
+        q.push(record(1, LogStream::Stdout, "a"));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(sink.posted().len(), 1, "the leading edge");
+        // A burst inside the gap: held for the one post the gap allows.
+        let burst = tokio::time::Instant::now();
+        for seq in 2..=5 {
+            q.push(record(seq, LogStream::Stdout, "b"));
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(sink.posted().len(), 1, "nothing more inside the gap");
+        tokio::time::sleep(gap + slack).await;
+        let posted = sink.posted();
+        let at = sink.posted_at();
+        assert_eq!(posted.len(), 2, "the burst is one post");
+        assert_eq!(
+            posted[1].records.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            vec![2, 3, 4, 5]
+        );
+        assert!(
+            at[1].duration_since(at[0]) + slack >= gap,
+            "two posts are the gap apart"
+        );
+        assert!(
+            at[1].duration_since(burst) < gap + slack,
+            "nothing queued waited longer than the gap"
+        );
+        assert!(s.flush(Duration::from_secs(1)).await);
+    }
+
+    #[tokio::test]
+    async fn a_queue_at_its_threshold_is_posted_inside_the_gap() {
+        let sink = Scripted::new(vec![]);
+        let q = Arc::new(Queue::new(QUEUE_MAX_BYTES, 100));
+        let cfg = ShipperConfig {
+            min_gap: Duration::from_secs(3600),
+            batch_bytes: 100,
+            ..fast()
+        };
+        let s = Shipping::start(q.clone(), sink.clone(), cfg);
+        q.push(record(1, LogStream::Stdout, "a"));
+        settle().await;
+        assert_eq!(sink.posted().len(), 1, "the leading edge");
+        q.push(record(2, LogStream::Stdout, &"b".repeat(60)));
+        settle().await;
+        assert_eq!(
+            sink.posted().len(),
+            1,
+            "under the threshold it waits the gap"
+        );
+        q.push(record(3, LogStream::Stdout, &"c".repeat(60)));
+        settle().await;
+        let posted = sink.posted();
+        assert_eq!(posted.len(), 2, "at the threshold it does not");
+        assert_eq!(
+            posted[1].records.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            vec![2]
+        );
+        assert!(s.flush(Duration::from_secs(1)).await);
     }
 
     #[test]

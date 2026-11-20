@@ -69,6 +69,7 @@ macro_rules! suite {
                 a_floor_written_under_another_policy_is_refused,
                 ping_answers,
                 appended_output_reads_back_in_sequence,
+                a_partial_record_keeps_its_mark_through_a_write_and_a_read,
                 a_retried_batch_stores_nothing_and_is_counted_ignored,
                 an_overlapping_batch_stores_only_its_new_records,
                 a_gap_is_stored_before_a_batch_with_dropped_counts_and_not_for_a_replay,
@@ -926,6 +927,7 @@ fn log_record(seq: u64, stream: LogStream, text: &str) -> LogRecord {
         stream,
         ts: at(i64::try_from(seq).unwrap()),
         text: text.into(),
+        partial: false,
     }
 }
 
@@ -988,6 +990,40 @@ pub(crate) async fn appended_output_reads_back_in_sequence(s: &dyn ClaimStore) {
     // Another claim's output is another ring.
     let other = Uuid::new_v4();
     assert_eq!(s.read_logs(other, None).await.unwrap().entries, Vec::new());
+}
+
+/// The `partial` mark of every record among `entries`, in order.
+fn partial_marks(entries: &[LogEntry]) -> Vec<bool> {
+    entries
+        .iter()
+        .filter_map(|e| match e {
+            LogEntry::Record(r) => Some(r.partial),
+            LogEntry::Gap(_) => None,
+        })
+        .collect()
+}
+
+/// ADR-0045 decision 9, amended 2026-11-20: a record that says its line goes on says so
+/// when it is read back, whole, from a cursor and as a tail; one that does not, does not.
+pub(crate) async fn a_partial_record_keeps_its_mark_through_a_write_and_a_read(s: &dyn ClaimStore) {
+    let uid = Uuid::new_v4();
+    let rec = claim(uid);
+    s.put_claim(rec.clone()).await.unwrap();
+    let mut pieces = batch(1, 3, "piece");
+    pieces.records[0].partial = true;
+    pieces.records[1].partial = true;
+    s.append_logs(&rec, &pieces, &ROOMY).await.unwrap();
+    let chunk = s.read_logs(uid, None).await.unwrap();
+    assert_eq!(records_of(&chunk.entries), vec![1, 2, 3]);
+    assert_eq!(
+        partial_marks(&chunk.entries),
+        vec![true, true, false],
+        "the mark is stored with its record"
+    );
+    let chunk = s.read_logs(uid, Some(1)).await.unwrap();
+    assert_eq!(partial_marks(&chunk.entries), vec![true, false]);
+    let chunk = s.read_logs_tail(uid, None, 1).await.unwrap();
+    assert_eq!(partial_marks(&chunk.entries), vec![false]);
 }
 
 pub(crate) async fn a_retried_batch_stores_nothing_and_is_counted_ignored(s: &dyn ClaimStore) {

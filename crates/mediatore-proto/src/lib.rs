@@ -257,7 +257,8 @@ pub enum LogStream {
     Stderr,
 }
 
-/// One line of the workload's output, already redacted in the VM (ADR-0045 decisions 1 and 2).
+/// One line of the workload's output, or one piece of a line (`partial`), already redacted in
+/// the VM (ADR-0045 decisions 1 and 2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogRecord {
     /// Per-claim sequence number, strictly increasing in the order the guest's readers produced
@@ -269,6 +270,14 @@ pub struct LogRecord {
     pub ts: Timestamp,
     /// The line, lossy UTF-8, without its terminator.
     pub text: String,
+    /// The line does not end here: it continues in a later record of the same `stream`
+    /// (ADR-0045 decisions 1 and 9, amended 2026-11-20). Set on what the guest ships of a
+    /// line that has not ended yet, and on every piece but the last of a line cut at the
+    /// guest's raw cap or split at [`MAX_LOG_RECORD_BYTES`]. `false`, and absent on the wire,
+    /// for a whole line and for the piece that ends one; a record stored without the field
+    /// reads as a whole line.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub partial: bool,
 }
 
 /// The guest's `POST /v1/me/logs` body (ADR-0045 decision 9): output the claim's node ships to
@@ -425,7 +434,9 @@ const _: () = assert!(DEFAULT_LOG_MAX_BYTES <= LOG_MAX_BYTES_CEILING);
 const _: () = assert!(MAX_LOG_BATCH_BYTES <= DEFAULT_LOG_MAX_BYTES);
 
 /// Seconds a node waits before its next batch when the broker answered `429` (ADR-0045
-/// decision 4): one batch per second per claim, the `Retry-After` the broker sends.
+/// decision 4, amended 2026-11-20): the `Retry-After` the broker sends. The limit is two
+/// batches per second per claim, so a token is back in half a second; a whole second is the
+/// least the header can say, and after it the bucket is full again.
 pub const LOG_RETRY_AFTER_SECS: u64 = 1;
 
 impl LogBatch {
@@ -1375,7 +1386,47 @@ mod tests {
             stream: LogStream::Stdout,
             ts: Timestamp::UNIX_EPOCH,
             text: text.to_owned(),
+            partial: false,
         }
+    }
+
+    /// ADR-0045 decision 9, amended 2026-11-20: the mark of a line that continues.
+    #[test]
+    fn a_partial_record_round_trips_and_the_flag_is_absent_when_false() {
+        let whole = log_record(1, "a whole line");
+        let value = serde_json::to_value(&whole).unwrap();
+        assert!(
+            value.get("partial").is_none(),
+            "a whole line carries no flag: {value}"
+        );
+        let piece = LogRecord {
+            partial: true,
+            ..log_record(2, "the start of a line")
+        };
+        let value = serde_json::to_value(&piece).unwrap();
+        assert_eq!(value["partial"], serde_json::Value::Bool(true));
+        for record in [whole, piece] {
+            let text = serde_json::to_string(&record).unwrap();
+            let back: LogRecord = serde_json::from_str(&text).unwrap();
+            assert_eq!(back, record, "{text}");
+            // As a stored entry and as a line of the owner's read.
+            let entry: LogEntry = serde_json::from_str(&text).unwrap();
+            assert_eq!(entry, LogEntry::Record(record.clone()));
+            let line: LogLine = serde_json::from_str(&text).unwrap();
+            assert_eq!(line, LogLine::Record(record));
+        }
+    }
+
+    #[test]
+    fn a_record_without_the_partial_flag_reads_as_a_whole_line() {
+        // What a guest or a store before the amendment wrote.
+        let old = r#"{"seq":7,"stream":"stderr","ts":"2026-11-17T00:00:00Z","text":"boom"}"#;
+        let record: LogRecord = serde_json::from_str(old).unwrap();
+        assert!(!record.partial, "no field is a whole line");
+        let entry: LogEntry = serde_json::from_str(old).unwrap();
+        assert!(matches!(entry, LogEntry::Record(r) if !r.partial && r.seq == 7));
+        let batch: LogBatch = serde_json::from_str(&format!(r#"{{"records":[{old}]}}"#)).unwrap();
+        assert!(!batch.records[0].partial, "nor in a batch");
     }
 
     #[test]

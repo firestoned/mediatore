@@ -319,6 +319,19 @@ before it is written, so a copy of etcd or a `get secrets` shows ciphertext
 ([ADR-0052](../adr/0052-a-sandbox-workloads-stored-output-sealed-per-batch-with-the-transit-key.md)).
 If OpenBao is unreachable a read answers `503`; retry it.
 
+Output reaches a follower as it is written, not in bursts. A line is shipped when it ends,
+at a newline or at a bare carriage return (a progress line rewritten with `\r` arrives as it
+moves), at once when the workload has been quiet and at most every half second while it
+keeps printing, and the broker wakes a follower when a batch is stored. A line that has not
+ended is not held for its newline: after 150 ms of silence the guest ships what it has of it,
+and `sandbox logs` joins the pieces into the line the workload wrote. The last few hundred
+bytes of such a line still wait, for more output or for the end of the line, because the
+redactor must see a secret whole before it lets go of anything near it; a prompt shorter than
+that shows when its line ends. A workload that block-buffers its own stdout because it is
+writing to a pipe and not to a terminal is out of this path's reach: nothing in the sandbox
+can ship what the workload has not written yet. The usual remedies are the workload's own:
+`PYTHONUNBUFFERED=1`, `stdbuf -oL`, or a logger that flushes each line.
+
 ### When a socket or `io_uring` call fails in the jail
 
 The seccomp filter ([ADR-0051](../adr/0051-socket-families-and-io-uring-denied-to-the-workload-by-seccomp.md))
@@ -362,6 +375,9 @@ mediatore sandbox logs --namespace team-a -f my-agent
 The CLI reads `GET /v1/claims/{name}/logs`, which any client with the session bearer can
 call directly. The body is NDJSON: a header line, then one line per record or gap in
 sequence, then an end line saying why the stream stopped (`client`, `claim_ended`, `ttl`).
+A record is a line of output, or a piece of one: a record with `"partial": true` continues
+in the next record of the same `stream`, and a client that prints lines joins them as the
+CLI does (the field is absent on a whole line and on the piece that ends one).
 `?follow=true` holds the connection open and sends an empty line every 15 s as a keepalive;
 `?tail=N`, `?since=SEQ` and `?namespace=` match the flags above.
 

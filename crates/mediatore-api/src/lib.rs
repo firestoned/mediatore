@@ -143,9 +143,13 @@ pub struct AppState {
     /// and `GET /v1/claims/{name}/logs` answer `501`, and a claim with `workload.logs: true` is
     /// refused at creation.
     pub logs: Option<LogLimits>,
-    /// One batch per second per claim on `POST /v1/me/logs` (ADR-0045 decision 4), so a
-    /// workload cannot turn the broker into a write amplifier; `429` with `Retry-After` beyond it.
+    /// Two batches per second per claim on `POST /v1/me/logs` (ADR-0045 decision 4, amended
+    /// 2026-11-20: `Limiter::per_second(2)`), so a workload cannot turn the broker into a
+    /// write amplifier; `429` with `Retry-After` beyond it.
     pub log_limiter: Limiter,
+    /// What wakes the followers of a claim's output when a batch for it is stored (ADR-0045
+    /// decision 9, amended 2026-11-20). Starts empty: [`LogWakes::default`].
+    pub log_wakes: LogWakes,
     /// `accept_plain_gateway_identity` (ADR-0053 decision 7): for one release, the two gateway
     /// routes also answer a peer presenting the listeners' ID, `spiffe://<td>/gateway`, each
     /// ask a `warn` line. `false` everywhere but an environment in the middle of moving its
@@ -484,7 +488,7 @@ impl Limiter {
     }
 
     /// `per_second` calls a second per claim (at least 1), the burst the same: the shape of
-    /// the batch limit of ADR-0045 decision 4.
+    /// the batch limit of ADR-0045 decision 4 (two a second since the amendment of 2026-11-20).
     #[must_use]
     pub fn per_second(per_second: u32) -> Self {
         Self::with_period(per_second, 1.0)
@@ -547,6 +551,98 @@ impl Limiter {
             true
         } else {
             false
+        }
+    }
+}
+
+/// What wakes the followers of `GET /v1/claims/{name}/logs?follow=true` (ADR-0045 decision 9,
+/// amended 2026-11-20): for each claim that has a follower on this replica, a counter that
+/// `POST /v1/me/logs` moves once the store has accepted a batch. A follower that sees it move
+/// reads the store from its cursor, as it does at every poll; nothing but "read now" travels
+/// here, never a record.
+///
+/// Bounded by the followers, not by the claims: an entry is made by the first follower of a
+/// claim ([`LogWakes::follow`]) and removed when the last one goes ([`LogWake`]'s drop), and
+/// a batch for a claim nobody follows on this replica makes none. In process memory, per
+/// replica: a follower on the replica that did not take the write is served by its poll.
+#[derive(Default)]
+pub struct LogWakes {
+    claims: std::sync::Mutex<HashMap<Uuid, tokio::sync::watch::Sender<u64>>>,
+}
+
+impl LogWakes {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<Uuid, tokio::sync::watch::Sender<u64>>> {
+        self.claims
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// A follower's hold on the wake of `claim_uid`, made if this is the claim's first
+    /// follower. Only a wake after this call is seen.
+    #[must_use]
+    pub fn follow(&self, claim_uid: Uuid) -> LogWake<'_> {
+        let counter = self
+            .lock()
+            .entry(claim_uid)
+            .or_insert_with(|| tokio::sync::watch::channel(0).0)
+            .subscribe();
+        LogWake {
+            table: self,
+            claim_uid,
+            counter,
+        }
+    }
+
+    /// A batch for `claim_uid` was stored: wake its followers, if it has any here. Wakes are
+    /// counted, not queued: however many arrive while a follower reads, it reads once more.
+    pub fn wake(&self, claim_uid: Uuid) {
+        let claims = self.lock();
+        if let Some(sender) = claims.get(&claim_uid) {
+            sender.send_modify(|n| *n = n.wrapping_add(1));
+        }
+    }
+
+    /// How many claims have a follower on this replica: the size of the table.
+    #[must_use]
+    pub fn followed(&self) -> usize {
+        self.lock().len()
+    }
+}
+
+/// One follower's hold on its claim's wake ([`LogWakes::follow`]). Dropped, it takes the
+/// claim out of the table when no other follower holds it.
+pub struct LogWake<'a> {
+    table: &'a LogWakes,
+    claim_uid: Uuid,
+    counter: tokio::sync::watch::Receiver<u64>,
+}
+
+impl LogWake<'_> {
+    /// Forget the wakes so far. Called before a read of the store: a batch stored while the
+    /// read is in flight moves the counter again, so the next [`Self::woken`] returns at once
+    /// and the wake is not lost between the read and the wait.
+    pub fn mark_seen(&mut self) {
+        drop(self.counter.borrow_and_update());
+    }
+
+    /// Wait until a batch was stored since [`Self::mark_seen`] (or since the last return of
+    /// this). Never returns when the table is gone: the caller's poll is what is left.
+    pub async fn woken(&mut self) {
+        if self.counter.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+impl Drop for LogWake<'_> {
+    fn drop(&mut self) {
+        let mut claims = self.table.lock();
+        // This follower's receiver still counts: one means no other.
+        if claims
+            .get(&self.claim_uid)
+            .is_some_and(|sender| sender.receiver_count() <= 1)
+        {
+            claims.remove(&self.claim_uid);
         }
     }
 }
@@ -1600,8 +1696,11 @@ struct LogsQuery {
     tail: Option<usize>,
 }
 
-/// Between two reads of the store while following (ADR-0045 decision 9, amended: a bounded
-/// poll of the store, the guest's batch cadence, in place of a watch on the segments).
+/// The longest a follower waits between two reads of the store (ADR-0045 decision 9, amended:
+/// a bounded poll of the store in place of a watch on the segments). Since the amendment of
+/// 2026-11-20 a batch stored through this replica wakes the follower sooner ([`LogWakes`]);
+/// the poll is what serves a follower of a claim whose node writes through another replica,
+/// and what notices the claim ending.
 const LOG_FOLLOW_POLL: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// One NDJSON line, terminated.
@@ -1698,8 +1797,9 @@ impl Outgoing {
 
 /// `GET /v1/claims/{name}/logs` (ADR-0045 decisions 5, 7, 9 and 10): the claim's stored output
 /// to its owner, as NDJSON: a `LogHeader`, each record or gap on its own line, and a last line
-/// `{"end": true, "reason": ...}`. With `follow` the broker keeps reading the store every
-/// [`LOG_FOLLOW_POLL`] until the claim ends (`claim_ended`), its record is swept (`ttl`) or the
+/// `{"end": true, "reason": ...}`. With `follow` the broker keeps reading the store, when a
+/// batch is stored ([`LogWakes`]) and at least every [`LOG_FOLLOW_POLL`], until the claim ends
+/// (`claim_ended`), its record is swept (`ttl`) or the
 /// reader goes (`client`, logged, not sent), with an empty line every [`LOG_KEEPALIVE_SECS`]
 /// of silence. Without it the stored output is sent and the stream ends: `claim_ended` for a
 /// claim that has ended, `client` for a live one, whose output may still grow.
@@ -1821,9 +1921,12 @@ async fn stream_logs(
     (reason, out)
 }
 
-/// The `follow` loop (decision 9): read the store every [`LOG_FOLLOW_POLL`] from `cursor`, send
-/// what is new, end with the claim (`claim_ended`), with its record's sweep (`ttl`) or with the
-/// reader (`client`, not sent); an empty line every [`LOG_KEEPALIVE_SECS`] of silence.
+/// The `follow` loop (decision 9, amended 2026-11-20): read the store from `cursor` when a
+/// batch for the claim is stored through this replica ([`LogWakes`]) or after
+/// [`LOG_FOLLOW_POLL`], whichever comes first, send what is new, end with the claim
+/// (`claim_ended`), with its record's sweep (`ttl`) or with the reader (`client`, not sent); an
+/// empty line every [`LOG_KEEPALIVE_SECS`] of silence. A wake carries nothing: what a follower
+/// is sent is always what a read of the store returned.
 async fn follow_logs(
     st: &AppState,
     out: &mut Outgoing,
@@ -1832,8 +1935,20 @@ async fn follow_logs(
     mut truncated: u64,
 ) -> LogEnd {
     let mut last_sent = std::time::Instant::now();
+    let mut wake = st.log_wakes.follow(rec.uid);
+    // The first read is at once: a batch stored between the read that opened the stream and
+    // the line above woke nobody.
+    let mut waits = false;
     loop {
-        tokio::time::sleep(LOG_FOLLOW_POLL).await;
+        if waits {
+            tokio::select! {
+                () = wake.woken() => {}
+                () = tokio::time::sleep(LOG_FOLLOW_POLL) => {}
+            }
+        }
+        waits = true;
+        // Before the read, so a batch stored during it is one more read and not a lost wake.
+        wake.mark_seen();
         if out.tx.is_closed() {
             return LogEnd::Client;
         }
@@ -1902,8 +2017,10 @@ async fn follow_logs(
 /// given, so redaction is the guest's, before the output left the VM. A node with no live
 /// claim (the guest flushing after the claim ended) is `204` and the batch is dropped, as a
 /// late exit is. `501` when the broker stores no output; `400 logs_not_requested` for a claim
-/// that did not opt in; `413` over [`MAX_LOG_BATCH_BYTES`]; `429` with `Retry-After` beyond one
-/// batch a second. The text is never logged, only counts.
+/// that did not opt in; `413` over [`MAX_LOG_BATCH_BYTES`]; `429` with `Retry-After` beyond two
+/// batches a second. A batch is stored before it is acknowledged, and once it is stored the
+/// claim's followers on this replica are woken ([`LogWakes`]). The text is never logged, only
+/// counts.
 async fn ingest_logs(
     State(st): State<Shared>,
     headers: HeaderMap,
@@ -1948,7 +2065,7 @@ async fn ingest_logs(
             [(header::RETRY_AFTER, LOG_RETRY_AFTER_SECS.to_string())],
             Json(ErrorBody {
                 error: "too_many_batches".into(),
-                detail: Some("one batch per second per claim".into()),
+                detail: Some("two batches per second per claim".into()),
             }),
         )
             .into_response());
@@ -1970,6 +2087,10 @@ async fn ingest_logs(
         dropped_stderr = body.dropped_stderr,
         "output batch stored"
     );
+    // After the store took it, never before: a follower reads the store, and must find it.
+    if outcome.stored > 0 {
+        st.log_wakes.wake(rec.uid);
+    }
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
@@ -3222,8 +3343,27 @@ mod tests {
     }
 
     #[test]
+    fn the_batch_limiter_takes_two_a_second_and_refuses_the_third() {
+        // ADR-0045 decision 4, amended 2026-11-20: two batches per second per claim, the
+        // burst the same, one more every half second.
+        let l = Limiter::per_second(2);
+        let a = Uuid::new_v4();
+        let t0 = l.buckets.lock().unwrap().last_pruned;
+        assert!(l.allow_at(a, t0));
+        assert!(l.allow_at(a, t0), "the burst is two");
+        assert!(!l.allow_at(a, t0), "the third within the second is refused");
+        let half = t0 + std::time::Duration::from_millis(500);
+        assert!(l.allow_at(a, half), "half a second gives one back");
+        assert!(!l.allow_at(a, half), "and only one");
+        let later = half + std::time::Duration::from_secs(1);
+        assert!(l.allow_at(a, later));
+        assert!(l.allow_at(a, later), "a second refills the burst");
+        assert!(!l.allow_at(a, later), "and no more than the burst");
+    }
+
+    #[test]
     fn the_per_second_limiter_takes_one_batch_and_refuses_the_next_within_the_second() {
-        // ADR-0045 decision 4: one batch per second per claim, the burst the same.
+        // The shape of ADR-0045 decision 4 at one a second, as it was first built.
         let l = Limiter::per_second(1);
         let a = Uuid::new_v4();
         let b = Uuid::new_v4();
@@ -3359,7 +3499,8 @@ mod tests {
             inject: BTreeMap::new(),
             inject_port: None,
             logs: None,
-            log_limiter: Limiter::per_second(1),
+            log_limiter: Limiter::per_second(2),
+            log_wakes: LogWakes::default(),
             accept_plain_gateway_identity: false,
             scopes: std::collections::BTreeMap::new(),
         }
@@ -6158,6 +6299,7 @@ mod tests {
                     stream: mediatore_proto::LogStream::Stdout,
                     ts: Timestamp::now(),
                     text: format!("line-{seq}"),
+                    partial: false,
                 })
                 .collect(),
             ..LogBatch::default()
@@ -6227,6 +6369,7 @@ mod tests {
                 stream: mediatore_proto::LogStream::Stdout,
                 ts: Timestamp::now(),
                 text: PRINTED.into(),
+                partial: false,
             }],
             ..LogBatch::default()
         };
@@ -6333,6 +6476,7 @@ mod tests {
                     stream: mediatore_proto::LogStream::Stdout,
                     ts: Timestamp::now(),
                     text: format!("output line {seq}"),
+                    partial: false,
                 })
                 .collect(),
             ..LogBatch::default()
@@ -7092,5 +7236,210 @@ mod tests {
         let issued =
             delegated_token(&st, &rec, &d, "claude".into(), rec.uid, Placement::Gateway).await;
         assert!(issued.is_err(), "no expiry inside: fail closed");
+    }
+
+    // ----- ADR-0045 decisions 4 and 9, amended 2026-11-20: a follower woken by the ingest -----
+
+    /// A broker that stores output, a registered node and a claim bound to it that opted in:
+    /// the broker, the claim's record and the node's peer identity.
+    async fn followed_claim() -> (Broker, ClaimRecord, String) {
+        let b = broker_with_logs(
+            Namespaces::Single("sandboxes".into()),
+            true,
+            Some(LogLimits {
+                max_bytes: mediatore_proto::DEFAULT_LOG_MAX_BYTES,
+            }),
+        )
+        .await;
+        let ek = "cd".repeat(32);
+        let agent = b.st.naming.agent_id(&ek);
+        b.st.store
+            .put_node(NodeRecord {
+                ek_hash: ek.clone(),
+                node_id: agent.clone(),
+                dmi_uuid: Uuid::new_v4(),
+                hostname: "vm".into(),
+                provider: None,
+                banned: false,
+                registered_at: Timestamp::now(),
+            })
+            .await
+            .unwrap();
+        let mut rec = claim(&[], Some(agent));
+        rec.workload.logs = true;
+        let rec = stored(&b.st, rec).await;
+        let peer = b.st.naming.node_id(&ek);
+        (b, rec, peer)
+    }
+
+    /// A batch of one stdout line.
+    fn one_line(seq: u64, text: &str) -> LogBatch {
+        LogBatch {
+            records: vec![mediatore_proto::LogRecord {
+                seq,
+                stream: mediatore_proto::LogStream::Stdout,
+                ts: Timestamp::now(),
+                text: text.into(),
+                partial: false,
+            }],
+            ..LogBatch::default()
+        }
+    }
+
+    /// The lines a follower is sent.
+    type Lines = tokio::sync::mpsc::Receiver<Result<axum::body::Bytes, std::convert::Infallible>>;
+
+    /// Run [`follow_logs`] for `rec` from the start of its output, and wait until it holds
+    /// its claim's wake and its first read, of an empty ring, is behind it.
+    async fn follower(st: &Shared, rec: &ClaimRecord) -> (tokio::task::JoinHandle<LogEnd>, Lines) {
+        let (tx, lines) = tokio::sync::mpsc::channel(32);
+        let (shared, followed) = (st.clone(), rec.clone());
+        let task = tokio::spawn(async move {
+            let mut out = Outgoing {
+                tx,
+                bytes: 0,
+                records: 0,
+            };
+            follow_logs(&shared, &mut out, followed, None, 0).await
+        });
+        for _ in 0..200 {
+            if st.log_wakes.followed() == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(st.log_wakes.followed(), 1, "the follower holds its wake");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        (task, lines)
+    }
+
+    #[tokio::test]
+    async fn a_follower_is_sent_a_batch_when_it_is_ingested_not_at_the_next_poll() {
+        let (b, rec, peer) = followed_claim().await;
+        let started = std::time::Instant::now();
+        let (task, mut lines) = follower(&b.st, &rec).await;
+        let body = serde_json::to_value(one_line(1, "woken-by-the-ingest")).unwrap();
+        let (status, _, text) = call(&b.st, "POST", "/v1/me/logs", Some(&peer), body).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{text}");
+        let line = tokio::time::timeout(LOG_FOLLOW_POLL / 2, lines.recv())
+            .await
+            .expect("the batch came before a poll could have run")
+            .expect("the stream is open")
+            .unwrap();
+        assert!(
+            started.elapsed() < LOG_FOLLOW_POLL,
+            "sooner than the follower's first poll"
+        );
+        let sent: LogEntry = serde_json::from_slice(&line).unwrap();
+        assert!(
+            matches!(&sent, LogEntry::Record(r) if r.seq == 1 && r.text == "woken-by-the-ingest"),
+            "what the store holds, read from the cursor"
+        );
+        // A retried batch stores nothing and wakes nobody: no line follows.
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        let body = serde_json::to_value(one_line(1, "woken-by-the-ingest")).unwrap();
+        let (status, _, _) = call(&b.st, "POST", "/v1/me/logs", Some(&peer), body).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let quiet = tokio::time::timeout(std::time::Duration::from_millis(100), lines.recv()).await;
+        assert!(quiet.is_err(), "a replay is not sent twice");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_follower_nobody_wakes_still_gets_the_batch_at_the_poll() {
+        let (b, rec, _peer) = followed_claim().await;
+        let started = std::time::Instant::now();
+        let (task, mut lines) = follower(&b.st, &rec).await;
+        // Stored as the other replica would have: through the store, with no wake here.
+        b.st.store
+            .append_logs(&rec, &one_line(1, "found-by-the-poll"), &b.st.logs.unwrap())
+            .await
+            .unwrap();
+        let line = tokio::time::timeout(LOG_FOLLOW_POLL * 2, lines.recv())
+            .await
+            .expect("the poll found it")
+            .expect("the stream is open")
+            .unwrap();
+        assert!(
+            started.elapsed() >= LOG_FOLLOW_POLL,
+            "nothing woke it: it waited for its poll"
+        );
+        let sent: LogEntry = serde_json::from_slice(&line).unwrap();
+        assert!(matches!(&sent, LogEntry::Record(r) if r.text == "found-by-the-poll"));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_wake_between_a_read_and_the_wait_is_kept_and_many_wakes_are_one() {
+        let soon = std::time::Duration::from_millis(50);
+        let wakes = LogWakes::default();
+        let uid = Uuid::new_v4();
+        let mut mine = wakes.follow(uid);
+        let idle = tokio::time::timeout(soon, mine.woken()).await;
+        assert!(idle.is_err(), "nothing stored, nothing to wake for");
+        // The read starts, and three batches are stored while it is in flight.
+        mine.mark_seen();
+        for _ in 0..3 {
+            wakes.wake(uid);
+        }
+        // The wait that follows the read returns at once, and once.
+        let kept = tokio::time::timeout(soon, mine.woken()).await;
+        assert!(kept.is_ok(), "a wake during the read is not lost");
+        let again = tokio::time::timeout(soon, mine.woken()).await;
+        assert!(again.is_err(), "three wakes cost one more read, not three");
+        // Another claim's batch wakes nobody here.
+        wakes.wake(Uuid::new_v4());
+        let other = tokio::time::timeout(soon, mine.woken()).await;
+        assert!(other.is_err(), "a wake is its own claim's");
+    }
+
+    #[test]
+    fn the_wake_table_holds_only_the_claims_that_are_followed() {
+        let wakes = LogWakes::default();
+        // A batch for a claim nobody follows makes no entry, however many arrive.
+        for _ in 0..1000 {
+            wakes.wake(Uuid::new_v4());
+        }
+        assert_eq!(wakes.followed(), 0);
+        let (one, two) = (Uuid::new_v4(), Uuid::new_v4());
+        let first = wakes.follow(one);
+        let second = wakes.follow(one);
+        let third = wakes.follow(two);
+        assert_eq!(wakes.followed(), 2, "an entry per claim, not per follower");
+        drop(first);
+        assert_eq!(
+            wakes.followed(),
+            2,
+            "a claim stays while a follower holds it"
+        );
+        drop(second);
+        assert_eq!(wakes.followed(), 1, "and goes with its last follower");
+        drop(third);
+        assert_eq!(wakes.followed(), 0);
+        // Followers that come and go leave nothing behind.
+        for _ in 0..1000 {
+            drop(wakes.follow(Uuid::new_v4()));
+        }
+        assert_eq!(wakes.followed(), 0);
+    }
+
+    #[tokio::test]
+    async fn two_batches_a_second_are_taken_and_the_third_is_told_to_wait() {
+        let (b, _rec, peer) = followed_claim().await;
+        for seq in 1..=2 {
+            let body = serde_json::to_value(one_line(seq, "line")).unwrap();
+            let (status, _, text) = call(&b.st, "POST", "/v1/me/logs", Some(&peer), body).await;
+            assert_eq!(status, StatusCode::NO_CONTENT, "batch {seq}: {text}");
+        }
+        let body = serde_json::to_value(one_line(3, "line")).unwrap();
+        let (status, refusal, _) = call(&b.st, "POST", "/v1/me/logs", Some(&peer), body).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(refusal["error"], "too_many_batches");
+        assert_eq!(refusal["detail"], "two batches per second per claim");
+        assert_eq!(
+            b.st.log_wakes.followed(),
+            0,
+            "a batch for a claim nobody follows makes no entry"
+        );
     }
 }
