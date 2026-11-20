@@ -3,21 +3,26 @@
 
 //! The sandbox listener: rotating server configs and the accept loop.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use arc_swap::ArcSwap;
 use axum::{Extension, Router};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
 use hyper_util::server::graceful::GracefulShutdown;
+use hyper_util::server::graceful::Watcher;
 use hyper_util::service::TowerToHyperService;
 use rustls::ServerConfig;
+use rustls::pki_types::CertificateDer;
 use rustls::server::NoServerSessionStorage;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tokio::time::Instant;
 use tokio_rustls::TlsAcceptor;
+use x509_cert::Certificate;
+use x509_cert::der::Decode;
 
 use crate::provider::sandbox_provider;
 use crate::verify::{Authorizer, SpiffeClientVerifier};
@@ -136,6 +141,13 @@ impl TlsConfigs {
 /// are held at once; beyond that a new one is accepted and closed at once (the loop keeps
 /// accepting and keeps hearing `shutdown`, where waiting for a slot would stall every peer
 /// behind the one that is waiting).
+///
+/// A connection lives no longer than the certificate it was verified with: it is closed at
+/// the peer leaf's `notAfter` at the latest, whatever is in flight on it. The verifier
+/// judged that certificate once, at the handshake; without this bound a peer whose SVID has
+/// expired, or whose entry was retracted and whose SVID was therefore never renewed, would
+/// keep the identity for as long as it kept the connection open. A peer with a renewed
+/// SVID connects again and is verified again.
 pub async fn serve(
     listener: TcpListener,
     configs: Arc<TlsConfigs>,
@@ -193,41 +205,16 @@ async fn serve_with(
         let router = router.clone();
         let watcher = graceful.watcher();
         tokio::spawn(async move {
-            let handshake = tokio::time::timeout(limits.handshake_timeout, acceptor.accept(tcp));
-            let tls = match handshake.await {
-                Ok(Ok(t)) => t,
-                Ok(Err(e)) => {
-                    tracing::info!(peer = %addr, error = %e, "mtls handshake refused");
-                    return;
-                }
-                Err(_) => {
-                    tracing::debug!(
-                        peer = %addr,
-                        timeout_ms = limits.handshake_timeout.as_millis(),
-                        "mtls handshake not finished in time; dropping"
-                    );
-                    return;
-                }
-            };
-            let Some(peer) = peer_of(tls.get_ref().1) else {
-                tracing::error!(peer = %addr, "handshake completed without a verified client SVID; dropping");
-                return;
-            };
-            let conn = tls.get_ref().1;
-            tracing::debug!(
-                peer = %addr,
-                spiffe_id = %peer.0,
-                kx = ?conn.negotiated_key_exchange_group().map(rustls::crypto::SupportedKxGroup::name),
-                suite = ?conn.negotiated_cipher_suite().map(|s| s.suite()),
-                "mtls connection"
-            );
-            let service = TowerToHyperService::new(router.layer(Extension(peer)));
-            let builder = auto::Builder::new(TokioExecutor::new());
-            let conn = builder.serve_connection(TokioIo::new(tls), service);
-            if let Err(e) = watcher.watch(conn).await {
-                tracing::debug!(peer = %addr, error = %e, "connection ended");
-            }
-            // Held for the connection's life; an early return above gives it back as well.
+            connection(
+                tcp,
+                addr,
+                &acceptor,
+                router,
+                watcher,
+                limits.handshake_timeout,
+            )
+            .await;
+            // Held for the connection's life, however it ended.
             drop(slot);
         });
     }
@@ -236,10 +223,83 @@ async fn serve_with(
     Ok(())
 }
 
+/// One accepted connection, from the handshake to its end: the handshake within
+/// `handshake_timeout`, then HTTP with the verified peer attached to every request, until
+/// the peer or the drain ends it or the peer certificate's `notAfter` passes, whichever
+/// comes first.
+async fn connection(
+    tcp: TcpStream,
+    addr: SocketAddr,
+    acceptor: &TlsAcceptor,
+    router: Router,
+    watcher: Watcher,
+    handshake_timeout: Duration,
+) {
+    let handshake = tokio::time::timeout(handshake_timeout, acceptor.accept(tcp));
+    let tls = match handshake.await {
+        Ok(Ok(t)) => t,
+        Ok(Err(e)) => {
+            tracing::info!(peer = %addr, error = %e, "mtls handshake refused");
+            return;
+        }
+        Err(_) => {
+            tracing::debug!(
+                peer = %addr,
+                timeout_ms = handshake_timeout.as_millis(),
+                "mtls handshake not finished in time; dropping"
+            );
+            return;
+        }
+    };
+    let session = tls.get_ref().1;
+    let verified = session
+        .peer_certificates()
+        .and_then(<[_]>::first)
+        .and_then(|leaf| peer_of(leaf).zip(lifetime_left(leaf, SystemTime::now())));
+    let Some((peer, left)) = verified else {
+        tracing::error!(peer = %addr, "handshake completed without a verified client SVID; dropping");
+        return;
+    };
+    tracing::debug!(
+        peer = %addr,
+        spiffe_id = %peer.0,
+        kx = ?session.negotiated_key_exchange_group().map(rustls::crypto::SupportedKxGroup::name),
+        suite = ?session.negotiated_cipher_suite().map(|s| s.suite()),
+        max_age_secs = left.as_secs(),
+        "mtls connection"
+    );
+    let spiffe_id = peer.0.clone();
+    let service = TowerToHyperService::new(router.layer(Extension(peer)));
+    let builder = auto::Builder::new(TokioExecutor::new());
+    let served = watcher.watch(builder.serve_connection(TokioIo::new(tls), service));
+    // Dropping `served` closes the connection: nothing is answered under a certificate
+    // that is no longer valid.
+    match tokio::time::timeout(left, served).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::debug!(peer = %addr, error = %e, "connection ended"),
+        Err(_) => {
+            tracing::info!(peer = %addr, %spiffe_id, "the peer certificate's notAfter passed; connection closed");
+        }
+    }
+}
+
+/// How long a connection verified with `leaf` may still live at `now`: until the
+/// certificate's `notAfter`, zero when that has passed. `None` for a certificate that does
+/// not parse (or a clock before 1970), which the caller treats as no verified peer at all.
+fn lifetime_left(leaf: &CertificateDer<'_>, now: SystemTime) -> Option<Duration> {
+    let cert = Certificate::from_der(leaf).ok()?;
+    let not_after = cert
+        .tbs_certificate()
+        .validity()
+        .not_after
+        .to_unix_duration();
+    let now = now.duration_since(SystemTime::UNIX_EPOCH).ok()?;
+    Some(not_after.saturating_sub(now))
+}
+
 /// The peer identity the verifier accepted: the leaf's SPIFFE ID, re-read from the
-/// connection so the request sees exactly what was verified.
-fn peer_of(conn: &rustls::ServerConnection) -> Option<PeerSpiffeId> {
-    let leaf = conn.peer_certificates()?.first()?;
+/// connection's own certificate so the request sees exactly what was verified.
+fn peer_of(leaf: &CertificateDer<'_>) -> Option<PeerSpiffeId> {
     spiffe::cert::spiffe_id_from_der(leaf)
         .ok()
         .map(|id| PeerSpiffeId(id.to_string()))
@@ -309,6 +369,48 @@ mod tests {
             Ok(Err(_)) => true,
             Err(_) => false,
         }
+    }
+
+    /// 2030-01-01T00:00:00Z, the `notAfter` of [`leaf_until_2030`], in Unix seconds.
+    const Y2030: u64 = 1_893_456_000;
+
+    /// A leaf whose `notAfter` is the first second of 2030.
+    fn leaf_until_2030() -> CertificateDer<'static> {
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("a key");
+        let mut params = rcgen::CertificateParams::default();
+        params.not_before = rcgen::date_time_ymd(2026, 1, 1);
+        params.not_after = rcgen::date_time_ymd(2030, 1, 1);
+        params
+            .self_signed(&key)
+            .expect("a certificate")
+            .der()
+            .clone()
+    }
+
+    #[test]
+    fn a_connection_may_live_until_the_peer_certificates_not_after_and_no_longer() {
+        let leaf = leaf_until_2030();
+        let at = |secs: u64| SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
+        assert_eq!(
+            lifetime_left(&leaf, at(Y2030 - 90)),
+            Some(Duration::from_secs(90)),
+            "ninety seconds before notAfter, ninety seconds are left"
+        );
+        assert_eq!(
+            lifetime_left(&leaf, at(Y2030)),
+            Some(Duration::ZERO),
+            "at notAfter nothing is left"
+        );
+        assert_eq!(
+            lifetime_left(&leaf, at(Y2030 + 3600)),
+            Some(Duration::ZERO),
+            "past notAfter nothing is left, never a negative or a wrapped age"
+        );
+        assert_eq!(
+            lifetime_left(&CertificateDer::from(vec![0x30, 0x00]), at(Y2030 - 90)),
+            None,
+            "a certificate that does not parse bounds nothing: the connection is dropped"
+        );
     }
 
     #[test]

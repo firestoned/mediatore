@@ -16,7 +16,11 @@ beside the jail) and [ADR-0027](0027-control-plane-relay-on-the-egress-gateway.m
 decision 7 (the claim SVID's TTL is at most 15 minutes) · **Amended:** 2026-11-03 by
 [ADR-0028](0028-egress-gateway-envoy-with-spiffe-identity.md) decision 4 (decision 2: the
 sandbox listener's authorizer admits the gateway identity `spiffe://<td>/gateway`, exactly
-that id, beside node and claim identities; it reaches its own route and nothing else)
+that id, beside node and claim identities; it reaches its own route and nothing else) ·
+**Amended:** 2026-11-19 by
+[ADR-0053](0053-the-gateways-authorizer-has-an-identity-of-its-own.md) decision 3
+(decision 2: the gateway peer the listener admits is `spiffe://<td>/gateway/authorizer`, not
+the listeners' ID; a connection ends at the peer certificate's `notAfter`)
 
 Companion: [ADR-0006](0006-registration-entries-as-clusterstaticentry.md) (registration
 entries). Together they are roadmap 01 and delete threat-model accepted risk **R-1**.
@@ -142,6 +146,16 @@ URI SAN becomes the request's peer identity as a typed connection extension
 `/v1/token` for claim IDs, `Naming::claim_uid_from`) run on it unchanged. The config is
 rebuilt on every rotation the source reports; a rotation that fails to build keeps the
 previous config, which expires on its own.
+
+*Amended 2026-11-19 by
+[ADR-0053](0053-the-gateways-authorizer-has-an-identity-of-its-own.md) decision 3:* beside
+node and claim identities the authorizer admits `spiffe://<td>/gateway/authorizer`, exactly, for
+the two gateway routes alone; the listeners' `spiffe://<td>/gateway`, admitted since ADR-0028,
+no longer completes a handshake (`sandbox_authorizer`, `crates/mediatore-api/src/lib.rs`), other
+than while the transition switch `accept_plain_gateway_identity` is on. Since the same day a
+connection on this listener is ended at the peer certificate's `notAfter` (`lifetime_left`,
+`crates/mediatore-tls/src/server.rs`), so a long-lived connection does not outlive the SVID it
+was verified with.
 
 **3. The dev header survives only under `dev_mode`, and `dev_mode` is refused unless the
 sandbox listener binds a loopback address.** `Config::load` rejects

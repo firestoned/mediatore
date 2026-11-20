@@ -3,7 +3,12 @@
 
 # ADR-0057: A claim's record written by compare-and-set and bound to its sandbox
 
-**Status:** Proposed · **Date:** 2026-11-19
+**Status:** Accepted, implemented 2026-11-19 (decisions 1 to 7 and 9 to 11; decision 8, the MAC
+over the record, is deferred and not built, its limit an accepted risk in the threat model;
+amended at implementation, each amendment dated at its decision; proven by the quality gate, with
+the shared store cases over both stores, and by the kind tiers passing on the new broker; the
+race itself on a real cluster and the two live steps this ADR asked of the kind tiers are not
+proven: *What was proven, and what was not*) · **Date:** 2026-11-19
 
 Roadmap 05 (the store). Amends [ADR-0034](0034-the-kubernetes-api-as-the-brokers-store.md)
 decision 1 (it reverses one sentence: "writes are status patches, which carry no resourceVersion
@@ -22,7 +27,8 @@ Three changes are recorded together because they are one contract seen from thre
 write of a record is accepted (decisions 1 to 6), whose word a record read from a status is
 (decisions 7 and 8), and what a stored envelope is bound to (decisions 9 to 11). The second is
 argued and then recommended for deferral; if the maintainer agrees, decision 8 leaves this ADR for
-one of its own (open question 2).
+one of its own (open question 2). (2026-11-19: the deferral was taken. Decision 8 stays below as
+the design to start from, and is not built.)
 
 ## Context
 
@@ -75,6 +81,9 @@ alone, with no audience in it.
    Files: `crates/mediatore-store/src/lib.rs`, `crates/mediatore-claims/src/kubestore.rs`
    (`record_from`).
 
+   *Amended 2026-11-19 at implementation: the type is `RecordVersion`, and `ClaimRecord.version`
+   is skipped by serde in both directions, so no stored shape and no API body can carry one.*
+
 2. **Every update of an existing record is conditional on that version.** `update_claim`
    writes only if the stored record is still at the version the caller's copy carries. In
    `KubeStore` the status patch names `metadata.resourceVersion`, which the API server checks and
@@ -100,6 +109,11 @@ alone, with no audience in it.
    Files: `crates/mediatore-claims/src/kubestore.rs` (`revoke_claim`),
    `crates/mediatore-store/src/lib.rs`.
 
+   *Amended 2026-11-19 at implementation: the release is one status merge patch with no
+   precondition and no call to the sealer, so it lands with OpenBao away. Beside `revokedAt` and
+   the refresh material it removes `status.record.delegations`, which the earlier release left
+   on the status.*
+
 4. **The status is written before the Secrets, in every write, and an update never creates a
    Secret.** The record is the marker; the Secrets follow it.
    - `put_claim`: the labels, then the record (conditional on the sandbox still carrying none),
@@ -124,6 +138,22 @@ alone, with no audience in it.
    Files: `crates/mediatore-claims/src/kubestore.rs` (`put_claim`, `revoke_claim`,
    `write_envelope`, `write_one_envelope`, `envelope_write`).
 
+   *Amended 2026-11-19 at implementation, two points.*
+
+   - *What a release deletes is the session Secrets, not every Secret of the sandbox:
+     `delete_sessions_of` selects by the sandbox UID label and the session label together (the
+     issuer's session and each delegation). The stored output segments of ADR-0045 carry the
+     sandbox UID too and are not credentials; they stay for `logs.retention_secs` as that ADR
+     decided and go with the sweep (`delete_secrets_of`, `sweep_logs`). "No Secret of the sandbox
+     exists" above reads "no session Secret".*
+   - *An envelope-only update writes no status, so on `KubeStore` it does not move the resource
+     version, and a second envelope-only update decided from the same read is not refused by
+     the store. What decision 3 promises still holds, because it rests on the release and not
+     on that version: the update reads the sandbox again before it writes, a Secret the release
+     deleted is never created again, and a replace that lands just before the deletion is
+     deleted with it. Within one replica the per-claim refresh lock already serialises the only
+     caller.*
+
 5. **A caller that meets a conflict reads again and decides again, and each caller's second
    decision is written down.** The store crate gains one helper, `modify_claim`: read the record,
    hand it to the caller's closure, write what the closure returns, and on `Conflict` start again,
@@ -145,6 +175,13 @@ alone, with no audience in it.
    (`Reconciler::bind`), `crates/mediatore-api/src/lib.rs` (`report`, `exit`, `refresh_session`),
    `crates/mediatore-claims/src/sandbox.rs` (`mirror`, unchanged, pinned).
 
+   *Amended 2026-11-19 at implementation: the bound is the constant `MODIFY_ATTEMPTS` (4). The
+   `503` of the table has the code `record_busy`. An `exit` goes on to the release on any
+   failure of its record write, not only when the attempts run out: a store error there must
+   not leave the claim to its deadline either. A refresh whose claim was released under it
+   answers `403`, as a released claim does; one that loses four times answers `503 record_busy`,
+   mints nothing and drops the rotated token, as the consequences below say.*
+
 6. **Both stores are held to it by the same cases.** The conformance suite gains the cases
    listed under "What must be proven", and stops being `MemoryStore`'s alone: the cases are made
    available to `mediatore-claims`, which runs them over `KubeStore` on its fake API server,
@@ -156,6 +193,14 @@ alone, with no audience in it.
    released record. The kind tier stays the proof on a real API server.
    Files: `crates/mediatore-store/src/conformance.rs`, `crates/mediatore-claims/src/kubestore.rs`
    (the `fake` module of its tests).
+
+   *Amended 2026-11-19 at implementation: the cases both stores run are in a module of their
+   own, `crates/mediatore-store/src/shared_cases.rs`, behind the crate's `test-support`
+   feature, which only `mediatore-claims`' tests enable; `conformance.rs` keeps the cases that
+   are `MemoryStore`'s alone and calls the shared ones. `KubeStore` runs them through a
+   `Fixture` over its fake API server, which now keeps a resource version per object and
+   answers `409` to a patch naming a stale one. Only the new cases are shared (open
+   question 5).*
 
 7. **The record names the sandbox it was written for.** `status.record` gains `sandboxUid` and
    `namespace`, written by `put_claim` from the object. On every read the store compares them
@@ -174,7 +219,30 @@ alone, with no audience in it.
    `record_status_from`, `carries_claim`, `put_claim`), `crates/mediatore-claims/src/sandbox.rs`
    (the failed sandbox), `deploy/base/crds` (rendered by `crdgen`).
 
+   *Amended 2026-11-19 at implementation: the comparison is `binding_of`, with three answers.
+   `Own`: both fields name the object. `Unbound`: neither field is there, a record written
+   before this ADR, read as before. `Foreign`: anything else, a record that names another
+   object or carries only one of the two fields; it reads as absent with the `warn` line, and
+   `put_claim` on that sandbox is a `Conflict`. The two fields are written once, by `put_claim`,
+   and no update rewrites them. The CRD carries them in both served versions, and the CRD must
+   be applied before the new broker starts: an API server still holding the old schema prunes
+   the two fields from the status, and every new record then reads as `Unbound`. Refusing
+   `Unbound` in the following release is still to do. The reconciler's half is built:
+   `refuse_foreign_record` (`crates/mediatore-claims/src/sandbox.rs`) fails the sandbox with
+   the reason `record_not_own` before anything is consumed, writes no record, leaves the parked
+   session untaken and deletes the owned claim if there is one
+   (`a_sandbox_whose_record_names_another_sandbox_is_failed_and_its_claim_deleted`). It was
+   written after the first gate run recorded under "What was proven" and passed in the next
+   (`make check`, 1010 tests).*
+
 8. **A MAC over the record's identity: designed here, and recommended for deferral.**
+
+   *Deferred 2026-11-19, not built. Nothing below exists in the tree: no `SealPurpose::Record`,
+   no `status.record.seal`, no verification on read. The limit it would address is an accepted
+   risk in the threat model, and the three conditions under "The recommendation" are its
+   revisit triggers: a deployment that must run without the admission policy (an API server
+   before 1.30); a second controller given `agentsandboxes/status`; the datastore's operator no
+   longer being the cluster's administrator.*
 
    *Who is left.* With the admission policy bound, a status is written by the broker's
    ServiceAccount and by: a principal admission does not apply to, or who can change or unbind
@@ -263,6 +331,13 @@ alone, with no audience in it.
    `crates/mediatore-api/src/lib.rs` (`seal_delegation`, the session park, `refresh_session`,
    `delegated_token`), `crates/mediatore-testkit/src/transit.rs`.
 
+   *Amended 2026-11-19 at implementation: the slot is the type `Slot` (the issuer's, or a
+   delegation's with its audience), and the purposes are `SealPurpose::SessionFormat1` (to open
+   what is stored; a sealer refuses to seal under it), `SealPurpose::Session(Slot)` and
+   `SealPurpose::Logs`. The start-up probe is two functions, `probe_sessions` and
+   `probe_output`. A delegation that does not open under the audience asked for is a `403`;
+   before this change an envelope that did not open was a `500`.*
+
 10. **A versioned format, so what is stored still opens.** `Sealed` gains `format`: absent or `1`
     is the bare sandbox UID of ADR-0013, `2` is decision 9's context. Everything sealed from this
     change on is `2`; nothing seals `1` again (the helper that did is removed, so a call site
@@ -275,6 +350,15 @@ alone, with no audience in it.
     like ADR-0034's cutover; from then on a `1` is `Rejected`.
     Files: `crates/mediatore-store/src/seal.rs` (`Sealed`),
     `crates/mediatore-claims/src/kubestore.rs` (`envelope_data`, `envelope_of`, `session_secret`).
+
+    *Amended 2026-11-19 at implementation: on a Secret the marker is the data key `format`,
+    `"2"` for the new context and absent for format 1. One thing this decision did not see: a
+    broker from before this change cannot open a format 2 envelope, so two versions of the
+    broker must not serve at once. An old replica that issues for a claim whose session a new
+    replica has sealed again fails to open it, and can leave a Secret the claim no longer opens.
+    The broker is rolled as one step (all replicas stopped, then started), which the store
+    guide says; "no drain is needed" in the consequences below is about the stored envelopes
+    and is not a licence for a rolling update.*
 
 11. **A delegation's expiry is believed from inside the envelope.** `DelegationPlain` gains
     `expires_at`, the instant `parked_expiry` computes today, sealed with the credential. For a
@@ -297,6 +381,11 @@ alone, with no audience in it.
 ## STRIDE, TB-9 and TB-10
 
 Every control below is one this ADR proposes. None is built; the file is where it will be.
+
+*Amended 2026-11-19 at implementation:* the controls of decisions 1 to 7 and 9 to 11 are built,
+and the threat model's TB-9 and TB-10 carry them with their tests since the pass of the same
+day; "not yet built" in the rows below is left as the proposal read. The two rows that name
+decision 8 and the restore are not controls: they are the accepted risks the pass recorded.
 
 | Boundary | Threat | STRIDE | Control (not yet built) |
 | --- | --- | --- | --- |
@@ -339,6 +428,8 @@ Every control below is one this ADR proposes. None is built; the file is where i
   with one schema (ADR-0049); `make crds` output is committed with the change.
 - Stored envelopes keep opening across the upgrade (decision 10). No drain is needed for the
   envelopes; a record without decision 7's fields is read until its claim ends.
+  *Amended 2026-11-19:* the upgrade itself has an order: the CRD first (decision 7's amendment),
+  then the broker, all replicas as one step (decision 10's amendment).
 - CALM (`docs/architecture/calm/architecture.json`): no node and no relation is added or
   removed. The description of the broker's relation to the API server says "conditional writes"
   and that of its relation to OpenBao names the slot. `make calm-validate` and
@@ -468,36 +559,80 @@ Not shown by any of these, and to be said as such in the threat-model pass: the 
 real cluster. The unit cases drive each interleaving in turn; the kind tier shows the API
 server's half of the bargain.
 
+## What was proven, and what was not
+
+Proven on 2026-11-19, on the build host:
+
+- **The quality gate** (`make check`). The ten shared cases run over `MemoryStore` and over
+  `KubeStore` on its fake API server. The `KubeStore`, reconciler, API and sealer tests named
+  above exist under those names, with these exceptions, which are not written:
+  `a_refresh_that_loses_to_a_release_mints_nothing_and_stores_nothing` and
+  `a_claim_whose_session_was_sealed_as_format_1_refreshes_and_is_stored_as_2` (the behaviour of
+  both is in `store_refreshed` and `refresh_session`, `crates/mediatore-api/src/lib.rs`, and the
+  format 1 half of the second is covered at the sealer by
+  `a_format_1_envelope_still_opens_under_the_bare_uid_and_a_relabelled_one_does_not`).
+  `a_sandbox_whose_record_names_another_sandbox_is_failed_and_its_claim_deleted`
+  (`sandbox.rs`) was written after this gate run and passed in the next one (1010 tests). Added
+  beyond the list:
+  `the_format_marker_is_absent_for_1_and_written_for_2` (`seal.rs`) and
+  `the_fake_derives_by_the_exact_format_2_context_bytes` (`transit_sealer.rs`).
+- **The kind tiers**, all eight, on the new broker with the new CRD: the sandbox tier's restart
+  step still finds the record and redoes nothing, and the Dex tier starts the broker against a
+  real OpenBao with the extended probe and refreshes a real session.
+
+Not proven:
+
+- The two live steps this ADR asked for are not in the tier scripts: a status patch as the
+  broker's ServiceAccount naming a stale resource version answered `409` by a real API server
+  (`dev/kind/sandbox-e2e.sh`), and a session Secret shown to carry format `2` after the first
+  issue (`dev/kind/dex-e2e.sh`). The tiers pass with the conditional writes in use, which shows
+  a real API server accepts them; the refusal on a real API server rests on the fake.
+- The race itself on a real cluster, as said above: the unit cases drive each interleaving in
+  turn.
+- The conflict rate per caller (open question 4) is not measured.
+- Nothing has run on the core cluster.
+
 ## Open questions
 
 1. **Build decision 8 now, or defer it?** Recommendation: defer, and build decision 7. The
    admission policy closed what was found; a MAC adds a second control for a cluster where the
    policy is missing, and costs a sealer call on reads, a cache, and a way for a rotation to end
-   live claims. Write the limit down as an accepted risk with the three triggers.
+   live claims. Write the limit down as an accepted risk with the three triggers. (Answered
+   2026-11-19: deferred, decision 7 built, the risk recorded in the threat model.)
 2. **Should decision 8 be its own ADR?** Recommendation: yes. Decisions 1 to 6 and 9 to 11
    tighten a contract with no new dependency; decision 8 adds one on the read path and a failure
    mode of its own, and deserves its own status line. If it is deferred, this ADR is accepted
    without it and keeps decision 8 only as a pointer; "bound to its sandbox" in the title is then
-   carried by decision 7 and decision 9.
+   carried by decision 7 and decision 9. (Answered 2026-11-19: yes. This ADR is accepted
+   without decision 8; the ADR of its own is not written and is written when a trigger fires.)
 3. **If decision 8 is built: the sealed digest, or the transit keyed hash?** Recommendation: the
    sealed digest. Two things to confirm on the OpenBao release the kind fixture pins before
    closing this: that `hmac` and `verify` accept a key created `derived`, and that they take no
    context. If both paths would be granted anyway and the binding in the encoding is thought
-   enough, the keyed hash is the smaller tag.
+   enough, the keyed hash is the smaller tag. (Open: it is a question only if decision 8 is
+   built.)
 4. **Are four attempts right, and how often does the mirror cost a caller one?** Recommendation:
-   ship four, count conflicts per caller in the kind sandbox tier, and decide from the number.
+   ship four, count conflicts per caller in the kind sandbox tier, and decide from the number. (Answered
+   2026-11-19 for the first half: four, `MODIFY_ATTEMPTS`. The count is not built and the number
+   is not known.)
 5. **Should the whole conformance suite run over `KubeStore` on the fake API server, or only the
    new cases?** Recommendation: the new cases with this change, the rest as a follow-up under
-   roadmap 05. The adapter is the cost, and it is paid once.
+   roadmap 05. The adapter is the cost, and it is paid once. (Answered 2026-11-19: the new
+   cases, in `shared_cases.rs`. The rest of the suite over `KubeStore` is not built and is an
+   item of roadmap 05.)
 6. **When does format `1` stop being read?** Recommendation: one release after `2` ships. With
    no broker-wide maximum TTL there is no number to wait for, only "every claim that was running
-   has ended"; the release notes say to check that no session Secret without the marker is left.
+   has ended"; the release notes say to check that no session Secret without the marker is left. (Answered
+   2026-11-19: one release after. The removal is still to do.)
 7. **Is "either timestamp" acceptable for two releases that race?** Recommendation: yes. The
-   alternative is a precondition on the release, which is what decision 3 exists to avoid.
+   alternative is a precondition on the release, which is what decision 3 exists to avoid. (Answered
+   2026-11-19: yes, as decision 3 is built.)
 8. **Should a release retract the entry named by the claim's UID instead of the one the record
    names?** The name is a function of the UID. Recommendation: yes, as a change of its own with
    its test; it removes one more field whose value is taken from the status on trust, and it is
-   independent of everything above.
+   independent of everything above. (Open, not built: a release still retracts the entry the
+   record names.)
 9. **Should the broker check at start that the status admission policy is bound?**
    Recommendation: yes, outside `dev_mode`, and with the entries policy in the same check. It
-   needs read access to the admission resources, which is a new grant, so it is not decided here.
+   needs read access to the admission resources, which is a new grant, so it is not decided here. (Open,
+   not built.)

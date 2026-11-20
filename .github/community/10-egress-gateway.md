@@ -4,7 +4,8 @@
 # 10: Egress gateway (Envoy, SPIFFE identity)
 
 **Status: done** (2026-11-03 to 2026-11-04; the live run on gateway VMs is roadmap 06's
-proof, below). [ADR-0028](../../docs/adr/0028-egress-gateway-envoy-with-spiffe-identity.md)
+proof, below); **reopened 2026-11-19** for ADR-0053 (the authorizer's own identity and the host
+table's output chain: built, its items and its live proof at the end). [ADR-0028](../../docs/adr/0028-egress-gateway-envoy-with-spiffe-identity.md)
 (Accepted 2026-11-02, implemented 2026-11-04) and
 [ADR-0027](../../docs/adr/0027-control-plane-relay-on-the-egress-gateway.md) (the control
 relay, implemented the same day). Built: the `gateways` list on `GET /v1/me`, the
@@ -56,7 +57,10 @@ injection) builds on this: its proxy, built 2026-10-30, tunnels through these ga
       table with the per-source cap (decisions 1, 2, 5 and 9)
 - [x] `ClusterStaticEntry` for `spiffe://<td>/gateway` per gateway VM: two per VM,
       `unix:user:envoy` and `unix:user:mediatore-gateway`, under that VM's agent
-      (`deploy/gateway/clusterstaticentries.yaml`, placeholders; 2026-11-04)
+      (`deploy/gateway/clusterstaticentries.yaml`, placeholders; 2026-11-04). Since
+      2026-11-19 (ADR-0053, below) three per VM and two IDs: `gateway-NN-envoy` and
+      `gateway-NN-envoy-inject` for `spiffe://<td>/gateway`, `gateway-NN-authorizer` for
+      `spiffe://<td>/gateway/authorizer`
 - [x] Three gateway `VirtualMachine`s, one per failure domain, on a TPM class: the
       two-interface `VMClass`, the `VMImage` and the three VMs with the egress address in
       `networkOverrides`, the sandbox address in `userData` and a required anti-affinity
@@ -111,3 +115,18 @@ Added 2026-11-15 ([ADR-0040](../../docs/adr/0040-the-gateway-places-an-audiences
 - [x] A third Envoy on the gateway (`envoy-inject`: the claim's mutual TLS in, TLS originated to a fixed host, its own user and SPIRE entry), the authorizer's second socket and the broker's credential route, so an audience's credential is placed at the gateway and never held by a pool VM; the guest's route to the inject port, the host table's `MEDIATORE_INJECT_PORT`, and a placed host removed from the tunnel lists (unit, e2e and render tests; `make gateway-render-check`, `make host-table-test`)
 
 Left to a live environment: the integration proof on a real Envoy with the real authorizer, the per-claim limit, the gateways' egress allowance, the OpenBao transit key and a release (threat model R-28, R-29).
+
+Added 2026-11-19 ([ADR-0053](../../docs/adr/0053-the-gateways-authorizer-has-an-identity-of-its-own.md)):
+
+- [x] The authorizer's own identity, `spiffe://<td>/gateway/authorizer`: `Naming`, the SVID selected by path and required at start, the broker's two gateway routes answering it alone and the listeners' ID no longer a peer of the broker, the transition switch `accept_plain_gateway_identity` (off by default), the audit line naming the peer (2026-11-19)
+- [x] The admission policy for gateway entries (`deploy/base/admission/clusterstaticentry-gateway.yaml`) and the entries' new shape, three per VM (2026-11-19)
+- [x] The gateway host table's output chain keyed on the socket's owner, with `EGRESS_DENY_ELEMENTS`, `CHECK_TCP_ELEMENTS` and `RESOLVER_ELEMENTS`, and the `MEDIATORE_URL` guard on the authorizer's unit; asserted by `make gateway-render-check` and `make gateway-image-check` (2026-11-19)
+- [x] A connection on the sandbox listener ends at its peer certificate's `notAfter` (2026-11-19)
+- [x] Tests: unit and end to end in `make check`; the kind gateway tiers with two identities on the pod, the listeners' identity refused by the broker and the admission dry runs (2026-11-19)
+- [x] Threat model: full pass; A-28 new, R-20 and R-27 narrowed, R-48 to R-51 new (2026-11-19)
+- [ ] The tunnel check on the unix socket by default, which removes the loopback exception (ADR-0053 open question 7)
+- [ ] The output chain's default policy moved to `drop`, once a booted gateway has given the list of users that open a connection (open question 4)
+- [ ] The transition switch removed, the release after the one that ships it
+- [ ] Per-gateway identities and binding a credential ask to the gateway serving the claim: an ADR of its own (decision 8)
+
+Left to a live environment: three gateway VMs booted from the image under the new entries, with the drops per user, the resolver under the chain, the agent's and the relay's upstreams and the migration in each direction observed (ADR-0053, *What was proven, and what was not*; threat model R-48). Until then the output chain is built and not verified.

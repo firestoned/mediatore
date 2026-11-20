@@ -110,8 +110,21 @@ about half a minute then refused for a quarter, is the gateway's SPIRE agent fai
 attestation and Envoy restarting with it (`Requires=spire-agent.service`): the server log
 check of step 2 names it. Either the CA that issued the gateway's EK is missing from
 `spire-tpm-ek-cas` (a gateway moved to another hypervisor has another swtpm CA), or the
-gateway VM was recreated and its two `ClusterStaticEntry` name the old agent ID:
+gateway VM was recreated and its `ClusterStaticEntry` objects name the old agent ID:
 regenerate them from the first RSA certificate in `.status.tpmEndorsementCertificates`.
+A gateway VM needs one entry per user (ADR-0053): `gateway-NN-envoy` and, with a
+gateway-placed audience, `gateway-NN-envoy-inject`, both `spiffe://<td>/gateway`, and
+`gateway-NN-authorizer`, `spiffe://<td>/gateway/authorizer`, for `unix:user:mediatore-gateway`.
+The admission policy `mediatore-clusterstaticentry-gateway` (in the base, applied with the
+overlay in step 4) refuses any other shape, the pre-ADR-0053 authorizer entry included.
+
+Envoy up and every tunnel `403` with the authorizer's unit restarting is the authorizer
+without its own SVID (its entry missing, or still the old shape): it refuses to start on any
+identity but `spiffe://<td>/gateway/authorizer`. The authorizer up and every tunnel refused
+with `broker_unreachable` while the relay ports are steady is the broker refusing its identity
+in the handshake (a broker from before ADR-0053, or an old authorizer entry against a broker
+without `accept_plain_gateway_identity`), or `MEDIATORE_URL` not naming `BROKER_ADDRESS`, which
+the authorizer's unit refuses to start on.
 
 ## 6. The Anthropic key
 

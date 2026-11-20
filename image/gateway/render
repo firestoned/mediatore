@@ -10,6 +10,13 @@
 # (/usr/libexec/mediatore-gateway/render) and by make to render and check the kind
 # tier's envoy.yaml from the same template.
 #
+# One exception, for a key added after gateways were deployed (ADR-0053 decision 5): a
+# template may write the placeholder as NAME:-default between the two '@', and a key no env
+# file defines then renders as the default (which may be empty, and holds no '@' and no
+# '|'). A key an env file does define wins as usual, an empty value included. So a gateway
+# whose env file predates the key still loads its table, with the default the template
+# states; a plain placeholder stays required.
+#
 #   render <template> <out|-> <env-file>...
 set -eu
 [ $# -ge 3 ] || { echo "usage: render <template> <out|-> <env-file>..." >&2; exit 2; }
@@ -23,9 +30,13 @@ for env in "$@"; do
     case $key in *[!A-Z0-9_]*|'') echo "render: $env: not KEY=value: $line" >&2; exit 1 ;; esac
     case $value in *'|'*) echo "render: $env: $key holds a '|'" >&2; exit 1 ;; esac
     expr="$expr
-s|@$key@|$value|g"
+s|@$key@|$value|g
+s|@$key:-[^@]*@|$value|g"
   done < "$env"
 done
+# What no env file defined and the template gave a default for: the default.
+expr="$expr
+s|@[A-Z][A-Z0-9_]*:-\([^@]*\)@|\1|g"
 # One script of one substitution per line, so a value may hold spaces (a whole YAML flow map, a ", 3133" element).
 rendered=$(sed -e "$expr" "$tmpl")
 left=$(printf '%s\n' "$rendered" | grep -o '@[A-Z][A-Z0-9_]*@' | sort -u | tr '\n' ' ' || true)

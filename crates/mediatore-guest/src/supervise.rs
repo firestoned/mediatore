@@ -12,12 +12,15 @@ use std::path::Path;
 use std::sync::Arc;
 
 use jiff::Timestamp;
+use tokio::io::{AsyncBufRead, AsyncBufReadExt as _, AsyncRead, BufReader};
 
-use mediatore_proto::RestartPolicy;
+use mediatore_proto::{LogStream, RestartPolicy};
 
 use crate::confine::EXIT_CONFINEMENT_REFUSED;
 use crate::jail::JailSpec;
-use crate::logs::Capture;
+use crate::logs::{
+    CONSOLE_PREFIX, Capture, DRAIN_TIMEOUT, RAW_LINE_CAP, Readers, neutralise_controls,
+};
 use crate::{net, sandboxfs, user};
 
 /// Seconds to wait before restarting a crashed workload.
@@ -26,6 +29,203 @@ const RESTART_DELAY_SECS: u64 = 2;
 /// `nsjail`'s flag for warnings and above only, added under output capture (ADR-0045
 /// decision 1) so its informational lines stay out of the workload's stderr records.
 pub const NSJAIL_QUIET: &str = "--quiet";
+
+/// The jail's output when the claim did not opt into capture (`workload.logs` off): the
+/// guest still owns both pipes, so nothing the workload writes reaches the guest's own
+/// stdout or stderr (the unit's journal stream) as the workload wrote it. Each line goes to
+/// the console as the capture's console copy does (ADR-0045 decision 9, amended
+/// 2026-11-19): control characters written out as text, [`CONSOLE_PREFIX`] in front.
+/// Nothing is queued, shipped or redacted here.
+///
+/// Read `reader` to EOF and hand each line, ready for the console (prefix, neutralised
+/// text, one newline), to `write`. A last line without its newline counts. A line over
+/// [`RAW_LINE_CAP`] is written in pieces of at most that, each a console line of its own,
+/// so a workload writing without newlines cannot grow the guest's memory; a char split by
+/// a cut waits for its other bytes.
+async fn relay_stream<R, W>(reader: R, mut write: W)
+where
+    R: AsyncRead + Unpin,
+    W: FnMut(&str),
+{
+    let mut reader = BufReader::new(reader);
+    // At most `RAW_LINE_CAP` bytes of the line being read; after a cut, the bytes (0 to 3) of
+    // the char it split.
+    let mut raw: Vec<u8> = Vec::new();
+    loop {
+        let read = match read_line_capped(&mut reader, &mut raw, RAW_LINE_CAP).await {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::debug!(error = %e, "output pipe closed with an error");
+                0
+            }
+        };
+        if read == 0 {
+            // The pipe closed: what is buffered is the end of a line with no newline.
+            if !raw.is_empty() {
+                write(&console_copy(&raw));
+            }
+            return;
+        }
+        if raw.last() == Some(&b'\n') {
+            raw.pop();
+            if raw.last() == Some(&b'\r') {
+                raw.pop();
+            }
+            write(&console_copy(&raw));
+            raw.clear();
+        } else if raw.len() >= RAW_LINE_CAP {
+            // Cut before its end: the piece is written, the split char's bytes stay.
+            let whole = raw.len() - split_char_suffix(&raw);
+            write(&console_copy(&raw[..whole]));
+            raw.drain(..whole);
+        }
+        // Otherwise the read stopped short of both the newline and the cap (it does at
+        // EOF): the next read says which.
+    }
+}
+
+/// The console line for the raw bytes of one workload line: lossy UTF-8, control characters
+/// neutralised ([`neutralise_controls`]), behind [`CONSOLE_PREFIX`], one newline at the end.
+/// The same text `logs.rs` writes for a captured line (its `console_line` is private).
+fn console_copy(raw: &[u8]) -> String {
+    let text = String::from_utf8_lossy(raw);
+    format!("{CONSOLE_PREFIX}{}\n", neutralise_controls(&text))
+}
+
+/// How many bytes at the end of `bytes` are the start of a UTF-8 char whose other bytes
+/// have not been read yet: 0 to 3.
+fn split_char_suffix(bytes: &[u8]) -> usize {
+    (1..=bytes.len().min(3))
+        .find(|back| {
+            matches!(
+                std::str::from_utf8(&bytes[bytes.len() - back..]),
+                Err(e) if e.valid_up_to() == 0 && e.error_len().is_none()
+            )
+        })
+        .unwrap_or(0)
+}
+
+/// Read up to and including the next `\n`, or until `buf` holds `cap` bytes, or EOF; the
+/// bytes read. (`logs.rs` has the same reader, private to it.)
+async fn read_line_capped<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    cap: usize,
+) -> std::io::Result<usize> {
+    let mut total = 0;
+    loop {
+        let avail = reader.fill_buf().await?;
+        if avail.is_empty() {
+            return Ok(total);
+        }
+        let room = cap.saturating_sub(buf.len());
+        let newline = avail.iter().position(|b| *b == b'\n');
+        let take = match newline {
+            Some(i) if i < room => i + 1,
+            _ => room.min(avail.len()),
+        };
+        buf.extend_from_slice(&avail[..take]);
+        reader.consume(take);
+        total += take;
+        if buf.last() == Some(&b'\n') || buf.len() >= cap {
+            return Ok(total);
+        }
+    }
+}
+
+/// One console line to the guest's stdout or stderr, in one write, as the capture's tee.
+fn write_console(stream: LogStream, line: &str) {
+    use std::io::Write as _;
+
+    let _ = match stream {
+        LogStream::Stdout => std::io::stdout().lock().write_all(line.as_bytes()),
+        LogStream::Stderr => std::io::stderr().lock().write_all(line.as_bytes()),
+    };
+}
+
+/// Who reads the jail's two pipes: the capture's readers, or the relay to the console.
+enum Output {
+    /// The claim opted in (ADR-0045): redact, tee, queue.
+    Captured(Readers),
+    /// It did not: neutralise, prefix, write to the console, keep nothing.
+    Relayed(Vec<tokio::task::JoinHandle<()>>),
+}
+
+impl Output {
+    /// Take the child's piped stdout and stderr and relay both until EOF.
+    fn relay(child: &mut tokio::process::Child) -> anyhow::Result<Self> {
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("the jail's stdout is not a pipe"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("the jail's stderr is not a pipe"))?;
+        Ok(Self::Relayed(vec![
+            tokio::spawn(relay_stream(stdout, |line: &str| {
+                write_console(LogStream::Stdout, line);
+            })),
+            tokio::spawn(relay_stream(stderr, |line: &str| {
+                write_console(LogStream::Stderr, line);
+            })),
+        ]))
+    }
+
+    /// Wait for the pipes to close, bounded by [`DRAIN_TIMEOUT`] on either path.
+    async fn drain(self) {
+        match self {
+            Self::Captured(readers) => readers.drain().await,
+            Self::Relayed(tasks) => {
+                let all = async {
+                    for handle in tasks {
+                        let _ = handle.await;
+                    }
+                };
+                if tokio::time::timeout(DRAIN_TIMEOUT, all).await.is_err() {
+                    tracing::warn!(
+                        "the workload's output pipes did not close in time; the tail may be lost"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// `nsjail`'s argument list for `spec`. Under capture [`NSJAIL_QUIET`] comes first: nsjail
+/// writes its own diagnostics to its stderr, which is the workload's stderr pipe, and the
+/// flag keeps its informational lines (the mounts, the pid) out of the owner's stream while
+/// its warnings and fatal messages still reach it. It must precede the spec's arguments,
+/// which end in `--` and the workload's argv: anything after that is the workload's, not
+/// nsjail's. Without capture the informational lines stay, on the console behind the prefix.
+fn nsjail_args(spec: &JailSpec, quiet: bool) -> Vec<String> {
+    let mut args = Vec::new();
+    if quiet {
+        args.push(NSJAIL_QUIET.to_owned());
+    }
+    args.extend(spec.to_args());
+    args
+}
+
+/// Spawn `nsjail` for the spec with both of its output streams as pipes, always (the jail
+/// never inherits the guest's stdout or stderr), and start whoever reads them.
+fn spawn_jail(
+    spec: &JailSpec,
+    capture: Option<&Arc<Capture>>,
+) -> anyhow::Result<(tokio::process::Child, Output)> {
+    let mut command = tokio::process::Command::new("nsjail");
+    command
+        .args(nsjail_args(spec, capture.is_some()))
+        .envs(spec.env())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = command.spawn()?;
+    let output = match capture {
+        Some(c) => Output::Captured(c.attach(&mut child)?),
+        None => Output::relay(&mut child)?,
+    };
+    Ok((child, output))
+}
 
 /// What the supervisor does after the jail exits before the deadline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,10 +359,11 @@ pub fn after_event(event: Event, policy: RestartPolicy) -> Next {
 /// Run `nsjail` with the spec's arguments until `expires_at`, restarting on exit as
 /// `policy` says, with the egress proxy `proxy` watched beside it.
 ///
-/// With `capture` (the claim opted in, ADR-0045 decision 1) the jail's stdout and stderr are
-/// pipes the capture's readers drain, redact, tee to the console and queue; the readers are
-/// drained to EOF after every exit before the next step. Without it the jail inherits the
-/// guest's stdio, as before.
+/// The jail's stdout and stderr are always pipes. With `capture` (the claim opted in,
+/// ADR-0045 decision 1) the capture's readers drain, redact, tee to the console and queue
+/// them; without it the guest relays each line to its own console, neutralised and prefixed
+/// (`relay_stream`), and keeps nothing. Either way the readers are drained to EOF after
+/// every exit before the next step.
 ///
 /// Returns when the deadline passes (the running jail killed first, then every other
 /// process of the sandbox user but the proxy, which is the caller's to kill once the output
@@ -184,23 +385,7 @@ pub async fn run(
             return Ok(Outcome::Deadline);
         };
 
-        let mut command = tokio::process::Command::new("nsjail");
-        command.args(spec.to_args()).envs(spec.env());
-        if capture.is_some() {
-            // nsjail writes its own diagnostics to its stderr, which under capture is the
-            // workload's stderr pipe: `--quiet` keeps its informational lines (the mounts,
-            // the pid) out of the owner's stream; its warnings and fatal messages (a
-            // refused mount, a confinement failure) still reach it, which is wanted.
-            command
-                .arg(NSJAIL_QUIET)
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped());
-        }
-        let mut child = command.spawn()?;
-        let readers = match capture {
-            Some(c) => Some(c.attach(&mut child)?),
-            None => None,
-        };
+        let (mut child, output) = spawn_jail(spec, capture)?;
         tracing::info!(pid = child.id(), user = %spec.user, logs = capture.is_some(), "jail started");
 
         let event = tokio::select! {
@@ -220,17 +405,14 @@ pub async fn run(
                 // Before the drain: a survivor holds the pipes open. The proxy is spared
                 // here and stopped by the caller; the teardown looks again without it.
                 kill_sandbox_processes(&spec.user, proxy.id()).await;
-                if let Some(r) = readers {
-                    r.drain().await;
-                }
+                output.drain().await;
                 return Ok(Outcome::Deadline);
             }
         };
-        // The pipes close with the jail; what is left in them is queued before anything
-        // else happens (ADR-0045 decision 8: the end of the output matters most).
-        if let Some(r) = readers {
-            r.drain().await;
-        }
+        // The pipes close with the jail; what is left in them is queued (or written to the
+        // console) before anything else happens (ADR-0045 decision 8: the end of the output
+        // matters most).
+        output.drain().await;
         match (event, after_event(event, policy)) {
             (Event::ProxyExited(status), _) => {
                 tracing::error!(%status, "the egress proxy exited; the jail has no way out, not restarting");
@@ -299,6 +481,340 @@ mod tests {
     use super::*;
     use std::os::unix::process::ExitStatusExt as _;
     use std::process::ExitStatus;
+
+    #[test]
+    fn quiet_is_nsjails_flag_and_never_one_of_the_workloads_arguments() {
+        let spec = JailSpec {
+            user: "sb-abc".into(),
+            rootfs: "/mnt/sandbox/rootfs".into(),
+            work: "/mnt/sandbox/work".into(),
+            agent_binary: "/usr/bin/mediatore".into(),
+            argv: vec!["/bin/sh".into(), "-c".into(), "id".into()],
+            rlimit_as_mib: 8192,
+            proxy_port: 3128,
+            phantom: crate::egress::Phantom::parse(
+                "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+            )
+            .unwrap(),
+        };
+        let quiet = nsjail_args(&spec, true);
+        let flag = quiet.iter().position(|a| a == NSJAIL_QUIET);
+        let separator = quiet.iter().position(|a| a == "--");
+        assert_eq!(flag, Some(0), "the flag is nsjail's first argument");
+        assert!(flag < separator, "and comes before the command");
+        assert_eq!(quiet[1..], spec.to_args()[..], "the rest is the spec's");
+        assert_eq!(quiet.last().map(String::as_str), Some("id"));
+        assert_eq!(nsjail_args(&spec, false), spec.to_args());
+    }
+
+    /// What the relay writes for `input`, one entry per console line.
+    async fn relayed(input: &[u8]) -> Vec<String> {
+        let mut lines = Vec::new();
+        relay_stream(input, |line: &str| lines.push(line.to_owned())).await;
+        lines
+    }
+
+    /// The workload's part of a console line: no prefix, no final newline.
+    fn payload(line: &str) -> &str {
+        line.strip_prefix(CONSOLE_PREFIX)
+            .and_then(|l| l.strip_suffix('\n'))
+            .expect("a console line starts with the prefix and ends with a newline")
+    }
+
+    #[tokio::test]
+    async fn every_relayed_line_is_prefixed_and_ends_with_one_newline() {
+        let lines = relayed(b"one\ntwo\r\n\nlast without newline").await;
+        assert_eq!(
+            lines,
+            [
+                "workload: one\n",
+                "workload: two\n",
+                "workload: \n",
+                "workload: last without newline\n"
+            ],
+            "CRLF stripped, an empty line kept, the last line counts"
+        );
+        let nothing = relayed(b"").await;
+        assert!(nothing.is_empty(), "no output, no console line");
+    }
+
+    #[tokio::test]
+    async fn a_relayed_line_cannot_open_with_a_priority_or_carry_a_control_character() {
+        let lines = relayed(
+            b"<3>disk failure\n2026-01-01T00:00:00Z  INFO mediatore: claim bound\n\x1b[2Jx\rforged\x07\n",
+        )
+        .await;
+        assert_eq!(
+            lines,
+            [
+                "workload: <3>disk failure\n",
+                "workload: 2026-01-01T00:00:00Z  INFO mediatore: claim bound\n",
+                "workload: \\x1b[2Jx\\x0dforged\\x07\n",
+            ]
+        );
+        for line in &lines {
+            assert!(
+                line.starts_with(CONSOLE_PREFIX),
+                "the guest writes the start"
+            );
+            assert_eq!(line.matches('\n').count(), 1, "one console line each");
+            assert!(
+                !payload(line).contains(char::is_control),
+                "no control character reaches the journal as itself"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_relayed_line_over_the_raw_cap_is_written_in_pieces_not_buffered() {
+        let mut input = "y".repeat(RAW_LINE_CAP + 10).into_bytes();
+        input.extend_from_slice(b"\nnext\n");
+        let lines = relayed(&input).await;
+        assert_eq!(
+            lines.len(),
+            3,
+            "the cut piece, the rest of the line, the next line"
+        );
+        assert_eq!(payload(&lines[0]).len(), RAW_LINE_CAP);
+        assert_eq!(payload(&lines[1]), "y".repeat(10));
+        assert_eq!(payload(&lines[2]), "next");
+
+        // No newline at all: nothing lost, and no piece is over the cap.
+        let endless = "z".repeat(3 * RAW_LINE_CAP + 7);
+        let pieces = relayed(endless.as_bytes()).await;
+        assert_eq!(pieces.len(), 4);
+        assert!(pieces.iter().all(|p| payload(p).len() <= RAW_LINE_CAP));
+        let total: usize = pieces.iter().map(|p| payload(p).len()).sum();
+        assert_eq!(total, endless.len(), "nothing lost, just cut");
+    }
+
+    #[tokio::test]
+    async fn a_char_split_by_the_cut_is_relayed_whole() {
+        // The two bytes of the e-acute straddle the cap.
+        let input = format!("{}\u{e9}z\n", "y".repeat(RAW_LINE_CAP - 1));
+        let lines = relayed(input.as_bytes()).await;
+        assert_eq!(lines.len(), 2);
+        assert_eq!(payload(&lines[0]).len(), RAW_LINE_CAP - 1);
+        assert_eq!(lines[1], "workload: \u{e9}z\n");
+        assert!(lines.iter().all(|l| !l.contains('\u{fffd}')));
+
+        // Bytes that are not UTF-8 at all are written lossily, never dropped or left raw.
+        let lossy = relayed(b"ok \xff\n").await;
+        assert_eq!(lossy, ["workload: ok \u{fffd}\n"]);
+    }
+
+    #[test]
+    fn the_start_of_a_char_at_the_end_of_a_piece_is_told_from_a_whole_one() {
+        assert_eq!(split_char_suffix(b""), 0);
+        assert_eq!(split_char_suffix(b"abc"), 0);
+        assert_eq!(split_char_suffix("a\u{e9}".as_bytes()), 0);
+        assert_eq!(split_char_suffix(b"a\xc3"), 1);
+        assert_eq!(split_char_suffix(b"a\xe2\x82"), 2);
+        assert_eq!(split_char_suffix(b"a\xf0\x9f\x98"), 3);
+        assert_eq!(split_char_suffix("a\u{1f600}".as_bytes()), 0);
+        // Not the start of anything: lossy, not held back.
+        assert_eq!(split_char_suffix(b"a\xff"), 0);
+        assert_eq!(split_char_suffix(b"\x82\x82\x82"), 0);
+    }
+
+    #[tokio::test]
+    async fn a_line_written_to_the_pipe_in_parts_is_one_console_line() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let (mut tx, rx) = tokio::io::duplex(8);
+        let lines = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = lines.clone();
+        let reader = tokio::spawn(relay_stream(rx, move |line: &str| {
+            sink.lock().unwrap().push(line.to_owned());
+        }));
+        tx.write_all(b"<6>par").await.unwrap();
+        tx.flush().await.unwrap();
+        tokio::task::yield_now().await;
+        tx.write_all(b"tial\nthe end, no newline").await.unwrap();
+        // The writer closes as the jail's end of the pipe does at exit: the reader sees EOF.
+        drop(tx);
+        reader.await.unwrap();
+        assert_eq!(
+            *lines.lock().unwrap(),
+            ["workload: <6>partial\n", "workload: the end, no newline\n"]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_relay_refuses_a_jail_whose_output_is_not_a_pipe() {
+        let mut inherited = tokio::process::Command::new("true").spawn().unwrap();
+        assert!(
+            Output::relay(&mut inherited).is_err(),
+            "a jail on the guest's own stdout must not start"
+        );
+        let _ = inherited.wait().await;
+
+        let mut piped = tokio::process::Command::new("true")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let output = Output::relay(&mut piped).unwrap();
+        assert!(piped.stdout.is_none() && piped.stderr.is_none());
+        let _ = piped.wait().await;
+        // Both pipes closed with the child: the drain ends well inside its bound.
+        tokio::time::timeout(std::time::Duration::from_secs(2), output.drain())
+            .await
+            .expect("the relay's readers saw EOF");
+    }
+
+    /// A workload that outlived its parent: a child and a grandchild of the spawned process,
+    /// each with its parent-death signal cleared, both asleep; the spawned process exits `0`
+    /// once the grandchild has said it is ready.
+    const SURVIVORS: &str = r#"
+import ctypes, os, time
+libc = ctypes.CDLL(None, use_errno=True)
+def detach():
+    if libc.prctl(1, 0, 0, 0, 0) != 0:
+        os._exit(3)
+r, w = os.pipe()
+if os.fork() == 0:
+    detach()
+    if os.fork() == 0:
+        detach()
+        os.write(w, b"x")
+    time.sleep(300)
+    os._exit(0)
+os.close(w)
+os._exit(0 if os.read(r, 1) == b"x" else 4)
+"#;
+
+    /// Whether `program args` exits `0`, its output discarded.
+    async fn succeeds(program: &str, args: &[&str]) -> bool {
+        tokio::process::Command::new(program)
+            .args(args)
+            .output()
+            .await
+            .unwrap_or_else(|e| panic!("could not run {program}: {e}"))
+            .status
+            .success()
+    }
+
+    /// A ruleset for `uid` that admits one documentation address and nothing else.
+    fn live_ruleset(uid: u32) -> net::Ruleset {
+        net::Ruleset {
+            uid,
+            allow: [("192.0.2.10".parse().unwrap(), 8443)]
+                .into_iter()
+                .collect(),
+            dns: std::collections::BTreeSet::new(),
+            proxy_port: 3128,
+            shape: net::Shape::Direct,
+        }
+    }
+
+    /// Run [`SURVIVORS`] as the sandbox user and wait for the process that was spawned; the
+    /// two it forked are still asleep when this returns.
+    async fn start_survivors(uid: u32, gid: u32) -> std::io::Result<ExitStatus> {
+        tokio::process::Command::new("python3")
+            .args(["-I", "-c", SURVIVORS])
+            .uid(uid)
+            .gid(gid)
+            .current_dir("/")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await
+    }
+
+    /// The teardown order of ADR-0020 decision 6 (amended 2026-11-19) against a real kernel:
+    /// a sandbox user, the uid-keyed table loaded for it, and two processes of the uid that
+    /// cleared their parent-death signal and outlived the process that started them. After
+    /// [`teardown`] none is left, the table is gone and the user is gone. It does not start
+    /// `nsjail` and does not go through [`run`] (that needs a jail root and an egress proxy).
+    ///
+    /// Run as root on the build host, never on a pool VM (it loads and deletes the table a
+    /// guest uses); it fails, never skips, anywhere else.
+    #[tokio::test]
+    #[ignore = "needs root, Linux, nft, useradd and python3; loads and deletes the sandbox table: run on the build host"]
+    async fn teardown_ends_processes_that_outlived_the_jail_before_the_table_and_the_user_go() {
+        assert_eq!(
+            std::env::consts::OS,
+            "linux",
+            "this test proves the teardown against a Linux process table; it must not pass anywhere else"
+        );
+        let me = tokio::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .await
+            .expect("run id");
+        assert_eq!(
+            String::from_utf8_lossy(&me.stdout).trim(),
+            "0",
+            "run this test as root: it creates a user and loads an nftables table"
+        );
+        let table = ["list", "table", "inet", net::TABLE];
+        assert!(
+            !succeeds(net::NFT, &table).await,
+            "a sandbox ruleset is already loaded here: this is a guest, not the build host"
+        );
+
+        let subject = mediatore_proto::Subject {
+            issuer: "https://issuer.example.com".into(),
+            id: format!("teardown-live-{}", uuid::Uuid::new_v4()),
+            display: None,
+        };
+        let name = user::ensure(&subject)
+            .await
+            .expect("create the sandbox user");
+        let uid = user::uid(&name).await.expect("the user's uid");
+        let gid = user::gid(&name).await.expect("the user's gid");
+        let loaded = net::load(&live_ruleset(uid)).await;
+        let started = start_survivors(uid, gid).await;
+        // The spawned process is reaped; what is left of the uid is the two it left behind.
+        let before = user::processes_of(Path::new(user::PROC_ROOT), uid).map(|pids| pids.len());
+
+        let root = mediatore_testkit::tempdir();
+        teardown(&root, &name).await;
+
+        let after = user::processes_of(Path::new(user::PROC_ROOT), uid).map(|pids| pids.len());
+        let table_left = succeeds(net::NFT, &table).await;
+        let user_left = succeeds("id", &[name.as_str()]).await;
+        // Whatever the answers, leave the host as it was before asserting on them.
+        let _ = user::kill_all(uid, None).await;
+        if table_left {
+            net::unload().await;
+        }
+        if user_left {
+            let _ = user::remove(&name).await;
+        }
+
+        assert!(
+            loaded.is_ok(),
+            "nft refused the ruleset: {:?}",
+            loaded.err()
+        );
+        assert!(
+            started
+                .as_ref()
+                .is_ok_and(std::process::ExitStatus::success),
+            "the workload did not start as the sandbox user (python3 missing?): {started:?}"
+        );
+        assert_eq!(
+            before.ok(),
+            Some(2),
+            "two processes of the sandbox user outlived the one that started them"
+        );
+        assert_eq!(
+            after.ok(),
+            Some(0),
+            "a process of the sandbox user is still alive after the teardown"
+        );
+        assert!(
+            !table_left,
+            "the sandbox table is still loaded after the teardown"
+        );
+        assert!(
+            !user_left,
+            "the sandbox user still exists after the teardown"
+        );
+    }
 
     #[test]
     fn only_the_confinement_refusal_stops_the_claim() {

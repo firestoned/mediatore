@@ -53,6 +53,38 @@ these. An operator who wants the session Secrets encrypted at rest as well enabl
 encryption at rest on the API server; it is a second layer, since the Secret holds
 ciphertext either way (below).
 
+## Writes of a record
+
+Since [ADR-0057](../adr/0057-a-claims-record-written-by-compare-and-set-and-bound-to-its-sandbox.md)
+a write of an existing record is a compare-and-set. The store hands out a record with the
+version it was read at (the `AgentSandbox`'s `resourceVersion`), an update is accepted only
+if the object is still at that version, and a caller that loses reads again and decides again,
+four times at most. A release is the one write with no precondition: it lands over any state,
+and anything decided before it and written after it is refused. In every write the status is
+written before the Secrets, and an update never creates a Secret, so once a release has
+returned no session Secret of the sandbox exists and none can come back.
+
+What an operator sees of it:
+
+- A guest's report or a session refresh that lost four times in a row answers
+  `503 record_busy` and writes nothing; the guest sends its report again, and the next
+  `POST /v1/token` refreshes again. A refresh that ends this way has rotated the token
+  upstream without storing it: whether the issuer still takes the old one is the issuer's
+  rotation policy, and where it does not the claim is released like any refused session.
+- A report for a claim that was released in the meantime is `404 no_claim`. An exit always
+  releases its claim, whether or not its record write landed.
+- `status.record` carries `sandboxUid` and `namespace`, written once when the record is
+  created. A record that names another object (a status put back by a restore under a new UID,
+  a copied manifest) is not read as that sandbox's record: the broker logs it at `warn`.
+  This is a consistency check, not a signature: whoever may write a status can
+  write the right UID, which is why the status admission policy matters
+  (`deploy/base/admission/agentsandbox-status.yaml`).
+- Upgrading across this change has an order. Apply the CRD first: an API server on the old
+  schema prunes the two new fields from the status. Then stop every broker replica and start
+  the new ones, as one step and not as a rolling update: a broker from before the change
+  cannot open a session sealed by one after it (the next section), and can leave a Secret the
+  claim no longer opens.
+
 ## RBAC
 
 The broker's ServiceAccount patches `agentsandboxes/status` and the resource's labels and
@@ -69,8 +101,16 @@ and a sandbox applied in another namespace gets its record where it is.
 ## Refresh material
 
 A claim holds refresh material only as a sealed envelope: the id of the key that sealed
-it, a fresh nonce, and the AES-256-GCM ciphertext with the sandbox's UID as associated
-data, so an envelope copied onto another sandbox's Secret does not open. The record type
+it, a fresh nonce, and the AES-256-GCM ciphertext, bound to the sandbox and to its slot.
+Since [ADR-0057](../adr/0057-a-claims-record-written-by-compare-and-set-and-bound-to-its-sandbox.md)
+the associated data is a label, the sandbox's UID and the slot (the issuer's session, or a
+delegated credential with its audience), so an envelope copied onto another sandbox's Secret
+does not open, and neither does one sandbox's delegation presented as another audience's or as
+the issuer's session. A Secret sealed this way carries the data key `format` with the value
+`2`; one sealed before the change has no such key, is bound to the bare UID, and still opens
+until its claim ends (the issuer's session is sealed again, as format 2, at the claim's next
+issue). A delegation's expiry is sealed inside its envelope and is the one the broker
+believes; the copy in clear on the Secret is for the sweep and for `kubectl`. The record type
 has no plaintext field. Revocation deletes the envelope's Secret.
 
 There are two sealers, and `store.sealing` names exactly one of them.
@@ -106,8 +146,8 @@ store:
 ```
 
 Sealing is `transit/encrypt/<key>` and unsealing `transit/decrypt/<key>`, with the
-binding UID as the derivation `context`, so the envelope opens only for its sandbox
-exactly as the local sealer's associated data arranges. The envelope's `key_id` is
+same bytes the local sealer uses as associated data (the label, the UID and the slot) as the
+derivation `context`, so the envelope opens only for its sandbox and its slot. The envelope's `key_id` is
 `transit:<mount>/<key>`, its ciphertext the `vault:vN:...` string OpenBao returned, so a
 key rotated at OpenBao (`bao write -f transit/keys/mediatore/rotate`) keeps old
 envelopes readable until the administrator raises `min_decryption_version`; the broker
@@ -115,8 +155,8 @@ re-seals every session at its next refresh anyway. The broker logs in at
 `auth/<auth_mount>/login` (`kubernetes` by default) with the projected ServiceAccount
 token the base Deployment mounts (audience `openbao`), keeps the OpenBao token in memory
 until its lease nears its end, and exchanges it again at once on a 403. At start it seals
-and unseals a probe, so a wrong URL, CA, role, policy, mount or key, or a key created
-without `derived`,
+and unseals a probe, so a wrong URL, CA, role, policy, mount or key, a key created
+without `derived`, or a key that does not keep one slot's envelope from opening as another's,
 stops the process. The URL must be `https` outside `dev_mode`. OpenBao being away is
 `503 sealer_unavailable` on the request that needed it and revokes nothing. On the
 OpenBao side the broker's policy needs `update` on the two paths and nothing else; the

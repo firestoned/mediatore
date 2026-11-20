@@ -14,7 +14,9 @@ resources:
   - service.yaml
   - service-sandbox.yaml
   - ingressroute.yaml
+  - networkpolicy.yaml
   - clusterspiffeid.yaml
   - admission/clusterstaticentry-mediatore.yaml
+  - admission/clusterstaticentry-gateway.yaml
   - admission/agentsandbox-subject.yaml
   - admission/agentsandbox-status.yaml

@@ -11,7 +11,9 @@
 //! a digest of the bound node's SPIFFE ID (`mediatore.io/node`, a label value being too
 //! short for the ID itself). Writes to the record are merge patches of `status.record`
 //! alone, so they compose with the reconciler's mirroring of the rest of the status from
-//! any replica. The compare-and-set the floors need is the resource's `resourceVersion`.
+//! any replica. An update of a record is compare and set on the sandbox's `resourceVersion`
+//! (ADR-0057 decision 2), as the floors' is on theirs; a release names no version and lands
+//! over anything (decision 3). The status is written before the Secrets, always (decision 4).
 //!
 //! Retention (decision 4): a record that ended stays on its resource, finalizer held, until
 //! [`ClaimStore::sweep`] runs past the retention window; the sweep logs the audit line,
@@ -31,10 +33,10 @@ use mediatore_proto::{
     ClaimReport, LOG_SEGMENT_BYTES, LogBatch, LogEntry, LogGap, Provider, Subject, Workload,
     WorkloadExit,
 };
-use mediatore_store::seal::{SealError, SealPurpose, Sealed, Sealer};
+use mediatore_store::seal::{FORMAT_BARE_UID, SealError, SealPurpose, Sealed, Sealer};
 use mediatore_store::{
     ClaimRecord, ClaimStore, DelegatedSession, LogAppend, LogChunk, LogLimits, LogStore,
-    NodeRecord, SessionRecord, StoreError,
+    MODIFY_ATTEMPTS, NodeRecord, RecordVersion, SessionRecord, StoreError,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -93,6 +95,9 @@ const OPEN_CONCURRENCY: usize = 4;
 const BLOB_OVERHEAD: usize = 256;
 /// How many times a conflicting segment write is retried before it is an error.
 const SEGMENT_WRITE_ATTEMPTS: usize = 3;
+/// The key of a session Secret's `data` that holds the envelope's format marker (ADR-0057
+/// decision 10). Absent is format 1.
+const FORMAT_KEY: &str = "format";
 /// How many location hints [`KubeStore`] keeps before it forgets them all: a forgotten hint
 /// costs one list, never an answer.
 const LOCATED_MAX: usize = 4096;
@@ -109,6 +114,15 @@ pub const FLOOR_CRD_FILE_NAME: &str = "mediatore.io_policyfloors.yaml";
 pub struct RecordStatus {
     /// The claim's UID (banlieue's `VirtualMachineClaim`), the key of the record.
     pub claim_uid: String,
+    /// The `metadata.uid` of the sandbox the record was written for (ADR-0057 decision 7),
+    /// set when the record is created and compared with the object on every read: a record
+    /// that names another object is not this object's record. Absent on a record written
+    /// before the ADR, which is read until its claim ends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_uid: Option<String>,
+    /// The namespace of that sandbox, written and compared with `sandboxUid`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
     /// When the record was created.
     pub created_at: Time,
     /// The bind deadline, once bound.
@@ -457,7 +471,16 @@ impl KubeStore {
         Ok(rec)
     }
 
-    /// Write `status.record` for `sb` from `rec`, and the labels the lookups need.
+    /// Write `status.record` for `sb` from `rec`, and the labels the lookups need: the
+    /// labels, then the status, each a merge patch conditional on the version the object is
+    /// at (ADR-0057 decision 2). The first patch names the `resourceVersion` `sb` was read at
+    /// and the second the one the first returned, so the chain holds from the caller's read to
+    /// the record: a write of the object in between, by anyone, is a `409` here and a
+    /// `Conflict` to the caller, with the record unwritten.
+    ///
+    /// The binding (`sandboxUid`, `namespace`, decision 7) is written from the object when the
+    /// sandbox carries no record yet, and carried over as it is stored otherwise: an update
+    /// never gives a record a binding it was not created with.
     ///
     /// A patch that would set nothing is not sent: the labels patch when `sb`, as read,
     /// already carries every label it would set with the same value, the status patch when
@@ -467,6 +490,11 @@ impl KubeStore {
     async fn write_record(&self, sb: &AgentSandbox, rec: &ClaimRecord) -> Result<(), StoreError> {
         let name = sb.name_any();
         let name = name.as_str();
+        let Some(mut read_at) = sb.metadata.resource_version.clone() else {
+            return Err(StoreError::Conflict(format!(
+                "sandbox {name} was read with no resourceVersion"
+            )));
+        };
         let mut labels: BTreeMap<&str, String> = BTreeMap::new();
         labels.insert(CLAIM_UID_LABEL, rec.uid.to_string());
         if let Some(node) = &rec.node_id {
@@ -474,56 +502,69 @@ impl KubeStore {
         }
         let carried = sb.labels();
         if !labels.iter().all(|(k, v)| carried.get(*k) == Some(v)) {
-            self.sandboxes_of(sb)
-                .patch(
-                    name,
-                    &PatchParams::default(),
-                    &Patch::Merge(serde_json::json!({ "metadata": { "labels": labels } })),
-                )
+            let patch = serde_json::json!({
+                "metadata": { "resourceVersion": read_at, "labels": labels },
+            });
+            let patched = self
+                .sandboxes_of(sb)
+                .patch(name, &PatchParams::default(), &Patch::Merge(patch))
                 .await
-                .map_err(|e| backend(&e))?;
+                .map_err(|e| conditional(&e, name))?;
+            read_at = patched.metadata.resource_version.ok_or_else(|| {
+                StoreError::Backend(format!(
+                    "sandbox {name}: a patch returned no resourceVersion"
+                ))
+            })?;
         }
-        let record = record_status_from(rec);
-        if record_status_of(sb) != Some(&record) {
+        let mut record = record_status_from(rec);
+        if let Some(held) = stored_record_of(sb) {
+            record.sandbox_uid.clone_from(&held.sandbox_uid);
+            record.namespace.clone_from(&held.namespace);
+        } else {
+            record.sandbox_uid.clone_from(&sb.metadata.uid);
+            record.namespace.clone_from(&sb.metadata.namespace);
+        }
+        if stored_record_of(sb) != Some(&record) {
+            let patch = serde_json::json!({
+                "metadata": { "resourceVersion": read_at },
+                "status": { "record": record },
+            });
             self.sandboxes_of(sb)
-                .patch_status(
-                    name,
-                    &PatchParams::default(),
-                    &Patch::Merge(serde_json::json!({ "status": { "record": record } })),
-                )
+                .patch_status(name, &PatchParams::default(), &Patch::Merge(patch))
                 .await
-                .map_err(|e| backend(&e))?;
+                .map_err(|e| conditional(&e, name))?;
         }
         Ok(())
     }
 
     /// Put `rec.refresh` and every delegation where the record keeps them: the sandbox's
     /// session Secrets, written as the record's own (`claimed`) and owned by the sandbox;
-    /// an envelope gone from the record (revoked) deletes its Secret (ADR-0043 decision 4).
-    async fn write_envelope(&self, sb: &AgentSandbox, rec: &ClaimRecord) -> Result<(), StoreError> {
+    /// an envelope gone from the record deletes its Secret (ADR-0043 decision 4). Always
+    /// after the status (ADR-0057 decision 4). `create` is true for a new record alone: an
+    /// update replaces a Secret in place and never creates one.
+    async fn write_envelope(
+        &self,
+        sb: &AgentSandbox,
+        rec: &ClaimRecord,
+        create: bool,
+    ) -> Result<(), StoreError> {
         let Some(sandbox_uid) = rec.sandbox_uid else {
             return Ok(());
         };
-        self.write_one_envelope(
-            sb,
-            rec,
-            sandbox_uid,
-            None,
-            rec.refresh.as_ref(),
-            Some(session_expiry(rec)),
-        )
-        .await?;
+        let session = EnvelopeSlot {
+            audience: None,
+            sealed: rec.refresh.as_ref(),
+            expires_at: Some(session_expiry(rec)),
+        };
+        self.write_one_envelope(sb, rec, &session, create).await?;
         // The delegations the record carries, then the Secrets of any it no longer does.
         for (audience, d) in &rec.delegations {
-            self.write_one_envelope(
-                sb,
-                rec,
-                sandbox_uid,
-                Some(audience),
-                Some(&d.envelope),
-                d.expires_at,
-            )
-            .await?;
+            let slot = EnvelopeSlot {
+                audience: Some(audience.as_str()),
+                sealed: Some(&d.envelope),
+                expires_at: d.expires_at,
+            };
+            self.write_one_envelope(sb, rec, &slot, create).await?;
         }
         let held = self
             .secrets()
@@ -543,77 +584,65 @@ impl KubeStore {
                 continue;
             };
             if !rec.delegations.contains_key(&audience) {
-                self.write_one_envelope(sb, rec, sandbox_uid, Some(&audience), None, None)
-                    .await?;
+                let slot = EnvelopeSlot {
+                    audience: Some(audience.as_str()),
+                    sealed: None,
+                    expires_at: None,
+                };
+                self.write_one_envelope(sb, rec, &slot, create).await?;
             }
         }
         Ok(())
     }
 
-    /// One Secret: the issuer's session (`audience` `None`) or a delegation's.
+    /// One Secret: the issuer's session (`slot.audience` `None`) or a delegation's.
+    ///
+    /// With `create` false (an update, ADR-0057 decision 4) a Secret that is absent is an
+    /// envelope a release or the sweep deleted, and it stays deleted: the write is a
+    /// `Conflict`. The replace is a `PATCH`, which the API server answers `404` for an object
+    /// deleted since the read, so no interleaving creates one either.
     async fn write_one_envelope(
         &self,
         sb: &AgentSandbox,
         rec: &ClaimRecord,
-        sandbox_uid: Uuid,
-        audience: Option<&str>,
-        sealed: Option<&Sealed>,
-        expires_at: Option<Timestamp>,
+        slot: &EnvelopeSlot<'_>,
+        create: bool,
     ) -> Result<(), StoreError> {
+        let Some(sandbox_uid) = rec.sandbox_uid else {
+            return Ok(());
+        };
+        let (audience, sealed, expires_at) = (slot.audience, slot.sealed, slot.expires_at);
         let name = match audience {
             Some(a) => delegation_name(sandbox_uid, a),
             None => session_name(sandbox_uid),
+        };
+        let gone = || {
+            StoreError::Conflict(format!(
+                "claim {}: an envelope's Secret is gone, and an update never creates one",
+                rec.uid
+            ))
         };
         let api = self.secrets();
         let existing = api.get_opt(&name).await.map_err(|e| backend(&e))?;
         match (envelope_write(sealed.is_some(), existing.is_some()), sealed) {
             (EnvelopeWrite::Replace, Some(sealed)) => {
-                let owners = owner_refs(&self.home, sb);
-                // The issuer session's expiry only ever moves later here: it was parked with
-                // the claim's creation plus its TTL, and the bind starts the claim's clock
-                // after that, so the Secret follows the record's deadline (and one written
-                // before it had an expiry gets one). A delegation's is the caller's and is
-                // written once, when it is parked.
-                let later = expires_at.filter(|wanted| {
-                    audience.is_none()
-                        && existing
-                            .as_ref()
-                            .and_then(expiry_of)
-                            .is_none_or(|held| held < *wanted)
-                });
-                // Everything the patch would set, already there on the Secret just read: the
-                // envelope, the `claimed` label, (when the sandbox owns it) the owner
-                // references and the expiry. Then the patch is not sent, the same accepted
-                // difference as `write_record`'s; any one of them differing sends the whole
-                // patch.
-                let unchanged = later.is_none()
-                    && existing.as_ref().is_some_and(|held| {
-                        envelope_of(held).as_ref() == Some(sealed)
-                            && held.labels().get(SESSION_LABEL).map(String::as_str)
-                                == Some("claimed")
-                            && owners
-                                .as_ref()
-                                .is_none_or(|o| held.metadata.owner_references.as_ref() == Some(o))
+                let landed = if let Some(held) = existing.as_ref() {
+                    self.replace_envelope(sb, &name, held, slot, sealed).await?
+                } else {
+                    false
+                };
+                if !landed {
+                    // Deleted since the read above: a patch creates nothing.
+                    return Err(if create {
+                        StoreError::Backend(format!(
+                            "Secret {name} was deleted while a new record's envelope was written"
+                        ))
+                    } else {
+                        gone()
                     });
-                if !unchanged {
-                    let mut metadata =
-                        serde_json::json!({ "labels": { SESSION_LABEL: "claimed" } });
-                    if let Some(owners) = owners {
-                        metadata["ownerReferences"] = serde_json::json!(owners);
-                    }
-                    let mut data = envelope_data(sealed);
-                    if let Some(later) = later {
-                        data["expires_at"] = expiry_data(later);
-                    }
-                    let patch = serde_json::json!({
-                        "metadata": metadata,
-                        "data": data,
-                    });
-                    api.patch(&name, &PatchParams::default(), &Patch::Merge(patch))
-                        .await
-                        .map_err(|e| backend(&e))?;
                 }
             }
+            (EnvelopeWrite::Create, Some(_)) if !create => return Err(gone()),
             (EnvelopeWrite::Create, Some(sealed)) => {
                 let mut secret = session_secret(
                     &SessionRecord {
@@ -642,6 +671,86 @@ impl KubeStore {
                 }
             }
             _ => {}
+        }
+        Ok(())
+    }
+
+    /// Replace in place the envelope the Secret `name` holds, read as `held`, by `sealed`.
+    /// `Ok(false)` when the Secret was deleted since it was read: the `PATCH` is a `404` and
+    /// nothing is created.
+    async fn replace_envelope(
+        &self,
+        sb: &AgentSandbox,
+        name: &str,
+        held: &Secret,
+        slot: &EnvelopeSlot<'_>,
+        sealed: &Sealed,
+    ) -> Result<bool, StoreError> {
+        let owners = owner_refs(&self.home, sb);
+        // The issuer session's expiry only ever moves later here: it was parked with the
+        // claim's creation plus its TTL, and the bind starts the claim's clock after that, so
+        // the Secret follows the record's deadline (and one written before it had an expiry
+        // gets one). A delegation's is the caller's and is written once, when it is parked.
+        let later = slot.expires_at.filter(|wanted| {
+            slot.audience.is_none() && expiry_of(held).is_none_or(|stored| stored < *wanted)
+        });
+        // Everything the patch would set, already there on the Secret just read: the
+        // envelope, the `claimed` label, (when the sandbox owns it) the owner references and
+        // the expiry. Then the patch is not sent, the same accepted difference as
+        // `write_record`'s; any one of them differing sends the whole patch.
+        let unchanged = later.is_none()
+            && envelope_of(held).as_ref() == Some(sealed)
+            && held.labels().get(SESSION_LABEL).map(String::as_str) == Some("claimed")
+            && owners
+                .as_ref()
+                .is_none_or(|o| held.metadata.owner_references.as_ref() == Some(o));
+        if unchanged {
+            return Ok(true);
+        }
+        let mut metadata = serde_json::json!({ "labels": { SESSION_LABEL: "claimed" } });
+        if let Some(owners) = owners {
+            metadata["ownerReferences"] = serde_json::json!(owners);
+        }
+        let mut data = envelope_data(sealed);
+        if let Some(later) = later {
+            data["expires_at"] = expiry_data(later);
+        }
+        let patch = serde_json::json!({ "metadata": metadata, "data": data });
+        match self
+            .secrets()
+            .patch(name, &PatchParams::default(), &Patch::Merge(patch))
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(e) if is_not_found(&e) => Ok(false),
+            Err(e) => Err(backend(&e)),
+        }
+    }
+
+    /// Every session Secret kept for a sandbox, parked or claimed: the issuer's session and
+    /// each delegation, by the session label. What a release removes (ADR-0057 decision 4).
+    /// The output's segments carry the sandbox's UID too and are not sessions: they stay for
+    /// the retention window (ADR-0045 decision 7) and go with [`Self::delete_secrets_of`].
+    async fn delete_sessions_of(&self, sandbox_uid: Uuid) -> Result<(), StoreError> {
+        let held = self
+            .secrets()
+            .list(&ListParams::default().labels(&format!(
+                "{SANDBOX_UID_LABEL}={sandbox_uid},{SESSION_LABEL}"
+            )))
+            .await
+            .map_err(|e| backend(&e))?;
+        let mut names: Vec<String> = held.items.iter().map(ResourceExt::name_any).collect();
+        // The session by name too, for one written before the label existed.
+        let by_name = session_name(sandbox_uid);
+        if !names.contains(&by_name) {
+            names.push(by_name);
+        }
+        for name in &names {
+            match self.secrets().delete(name, &DeleteParams::default()).await {
+                Ok(_) => {}
+                Err(e) if is_not_found(&e) => {}
+                Err(e) => return Err(backend(&e)),
+            }
         }
         Ok(())
     }
@@ -951,14 +1060,73 @@ impl KubeStore {
     }
 }
 
-/// The record's part of the status, if the sandbox has one.
-#[must_use]
-pub fn record_status_of(sb: &AgentSandbox) -> Option<&RecordStatus> {
+/// What is stored at `status.record`, whoever it names. For the writes, which compare with
+/// and refuse over whatever is there; a read goes through [`record_status_of`].
+fn stored_record_of(sb: &AgentSandbox) -> Option<&RecordStatus> {
     sb.status.as_ref()?.record.as_ref()
 }
 
+/// How a stored record stands to the object it is on (ADR-0057 decision 7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Binding {
+    /// It names this object: its UID and its namespace.
+    Own,
+    /// It names nothing: written before the ADR. Read as before, until its claim ends.
+    Unbound,
+    /// It names another object, or only half of one: not a record of this sandbox.
+    Foreign,
+}
+
+/// Compare what `status` names with `sb`. A missing field is never a match: both absent is a
+/// record from before the ADR, and anything else must equal the object's own `metadata.uid`
+/// and `metadata.namespace`, both of which the object must have.
+fn binding_of(sb: &AgentSandbox, status: &RecordStatus) -> Binding {
+    match (status.sandbox_uid.as_deref(), status.namespace.as_deref()) {
+        (None, None) => Binding::Unbound,
+        (Some(uid), Some(namespace))
+            if sb.metadata.uid.as_deref() == Some(uid)
+                && sb.metadata.namespace.as_deref() == Some(namespace) =>
+        {
+            Binding::Own
+        }
+        _ => Binding::Foreign,
+    }
+}
+
+/// The record's part of the status, if the sandbox has one that is its own. A record that
+/// names another sandbox (a status carried onto this object by a restore or a copied
+/// manifest) is not a record (ADR-0057 decision 7): `None`, said at `warn` with the sandbox,
+/// the claim and the two UIDs. Not a cryptographic check: a writer of statuses can write the
+/// right UID.
+#[must_use]
+pub fn record_status_of(sb: &AgentSandbox) -> Option<&RecordStatus> {
+    let status = stored_record_of(sb)?;
+    if binding_of(sb, status) == Binding::Foreign {
+        tracing::warn!(
+            sandbox = %sb.name_any(),
+            namespace = sb.metadata.namespace.as_deref().unwrap_or("-"),
+            claim_uid = %status.claim_uid,
+            sandbox_uid = sb.metadata.uid.as_deref().unwrap_or("-"),
+            record_sandbox_uid = status.sandbox_uid.as_deref().unwrap_or("-"),
+            record_namespace = status.namespace.as_deref().unwrap_or("-"),
+            "status.record names another sandbox; not read as this sandbox's record (ADR-0057 decision 7)"
+        );
+        return None;
+    }
+    Some(status)
+}
+
+/// Whether `sb` carries a `status.record` that is not its own: one that names another
+/// sandbox, or only half of one (ADR-0057 decision 7). False without a record, for the
+/// sandbox's own record and for one written before the ADR. For the reconciler, which fails
+/// such a sandbox before anything is consumed for it; says nothing itself.
+pub(crate) fn carries_foreign_record(sb: &AgentSandbox) -> bool {
+    stored_record_of(sb).is_some_and(|status| binding_of(sb, status) == Binding::Foreign)
+}
+
 /// Whether `sb` is the sandbox of claim `uid` as the label lookup means it: it carries the
-/// claim's label with that value, and its record is that claim's.
+/// claim's label with that value, and its record is that claim's and names this sandbox
+/// ([`record_status_of`]).
 fn carries_claim(sb: &AgentSandbox, uid: Uuid) -> bool {
     let uid = uid.to_string();
     sb.labels().get(CLAIM_UID_LABEL) == Some(&uid)
@@ -1065,6 +1233,8 @@ impl SealedBlob {
                 key_id: line.key_id,
                 nonce: b64.decode(line.nonce).ok()?,
                 ciphertext,
+                // Not a session envelope: the output's context does not depend on the marker.
+                format: FORMAT_BARE_UID,
             },
         })
     }
@@ -1458,6 +1628,19 @@ fn backend(e: &kube::Error) -> StoreError {
     StoreError::Backend(e.to_string())
 }
 
+/// The error of a conditional write of sandbox `name` (ADR-0057 decision 2): a `409` is the
+/// precondition failing, the object having moved since it was read, and a `Conflict` to the
+/// caller, as it is for a floor.
+fn conditional(e: &kube::Error, name: &str) -> StoreError {
+    if is_conflict(e) {
+        StoreError::Conflict(format!("sandbox {name} moved since it was read"))
+    } else if is_not_found(e) {
+        StoreError::NotFound(name.to_owned())
+    } else {
+        backend(e)
+    }
+}
+
 fn is_conflict(e: &kube::Error) -> bool {
     matches!(e, kube::Error::Api(a) if a.code == 409)
 }
@@ -1470,9 +1653,13 @@ fn time_of(t: Timestamp) -> Time {
     Time(t)
 }
 
+/// `rec` as `status.record` spells it, without the binding to its sandbox.
 fn record_status_from(rec: &ClaimRecord) -> RecordStatus {
     RecordStatus {
         claim_uid: rec.uid.to_string(),
+        // The binding is the object's, not the record's: `write_record` sets it.
+        sandbox_uid: None,
+        namespace: None,
         created_at: time_of(rec.created_at),
         expires_at: rec.expires_at.map(time_of),
         revoked_at: rec.revoked_at.map(time_of),
@@ -1503,7 +1690,9 @@ pub(crate) fn namespace_of(sb: &AgentSandbox) -> String {
         .unwrap_or_else(|| mediatore_store::FALLBACK_NAMESPACE.to_owned())
 }
 
-/// The record a sandbox and its `status.record` describe, without the envelope.
+/// The record a sandbox and its `status.record` describe, without the envelope, at the
+/// version the sandbox was read at (ADR-0057 decision 1). `status` is the sandbox's own
+/// ([`record_status_of`]).
 fn record_from(sb: &AgentSandbox, status: &RecordStatus) -> Result<ClaimRecord, StoreError> {
     let uid = Uuid::parse_str(&status.claim_uid)
         .map_err(|e| StoreError::Backend(format!("status.record.claimUid: {e}")))?;
@@ -1534,7 +1723,21 @@ fn record_from(sb: &AgentSandbox, status: &RecordStatus) -> Result<ClaimRecord, 
             .clone()
             .and_then(|v| serde_json::from_value::<WorkloadExit>(v).ok()),
         delegations: BTreeMap::new(),
+        version: sb
+            .metadata
+            .resource_version
+            .as_deref()
+            .map(RecordVersion::new),
     })
+}
+
+/// One envelope of a record and where it is kept: the issuer's session (`audience` `None`)
+/// or a delegation's, the envelope the record carries for it (`None`: it carries none, the
+/// Secret goes), and the expiry its Secret is to carry.
+struct EnvelopeSlot<'a> {
+    audience: Option<&'a str>,
+    sealed: Option<&'a Sealed>,
+    expires_at: Option<Timestamp>,
 }
 
 /// The owner reference a session Secret in `home` carries: its sandbox, when the sandbox
@@ -1563,7 +1766,8 @@ fn owner_of(sb: &AgentSandbox) -> OwnerReference {
 enum EnvelopeWrite {
     /// The record carries it and the Secret exists: replace its data.
     Replace,
-    /// The record carries it and no Secret exists: create one.
+    /// The record carries it and no Secret exists: create one, for a new record only
+    /// (ADR-0057 decision 4: an update never creates a Secret).
     Create,
     /// The record no longer carries it (a released claim) and a Secret exists: delete the object, so no empty
     /// marker outlives the claim.
@@ -1581,14 +1785,33 @@ fn envelope_write(carried: bool, exists: bool) -> EnvelopeWrite {
     }
 }
 
+/// An envelope as a merge patch of a Secret's `data` spells it. The format marker (ADR-0057
+/// decision 10) is a key of its own, absent for format 1: the patch names it either way, so a
+/// format 2 envelope replacing a format 1 one gains it and the reverse would lose it.
 fn envelope_data(sealed: &Sealed) -> serde_json::Value {
     use base64::Engine as _;
     let b64 = base64::engine::general_purpose::STANDARD;
+    let format = if sealed.format == FORMAT_BARE_UID {
+        serde_json::Value::Null
+    } else {
+        b64.encode(sealed.format.to_string()).into()
+    };
     serde_json::json!({
         "key_id": b64.encode(sealed.key_id.as_bytes()),
         "nonce": b64.encode(&sealed.nonce),
         "ciphertext": b64.encode(&sealed.ciphertext),
+        FORMAT_KEY: format,
     })
+}
+
+/// The format marker of the envelope a Secret holds: 1 when the key is absent, the number
+/// when it reads as one, and `None` when it is there and is no number (then the Secret holds
+/// no envelope this broker can open, and none is read from it).
+fn format_of(data: &BTreeMap<String, ByteString>) -> Option<u8> {
+    match data.get(FORMAT_KEY) {
+        None => Some(FORMAT_BARE_UID),
+        Some(raw) => std::str::from_utf8(&raw.0).ok()?.parse().ok(),
+    }
 }
 
 /// When the issuer session's envelope stops being stored (ADR-0043 decision 4, the rule the
@@ -1622,6 +1845,7 @@ fn envelope_of(secret: &Secret) -> Option<Sealed> {
         key_id,
         nonce: data.get("nonce")?.0.clone(),
         ciphertext: data.get("ciphertext")?.0.clone(),
+        format: format_of(data)?,
     })
 }
 
@@ -1661,6 +1885,12 @@ fn session_secret(rec: &SessionRecord, state: &str) -> Secret {
         "ciphertext".to_owned(),
         ByteString(sealed.ciphertext.clone()),
     );
+    if sealed.format != FORMAT_BARE_UID {
+        data.insert(
+            FORMAT_KEY.to_owned(),
+            ByteString(sealed.format.to_string().into_bytes()),
+        );
+    }
     let mut secret = Secret::default();
     let mut labels = BTreeMap::from([
         (SANDBOX_UID_LABEL.to_owned(), sandbox_uid.to_string()),
@@ -1881,15 +2111,37 @@ impl LogStore for KubeStore {
 #[async_trait]
 impl ClaimStore for KubeStore {
     async fn put_claim(&self, rec: ClaimRecord) -> Result<(), StoreError> {
-        let sb = self.sandbox_for(&rec).await?;
-        if record_status_of(&sb).is_some() {
-            return Err(StoreError::Conflict(rec.uid.to_string()));
+        // The labels, then the record, then the Secrets (ADR-0057 decision 4). The record is
+        // conditional on the sandbox still carrying none: a version that moved under the
+        // write for another reason (the mirror, a label) is read again and tried again here,
+        // with the record in hand, because the parked session was taken to build it and an
+        // error returned for that would lose it.
+        for _ in 0..MODIFY_ATTEMPTS {
+            let sb = self.sandbox_for(&rec).await?;
+            // Whatever is stored there, this sandbox's own or one that names another
+            // (decision 7): a second record is never written over a first.
+            if stored_record_of(&sb).is_some() {
+                return Err(StoreError::Conflict(rec.uid.to_string()));
+            }
+            if self.sandbox_of_claim(rec.uid).await.is_ok() {
+                return Err(StoreError::Conflict(rec.uid.to_string()));
+            }
+            if sb.metadata.uid.is_none() || sb.metadata.namespace.is_none() {
+                return Err(StoreError::Backend(format!(
+                    "sandbox {} has no uid or no namespace to bind a record to",
+                    sb.name_any()
+                )));
+            }
+            match self.write_record(&sb, &rec).await {
+                Ok(()) => return self.write_envelope(&sb, &rec, true).await,
+                Err(StoreError::Conflict(_)) => {}
+                Err(e) => return Err(e),
+            }
         }
-        if self.sandbox_of_claim(rec.uid).await.is_ok() {
-            return Err(StoreError::Conflict(rec.uid.to_string()));
-        }
-        self.write_envelope(&sb, &rec).await?;
-        self.write_record(&sb, &rec).await
+        Err(StoreError::Conflict(format!(
+            "claim {}: its sandbox moved under {MODIFY_ATTEMPTS} attempts to write the record",
+            rec.uid
+        )))
     }
 
     async fn get_claim(&self, uid: Uuid) -> Result<ClaimRecord, StoreError> {
@@ -1919,35 +2171,81 @@ impl ClaimStore for KubeStore {
     }
 
     async fn update_claim(&self, rec: ClaimRecord) -> Result<(), StoreError> {
-        // The sandbox is read here, now, and its record decides: a released claim is final.
-        // `rec` may be a copy read before the release (a guest's report, a refresh, a bind),
-        // and writing it would create again the session and delegation Secrets the release
-        // deleted and clear `revokedAt`. So nothing is written, neither Secret nor status.
-        //
-        // Not closed: a release landing between this read and the writes below. That takes
-        // a compare-and-set on the resource's `resourceVersion`, a change to the storage
-        // contract that needs its ADR; until then the envelope sweep deletes what such a
-        // write leaves on a released record (`sweep_sessions`).
+        // The sandbox is read here, now, and its record decides: a released claim is final,
+        // whatever version `rec` names. `rec` may be a copy read before the release (a guest's
+        // report, a refresh, a bind), and writing it would clear `revokedAt` and put the
+        // refresh material back. So nothing is written, neither Secret nor status.
         let sb = self.sandbox_of_claim(rec.uid).await?;
-        if record_status_of(&sb).is_some_and(|held| held.revoked_at.is_some()) {
+        if stored_record_of(&sb).is_some_and(|held| held.revoked_at.is_some()) {
             return Err(StoreError::Conflict(format!(
                 "claim {} is released",
                 rec.uid
             )));
         }
+        // Compare and set (ADR-0057 decision 2): `rec` is written only while the sandbox is
+        // still at the version `rec` was read at. Compared here, and named again in each
+        // patch `write_record` sends, where the API server checks it: a release landing
+        // after this read moves the version and the patch is a 409.
+        let Some(read_at) = rec.version.as_ref() else {
+            return Err(StoreError::Conflict(format!(
+                "claim {}: an update of a record that carries no version",
+                rec.uid
+            )));
+        };
+        if sb.metadata.resource_version.as_deref() != Some(read_at.as_str()) {
+            return Err(StoreError::Conflict(format!(
+                "claim {} moved since it was read",
+                rec.uid
+            )));
+        }
         // The status first: a refused or failed status write then leaves no Secret behind.
+        // An update that changes only an envelope sends no status patch; the read and the
+        // comparison above are its check, and the Secret is replaced in place, never created.
         self.write_record(&sb, &rec).await?;
-        self.write_envelope(&sb, &rec).await
+        self.write_envelope(&sb, &rec, false).await
     }
 
     async fn revoke_claim(&self, uid: Uuid, at: Timestamp) -> Result<(), StoreError> {
         let sb = self.sandbox_of_claim(uid).await?;
-        let mut rec = self.record_of(&sb).await?;
-        rec.revoked_at.get_or_insert(at);
-        rec.refresh = None;
-        rec.delegations.clear();
-        self.write_envelope(&sb, &rec).await?;
-        self.write_record(&sb, &rec).await
+        let Some(held) = record_status_of(&sb) else {
+            return Err(StoreError::NotFound(uid.to_string()));
+        };
+        // The status first (ADR-0057 decision 4), as a patch that names only what a release
+        // sets and no resource version (decision 3): it lands over whatever was written
+        // before it, and moves the version every earlier decision was read at. `revokedAt`
+        // is set when the record read here has none, so a release of a released record keeps
+        // the first timestamp. No sealer is involved: a release never waits on one.
+        let settled = held.revoked_at.is_some() && !held.refresh && held.delegations.is_empty();
+        if !settled {
+            let mut record = serde_json::json!({ "refresh": false, "delegations": null });
+            if held.revoked_at.is_none() {
+                record["revokedAt"] = serde_json::to_value(time_of(at))
+                    .map_err(|e| StoreError::Backend(e.to_string()))?;
+            }
+            let name = sb.name_any();
+            self.sandboxes_of(&sb)
+                .patch_status(
+                    &name,
+                    &PatchParams::default(),
+                    &Patch::Merge(serde_json::json!({ "status": { "record": record } })),
+                )
+                .await
+                .map_err(|e| {
+                    if is_not_found(&e) {
+                        StoreError::NotFound(uid.to_string())
+                    } else {
+                        backend(&e)
+                    }
+                })?;
+        }
+        // Then the Secrets, on every release: one of an already released record finishes
+        // what a failed first attempt left. Between the two steps a Secret can exist beside
+        // a released record; nothing issues from it, and the envelope sweep removes it if
+        // this deletion never completes.
+        if let Some(sandbox_uid) = sandbox_uid_of(&sb) {
+            self.delete_sessions_of(sandbox_uid).await?;
+        }
+        Ok(())
     }
 
     async fn get_claim_by_node(&self, node_id: &str) -> Result<ClaimRecord, StoreError> {
@@ -2275,8 +2573,8 @@ impl ClaimStore for KubeStore {
             let orphan = sandbox.is_none() && session.created_at < before;
             // The claim may still issue: not released, and unbound or before its deadline.
             let live = record.is_some_and(|r| r.is_live(now));
-            // The claim is over. Its release deleted these; one that is here all the same (the delete failed, the
-            // deadline passed with no release, or a writer raced the release, see `update_claim`) goes now.
+            // The claim is over. Its release deleted these; one that is here all the same (the delete failed, or the
+            // deadline passed with no release) goes now.
             let ended = record.is_some_and(|r| !r.is_live(now));
             let due = match state {
                 // Old (the grace period, which an orphan is past too) or expired (ADR-0043 decision 4); the same
@@ -2431,7 +2729,11 @@ mod tests {
     /// does where the store depends on it: a read by name honours the namespace and the name
     /// and is a 404 for an unknown one, a list honours its namespace and label selector, a
     /// merge patch is applied (the status only through the status subresource), a delete
-    /// waits on finalizers, and a metadata-only list carries no data.
+    /// waits on finalizers, and a metadata-only list carries no data. Every sandbox has a
+    /// `resourceVersion` that each write which changes it moves, and a patch that names
+    /// another one is a `409` (ADR-0057 decision 6): a fake that took a stale write would
+    /// hide exactly what the store's compare-and-set is for. A patch of a Secret that is gone
+    /// is a `404`: a patch creates nothing.
     mod fake {
         use super::*;
         use http::{Request, Response};
@@ -2450,6 +2752,12 @@ mod tests {
             pub log: Vec<(String, String)>,
             /// The paths of the lists that asked for metadata only.
             pub metadata_lists: Vec<String>,
+            /// Every patch, in order: the path and the body as sent.
+            pub patches: Vec<(String, serde_json::Value)>,
+            /// How many of the next sandbox patches find that another writer got in first:
+            /// the object's `resourceVersion` is moved before the patch's own precondition is
+            /// checked, as a mirror's patch landing between a read and a write would move it.
+            pub moves_before_patch: usize,
         }
 
         /// A store over the fake API server, sealing output with a local key.
@@ -2578,6 +2886,9 @@ mod tests {
                 .split('&')
                 .find_map(|p| p.strip_prefix("labelSelector="))
                 .unwrap_or("");
+            if call.method == "PATCH" {
+                st.patches.push((call.path.to_owned(), sent.clone()));
+            }
             if call.path.contains("/agentsandboxes") {
                 answer_sandbox(st, call, selector, &sent)
             } else {
@@ -2593,6 +2904,13 @@ mod tests {
             selector: &str,
             sent: &serde_json::Value,
         ) -> (u16, serde_json::Value) {
+            // No object on an API server is without a `resourceVersion`: one a test put into
+            // the state without is at its first.
+            for sb in &mut st.sandboxes {
+                if sb["metadata"]["resourceVersion"].is_null() {
+                    sb["metadata"]["resourceVersion"] = "1".into();
+                }
+            }
             let (head, tail) = call
                 .path
                 .split_once("/agentsandboxes")
@@ -2632,26 +2950,7 @@ mod tests {
             };
             match call.method {
                 "GET" => (200, st.sandboxes[i].clone()),
-                "PATCH" => {
-                    // The status moves through its subresource alone, and nothing else does.
-                    if subresource {
-                        merge(&mut st.sandboxes[i]["status"], &sent["status"]);
-                    } else {
-                        let mut patch = sent.clone();
-                        if let Some(map) = patch.as_object_mut() {
-                            map.remove("status");
-                        }
-                        merge(&mut st.sandboxes[i], &patch);
-                    }
-                    let sb = st.sandboxes[i].clone();
-                    let released = sb["metadata"]["finalizers"]
-                        .as_array()
-                        .is_none_or(Vec::is_empty);
-                    if released && !sb["metadata"]["deletionTimestamp"].is_null() {
-                        st.sandboxes.remove(i);
-                    }
-                    (200, sb)
-                }
+                "PATCH" => patch_sandbox(st, i, subresource, sent),
                 "DELETE" => {
                     // Held by a finalizer: marked, and gone when the last one is released.
                     let finalized = st.sandboxes[i]["metadata"]["finalizers"]
@@ -2667,6 +2966,117 @@ mod tests {
                 }
                 _ => status(500, "InternalError", "unexpected request on a sandbox"),
             }
+        }
+
+        /// A merge patch of the sandbox at `i`, or of its status through the subresource:
+        /// conditional on the `resourceVersion` it names, if it names one.
+        fn patch_sandbox(
+            st: &mut State,
+            i: usize,
+            subresource: bool,
+            sent: &serde_json::Value,
+        ) -> (u16, serde_json::Value) {
+            if st.moves_before_patch > 0 {
+                st.moves_before_patch -= 1;
+                move_version(&mut st.sandboxes[i]);
+            }
+            // A patch that names a `resourceVersion` is conditional on it, through the
+            // status subresource as anywhere else.
+            let named = &sent["metadata"]["resourceVersion"];
+            if !named.is_null() && *named != st.sandboxes[i]["metadata"]["resourceVersion"] {
+                return conflict("the object has been modified");
+            }
+            let before = st.sandboxes[i].clone();
+            // The status moves through its subresource alone, and nothing else does.
+            if subresource {
+                merge(&mut st.sandboxes[i]["status"], &sent["status"]);
+            } else {
+                let mut patch = sent.clone();
+                if let Some(map) = patch.as_object_mut() {
+                    map.remove("status");
+                }
+                merge(&mut st.sandboxes[i], &patch);
+            }
+            // A patch that changes nothing leaves the resourceVersion alone.
+            if st.sandboxes[i] != before {
+                move_version(&mut st.sandboxes[i]);
+            }
+            let sb = st.sandboxes[i].clone();
+            let released = sb["metadata"]["finalizers"]
+                .as_array()
+                .is_none_or(Vec::is_empty);
+            if released && !sb["metadata"]["deletionTimestamp"].is_null() {
+                st.sandboxes.remove(i);
+            }
+            (200, sb)
+        }
+
+        /// Move an object's `resourceVersion` on, as every write that changes it does.
+        fn move_version(object: &mut serde_json::Value) {
+            let current = object["metadata"]["resourceVersion"]
+                .as_str()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(1);
+            object["metadata"]["resourceVersion"] = (current + 1).to_string().into();
+        }
+
+        /// Another writer wrote the seeded sandbox (the mirror, a label): its
+        /// `resourceVersion` moves and nothing the store reads changes.
+        pub fn touch(st: &mut State) {
+            move_version(&mut st.sandboxes[0]);
+        }
+
+        /// The bodies of the patches sent to a sandbox or its status, in order.
+        pub fn sandbox_patches(st: &State) -> Vec<&serde_json::Value> {
+            st.patches
+                .iter()
+                .filter(|(path, _)| path.contains("/agentsandboxes/"))
+                .map(|(_, body)| body)
+                .collect()
+        }
+
+        /// The requests that were not reads, in order: the verb and the path.
+        pub fn writes(st: &State) -> Vec<(&str, &str)> {
+            st.log
+                .iter()
+                .filter(|(m, _)| m != "GET")
+                .map(|(m, p)| (m.as_str(), p.as_str()))
+                .collect()
+        }
+
+        /// A sandbox `name` of UID `uid` in `namespace`, as the front door creates one: no
+        /// label, no status, at its first `resourceVersion`.
+        pub fn sandbox_named(name: &str, namespace: &str, uid: Uuid) -> serde_json::Value {
+            let mut sb = serde_json::to_value(AgentSandbox::new(
+                name,
+                crate::sandbox::AgentSandboxSpec {
+                    subject: crate::sandbox::SandboxSubject {
+                        issuer: "https://idp.example".into(),
+                        id: "octocat".into(),
+                        display: None,
+                    },
+                    pool_ref: Some(banlieue_api::common::LocalObjectReference {
+                        name: "pool-a".into(),
+                    }),
+                    pool_selector: None,
+                    selection: None,
+                    ttl_seconds: 3600,
+                    audiences: vec![],
+                    workload: crate::sandbox::SandboxWorkload {
+                        image: "registry.internal:5000/x:1".into(),
+                        args: vec!["/bin/x".into()],
+                        restart: None,
+                        logs: false,
+                    },
+                    policy_ref: None,
+                },
+            ))
+            .unwrap();
+            sb["metadata"] = serde_json::json!({
+                "name": name, "namespace": namespace, "uid": uid.to_string(),
+                "resourceVersion": "1", "finalizers": [FINALIZER],
+            });
+            sb
         }
 
         /// What a metadata-only list returns of an object: its metadata, no data.
@@ -2805,6 +3215,7 @@ mod tests {
                         key_id: "k1".into(),
                         nonce: vec![1],
                         ciphertext: vec![2],
+                        format: FORMAT_BARE_UID,
                     },
                     created_at,
                     audience: audience.map(str::to_owned),
@@ -2897,7 +3308,8 @@ mod tests {
         }
 
         /// A sandbox in the tenant namespace with a record, its session Secret and one
-        /// delegation Secret in the home namespace.
+        /// delegation Secret in the home namespace. The record is one written before ADR-0057:
+        /// it names no sandbox, and its envelopes carry no format marker.
         pub fn seed(revoked: bool) -> (Arc<Mutex<State>>, Uuid) {
             let claim = Uuid::new_v4();
             let sandbox = Uuid::new_v4();
@@ -2928,6 +3340,7 @@ mod tests {
             .unwrap();
             sb["metadata"] = serde_json::json!({
                 "name": "sb-1", "namespace": TENANT, "uid": sandbox.to_string(),
+                "resourceVersion": "1",
                 "labels": { CLAIM_UID_LABEL: claim.to_string() },
                 "finalizers": [FINALIZER],
             });
@@ -3217,6 +3630,7 @@ mod tests {
             key_id: "k1".into(),
             nonce: vec![3],
             ciphertext: vec![4],
+            format: FORMAT_BARE_UID,
         };
         rec.refresh = Some(rotated.clone());
         store.update_claim(rec).await.unwrap();
@@ -3240,7 +3654,7 @@ mod tests {
         let store = fake::store(&state);
         let mut rec = store.get_claim(claim).await.unwrap();
         rec.entry_id = Some("entry-1".into());
-        store.update_claim(rec.clone()).await.unwrap();
+        store.update_claim(rec).await.unwrap();
         {
             let st = state.lock().unwrap();
             let patched = fake::patched(&st);
@@ -3248,6 +3662,8 @@ mod tests {
             assert!(patched[0].ends_with("/agentsandboxes/sb-1/status"));
         }
         let node = "spiffe://sandbox.test/spire/agent/tpm/aaaa";
+        // Read again: the copy above is from before its own write (ADR-0057 decision 2).
+        let mut rec = store.get_claim(claim).await.unwrap();
         rec.node_id = Some(node.into());
         store.update_claim(rec).await.unwrap();
         let st = state.lock().unwrap();
@@ -3500,6 +3916,7 @@ mod tests {
             key_id: "k1".into(),
             nonce: vec![3],
             ciphertext: vec![4],
+            format: FORMAT_BARE_UID,
         });
         store.update_claim(rec).await.unwrap();
         let st = state.lock().unwrap();
@@ -3559,24 +3976,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_session_secret_created_for_a_record_carries_the_claims_expiry() {
-        // The Secret is gone (swept, or the session never was parked under this name) and the record carries an
-        // envelope: the Secret created for it is not open-ended.
-        let (state, claim) = fake::seed(false);
+    async fn a_session_secret_created_for_a_new_record_carries_the_claims_expiry() {
+        // No session was parked under this name and the new record carries an envelope: the
+        // Secret a put creates for it is not open-ended. Only a put creates one.
+        let (state, _seeded) = fake::seed(false);
+        unrecorded(&state);
         let sandbox = fake::sandbox_uid(&state.lock().unwrap());
         let name = session_name(sandbox);
         let store = fake::store(&state);
-        let mut rec = store.get_claim(claim).await.unwrap();
-        state
-            .lock()
-            .unwrap()
-            .secrets
-            .retain(|s| s["metadata"]["name"] != name.as_str());
+        let mut rec = test_record(Uuid::new_v4());
+        rec.name = "sb-1".into();
+        rec.namespace = fake::TENANT.into();
+        rec.sandbox_uid = Some(sandbox);
+        rec.refresh = Some(format_2_envelope());
         let deadline = Timestamp::from_second(Timestamp::now().as_second() + 600).unwrap();
         rec.expires_at = Some(deadline);
-        store.update_claim(rec).await.unwrap();
+        store.put_claim(rec).await.unwrap();
         let st = state.lock().unwrap();
-        assert_eq!(st.secrets.len(), 2, "created again beside the delegation");
+        assert_eq!(st.secrets.len(), 1, "created for the new record");
         assert_eq!(fake::expiry(&st, &name), Some(deadline));
     }
 
@@ -3626,6 +4043,7 @@ mod tests {
             key_id: "k1".into(),
             nonce: vec![1, 2, 3],
             ciphertext: vec![9, 9, 9, 9],
+            format: FORMAT_BARE_UID,
         };
         let rec = ClaimRecord {
             uid,
@@ -3654,6 +4072,7 @@ mod tests {
                 },
             }),
             delegations: BTreeMap::new(),
+            version: None,
         };
         let status = record_status_from(&rec);
         assert_eq!(status.claim_uid, uid.to_string());
@@ -3793,6 +4212,7 @@ mod tests {
                     key_id: "k1".into(),
                     nonce: vec![1, 2, 3],
                     ciphertext: vec![9, 9, 9, 9],
+                    format: FORMAT_BARE_UID,
                 },
                 created_at: Timestamp::from_second(1_700_000_000).unwrap(),
                 audience: Some("anthropic".into()),
@@ -3884,6 +4304,7 @@ mod tests {
             report: None,
             exit: None,
             delegations: BTreeMap::new(),
+            version: None,
         }
     }
 
@@ -3900,6 +4321,7 @@ mod tests {
                 key_id: "k".into(),
                 nonce: vec![],
                 ciphertext: b"x".to_vec(),
+                format: FORMAT_BARE_UID,
             },
         });
         seg
@@ -3948,7 +4370,7 @@ mod tests {
 
         async fn seal_with(
             &self,
-            purpose: SealPurpose,
+            purpose: SealPurpose<'_>,
             claim_uid: Uuid,
             plaintext: &[u8],
         ) -> Result<Sealed, SealError> {
@@ -3961,7 +4383,7 @@ mod tests {
 
         async fn unseal_with(
             &self,
-            purpose: SealPurpose,
+            purpose: SealPurpose<'_>,
             claim_uid: Uuid,
             sealed: &Sealed,
         ) -> Result<Vec<u8>, SealError> {
@@ -4981,5 +5403,570 @@ mod tests {
             &logs_segment_name(claim, 3),
             "a new segment after the plaintext one: {names:?}"
         );
+    }
+
+    /// A format 2 envelope, as everything sealed since ADR-0057 is. The store keeps it and
+    /// opens nothing, so the bytes are arbitrary.
+    fn format_2_envelope() -> Sealed {
+        Sealed {
+            key_id: "k1".into(),
+            nonce: vec![3],
+            ciphertext: vec![4],
+            format: mediatore_store::seal::FORMAT_SLOT,
+        }
+    }
+
+    /// A record for a new claim on the seeded sandbox, once it is `unrecorded`.
+    fn new_record_on_seeded(state: &Mutex<fake::State>) -> ClaimRecord {
+        let mut rec = test_record(Uuid::new_v4());
+        rec.name = "sb-1".into();
+        rec.namespace = fake::TENANT.into();
+        rec.sandbox_uid = Some(fake::sandbox_uid(&state.lock().unwrap()));
+        rec
+    }
+
+    /// The keys of a JSON object, sorted.
+    fn keys(v: &serde_json::Value) -> Vec<String> {
+        let mut keys: Vec<String> = v
+            .as_object()
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default();
+        keys.sort();
+        keys
+    }
+
+    #[tokio::test]
+    async fn the_fake_api_server_refuses_a_status_patch_on_a_stale_resource_version() {
+        let (state, _claim) = fake::seed(false);
+        let store = fake::store(&state);
+        let api = store.sandboxes_in(fake::TENANT);
+        let params = PatchParams::default();
+        let version = |sb: AgentSandbox| sb.metadata.resource_version;
+        let read_at = version(api.get("sb-1").await.unwrap()).expect("a resourceVersion");
+        // An unconditional status patch (the mirror's shape) lands and moves the version.
+        let first = serde_json::json!({ "status": { "reason": "first" } });
+        api.patch_status("sb-1", &params, &Patch::Merge(first))
+            .await
+            .unwrap();
+        let moved = version(api.get("sb-1").await.unwrap());
+        assert!(
+            moved.is_some() && moved.as_deref() != Some(read_at.as_str()),
+            "a write moves the resourceVersion"
+        );
+        // A patch naming the version read before it: 409, through the status subresource
+        // and beside it.
+        let late = serde_json::json!({
+            "metadata": { "resourceVersion": read_at }, "status": { "reason": "late" },
+        });
+        let answer = api.patch_status("sb-1", &params, &Patch::Merge(late)).await;
+        let refused = answer.as_ref().is_err_and(is_conflict);
+        assert!(refused, "a stale status patch is a 409");
+        let late = serde_json::json!({
+            "metadata": { "resourceVersion": read_at, "labels": { "late": "yes" } },
+        });
+        let answer = api.patch("sb-1", &params, &Patch::Merge(late)).await;
+        let refused = answer.as_ref().is_err_and(is_conflict);
+        assert!(refused, "a stale patch of the object is a 409");
+        {
+            let st = state.lock().unwrap();
+            assert_eq!(st.sandboxes[0]["status"]["reason"], "first");
+            assert!(st.sandboxes[0]["metadata"]["labels"]["late"].is_null());
+        }
+        // One naming the current version lands; one that changes nothing moves nothing.
+        let current = serde_json::json!({
+            "metadata": { "resourceVersion": moved }, "status": { "reason": "second" },
+        });
+        api.patch_status("sb-1", &params, &Patch::Merge(current))
+            .await
+            .unwrap();
+        let after = version(api.get("sb-1").await.unwrap());
+        assert!(after != moved, "the conditional patch landed and moved it");
+        let again = serde_json::json!({ "status": { "reason": "second" } });
+        api.patch_status("sb-1", &params, &Patch::Merge(again))
+            .await
+            .unwrap();
+        let settled = version(api.get("sb-1").await.unwrap());
+        assert!(
+            settled == after,
+            "a patch that changes nothing leaves the resourceVersion alone"
+        );
+        // And a patch of a Secret that is gone creates nothing: 404.
+        let nothing = serde_json::json!({ "data": {} });
+        let answer = store
+            .secrets()
+            .patch("mediatore-session-gone", &params, &Patch::Merge(nothing))
+            .await;
+        let missing = answer.as_ref().is_err_and(is_not_found);
+        assert!(missing, "a patch of a Secret that is gone is a 404");
+        assert_eq!(state.lock().unwrap().secrets.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn an_update_names_the_resource_version_it_read_and_a_409_is_a_conflict() {
+        let (state, claim) = fake::seed(false);
+        let store = fake::store(&state);
+        let mut rec = store.get_claim(claim).await.unwrap();
+        rec.entry_id = Some("entry-1".into());
+        // Another writer lands between the store's own read and its patch.
+        state.lock().unwrap().moves_before_patch = 1;
+        let refused = matches!(store.update_claim(rec).await, Err(StoreError::Conflict(_)));
+        assert!(refused, "the API server's 409 is a conflict");
+        {
+            let st = state.lock().unwrap();
+            let sent = fake::sandbox_patches(&st);
+            assert_eq!(sent.len(), 1, "the status patch");
+            assert_eq!(
+                sent[0]["metadata"]["resourceVersion"], "1",
+                "it names the version the record was read at"
+            );
+            assert!(
+                st.sandboxes[0]["status"]["record"]["entryId"].is_null(),
+                "and nothing was written"
+            );
+            assert_eq!(st.secrets.len(), 2);
+        }
+        // Read again, decide again: it lands, naming the version read this time.
+        let mut again = store.get_claim(claim).await.unwrap();
+        again.entry_id = Some("entry-1".into());
+        store.update_claim(again).await.unwrap();
+        let st = state.lock().unwrap();
+        let sent = fake::sandbox_patches(&st);
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[1]["metadata"]["resourceVersion"], "2");
+        assert_eq!(st.sandboxes[0]["status"]["record"]["entryId"], "entry-1");
+    }
+
+    #[tokio::test]
+    async fn a_release_patch_names_no_resource_version_and_only_the_fields_it_sets() {
+        let (state, claim) = fake::seed(false);
+        let store = fake::store(&state);
+        // Whatever moved under it: a release carries no precondition, so it lands.
+        state.lock().unwrap().moves_before_patch = 3;
+        store.revoke_claim(claim, Timestamp::now()).await.unwrap();
+        let st = state.lock().unwrap();
+        let sent = fake::sandbox_patches(&st);
+        assert_eq!(sent.len(), 1, "one status patch");
+        assert_eq!(keys(sent[0]), vec!["status"], "no metadata, so no version");
+        assert_eq!(keys(&sent[0]["status"]), vec!["record"]);
+        assert_eq!(
+            keys(&sent[0]["status"]["record"]),
+            vec!["delegations", "refresh", "revokedAt"],
+            "only what a release sets"
+        );
+        let record = &st.sandboxes[0]["status"]["record"];
+        assert!(record["revokedAt"].is_string(), "released");
+        assert_eq!(record["refresh"], false);
+        assert!(record["delegations"].is_null(), "the delegations are gone");
+        let kept = record["claimUid"] == claim.to_string() && record["createdAt"].is_string();
+        assert!(kept, "nothing else of the record was touched");
+    }
+
+    #[tokio::test]
+    async fn a_put_writes_the_labels_then_the_status_then_the_secrets() {
+        let (state, _seeded) = fake::seed(false);
+        unrecorded(&state);
+        let sandbox = fake::sandbox_uid(&state.lock().unwrap());
+        let store = fake::store(&state);
+        let mut rec = new_record_on_seeded(&state);
+        rec.refresh = Some(format_2_envelope());
+        store.put_claim(rec).await.unwrap();
+        {
+            let st = state.lock().unwrap();
+            let writes = fake::writes(&st);
+            assert_eq!(writes.len(), 3, "the labels, the status, one Secret");
+            let labels = writes[0].0 == "PATCH" && writes[0].1.ends_with("/agentsandboxes/sb-1");
+            assert!(labels, "the labels first");
+            let status =
+                writes[1].0 == "PATCH" && writes[1].1.ends_with("/agentsandboxes/sb-1/status");
+            assert!(status, "then the record");
+            let secret = writes[2].0 == "POST" && writes[2].1.ends_with("/secrets");
+            assert!(secret, "then the Secret");
+            let record = &st.sandboxes[0]["status"]["record"];
+            let bound =
+                record["sandboxUid"] == sandbox.to_string() && record["namespace"] == fake::TENANT;
+            assert!(bound, "the record names the sandbox it was written for");
+        }
+
+        // A record that cannot be written leaves no Secret behind: the status goes first.
+        let (state, _seeded) = fake::seed(false);
+        unrecorded(&state);
+        let store = fake::store(&state);
+        let mut rec = new_record_on_seeded(&state);
+        rec.refresh = Some(format_2_envelope());
+        state.lock().unwrap().moves_before_patch = usize::MAX;
+        let refused = matches!(store.put_claim(rec).await, Err(StoreError::Conflict(_)));
+        assert!(refused, "a sandbox that never holds still is a conflict");
+        let st = state.lock().unwrap();
+        assert!(st.secrets.is_empty(), "no Secret without its record");
+        assert!(st.sandboxes[0]["status"]["record"].is_null());
+    }
+
+    #[tokio::test]
+    async fn a_put_retries_a_moved_resource_version_and_keeps_the_session_it_took() {
+        let (state, _seeded) = fake::seed(false);
+        unrecorded(&state);
+        let sandbox = fake::sandbox_uid(&state.lock().unwrap());
+        state.lock().unwrap().secrets.push(fake::session(
+            sandbox,
+            None,
+            "parked",
+            Timestamp::now(),
+            None,
+        ));
+        let store = fake::store(&state);
+        // The reconciler's order: the parked session is taken to build the record.
+        let taken = store.take_session(sandbox).await.unwrap().expect("parked");
+        let mut rec = new_record_on_seeded(&state);
+        rec.refresh = Some(taken.refresh.clone());
+        let claim = rec.uid;
+        // The mirror writes the sandbox twice while the record is on its way.
+        state.lock().unwrap().moves_before_patch = 2;
+        store.put_claim(rec).await.unwrap();
+        let back = store.get_claim(claim).await.unwrap();
+        let kept = back.refresh.as_ref() == Some(&taken.refresh);
+        assert!(kept, "the session taken for the record is the record's");
+        let st = state.lock().unwrap();
+        assert_eq!(st.secrets.len(), 1, "the one Secret, never a second");
+        assert_eq!(
+            fake::sandbox_patches(&st).len(),
+            4,
+            "two refused label patches, then the labels and the status"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_release_marks_the_status_before_it_deletes_the_secrets() {
+        let (state, claim) = fake::seed(false);
+        let store = fake::store(&state);
+        store.revoke_claim(claim, Timestamp::now()).await.unwrap();
+        let st = state.lock().unwrap();
+        let writes = fake::writes(&st);
+        let status_first = writes
+            .first()
+            .is_some_and(|(m, p)| *m == "PATCH" && p.ends_with("/agentsandboxes/sb-1/status"));
+        assert!(status_first, "the status is patched before anything goes");
+        let then_deletes = writes
+            .iter()
+            .skip(1)
+            .all(|(m, p)| *m == "DELETE" && p.contains("/secrets/"));
+        assert!(
+            then_deletes && writes.len() == 3,
+            "then the session and the delegation Secrets are deleted"
+        );
+        assert!(st.secrets.is_empty(), "left: {:?}", fake::secret_names(&st));
+    }
+
+    #[tokio::test]
+    async fn a_release_of_a_released_record_still_deletes_what_is_left() {
+        // A first release marked the status and failed before its deletions: the record
+        // says released and the Secrets are still there.
+        let (state, claim) = fake::seed(true);
+        let store = fake::store(&state);
+        store.revoke_claim(claim, Timestamp::now()).await.unwrap();
+        {
+            let st = state.lock().unwrap();
+            assert!(st.secrets.is_empty(), "the retry finished the deletion");
+            assert_eq!(
+                st.sandboxes[0]["status"]["record"]["revokedAt"], "2026-01-01T01:00:00Z",
+                "the first timestamp stays"
+            );
+            let untouched = fake::sandbox_patches(&st)
+                .iter()
+                .all(|p| p["status"]["record"]["revokedAt"].is_null());
+            assert!(untouched, "no patch names revokedAt again");
+        }
+        // Once nothing is left, another release writes nothing to the sandbox.
+        let before = fake::sandbox_patches(&state.lock().unwrap()).len();
+        store.revoke_claim(claim, Timestamp::now()).await.unwrap();
+        assert_eq!(fake::sandbox_patches(&state.lock().unwrap()).len(), before);
+    }
+
+    #[tokio::test]
+    async fn an_update_never_creates_an_envelope_secret() {
+        // The session Secret went (a release's deletion, the sweep) after the copy was read.
+        // The copy still carries the envelope; writing it must not bring the Secret back.
+        let (state, claim) = fake::seed(false);
+        let sandbox = fake::sandbox_uid(&state.lock().unwrap());
+        let name = session_name(sandbox);
+        let store = fake::store(&state);
+        let mut rec = store.get_claim(claim).await.unwrap();
+        state
+            .lock()
+            .unwrap()
+            .secrets
+            .retain(|s| s["metadata"]["name"] != name.as_str());
+        rec.expires_at = Some(Timestamp::from_second(Timestamp::now().as_second() + 600).unwrap());
+        let refused = matches!(store.update_claim(rec).await, Err(StoreError::Conflict(_)));
+        assert!(
+            refused,
+            "an update whose envelope's Secret is gone is a conflict"
+        );
+        let st = state.lock().unwrap();
+        assert_eq!(
+            st.secrets.len(),
+            1,
+            "only the delegation: nothing was created"
+        );
+        let created = fake::writes(&st).iter().any(|(m, _)| *m == "POST");
+        assert!(!created, "no create was sent");
+    }
+
+    #[tokio::test]
+    async fn an_envelope_only_update_on_a_released_or_moved_record_is_a_conflict() {
+        let (state, claim) = fake::seed(false);
+        let store = fake::store(&state);
+        // Moved: another writer wrote the sandbox after the copy was read.
+        let mut rec = store.get_claim(claim).await.unwrap();
+        rec.refresh = Some(format_2_envelope());
+        {
+            let mut st = state.lock().unwrap();
+            fake::touch(&mut st);
+            st.log.clear();
+        }
+        let refused = matches!(store.update_claim(rec).await, Err(StoreError::Conflict(_)));
+        assert!(refused, "the version moved since the read");
+        let read_only = fake::writes(&state.lock().unwrap()).is_empty();
+        assert!(read_only, "nothing was sent but reads");
+
+        // Released: a release on another replica marked the status after the copy was read.
+        let mut rec = store.get_claim(claim).await.unwrap();
+        rec.refresh = Some(format_2_envelope());
+        {
+            let mut st = state.lock().unwrap();
+            st.sandboxes[0]["status"]["record"]["revokedAt"] = "2026-01-01T01:00:00Z".into();
+            fake::touch(&mut st);
+            st.log.clear();
+        }
+        let refused = matches!(store.update_claim(rec).await, Err(StoreError::Conflict(_)));
+        assert!(refused, "the record is released");
+        let st = state.lock().unwrap();
+        assert!(fake::writes(&st).is_empty(), "nothing was sent but reads");
+        let untouched = st
+            .secrets
+            .iter()
+            .all(|s| s["metadata"]["resourceVersion"] == "1");
+        assert!(untouched, "no Secret was replaced");
+    }
+
+    #[tokio::test]
+    async fn a_record_naming_another_sandbox_is_not_found_and_is_never_overwritten() {
+        let (state, claim) = fake::seed(false);
+        let sandbox = fake::sandbox_uid(&state.lock().unwrap());
+        let store = fake::store(&state);
+        let name_it = |uid: Option<String>, namespace: Option<&str>| {
+            let mut st = state.lock().unwrap();
+            let record = &mut st.sandboxes[0]["status"]["record"];
+            record["sandboxUid"] = uid.map_or(serde_json::Value::Null, Into::into);
+            record["namespace"] = namespace.map_or(serde_json::Value::Null, Into::into);
+            st.log.clear();
+        };
+        // Its own sandbox, in its own namespace: read.
+        name_it(Some(sandbox.to_string()), Some(fake::TENANT));
+        let own = store.get_claim(claim).await.is_ok();
+        assert!(own, "a record naming its own sandbox reads");
+
+        // Another object's UID (a restore under new UIDs, a copied manifest), another
+        // namespace, half a binding: none of them is this sandbox's record. A missing field
+        // is never a match.
+        let foreign = [
+            (Some(Uuid::new_v4().to_string()), Some(fake::TENANT)),
+            (Some(sandbox.to_string()), Some("elsewhere")),
+            (Some(sandbox.to_string()), None),
+            (None, Some(fake::TENANT)),
+        ];
+        for (uid, namespace) in foreign {
+            name_it(uid, namespace);
+            assert!(matches!(
+                store.get_claim(claim).await,
+                Err(StoreError::NotFound(_))
+            ));
+            assert!(matches!(
+                store.get_claim_by_name(fake::TENANT, "sb-1").await,
+                Err(StoreError::NotFound(_))
+            ));
+            assert_eq!(store.list_claims().await.unwrap().len(), 0);
+            assert!(matches!(
+                store.revoke_claim(claim, Timestamp::now()).await,
+                Err(StoreError::NotFound(_))
+            ));
+            // A new record for this sandbox is refused: the first is never written over.
+            let rec = new_record_on_seeded(&state);
+            assert!(matches!(
+                store.put_claim(rec).await,
+                Err(StoreError::Conflict(_))
+            ));
+            let st = state.lock().unwrap();
+            assert!(fake::writes(&st).is_empty(), "nothing was written");
+            let kept = st.sandboxes[0]["status"]["record"]["claimUid"] == claim.to_string();
+            assert!(kept, "the record that was there is still there");
+            assert_eq!(st.secrets.len(), 2, "and so are its Secrets");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_record_without_a_sandbox_uid_still_reads_until_its_claim_ends() {
+        // The seeded record is one a broker before ADR-0057 wrote: no sandboxUid, no
+        // namespace. It reads, updates and ends as before.
+        let (state, claim) = fake::seed(false);
+        let store = fake::store(&state);
+        let mut rec = store.get_claim(claim).await.unwrap();
+        rec.entry_id = Some("entry-1".into());
+        store.update_claim(rec).await.unwrap();
+        {
+            let st = state.lock().unwrap();
+            let record = &st.sandboxes[0]["status"]["record"];
+            assert_eq!(record["entryId"], "entry-1", "it is updated as before");
+            let unbound = record["sandboxUid"].is_null() && record["namespace"].is_null();
+            assert!(
+                unbound,
+                "an update never gives a record a binding it was not created with"
+            );
+        }
+        store.revoke_claim(claim, Timestamp::now()).await.unwrap();
+        let ended = store.get_claim(claim).await.unwrap();
+        assert!(ended.revoked_at.is_some(), "and is released as before");
+        let later = Timestamp::now() + jiff::SignedDuration::from_secs(5);
+        assert_eq!(store.sweep(later).await.unwrap(), 1, "and swept as before");
+    }
+
+    #[tokio::test]
+    async fn an_envelope_round_trips_its_format_through_the_secret_and_an_absent_one_is_1() {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let sandbox_uid = Uuid::new_v4();
+        let parked = |sealed: &Sealed| {
+            session_secret(
+                &SessionRecord {
+                    sandbox_uid,
+                    subject: Subject {
+                        issuer: "https://idp.example".into(),
+                        id: "octocat".into(),
+                        display: None,
+                    },
+                    issuer: String::new(),
+                    refresh: sealed.clone(),
+                    created_at: Timestamp::from_second(1_700_000_000).unwrap(),
+                    audience: None,
+                    expires_at: None,
+                },
+                "parked",
+            )
+        };
+        // Format 2: a key of its own in the Secret, and back.
+        let new = format_2_envelope();
+        let secret = parked(&new);
+        let marker = secret
+            .data
+            .as_ref()
+            .and_then(|d| d.get(FORMAT_KEY))
+            .map(|b| b.0.clone());
+        assert_eq!(marker, Some(b"2".to_vec()));
+        let same = envelope_of(&secret).as_ref() == Some(&new);
+        assert!(same, "format 2 round-trips through the Secret");
+        assert_eq!(envelope_data(&new)[FORMAT_KEY], b64.encode("2"));
+        // Format 1: no key at all, read back as 1; a patch to it removes the key.
+        let old = Sealed {
+            format: FORMAT_BARE_UID,
+            ..new.clone()
+        };
+        let secret = parked(&old);
+        let absent = secret
+            .data
+            .as_ref()
+            .is_some_and(|d| !d.contains_key(FORMAT_KEY));
+        assert!(absent, "format 1 is the absent marker");
+        assert_eq!(
+            envelope_of(&secret).map(|e| e.format),
+            Some(FORMAT_BARE_UID)
+        );
+        assert!(envelope_data(&old)[FORMAT_KEY].is_null());
+        // A marker that is no number: no envelope is read from the Secret.
+        let mut odd = parked(&new);
+        if let Some(data) = odd.data.as_mut() {
+            data.insert(FORMAT_KEY.to_owned(), ByteString(b"two".to_vec()));
+        }
+        assert!(
+            envelope_of(&odd).is_none(),
+            "an unreadable marker opens nothing"
+        );
+
+        // Through the store: a session stored with no marker reads as format 1, and the
+        // format 2 envelope its next refresh writes comes back as 2.
+        let (state, claim) = fake::seed(false);
+        let store = fake::store(&state);
+        let mut rec = store.get_claim(claim).await.unwrap();
+        assert_eq!(
+            rec.refresh.as_ref().map(|e| e.format),
+            Some(FORMAT_BARE_UID),
+            "no marker reads as format 1"
+        );
+        rec.refresh = Some(new.clone());
+        store.update_claim(rec).await.unwrap();
+        let back = store.get_claim(claim).await.unwrap();
+        let stored = back.refresh.as_ref() == Some(&new);
+        assert!(stored, "the marker came back from the Secret");
+        assert_eq!(
+            back.delegations["api.example"].envelope.format, FORMAT_BARE_UID,
+            "a delegation is sealed once and stays as it was"
+        );
+    }
+
+    #[test]
+    fn the_mirrors_patch_never_names_the_record() {
+        // The mirror (`sandbox::mirror`) clears `record` on the status it sends and sends
+        // `{"status": status}` with no precondition (ADR-0057 decision 5). Pinned here, where
+        // the record's writer lives: such a status serialises with no `record` key, so a merge
+        // patch of it leaves the stored record alone, and it names no resource version.
+        let status = crate::sandbox::AgentSandboxStatus {
+            reason: Some("mirrored".into()),
+            record: None,
+            ..crate::sandbox::AgentSandboxStatus::default()
+        };
+        let patch = serde_json::json!({ "status": status });
+        assert!(
+            patch["status"].get("record").is_none(),
+            "a mirrored status names no record"
+        );
+        assert!(patch.get("metadata").is_none(), "and no resource version");
+    }
+
+    /// The shared cases of ADR-0057 decision 6 over this store on the fake API server: the
+    /// adapter makes the `AgentSandbox` a case's record names exist before the record is put.
+    struct OnFake {
+        store: KubeStore,
+        state: Arc<Mutex<fake::State>>,
+    }
+
+    impl OnFake {
+        fn new() -> Self {
+            let state = Arc::new(Mutex::new(fake::State::default()));
+            Self {
+                store: fake::store(&state),
+                state,
+            }
+        }
+    }
+
+    impl mediatore_store::shared_cases::Fixture for OnFake {
+        fn store(&self) -> &dyn ClaimStore {
+            &self.store
+        }
+
+        fn prepare(&self, rec: ClaimRecord) -> ClaimRecord {
+            let mut rec = rec;
+            let sandbox = *rec.sandbox_uid.get_or_insert_with(Uuid::new_v4);
+            self.state
+                .lock()
+                .unwrap()
+                .sandboxes
+                .push(fake::sandbox_named(&rec.name, &rec.namespace, sandbox));
+            rec
+        }
+    }
+
+    mod shared_over_the_fake_api_server {
+        use super::*;
+
+        mediatore_store::shared_suite!(OnFake::new());
     }
 }

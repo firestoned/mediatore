@@ -108,6 +108,21 @@ impl Naming {
     pub fn is_gateway(&self, spiffe_id: &str) -> bool {
         spiffe_id == self.gateway_id()
     }
+
+    /// `spiffe://<td>/gateway/authorizer`: the identity of a gateway's authorizer
+    /// (`mediatore gateway`), as a client of the broker (ADR-0053 decision 1). The
+    /// listeners keep [`Self::gateway_id`]; the two never stand in for each other.
+    #[must_use]
+    pub fn gateway_authorizer_id(&self) -> String {
+        format!("spiffe://{}/gateway/authorizer", self.trust_domain)
+    }
+
+    /// Whether a peer SPIFFE ID is the gateway authorizer's: exactly it, never a prefix,
+    /// so it is disjoint from [`Self::is_gateway`] by construction.
+    #[must_use]
+    pub fn is_gateway_authorizer(&self, spiffe_id: &str) -> bool {
+        spiffe_id == self.gateway_authorizer_id()
+    }
 }
 
 /// `mediatore-node-<ek-hash>`: deterministic, so "ensure" is a create that tolerates 409.
@@ -384,6 +399,36 @@ mod tests {
         assert!(!n.is_gateway(&n.broker_id()));
         assert!(n.claim_uid_from(&n.gateway_id()).is_none());
         assert!(n.node_ek_from(&n.gateway_id()).is_none());
+    }
+
+    #[test]
+    fn the_authorizer_identity_is_exactly_one_id_and_is_not_the_gateway_identity() {
+        // ADR-0053 decision 1: two exact names, disjoint in both directions. No matcher
+        // is a prefix test, so `/gateway` does not take in what sits under it.
+        let n = Naming {
+            trust_domain: "sandbox.test".into(),
+        };
+        let authorizer = n.gateway_authorizer_id();
+        assert_eq!(authorizer, "spiffe://sandbox.test/gateway/authorizer");
+        assert!(n.is_gateway_authorizer(&authorizer));
+        assert!(!n.is_gateway(&authorizer));
+        assert!(!n.is_gateway_authorizer(&n.gateway_id()));
+        assert!(n.is_gateway(&n.gateway_id()));
+        for near in [
+            "spiffe://sandbox.test/gateway/authorizer/",
+            "spiffe://sandbox.test/gateway/authorizer/1",
+            "spiffe://sandbox.test/gateway/authorizerx",
+            "spiffe://sandbox.test/gateway/",
+            "spiffe://sandbox.test/gateway-authorizer",
+            "spiffe://sandbox.test/authorizer",
+            "spiffe://other.test/gateway/authorizer",
+        ] {
+            assert!(!n.is_gateway_authorizer(near), "{near}");
+            assert!(!n.is_gateway(near), "{near}");
+        }
+        assert!(!n.is_gateway_authorizer(&n.broker_id()));
+        assert!(n.claim_uid_from(&authorizer).is_none());
+        assert!(n.node_ek_from(&authorizer).is_none());
     }
 
     #[test]

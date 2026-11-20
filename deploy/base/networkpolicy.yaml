@@ -1,0 +1,44 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+#
+# ADR-0007 decision 7, in the base so that no install is without it: nothing reaches the
+# broker's pods but the sandbox listener (8443) from the sandbox segment and the user API
+# (8080) from the ingress controller's namespace. Selecting the pods for Ingress is the
+# default deny: what no rule below admits is refused, on a CNI that enforces
+# NetworkPolicy (on one that does not, this object is inert).
+#
+# Both peers are placeholders that admit nothing real: the CIDR is a documentation range
+# (RFC 5737) and no namespace carries the name below (a namespace's name cannot hold a
+# dot). An install that applies this file unchanged therefore has a broker nobody
+# reaches, sandboxes and people alike: an overlay patches both with the cluster's values,
+# as deploy/overlays/homelab-example/networkpolicy.yaml does, and adds what only the
+# deployment knows (the node CIDR for the kubelet's probe where the CNI does not exempt
+# it, the gateways' egress addresses, the Egress rules). `ingress` is a list without a
+# merge key: a patch replaces all of it, so it restates both rules.
+#
+# No Egress here: what the broker may reach (DNS, the API server, the issuer, OpenBao) is
+# addresses only the deployment has, and a wrong guess stops the broker from starting.
+# The overlay adds it.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mediatore
+  labels: { app.kubernetes.io/name: mediatore }
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: mediatore }
+  policyTypes: [Ingress]
+  ingress:
+    # The sandbox listener: the sandbox segment (or the gateways' egress addresses once
+    # the relay carries every session), over SPIFFE mTLS. Placeholder: patch it.
+    - from:
+        - ipBlock: { cidr: 192.0.2.0/24 }
+      ports:
+        - { port: 8443, protocol: TCP }
+    # The user API: the ingress controller's namespace, so a bearer travels the ingress's
+    # TLS and nothing else in the cluster posts to the broker. Placeholder: patch it.
+    - from:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: ingress-controller.example }
+      ports:
+        - { port: 8080, protocol: TCP }

@@ -13,7 +13,9 @@
 //! refused with exit 125 and runs nothing. Since ADR-0051 the same run proves the seccomp
 //! layer: `AF_VSOCK`, `AF_NETLINK` and `AF_PACKET` fail `EAFNOSUPPORT`, a UDP or raw inet
 //! socket and `io_uring_setup` fail `EPERM`, a non-blocking inet stream socket and `AF_UNIX`
-//! work, and a forked child inherits the filter. Needs `python3` on the host.
+//! work, and a forked child inherits the filter. Since its amendment of 2026-11-19 an inet
+//! stream socket opened as MPTCP (protocol 262) fails `EPERM` too, and one that names
+//! `IPPROTO_TCP` works. Needs `python3` on the host.
 
 #[test]
 #[ignore = "needs a Linux kernel with Landlock (5.13+, 6.7+ for the ports): run on the build host"]
@@ -79,6 +81,11 @@ refused(uring, errno.EPERM, 22)
 ok(lambda: socket.socket(socket.AF_INET, socket.SOCK_STREAM | socket.SOCK_NONBLOCK).close(), 23)
 ok(lambda: socket.socket(socket.AF_UNIX, socket.SOCK_STREAM).close(), 24)
 ok(lambda: socket.socketpair().__getitem__(0).close(), 25)
+def proto(domain, protocol):
+    return lambda: socket.socket(domain, socket.SOCK_STREAM, protocol).close()
+refused(proto(socket.AF_INET, 262), errno.EPERM, 27)
+refused(proto(socket.AF_INET6, 262), errno.EPERM, 28)
+ok(proto(socket.AF_INET, socket.IPPROTO_TCP), 29)
 pid = os.fork()
 if pid == 0:
     os._exit(0 if errno_of(sock(socket.AF_VSOCK, socket.SOCK_STREAM)) == errno.EAFNOSUPPORT else 1)
@@ -126,8 +133,8 @@ sys.exit(0)
             Some(0),
             "the probe failed at the step its exit code names (10 write allowed, 11 write denied, \
              12 connect allowed, 13 connect denied, 14 bind, 15 read, 16 to 18 families, 19 to 21 non-stream \
-             inet sockets, 22 io_uring, 23 to 25 allowed sockets, 26 child inheritance); 125 means \
-             confinement refused"
+             inet sockets, 22 io_uring, 23 to 25 allowed sockets, 26 child inheritance, 27 and 28 an \
+             MPTCP socket, 29 an explicit TCP one); 125 means confinement refused"
         );
 
         let refused = Command::new(bin)

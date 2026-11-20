@@ -5,6 +5,10 @@
 //! `MemoryStore`; the Kubernetes store (ADR-0034) is proven by the kind tiers on a real API
 //! server, since a record there needs an `AgentSandbox` to live on. A
 //! behaviour one backend has and another lacks is a bug in the one that lacks it.
+//!
+//! The cases of ADR-0057 (the version, the compare-and-set, the release that cannot lose,
+//! `modify_claim`) are not here: they are in [`crate::shared_cases`], which `mediatore-claims`
+//! runs over the Kubernetes store on its fake API server too.
 
 use std::collections::BTreeMap;
 
@@ -14,7 +18,7 @@ use mediatore_proto::{
 };
 use uuid::Uuid;
 
-use crate::seal::{LocalKeySealer, Sealer};
+use crate::seal::{LocalKeySealer, Sealed, Sealer, Slot};
 use crate::{
     ClaimRecord, ClaimStore, DelegatedSession, LogLimits, NodeRecord, PolicyFloor, SessionRecord,
     StoreError,
@@ -117,6 +121,7 @@ pub(crate) fn claim(uid: Uuid) -> ClaimRecord {
         report: None,
         exit: None,
         delegations: BTreeMap::new(),
+        version: None,
     }
 }
 
@@ -136,6 +141,23 @@ fn sealer() -> LocalKeySealer {
     LocalKeySealer::new([7u8; 32])
 }
 
+/// An envelope for `binding`, sealed under the issuer's slot: the store keeps envelopes and
+/// opens none, so one slot serves every case here.
+async fn seal(binding: Uuid, plain: &[u8]) -> Sealed {
+    sealer()
+        .seal_session(Slot::Issuer, binding, plain)
+        .await
+        .unwrap()
+}
+
+/// What [`seal`] sealed.
+async fn unseal(binding: Uuid, envelope: &Sealed) -> Vec<u8> {
+    sealer()
+        .unseal_session(Slot::Issuer, binding, envelope)
+        .await
+        .unwrap()
+}
+
 pub(crate) async fn a_claim_round_trips_every_field(s: &dyn ClaimStore) {
     let uid = Uuid::new_v4();
     let mut rec = claim(uid);
@@ -143,7 +165,7 @@ pub(crate) async fn a_claim_round_trips_every_field(s: &dyn ClaimStore) {
     rec.node_id = Some("spiffe://sandbox.test/spire/agent/tpm/ek1".into());
     let sandbox_uid = Uuid::new_v4();
     rec.sandbox_uid = Some(sandbox_uid);
-    rec.refresh = Some(sealer().seal(sandbox_uid, b"refresh-token").await.unwrap());
+    rec.refresh = Some(seal(sandbox_uid, b"refresh-token").await);
     rec.expires_at = Some(at(3600));
     rec.policy_uid = Some("3f1b8d2a-0c4e-4b7a-9d6f-2e5c1a7b9f03".into());
     rec.bundle_version = Some(u64::from(u32::MAX) + 1);
@@ -205,11 +227,7 @@ pub(crate) async fn a_claim_round_trips_every_field(s: &dyn ClaimStore) {
         let env = got.refresh.as_ref().expect("envelope survives");
         assert_eq!(env, rec.refresh.as_ref().unwrap());
         assert_eq!(
-            sealer()
-                .unseal(got.seal_binding(), env)
-                .await
-                .unwrap()
-                .as_slice(),
+            unseal(got.seal_binding(), env).await.as_slice(),
             b"refresh-token"
         );
     }
@@ -297,14 +315,11 @@ pub(crate) async fn an_update_over_a_released_claim_writes_nothing(s: &dyn Claim
     let mut rec = claim(uid);
     rec.sandbox_uid = Some(sandbox_uid);
     rec.expires_at = Some(at(3600));
-    rec.refresh = Some(sealer().seal(sandbox_uid, b"dex-refresh").await.unwrap());
+    rec.refresh = Some(seal(sandbox_uid, b"dex-refresh").await);
     rec.delegations.insert(
         "github".into(),
         DelegatedSession {
-            envelope: sealer()
-                .seal(sandbox_uid, b"{\"token\":\"gh\"}")
-                .await
-                .unwrap(),
+            envelope: seal(sandbox_uid, b"{\"token\":\"gh\"}").await,
             expires_at: None,
         },
     );
@@ -341,7 +356,7 @@ pub(crate) async fn an_update_over_a_released_claim_writes_nothing(s: &dyn Claim
 pub(crate) async fn revoke_is_idempotent_and_drops_the_refresh_envelope(s: &dyn ClaimStore) {
     let uid = Uuid::new_v4();
     let mut rec = claim(uid);
-    rec.refresh = Some(sealer().seal(uid, b"secret").await.unwrap());
+    rec.refresh = Some(seal(uid, b"secret").await);
     rec.expires_at = Some(at(3600));
     s.put_claim(rec).await.unwrap();
 
@@ -518,7 +533,7 @@ pub(crate) async fn a_session_is_taken_once_deleted_on_demand_and_swept_when_sta
         sandbox_uid,
         subject: subject(),
         issuer: "https://issuer.example.com".into(),
-        refresh: sealer().seal(sandbox_uid, b"dex-refresh").await.unwrap(),
+        refresh: seal(sandbox_uid, b"dex-refresh").await,
         created_at: at(0),
         audience: None,
         expires_at: None,
@@ -529,10 +544,7 @@ pub(crate) async fn a_session_is_taken_once_deleted_on_demand_and_swept_when_sta
 
     let taken = s.take_session(sandbox_uid).await.unwrap().expect("parked");
     assert_eq!(taken, session);
-    assert_eq!(
-        sealer().unseal(sandbox_uid, &taken.refresh).await.unwrap(),
-        b"dex-refresh"
-    );
+    assert_eq!(unseal(sandbox_uid, &taken.refresh).await, b"dex-refresh");
     assert!(
         s.take_session(sandbox_uid).await.unwrap().is_none(),
         "taken once"
@@ -612,10 +624,7 @@ pub(crate) async fn delegations_are_parked_per_audience_and_revocation_empties_t
     let got = s.get_claim(uid).await.unwrap();
     assert_eq!(got.delegations, rec.delegations);
     assert_eq!(
-        sealer()
-            .unseal(sandbox_uid, &got.delegations["anthropic"].envelope)
-            .await
-            .unwrap(),
+        unseal(sandbox_uid, &got.delegations["anthropic"].envelope).await,
         b"{\"token\":\"sess\"}"
     );
     s.revoke_claim(uid, at(5)).await.unwrap();
@@ -672,7 +681,7 @@ pub(crate) async fn an_envelope_is_swept_when_it_expires_and_not_only_when_it_is
 /// the claim's end, which can be later than the envelope's expiry by the time the claim waited to bind.
 pub(crate) async fn a_bound_claims_delegation_is_removed_when_it_expires(s: &dyn ClaimStore) {
     let uid = Uuid::new_v4();
-    let envelope = |plain: &'static [u8]| async move { sealer().seal(uid, plain).await.unwrap() };
+    let envelope = |plain: &'static [u8]| async move { seal(uid, plain).await };
     let mut rec = claim(uid);
     rec.delegations.insert(
         "expired".into(),
@@ -762,11 +771,11 @@ pub(crate) async fn a_live_claims_session_outlasts_the_sweep_and_an_ended_claims
         // Created long before any cutoff a sweep is given.
         rec.created_at = at(0);
         rec.expires_at = expires_at;
-        rec.refresh = Some(sealer().seal(uid, b"dex-refresh").await.unwrap());
+        rec.refresh = Some(seal(uid, b"dex-refresh").await);
         rec.delegations.insert(
             "open".into(),
             DelegatedSession {
-                envelope: sealer().seal(uid, b"{\"token\":\"c\"}").await.unwrap(),
+                envelope: seal(uid, b"{\"token\":\"c\"}").await,
                 expires_at: None,
             },
         );
@@ -800,7 +809,7 @@ async fn parked(
         sandbox_uid,
         subject: subject(),
         issuer: String::new(),
-        refresh: sealer().seal(sandbox_uid, plain).await.unwrap(),
+        refresh: seal(sandbox_uid, plain).await,
         created_at: at(0),
         audience: audience.map(str::to_owned),
         expires_at,

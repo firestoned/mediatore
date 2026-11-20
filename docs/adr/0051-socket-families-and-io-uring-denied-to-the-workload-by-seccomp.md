@@ -178,7 +178,11 @@ on a kernel's behaviour staying as it is: in `crates/mediatore-guest/src/seccomp
 constant `INET_STREAM_PROTOCOLS` (`0` and `IPPROTO_TCP`, 6) beside `INET_FAMILIES`, and one
 more rule per inet family in the `EPERM` filter, next to the type rules. The unit test is
 `an_inet_stream_socket_whose_protocol_is_not_tcp_is_refused_with_eperm`, and the live test in
-`crates/mediatore/tests/jail_exec_live.rs` gains an MPTCP `socket()` that fails. Not built.*
+`crates/mediatore/tests/jail_exec_live.rs` gains an MPTCP `socket()` that fails. Built the same
+day, 2026-11-19: the constant and the rules are in the filter, an inet stream socket of any
+protocol but `0` and 6 fails with `EPERM`, the unit test passes in the quality gate, and the
+live test's steps 27 to 29 are the probe. The table and the sysctl stay as the layers below
+it.*
 
 *Second, user namespaces. `DENIED_SYSCALLS` refuses `unshare` and `setns`, and the filter has
 no rule for `clone` or `clone3`. A rule on `clone` could compare its flags, but `clone3` takes

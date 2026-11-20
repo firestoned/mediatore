@@ -2,10 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # The egress gateway in kind (`make kind-gateway`, ADR-0028): one pod standing in for a
-# gateway VM, Envoy from its official image beside the authorizer, mediatore gateway, both
-# with the gateway SVID from the real agent through the CSI volume (the ClusterSPIFFEID is a
-# test fixture an admin creates; on a VM it is the platform team's ClusterStaticEntry,
-# decision 2). Beside it, the destination the tier reaches through the gateway: the
+# gateway VM, Envoy from its official image beside the authorizer, mediatore gateway, each
+# with an SVID of its own from the real agent through the CSI volume (ADR-0053 decision 1):
+# the Envoy container holds spiffe://<td>/gateway, the listeners' identity a forwarder
+# verifies, and the authorizer container spiffe://<td>/gateway/authorizer, the one the
+# broker answers. Two ClusterSPIFFEIDs select the same pod and differ by container name
+# (the k8s workload attestor's k8s:container-name selector, as deploy/base does for the
+# broker), so neither container is handed the other's SVID. They are test fixtures an admin
+# creates; on a VM they are the platform team's ClusterStaticEntries, one per user
+# (deploy/gateway/clusterstaticentries.yaml). Beside it, the destination the tier reaches through the gateway: the
 # testkit's probe in its serve mode, answering with the host it was asked for, over TLS on
 # the certificate `make kind-gateway` mints (Secret destination-tls, the fixture CA on the
 # proxy's route as the audience's CA), since the egress proxy speaks HTTPS to every
@@ -28,7 +33,29 @@ spec:
     matchLabels: { mediatore.dev/e2e-role: gateway }
   namespaceSelector:
     matchLabels: { kubernetes.io/metadata.name: mediatore-e2e-gateway }
+  # The listeners' identity: the Envoy container alone (on a VM, unix:user:envoy).
+  workloadSelectorTemplates:
+    - "k8s:container-name:envoy"
   ttl: 1h
+  hint: gateway
+---
+apiVersion: spire.spiffe.io/v1alpha1
+kind: ClusterSPIFFEID
+metadata:
+  name: mediatore-e2e-gateway-authorizer
+spec:
+  className: spire-server-spire
+  spiffeIDTemplate: "spiffe://{{ .TrustDomain }}/gateway/authorizer"
+  podSelector:
+    matchLabels: { mediatore.dev/e2e-role: gateway }
+  namespaceSelector:
+    matchLabels: { kubernetes.io/metadata.name: mediatore-e2e-gateway }
+  # The authorizer's identity: the authorizer container alone (on a VM,
+  # unix:user:mediatore-gateway).
+  workloadSelectorTemplates:
+    - "k8s:container-name:authorizer"
+  ttl: 1h
+  hint: gateway-authorizer
 ---
 apiVersion: v1
 kind: Service

@@ -2,19 +2,42 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Where a claim's allowlist comes from: the broker's gateway-only route (ADR-0028
-//! decision 4), `GET /v1/gateway/claims/{uid}`, asked over SPIFFE mTLS with the gateway
-//! SVID from the local Workload API.
+//! decision 4), `GET /v1/gateway/claims/{uid}`, asked over SPIFFE mTLS with the authorizer's
+//! own SVID, `spiffe://<td>/gateway/authorizer`, from the local Workload API (ADR-0053
+//! decisions 1 and 2). The gateway's listeners hold `spiffe://<td>/gateway`; the authorizer
+//! never asks under that name and does not start when its own is not to be had.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use mediatore_proto::{ClaimEgress, GatewayCredential, GatewayCredentialRequest};
+use mediatore_spire::Naming;
 use mediatore_tls::{MaterialSource, SpiffeId, WorkloadApiSource};
 use uuid::Uuid;
 
 /// Header carrying the peer SPIFFE ID against a `dev_mode` broker.
 #[cfg(feature = "dev")]
 const DEV_PEER_HEADER: &str = "x-mediatore-peer-spiffe-id";
+
+/// The path of the authorizer's SPIFFE ID, `spiffe://<td>/gateway/authorizer` (ADR-0053
+/// decision 1; `Naming::gateway_authorizer_id`, which a test holds this to). The SVID asked
+/// of the Workload API is the one with exactly this path, never the agent's default.
+pub const AUTHORIZER_PATH: &str = "/gateway/authorizer";
+
+/// Refuse any identity but the authorizer's own (ADR-0053 decision 2): exactly
+/// `spiffe://<td>/gateway/authorizer` in `own`'s trust domain. The listeners'
+/// `spiffe://<td>/gateway` is refused like any other name.
+pub fn ensure_authorizer(own: &SpiffeId) -> anyhow::Result<()> {
+    let naming = Naming {
+        trust_domain: own.trust_domain().to_string(),
+    };
+    anyhow::ensure!(
+        naming.is_gateway_authorizer(&own.to_string()),
+        "the authorizer's identity must be {}, got {own}: it does not start under another name",
+        naming.gateway_authorizer_id()
+    );
+    Ok(())
+}
 
 /// How long the authorizer waits for its first SVID before it fails closed. The gateway's
 /// entry is static (ADR-0028 decision 2), so the agent has it as soon as it attested;
@@ -105,7 +128,7 @@ pub struct Broker {
 }
 
 enum Transport {
-    /// The gateway SVID as the client certificate; the broker accepted only as
+    /// The authorizer's SVID as the client certificate; the broker accepted only as
     /// `spiffe://<td>/mediatore`.
     Mtls {
         source: Arc<dyn MaterialSource>,
@@ -118,19 +141,24 @@ enum Transport {
 
 impl Broker {
     /// Obtain the transport identity from the Workload API at `workload_api_socket`,
-    /// within [`WORKLOAD_API_WAIT`]. Fails closed: no Workload API, no authorizer.
+    /// within [`WORKLOAD_API_WAIT`]: the SVID of the authorizer's own ID, selected by ID
+    /// among whatever the agent hands this user, never the default one (ADR-0053
+    /// decision 2). Fails closed: no Workload API or no such SVID, no authorizer.
     pub async fn connect(mediatore_url: &str, workload_api_socket: &str) -> anyhow::Result<Self> {
         let endpoint = mediatore_tls::endpoint(workload_api_socket);
-        let source = WorkloadApiSource::connect(&endpoint, WORKLOAD_API_WAIT)
+        let source = WorkloadApiSource::connect_as(&endpoint, AUTHORIZER_PATH, WORKLOAD_API_WAIT)
             .await
             .map_err(|e| anyhow::anyhow!("Workload API at {endpoint}: {e}"))?;
         let own = source.current()?;
-        tracing::info!(spiffe_id = %own.spiffe_id, "gateway SVID from the Workload API");
+        ensure_authorizer(&own.spiffe_id)?;
+        tracing::info!(spiffe_id = %own.spiffe_id, "the authorizer's SVID from the Workload API");
         Self::with_material(mediatore_url, Arc::new(source))
     }
 
     /// The broker over mTLS with whatever `source` supplies; the server is expected to be
-    /// the broker of the material's trust domain.
+    /// the broker of the material's trust domain. No check of the identity here: this is the
+    /// seam the end-to-end suite uses to show what the broker does with a wrong one.
+    /// [`Self::connect`], the only caller outside tests, has made that check.
     pub fn with_material(
         mediatore_url: &str,
         source: Arc<dyn MaterialSource>,
@@ -256,6 +284,42 @@ mod tests {
     use super::*;
 
     const SECRET: &str = "sk-ant-oat01-NEVER-LOG-THIS";
+    /// The authorizer's own identity in the tests' trust domain.
+    const AUTHORIZER: &str = "spiffe://sandbox.test/gateway/authorizer";
+
+    #[test]
+    fn the_authorizer_asks_as_the_authorizer_identity_and_does_not_start_on_the_listeners() {
+        // ADR-0053 decisions 1 and 2. The path asked of the Workload API is the one `Naming`
+        // gives the authorizer, so the two cannot drift apart.
+        let naming = Naming {
+            trust_domain: "sandbox.test".into(),
+        };
+        assert_eq!(naming.gateway_authorizer_id(), AUTHORIZER);
+        assert_eq!(
+            format!("spiffe://sandbox.test{AUTHORIZER_PATH}"),
+            naming.gateway_authorizer_id()
+        );
+        let id = |s: &str| SpiffeId::new(s).expect("a SPIFFE ID");
+        ensure_authorizer(&id(AUTHORIZER)).expect("its own identity");
+        ensure_authorizer(&id("spiffe://other.test/gateway/authorizer"))
+            .expect("its own identity, whatever trust domain the agent serves");
+        // The listeners' name first of all, then everything near either name.
+        for other in [
+            naming.gateway_id(),
+            "spiffe://sandbox.test/gateway/authorizer/extra".to_owned(),
+            "spiffe://sandbox.test/gateway/authorizerx".to_owned(),
+            "spiffe://sandbox.test/gateway/1".to_owned(),
+            "spiffe://sandbox.test/authorizer".to_owned(),
+            naming.broker_id(),
+            naming.node_id("ekhash"),
+        ] {
+            let err = ensure_authorizer(&id(&other)).expect_err(&other);
+            assert!(
+                err.to_string().contains(AUTHORIZER) && err.to_string().contains(&other),
+                "the refusal names both identities: {err}"
+            );
+        }
+    }
 
     fn body(audience: &str, value: &str) -> String {
         serde_json::json!({
@@ -411,14 +475,15 @@ mod tests {
                     );
                     assert!(
                         req.to_ascii_lowercase()
-                            .contains("x-mediatore-peer-spiffe-id: spiffe://sandbox.test/gateway")
+                            .contains(&format!("x-mediatore-peer-spiffe-id: {AUTHORIZER}\r\n")),
+                        "the ask goes out under the authorizer's identity, whole"
                     );
                     let json: serde_json::Value =
                         serde_json::from_str(req.split("\r\n\r\n").nth(1).unwrap()).unwrap();
                     assert_eq!(json, serde_json::json!({ "audience": "anthropic" }));
                 })
                 .await;
-            let broker = Broker::dev_header(&base, "spiffe://sandbox.test/gateway");
+            let broker = Broker::dev_header(&base, AUTHORIZER);
             let got = broker.credential(uid, "anthropic").await;
             server.await.unwrap();
             let Ok(CredentialAnswer::Found(c)) = got else {
@@ -433,7 +498,7 @@ mod tests {
             for (status, want) in [("403 Forbidden", 403u16), ("401 Unauthorized", 401)] {
                 let (base, server) =
                     serve_once(http(status, "{\"error\":\"forbidden\"}"), |_| {}).await;
-                let broker = Broker::dev_header(&base, "spiffe://sandbox.test/gateway");
+                let broker = Broker::dev_header(&base, AUTHORIZER);
                 assert!(matches!(
                     broker.credential(Uuid::new_v4(), "anthropic").await,
                     Err(AskError::Refused(s)) if s == want
@@ -441,13 +506,13 @@ mod tests {
                 server.await.unwrap();
             }
             let (base, server) = serve_once(http("404 Not Found", "{}"), |_| {}).await;
-            let broker = Broker::dev_header(&base, "spiffe://sandbox.test/gateway");
+            let broker = Broker::dev_header(&base, AUTHORIZER);
             assert!(matches!(
                 broker.credential(Uuid::new_v4(), "anthropic").await,
                 Ok(CredentialAnswer::Gone)
             ));
             server.await.unwrap();
-            let dead = Broker::dev_header("http://127.0.0.1:1", "spiffe://sandbox.test/gateway");
+            let dead = Broker::dev_header("http://127.0.0.1:1", AUTHORIZER);
             assert!(matches!(
                 dead.credential(Uuid::new_v4(), "anthropic").await,
                 Err(AskError::Unreachable(_))

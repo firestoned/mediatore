@@ -17,7 +17,8 @@ import yaml
 
 # deploy/base, as kustomize renders it. The overlay (config, Secrets, ingress) is the
 # operator's and deliberately not in the manifest. Three CRDs since ADR-0034 (AgentSandbox,
-# SandboxNode, PolicyFloor); two Roles (the watcher Lease, the session Secrets).
+# SandboxNode, PolicyFloor); two Roles (the watcher Lease, the session Secrets); the one
+# NetworkPolicy, whose placeholder peers admit nothing until an overlay patches them.
 EXPECTED_KINDS = {
     "CustomResourceDefinition": 3,
     "ServiceAccount": 1,
@@ -27,10 +28,11 @@ EXPECTED_KINDS = {
     "RoleBinding": 2,
     "Deployment": 1,
     "Service": 2,
+    "NetworkPolicy": 1,
     "ClusterSPIFFEID": 1,
     "ConfigMap": 1,
-    "ValidatingAdmissionPolicy": 3,
-    "ValidatingAdmissionPolicyBinding": 3,
+    "ValidatingAdmissionPolicy": 4,
+    "ValidatingAdmissionPolicyBinding": 4,
 }
 
 

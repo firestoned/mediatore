@@ -441,7 +441,7 @@ kind-spire: kind-create kind-openbao ## Apply SPIRE (server, controller manager,
 
 kind-deploy: kind-create ## Apply the broker's CRD, ServiceAccount, RBAC and admission policies; mint its kubeconfig
 	@$(KIND_KUBECTL) get ns banlieue-system >/dev/null 2>&1 || $(KIND_KUBECTL) create ns banlieue-system
-	$(KIND_KUBECTL) apply -n banlieue-system -f deploy/base/crds -f deploy/base/serviceaccount.yaml -f deploy/base/rbac.yaml -f deploy/base/admission/clusterstaticentry-mediatore.yaml -f deploy/base/admission/agentsandbox-subject.yaml -f deploy/base/admission/agentsandbox-status.yaml
+	$(KIND_KUBECTL) apply -n banlieue-system -f deploy/base/crds -f deploy/base/serviceaccount.yaml -f deploy/base/rbac.yaml -f deploy/base/admission/clusterstaticentry-mediatore.yaml -f deploy/base/admission/clusterstaticentry-gateway.yaml -f deploy/base/admission/agentsandbox-subject.yaml -f deploy/base/admission/agentsandbox-status.yaml
 	@./dev/kind/sa-kubeconfig.sh $(KIND_KUBECONFIG) $(KIND_SA_KUBECONFIG)
 	@./dev/kind/admission-settled.sh $(KIND_SA_KUBECONFIG) $(SPIRE_TRUST_DOMAIN)
 

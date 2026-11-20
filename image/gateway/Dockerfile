@@ -56,7 +56,9 @@ FROM ${KAIROS_BASE}
 ARG TPM_PLUGIN_AGENT_SHA
 
 # tpm2-tools: the EK certificate export banlieue's layer runs (its examples/21).
-# qemu-guest-agent: the libvirt provider reads the VM's addresses through it.
+# qemu-guest-agent: the libvirt provider reads the VM's addresses and, the VM being
+# tpmEnabled, its EK certificate through it; its command set is cut to what that takes by
+# image/gateway/qemu-ga.conf, below.
 # nftables: the host table (ADR-0027 decision 5); the base has it, named so a base
 # without it fails.
 # Removed: every listener the base ships. Nothing inbound but the two planes (ADR-0028
@@ -98,6 +100,9 @@ COPY image/gateway/systemd/spire-agent.service \
      image/gateway/systemd/mediatore-gateway.service \
      /etc/systemd/system/
 COPY image/gateway/sysctl/99-mediatore-gateway.conf /etc/sysctl.d/99-mediatore-gateway.conf
+# The guest agent answers the commands banlieue's provider sends and no other: no exec, no
+# file write (threat model R-43).
+COPY image/gateway/qemu-ga.conf /etc/qemu/qemu-ga.conf
 COPY image/spire/agent.conf /usr/share/mediatore/agent.conf.example
 # The examples render every template completely: a placeholder nobody documents fails the build.
 RUN chmod 0755 /usr/libexec/mediatore-gateway/render \

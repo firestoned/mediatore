@@ -10,8 +10,39 @@
 # new arrives: replies to the gateway's own connections only. Forwarding is off in sysctl
 # and dropped here as well. Loopback carries the authorizer and nothing else listens. The inject Envoy's port (ADR-0040 decision 7) is a fifth
 # element of the relay's set, under the same per-source cap, only when the deployment sets INJECT_PORT_ELEMENT (env.inject.example).
+#
+# Output (ADR-0053 decisions 5 and 6) is keyed on the socket's owner. The policy stays accept
+# for the users the table does not name (root, the resolver's, the clock's); the five it names
+# may open a new connection only where their row says, and two rules hold for every user:
+# nothing new leaves by the sandbox interface, and the broker's address is reached by the
+# authorizer's and the relay's users and by nobody else. User names are resolved when the
+# table loads: one that does not exist fails the load, and with it every unit that requires
+# the table. Unix sockets are not seen here: the agent's stays reachable to both Envoys.
+#   mediatore-gateway  the broker, BROKER_ADDRESS at BROKER_PORT, and nothing else
+#   envoy-relay        its four fixed upstreams, each by address and port, and nothing else
+#   spire              the SPIRE server, and nothing else
+#   envoy              any IPv4 destination that is not loopback or one of the VM's own
+#                      addresses (the authorizer's check port excepted while that is loopback
+#                      TCP, CHECK_TCP_ELEMENTS), link-local, a control-plane address of the
+#                      env file or one of the operator's EGRESS_DENY_ELEMENTS; no IPv6
+#   envoy-inject       the same, with no loopback exception (its check is a unix socket)
+# A name a claim is allowed is resolved by Envoy; the rules above apply at connect time, to
+# whatever address it resolved to. The three keys this chain added are optional, each with
+# its default written at its placeholder below, so an env file from before the chain existed
+# still loads the table (image/gateway/render).
 flush ruleset
 table inet mediatore_gateway {
+  # Where neither Envoy may open a connection, whatever name led there: link-local, the
+  # control plane's addresses, and the ranges the operator lists (", 10.0.0.0/8, ..." in
+  # EGRESS_DENY_ELEMENTS; empty by default, those ranges are then the datacenter firewall's).
+  set egress_refused { type ipv4_addr; flags interval; auto-merge; elements = { 169.254.0.0/16, @SPIRE_SERVER_ADDRESS@, @SPIRE_BUNDLE_ADDRESS@, @REGISTRY_ADDRESS@, @BROKER_ADDRESS@@EGRESS_DENY_ELEMENTS:-@ } }
+  # The authorizer's tunnel check while it is loopback TCP: "elements = { 9001 }", the
+  # default. Empty once the data plane asks the check socket (env.inject.example).
+  set check_tcp { type inet_service; @CHECK_TCP_ELEMENTS:-elements = { 9001 }@ }
+  # The Envoys' resolver, only where the rules below would refuse it: a stub on loopback, or
+  # an address inside a denied range ("elements = { 127.0.0.53 }"). Empty by default: a
+  # resolver on the egress side outside the refused set needs no entry.
+  set resolvers { type ipv4_addr; @RESOLVER_ELEMENTS:-@ }
   set relay_ports { type inet_service; elements = { @RELAY_SPIRE_PORT@, @RELAY_BROKER_PORT@, @RELAY_BUNDLE_PORT@, @RELAY_REGISTRY_PORT@@INJECT_PORT_ELEMENT@ } }
   # One element per sandbox source address, counting its connections to the relay.
   set relay_sources { type ipv4_addr; flags dynamic; size 65535; }
@@ -28,5 +59,47 @@ table inet mediatore_gateway {
   chain forward {
     type filter hook forward priority filter; policy drop;
     log prefix "mediatore-gateway forward: " counter drop
+  }
+  chain output {
+    type filter hook output priority filter; policy accept;
+    # Replies of the listeners and every connection already admitted: the rules below are
+    # about a new one.
+    ct state established,related accept
+    # Every user: nothing on a gateway initiates toward the sandbox segment (ADR-0010).
+    oifname "@SANDBOX_IF@" ct state new log prefix "mediatore-gateway out sandbox: " counter drop
+    meta skuid "mediatore-gateway" jump output_authorizer
+    meta skuid "envoy-relay" jump output_relay
+    meta skuid "spire" jump output_agent
+    meta skuid "envoy" jump output_envoy
+    meta skuid "envoy-inject" jump output_listener
+    # Every other user, root included: as before, but for the broker's address, on any port.
+    ip daddr @BROKER_ADDRESS@ ct state new log prefix "mediatore-gateway out broker: " counter drop
+  }
+  chain output_authorizer {
+    ip daddr @BROKER_ADDRESS@ tcp dport @BROKER_PORT@ accept
+    log prefix "mediatore-gateway out authorizer: " counter drop
+  }
+  chain output_relay {
+    ip daddr @SPIRE_SERVER_ADDRESS@ tcp dport @SPIRE_SERVER_PORT@ accept
+    ip daddr @BROKER_ADDRESS@ tcp dport @BROKER_PORT@ accept
+    ip daddr @SPIRE_BUNDLE_ADDRESS@ tcp dport @SPIRE_BUNDLE_PORT@ accept
+    ip daddr @REGISTRY_ADDRESS@ tcp dport @REGISTRY_PORT@ accept
+    log prefix "mediatore-gateway out relay: " counter drop
+  }
+  chain output_agent {
+    ip daddr @SPIRE_SERVER_ADDRESS@ tcp dport @SPIRE_SERVER_PORT@ accept
+    log prefix "mediatore-gateway out agent: " counter drop
+  }
+  chain output_envoy {
+    # The one loopback exception, the tunnel Envoy's alone: the authorizer's check.
+    oif "lo" ip daddr 127.0.0.1 tcp dport @check_tcp accept
+    jump output_listener
+  }
+  chain output_listener {
+    ip daddr @resolvers meta l4proto { tcp, udp } th dport 53 accept
+    oif "lo" log prefix "mediatore-gateway out loopback: " counter drop
+    meta nfproto ipv6 log prefix "mediatore-gateway out ipv6: " counter drop
+    ip daddr @egress_refused log prefix "mediatore-gateway out refused: " counter drop
+    accept
   }
 }

@@ -1,0 +1,109 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+#
+# The shape of an egress gateway's SPIRE registration entry, for whoever applies one
+# (ADR-0053 decision 4). The gateway's entries are the platform team's, never the
+# broker's (ADR-0028 decision 2), so this policy binds no ServiceAccount: it matches a
+# ClusterStaticEntry from ANY principal whose spiffeID path is /gateway or begins with
+# /gateway/, and admits two shapes and nothing wider:
+#
+#   listeners   spiffe://<td>/gateway             one selector: unix:user:envoy or unix:user:envoy-inject
+#   authorizer  spiffe://<td>/gateway/authorizer  one selector: unix:user:mediatore-gateway
+#
+# The listeners' ID is what a sandbox's forwarder verifies; the authorizer's is the one
+# gateway identity the broker answers. An entry that gives the authorizer's ID to an
+# Envoy's user, or a listener's ID to the authorizer's user (the shape every gateway had
+# before ADR-0053), would undo that split without any error anywhere: it is refused here,
+# with two selectors and every other path under /gateway.
+#
+# What this is not: a bound on a cluster administrator, who can delete it, nor on SPIRE's
+# own admin API, nor on a ClusterSPIFFEID template that renders the same ID (the kind
+# tier's fixture). RBAC on clusterstaticentries and on this policy is the platform team's.
+# A policy does not judge objects that already exist but does refuse an update to one, so
+# apply it once the last entry of the old shape has been replaced (ADR-0053 decision 7).
+# The broker's own policy (clusterstaticentry-mediatore.yaml) is unchanged and already
+# refuses its ServiceAccount both IDs. Requires Kubernetes 1.30+.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: mediatore-clusterstaticentry-gateway
+  labels:
+    app.kubernetes.io/name: mediatore
+    app.kubernetes.io/component: admission
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["spire.spiffe.io"]
+        apiVersions: ["v1alpha1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["clusterstaticentries"]
+  # Every principal, and only entries under the gateway's path. The path is what follows
+  # the trust domain: /gateway itself, or anything beginning with /gateway/.
+  matchConditions:
+    - name: is-a-gateway-entry
+      expression: "has(object.spec.spiffeID) && object.spec.spiffeID.matches('^spiffe://[^/]+/gateway(/.*)?$')"
+  variables:
+    - name: td
+      expression: "'^spiffe://[a-z0-9.-]+'"
+    - name: isAuthorizer
+      expression: "object.spec.spiffeID.endsWith('/gateway/authorizer')"
+  validations:
+    - expression: "object.spec.spiffeID.matches(variables.td + '/gateway(/authorizer)?$')"
+      message: "spiffeID under /gateway must be spiffe://<td>/gateway (the listeners) or spiffe://<td>/gateway/authorizer (the authorizer); nothing else lives under /gateway (ADR-0053)"
+      reason: Forbidden
+    - expression: "has(object.spec.selectors) && size(object.spec.selectors) == 1"
+      message: "a gateway entry has exactly one selector: one entry per user per VM"
+      reason: Forbidden
+    - expression: >-
+        variables.isAuthorizer ||
+        (has(object.spec.selectors) && object.spec.selectors.all(s, s == 'unix:user:envoy' || s == 'unix:user:envoy-inject'))
+      message: "spiffe://<td>/gateway is the listeners' identity: its selector is unix:user:envoy or unix:user:envoy-inject; the authorizer's user (unix:user:mediatore-gateway) holds spiffe://<td>/gateway/authorizer (ADR-0053)"
+      reason: Forbidden
+    - expression: >-
+        !variables.isAuthorizer ||
+        (has(object.spec.selectors) && object.spec.selectors.all(s, s == 'unix:user:mediatore-gateway'))
+      message: "spiffe://<td>/gateway/authorizer is the authorizer's identity: its selector is unix:user:mediatore-gateway and no Envoy's user (ADR-0053)"
+      reason: Forbidden
+    - expression: >-
+        has(object.spec.parentID) &&
+        object.spec.parentID.matches(variables.td + '/spire/agent/[a-z0-9_]+/[A-Za-z0-9._/-]+$')
+      message: "parentID must be an attested agent ID: spiffe://<td>/spire/agent/<attestor>/<id>"
+      reason: Forbidden
+    - expression: >-
+        has(object.spec.parentID) &&
+        object.spec.spiffeID.split('/')[2] == object.spec.parentID.split('/')[2]
+      message: "spiffeID and parentID must be in the same trust domain"
+      reason: Forbidden
+    - expression: "!has(object.spec.admin) || !object.spec.admin"
+      message: "a gateway entry is never admin"
+      reason: Forbidden
+    - expression: "!has(object.spec.downstream) || !object.spec.downstream"
+      message: "a gateway entry is never downstream"
+      reason: Forbidden
+    - expression: "!has(object.spec.storeSVID) || !object.spec.storeSVID"
+      message: "a gateway entry never uses an SVIDStore"
+      reason: Forbidden
+    - expression: "!has(object.spec.federatesWith) || size(object.spec.federatesWith) == 0"
+      message: "a gateway entry never federates"
+      reason: Forbidden
+    - expression: "!has(object.spec.dnsNames) || size(object.spec.dnsNames) == 0"
+      message: "a gateway entry carries no DNS names"
+      reason: Forbidden
+    - expression: "has(object.spec.className) && object.spec.className != ''"
+      message: "className is required (the controller manager ignores classless resources)"
+      reason: Invalid
+    - expression: "!has(object.spec.x509SVIDTTL) || duration(object.spec.x509SVIDTTL) <= duration('4h')"
+      message: "x509SVIDTTL must be at most 4h"
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: mediatore-clusterstaticentry-gateway
+  labels:
+    app.kubernetes.io/name: mediatore
+    app.kubernetes.io/component: admission
+spec:
+  policyName: mediatore-clusterstaticentry-gateway
+  validationActions: ["Deny"]

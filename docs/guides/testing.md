@@ -316,7 +316,8 @@ The authorizer of [ADR-0028](../adr/0028-egress-gateway-envoy-with-spiffe-identi
 decision 4, `mediatore gateway`, is proven against the broker in `make check`, with no
 Envoy and no VM: `crates/mediatore/tests/e2e_gateway.rs` runs the fake issuer, the broker's
 sandbox listener over the production mTLS listener under the testkit's `TestCa`, the real
-`Authorizer` with its broker client presenting the gateway SVID from that CA, and the check
+`Authorizer` with its broker client presenting the authorizer's own SVID
+(`spiffe://<td>/gateway/authorizer`, ADR-0053) from that CA, and the check
 service Envoy would call, on loopback. A stand-in for Envoy sends Envoy's own `Check` call
 over gRPC with what Envoy fills in from the downstream connection (the peer's SPIFFE ID as
 the principal, the method, the authority). What is proven: a bound claim reaches each
@@ -360,8 +361,11 @@ answer's parsing) is unit-tested over a scripted attempt in
 (pinned by digest, the digest the gateway image copies the binary from) on the bootstrap
 the image carries (`image/gateway/envoy/gateway.yaml.in` rendered with
 `dev/kind/gateway/envoy.env`; `make gateway-render-check` fails on drift and runs before
-the tier) beside `mediatore gateway`, both
-holding `spiffe://<td>/gateway` from the agent through the CSI volume, and a destination
+the tier) beside `mediatore gateway`, each holding an identity of its own from the agent
+through the CSI volume
+([ADR-0053](../adr/0053-the-gateways-authorizer-has-an-identity-of-its-own.md)): Envoy's
+container `spiffe://<td>/gateway` and the authorizer's `spiffe://<td>/gateway/authorizer`, from
+two `ClusterSPIFFEID` fixtures told apart by container name, and a destination
 behind it (the testkit's `gateway-probe` in its serve mode, over TLS on a certificate
 `make kind-gateway` mints with `tls-fixture`, since the proxy speaks HTTPS to every
 upstream). `dev/kind/gateway-e2e.sh` binds a sandbox as the sandbox tier does, so the
@@ -379,8 +383,15 @@ holding a node SVID is refused by Envoy's validator at the handshake and the wor
 until the stale bound and then the outage is a refusal with `broker_unreachable`, a
 deleted sandbox is cut off with `claim_gone` once its answer is stale, and Envoy's access
 log, the authorizer's decisions, the proxy's forwards and the destination's requests agree
-on who reached what. The checks are listed in the script; a mismatch names the authority,
-the status and what was expected.
+on who reached what. Since ADR-0053 the tier also shows that the authorizer's log names its
+own ID, that a client holding the listeners' identity is refused by the broker in the
+handshake, and, by server-side dry runs that create nothing, what the gateway entries'
+admission policy does: the listeners' two shapes and the authorizer's are admitted, and
+swapped selectors, two selectors, another path under `/gateway`, `admin`, a long TTL, DNS
+names and either gateway ID as the broker's ServiceAccount are refused. The tier's gateway is a
+pod: it has no `unix:user` selector, no host table and no systemd unit, so the output chain
+and the entries of a gateway VM are not what it proves. The checks are listed in the script; a
+mismatch names the authority, the status and what was expected.
 
 `make kind-e2e-gateway-policy` is the same run under a policy (ADR-0030): notaio (from
 `make kind-notaio`) publishes the bundle of a policy whose direct `egress[]` names the

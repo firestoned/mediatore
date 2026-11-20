@@ -8,7 +8,9 @@
 2026-11-03 by [ADR-0028](0028-egress-gateway-envoy-with-spiffe-identity.md) decision 4
 (a fifth identity, the egress gateway's `spiffe://<td>/gateway`); 2026-11-09 by
 [ADR-0034](0034-the-kubernetes-api-as-the-brokers-store.md) (the node register is a
-`SandboxNode` resource, not a table)
+`SandboxNode` resource, not a table); 2026-11-19 by
+[ADR-0053](0053-the-gateways-authorizer-has-an-identity-of-its-own.md) (a sixth
+identity, `spiffe://<td>/gateway/authorizer`, so `/gateway` is no longer a leaf)
 
 ## Context
 
@@ -50,6 +52,13 @@ decision 4:* the table gains `spiffe://<td>/gateway`, held by the egress gateway
 (exactly that id, nothing under it; `Naming::gateway_id` in
 `crates/mediatore-spire/src/lib.rs`), declared by the operator as `ClusterStaticEntry`
 objects under each gateway VM's own TPM agent, never by the broker.
+
+*Amended 2026-11-19 by
+[ADR-0053](0053-the-gateways-authorizer-has-an-identity-of-its-own.md) decision 1:* the
+table gains `spiffe://<td>/gateway/authorizer`, held by `mediatore gateway` as its client
+identity to the broker (`Naming::gateway_authorizer_id`, `is_gateway_authorizer`), declared the
+same way; the two gateway IDs are each matched exactly and neither predicate accepts the other,
+so "nothing under it" now reads "nothing under it but the authorizer's".
 
 **Username derivation**, implemented in `mediatore-proto::Subject::sandbox_username`:
 `sb-` followed by the first 12 lowercase hex characters of

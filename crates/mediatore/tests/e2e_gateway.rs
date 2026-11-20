@@ -59,8 +59,15 @@ fn claim_svid(uid: &uuid::Uuid) -> String {
     format!("spiffe://{TRUST_DOMAIN}/banlieue/claim/{uid}")
 }
 
+/// The gateways' listener identity: what a sandbox's forwarder verifies, and since ADR-0053
+/// no peer of the broker.
 fn gateway_svid() -> String {
     format!("spiffe://{TRUST_DOMAIN}/gateway")
+}
+
+/// The authorizer's own identity (ADR-0053 decision 1): the one the broker answers.
+fn authorizer_svid() -> String {
+    format!("spiffe://{TRUST_DOMAIN}/gateway/authorizer")
 }
 
 fn state(idp: &FakeIdp, policy_egress: Option<mediatore_api::PolicyEgress>) -> Arc<AppState> {
@@ -76,6 +83,7 @@ fn state(idp: &FakeIdp, policy_egress: Option<mediatore_api::PolicyEgress>) -> A
         inject_port: None,
         logs: None,
         log_limiter: Limiter::per_second(1),
+        accept_plain_gateway_identity: false,
         store: MemoryStore::shared(),
         spire: Arc::new(mediatore_spire::MemoryEntries::default()),
         naming: Naming {
@@ -165,9 +173,11 @@ impl Harness {
             .expect("bind sandbox");
         let sandbox_url = format!("https://{}", sandbox.local_addr().expect("addr"));
         let broker = MemoryMaterial::new(ca.svid(&broker_id().to_string()));
-        let configs =
-            TlsConfigs::spawn(broker, mediatore_api::sandbox_authorizer(st.naming.clone()))
-                .expect("tls configs");
+        let configs = TlsConfigs::spawn(
+            broker,
+            mediatore_api::sandbox_authorizer(st.naming.clone(), false),
+        )
+        .expect("tls configs");
         tokio::spawn(mediatore_tls::serve(
             sandbox,
             configs,
@@ -320,7 +330,7 @@ impl Harness {
 
 #[tokio::test]
 async fn a_claim_reaches_its_allowlist_and_nothing_else_and_a_released_claim_is_cut_off() {
-    let h = Harness::start(&gateway_svid(), CacheConfig::default(), None).await;
+    let h = Harness::start(&authorizer_svid(), CacheConfig::default(), None).await;
     let (token, claim) = h.bound_claim().await;
     let uid = claim.uid.expect("uid");
     let peer = claim_svid(&uid);
@@ -380,7 +390,7 @@ async fn a_claim_reaches_its_allowlist_and_nothing_else_and_a_released_claim_is_
         "still fresh: the cache answers"
     );
     let h2 = Harness::start(
-        &gateway_svid(),
+        &authorizer_svid(),
         CacheConfig {
             fresh_for: Duration::ZERO,
             ..CacheConfig::default()
@@ -409,7 +419,7 @@ async fn a_claim_reaches_its_allowlist_and_nothing_else_and_a_released_claim_is_
 async fn a_broker_that_is_down_is_a_deny_and_so_is_a_gateway_the_broker_does_not_know() {
     // Nothing listens there: every ask is an outage, and nothing was ever cached.
     let h = Harness::start(
-        &gateway_svid(),
+        &authorizer_svid(),
         CacheConfig::default(),
         Some("https://127.0.0.1:9"),
     )
@@ -430,18 +440,56 @@ async fn a_broker_that_is_down_is_a_deny_and_so_is_a_gateway_the_broker_does_not
         (403, "broker_refused".into())
     );
 
-    // The authorizer presenting something under the gateway path: not a peer at all.
-    let h = Harness::start(
-        &format!("{}/1", gateway_svid()),
-        CacheConfig::default(),
-        None,
-    )
-    .await;
+    // The authorizer presenting something under its own path, or under the gateway's: not
+    // a peer at all.
+    for stranger in [
+        format!("{}/1", authorizer_svid()),
+        format!("{}/1", gateway_svid()),
+    ] {
+        let h = Harness::start(&stranger, CacheConfig::default(), None).await;
+        let (_, claim) = h.bound_claim().await;
+        let peer = claim_svid(&claim.uid.expect("uid"));
+        assert_eq!(
+            h.check(&peer, "CONNECT", ALLOWED[0]).await,
+            (403, "broker_unreachable".into()),
+            "{stranger}"
+        );
+    }
+}
+
+/// ADR-0053 decisions 2 and 3: an authorizer that holds the listeners' identity (two
+/// entries for its user, a mistaken entry, an image from before the split) gets nothing
+/// from the broker, so no tunnel opens through it. `mediatore gateway` itself does not
+/// start under that name (`Broker::connect`); this is the broker's side of the same
+/// refusal, with a client built past that check. Over mutual TLS the refusal is the
+/// handshake's, which the authorizer cannot tell from an outage: nothing was cached, so it
+/// denies.
+#[tokio::test]
+async fn an_authorizer_holding_the_listeners_identity_is_refused_and_denies_every_tunnel() {
+    let h = Harness::start(&gateway_svid(), CacheConfig::default(), None).await;
     let (_, claim) = h.bound_claim().await;
     let peer = claim_svid(&claim.uid.expect("uid"));
+    for authority in ALLOWED {
+        assert_eq!(
+            h.check(&peer, "CONNECT", authority).await,
+            (403, "broker_unreachable".into()),
+            "{authority}"
+        );
+    }
+    // The same broker answers the same question from the authorizer's own identity.
+    let authorizer = h.mtls_as(&authorizer_svid());
+    let url = format!(
+        "{}/v1/gateway/claims/{}",
+        h.sandbox_url,
+        claim.uid.expect("uid")
+    );
     assert_eq!(
-        h.check(&peer, "CONNECT", ALLOWED[0]).await,
-        (403, "broker_unreachable".into())
+        authorizer.get(&url).send().await.expect("ask").status(),
+        200
+    );
+    assert!(
+        h.mtls_as(&gateway_svid()).get(&url).send().await.is_err(),
+        "the listeners' identity does not complete a handshake"
     );
 }
 
@@ -508,7 +556,7 @@ async fn the_dev_header_transport_reaches_a_dev_mode_broker() {
         .unwrap();
     let peer = claim_svid(&claim.uid.unwrap());
 
-    let source = Broker::dev_header(&sandbox_url, &gateway_svid());
+    let source = Broker::dev_header(&sandbox_url, &authorizer_svid());
     let authorizer = Authorizer::new(TRUST_DOMAIN, Arc::new(source), CacheConfig::default());
     let d = authorizer.authorize(&peer, "CONNECT", ALLOWED[0]).await;
     assert_eq!(d.verdict, Ok(()));
@@ -516,10 +564,19 @@ async fn the_dev_header_transport_reaches_a_dev_mode_broker() {
         .authorize(&peer, "CONNECT", "other.home.example:443")
         .await;
     assert_eq!(d.verdict, Err(mediatore_gateway::Refusal::NotAllowed));
-    let source = Broker::dev_header(&sandbox_url, &node_svid());
-    let authorizer = Authorizer::new(TRUST_DOMAIN, Arc::new(source), CacheConfig::default());
-    let d = authorizer.authorize(&peer, "CONNECT", ALLOWED[0]).await;
-    assert_eq!(d.verdict, Err(mediatore_gateway::Refusal::BrokerRefused));
+    // The route's own check, which is what holds where there is no handshake to refuse a
+    // peer (ADR-0053 decision 3): a node, and the gateways' listener identity, are answered
+    // 403 and the authorizer denies, cached or not.
+    for other in [node_svid(), gateway_svid()] {
+        let source = Broker::dev_header(&sandbox_url, &other);
+        let authorizer = Authorizer::new(TRUST_DOMAIN, Arc::new(source), CacheConfig::default());
+        let d = authorizer.authorize(&peer, "CONNECT", ALLOWED[0]).await;
+        assert_eq!(
+            d.verdict,
+            Err(mediatore_gateway::Refusal::BrokerRefused),
+            "{other}"
+        );
+    }
 }
 
 /// A reflector that admitted a bundle for the conformance policy whose direct `egress[]` is
@@ -592,7 +649,7 @@ async fn enforcing_serves_a_policys_direct_egress_and_shadow_serves_none_of_it()
         )
         .await;
         let h = Harness::start_with(
-            &gateway_svid(),
+            &authorizer_svid(),
             CacheConfig::default(),
             None,
             Some(mediatore_api::PolicyEgress { bundles, mode }),
@@ -686,7 +743,7 @@ async fn a_claim_with_no_policy_or_a_bundle_the_cache_does_not_hold_gets_the_aud
         let (bundles, _published) =
             cache_with_direct_egress(&[(DIRECT, false)], jiff::Timestamp::now()).await;
         let h = Harness::start_with(
-            &gateway_svid(),
+            &authorizer_svid(),
             CacheConfig::default(),
             None,
             Some(mediatore_api::PolicyEgress {

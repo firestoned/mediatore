@@ -12,7 +12,10 @@ gateway is the verified bundle's `egress[]` too, behind the `policy.egress` swit
 2026-11-09 (decision 7: a gateway's own `5xx` moves the forwarder on; a `4xx` stays the verdict) ·
 2026-11-15 by [ADR-0040](0040-the-gateway-places-an-audiences-credential-the-pool-never-holds-it.md)
 (decision 9: the credential injection it reserved, on a third Envoy, `envoy-inject`, under
-decision 8's hardening)
+decision 8's hardening) · 2026-11-19 by
+[ADR-0053](0053-the-gateways-authorizer-has-an-identity-of-its-own.md) (decisions 2, 4
+and 8: the authorizer has an identity of its own, the gateway routes answer it alone, and the
+host table gains an output chain keyed on the socket's owner)
 
 Roadmap 10. Gives the egress gateway of [ADR-0010](0010-no-inbound-to-sandboxes.md)
 decision 4 its software, its identity and its authorization. Amends banlieue
@@ -75,6 +78,14 @@ that identity.
    particular VM. The registration entries are `ClusterStaticEntry` objects
    (ADR-0006), applied by the platform team with the agent's SPIFFE ID as the parent;
    the broker does not mint them, because a gateway is not a claim.
+
+   *Amended 2026-11-19 by
+   [ADR-0053](0053-the-gateways-authorizer-has-an-identity-of-its-own.md): a gateway has
+   two identities. The listeners (the tunnel Envoy and `envoy-inject`) keep
+   `spiffe://<td>/gateway`, which is what a client verifies; the authorizer holds
+   `spiffe://<td>/gateway/authorizer` as its client identity to the broker, and the route of
+   decision 4 answers that ID alone. An admission policy pins the two entry shapes
+   (`deploy/base/admission/clusterstaticentry-gateway.yaml`).*
 
 3. **The sandbox leg is mutual TLS carrying CONNECT.** A new role in the one binary,
    `mediatore forward` (ADR-0014), runs in the VM as the claim's `sb-` user, listens on a
@@ -147,6 +158,15 @@ that identity.
    - An access log line per tunnel: time, claim SPIFFE ID, claim UID, authority, verdict
      and reason, bytes each way, duration. Logged to the journal and shipped by the image's
      log forwarder. Never the payload, never a token.
+
+   *Amended 2026-11-19 by
+   [ADR-0053](0053-the-gateways-authorizer-has-an-identity-of-its-own.md) decisions 5
+   and 6: the host table gains an output chain keyed on the socket's owner
+   (`image/gateway/nftables.conf.in`). Its default policy is `accept`; the authorizer, the relay
+   and the agent are each held to their upstreams, both Envoys are refused loopback, the VM's own
+   addresses, link-local, the control-plane addresses and all IPv6, and only the authorizer's and
+   the relay's users reach the broker's address. Built and asserted in the image; not yet run on
+   a booted gateway VM.*
 
 9. **Phase one is identity, allowlist and audit. No interception.** Credential
    injection (roadmap 07) needs the gateway to read or rewrite requests, which means a

@@ -29,6 +29,8 @@ TimeoutStopSec=10
 # Then SIGKILL to whatever is left in the cgroup.
 SendSIGKILL=yes
 RuntimeDirectory=mediatore-guest
+# A line on stdout or stderr that starts with <N> is text, never a journal priority.
+SyslogLevelPrefix=no
 NoNewPrivileges=no
 
 [Install]

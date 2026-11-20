@@ -46,9 +46,10 @@ use mediatore_proto::{
     Route, Secret, Subject, TokenRequest, TokenResponse, WorkloadExit, error_code,
 };
 use mediatore_spire::{EntryManager, Naming};
-use mediatore_store::seal::{SealError, Sealed, Sealer};
+use mediatore_store::seal::{FORMAT_BARE_UID, SealError, Sealed, Sealer, Slot};
 use mediatore_store::{
-    ClaimRecord, ClaimStore, DelegatedSession, LogLimits, NodeRecord, SessionRecord, StoreError,
+    ClaimRecord, ClaimStore, DelegatedSession, LogLimits, Modified, NodeRecord, SessionRecord,
+    StoreError, modify_claim,
 };
 use mediatore_sts::{MintRequest, Sts};
 use mediatore_tls::PeerSpiffeId;
@@ -141,6 +142,11 @@ pub struct AppState {
     /// One batch per second per claim on `POST /v1/me/logs` (ADR-0045 decision 4), so a
     /// workload cannot turn the broker into a write amplifier; `429` with `Retry-After` beyond it.
     pub log_limiter: Limiter,
+    /// `accept_plain_gateway_identity` (ADR-0053 decision 7): for one release, the two gateway
+    /// routes also answer a peer presenting the listeners' ID, `spiffe://<td>/gateway`, each
+    /// ask a `warn` line. `false` everywhere but an environment in the middle of moving its
+    /// gateways' entries; with it on, the compartment of ADR-0053 is not in force.
+    pub accept_plain_gateway_identity: bool,
 }
 
 /// Which namespaces the user API serves and who may use each (ADR-0046 decisions 3 to 5).
@@ -515,16 +521,52 @@ fn peer_spiffe_id(
 
 /// Who may complete a handshake with the sandbox listener: node and claim identities of
 /// this trust domain, parsed by the same rules the handlers apply, and the gateway
-/// identity (ADR-0028 decision 4, amending ADR-0007 decision 2), and nothing else, not
-/// even another broker. Which routes each may use is the handlers' business: the gateway
-/// reaches its own route and nothing a node or a claim reaches.
-pub fn sandbox_authorizer(naming: Naming) -> mediatore_tls::Authorizer {
+/// authorizer's identity, `spiffe://<td>/gateway/authorizer` (ADR-0053 decision 3, amending
+/// ADR-0028 decision 4 and ADR-0007 decision 2), and nothing else, not even another broker.
+/// The listeners' identity, `spiffe://<td>/gateway`, is a name the sandboxes verify and no
+/// peer of the broker: it is admitted only while `accept_plain_gateway_identity` is on
+/// (ADR-0053 decision 7). Which routes each may use is the handlers' business: the
+/// authorizer reaches its own two routes and nothing a node or a claim reaches.
+pub fn sandbox_authorizer(
+    naming: Naming,
+    accept_plain_gateway_identity: bool,
+) -> mediatore_tls::Authorizer {
     Arc::new(move |id: &mediatore_tls::SpiffeId| {
         let id = id.to_string();
         naming.node_ek_from(&id).is_some()
             || naming.claim_uid_from(&id).is_some()
-            || naming.is_gateway(&id)
+            || naming.is_gateway_authorizer(&id)
+            || (accept_plain_gateway_identity && naming.is_gateway(&id))
     })
+}
+
+/// The guard of the two gateway routes (ADR-0053 decision 3): the peer must be the gateway
+/// authorizer's identity, exactly. Anything else, the listeners' `spiffe://<td>/gateway`
+/// included, is `403 forbidden`, and the caller runs this before it parses or looks up the
+/// claim, so a refusal says nothing about whether a claim exists. With
+/// `accept_plain_gateway_identity` on (decision 7) the listeners' ID is answered too, and
+/// every such ask is a `warn` line naming the peer, the route and the claim UID as asked.
+fn require_gateway_authorizer(
+    st: &AppState,
+    peer: &str,
+    route: &'static str,
+    claim_uid: &str,
+) -> Result<(), ApiError> {
+    if st.naming.is_gateway_authorizer(peer) {
+        return Ok(());
+    }
+    if st.accept_plain_gateway_identity && st.naming.is_gateway(peer) {
+        tracing::warn!(
+            %peer,
+            route,
+            claim_uid,
+            "a gateway asked under the listeners' identity, accepted because accept_plain_gateway_identity is on: move this gateway's authorizer entry to the authorizer's ID (ADR-0053 decision 7)"
+        );
+        return Ok(());
+    }
+    Err(ApiError::forbidden(
+        "peer is not the gateway authorizer's identity",
+    ))
 }
 
 // ---------- user-facing ----------
@@ -764,7 +806,7 @@ async fn dev_claim(
     let refresh = match (sealer, session) {
         (Some(sealer), Some(token)) => Some(
             sealer
-                .seal(uid, token.0.as_bytes())
+                .seal_session(Slot::Issuer, uid, token.0.as_bytes())
                 .await
                 .map_err(seal_error)?,
         ),
@@ -773,10 +815,11 @@ async fn dev_claim(
     let mut dev_delegations = BTreeMap::new();
     if let Some(sealer) = sealer {
         for d in delegations {
+            let sealed_until = parked_expiry(d.expires_at, Timestamp::now(), req.ttl_seconds);
             dev_delegations.insert(
                 d.audience.clone(),
                 DelegatedSession {
-                    envelope: seal_delegation(sealer, uid, d).await?,
+                    envelope: seal_delegation(sealer, uid, d, sealed_until).await?,
                     expires_at: d.expires_at,
                 },
             );
@@ -803,6 +846,7 @@ async fn dev_claim(
             exit: None,
             delegations: dev_delegations,
             namespace,
+            version: None,
         })
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
@@ -983,18 +1027,26 @@ fn basic_parts(token: &str) -> Result<(&str, &str), &'static str> {
     Ok((user, secret))
 }
 
-/// Seal a delegation's plaintext for `binding` (ADR-0035 decision 3).
+/// Seal a delegation's plaintext for `binding` (ADR-0035 decision 3), under its audience's
+/// slot (ADR-0057 decision 9), so it opens as that audience's and as nothing else, with
+/// `expires_at` inside (decision 11): the instant the issue path bounds the credential by,
+/// whatever is kept in clear beside the envelope.
 async fn seal_delegation(
     sealer: &dyn Sealer,
     binding: Uuid,
     d: &Delegation,
+    expires_at: Timestamp,
 ) -> Result<Sealed, ApiError> {
     let plain = DelegationPlain {
         token: d.token.clone().unwrap_or_else(|| Secret(String::new())),
         refresh_token: d.refresh_token.clone(),
+        expires_at: Some(expires_at),
     };
     let bytes = serde_json::to_vec(&plain).map_err(|e| ApiError::internal(e.to_string()))?;
-    sealer.seal(binding, &bytes).await.map_err(seal_error)
+    sealer
+        .seal_session(Slot::Delegation(&d.audience), binding, &bytes)
+        .await
+        .map_err(seal_error)
 }
 
 /// The production front door (ADR-0008 decision 4): the request becomes an `AgentSandbox`
@@ -1097,11 +1149,13 @@ async fn park_delegations(
         .and_then(|u| Uuid::parse_str(u).ok())
         .ok_or_else(|| anyhow::anyhow!("the created sandbox has no UUID uid"))?;
     for d in delegations {
-        let refresh = seal_delegation(sealer, sandbox_uid, d)
-            .await
-            .map_err(|e| anyhow::anyhow!("sealing the delegation failed: {}", e.body.error))?;
         let created_at = Timestamp::now();
         let expires_at = parked_expiry(d.expires_at, created_at, created.spec.ttl_seconds);
+        // The same instant inside the envelope and in clear beside it: the issue path
+        // believes the sealed one, the sweep reads the clear one (ADR-0057 decision 11).
+        let refresh = seal_delegation(sealer, sandbox_uid, d, expires_at)
+            .await
+            .map_err(|e| anyhow::anyhow!("sealing the delegation failed: {}", e.body.error))?;
         st.store
             .put_session(SessionRecord {
                 sandbox_uid,
@@ -1134,7 +1188,9 @@ async fn park_session(
         .as_deref()
         .and_then(|u| Uuid::parse_str(u).ok())
         .ok_or_else(|| anyhow::anyhow!("the created sandbox has no UUID uid"))?;
-    let refresh = sealer.seal(sandbox_uid, token.0.as_bytes()).await?;
+    let refresh = sealer
+        .seal_session(Slot::Issuer, sandbox_uid, token.0.as_bytes())
+        .await?;
     let created_at = Timestamp::now();
     let expires_at = parked_expiry(None, created_at, created.spec.ttl_seconds);
     st.store
@@ -1798,7 +1854,7 @@ async fn exit(
     peer: Option<Extension<PeerSpiffeId>>,
     Json(body): Json<GuestExit>,
 ) -> Result<StatusCode, ApiError> {
-    let mut rec = match claim_of_node_peer(&st, &headers, peer.as_ref().map(|e| &e.0)).await {
+    let rec = match claim_of_node_peer(&st, &headers, peer.as_ref().map(|e| &e.0)).await {
         Ok(rec) => rec,
         Err(e) if e.status == StatusCode::NOT_FOUND => {
             tracing::debug!("a node reported an exit with no live claim bound; nothing to end");
@@ -1815,14 +1871,31 @@ async fn exit(
         restart = %rec.workload.restart,
         "workload exited and its restart policy ends the claim (ADR-0033)"
     );
-    rec.exit = Some(WorkloadExit {
+    let exited = WorkloadExit {
         exited_at: Timestamp::now(),
         exit: body,
-    });
-    st.store
-        .update_claim(rec.clone())
-        .await
-        .map_err(|e| ApiError::internal(e.to_string()))?;
+    };
+    // The exit is put on the record as it is when it is written (ADR-0057 decision 5), and
+    // nothing else of the copy read above is carried over.
+    let written = modify_claim(st.store.as_ref(), rec.uid, |mut fresh| {
+        fresh.exit = Some(exited.clone());
+        Some(fresh)
+    })
+    .await;
+    match written {
+        Ok(Modified::Written | Modified::Unchanged) => {}
+        Ok(Modified::Released) | Err(StoreError::NotFound(_)) => {
+            // Ended already: the exit is in the line above and not on the record.
+            tracing::debug!(claim_uid = %rec.uid, "exit for a claim that has ended already; nothing to end");
+            return Ok(StatusCode::NO_CONTENT);
+        }
+        Err(e) => {
+            // The record was busy, or the write failed. The release goes ahead all the
+            // same: a claim is never left to its deadline because its record could not
+            // take the exit. A release carries no precondition.
+            tracing::warn!(claim_uid = %rec.uid, error = %e, "the exit could not be put on the record; the claim is released all the same");
+        }
+    }
     if st.dev_mode {
         reconciler(&st)
             .release(rec.uid)
@@ -1848,7 +1921,7 @@ async fn report(
     peer: Option<Extension<PeerSpiffeId>>,
     Json(body): Json<GuestReport>,
 ) -> Result<StatusCode, ApiError> {
-    let mut rec = claim_of_node_peer(&st, &headers, peer.as_ref().map(|e| &e.0)).await?;
+    let rec = claim_of_node_peer(&st, &headers, peer.as_ref().map(|e| &e.0)).await?;
     node_report_allowed(&st, rec.uid)?;
     body.validate()
         .map_err(|e| ApiError::bad_request("invalid_report", e))?;
@@ -1862,15 +1935,34 @@ async fn report(
         host_table = ?body.host_table,
         "guest report recorded"
     );
-    rec.report = Some(ClaimReport {
+    let report = ClaimReport {
         reported_at: Timestamp::now(),
         report: body,
-    });
-    st.store
-        .update_claim(rec)
-        .await
-        .map_err(|e| ApiError::internal(e.to_string()))?;
-    Ok(StatusCode::NO_CONTENT)
+    };
+    // The report is put on the record as it is when it is written (ADR-0057 decision 5);
+    // nothing else of the copy read above is carried over.
+    let written = modify_claim(st.store.as_ref(), rec.uid, |mut fresh| {
+        fresh.report = Some(report.clone());
+        Some(fresh)
+    })
+    .await;
+    match written {
+        Ok(Modified::Written | Modified::Unchanged) => Ok(StatusCode::NO_CONTENT),
+        // Released or gone since the lookup: what a node with no live claim is told.
+        Ok(Modified::Released) | Err(StoreError::NotFound(_)) => Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "no_claim",
+            Some("no live claim bound to this node".into()),
+        )),
+        // Every attempt lost to another write: nothing was written, the guest may send it
+        // again.
+        Err(StoreError::Conflict(_)) => Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "record_busy",
+            Some("the claim's record is being written; send the report again".into()),
+        )),
+        Err(e) => Err(store_error(e)),
+    }
 }
 
 async fn me(
@@ -2121,8 +2213,9 @@ fn audience_egress(st: &AppState, rec: &ClaimRecord) -> Vec<Endpoint> {
 }
 
 /// `GET /v1/gateway/claims/{uid}`: what a gateway may let the claim reach (ADR-0028
-/// decision 4). The peer must be the gateway identity, `spiffe://<td>/gateway`: a node, a
-/// claim, even the claim asked about, is `403`. A claim the store does not know, one not
+/// decision 4). The peer must be the gateway authorizer's identity,
+/// `spiffe://<td>/gateway/authorizer` (ADR-0053 decision 3): a node, a claim, even the claim
+/// asked about, and the gateway's own listeners are `403`. A claim the store does not know, one not
 /// bound (no deadline yet, so no identity for a tunnel to carry), one released or past its
 /// deadline is `404`, the one answer the gateway takes as "deny, and drop what was cached".
 async fn claim_egress(
@@ -2132,9 +2225,7 @@ async fn claim_egress(
     Path(uid): Path<String>,
 ) -> Result<Json<ClaimEgress>, ApiError> {
     let peer = peer_spiffe_id(&st, peer.as_ref().map(|e| &e.0), &headers)?;
-    if !st.naming.is_gateway(&peer) {
-        return Err(ApiError::forbidden("peer is not the gateway identity"));
-    }
+    require_gateway_authorizer(&st, &peer, "GET /v1/gateway/claims/{uid}", &uid)?;
     let uid = Uuid::parse_str(&uid)
         .map_err(|_| ApiError::bad_request("invalid_claim_uid", "claim uid must be a UUID"))?;
     let unknown = || ApiError::not_found("no live claim with this uid");
@@ -2210,7 +2301,7 @@ async fn refresh_session(
         return Err(ApiError::not_implemented("sealing"));
     };
     let plaintext = sealer
-        .unseal(rec.seal_binding(), envelope)
+        .unseal_session(Slot::Issuer, rec.seal_binding(), envelope)
         .await
         .map_err(|e| {
             // An outage at the sealer is an outage: the envelope stays, nothing is revoked.
@@ -2266,20 +2357,50 @@ async fn refresh_session(
         release_quietly(st, rec.uid).await;
         return Err(session_revoked());
     }
+    // Sealed again at every refresh, always as format 2 (ADR-0057 decision 10): a session
+    // stored as format 1 becomes 2 here.
     let envelope = sealer
-        .seal(rec.seal_binding(), refresh_token.as_bytes())
+        .seal_session(Slot::Issuer, rec.seal_binding(), refresh_token.as_bytes())
         .await
         .map_err(seal_error)?;
-    let mut updated = rec.clone();
-    updated.refresh = Some(envelope);
-    st.store
-        .update_claim(updated)
-        .await
-        .map_err(|e| ApiError::internal(e.to_string()))?;
+    store_refreshed(st, rec.uid, &envelope).await?;
     Ok(Fresh {
         groups: validated.map(|v| v.groups).unwrap_or_default(),
         obo,
     })
+}
+
+/// Put a freshly sealed session envelope on the record of claim `claim_uid` as it is when it
+/// is written (ADR-0057 decision 5). A claim released or gone in the meantime gets the answer
+/// a released claim gets: the envelope is dropped unstored and the caller mints nothing. When
+/// every attempt lost to another write the answer is `503`, nothing is minted and the
+/// envelope is dropped; the rotated token it held is then not stored anywhere.
+async fn store_refreshed(
+    st: &AppState,
+    claim_uid: Uuid,
+    envelope: &Sealed,
+) -> Result<(), ApiError> {
+    let written = modify_claim(st.store.as_ref(), claim_uid, |mut fresh| {
+        fresh.refresh = Some(envelope.clone());
+        Some(fresh)
+    })
+    .await;
+    match written {
+        Ok(Modified::Written | Modified::Unchanged) => Ok(()),
+        Ok(Modified::Released) | Err(StoreError::NotFound(_)) => {
+            tracing::info!(%claim_uid, "claim released during a session refresh; nothing stored, nothing minted");
+            Err(ApiError::forbidden("claim revoked or expired"))
+        }
+        Err(StoreError::Conflict(_)) => {
+            tracing::warn!(%claim_uid, "the refreshed session could not be stored: the record was busy; nothing minted");
+            Err(ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "record_busy",
+                Some("the claim's record is being written; ask again".to_owned()),
+            ))
+        }
+        Err(e) => Err(store_error(e)),
+    }
 }
 
 /// A failed On-Behalf-Of exchange at claim creation (ADR-0016 decision 1): Entra's
@@ -2600,9 +2721,37 @@ async fn delegated_token(
             "no credential was delegated for this audience, or it was revoked",
         ));
     };
+    // Opened under the audience that was asked for (ADR-0057 decision 9): nothing in clear
+    // chooses the context, so an envelope of another audience of this sandbox, or its
+    // issuer's session, put in this one's place does not open.
+    let plain = sealer
+        .unseal_session(Slot::Delegation(&audience), rec.seal_binding(), &held.envelope)
+        .await
+        .map_err(|e| {
+            if let SealError::Unavailable(_) = e {
+                return seal_error(e);
+            }
+            tracing::warn!(%claim_uid, %audience, error = %e, "delegation envelope did not open for this audience");
+            ApiError::forbidden("the delegated credential does not open for this audience")
+        })?;
+    let plain: DelegationPlain = serde_json::from_slice(&plain)
+        .map_err(|_| ApiError::internal("the delegation envelope is not what was sealed"))?;
+    // The expiry that bounds the credential (decision 11): the one sealed with it. No clear
+    // value is read for a format 2 envelope, and one that carries no expiry inside is not
+    // what this broker seals: refused. A format 1 envelope has none inside and keeps the
+    // clear value, as it was issued from before, until its claim ends.
+    let stored_expiry = if held.envelope.format == FORMAT_BARE_UID {
+        held.expires_at
+    } else {
+        Some(
+            plain
+                .expires_at
+                .ok_or_else(|| ApiError::internal("the delegation envelope carries no expiry"))?,
+        )
+    };
     let now = Timestamp::now();
     let mut expires_at = now + d.ttl;
-    if let Some(e) = held.expires_at {
+    if let Some(e) = stored_expiry {
         expires_at = expires_at.min(e);
     }
     if let Some(e) = rec.expires_at {
@@ -2611,12 +2760,6 @@ async fn delegated_token(
     if expires_at <= now {
         return Err(ApiError::forbidden("the delegated credential has expired"));
     }
-    let plain = sealer
-        .unseal(rec.seal_binding(), &held.envelope)
-        .await
-        .map_err(seal_error)?;
-    let plain: DelegationPlain = serde_json::from_slice(&plain)
-        .map_err(|_| ApiError::internal("the delegation envelope is not what was sealed"))?;
     if d.basic {
         // ADR-0041 decision 8: `Authorization: Basic base64(user:secret)`, whole, so the gateway places
         // it as it is (a response with a header carries the value bare).
@@ -2682,14 +2825,14 @@ fn policy_admits(st: &AppState, rec: &ClaimRecord, audience: &str) -> Result<(),
 }
 
 /// `POST /v1/gateway/claims/{uid}/credential`: the credential of a gateway-placed audience, for
-/// the gateway's authorizer alone (ADR-0040 decision 2). The peer must be the gateway
-/// identity, as for `GET /v1/gateway/claims/{uid}`: a node, a claim, even the claim asked about,
-/// is `403`. A claim that is unknown, unbound, released or past its deadline is `404`, the answer
+/// the gateway's authorizer alone (ADR-0040 decision 2). The peer must be the authorizer's
+/// identity (ADR-0053 decision 3), as for `GET /v1/gateway/claims/{uid}`: a node, a claim, even
+/// the claim asked about, and a gateway's listener are `403`. A claim that is unknown, unbound, released or past its deadline is `404`, the answer
 /// the gateway takes as "drop what was cached". The gate then is `POST /v1/token`'s (the claim
 /// names the audience, the per-claim rate limit) plus the policy bundle under `enforce`, the
 /// audience must be gateway-placed, and the credential comes from the same per-backend code.
 /// It is built for this answer and kept nowhere; each issue is one audit line that names the
-/// claim, audience, subject, backend and expiry, never the credential.
+/// claim, audience, subject, backend, expiry and the peer that asked, never the credential.
 async fn gateway_credential(
     State(st): State<Shared>,
     headers: HeaderMap,
@@ -2698,9 +2841,7 @@ async fn gateway_credential(
     Json(req): Json<GatewayCredentialRequest>,
 ) -> Result<Json<GatewayCredential>, ApiError> {
     let peer = peer_spiffe_id(&st, peer.as_ref().map(|e| &e.0), &headers)?;
-    if !st.naming.is_gateway(&peer) {
-        return Err(ApiError::forbidden("peer is not the gateway identity"));
-    }
+    require_gateway_authorizer(&st, &peer, "POST /v1/gateway/claims/{uid}/credential", &uid)?;
     let claim_uid = Uuid::parse_str(&uid)
         .map_err(|_| ApiError::bad_request("invalid_claim_uid", "claim uid must be a UUID"))?;
     let unknown = || ApiError::not_found("no live claim with this uid");
@@ -2735,7 +2876,7 @@ async fn gateway_credential(
     let actor = st.naming.claim_id(claim_uid);
     let issued = issue_token(&st, &actor, claim_uid, rec, audience, Placement::Gateway).await?;
     let credential = GatewayCredential::from_token_response(issued, Timestamp::now());
-    tracing::info!(%claim_uid, audience = %credential.audience, subject = %credential.subject.id, backend, expires_at = %credential.expires_at, "gateway credential issued");
+    tracing::info!(%claim_uid, audience = %credential.audience, subject = %credential.subject.id, backend, expires_at = %credential.expires_at, %peer, "gateway credential issued");
     Ok(Json(credential))
 }
 
@@ -2915,6 +3056,7 @@ mod tests {
             inject_port: None,
             logs: None,
             log_limiter: Limiter::per_second(1),
+            accept_plain_gateway_identity: false,
         }
     }
 
@@ -3050,6 +3192,7 @@ mod tests {
             exit: None,
             delegations: BTreeMap::new(),
             namespace: "sandboxes".into(),
+            version: None,
         }
     }
 
@@ -3089,8 +3232,9 @@ mod tests {
         )
     }
 
+    /// The one peer of the gateway routes: the authorizer's identity (ADR-0053 decision 3).
     fn gateway_peer() -> String {
-        naming().gateway_id()
+        naming().gateway_authorizer_id()
     }
 
     /// `POST /v1/gateway/claims/{uid}/credential` as `peer`.
@@ -3156,9 +3300,13 @@ mod tests {
         let plain = serde_json::to_vec(&DelegationPlain {
             token: Secret(SESSION_TOKEN.into()),
             refresh_token: None,
+            expires_at: Some(Timestamp::now() + SignedDuration::from_hours(1)),
         })
         .unwrap();
-        let envelope = sealer.seal(rec.seal_binding(), &plain).await.unwrap();
+        let envelope = sealer
+            .seal_session(Slot::Delegation("claude"), rec.seal_binding(), &plain)
+            .await
+            .unwrap();
         rec.delegations.insert(
             "claude".into(),
             DelegatedSession {
@@ -3195,9 +3343,13 @@ mod tests {
         let plain = serde_json::to_vec(&DelegationPlain {
             token: Secret("alice:p@ss:word".into()),
             refresh_token: None,
+            expires_at: Some(Timestamp::now() + SignedDuration::from_hours(1)),
         })
         .unwrap();
-        let envelope = sealer.seal(rec.seal_binding(), &plain).await.unwrap();
+        let envelope = sealer
+            .seal_session(Slot::Delegation("claude"), rec.seal_binding(), &plain)
+            .await
+            .unwrap();
         rec.delegations.insert(
             "claude".into(),
             DelegatedSession {
@@ -3327,18 +3479,21 @@ mod tests {
     // ----- who may ask, and for what -----
 
     #[tokio::test]
-    async fn only_the_gateway_identity_may_ask_and_a_refusal_never_carries_the_credential() {
+    async fn only_the_authorizers_identity_may_ask_and_a_refusal_never_carries_the_credential() {
         let st: Shared = Arc::new(placed_state());
         let rec = stored(&st, claim(&["anthropic"], None)).await;
         let n = naming();
-        let not_gateways = [
+        let not_authorizers = [
             n.claim_id(rec.uid),
             n.node_id("ekhash"),
             n.broker_id(),
+            n.gateway_id(),
             "spiffe://other.test/gateway".to_owned(),
+            "spiffe://other.test/gateway/authorizer".to_owned(),
             format!("spiffe://{TD}/gateway/extra"),
+            format!("spiffe://{TD}/gateway/authorizer/extra"),
         ];
-        for peer in &not_gateways {
+        for peer in &not_authorizers {
             let (status, body, text) = ask(&st, rec.uid, Some(peer), "anthropic").await;
             assert_eq!(status, StatusCode::FORBIDDEN, "{peer}: {text}");
             assert_eq!(code(&body), "forbidden", "{peer}");
@@ -3347,6 +3502,151 @@ mod tests {
         let (status, _, text) = ask(&st, rec.uid, None, "anthropic").await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "no peer identity: {text}");
         assert!(!text.contains(SECRET_VALUE));
+        let (status, _, text) = ask(&st, rec.uid, Some(&gateway_peer()), "anthropic").await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the authorizer is answered: {status}"
+        );
+        assert!(text.contains(SECRET_VALUE), "and with the credential");
+    }
+
+    /// `GET /v1/gateway/claims/{uid}` as `peer`.
+    async fn ask_egress(
+        st: &Shared,
+        uid: impl std::fmt::Display,
+        peer: &str,
+    ) -> (StatusCode, serde_json::Value, String) {
+        call(
+            st,
+            "GET",
+            &format!("/v1/gateway/claims/{uid}"),
+            Some(peer),
+            serde_json::Value::Null,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn the_plain_gateway_identity_is_refused_on_both_gateway_routes_before_the_claim_is_looked_up()
+     {
+        // ADR-0053 decision 3: a listener's name gets the one answer whatever it asks about, a
+        // live claim, a UID the store never held, or text that is no UID at all. The
+        // authorizer's answers to the same three differ (200, 404, 400), so the refusal comes
+        // before the claim is parsed or read and says nothing about whether it exists.
+        let st: Shared = Arc::new(placed_state());
+        let live = stored(&st, claim(&["anthropic"], None)).await;
+        let plain = naming().gateway_id();
+        let authorizer = gateway_peer();
+        let asked = [
+            (live.uid.to_string(), StatusCode::OK),
+            (Uuid::new_v4().to_string(), StatusCode::NOT_FOUND),
+            ("not-a-uuid".to_owned(), StatusCode::BAD_REQUEST),
+        ];
+        for (uid, as_authorizer) in &asked {
+            let (status, body, text) = ask(&st, uid, Some(&plain), "anthropic").await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "credential, {uid}: {text}");
+            assert_eq!(code(&body), "forbidden", "credential, {uid}");
+            assert!(!text.contains(SECRET_VALUE), "credential, {uid}");
+            let (status, body, text) = ask_egress(&st, uid, &plain).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "egress, {uid}: {text}");
+            assert_eq!(code(&body), "forbidden", "egress, {uid}");
+            let (status, _, _) = ask(&st, uid, Some(&authorizer), "anthropic").await;
+            assert_eq!(
+                status, *as_authorizer,
+                "the authorizer's credential ask, {uid}"
+            );
+            let (status, _, _) = ask_egress(&st, uid, &authorizer).await;
+            assert_eq!(status, *as_authorizer, "the authorizer's egress ask, {uid}");
+        }
+    }
+
+    #[test]
+    fn the_sandbox_listener_admits_the_authorizer_and_no_longer_the_plain_gateway_identity() {
+        // ADR-0053 decision 3, the outer refusal: the handshake's list.
+        let n = naming();
+        let id = |s: &str| mediatore_tls::SpiffeId::new(s).expect("a SPIFFE ID");
+        let strict = sandbox_authorizer(n.clone(), false);
+        assert!(strict(&id(&n.gateway_authorizer_id())));
+        assert!(strict(&id(&n.node_id("ekhash"))));
+        assert!(strict(&id(&n.claim_id(Uuid::new_v4()))));
+        for stranger in [
+            n.gateway_id(),
+            n.broker_id(),
+            format!("spiffe://{TD}/gateway/authorizer/extra"),
+            format!("spiffe://{TD}/gateway/extra"),
+            "spiffe://other.test/gateway/authorizer".to_owned(),
+        ] {
+            assert!(!strict(&id(&stranger)), "{stranger}");
+        }
+        // Decision 7: the switch widens the list by the listeners' ID and by nothing else.
+        let lenient = sandbox_authorizer(n.clone(), true);
+        assert!(lenient(&id(&n.gateway_id())));
+        assert!(lenient(&id(&n.gateway_authorizer_id())));
+        assert!(!lenient(&id(&n.broker_id())));
+        assert!(!lenient(&id(&format!("spiffe://{TD}/gateway/extra"))));
+    }
+
+    #[tokio::test]
+    async fn the_transition_switch_is_off_by_default_and_when_on_admits_the_plain_identity_with_a_warning()
+     {
+        capture_logs();
+        assert!(
+            !placed_state().accept_plain_gateway_identity,
+            "off unless a test turns it on"
+        );
+        let mut st = placed_state();
+        st.accept_plain_gateway_identity = true;
+        let st: Shared = Arc::new(st);
+        let rec = stored(&st, claim(&["anthropic"], None)).await;
+        let plain = naming().gateway_id();
+        let (status, _, text) = ask_egress(&st, rec.uid, &plain).await;
+        assert_eq!(status, StatusCode::OK, "egress under the switch: {text}");
+        let (status, _, _) = ask(&st, rec.uid, Some(&plain), "anthropic").await;
+        assert_eq!(status, StatusCode::OK, "credential under the switch");
+        let logs = captured();
+        let warned: Vec<&str> = logs
+            .lines()
+            .filter(|l| l.contains("WARN") && l.contains("accept_plain_gateway_identity"))
+            .collect();
+        assert_eq!(warned.len(), 2, "one warning per ask: {logs}");
+        let uid_text = rec.uid.to_string();
+        for (line, route) in warned.iter().zip([
+            "GET /v1/gateway/claims/{uid}",
+            "POST /v1/gateway/claims/{uid}/credential",
+        ]) {
+            for needle in [plain.as_str(), route, uid_text.as_str()] {
+                assert!(line.contains(needle), "{needle} in {line}");
+            }
+        }
+        assert!(!logs.contains(SECRET_VALUE), "no credential in a log line");
+        // The authorizer's own asks are not warnings, and the switch admits nothing else.
+        capture_logs();
+        let (status, _, _) = ask_egress(&st, rec.uid, &gateway_peer()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !captured().contains("accept_plain_gateway_identity"),
+            "the authorizer's ask is no warning"
+        );
+        let (status, _, _) = ask_egress(&st, rec.uid, &naming().claim_id(rec.uid)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "a claim is still no gateway");
+    }
+
+    #[tokio::test]
+    async fn the_audit_line_names_the_peer_that_asked() {
+        capture_logs();
+        let st: Shared = Arc::new(placed_state());
+        let rec = stored(&st, claim(&["anthropic"], None)).await;
+        let gw = gateway_peer();
+        let (status, _, _) = ask(&st, rec.uid, Some(&gw), "anthropic").await;
+        assert_eq!(status, StatusCode::OK);
+        let logs = captured();
+        let line = logs
+            .lines()
+            .find(|l| l.contains("gateway credential issued") && l.contains(&rec.uid.to_string()))
+            .unwrap_or_else(|| panic!("no audit line in: {logs}"));
+        assert!(line.contains(&gw), "the peer's SPIFFE ID in {line}");
+        assert!(!logs.contains(SECRET_VALUE), "and never the credential");
     }
 
     #[tokio::test]
@@ -3642,12 +3942,16 @@ mod tests {
         let plain = serde_json::to_vec(&DelegationPlain {
             token: Secret(SESSION_TOKEN.into()),
             refresh_token: None,
+            expires_at: Some(Timestamp::now() - SignedDuration::from_secs(5)),
         })
         .unwrap();
         expired.delegations.insert(
             "claude".into(),
             DelegatedSession {
-                envelope: sealer.seal(expired.seal_binding(), &plain).await.unwrap(),
+                envelope: sealer
+                    .seal_session(Slot::Delegation("claude"), expired.seal_binding(), &plain)
+                    .await
+                    .unwrap(),
                 expires_at: Some(Timestamp::now() - SignedDuration::from_secs(5)),
             },
         );
@@ -4122,12 +4426,16 @@ mod tests {
         let plain = serde_json::to_vec(&DelegationPlain {
             token: Secret(SESSION_TOKEN.into()),
             refresh_token: None,
+            expires_at: Some(Timestamp::now() + SignedDuration::from_hours(1)),
         })
         .unwrap();
         delegated.delegations.insert(
             "claude".into(),
             DelegatedSession {
-                envelope: sealer.seal(delegated.seal_binding(), &plain).await.unwrap(),
+                envelope: sealer
+                    .seal_session(Slot::Delegation("claude"), delegated.seal_binding(), &plain)
+                    .await
+                    .unwrap(),
                 expires_at: Some(Timestamp::now() + SignedDuration::from_hours(1)),
             },
         );
@@ -5364,5 +5672,348 @@ mod tests {
         for token in [&ok, &denied_token, &omitted] {
             assert!(!logs.contains(token.as_str()), "a token reached a log line");
         }
+    }
+
+    // ----- ADR-0057: compare-and-set callers, the slot, the sealed expiry -----
+
+    /// A store whose records are contended: every `update_claim` meets `on_update`, and
+    /// everything else is the in-memory store's.
+    mod contended {
+        use super::*;
+        use mediatore_store::{LogAppend, LogChunk, LogStore, MemoryStore, PolicyFloor};
+
+        /// What a contended record does to an update (ADR-0057 decision 5).
+        #[derive(Clone, Copy)]
+        pub(super) enum OnUpdate {
+            /// Every update loses to another write.
+            Conflict,
+            /// A release lands first, and the update is then refused.
+            Release,
+        }
+
+        pub(super) struct Contended {
+            pub(super) inner: Arc<MemoryStore>,
+            pub(super) on_update: OnUpdate,
+        }
+
+        #[async_trait::async_trait]
+        impl LogStore for Contended {
+            async fn append_logs(
+                &self,
+                rec: &ClaimRecord,
+                batch: &LogBatch,
+                limits: &LogLimits,
+            ) -> Result<LogAppend, StoreError> {
+                self.inner.append_logs(rec, batch, limits).await
+            }
+            async fn read_logs(
+                &self,
+                claim_uid: Uuid,
+                since: Option<u64>,
+            ) -> Result<LogChunk, StoreError> {
+                self.inner.read_logs(claim_uid, since).await
+            }
+            async fn delete_logs(&self, claim_uid: Uuid) -> Result<(), StoreError> {
+                self.inner.delete_logs(claim_uid).await
+            }
+            async fn sweep_logs(&self, before: Timestamp) -> Result<usize, StoreError> {
+                self.inner.sweep_logs(before).await
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl ClaimStore for Contended {
+            async fn put_claim(&self, rec: ClaimRecord) -> Result<(), StoreError> {
+                self.inner.put_claim(rec).await
+            }
+            async fn get_claim(&self, uid: Uuid) -> Result<ClaimRecord, StoreError> {
+                self.inner.get_claim(uid).await
+            }
+            async fn get_claim_by_name(
+                &self,
+                namespace: &str,
+                name: &str,
+            ) -> Result<ClaimRecord, StoreError> {
+                self.inner.get_claim_by_name(namespace, name).await
+            }
+            async fn update_claim(&self, rec: ClaimRecord) -> Result<(), StoreError> {
+                if let OnUpdate::Release = self.on_update {
+                    self.inner.revoke_claim(rec.uid, Timestamp::now()).await?;
+                }
+                Err(StoreError::Conflict("contended".into()))
+            }
+            async fn revoke_claim(&self, uid: Uuid, at: Timestamp) -> Result<(), StoreError> {
+                self.inner.revoke_claim(uid, at).await
+            }
+            async fn get_claim_by_node(&self, node_id: &str) -> Result<ClaimRecord, StoreError> {
+                self.inner.get_claim_by_node(node_id).await
+            }
+            async fn list_claims(&self) -> Result<Vec<ClaimRecord>, StoreError> {
+                self.inner.list_claims().await
+            }
+            async fn put_node(&self, rec: NodeRecord) -> Result<(), StoreError> {
+                self.inner.put_node(rec).await
+            }
+            async fn get_node(&self, ek_hash: &str) -> Result<NodeRecord, StoreError> {
+                self.inner.get_node(ek_hash).await
+            }
+            async fn get_node_by_dmi(&self, dmi_uuid: Uuid) -> Result<NodeRecord, StoreError> {
+                self.inner.get_node_by_dmi(dmi_uuid).await
+            }
+            async fn ban_node(&self, ek_hash: &str) -> Result<(), StoreError> {
+                self.inner.ban_node(ek_hash).await
+            }
+            async fn list_nodes(&self) -> Result<Vec<NodeRecord>, StoreError> {
+                self.inner.list_nodes().await
+            }
+            async fn delete_node(&self, ek_hash: &str) -> Result<(), StoreError> {
+                self.inner.delete_node(ek_hash).await
+            }
+            async fn sweep(&self, before: Timestamp) -> Result<usize, StoreError> {
+                self.inner.sweep(before).await
+            }
+            async fn put_session(&self, rec: SessionRecord) -> Result<(), StoreError> {
+                self.inner.put_session(rec).await
+            }
+            async fn take_session(
+                &self,
+                sandbox_uid: Uuid,
+            ) -> Result<Option<SessionRecord>, StoreError> {
+                self.inner.take_session(sandbox_uid).await
+            }
+            async fn take_delegations(
+                &self,
+                sandbox_uid: Uuid,
+            ) -> Result<Vec<SessionRecord>, StoreError> {
+                self.inner.take_delegations(sandbox_uid).await
+            }
+            async fn delete_session(&self, sandbox_uid: Uuid) -> Result<(), StoreError> {
+                self.inner.delete_session(sandbox_uid).await
+            }
+            async fn sweep_sessions(&self, before: Timestamp) -> Result<usize, StoreError> {
+                self.inner.sweep_sessions(before).await
+            }
+            async fn get_policy_floor(
+                &self,
+                namespace: &str,
+                name: &str,
+            ) -> Result<Option<PolicyFloor>, StoreError> {
+                self.inner.get_policy_floor(namespace, name).await
+            }
+            async fn advance_policy_floor(
+                &self,
+                held: Option<&PolicyFloor>,
+                next: PolicyFloor,
+            ) -> Result<(), StoreError> {
+                self.inner.advance_policy_floor(held, next).await
+            }
+            async fn ping(&self) -> Result<(), StoreError> {
+                self.inner.ping().await
+            }
+        }
+    }
+
+    /// A broker over a contended store, with one registered node and its bound, live claim:
+    /// the state, the store beneath it, the node's SPIFFE ID and the claim's record.
+    async fn contended_broker(
+        on_update: contended::OnUpdate,
+    ) -> (
+        Shared,
+        Arc<mediatore_store::MemoryStore>,
+        String,
+        ClaimRecord,
+    ) {
+        let inner = mediatore_store::MemoryStore::shared();
+        let mut st = placed_state();
+        st.store = Arc::new(contended::Contended {
+            inner: inner.clone(),
+            on_update,
+        });
+        let st: Shared = Arc::new(st);
+        let node = st.naming.node_id("ek1");
+        st.store
+            .put_node(NodeRecord {
+                ek_hash: "ek1".into(),
+                node_id: node.clone(),
+                dmi_uuid: Uuid::new_v4(),
+                hostname: "pool-1".into(),
+                provider: None,
+                banned: false,
+                registered_at: Timestamp::now(),
+            })
+            .await
+            .unwrap();
+        let rec = stored(&st, claim(&["grafana"], Some(node.clone()))).await;
+        (st, inner, node, rec)
+    }
+
+    fn a_guest_report() -> serde_json::Value {
+        serde_json::to_value(GuestReport {
+            image_digest: format!("sha256:{}", "a".repeat(64)),
+            sandbox_ruleset_sha256: "b".repeat(64),
+            host_table: HostTable::NotLoaded,
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_report_after_a_release_is_no_claim_and_writes_nothing() {
+        // Released between the lookup of the node's claim and the write of the report.
+        let (st, inner, node, rec) = contended_broker(contended::OnUpdate::Release).await;
+        let (status, body, _) =
+            call(&st, "POST", "/v1/me/report", Some(&node), a_guest_report()).await;
+        assert_eq!(
+            (status, code(&body)),
+            (StatusCode::NOT_FOUND, "no_claim"),
+            "what a node with no live claim is told"
+        );
+        let after = inner.get_claim(rec.uid).await.unwrap();
+        let untouched = after.revoked_at.is_some() && after.report.is_none();
+        assert!(untouched, "released, and no report was written");
+        // Released before the report arrives: the same answer.
+        let (status, body, _) =
+            call(&st, "POST", "/v1/me/report", Some(&node), a_guest_report()).await;
+        assert_eq!((status, code(&body)), (StatusCode::NOT_FOUND, "no_claim"));
+
+        // A record too busy to take it: 503, nothing written, to be sent again.
+        let (st, inner, node, rec) = contended_broker(contended::OnUpdate::Conflict).await;
+        let (status, body, _) =
+            call(&st, "POST", "/v1/me/report", Some(&node), a_guest_report()).await;
+        assert_eq!(
+            (status, code(&body)),
+            (StatusCode::SERVICE_UNAVAILABLE, "record_busy")
+        );
+        let after = inner.get_claim(rec.uid).await.unwrap();
+        let untouched = after.revoked_at.is_none() && after.report.is_none();
+        assert!(
+            untouched,
+            "nothing was written, and the claim is still live"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_exit_whose_record_write_conflicts_still_releases_the_claim() {
+        let the_exit = || serde_json::json!({ "code": 0, "restarts": 0 });
+        let (st, inner, node, rec) = contended_broker(contended::OnUpdate::Conflict).await;
+        let (status, ..) = call(&st, "POST", "/v1/me/exit", Some(&node), the_exit()).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let ended = inner.get_claim(rec.uid).await.unwrap();
+        assert!(
+            ended.revoked_at.is_some(),
+            "the claim is released though its record never took the exit"
+        );
+        assert!(
+            ended.exit.is_none(),
+            "the exit is in the log line, not on the record"
+        );
+
+        // An exit that finds the claim released under it has nothing left to end: 204.
+        let (st, inner, node, rec) = contended_broker(contended::OnUpdate::Release).await;
+        let (status, ..) = call(&st, "POST", "/v1/me/exit", Some(&node), the_exit()).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let ended = inner.get_claim(rec.uid).await.unwrap();
+        let released_once = ended.revoked_at.is_some() && ended.exit.is_none();
+        assert!(released_once, "ended already; nothing was written over it");
+    }
+
+    /// A claim under `claude` whose delegation is sealed as the claim API seals one, with
+    /// `inside` as the expiry in the envelope and `clear` as the one kept beside it.
+    async fn delegated_claim(
+        sealer: &dyn Sealer,
+        inside: Option<Timestamp>,
+        clear: Timestamp,
+    ) -> ClaimRecord {
+        let mut rec = claim(&["claude"], None);
+        let plain = serde_json::to_vec(&DelegationPlain {
+            token: Secret(SESSION_TOKEN.into()),
+            refresh_token: None,
+            expires_at: inside,
+        })
+        .unwrap();
+        let envelope = sealer
+            .seal_session(Slot::Delegation("claude"), rec.seal_binding(), &plain)
+            .await
+            .unwrap();
+        rec.delegations.insert(
+            "claude".into(),
+            DelegatedSession {
+                envelope,
+                expires_at: Some(clear),
+            },
+        );
+        rec
+    }
+
+    #[tokio::test]
+    async fn a_delegation_presented_under_another_audience_of_its_sandbox_is_refused() {
+        let mut st = placed_state();
+        let sealer: Arc<dyn Sealer> = Arc::new(mediatore_store::seal::LocalKeySealer::new([7; 32]));
+        st.sealer = Some(sealer.clone());
+        let d = st.delegated["claude"].clone();
+        let until = Timestamp::now() + SignedDuration::from_hours(1);
+        let mut rec = delegated_claim(sealer.as_ref(), Some(until), until).await;
+        let uid = rec.uid;
+        let own = delegated_token(&st, &rec, &d, "claude".into(), uid, Placement::Gateway).await;
+        assert!(own.is_ok(), "its own audience opens it");
+
+        // The contents of `claude`'s Secret put where another audience's are read from.
+        let moved = rec.delegations["claude"].clone();
+        rec.delegations.insert("other".into(), moved);
+        let other = delegated_token(&st, &rec, &d, "other".into(), uid, Placement::Gateway).await;
+        let refused = other.is_err_and(|e| e.status == StatusCode::FORBIDDEN);
+        assert!(
+            refused,
+            "another audience of the same sandbox does not open it"
+        );
+
+        // The issuer's session put where a delegation is read from.
+        let session = sealer
+            .seal_session(Slot::Issuer, rec.seal_binding(), b"refresh-token")
+            .await
+            .unwrap();
+        rec.delegations.insert(
+            "claude".into(),
+            DelegatedSession {
+                envelope: session,
+                expires_at: Some(until),
+            },
+        );
+        let as_session =
+            delegated_token(&st, &rec, &d, "claude".into(), uid, Placement::Gateway).await;
+        let refused = as_session.is_err_and(|e| e.status == StatusCode::FORBIDDEN);
+        assert!(refused, "the issuer's session is no delegation");
+    }
+
+    #[tokio::test]
+    async fn a_delegations_clear_expiry_moved_later_issues_nothing_past_the_sealed_one() {
+        let mut st = placed_state();
+        let sealer: Arc<dyn Sealer> = Arc::new(mediatore_store::seal::LocalKeySealer::new([7; 32]));
+        st.sealer = Some(sealer.clone());
+        let d = st.delegated["claude"].clone();
+        // The clear expiry, on the Secret and the status, says an hour from now.
+        let clear = Timestamp::now() + SignedDuration::from_hours(1);
+
+        // Sealed with a minute left: the credential is bounded by that minute.
+        let soon = Timestamp::now() + SignedDuration::from_mins(1);
+        let rec = delegated_claim(sealer.as_ref(), Some(soon), clear).await;
+        let issued =
+            delegated_token(&st, &rec, &d, "claude".into(), rec.uid, Placement::Gateway).await;
+        let bounded = issued.is_ok_and(|t| t.expires_at <= soon);
+        assert!(bounded, "bounded by the sealed expiry, not the clear one");
+
+        // Sealed expiry passed: nothing is issued, whatever the clear one says.
+        let past = Timestamp::now() - SignedDuration::from_secs(5);
+        let rec = delegated_claim(sealer.as_ref(), Some(past), clear).await;
+        let issued =
+            delegated_token(&st, &rec, &d, "claude".into(), rec.uid, Placement::Gateway).await;
+        let refused = issued.is_err_and(|e| e.status == StatusCode::FORBIDDEN);
+        assert!(refused, "the sealed expiry has passed");
+
+        // A format 2 envelope with no expiry inside is not one this broker sealed: never
+        // issued from, and the clear value is not read in its place.
+        let rec = delegated_claim(sealer.as_ref(), None, clear).await;
+        let issued =
+            delegated_token(&st, &rec, &d, "claude".into(), rec.uid, Placement::Gateway).await;
+        assert!(issued.is_err(), "no expiry inside: fail closed");
     }
 }

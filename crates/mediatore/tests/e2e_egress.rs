@@ -148,6 +148,7 @@ fn state(idp: &FakeIdp, upstream: &TlsUpstream, keyed_upstream: &TlsUpstream) ->
         inject_port: None,
         logs: None,
         log_limiter: Limiter::per_second(1),
+        accept_plain_gateway_identity: false,
         store: MemoryStore::shared(),
         spire: Arc::new(mediatore_spire::MemoryEntries::default()),
         naming: Naming {

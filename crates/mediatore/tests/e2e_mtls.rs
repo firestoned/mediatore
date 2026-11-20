@@ -67,6 +67,7 @@ fn state(idp: &FakeIdp, dev_mode: bool) -> Arc<AppState> {
         inject_port: None,
         logs: None,
         log_limiter: Limiter::per_second(1),
+        accept_plain_gateway_identity: false,
         store: MemoryStore::shared(),
         spire: Arc::new(mediatore_spire::MemoryEntries::default()),
         naming: Naming {
@@ -125,9 +126,24 @@ impl Harness {
 
     /// The broker serving with `broker_material` (whatever identity that carries).
     async fn start_with(ca: TestCa, broker_material: Material) -> Self {
+        Self::start_as(ca, broker_material, false).await
+    }
+
+    /// The broker with `accept_plain_gateway_identity` on (ADR-0053 decision 7), at the
+    /// handshake and on the routes, as the one config key sets both.
+    async fn start_accepting_the_plain_gateway_identity() -> Self {
+        let ca = TestCa::new(TRUST_DOMAIN);
+        let broker = ca.svid(&broker_id().to_string());
+        Self::start_as(ca, broker, true).await
+    }
+
+    async fn start_as(ca: TestCa, broker_material: Material, accept_plain: bool) -> Self {
         mediatore_proto::tls::ensure_provider();
         let idp = FakeIdp::start().await;
-        let st = state(&idp, true);
+        let mut st = state(&idp, true);
+        Arc::get_mut(&mut st)
+            .expect("the state has one owner until the routers take it")
+            .accept_plain_gateway_identity = accept_plain;
 
         let user = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -142,7 +158,7 @@ impl Harness {
         let broker = MemoryMaterial::new(broker_material);
         let configs = TlsConfigs::spawn(
             broker.clone(),
-            mediatore_api::sandbox_authorizer(st.naming.clone()),
+            mediatore_api::sandbox_authorizer(st.naming.clone(), accept_plain),
         )
         .expect("tls configs");
         tokio::spawn(mediatore_tls::serve(
@@ -377,18 +393,48 @@ async fn a_ca_shaped_certificate_is_not_a_peer() {
     assert!(h.healthz(&Harness::mtls(&ca_shaped)).await.is_err());
 }
 
-/// The gateway identity completes the handshake (ADR-0028 decision 4, amending ADR-0007
-/// decision 2) and reaches its own route and nothing else; nothing under its path is a peer.
+fn gateway_svid() -> String {
+    format!("spiffe://{TRUST_DOMAIN}/gateway")
+}
+
+fn authorizer_svid() -> String {
+    format!("spiffe://{TRUST_DOMAIN}/gateway/authorizer")
+}
+
+/// `POST /v1/gateway/claims/{uid}/credential` as `client`: the status and the error code.
+async fn ask_credential(h: &Harness, client: &reqwest::Client, uid: uuid::Uuid) -> (u16, String) {
+    let resp = client
+        .post(format!(
+            "{}/v1/gateway/claims/{uid}/credential",
+            h.sandbox_url
+        ))
+        .json(&mediatore_proto::GatewayCredentialRequest {
+            audience: AUDIENCE.into(),
+        })
+        .send()
+        .await
+        .expect("credential");
+    let status = resp.status().as_u16();
+    let body: serde_json::Value = resp.json().await.unwrap_or_default();
+    (
+        status,
+        body["error"].as_str().unwrap_or_default().to_owned(),
+    )
+}
+
+/// The authorizer's identity completes the handshake (ADR-0053 decision 3, amending
+/// ADR-0028 decision 4 and ADR-0007 decision 2) and reaches the two gateway routes and
+/// nothing else; nothing under its path is a peer.
 #[tokio::test]
-async fn the_gateway_identity_is_a_peer_for_its_own_route_only() {
+async fn the_authorizer_identity_is_a_peer_for_the_gateway_routes_only() {
     let h = Harness::start().await;
-    let gateway = h.mtls_as(&format!("spiffe://{TRUST_DOMAIN}/gateway"));
-    assert_eq!(h.healthz(&gateway).await.unwrap(), 200);
+    let authorizer = Harness::mtls(&h.ca.gateway_authorizer_svid());
+    assert_eq!(h.healthz(&authorizer).await.unwrap(), 200);
     assert!(
-        h.healthz(&h.mtls_as(&format!("spiffe://{TRUST_DOMAIN}/gateway/1")))
+        h.healthz(&h.mtls_as(&format!("{}/1", authorizer_svid())))
             .await
             .is_err(),
-        "the gateway identity is one id, not a prefix"
+        "the authorizer's identity is one id, not a prefix"
     );
 
     let node = h.mtls_as(&node_svid());
@@ -397,16 +443,35 @@ async fn the_gateway_identity_is_a_peer_for_its_own_route_only() {
     let uid = claim.uid.expect("uid");
     let url = format!("{}/v1/gateway/claims/{uid}", h.sandbox_url);
 
-    let resp = gateway.get(&url).send().await.expect("gateway");
+    let resp = authorizer.get(&url).send().await.expect("authorizer");
     assert_eq!(resp.status(), 200);
     let answer: mediatore_proto::ClaimEgress = resp.json().await.expect("body");
     assert_eq!(answer.claim_uid, uid);
+    // The credential route lets it past the guard: the refusal it gets is the audience's
+    // (placed in the proxy in this broker), where any other peer gets `forbidden`.
+    assert_eq!(
+        ask_credential(&h, &authorizer, uid).await,
+        (403, "not_placed_at_gateway".to_owned())
+    );
 
-    // The certificate is the identity: the node on the gateway's route, the gateway on
-    // the node's and the claim's, each refused.
+    // The certificate is the identity: the node and the claim on the gateway's routes, the
+    // authorizer on the node's and the claim's, each refused.
     assert_eq!(node.get(&url).send().await.expect("node").status(), 403);
     assert_eq!(
-        gateway
+        ask_credential(&h, &node, uid).await,
+        (403, "forbidden".to_owned())
+    );
+    let workload = h.mtls_as(&claim_svid(&uid));
+    assert_eq!(
+        workload.get(&url).send().await.expect("claim").status(),
+        403
+    );
+    assert_eq!(
+        ask_credential(&h, &workload, uid).await,
+        (403, "forbidden".to_owned())
+    );
+    assert_eq!(
+        authorizer
             .get(format!("{}/v1/me", h.sandbox_url))
             .send()
             .await
@@ -414,7 +479,106 @@ async fn the_gateway_identity_is_a_peer_for_its_own_route_only() {
             .status(),
         403
     );
-    assert_eq!(h.token(&gateway).await.status(), 403);
+    assert_eq!(h.token(&authorizer).await.status(), 403);
+}
+
+/// The gateways' listener identity is a name the sandboxes verify and no peer of the broker
+/// (ADR-0053 decision 3): it fails the handshake like any stranger, on every route.
+#[tokio::test]
+async fn the_plain_gateway_identity_does_not_complete_a_handshake_with_the_broker() {
+    let h = Harness::start().await;
+    // The listener is up and the CA is the right one: a node gets through.
+    assert_eq!(h.healthz(&h.mtls_as(&node_svid())).await.unwrap(), 200);
+    let listener = Harness::mtls(&h.ca.gateway_listener_svid());
+    assert!(
+        h.healthz(&listener).await.is_err(),
+        "spiffe://<td>/gateway completed a handshake with the broker"
+    );
+    let any_claim = uuid::Uuid::new_v4();
+    assert!(
+        listener
+            .get(format!("{}/v1/gateway/claims/{any_claim}", h.sandbox_url))
+            .send()
+            .await
+            .is_err(),
+        "no request of a listener's reaches a route"
+    );
+    assert!(
+        h.healthz(&h.mtls_as(&format!("{}/1", gateway_svid())))
+            .await
+            .is_err(),
+        "nor anything else under the gateway's path"
+    );
+}
+
+/// The transition switch (ADR-0053 decision 7): with it on, the listeners' identity is a
+/// peer of the two gateway routes again, as before the split, and of nothing else.
+#[tokio::test]
+async fn the_transition_switch_admits_the_plain_gateway_identity_to_the_gateway_routes_only() {
+    let h = Harness::start_accepting_the_plain_gateway_identity().await;
+    let listener = Harness::mtls(&h.ca.gateway_listener_svid());
+    assert_eq!(h.healthz(&listener).await.unwrap(), 200);
+    let node = h.mtls_as(&node_svid());
+    assert_eq!(h.register_node(&node).await.status(), 200);
+    let claim = h.create_claim(&h.login("octocat")).await;
+    let uid = claim.uid.expect("uid");
+    let url = format!("{}/v1/gateway/claims/{uid}", h.sandbox_url);
+    assert_eq!(
+        listener.get(&url).send().await.expect("plain").status(),
+        200
+    );
+    assert_eq!(
+        ask_credential(&h, &listener, uid).await,
+        (403, "not_placed_at_gateway".to_owned())
+    );
+    assert_eq!(h.token(&listener).await.status(), 403);
+    // The authorizer is a peer either way, and the switch widens nothing else.
+    let authorizer = Harness::mtls(&h.ca.gateway_authorizer_svid());
+    assert_eq!(
+        authorizer
+            .get(&url)
+            .send()
+            .await
+            .expect("authorizer")
+            .status(),
+        200
+    );
+    assert!(
+        h.healthz(&h.mtls_as(&format!("{}/1", gateway_svid())))
+            .await
+            .is_err()
+    );
+    assert!(
+        h.healthz(&h.mtls_as(&broker_id().to_string()))
+            .await
+            .is_err()
+    );
+}
+
+/// A connection is closed at the peer certificate's `notAfter` at the latest: the listener
+/// verified that certificate once, at the handshake, and an identity must not outlive it by
+/// keeping a connection open.
+#[tokio::test]
+async fn a_connection_does_not_outlive_the_peer_certificates_not_after() {
+    let h = Harness::start().await;
+    let lifetime = Duration::from_secs(3);
+    let short = Harness::mtls(&h.ca.svid_valid_for(&node_svid(), lifetime));
+    assert_eq!(
+        h.healthz(&short).await.unwrap(),
+        200,
+        "the certificate is valid at the handshake"
+    );
+    // The client keeps the connection in its pool. Once the certificate has expired the
+    // listener has closed it, so the next request needs a new handshake, and that one is
+    // refused for the expired certificate. A listener that kept the connection would
+    // answer 200 on it here.
+    tokio::time::sleep(lifetime + Duration::from_millis(1500)).await;
+    assert!(
+        h.healthz(&short).await.is_err(),
+        "a request was answered on a connection whose peer certificate had expired"
+    );
+    // The listener itself is fine: a peer with a valid certificate is served.
+    assert_eq!(h.healthz(&h.mtls_as(&node_svid())).await.unwrap(), 200);
 }
 
 #[tokio::test]

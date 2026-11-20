@@ -660,6 +660,16 @@ pub struct Config {
     /// own port, never a gateway's data-plane port.
     #[serde(default)]
     pub gateway_inject_port: Option<u16>,
+    /// The transition switch of ADR-0053 decision 7, for one release: when `true`, the
+    /// sandbox listener's handshake and the two gateway routes also accept a peer presenting
+    /// the gateways' listener identity, `spiffe://<td>/gateway`, as they did before the
+    /// authorizer had `spiffe://<td>/gateway/authorizer`, and every such ask is a `warn`
+    /// line. `false` by default and wherever the gateways' entries, their image and the
+    /// broker change in one window. While it is `true` a gateway's listeners can ask the
+    /// broker what only its authorizer should. The key is removed in the following release,
+    /// where a config still carrying it is refused as an unknown field.
+    #[serde(default)]
+    pub accept_plain_gateway_identity: bool,
 }
 
 fn default_listen() -> ListenConfig {
@@ -1121,6 +1131,11 @@ impl Config {
     /// and the namespaces in force with their group values. Values are configuration, never a
     /// token.
     pub fn log_startup(&self) {
+        if self.accept_plain_gateway_identity {
+            tracing::warn!(
+                "accept_plain_gateway_identity is on: the gateway routes also answer the gateways' listener identity (spiffe://<td>/gateway), so the authorizer's compartment is not in force; set it back to false once no gateway asks under that identity (ADR-0053 decision 7)"
+            );
+        }
         for issuer in &self.issuers {
             // `check_gates` ran at load; a gate that does not resolve is logged as such.
             let form = issuer
@@ -1349,6 +1364,59 @@ listen: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }
         .unwrap_err()
         .to_string();
         assert!(err.contains("host:port"), "{err}");
+    }
+
+    #[test]
+    fn accept_plain_gateway_identity_defaults_to_false() {
+        // ADR-0053 decision 7: strict unless the operator says otherwise, in so many words.
+        let cfg = Config::parse(&format!("{BASE}dev_mode: true\n")).unwrap();
+        assert!(!cfg.accept_plain_gateway_identity, "off when absent");
+        let cfg = Config::parse(&format!(
+            "{BASE}dev_mode: true\naccept_plain_gateway_identity: false\n"
+        ))
+        .unwrap();
+        assert!(!cfg.accept_plain_gateway_identity);
+        let cfg = Config::parse(&format!(
+            "{BASE}dev_mode: true\naccept_plain_gateway_identity: true\n"
+        ))
+        .unwrap();
+        assert!(cfg.accept_plain_gateway_identity, "on only when written");
+        // A key near it is refused, never read as the default: this is also how the key's
+        // removal in the following release stops a broker that still carries it.
+        for near in [
+            "accept_plain_gateway_identities: true",
+            "accept_plain_gateway_id: true",
+            "accept_gateway_identity: true",
+        ] {
+            let err = Config::parse(&format!("{BASE}dev_mode: true\n{near}\n"))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("unknown field"), "{near}: {err}");
+        }
+        assert!(
+            Config::parse(&format!(
+                "{BASE}dev_mode: true\naccept_plain_gateway_identity: maybe\n"
+            ))
+            .is_err(),
+            "a value that is not a boolean is refused, never read as a default"
+        );
+    }
+
+    #[test]
+    fn startup_warns_while_the_plain_gateway_identity_is_accepted_and_says_nothing_otherwise() {
+        let on = Config::parse(&format!(
+            "{BASE}dev_mode: true\naccept_plain_gateway_identity: true\n"
+        ))
+        .unwrap();
+        let logs = startup_log(&on);
+        assert!(
+            logs.lines()
+                .any(|l| l.contains("WARN") && l.contains("accept_plain_gateway_identity is on")),
+            "{logs}"
+        );
+        let off = Config::parse(&format!("{BASE}dev_mode: true\n")).unwrap();
+        let logs = startup_log(&off);
+        assert!(!logs.contains("accept_plain_gateway_identity"), "{logs}");
     }
 
     #[test]
@@ -2902,7 +2970,7 @@ listen: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }
     /// keys are all keys of `Config` and it names at least one of the keys this ADR is about.
     /// The keys a fragment lacks are filled in with the smallest valid value.
     fn doc_configs(doc: &str) -> Vec<String> {
-        const KEYS: [&str; 15] = [
+        const KEYS: [&str; 16] = [
             "trust_domain",
             "spire",
             "issuers",
@@ -2918,6 +2986,7 @@ listen: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }
             "policy",
             "gateways",
             "gateway_inject_port",
+            "accept_plain_gateway_identity",
         ];
         let mut out = Vec::new();
         let mut rest = doc;

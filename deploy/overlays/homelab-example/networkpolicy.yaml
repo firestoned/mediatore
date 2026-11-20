@@ -6,6 +6,11 @@
 # proxies only; egress to DNS, the API server and the issuer, nothing else. The Workload
 # API is a socket on the node, not a network path. The CIDRs are placeholders (RFC 5737):
 # put the sandbox segment and the control-plane addresses of your cluster in.
+#
+# A patch over deploy/base/networkpolicy.yaml (kustomization.yaml lists it under
+# patches), which carries the object with peers that admit nothing: this file is the
+# values. `policyTypes`, `ingress` and `egress` are lists without a merge key, so each
+# replaces the base's whole and is complete here.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:

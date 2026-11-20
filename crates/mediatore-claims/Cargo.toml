@@ -45,6 +45,8 @@ base64.workspace = true
 
 [dev-dependencies]
 mediatore-testkit.workspace = true
+# The storage contract's shared cases (ADR-0057 decision 6), run over the Kubernetes store.
+mediatore-store = { workspace = true, features = ["test-support"] }
 sandboxpolicy-bundle.workspace = true
 # A fake Kubernetes API for the store's cross-namespace Secret tests (ADR-0046 decision 9).
 tower-test.workspace = true

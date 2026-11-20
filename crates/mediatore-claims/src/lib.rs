@@ -17,7 +17,7 @@ use std::sync::Arc;
 use jiff::Timestamp;
 use mediatore_proto::ClaimPhase;
 use mediatore_spire::{EntryKind, EntryManager, Naming};
-use mediatore_store::{ClaimStore, StoreError};
+use mediatore_store::{ClaimStore, Modified, StoreError, modify_claim};
 use uuid::Uuid;
 
 pub mod crd_formats;
@@ -73,10 +73,19 @@ impl Reconciler {
     /// EK hash is `ek_hash`, and start the claim's TTL clock. Returns only once the entry
     /// is set on the SPIRE server; a masked or refused entry is an error and the claim
     /// stays unbound.
+    ///
+    /// The record is written compare and set (ADR-0057 decision 5): what is decided, is
+    /// decided on the record as it is when it is written. An entry id already there is done
+    /// and nothing is written; otherwise the entry id and the node are set, and the deadline
+    /// only if none is set. A claim released (or gone) under the bind gets the entry it has
+    /// just been given retracted before this returns, and the bind is an error.
     pub async fn bind(&self, claim_uid: Uuid, ek_hash: &str) -> anyhow::Result<()> {
-        let mut rec = self.store.get_claim(claim_uid).await?;
+        let rec = self.store.get_claim(claim_uid).await?;
         if rec.entry_id.is_some() {
             return Ok(()); // idempotent on restart
+        }
+        if rec.revoked_at.is_some() {
+            anyhow::bail!("claim {claim_uid} is released; no entry is declared for it");
         }
         let user = rec.subject.sandbox_username();
         // The SVID never outlives the claim (ADR-0027 decision 7): the clock starts now.
@@ -85,14 +94,38 @@ impl Reconciler {
             .spire
             .create_claim_entry(ek_hash, claim_uid, &user, claim_ttl)
             .await?;
-        rec.entry_id = Some(entry);
-        rec.node_id = Some(self.naming.agent_id(ek_hash));
-        rec.expires_at.get_or_insert_with(|| {
-            Timestamp::now() + jiff::SignedDuration::from_secs(i64::from(rec.ttl_seconds))
-        });
-        self.store.update_claim(rec).await?;
-        tracing::info!(%claim_uid, ek_hash, "claim bound: entry set");
-        Ok(())
+        let node_id = self.naming.agent_id(ek_hash);
+        let outcome = modify_claim(self.store.as_ref(), claim_uid, |mut fresh| {
+            if fresh.entry_id.is_some() {
+                return None;
+            }
+            fresh.entry_id = Some(entry.clone());
+            fresh.node_id = Some(node_id.clone());
+            if fresh.expires_at.is_none() {
+                fresh.expires_at = Some(
+                    Timestamp::now()
+                        + jiff::SignedDuration::from_secs(i64::from(fresh.ttl_seconds)),
+                );
+            }
+            Some(fresh)
+        })
+        .await;
+        match outcome {
+            Ok(Modified::Written | Modified::Unchanged) => {
+                tracing::info!(%claim_uid, ek_hash, "claim bound: entry set");
+                Ok(())
+            }
+            Ok(Modified::Released) | Err(StoreError::NotFound(_)) => {
+                // Released under the bind: nothing was written, and the entry declared a
+                // moment ago must not outlive the release that did not see it.
+                self.spire.delete_entry(&entry).await?;
+                tracing::warn!(%claim_uid, ek_hash, "claim released while it was being bound; its entry is retracted");
+                anyhow::bail!("claim {claim_uid} was released while it was being bound")
+            }
+            // Every attempt lost to another write, or the store failed: the claim stays
+            // unbound and the controller requeues.
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Handle a release: entry first, then refresh material.
@@ -141,7 +174,7 @@ impl Reconciler {
 mod tests {
     use jiff::Timestamp;
     use mediatore_proto::{Subject, Workload};
-    use mediatore_spire::{MemoryEntries, claim_entry_name};
+    use mediatore_spire::{EntryRef, MemoryEntries, SpireError, claim_entry_name};
     use mediatore_store::{ClaimRecord, MemoryStore};
 
     use super::*;
@@ -198,6 +231,7 @@ mod tests {
             report: None,
             exit: None,
             delegations: std::collections::BTreeMap::new(),
+            version: None,
         }
     }
 
@@ -234,6 +268,132 @@ mod tests {
         // Idempotent: a second bind declares nothing new.
         r.bind(uid, EK).await.unwrap();
         assert_eq!(entries.names().len(), 1);
+    }
+
+    /// What lands on the record while `create_claim_entry` is in flight, which is between a
+    /// bind's first read and its write.
+    #[derive(Clone, Copy)]
+    enum Meanwhile {
+        /// The claim is released.
+        Released,
+        /// Another writer sets the deadline.
+        Deadline(Timestamp),
+    }
+
+    /// Entries that let another writer in while a claim entry is being declared.
+    struct Interleaved {
+        inner: Arc<MemoryEntries>,
+        store: Arc<MemoryStore>,
+        meanwhile: Meanwhile,
+    }
+
+    #[async_trait::async_trait]
+    impl EntryManager for Interleaved {
+        async fn ensure_node_entry(&self, ek_hash: &str) -> Result<String, SpireError> {
+            self.inner.ensure_node_entry(ek_hash).await
+        }
+
+        async fn create_claim_entry(
+            &self,
+            ek_hash: &str,
+            claim_uid: Uuid,
+            unix_user: &str,
+            claim_ttl: std::time::Duration,
+        ) -> Result<String, SpireError> {
+            let entry = self
+                .inner
+                .create_claim_entry(ek_hash, claim_uid, unix_user, claim_ttl)
+                .await?;
+            match self.meanwhile {
+                Meanwhile::Released => {
+                    self.store
+                        .revoke_claim(claim_uid, Timestamp::now())
+                        .await
+                        .unwrap();
+                }
+                Meanwhile::Deadline(at) => {
+                    let mut rec = self.store.get_claim(claim_uid).await.unwrap();
+                    rec.expires_at = Some(at);
+                    self.store.update_claim(rec).await.unwrap();
+                }
+            }
+            Ok(entry)
+        }
+
+        async fn delete_entry(&self, name: &str) -> Result<(), SpireError> {
+            self.inner.delete_entry(name).await
+        }
+
+        async fn list_entries(&self) -> Result<Vec<EntryRef>, SpireError> {
+            self.inner.list_entries().await
+        }
+    }
+
+    fn interleaved(meanwhile: Meanwhile) -> (Reconciler, Arc<MemoryEntries>, Arc<MemoryStore>) {
+        let entries = Arc::new(MemoryEntries::default());
+        let store = MemoryStore::shared();
+        let r = Reconciler {
+            store: store.clone(),
+            spire: Arc::new(Interleaved {
+                inner: entries.clone(),
+                store: store.clone(),
+                meanwhile,
+            }),
+            naming: Naming {
+                trust_domain: "sandbox.test".into(),
+            },
+        };
+        (r, entries, store)
+    }
+
+    #[tokio::test]
+    async fn a_bind_that_loses_to_a_release_retracts_its_entry_and_binds_nothing() {
+        let (r, entries, store) = interleaved(Meanwhile::Released);
+        let uid = Uuid::new_v4();
+        store.put_claim(record(uid)).await.unwrap();
+        assert!(
+            r.bind(uid, EK).await.is_err(),
+            "a bind that lost to a release is an error"
+        );
+        assert!(
+            entries.names().is_empty(),
+            "the entry it declared is retracted before it returns"
+        );
+        let rec = store.get_claim(uid).await.unwrap();
+        let unbound = rec.entry_id.is_none() && rec.node_id.is_none() && rec.expires_at.is_none();
+        assert!(unbound, "nothing of the bind is on the record");
+        assert!(rec.revoked_at.is_some(), "and the release stands");
+        // A bind of a claim already released declares nothing at all.
+        assert!(r.bind(uid, EK).await.is_err());
+        assert!(entries.names().is_empty(), "no entry for a released claim");
+    }
+
+    #[tokio::test]
+    async fn a_bind_that_meets_a_conflict_binds_once_and_keeps_the_first_deadline() {
+        // Another writer moved the record between this bind's read and its write, and set a
+        // deadline. The bind decides on the record as it then is: the entry and the node
+        // are set once, the deadline that is there is kept.
+        let deadline = Timestamp::now() + jiff::SignedDuration::from_secs(120);
+        let (r, entries, store) = interleaved(Meanwhile::Deadline(deadline));
+        let uid = Uuid::new_v4();
+        store.put_claim(record(uid)).await.unwrap();
+        r.bind(uid, EK).await.unwrap();
+        let rec = store.get_claim(uid).await.unwrap();
+        let bound = rec.entry_id.as_deref() == Some(claim_entry_name(uid).as_str())
+            && rec.node_id.is_some();
+        assert!(bound, "the entry and the node are on the record");
+        assert_eq!(rec.expires_at, Some(deadline), "the first deadline is kept");
+        assert_eq!(entries.names().len(), 1);
+        // A second bind finds the entry id and writes nothing.
+        let before = rec.version;
+        r.bind(uid, EK).await.unwrap();
+        assert_eq!(entries.names().len(), 1, "bound once");
+        let again = store.get_claim(uid).await.unwrap();
+        assert!(
+            again.version == before,
+            "nothing was written the second time"
+        );
+        assert_eq!(again.expires_at, Some(deadline));
     }
 
     #[tokio::test]
