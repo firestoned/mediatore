@@ -26,7 +26,7 @@ never sits behind a TLS-ending proxy: it is exposed as a TLS passthrough so the 
 | `POST /v1/claims` | request a sandbox (below) |
 | `GET /v1/claims/{name}` | the sandbox's status, mirrored from its `AgentSandbox`; only its subject may read it, in a namespace the caller's groups admit (`?namespace=`, ADR-0046: a namespace they do not admit answers `404`, the same as no such sandbox) |
 | `DELETE /v1/claims/{name}` | delete the `AgentSandbox` (`?namespace=` as for `GET`); the reconciler's finalizer does the rest |
-| `GET /v1/claims/{name}/logs` | the workload's output, for a sandbox created with `workload.logs: true` (ADR-0045): NDJSON, a header, the records and gaps in sequence, an end line; `?follow=`, `?since=`, `?tail=`, `?namespace=` as for `GET`; the same subject and namespace checks; `501` unless the broker's `logs.enabled` |
+| `GET /v1/claims/{name}/logs` | the workload's output, for a sandbox created with `workload.logs: true` (ADR-0045): NDJSON, a header, the records and gaps in sequence (a record marked `partial` is a piece of a line that continues in the next record of its stream), an end line; a follower is sent a batch when it is stored, and reads at least every two seconds; `?follow=`, `?since=`, `?tail=`, `?namespace=` as for `GET`; the same subject and namespace checks; `501` unless the broker's `logs.enabled` |
 
 **Sandbox API** (`sandbox_router`)
 

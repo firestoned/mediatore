@@ -3,7 +3,7 @@
 
 # ADR-0045: A sandbox workload's output, redacted in the VM and streamed to its owner
 
-**Status:** Accepted and implemented 2026-11-17; decision 6's storage is amended by [ADR-0052](0052-a-sandbox-workloads-stored-output-sealed-per-batch-with-the-transit-key.md) (Accepted 2026-11-19: the segments are sealed per batch with the transit key) and so is R-39's reasoning; the rest stands (proposed the same day; amended at implementation: the capture is a per-sandbox opt-in, `workload.logs`, beside the broker's `logs.enabled`, and decisions 2, 9, 11 and 12 say what was built where it differs from the proposal) · **Date:** 2026-11-17
+**Status:** Accepted and implemented 2026-11-17; decision 6's storage is amended by [ADR-0052](0052-a-sandbox-workloads-stored-output-sealed-per-batch-with-the-transit-key.md) (Accepted 2026-11-19: the segments are sealed per batch with the transit key) and so is R-39's reasoning; the rest stands (proposed the same day; amended at implementation: the capture is a per-sandbox opt-in, `workload.logs`, beside the broker's `logs.enabled`, and decisions 2, 9, 11 and 12 say what was built where it differs from the proposal; amended 2026-11-20 at decisions 1, 2, 3, 4, 6, 8 and 9 so that output reaches its owner as it is written: a leading-edge batcher, a record for a line that has not ended, a follower woken by the ingest) · **Date:** 2026-11-17
 
 Roadmap 06 (the guest) and roadmap 08 (the `AgentSandbox` CRD). Adds routes to both APIs
 beside `POST /v1/me/exit` ([ADR-0033](0033-a-one-shot-workload-the-restart-policy-and-the-claim-released-when-it-is-done.md))
@@ -74,6 +74,27 @@ leaves the VM.
    seconds or at 32 KiB, whichever comes first, with `POST /v1/me/logs` (decision 9).
    Proof: a unit test of the supervisor with a fake child that writes to both streams and a
    fake broker client that records the batches.
+   *Amended 2026-11-20: output reached its owner late and in bursts (a line held until its
+   newline, a post every 2 seconds, one batch a second at the broker, a follower's read every
+   2 seconds: up to 4 seconds for a whole line and without bound for one that did not end), so
+   the guest's two waits change. The batcher posts on the leading edge: a record queued when
+   at least `ShipperConfig::min_gap` (500 ms) has passed since the last post began is posted
+   at once, and otherwise when that gap has elapsed, or at 32 KiB as before. Sparse output
+   leaves immediately, sustained output is posted at most every 500 ms, and nothing queued
+   waits longer than the gap for its post to begin. The readers no longer hold a line until
+   it ends. A bare carriage return ends a record as a newline does (a progress line rewritten
+   with `\r` is a run of records; `\r\n` is still one terminator). And when a reader holds
+   the start of a line and nothing more has arrived for `PARTIAL_IDLE` (150 ms), it queues
+   what the redactor lets go of it (decision 2) as a record marked `partial` (decision 9);
+   the record that ends the line is not marked. A piece cut at the raw cap or split at the
+   64 KiB record limit is marked the same way, which it was not before: a reader could not
+   tell such a piece from a whole line. The size limits and the escaping of control
+   characters apply to a partial record exactly as to a line. Not done here: a workload that
+   block-buffers its own stdout because it is a pipe is still late by its own choice
+   (`PYTHONUNBUFFERED=1`, `stdbuf -oL`, a line-buffered logger are the remedies, in the
+   guide), and the pty stays rejected. Proof: the unit tests of `logs.rs` (a lone record
+   posted without waiting, a burst posted once per gap, a carriage return, an idle partial
+   and its completion, the marks at the cap and at the record limit).*
 
 2. **Redaction at the guest, before output leaves the VM (`crates/mediatore-guest`, a
    `redact` module).** Redaction is best effort, not a guarantee, and is documented as such in
@@ -115,6 +136,19 @@ leaves the VM.
    another) and of `logs.rs` (a known phantom fed through the reader is absent from the queued
    records; every credential-bearing key `JailSpec::env()` emits has its value in
    `JailSpec::secret_values()`, so a new credential cannot be placed unredacted).
+   *Amended 2026-11-20: a record for a line that has not ended (decision 1) is a new place
+   where the output is cut, so it is a redaction boundary and is treated as the cut at the
+   raw cap already is. The reader gives what it holds to `Redactor::redact_head`, which lets
+   go only of what no later byte can turn into a secret and keeps the rest in memory,
+   unredacted, in front of what is read next: at least `Redactor::hold_back()` bytes (one
+   less than the longest literal form, never under 256), and from its start any value still
+   running at the end (an `Authorization` value, a run that may yet be a JWT). A secret
+   written in two halves with a pause between them is therefore still seen whole and
+   removed. The price is stated plainly: the last few hundred bytes of an unterminated line
+   still lag, until more bytes arrive or the line ends, and a line shorter than the
+   hold-back is not shown at all before it ends. That is the control, not a defect to tune
+   away. Proof: a unit test in `logs.rs` that writes a known secret in two halves across an
+   idle pause and finds it in no record.*
 
 3. **Ordering and interleaving.** stdout and stderr are two pipes, so their true interleaving
    is not recoverable; the guarantee is per stream, in order, plus the arrival order at the
@@ -124,6 +158,11 @@ leaves the VM.
    Text is lossy UTF-8 (invalid bytes become U+FFFD) so the wire stays JSON. A gap (decision
    8) is a line of its own between the records, `{lost_stdout, lost_stderr}` (`LogGap`,
    `crates/mediatore-proto`), stored and served where it happened.
+   *Amended 2026-11-20: a record is no longer always a whole line. A record marked
+   `partial` continues in the next record of the same stream, and the two streams' records
+   may alternate between the pieces of one line, since `seq` is still the arrival order at
+   the readers. The CLI joins the pieces of a line and never lets the other stream's record
+   land inside it (decision 9).*
 
 4. **A size cap per claim and a TTL, at the broker (`crates/mediatore-claims`,
    `crates/mediatore-api`, `mediatore.yaml` under `logs:`).** The store keeps the newest
@@ -142,6 +181,15 @@ leaves the VM.
    setting. Proof: the store conformance suite (`crates/mediatore-store/src/conformance.rs`)
    that overfills the ring and sees the oldest dropped and the count right, and the sweep
    cases; e2e for `413` and `429`.
+   *Amended 2026-11-20: the limit moves with the guest's cadence (decision 1) to two
+   batches per second per claim, with a burst of two (`log_limiter`,
+   `Limiter::per_second(2)`). The `429` still carries `Retry-After: 1`, a whole second being
+   the least the header can say and more than the half second a token takes to return, and
+   the guest still waits it out and sends the same batch again. A guest at the new cadence
+   in front of a broker at the old limit is told `429` before most batches under sustained
+   output, waits the second and is then taken, so it settles at about one batch a second, as
+   before; nothing is lost that was not lost before. The sizes are unchanged, so the most a claim can make the broker write is
+   doubled in count and not in bytes per batch.*
 
 5. **RBAC: only the claim's owner reads it (`crates/mediatore-api`).** The route
    `GET /v1/claims/{name}/logs` (decision 9) goes through the same check as
@@ -203,6 +251,13 @@ leaves the VM.
    `mediatore.io/sandbox-uid`, the entries as NDJSON in `data`, the ring's counters as
    annotations; trimming is by whole segment, so what the owner is told was dropped is
    counted in 64 KiB steps, never less than what went.
+   *Amended 2026-11-20: a chatty claim now costs up to two object writes a second where it
+   cost one about every 2 seconds, bounded by the rate limit of decision 4 as amended. Each
+   accepted batch is still sealed and stored before it is acknowledged (ADR-0052,
+   unchanged), so the cost is that many transit calls and that many Secret updates per
+   printing claim, and one sealed blob per batch in the open segment. A claim that prints
+   little writes little: the leading edge of decision 1 changes when a batch leaves, not
+   how many there are for sparse output.*
 
 7. **Released claims, and no tail in `status.record`.** Releasing a claim (the owner's
    `DELETE`, the deadline, a workload exit under ADR-0033) does not delete the output: the
@@ -233,6 +288,10 @@ leaves the VM.
    shipping and keep the console copy, one `info` line. Delivery is therefore at-least-once
    with idempotent writes and bounded, counted loss; it is not a durable log, and the guide
    says so.
+   *Amended 2026-11-20: the workload still never waits. The idle timer of decision 1 is
+   the reader's own and holds nothing back from the pipe, the bytes the redactor keeps
+   between records are bounded as they were at the raw cap, and a `429` or a failed post
+   delays the batches behind it exactly as before.*
 
 9. **The wire, and the CLI.** *Amended 2026-11-19: output is the workload's, so its control
    characters are data and never instructions to a terminal or a journal. After redaction and
@@ -241,6 +300,26 @@ leaves the VM.
    console copy starts with `workload: `, written by the guest, so a line cannot open with a
    journal priority or pass for the guest's own. The CLI escapes again when it prints, and
    `mediatore sandbox logs --raw` turns that second pass off for output sent to a file.*
+   *Amended 2026-11-20: `LogRecord` gains `partial: bool`, `false` and absent from the wire
+   for a whole line or the end of one, `true` when the line continues in a later record of
+   the same stream. It is carried unchanged through the batch, the sealed blob and the
+   NDJSON the owner reads; a record stored before this amendment has no such field and
+   reads as a whole line, and an older reader ignores it and prints each piece as a line.
+   A follower is woken by the ingest: the broker keeps, per claim that is being followed, a
+   wake (`LogWakes`, `crates/mediatore-api`), `POST /v1/me/logs` signals it once the store
+   has accepted the batch, and the follow loop waits for the wake or for the 2 second poll,
+   whichever comes first, then reads the store from its cursor exactly as before. There is
+   still one path for cursors, gaps and unsealing, and a follower never receives a record
+   that is not stored. A wake that arrives while a read is in flight is kept and costs one
+   more read, however many batches it stands for. The poll remains: it is what serves a
+   follower connected to the replica that did not take the write, and what notices the
+   claim ending. The table holds an entry only while a follower of that claim is connected
+   and drops it with the last one, so it is bounded by the open follow reads and a node's
+   batches for a claim nobody follows touch nothing. The keepalive is unchanged. The CLI
+   writes a partial record without a newline and without a second timestamp on its
+   continuation, so the pieces join into the line the workload wrote; a record of the
+   other stream, a gap note or the end of the stream ends an open line first. `--raw` joins
+   the same way, and the escaping is unchanged.*
    - **Node API (node SVID, `crates/mediatore-proto`, `crates/mediatore-api`):**
      `POST /v1/me/logs` with `LogBatch { records: Vec<LogRecord>, dropped_stdout: u64,
      dropped_stderr: u64 }` and `LogRecord { seq: u64, stream: LogStream (stdout|stderr),
@@ -372,7 +451,10 @@ leaves the VM.
 - The defaults (1 MiB, 4 MiB ceiling, retention equal to the claim's) are set, not measured;
   a live run with a chatty agent (the research agent of `docs/guides/research-agent-walkthrough.md`
   with `--logs`) should confirm them, and the two-second re-read of a follower should be
-  watched against the API server's request rate with several followers.
+  watched against the API server's request rate with several followers. *Amended
+  2026-11-20: a follower now also reads once per accepted batch, so at most twice a second
+  per follower of a printing claim on the replica that took the write; that rate is what to
+  watch.*
 
 ## Follow-on work
 
@@ -386,5 +468,8 @@ leaves the VM.
 - [x] Docs: README status table, `docs/guides` (requesting a sandbox, running workloads, the
       store, testing), the `logs:` block in the example configurations.
 - [x] Threat-model full pass (2026-11-17), stamp bumped to this ADR.
+- [x] Amendment of 2026-11-20 (the leading-edge batcher, partial records, the follower's
+      wake, two batches a second): tests first, the guide, CALM descriptions, and a
+      threat-model pass with no new ADR.
 - [ ] A live run with `--logs` on the core cluster (a release carrying the node routes), and
       the defaults measured against it.

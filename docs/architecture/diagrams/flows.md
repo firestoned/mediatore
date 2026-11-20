@@ -124,7 +124,7 @@ From the opt-in on the claim to the owner reading the finished workload's output
 flowchart TD
     t1["1. mediatore sandbox create --logs: the claim carries workload.logs: true; a broker with logs.enabled false refuses it 501 before anything is created."]
     t2["2. GET /v1/me returns the workload with logs: true; the guest spawns nsjail with piped stdout and stderr, redacts each line in the VM, writes it through to the console and queues it with a sequence number."]
-    t3["3. POST /v1/me/logs every two seconds or at 32 KiB over the node SVID through the control relay; the broker checks the node is the claim's, the opt-in, the shape, the size and the rate."]
+    t3["3. POST /v1/me/logs on the leading edge (at once after a quiet half second, otherwise every half second, or at 32 KiB; a line that has not ended goes as a partial record) over the node SVID through the control relay; the broker checks the node is the claim's, the opt-in, the shape, the size and the rate (two batches a second), stores the batch and wakes the claim's followers."]
     t4["4. The batch is appended to the claim's Secret ring; a retried batch is a no-op; the oldest segment goes when the cap is reached and the dropped bytes are counted."]
     t5["5. The workload exits under its restart policy: the guest flushes the queue (five seconds at most), then POSTs /v1/me/exit and the claim is released (ADR-0033)."]
     t6["6. mediatore sandbox logs <name>: the owner reads the stored output as NDJSON (stdout lines to stdout, stderr to stderr, a gap or a truncation one line on stderr) for the retention window after the claim ended; another subject is 403."]

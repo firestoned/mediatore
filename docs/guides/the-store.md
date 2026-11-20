@@ -217,7 +217,9 @@ only the sequence range, the text byte count and the key id in clear (the segmen
 flight; a cursor skips the blobs behind it; a tail starts from the newest). If OpenBao cannot be
 reached the write and the read are a `503`, the guest retries the same batch, and nothing is
 stored in clear; a blob that does not open for the claim, or a segment without the marker, is
-shown to the owner as an unreadable gap and never served. `logs.enabled: true` without
+shown to the owner as an unreadable gap and never served. A claim that keeps printing costs at
+most two such writes a second, each with its one `encrypt` (the node's batch limit, `429`
+beyond it); one that prints now and then costs a write when it does. `logs.enabled: true` without
 `store.sealing` refuses to start. The Role needs no new verb and OpenBao no new policy. The segments carry an owner reference to the
 `AgentSandbox` when the sandbox lives in the broker's namespace, so garbage collection takes
 them with it; otherwise the sweep does. They go `logs.retention_secs` after the claim ended
