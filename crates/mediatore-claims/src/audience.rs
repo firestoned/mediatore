@@ -12,13 +12,27 @@
 //! there, so the outcome does not depend on which bundle was read first and one team cannot take a
 //! platform audience away from another.
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
+use std::time::Duration;
 
+use futures::StreamExt as _;
 use jiff::Timestamp;
-use mediatore_policy::AudienceBundlePayload;
-use mediatore_policy::types::{AudienceDefinition, Backend, CredentialSource};
+use k8s_openapi::api::core::v1::ConfigMap;
+use kube::runtime::WatchStreamExt as _;
+use kube::runtime::watcher::{self, Event};
+use kube::{Api, Client, ResourceExt};
+use mediatore_policy::types::{
+    AudienceDefinition, Backend, CredentialFormat, CredentialSource, Placement,
+};
+use mediatore_policy::{AudienceBundlePayload, Envelope, Refusal, TrustedKeys, admit_audience};
 use mediatore_proto::{Endpoint, EndpointRule};
+use mediatore_store::ClaimStore;
+
+/// The `ConfigMap` key notaio writes an audience bundle under (notaio ADR-0020 decision 10).
+pub const AUDIENCE_KEY: &str = "audience.dsse.json";
+/// Between sweeps of expired definitions out of the catalog.
+const SWEEP_EVERY: Duration = Duration::from_secs(60);
 
 /// Header names an audience may never set: they frame the request or belong to the proxy. The
 /// same list as notaio's `L026` (`sandboxpolicy-core`'s `RESERVED_HEADERS`).
@@ -387,6 +401,558 @@ impl AudienceCatalog {
     }
 }
 
+/// The shape of a definition the file and a bundle can both say, for the shadow comparison
+/// (ADR-0055 decision 8). Names and values a log may carry, never a credential or a reference.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Shape {
+    /// `sts`, `secret`, `delegated`, `entra-obo` or `none`.
+    pub backend: &'static str,
+    /// `gateway` or `proxy`.
+    pub placement: &'static str,
+    /// `bearer` or `basic`.
+    pub format: &'static str,
+    /// The header the credential is placed in, lowercase.
+    pub header: String,
+    /// The names of the further headers, sorted.
+    pub extra_headers: Vec<String>,
+    /// `host:port`, lowercase, sorted, deduplicated.
+    pub endpoints: Vec<String>,
+    /// `METHOD path`, sorted, deduplicated.
+    pub rules: Vec<String>,
+    /// The longest token lifetime, in seconds.
+    pub max_ttl: i64,
+}
+
+impl Shape {
+    /// A shape from its parts, normalized as [`shape_of`] normalizes a definition's.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)] // one argument per compared field, each named at the call
+    pub fn new(
+        backend: &'static str,
+        placement: &'static str,
+        format: &'static str,
+        header: &str,
+        extra_headers: impl IntoIterator<Item = String>,
+        endpoints: impl IntoIterator<Item = String>,
+        rules: impl IntoIterator<Item = (String, String)>,
+        max_ttl: i64,
+    ) -> Self {
+        let sorted = |it: Vec<String>| {
+            let mut v = it;
+            v.sort();
+            v.dedup();
+            v
+        };
+        Self {
+            backend,
+            placement,
+            format,
+            header: header.to_ascii_lowercase(),
+            extra_headers: sorted(
+                extra_headers
+                    .into_iter()
+                    .map(|h| h.to_ascii_lowercase())
+                    .collect(),
+            ),
+            endpoints: sorted(
+                endpoints
+                    .into_iter()
+                    .map(|e| e.to_ascii_lowercase())
+                    .collect(),
+            ),
+            rules: sorted(
+                rules
+                    .into_iter()
+                    .map(|(m, p)| format!("{} {p}", m.to_ascii_uppercase()))
+                    .collect(),
+            ),
+            max_ttl,
+        }
+    }
+}
+
+/// The name a backend has in the configuration and in logs.
+#[must_use]
+pub const fn backend_name(b: Backend) -> &'static str {
+    match b {
+        Backend::Sts => "sts",
+        Backend::Secret => "secret",
+        Backend::Delegated => "delegated",
+        Backend::EntraObo => "entra-obo",
+        Backend::None => "none",
+    }
+}
+
+/// The shape of a signed definition.
+#[must_use]
+pub fn shape_of(d: &AudienceDefinition) -> Shape {
+    Shape::new(
+        backend_name(d.credential.backend),
+        match d.credential.placement {
+            Placement::Gateway => "gateway",
+            Placement::Proxy => "proxy",
+        },
+        match d.credential.format {
+            CredentialFormat::Bearer => "bearer",
+            CredentialFormat::Basic => "basic",
+        },
+        d.credential.header.as_deref().unwrap_or("authorization"),
+        d.credential.extra_headers.iter().map(|h| h.name.clone()),
+        d.endpoints.iter().cloned(),
+        d.rules.iter().map(|r| (r.method.clone(), r.path.clone())),
+        i64::from(d.max_ttl_seconds),
+    )
+}
+
+/// The fields in which `file` and `bundle` differ, in a fixed order.
+#[must_use]
+pub fn differences(file: &Shape, bundle: &Shape) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    let mut check = |name, same: bool| {
+        if !same {
+            out.push(name);
+        }
+    };
+    check("backend", file.backend == bundle.backend);
+    check("placement", file.placement == bundle.placement);
+    check("format", file.format == bundle.format);
+    check("header", file.header == bundle.header);
+    check("extra_headers", file.extra_headers == bundle.extra_headers);
+    check("endpoints", file.endpoints == bundle.endpoints);
+    check("rules", file.rules == bundle.rules);
+    check("max_ttl", file.max_ttl == bundle.max_ttl);
+    out
+}
+
+fn compared(file: &Shape, bundle: &Shape) -> String {
+    let diff = differences(file, bundle);
+    if diff.is_empty() {
+        "matches the file".to_owned()
+    } else {
+        format!("differs from the file in: {}", diff.join(", "))
+    }
+}
+
+/// The shadow comparison (ADR-0055 decision 8): for each audience of the file (by name) and each
+/// live definition, one verdict. A file audience is compared with the platform definition of its
+/// name; a team definition is compared with the file audience of its name if there is one, and
+/// otherwise reported as one that would appear. Keys are the file's names for platform audiences
+/// and `<namespace>/<name>` for team audiences.
+#[must_use]
+pub fn shadow_report(
+    catalog: &AudienceCatalog,
+    file: &BTreeMap<String, Shape>,
+    now: Timestamp,
+) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for (name, shape) in file {
+        let verdict = match catalog.live(catalog.platform_namespace(), name, now) {
+            Some(a) => compared(shape, &shape_of(&a.definition)),
+            None => "in the file, no platform definition".to_owned(),
+        };
+        out.insert(name.clone(), verdict);
+    }
+    for a in catalog.audiences.values().filter(|a| a.not_after > now) {
+        match a.kind {
+            AudienceKind::Platform => {
+                if !file.contains_key(&a.name) {
+                    out.insert(
+                        a.name.clone(),
+                        "would appear: a platform audience not in the file".to_owned(),
+                    );
+                }
+            }
+            AudienceKind::Team => {
+                let verdict = match file.get(&a.name) {
+                    Some(shape) => format!(
+                        "a team audience of {}: {}",
+                        a.namespace,
+                        compared(shape, &shape_of(&a.definition))
+                    ),
+                    None => format!("would appear: a team audience of {}", a.namespace),
+                };
+                out.insert(format!("{}/{}", a.namespace, a.name), verdict);
+            }
+        }
+    }
+    out
+}
+
+/// The catalog every reader takes its snapshot from, and which namespaces have been listed.
+#[derive(Debug)]
+pub struct LiveCatalog {
+    current: RwLock<Arc<AudienceCatalog>>,
+    synced: RwLock<HashSet<String>>,
+    namespaces: Vec<String>,
+}
+
+impl LiveCatalog {
+    /// An empty catalog over `namespaces`, platform audiences in `platform_namespace`.
+    #[must_use]
+    pub fn new(platform_namespace: String, namespaces: Vec<String>) -> Self {
+        Self {
+            current: RwLock::new(Arc::new(AudienceCatalog::new(platform_namespace))),
+            synced: RwLock::new(HashSet::new()),
+            namespaces,
+        }
+    }
+
+    /// The current snapshot: take it once per request and resolve against it.
+    #[must_use]
+    pub fn snapshot(&self) -> Arc<AudienceCatalog> {
+        self.current
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// The namespaces read, in the order listed.
+    #[must_use]
+    pub fn namespaces(&self) -> &[String] {
+        &self.namespaces
+    }
+
+    /// Whether `namespace`'s first list completed.
+    #[must_use]
+    pub fn synced(&self, namespace: &str) -> bool {
+        self.synced
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(namespace)
+    }
+
+    /// Whether every namespace read has completed its first list: until then an audience with no
+    /// definition may simply not have been read.
+    #[must_use]
+    pub fn all_synced(&self) -> bool {
+        let listed = self.synced.read().unwrap_or_else(PoisonError::into_inner);
+        self.namespaces.iter().all(|n| listed.contains(n))
+    }
+
+    /// Swap in the next snapshot, built from the current one.
+    fn update<T>(&self, f: impl FnOnce(&AudienceCatalog) -> (AudienceCatalog, T)) -> T {
+        let mut current = self.current.write().unwrap_or_else(PoisonError::into_inner);
+        let (next, out) = f(&current);
+        *current = Arc::new(next);
+        out
+    }
+
+    fn mark_synced(&self, namespace: &str) {
+        self.synced
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(namespace.to_owned());
+    }
+}
+
+/// What became of one `ConfigMap` delivery.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AudienceOutcome {
+    /// Verified, the floor written, checked, in the next snapshot.
+    Admitted {
+        /// `<namespace>/<name>`.
+        audience: String,
+        /// Platform or team.
+        kind: AudienceKind,
+        /// The bundle's version.
+        version: u64,
+    },
+    /// Not verified or decided against: the catalog and the floor are as they were.
+    Refused {
+        /// notaio's error name, or `mediatore-policy`'s.
+        code: &'static str,
+    },
+    /// Verified, but the broker does not take the definition (decision 4): any definition held
+    /// for the audience is withdrawn, since notaio has moved past it.
+    Withdrawn {
+        /// The rule broken.
+        code: &'static str,
+    },
+    /// Not an audience bundle the broker reads.
+    Ignored(&'static str),
+}
+
+/// The audience reflector (ADR-0055 decision 1): the trusted keys, the store the floor lives in,
+/// the namespaces read and the live catalog it fills. Every replica runs it, outside the Lease.
+pub struct AudienceReflector {
+    store: Arc<dyn ClaimStore>,
+    keys: TrustedKeys,
+    live: Arc<LiveCatalog>,
+    /// `(namespace, configmap)` to the audience it carries, for a delete or a relist.
+    configmaps: Mutex<HashMap<(String, String), String>>,
+    /// The file's audiences, under `shadow`; each verdict logged when it changes.
+    shadow: Option<BTreeMap<String, Shape>>,
+    reported: Mutex<BTreeMap<String, String>>,
+}
+
+impl AudienceReflector {
+    /// A reflector over `namespaces` (the platform namespace and every sandbox namespace).
+    #[must_use]
+    pub fn new(
+        store: Arc<dyn ClaimStore>,
+        keys: TrustedKeys,
+        platform_namespace: String,
+        namespaces: Vec<String>,
+    ) -> Self {
+        Self {
+            store,
+            keys,
+            live: Arc::new(LiveCatalog::new(platform_namespace, namespaces)),
+            configmaps: Mutex::new(HashMap::new()),
+            shadow: None,
+            reported: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// Compare every change with the file's audiences and log the verdicts (`shadow`).
+    #[must_use]
+    pub fn with_shadow(mut self, file: BTreeMap<String, Shape>) -> Self {
+        self.shadow = Some(file);
+        self
+    }
+
+    /// The live catalog the readers take snapshots from.
+    #[must_use]
+    pub fn live(&self) -> Arc<LiveCatalog> {
+        self.live.clone()
+    }
+
+    fn platform(&self) -> String {
+        self.live.snapshot().platform_namespace().to_owned()
+    }
+
+    /// A `ConfigMap` seen (added, changed, or listed at start), at the current time.
+    pub async fn applied(&self, cm: &ConfigMap) -> AudienceOutcome {
+        self.applied_at(cm, Timestamp::now()).await
+    }
+
+    /// [`applied`](Self::applied) with the clock injected: verify, move the floor, check, swap.
+    /// Logs the outcome; never the envelope, a credential or a reference.
+    pub async fn applied_at(&self, cm: &ConfigMap, now: Timestamp) -> AudienceOutcome {
+        let configmap = cm.name_any();
+        let namespace = cm.namespace().unwrap_or_default();
+        if !self.live.namespaces.contains(&namespace) {
+            return AudienceOutcome::Ignored("a namespace audiences are not read in");
+        }
+        let Some(text) = cm.data.as_ref().and_then(|d| d.get(AUDIENCE_KEY)) else {
+            // notaio labels its policy bundles the same way: those are the policy reflector's.
+            return AudienceOutcome::Ignored("no audience.dsse.json");
+        };
+        let Ok(envelope) = serde_json::from_str::<Envelope>(text) else {
+            tracing::warn!(namespace = %namespace, configmap = %configmap, "audience bundle ignored: the envelope does not parse");
+            return AudienceOutcome::Ignored("the envelope does not parse");
+        };
+        let payload = match admit_audience(
+            self.store.as_ref(),
+            &envelope,
+            &namespace,
+            &self.keys,
+            now,
+        )
+        .await
+        {
+            Ok(p) => p,
+            Err(refusal) => {
+                let code = refusal.code();
+                let reason = match &refusal {
+                    Refusal::Bundle(e) => e.to_string(),
+                    other => other.to_string(),
+                };
+                tracing::warn!(namespace = %namespace, configmap = %configmap, code, reason = %reason, "audience bundle refused; nothing changed");
+                return AudienceOutcome::Refused { code };
+            }
+        };
+        let name = payload.content.audience.name.clone();
+        let key = (namespace.clone(), configmap.clone());
+        let outcome = match audience_of(&payload, &self.platform()) {
+            Ok(a) => {
+                let (kind, version) = (a.kind, a.version);
+                tracing::info!(
+                    namespace = %namespace,
+                    audience = %name,
+                    kind = kind.as_str(),
+                    version,
+                    not_after = %a.not_after,
+                    "audience definition admitted"
+                );
+                self.live.update(|c| (c.with(a), ()));
+                self.configmaps
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(key, name.clone());
+                AudienceOutcome::Admitted {
+                    audience: format!("{namespace}/{name}"),
+                    kind,
+                    version,
+                }
+            }
+            Err(why) => {
+                let code = why.code();
+                let held = self.live.update(|c| c.without(&namespace, &name));
+                tracing::warn!(
+                    namespace = %namespace,
+                    audience = %name,
+                    code,
+                    reason = %why,
+                    withdrawn = held,
+                    "audience definition not taken (ADR-0055 decision 4)"
+                );
+                self.configmaps
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(&key);
+                AudienceOutcome::Withdrawn { code }
+            }
+        };
+        self.report(now);
+        outcome
+    }
+
+    /// The `ConfigMap` is gone: its audience leaves the catalog (the floor stays). `true` when
+    /// something was withdrawn.
+    pub fn deleted(&self, cm: &ConfigMap) -> bool {
+        let namespace = cm.namespace().unwrap_or_default();
+        let key = (namespace.clone(), cm.name_any());
+        let Some(name) = self
+            .configmaps
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&key)
+        else {
+            return false;
+        };
+        let held = self.live.update(|c| c.without(&namespace, &name));
+        if held {
+            tracing::info!(namespace = %namespace, audience = %name, "audience definition withdrawn");
+            self.report(Timestamp::now());
+        }
+        held
+    }
+
+    /// The watch on `namespace` listed everything again: an audience whose `ConfigMap` was not
+    /// among `seen` was deleted while the watch was away. Marks the namespace listed.
+    pub fn resynced(&self, namespace: &str, seen: &HashSet<String>) -> usize {
+        let gone: Vec<String> = {
+            let mut map = self
+                .configmaps
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let keys: Vec<_> = map
+                .keys()
+                .filter(|(ns, cm)| ns == namespace && !seen.contains(cm))
+                .cloned()
+                .collect();
+            keys.iter().filter_map(|k| map.remove(k)).collect()
+        };
+        let mut withdrawn = 0;
+        for name in &gone {
+            if self.live.update(|c| c.without(namespace, name)) {
+                withdrawn += 1;
+                tracing::info!(namespace, audience = %name, "audience definition gone since the last list");
+            }
+        }
+        self.live.mark_synced(namespace);
+        self.report(Timestamp::now());
+        withdrawn
+    }
+
+    /// Drop the definitions past their `notAfter` at `now`; how many.
+    pub fn sweep(&self, now: Timestamp) -> usize {
+        let gone = self.live.update(|c| c.swept(now));
+        for (ns, name) in &gone {
+            tracing::info!(namespace = %ns, audience = %name, "audience definition expired");
+        }
+        if !gone.is_empty() {
+            self.report(now);
+        }
+        gone.len()
+    }
+
+    /// Under `shadow`, once every namespace is listed: log each verdict that changed.
+    fn report(&self, now: Timestamp) {
+        let Some(file) = &self.shadow else {
+            return;
+        };
+        if !self.live.all_synced() {
+            return;
+        }
+        let report = shadow_report(&self.live.snapshot(), file, now);
+        let mut last = self.reported.lock().unwrap_or_else(PoisonError::into_inner);
+        for (audience, verdict) in &report {
+            if last.get(audience) == Some(verdict) {
+                continue;
+            }
+            if verdict == "matches the file" {
+                tracing::info!(audience = %audience, verdict = %verdict, "audience shadow (ADR-0055)");
+            } else {
+                tracing::warn!(audience = %audience, verdict = %verdict, "audience shadow (ADR-0055)");
+            }
+        }
+        for audience in last.keys().filter(|a| !report.contains_key(*a)) {
+            tracing::info!(audience = %audience, "audience shadow: no longer in the file or the catalog");
+        }
+        *last = report;
+    }
+}
+
+/// One watch per namespace read and the expiry sweep, until a watch ends. Every replica.
+///
+/// # Errors
+/// When a watch or the sweep ends, which they do not on their own.
+pub async fn run(client: Client, reflector: Arc<AudienceReflector>) -> anyhow::Result<()> {
+    let mut watches = Vec::new();
+    for ns in reflector.live.namespaces() {
+        let api = Api::<ConfigMap>::namespaced(client.clone(), ns);
+        let r = reflector.clone();
+        let ns = ns.clone();
+        watches.push(Box::pin(async move {
+            let mut seen = HashSet::new();
+            let mut events = watcher::watcher(
+                api,
+                watcher::Config::default().labels(crate::policy::BUNDLE_SELECTOR),
+            )
+            .default_backoff()
+            .boxed();
+            while let Some(event) = events.next().await {
+                match event {
+                    Ok(Event::Init) => seen.clear(),
+                    Ok(Event::InitApply(cm)) => {
+                        seen.insert(cm.name_any());
+                        r.applied(&cm).await;
+                    }
+                    Ok(Event::InitDone) => {
+                        r.resynced(&ns, &seen);
+                    }
+                    Ok(Event::Apply(cm)) => {
+                        r.applied(&cm).await;
+                    }
+                    Ok(Event::Delete(cm)) => {
+                        r.deleted(&cm);
+                    }
+                    Err(e) if crate::watch::watch_error_is_routine(&e) => {
+                        tracing::debug!(namespace = %ns, error = %e, "audience watch: routine");
+                    }
+                    Err(e) => tracing::warn!(namespace = %ns, error = %e, "audience watch"),
+                }
+            }
+            anyhow::bail!("the audience watch on {ns} ended")
+        }));
+    }
+    let sweep = async {
+        let mut tick = tokio::time::interval(SWEEP_EVERY);
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            reflector.sweep(Timestamp::now());
+        }
+    };
+    tracing::info!(namespaces = ?reflector.live.namespaces(), "audience reflector running");
+    tokio::select! {
+        (r, _, _) = futures::future::select_all(watches) => r,
+        () = sweep => anyhow::bail!("the audience sweep ended"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -696,5 +1262,251 @@ mod tests {
             (a.version, a.endpoints[0].to_string()),
             (2, "b.example.com:443".into())
         );
+    }
+
+    // The reflector (ADR-0055 decision 1) and the shadow comparison (decision 8).
+
+    mod reflector {
+        use std::collections::{BTreeMap, HashSet};
+        use std::sync::Arc;
+
+        use jiff::{SignedDuration, Timestamp};
+        use mediatore_store::{ClaimStore, MemoryStore};
+        use mediatore_testkit::policy::{
+            audience_configmap, bundle_configmap, fresh_bundle, signed_audience,
+        };
+
+        use super::super::*;
+        use super::{PLATFORM, definition};
+
+        const TEAM: &str = "team-a";
+
+        fn rig() -> (Arc<MemoryStore>, AudienceReflector) {
+            let store = Arc::new(MemoryStore::default());
+            let keys = signed_audience(
+                Timestamp::now(),
+                1,
+                TEAM,
+                "x",
+                definition("x.example.com:443"),
+            )
+            .keys;
+            let r = AudienceReflector::new(
+                store.clone(),
+                keys,
+                PLATFORM.into(),
+                vec![PLATFORM.into(), TEAM.into()],
+            );
+            (store, r)
+        }
+
+        fn cm(
+            ns: &str,
+            name: &str,
+            version: u64,
+            d: AudienceDefinition,
+        ) -> k8s_openapi::api::core::v1::ConfigMap {
+            let a = signed_audience(Timestamp::now(), version, ns, name, d);
+            audience_configmap(ns, name, &a.envelope)
+        }
+
+        #[tokio::test]
+        async fn a_bundle_in_a_watched_namespace_is_admitted_into_the_next_snapshot() {
+            let (store, r) = rig();
+            let before = r.live().snapshot();
+            let out = r
+                .applied_at(
+                    &cm(TEAM, "registry", 1, definition("r.example.com:443")),
+                    Timestamp::now(),
+                )
+                .await;
+            assert_eq!(
+                out,
+                AudienceOutcome::Admitted {
+                    audience: format!("{TEAM}/registry"),
+                    kind: AudienceKind::Team,
+                    version: 1
+                }
+            );
+            let now = Timestamp::now();
+            assert!(r.live().snapshot().resolve(TEAM, "registry", now).is_ok());
+            // A snapshot already taken is unchanged.
+            assert!(before.resolve(TEAM, "registry", now).is_err());
+            assert!(
+                store
+                    .get_policy_floor(TEAM, "audience/registry")
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+        }
+
+        #[tokio::test]
+        async fn what_is_not_an_audience_bundle_here_is_ignored() {
+            let (_, r) = rig();
+            let now = Timestamp::now();
+            let elsewhere = cm("team-b", "registry", 1, definition("r.example.com:443"));
+            assert!(matches!(
+                r.applied_at(&elsewhere, now).await,
+                AudienceOutcome::Ignored(_)
+            ));
+            // A policy bundle carries the same label; it is not ours.
+            let policy = bundle_configmap(TEAM, "agent-bundle", &fresh_bundle(now, 1).envelope);
+            assert!(matches!(
+                r.applied_at(&policy, now).await,
+                AudienceOutcome::Ignored(_)
+            ));
+            assert!(r.live().snapshot().is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_refused_bundle_changes_nothing() {
+            let store = Arc::new(MemoryStore::default());
+            let r = AudienceReflector::new(
+                store.clone(),
+                mediatore_policy::TrustedKeys::new(),
+                PLATFORM.into(),
+                vec![TEAM.into()],
+            );
+            let out = r
+                .applied_at(
+                    &cm(TEAM, "registry", 1, definition("r.example.com:443")),
+                    Timestamp::now(),
+                )
+                .await;
+            assert_eq!(
+                out,
+                AudienceOutcome::Refused {
+                    code: "NoValidSignature"
+                }
+            );
+            assert!(r.live().snapshot().is_empty());
+            assert!(
+                store
+                    .get_policy_floor(TEAM, "audience/registry")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        #[tokio::test]
+        async fn a_newer_definition_the_broker_refuses_withdraws_the_one_held() {
+            let (_, r) = rig();
+            let now = Timestamp::now();
+            r.applied_at(
+                &cm(TEAM, "registry", 1, definition("r.example.com:443")),
+                now,
+            )
+            .await;
+            let mut d = definition("r.example.com:443");
+            d.credential.backend = Backend::Sts;
+            d.credential.source = None;
+            let out = r.applied_at(&cm(TEAM, "registry", 2, d), now).await;
+            assert_eq!(out, AudienceOutcome::Withdrawn { code: "L022" });
+            assert!(r.live().snapshot().resolve(TEAM, "registry", now).is_err());
+        }
+
+        #[tokio::test]
+        async fn a_deleted_or_unlisted_configmap_withdraws_its_audience() {
+            let (_, r) = rig();
+            let now = Timestamp::now();
+            let registry = cm(TEAM, "registry", 1, definition("r.example.com:443"));
+            r.applied_at(&registry, now).await;
+            r.applied_at(&cm(TEAM, "other", 1, definition("o.example.com:443")), now)
+                .await;
+            assert!(r.deleted(&registry));
+            assert!(r.live().snapshot().resolve(TEAM, "registry", now).is_err());
+
+            assert!(!r.live().synced(TEAM));
+            let seen = HashSet::new();
+            assert_eq!(r.resynced(TEAM, &seen), 1);
+            assert!(r.live().snapshot().is_empty());
+            assert!(r.live().synced(TEAM));
+            assert!(!r.live().all_synced());
+            r.resynced(PLATFORM, &seen);
+            assert!(r.live().all_synced());
+        }
+
+        #[tokio::test]
+        async fn an_expired_definition_is_swept() {
+            let (_, r) = rig();
+            let now = Timestamp::now();
+            r.applied_at(
+                &cm(TEAM, "registry", 1, definition("r.example.com:443")),
+                now,
+            )
+            .await;
+            assert_eq!(r.sweep(now + SignedDuration::from_hours(2)), 1);
+            assert!(r.live().snapshot().is_empty());
+        }
+
+        fn file(endpoint: &str) -> Shape {
+            shape_of(&definition(endpoint))
+        }
+
+        #[tokio::test]
+        async fn the_shadow_report_says_what_matches_what_differs_and_what_would_appear() {
+            let (_, r) = rig();
+            let now = Timestamp::now();
+            r.applied_at(
+                &cm(PLATFORM, "same", 1, definition("s.example.com:443")),
+                now,
+            )
+            .await;
+            r.applied_at(
+                &cm(PLATFORM, "moved", 1, definition("new.example.com:443")),
+                now,
+            )
+            .await;
+            r.applied_at(
+                &cm(PLATFORM, "new", 1, definition("n.example.com:443")),
+                now,
+            )
+            .await;
+            r.applied_at(
+                &cm(TEAM, "registry", 1, definition("r.example.com:443")),
+                now,
+            )
+            .await;
+            let file = BTreeMap::from([
+                ("same".to_owned(), file("s.example.com:443")),
+                ("moved".to_owned(), file("old.example.com:443")),
+                ("missing".to_owned(), file("m.example.com:443")),
+            ]);
+            let report = shadow_report(&r.live().snapshot(), &file, now);
+            assert_eq!(report["same"], "matches the file");
+            assert_eq!(report["moved"], "differs from the file in: endpoints");
+            assert_eq!(report["missing"], "in the file, no platform definition");
+            assert_eq!(
+                report["new"],
+                "would appear: a platform audience not in the file"
+            );
+            assert_eq!(
+                report[&format!("{TEAM}/registry")],
+                "would appear: a team audience of team-a"
+            );
+        }
+
+        #[test]
+        fn every_field_the_file_and_the_definition_share_is_compared() {
+            let base = definition("a.example.com:443");
+            let mut other = base.clone();
+            other.credential.placement = mediatore_policy::types::Placement::Proxy;
+            other.credential.header = Some("x-api-key".into());
+            other.max_ttl_seconds = 60;
+            other.rules = vec![mediatore_policy::types::EndpointRule {
+                method: "GET".into(),
+                path: "/v1/**".into(),
+            }];
+            assert_eq!(
+                differences(&shape_of(&base), &shape_of(&other)),
+                vec!["placement", "header", "rules", "max_ttl"]
+            );
+            assert_eq!(
+                differences(&shape_of(&base), &shape_of(&base)),
+                Vec::<&str>::new()
+            );
+        }
     }
 }

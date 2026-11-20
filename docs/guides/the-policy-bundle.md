@@ -335,6 +335,55 @@ make sure no live claim lacks a policy, then `enforce` in dev and each tier in t
 next ask. The cost is a dependency: under `enforce` a notaio outage longer than the bundle lifetime (15 minutes by default), or a broker clock
 ahead of notaio's by more than the refresh margin, takes the audiences away from every claim under a policy.
 
+## Audience definitions from notaio (`policy.audience_definitions`)
+
+An audience's definition (its backend, where its credential is placed, its endpoints, the widest
+rules and token any grant may have) can come from notaio as a signed audience bundle instead of
+from `audiences[]` in `mediatore.yaml` ([ADR-0055](../adr/0055-audiences-from-signed-sandboxaudience-bundles.md),
+notaio ADR-0020). notaio publishes one `<audience>-audience` ConfigMap per `SandboxAudience`, the
+envelope under `audience.dsse.json`, once `NOTAIO_AUDIENCE_PLATFORM_NAMESPACE` is set on its side.
+
+```yaml
+# mediatore.yaml
+policy:
+  trusted_keys: [ ... ]                  # the same keys verify both kinds of bundle
+  audience_definitions:
+    mode: shadow                         # config (default) | shadow | bundles
+    platform_namespace: sandbox-platform # must match NOTAIO_AUDIENCE_PLATFORM_NAMESPACE
+    credential_refresh_secs: 60          # default 60
+```
+
+- **`config`** (or no `audience_definitions`): `audiences[]` serves and no audience bundle is read.
+- **`shadow`**: the broker reads audience bundles in the platform namespace and in every sandbox
+  namespace, verifies each (payload type, a trusted key, schema, digest, lifetime) and keeps a version
+  floor per audience in the store beside the policy floors. `audiences[]` still serves.
+- **`bundles`**: the catalog serves and `audiences[]` must be empty. **Not built yet**: the broker
+  refuses to start with it.
+
+An audience in the platform namespace is a platform audience, usable from every namespace; one in any
+other namespace is a team audience, usable only by claims in that namespace. The kind comes from the
+namespace, never from a field of the bundle. The broker checks each definition again as notaio does: a
+team audience's backend is `secret` or `none` and its credential is never in OpenBao; no header is
+reserved (`host`, `content-length`, `proxy-authorization` and the rest); every endpoint is an exact DNS
+`host:port`. A name or an endpoint that two audiences share is refused, for both, from every namespace
+that can see both, and nowhere else.
+
+The broker needs the bundle `Role` of `deploy/policy-bundles` in the platform namespace and in each
+sandbox namespace it does not already read policies in. At start it logs `policy.audience_definitions
+(ADR-0055)` with the mode, the platform namespace and the namespaces read, then `audience definition
+admitted` with the namespace, name, kind and version of each bundle it takes, `audience bundle
+refused; nothing changed` for one that does not verify, and `audience definition not taken` with the
+rule (`L022`, `L023`, `L026`, `L017`) for one that verifies but breaks a rule; that one also withdraws
+any earlier definition of the audience.
+
+Under `shadow`, once every namespace has been listed, each audience gets one `audience shadow
+(ADR-0055)` line whenever its verdict changes: `matches the file`, `differs from the file in:` and
+the fields (`backend`, `placement`, `format`, `header`, `extra_headers`, `endpoints`, `rules`,
+`max_ttl`), `in the file, no platform definition`, or `would appear:` for a definition the file does
+not have. A matching verdict is `info`; the others are `warn`. Neither a credential nor where it is
+read from is ever logged. Run `shadow` until no audience logs a difference before `bundles` is built
+and switched on.
+
 ## What comes next
 
 `policy.audiences` enforces a claim's audiences, rules, endpoints and lifetimes (above), and `policy.sources` decides which namespace may

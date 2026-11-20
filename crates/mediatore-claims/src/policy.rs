@@ -588,6 +588,15 @@ impl BundleReflector {
             return ignored(&namespace, &name, "a namespace not in policy.namespaces");
         }
         let Some(text) = cm.data.as_ref().and_then(|d| d.get(BUNDLE_KEY)) else {
+            if cm
+                .data
+                .as_ref()
+                .is_some_and(|d| d.contains_key(crate::audience::AUDIENCE_KEY))
+            {
+                // notaio's audience bundle, under the same label: the audience reflector's
+                // (ADR-0055), and not worth a line here on every delivery.
+                return Outcome::Ignored("an audience bundle");
+            }
             return ignored(&namespace, &name, "no bundle.dsse.json");
         };
         let Ok(envelope) = serde_json::from_str::<Envelope>(text) else {

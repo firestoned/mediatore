@@ -75,6 +75,8 @@ anyhow.workspace = true
 aws-lc-rs.workspace = true
 # A bundle signed at the real clock for the reflector and the comparison (ADR-0026).
 sandboxpolicy-bundle.workspace = true
+# An audience definition signed the same way (ADR-0055).
+sandboxpolicy-types.workspace = true
 
 [lints]
 workspace = true

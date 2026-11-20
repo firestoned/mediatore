@@ -40,6 +40,7 @@ flowchart LR
     system-banlieue["banlieue Control Plane"]
     system-notaio["notaio Policy Control Plane"]
     data-asset-policy-bundles["SandboxPolicy bundles (ConfigMaps)"]
+    data-asset-audience-bundles["SandboxAudience bundles (ConfigMaps)"]
     data-asset-policy-trusted-keys["Policy trust anchor (configured keys)"]
     service-spire-server["SPIRE Server (downstream)"]
     service-spire-controller-manager["SPIRE Controller Manager"]
@@ -107,8 +108,10 @@ flowchart LR
     service-mediatore-watcher -->|HTTPS| service-kubernetes-api
     system-notaio -->|HTTPS| service-kubernetes-api
     service-mediatore-watcher -->|HTTPS| service-kubernetes-api
+    service-mediatore-watcher -->|HTTPS| service-kubernetes-api
     subgraph sg_system-notaio [System Notaio]
         data-asset-policy-bundles
+        data-asset-audience-bundles
     end
     service-spire-controller-manager -->|HTTPS| service-kubernetes-api
     service-spire-controller-manager --> service-spire-server

@@ -2316,6 +2316,7 @@ dependencies = [
  "reqwest",
  "rustls",
  "sandboxpolicy-bundle",
+ "sandboxpolicy-types",
  "serde_json",
  "sha2",
  "tar",

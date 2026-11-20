@@ -150,6 +150,38 @@ impl AudienceConfig {
         }
     }
 
+    /// What the shadow comparison compares with a signed definition (ADR-0055 decision 8).
+    #[must_use]
+    pub fn shape(&self) -> mediatore_claims::audience::Shape {
+        let backend = match self.via {
+            Backend::Sts => "sts",
+            Backend::Secret => "secret",
+            Backend::Delegated => "delegated",
+            Backend::EntraObo => "entra-obo",
+            Backend::None => "none",
+        };
+        let placement = match self.inject {
+            Inject::Proxy => "proxy",
+            Inject::Gateway => "gateway",
+        };
+        let format = match (self.via, self.credential) {
+            (Backend::Delegated, Credential::Basic) => "basic",
+            _ => "bearer",
+        };
+        mediatore_claims::audience::Shape::new(
+            backend,
+            placement,
+            format,
+            self.credential_header(),
+            self.public_extra_headers().iter().map(|h| h.name.clone()),
+            self.egress.iter().map(ToString::to_string),
+            self.rules
+                .iter()
+                .map(|r| (r.method.clone(), r.path.clone())),
+            self.max_ttl,
+        )
+    }
+
     /// The public headers placed beside the credential (`secret_extra_headers`, `extra_headers`).
     fn public_extra_headers(&self) -> &[HeaderPair] {
         match self.via {
@@ -531,6 +563,53 @@ pub struct PolicySection {
     /// No mapping is spelled by leaving the key out: present and empty does not start.
     #[serde(default)]
     pub sources: Option<std::collections::BTreeMap<String, PolicySourceEntry>>,
+    /// Where audience definitions come from (ADR-0055 decision 8). Absent means `config`:
+    /// `audiences[]` in this file, and no audience bundle is read.
+    #[serde(default)]
+    pub audience_definitions: Option<AudienceDefinitionsSection>,
+}
+
+/// Where the broker's audience definitions come from (ADR-0055 decision 8).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AudienceMode {
+    /// `audiences[]` in this file; audience bundles are not read. The default.
+    #[default]
+    Config,
+    /// Both are read and the file serves; each audience's comparison is logged when it changes.
+    Shadow,
+    /// notaio's signed audience bundles serve; `audiences[]` must be empty.
+    Bundles,
+}
+
+impl std::fmt::Display for AudienceMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Config => "config",
+            Self::Shadow => "shadow",
+            Self::Bundles => "bundles",
+        })
+    }
+}
+
+/// `policy.audience_definitions` (ADR-0055 decisions 1 and 10). A typo in a field is a start error.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AudienceDefinitionsSection {
+    /// `config` (default), `shadow` or `bundles`.
+    #[serde(default)]
+    pub mode: AudienceMode,
+    /// The namespace platform audiences live in: must match notaio's
+    /// `NOTAIO_AUDIENCE_PLATFORM_NAMESPACE`. An RFC 1123 label; no default.
+    pub platform_namespace: String,
+    /// Between reads of an audience's credential source (decision 5); a failed read keeps the
+    /// last good value for two of these.
+    #[serde(default = "default_credential_refresh_secs")]
+    pub credential_refresh_secs: u64,
+}
+
+const fn default_credential_refresh_secs() -> u64 {
+    60
 }
 
 /// One sandbox namespace of `policy.sources`. A struct, not a bare list, so a typo in the
@@ -1442,7 +1521,88 @@ impl Config {
                 anyhow::bail!("policy.namespaces: {ns} is listed twice");
             }
         }
-        check_policy_sources(policy)
+        check_policy_sources(policy)?;
+        self.check_audience_definitions()
+    }
+
+    /// ADR-0055 decision 10: a platform namespace that is an RFC 1123 label, a positive refresh,
+    /// and under `bundles` no `audiences[]`. `trusted_keys` is already required by the section.
+    fn check_audience_definitions(&self) -> anyhow::Result<()> {
+        let Some(d) = self
+            .policy
+            .as_ref()
+            .and_then(|p| p.audience_definitions.as_ref())
+        else {
+            return Ok(());
+        };
+        if !mediatore_proto::is_dns_label(&d.platform_namespace) {
+            anyhow::bail!(
+                "policy.audience_definitions.platform_namespace: {:?} is not an RFC 1123 label (ADR-0055 decision 10)",
+                d.platform_namespace
+            );
+        }
+        if d.credential_refresh_secs == 0 {
+            anyhow::bail!(
+                "policy.audience_definitions.credential_refresh_secs must be positive (ADR-0055 decision 5)"
+            );
+        }
+        if d.mode == AudienceMode::Bundles {
+            if !self.audiences.is_empty() {
+                anyhow::bail!(
+                    "policy.audience_definitions.mode is bundles but audiences[] lists {} audience(s): under bundles every definition comes from notaio; run shadow until no difference is logged, then remove audiences[] (ADR-0055 decision 8)",
+                    self.audiences.len()
+                );
+            }
+            anyhow::bail!(
+                "policy.audience_definitions.mode: bundles is not implemented yet; use shadow (ADR-0055)"
+            );
+        }
+        Ok(())
+    }
+
+    /// Where audience definitions come from: `config` without the section.
+    #[must_use]
+    pub fn audience_mode(&self) -> AudienceMode {
+        self.policy
+            .as_ref()
+            .and_then(|p| p.audience_definitions.as_ref())
+            .map_or(AudienceMode::Config, |d| d.mode)
+    }
+
+    /// The namespaces audience bundles are read in (ADR-0055 decision 1): the platform namespace,
+    /// then every namespace a sandbox may live in, each once. Empty without the section.
+    #[must_use]
+    pub fn audience_namespaces(&self) -> Vec<String> {
+        let Some(d) = self
+            .policy
+            .as_ref()
+            .and_then(|p| p.audience_definitions.as_ref())
+        else {
+            return Vec::new();
+        };
+        let mut out = vec![d.platform_namespace.clone()];
+        let sandboxes = match self.namespaces() {
+            Namespaces::Single(ns) => vec![ns],
+            Namespaces::Map(m) => m.into_keys().collect(),
+        };
+        for ns in sandboxes {
+            if !out.contains(&ns) {
+                out.push(ns);
+            }
+        }
+        out
+    }
+
+    /// The file's audiences as the shadow comparison sees them (ADR-0055 decision 8): what a
+    /// definition can also say, never a credential or a file path.
+    #[must_use]
+    pub fn audience_shapes(
+        &self,
+    ) -> std::collections::BTreeMap<String, mediatore_claims::audience::Shape> {
+        self.audiences
+            .iter()
+            .map(|a| (a.name.clone(), a.shape()))
+            .collect()
     }
 
     /// `policy.sources` as the reconciler, the front door and the gateway answer read it
@@ -3222,6 +3382,132 @@ listen: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }
         ))
         .unwrap();
         assert_eq!(cfg.policy_sources().sources_of("pool-ns"), ["sandboxes"]);
+    }
+
+    // ADR-0055 decisions 8 and 10.
+
+    fn audience_definitions(body: &str) -> String {
+        policy_reading("sandboxes", &format!("  audience_definitions:\n{body}"))
+    }
+
+    #[test]
+    fn without_audience_definitions_the_file_serves_and_no_audience_bundle_is_read() {
+        let cfg = with(&policy_reading("sandboxes", "")).unwrap();
+        assert_eq!(cfg.audience_mode(), AudienceMode::Config);
+        assert_eq!(cfg.audience_namespaces(), Vec::<String>::new());
+        assert_eq!(with("").unwrap().audience_mode(), AudienceMode::Config);
+    }
+
+    #[test]
+    fn shadow_reads_the_platform_namespace_and_every_sandbox_namespace() {
+        let cfg = with(&format!(
+            "{TENANTS}{}",
+            policy_reading(
+                "infra, team-a",
+                "  audience_definitions: { mode: shadow, platform_namespace: sandbox-platform }\n"
+            )
+        ))
+        .unwrap();
+        assert_eq!(cfg.audience_mode(), AudienceMode::Shadow);
+        assert_eq!(
+            cfg.audience_namespaces(),
+            ["sandbox-platform", "infra", "team-a", "team-b"]
+        );
+        let d = cfg.policy.unwrap().audience_definitions.unwrap();
+        assert_eq!(d.credential_refresh_secs, 60);
+
+        // The platform namespace may also be a sandbox namespace; it is read once.
+        let cfg = with(&audience_definitions(
+            "    mode: shadow\n    platform_namespace: sandboxes\n",
+        ))
+        .unwrap();
+        assert_eq!(cfg.audience_namespaces(), ["sandboxes"]);
+    }
+
+    #[test]
+    fn audience_definitions_refuse_a_bad_platform_namespace_a_zero_refresh_or_a_typo() {
+        let err = refused(&audience_definitions(
+            "    mode: shadow\n    platform_namespace: Sandbox_Platform\n",
+        ));
+        assert!(err.contains("platform_namespace"), "{err}");
+        let err = refused(&audience_definitions(
+            "    mode: shadow\n    platform_namespace: p\n    credential_refresh_secs: 0\n",
+        ));
+        assert!(err.contains("credential_refresh_secs"), "{err}");
+        assert!(
+            with(&audience_definitions(
+                "    mode: shadow\n    platform_namespce: p\n"
+            ))
+            .is_err()
+        );
+        assert!(
+            with(&audience_definitions(
+                "    mode: bundle\n    platform_namespace: p\n"
+            ))
+            .is_err()
+        );
+        assert!(
+            with(&audience_definitions("    mode: shadow\n")).is_err(),
+            "no default namespace"
+        );
+    }
+
+    #[test]
+    fn bundles_refuses_an_audiences_list_and_is_not_served_yet() {
+        let body = "    mode: bundles\n    platform_namespace: p\n";
+        let err = Config::parse(&format!(
+            "{}audiences:\n  - {{ name: a, via: none }}\n{}",
+            DEV.replace("audiences: []\n", ""),
+            audience_definitions(body)
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("audiences[]") && err.contains("shadow"),
+            "{err}"
+        );
+        let err = refused(&audience_definitions(body));
+        assert!(err.contains("not implemented"), "{err}");
+    }
+
+    #[test]
+    fn a_file_audience_has_the_shape_a_definition_of_it_would_have() {
+        use mediatore_claims::audience::{differences, shape_of};
+        use mediatore_policy::types::{
+            AudienceCredential, AudienceDefinition, Backend as B, CredentialFormat,
+            CredentialSource, HeaderPair as H, Placement, SecretRef,
+        };
+        let cfg = Config::parse(
+            "trust_domain: sandbox.test\nissuers: []\nlisten: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }\ndev_mode: true\naudiences:\n  - name: anthropic\n    via: secret\n    secret_file: /s\n    secret_header: x-api-key\n    secret_extra_headers:\n      - { name: anthropic-version, value: \"2023-06-01\" }\n    egress: [\"api.anthropic.com:443\"]\n    rules:\n      - { method: POST, path: \"/v1/messages\" }\n",
+        )
+        .unwrap();
+        let file = &cfg.audience_shapes()["anthropic"];
+        let signed = AudienceDefinition {
+            credential: AudienceCredential {
+                backend: B::Secret,
+                placement: Placement::Proxy,
+                format: CredentialFormat::Bearer,
+                source: Some(CredentialSource::SecretRef(SecretRef {
+                    name: "anthropic".into(),
+                    token_key: "key".into(),
+                    username_key: None,
+                })),
+                header: Some("x-api-key".into()),
+                extra_headers: vec![H {
+                    name: "anthropic-version".into(),
+                    value: "2023-06-01".into(),
+                }],
+                refresh: None,
+            },
+            endpoints: vec!["api.anthropic.com:443".into()],
+            rules: vec![mediatore_policy::types::EndpointRule {
+                method: "post".into(),
+                path: "/v1/messages".into(),
+            }],
+            max_ttl_seconds: 900,
+            ca_ref: None,
+        };
+        assert_eq!(differences(file, &shape_of(&signed)), Vec::<&str>::new());
     }
 
     #[test]

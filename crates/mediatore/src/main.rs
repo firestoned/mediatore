@@ -13,6 +13,7 @@ use std::sync::Arc;
 use clap::{Parser, Subcommand};
 use mediatore_api::{AppState, Limiter};
 use mediatore_claims::Reconciler;
+use mediatore_claims::audience::AudienceReflector;
 use mediatore_claims::kubestore::KubeStore;
 use mediatore_claims::lease::LeaseConfig;
 use mediatore_claims::policy::{BundleCache, BundleReflector};
@@ -140,6 +141,7 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
     // The reflector needs the store the state is about to own, and the state needs the
     // reflector's cache (ADR-0030): built first.
     let reflector = bundle_reflector(&cfg, &store, client.is_some())?;
+    let audiences = audience_reflector(&cfg, &store, client.is_some())?;
     let policy_egress = policy_egress(&cfg, reflector.as_deref());
 
     let state = Arc::new(AppState {
@@ -206,8 +208,14 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
         // `policy` section.
         let bundles = reflector.as_ref().map(|r| r.cache());
         let policy_client = client.clone();
+        let audience_client = client.clone();
         let p = async {
             policy_reflector(policy_client, reflector)
+                .await
+                .map_err(std::io::Error::other)
+        };
+        let aud = async {
+            run_audience_reflector(audience_client, audiences)
                 .await
                 .map_err(std::io::Error::other)
         };
@@ -216,7 +224,7 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
                 .await
                 .map_err(std::io::Error::other)
         };
-        tokio::try_join!(u, s, w, p)?;
+        tokio::try_join!(u, s, w, p, aud)?;
     } else {
         if cfg.policy.is_some() {
             tracing::warn!("policy configured but no cluster client (dev_mode): no bundle is read");
@@ -265,6 +273,57 @@ fn bundle_reflector(
         keys,
         policy.namespaces.clone(),
     ))))
+}
+
+/// The audience reflector (ADR-0055 decision 1) under `shadow`: notaio's audience bundles read
+/// beside the file, each comparison logged; the file still serves. `None` under `config`, and
+/// without a cluster. `bundles` never starts yet (the configuration refuses it).
+fn audience_reflector(
+    cfg: &Config,
+    store: &Arc<dyn ClaimStore>,
+    has_cluster: bool,
+) -> anyhow::Result<Option<Arc<AudienceReflector>>> {
+    let mode = cfg.audience_mode();
+    let (Some(policy), true) = (cfg.policy.as_ref(), has_cluster) else {
+        return Ok(None);
+    };
+    let Some(defs) = policy.audience_definitions.as_ref() else {
+        return Ok(None);
+    };
+    let namespaces = cfg.audience_namespaces();
+    tracing::info!(
+        mode = %mode,
+        platform_namespace = %defs.platform_namespace,
+        namespaces = ?namespaces,
+        "policy.audience_definitions (ADR-0055)"
+    );
+    if mode == config::AudienceMode::Config {
+        return Ok(None);
+    }
+    let keys = mediatore_policy::trusted_keys(&policy.trusted_keys)?;
+    let reflector = AudienceReflector::new(
+        store.clone(),
+        keys,
+        defs.platform_namespace.clone(),
+        namespaces,
+    )
+    .with_shadow(cfg.audience_shapes());
+    Ok(Some(Arc::new(reflector)))
+}
+
+/// The audience reflector on every replica, until shutdown; nothing without one. A watch that
+/// ends is an error, so the pod restarts with the cause in its log.
+async fn run_audience_reflector(
+    client: kube::Client,
+    reflector: Option<Arc<AudienceReflector>>,
+) -> anyhow::Result<()> {
+    let Some(reflector) = reflector else {
+        return Ok(());
+    };
+    tokio::select! {
+        r = mediatore_claims::audience::run(client, reflector) => r,
+        () = shutdown() => Ok(()),
+    }
 }
 
 /// The reflector on every replica, outside the Lease: each replica needs the cache it will

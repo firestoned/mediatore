@@ -98,6 +98,12 @@
       "description": "notaio's signed bundles, one ConfigMap per policy in each namespace listed in policy.namespaces. State notaio owns and the broker only reads: the broker's RBAC there is a Role granting get, list and watch on ConfigMaps and nothing else. A bundle is used only once it verifies against the configured keys at the current time and passes notaio's floor rule; one that fails is logged with its reason and changes nothing, an expired one leaves the cache. Under policy.egress: shadow (the default) a bundle is compared with the broker's configuration and reported, never enforced (ADR-0026, roadmap 09, done); under policy.egress: enforce its servable direct egress is served at the gateway (ADR-0030), and a gateway-placed audience must be one the claim's policy admits (ADR-0040). Which namespaces' bundles a sandbox may name is the broker's configuration, policy.sources (ADR-0054), never cluster state: a namespace's own bundles by default, an explicit list otherwise; being read (policy.namespaces) does not make a bundle nameable."
     },
     {
+      "unique-id": "data-asset-audience-bundles",
+      "node-type": "data-asset",
+      "name": "SandboxAudience bundles (ConfigMaps)",
+      "description": "notaio's signed audience bundles (notaio ADR-0020, mediatore ADR-0055): one <audience>-audience ConfigMap per SandboxAudience, the envelope under audience.dsse.json, in the platform audience namespace (platform audiences, visible from every namespace) or a sandbox namespace (team audiences, usable only from that namespace). The kind is the namespace's, never a field of the bundle. Read with the same Role and keys as the policy bundles; verified under the audience payload type, so a policy bundle never verifies as one nor the reverse; a version floor per audience in the store beside the policy floors. Checked again on admission (a team audience's backend is secret or none and never OpenBao, no reserved header, exact DNS endpoints), and a name or endpoint two audiences share is refused for both from every namespace that sees both. Under policy.audience_definitions.mode: shadow they are compared with audiences[] and logged; the file still serves. The bundles mode, the credential reads and the API's use of the catalog are decided (ADR-0055) and not built."
+    },
+    {
       "unique-id": "data-asset-policy-trusted-keys",
       "node-type": "data-asset",
       "name": "Policy trust anchor (configured keys)",
@@ -489,7 +495,7 @@
     },
     {
       "unique-id": "rel-notaio-kube-api",
-      "description": "notaio writes each policy's bundle ConfigMap in the policy's namespace and keeps it current: a new version on every change, re-signed on a key rotation (ADR-0026). mediatore never calls notaio; the ConfigMap is the whole interface.",
+      "description": "notaio writes each policy's bundle ConfigMap in the policy's namespace and keeps it current: a new version on every change, re-signed on a key rotation (ADR-0026); and each SandboxAudience's bundle ConfigMap in the audience's namespace, once its platform audience namespace is set (notaio ADR-0020, mediatore ADR-0055). mediatore never calls notaio; the ConfigMap is the whole interface.",
       "relationship-type": {
         "connects": {
           "source": {
@@ -518,13 +524,29 @@
       "protocol": "HTTPS"
     },
     {
+      "unique-id": "rel-watcher-audience-bundles",
+      "description": "The audience reflector (ADR-0055 decision 1, built for shadow): a watch on ConfigMaps labelled app.kubernetes.io/managed-by=notaio in the platform audience namespace and every sandbox namespace, under the policy bundles' Role (get, list and watch on ConfigMaps only). A ConfigMap without audience.dsse.json is a policy bundle or not notaio's and is skipped. Every replica runs it, outside the Lease; the SandboxAudience CRD is never read.",
+      "relationship-type": {
+        "connects": {
+          "source": {
+            "node": "service-mediatore-watcher"
+          },
+          "destination": {
+            "node": "service-kubernetes-api"
+          }
+        }
+      },
+      "protocol": "HTTPS"
+    },
+    {
       "unique-id": "rel-notaio-composition",
-      "description": "The bundles are notaio's state; mediatore holds a verified copy in memory and the floor in its store.",
+      "description": "The policy and audience bundles are notaio's state; mediatore holds a verified copy in memory and the floors in its store.",
       "relationship-type": {
         "composed-of": {
           "container": "system-notaio",
           "nodes": [
-            "data-asset-policy-bundles"
+            "data-asset-policy-bundles",
+            "data-asset-audience-bundles"
           ]
         }
       }
