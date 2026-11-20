@@ -59,6 +59,13 @@ pub struct WatcherConfig {
     /// Audiences mediatore serves, as configured; a sandbox may request a subset, and the
     /// shadow comparison (ADR-0026 decision 7) reads what each would allow.
     pub audiences: Vec<Audience>,
+    /// ADR-0053: per scoped audience, its rules per namespace. A sandbox in a namespace an audience
+    /// does not list may not name it (refused as not configured), and the shadow comparison reads that
+    /// namespace's rules. An audience absent from the map is unscoped.
+    pub scopes: std::collections::BTreeMap<
+        String,
+        std::collections::BTreeMap<String, Vec<mediatore_proto::EndpointRule>>,
+    >,
     /// Issuers mediatore trusts; a sandbox's subject must come from one.
     pub issuers: Vec<String>,
     /// The registries a gateway-era pool can reach (`registries[].reach`, ADR-0029): a
@@ -74,6 +81,9 @@ pub struct WatcherConfig {
     /// `policy.egress` (ADR-0030): decides whether a bundle's direct egress is `P006` or,
     /// as the broker serves it, only its unservable entries are `P007`.
     pub egress_mode: crate::policy::EgressMode,
+    /// `policy.audiences` (ADR-0053 decisions 9 to 16): under `Enforce` a sandbox is refused unless
+    /// its policy resolves to a verified bundle that grants what it asks for.
+    pub audiences_mode: crate::policy::EgressMode,
     /// The audiences served from the requester's own credential (`via: delegated`,
     /// ADR-0035). A sandbox naming one whose delegation did not reach its record is
     /// refused before the claim binds a VM.
@@ -89,6 +99,58 @@ pub struct WatcherConfig {
     pub logs_retention: Duration,
 }
 
+impl WatcherConfig {
+    /// ADR-0053 decision 4: may a sandbox in `namespace` name `audience`? An unscoped audience is
+    /// usable everywhere; a scoped one only where it lists the namespace.
+    #[must_use]
+    pub fn scope_allows(&self, audience: &str, namespace: &str) -> bool {
+        self.scopes
+            .get(audience)
+            .is_none_or(|per| per.contains_key(namespace))
+    }
+
+    /// ADR-0053 decision 11: whether `bundle` grants a sandbox in `namespace` the audience in a way the
+    /// broker's own configuration (the ceiling, the namespace's file grant, the endpoints) leaves usable.
+    #[must_use]
+    pub fn grants(
+        &self,
+        namespace: &str,
+        audience: &str,
+        bundle: &mediatore_policy::BundlePayload,
+    ) -> bool {
+        let Some(configured) = self.audiences.iter().find(|a| a.name == audience) else {
+            return false;
+        };
+        let Some(grant) = bundle.content.audiences.iter().find(|g| g.name == audience) else {
+            return false;
+        };
+        let file = self
+            .scopes
+            .get(audience)
+            .and_then(|per| per.get(namespace))
+            .map(Vec::as_slice);
+        crate::policy::effective_grant(&configured.rules, file, &configured.egress, grant).is_some()
+    }
+
+    /// The audiences as a sandbox in `namespace` meets them (ADR-0053 decision 8): the ones its
+    /// namespace may use, a scoped one carrying that namespace's rules, so the shadow comparison
+    /// judges what the claim can actually do.
+    #[must_use]
+    pub fn audiences_in(&self, namespace: &str) -> Vec<Audience> {
+        self.audiences
+            .iter()
+            .filter(|a| self.scope_allows(&a.name, namespace))
+            .map(|a| {
+                let mut a = a.clone();
+                if let Some(rules) = self.scopes.get(&a.name).and_then(|per| per.get(namespace)) {
+                    a.rules = rules.clone();
+                }
+                a
+            })
+            .collect()
+    }
+}
+
 impl Default for WatcherConfig {
     fn default() -> Self {
         Self {
@@ -96,11 +158,13 @@ impl Default for WatcherConfig {
             resolve_timeout: Duration::from_secs(60),
             requeue: Duration::from_secs(5),
             audiences: vec![],
+            scopes: std::collections::BTreeMap::new(),
             issuers: vec![],
             reachable_registries: None,
             placed_registries: std::collections::BTreeMap::new(),
             retention: Duration::from_hours(1),
             egress_mode: crate::policy::EgressMode::default(),
+            audiences_mode: crate::policy::EgressMode::default(),
             delegated_audiences: std::collections::BTreeSet::new(),
             node_grace: Duration::from_mins(10),
             logs_enabled: false,

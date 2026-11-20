@@ -81,6 +81,10 @@ pub struct AppState {
     /// Per audience, the egress proxy's rules (`audiences[].rules`, ADR-0025); `GET /v1/me`
     /// returns one route per audience and endpoint of the claim, carrying them.
     pub rules: BTreeMap<String, Vec<EndpointRule>>,
+    /// ADR-0053: for an audience scoped to namespaces (`audiences[].namespaces`), its rules per
+    /// namespace. An audience in this map is usable only from a namespace it lists, with that
+    /// namespace's rules; one absent from it is unscoped and uses `rules`/`inject` as before.
+    pub scopes: BTreeMap<String, BTreeMap<String, Vec<EndpointRule>>>,
     /// Per audience, the PEM of the CA the egress proxy trusts for its endpoints
     /// (`audiences[].ca_file`, ADR-0025 amended); absent, the Mozilla roots. Public material,
     /// validated at start, carried on the route.
@@ -147,6 +151,158 @@ pub struct AppState {
     /// ask a `warn` line. `false` everywhere but an environment in the middle of moving its
     /// gateways' entries; with it on, the compartment of ADR-0053 is not in force.
     pub accept_plain_gateway_identity: bool,
+}
+
+impl AppState {
+    /// ADR-0053 decision 4: may a claim in `namespace` use `audience`? An unscoped audience is usable
+    /// from every namespace; a scoped one only from a namespace it lists. Whether the audience exists
+    /// is a separate question (`audiences`).
+    #[must_use]
+    pub fn scope_allows(&self, audience: &str, namespace: &str) -> bool {
+        self.scopes
+            .get(audience)
+            .is_none_or(|per| per.contains_key(namespace))
+    }
+
+    /// The rules the proxy applies to `audience` for a claim in `namespace`: the namespace's own
+    /// for a scoped audience, the audience's for an unscoped one.
+    #[must_use]
+    pub fn rules_in(&self, audience: &str, namespace: &str) -> Vec<EndpointRule> {
+        match self.scopes.get(audience) {
+            Some(per) => per.get(namespace).cloned().unwrap_or_default(),
+            None => self.rules.get(audience).cloned().unwrap_or_default(),
+        }
+    }
+}
+
+/// Whether `policy.audiences` is `enforce` and there is a `policy` section to enforce
+/// (ADR-0053 decision 9).
+fn enforcing(st: &AppState) -> Option<&PolicyEgress> {
+    st.policy_egress
+        .as_ref()
+        .filter(|pe| pe.audiences == mediatore_claims::policy::EgressMode::Enforce)
+}
+
+/// ADR-0053 decision 10: what `POST /v1/claims` requires under `policy.audiences: enforce`, after the
+/// namespace check of ADR-0046. Returns the policy's `uid` to record (the dev path writes the record
+/// itself; the reconciler records it for a sandbox), `None` when nothing is enforced.
+///
+/// - the claim names a policy (`400 policy_required`);
+/// - every watched namespace has completed its first list, or `503 policy_not_synced` and nothing is
+///   created: "no bundle yet" is never read as "no policy";
+/// - the policy resolves to a verified, unexpired bundle (`400 unknown_policy`);
+/// - the bundle grants every audience asked for, in a way the ceiling leaves usable (`400
+///   unknown_audience`, the same answer as an audience that does not exist);
+/// - `ttl_seconds` fits the bundle's lease (`400 ttl_exceeds_policy`).
+fn admit_under_policy(
+    st: &AppState,
+    req: &ClaimRequest,
+    namespace: &str,
+) -> Result<Option<String>, ApiError> {
+    let Some(pe) = enforcing(st) else {
+        return Ok(None);
+    };
+    let Some(name) = req.policy_ref.as_deref() else {
+        return Err(ApiError::bad_request(
+            "policy_required",
+            "name the policy this sandbox is under (policy_ref)",
+        ));
+    };
+    if !pe.bundles.synced_all() {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "policy_not_synced",
+            Some("the policy bundles have not all been read yet; try again shortly".to_owned()),
+        ));
+    }
+    let Some(bundle) = pe.bundles.resolve(namespace, name, Timestamp::now()) else {
+        return Err(ApiError::bad_request("unknown_policy", name.to_owned()));
+    };
+    if let Some(bad) = req
+        .audiences
+        .iter()
+        .find(|a| effective_in(st, namespace, a, Some(&bundle)).is_none())
+    {
+        tracing::info!(%namespace, policy = name, audience = %bad, "claim refused: the policy does not grant the audience (ADR-0053)");
+        return Err(ApiError::bad_request("unknown_audience", bad.clone()));
+    }
+    if i64::from(req.ttl_seconds) > i64::from(bundle.content.lease.max_duration_seconds) {
+        tracing::info!(%namespace, policy = name, "claim refused: ttl above the policy's lease (ADR-0053)");
+        return Err(ApiError::bad_request(
+            "ttl_exceeds_policy",
+            "ttl_seconds is above the policy's lease",
+        ));
+    }
+    Ok(Some(bundle.content.policy.uid.clone()))
+}
+
+/// What a claim in `namespace` may do with `audience` (ADR-0053 decisions 4, 5 and 11): `None`
+/// when it may not use it. Without `enforce` that is the namespace's scope (phase 1); under
+/// `enforce` it is also the bundle's grant, bounded by the audience's own `rules` (the ceiling),
+/// and `bundle` is the claim's verified bundle, `None` when it has none or it is unusable now.
+fn effective_in(
+    st: &AppState,
+    namespace: &str,
+    audience: &str,
+    bundle: Option<&mediatore_policy::BundlePayload>,
+) -> Option<mediatore_claims::policy::EffectiveAudience> {
+    if !st.scope_allows(audience, namespace) {
+        return None;
+    }
+    let egress = st.egress.get(audience).map_or(&[][..], Vec::as_slice);
+    if enforcing(st).is_none() {
+        return Some(mediatore_claims::policy::EffectiveAudience {
+            rules: st.rules_in(audience, namespace),
+            egress: egress.to_vec(),
+            ttl_cap: None,
+        });
+    }
+    let grant = bundle?
+        .content
+        .audiences
+        .iter()
+        .find(|g| g.name == audience)?;
+    let ceiling = st.rules.get(audience).map_or(&[][..], Vec::as_slice);
+    let file = st
+        .scopes
+        .get(audience)
+        .and_then(|per| per.get(namespace))
+        .map(Vec::as_slice);
+    mediatore_claims::policy::effective_grant(ceiling, file, egress, grant)
+}
+
+/// The claim's current verified bundle (ADR-0053 decision 12): found by the policy `uid` the
+/// record holds, never the version it was created under; `None` for a claim with no policy and
+/// for a bundle that is missing, expired or no longer verified.
+fn claim_bundle(st: &AppState, rec: &ClaimRecord) -> Option<Arc<mediatore_policy::BundlePayload>> {
+    let pe = enforcing(st)?;
+    pe.bundles
+        .by_uid(rec.policy_uid.as_deref()?, Timestamp::now())
+}
+
+/// What the claim may do with `audience` now: [`effective_in`] on its own namespace and its
+/// current bundle.
+fn effective(
+    st: &AppState,
+    rec: &ClaimRecord,
+    audience: &str,
+) -> Option<mediatore_claims::policy::EffectiveAudience> {
+    effective_in(
+        st,
+        &rec.namespace,
+        audience,
+        claim_bundle(st, rec).as_deref(),
+    )
+}
+
+/// The audiences a claim may use now: the ones it names that its namespace lists and, under
+/// `enforce`, its bundle grants (ADR-0053 decisions 4 and 12). Every mint, route and allowlist
+/// for a claim reads this, never `rec.audiences` directly.
+fn claim_audiences<'a>(st: &'a AppState, rec: &'a ClaimRecord) -> impl Iterator<Item = &'a String> {
+    let bundle = claim_bundle(st, rec);
+    rec.audiences
+        .iter()
+        .filter(move |a| effective_in(st, &rec.namespace, a, bundle.as_deref()).is_some())
 }
 
 /// Which namespaces the user API serves and who may use each (ADR-0046 decisions 3 to 5).
@@ -660,9 +816,17 @@ async fn create_claim(
     // the sandbox; say so now, and never read "neither" as "any pool".
     req.pool()
         .map_err(|e| ApiError::bad_request("invalid_pool", e.to_string()))?;
-    if let Some(bad) = req.audiences.iter().find(|a| !st.audiences.contains(a)) {
+    // An audience this namespace may not use is answered as one that does not exist (ADR-0053
+    // decision 4): the response does not say which audiences exist elsewhere.
+    if let Some(bad) = req
+        .audiences
+        .iter()
+        .find(|a| !st.audiences.contains(a) || !st.scope_allows(a, &namespace))
+    {
         return Err(ApiError::bad_request("unknown_audience", bad.clone()));
     }
+    // ADR-0053 decision 10: under `policy.audiences: enforce`, a verified bundle that grants it all.
+    admit_under_policy(&st, &req, &namespace)?;
     // The guest would refuse it at bind (ADR-0021); say so now (ADR-0022 decision 4).
     let image = req
         .workload
@@ -802,6 +966,9 @@ async fn dev_claim(
     delegations: &[Delegation],
 ) -> Result<(StatusCode, Json<ClaimResponse>), ApiError> {
     let uid = Uuid::new_v4();
+    // The record carries the policy the claim was admitted under, as the reconciler writes it for a
+    // sandbox (ADR-0026 decision 6); the check is the same and cheap.
+    let policy_uid = admit_under_policy(st, req, &namespace)?;
     // The dev binder writes the record itself, so the envelope binds to the record's UID.
     let refresh = match (sealer, session) {
         (Some(sealer), Some(token)) => Some(
@@ -840,7 +1007,7 @@ async fn dev_claim(
             expires_at: None,
             revoked_at: None,
             sandbox_uid: None,
-            policy_uid: None,
+            policy_uid,
             bundle_version: None,
             report: None,
             exit: None,
@@ -1988,45 +2155,46 @@ async fn me(
     // audience and that audience's rules; the config guarantees one audience per endpoint.
     // A direct entry gets a route with no audience and no credential (decision 8): the
     // proxy forwards bare, and the gateway, not the proxy, is what admits it.
-    let mut routes: Vec<Route> = rec
-        .audiences
-        .iter()
+    let mut routes: Vec<Route> = claim_audiences(&st, &rec)
         .flat_map(|a| {
-            st.egress.get(a).into_iter().flatten().map(|e| Route {
-                audience: Some(a.clone()),
-                endpoint: e.clone(),
-                rules: st.rules.get(a).cloned().unwrap_or_default(),
-                ca_pem: st.cas.get(a).cloned(),
-                credential: if st.no_credential.contains(a) {
-                    Credential::None
-                } else if st.inject.contains_key(a) {
-                    // ADR-0040: the gateway places it; the proxy never asks for a token.
-                    Credential::Gateway
-                } else {
-                    Credential::Token
-                },
-                // ADR-0032 decision 2 and ADR-0035: where a `via: secret` or a delegated
-                // credential goes, when not `Authorization`; the proxy owns that header on
-                // every route (ADR-0025 decision 3).
-                credential_header: st
-                    .secrets
-                    .get(a)
-                    .filter(|sec| sec.header != "authorization")
-                    .map(|sec| sec.header.clone())
-                    .or_else(|| {
-                        st.delegated
-                            .get(a)
-                            .filter(|d| d.header != "authorization")
-                            .map(|d| d.header.clone())
-                    }),
-                // ADR-0040: the gateways' inject port, on the routes of an audience placed
-                // there; every other route is placed by the proxy.
-                inject_port: st
-                    .inject
-                    .contains_key(a)
-                    .then_some(st.inject_port)
-                    .flatten(),
-            })
+            let eff = effective(&st, &rec, a).unwrap_or_else(|| unreachable!("filtered"));
+            let rules = eff.rules;
+            eff.egress.into_iter().map(move |e| (a, e, rules.clone()))
+        })
+        .map(|(a, e, rules)| Route {
+            audience: Some(a.clone()),
+            endpoint: e,
+            rules,
+            ca_pem: st.cas.get(a).cloned(),
+            credential: if st.no_credential.contains(a) {
+                Credential::None
+            } else if st.inject.contains_key(a) {
+                // ADR-0040: the gateway places it; the proxy never asks for a token.
+                Credential::Gateway
+            } else {
+                Credential::Token
+            },
+            // ADR-0032 decision 2 and ADR-0035: where a `via: secret` or a delegated
+            // credential goes, when not `Authorization`; the proxy owns that header on
+            // every route (ADR-0025 decision 3).
+            credential_header: st
+                .secrets
+                .get(a)
+                .filter(|sec| sec.header != "authorization")
+                .map(|sec| sec.header.clone())
+                .or_else(|| {
+                    st.delegated
+                        .get(a)
+                        .filter(|d| d.header != "authorization")
+                        .map(|d| d.header.clone())
+                }),
+            // ADR-0040: the gateways' inject port, on the routes of an audience placed
+            // there; every other route is placed by the proxy.
+            inject_port: st
+                .inject
+                .contains_key(a)
+                .then_some(st.inject_port)
+                .flatten(),
         })
         .chain(direct.into_iter().map(|e| Route {
             audience: None,
@@ -2123,6 +2291,9 @@ pub struct PolicyEgress {
     pub bundles: Arc<mediatore_claims::policy::BundleCache>,
     /// `policy.egress`.
     pub mode: mediatore_claims::policy::EgressMode,
+    /// `policy.audiences` (ADR-0053 decisions 9 to 16): under `Enforce` a claim is admitted, minted
+    /// for and routed only under a verified bundle that grants what it uses.
+    pub audiences: mediatore_claims::policy::EgressMode,
 }
 
 /// The `host:port` pairs a claim may reach: the union of its audiences' `egress` and, when
@@ -2186,26 +2357,28 @@ fn served_direct_egress(st: &AppState, rec: &ClaimRecord, audience: &[Endpoint])
 /// inject listener, where the rules are enforced and the credential is placed, and through no
 /// other path.
 fn placed_endpoints(st: &AppState, rec: &ClaimRecord) -> Vec<Endpoint> {
-    rec.audiences
-        .iter()
-        .filter_map(|a| st.inject.get(a))
-        .flatten()
-        .map(|r| r.endpoint.clone())
+    claim_audiences(st, rec)
+        .filter_map(|a| st.inject.get(a).map(|routes| (a, routes)))
+        .flat_map(|(a, routes)| {
+            let allowed = effective(st, rec, a).map(|e| e.egress).unwrap_or_default();
+            routes
+                .iter()
+                .map(|r| r.endpoint.clone())
+                .filter(move |e| allowed.contains(e))
+        })
         .collect()
 }
 
 /// The union of the claim's audiences' `egress`, sorted and deduplicated, without the hosts a
 /// gateway-placed audience binds to the inject path: a `CONNECT` tunnel to such a host would go
-/// around the rules the inject listener enforces (ADR-0040).
+/// around the rules the inject listener enforces (ADR-0040). Under `enforce` an audience's
+/// endpoints are those its bundle grants (ADR-0053 decision 11).
 fn audience_egress(st: &AppState, rec: &ClaimRecord) -> Vec<Endpoint> {
     let placed = placed_endpoints(st, rec);
-    let mut egress: Vec<Endpoint> = rec
-        .audiences
-        .iter()
-        .filter_map(|a| st.egress.get(a))
-        .flatten()
+    let mut egress: Vec<Endpoint> = claim_audiences(st, rec)
+        .filter_map(|a| effective(st, rec, a))
+        .flat_map(|e| e.egress)
         .filter(|e| !placed.contains(e))
-        .cloned()
         .collect();
     egress.sort();
     egress.dedup();
@@ -2252,12 +2425,26 @@ async fn claim_egress(
 /// of each audience it names that is declared `inject: gateway`, sorted by audience then
 /// endpoint. Empty for a claim with no such audience. Carries no credential.
 fn inject_of(st: &AppState, rec: &ClaimRecord) -> Vec<InjectRoute> {
-    let mut routes: Vec<InjectRoute> = rec
-        .audiences
-        .iter()
-        .filter_map(|a| st.inject.get(a))
-        .flatten()
-        .cloned()
+    // A scoped audience's routes carry the rules of the claim's namespace, and under `enforce` the
+    // bundle's grant bounded by the ceiling; only the endpoints the grant lists are routed
+    // (ADR-0053 decisions 5 and 11).
+    let rewrite = enforcing(st).is_some();
+    let mut routes: Vec<InjectRoute> = claim_audiences(st, rec)
+        .filter_map(|a| st.inject.get(a).map(|rs| (a, rs)))
+        .flat_map(|(a, rs)| {
+            let eff = effective(st, rec, a).unwrap_or_else(|| unreachable!("filtered"));
+            let scoped = rewrite || st.scopes.contains_key(a);
+            rs.iter()
+                .filter(|r| !rewrite || eff.egress.contains(&r.endpoint))
+                .map(|r| {
+                    let mut r = r.clone();
+                    if scoped {
+                        r.rules.clone_from(&eff.rules);
+                    }
+                    r
+                })
+                .collect::<Vec<_>>()
+        })
         .collect();
     routes.sort_by(|a, b| {
         a.audience
@@ -2537,6 +2724,29 @@ async fn issue_token(
     audience: String,
     placement: Placement,
 ) -> Result<TokenResponse, ApiError> {
+    // ADR-0053 decision 11: under `enforce` a credential lives at most the bundle grant's
+    // `ttlSeconds`. The STS mints with it; every other backend's expiry is the proxy's or the
+    // gateway's cache bound, so it is clamped on the way out.
+    let cap = effective(st, &rec, &audience)
+        .and_then(|e| e.ttl_cap)
+        .map(SignedDuration::from_secs);
+    let mut issued =
+        issue_token_capped(st, actor, claim_uid, rec, audience, placement, cap).await?;
+    if let Some(cap) = cap {
+        issued.expires_at = issued.expires_at.min(Timestamp::now() + cap);
+    }
+    Ok(issued)
+}
+
+async fn issue_token_capped(
+    st: &AppState,
+    actor: &str,
+    claim_uid: Uuid,
+    rec: ClaimRecord,
+    audience: String,
+    placement: Placement,
+    cap: Option<SignedDuration>,
+) -> Result<TokenResponse, ApiError> {
     // Before any backend, the operator's `via: secret` included: nothing is handed to a claim
     // whose issuer or audience has left the configuration.
     let issuer = still_configured(st, &rec, &audience, claim_uid)?;
@@ -2611,6 +2821,9 @@ async fn issue_token(
     // claim's deadline.
     let now = Timestamp::now();
     let mut ttl = SignedDuration::from_mins(15).min(sts.max_ttl_for(&audience));
+    if let Some(cap) = cap {
+        ttl = ttl.min(cap);
+    }
     if let Some(end) = claim_end {
         ttl = ttl.min(end.duration_since(now));
     }
@@ -2666,7 +2879,7 @@ async fn token_claim(
     if !rec.is_live(Timestamp::now()) {
         return Err(ApiError::forbidden("claim revoked or expired"));
     }
-    if !rec.audiences.iter().any(|a| a == audience) {
+    if !claim_audiences(st, &rec).any(|a| a == audience) {
         return Err(ApiError::bad_request(
             "unknown_audience",
             audience.to_owned(),
@@ -2854,7 +3067,7 @@ async fn gateway_credential(
         return Err(unknown());
     }
     let audience = req.audience;
-    if !rec.audiences.iter().any(|a| a == &audience) {
+    if !claim_audiences(&st, &rec).any(|a| a == &audience) {
         return Err(ApiError::bad_request("unknown_audience", audience));
     }
     if !st.inject.contains_key(&audience) {
@@ -3057,6 +3270,7 @@ mod tests {
             logs: None,
             log_limiter: Limiter::per_second(1),
             accept_plain_gateway_identity: false,
+            scopes: std::collections::BTreeMap::new(),
         }
     }
 
@@ -4011,6 +4225,7 @@ mod tests {
             PolicyEgress {
                 bundles: reflector.cache(),
                 mode,
+                audiences: mediatore_claims::policy::EgressMode::Shadow,
             },
             uid,
         )
@@ -4228,6 +4443,383 @@ mod tests {
         assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
         assert_eq!(code(&body), "forbidden");
         assert!(!text.contains(SECRET_VALUE));
+    }
+
+    // ----- ADR-0053: an audience scoped to namespaces, each with its own rules -----
+
+    fn rule(method: &str, path: &str) -> EndpointRule {
+        EndpointRule {
+            method: method.into(),
+            path: path.into(),
+        }
+    }
+
+    /// `placed_state()` with `anthropic` scoped to `team-a` and `team-b`, each with its own rules.
+    fn scoped_state() -> AppState {
+        let mut st = placed_state();
+        st.scopes.insert(
+            "anthropic".into(),
+            [
+                ("team-a".to_owned(), vec![rule("GET", "/a/**")]),
+                ("team-b".to_owned(), vec![rule("GET", "/b/**")]),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        st
+    }
+
+    fn claim_in(namespace: &str, audiences: &[&str], node: Option<String>) -> ClaimRecord {
+        let mut c = claim(audiences, node);
+        c.namespace = namespace.into();
+        c
+    }
+
+    async fn gateway_answer(st: &Shared, uid: Uuid) -> mediatore_proto::ClaimEgress {
+        let (status, body, text) = call(
+            st,
+            "GET",
+            &format!("/v1/gateway/claims/{uid}"),
+            Some(&gateway_peer()),
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        serde_json::from_value(body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_gateways_claim_answer_carries_the_rules_of_the_claims_namespace() {
+        let st: Shared = Arc::new(scoped_state());
+        let a = stored(&st, claim_in("team-a", &["anthropic"], None)).await;
+        let b = stored(&st, claim_in("team-b", &["anthropic"], None)).await;
+        let a = gateway_answer(&st, a.uid).await;
+        let b = gateway_answer(&st, b.uid).await;
+        assert_eq!(a.inject.len(), 1);
+        assert_eq!(a.inject[0].rules, vec![rule("GET", "/a/**")]);
+        assert_eq!(b.inject[0].rules, vec![rule("GET", "/b/**")]);
+    }
+
+    #[tokio::test]
+    async fn a_claim_in_a_namespace_the_audience_does_not_list_gets_nothing_of_it() {
+        // ADR-0053 decision 4: a claim that was bound before the entry was removed (or whose record names it
+        // some other way) loses the audience at the gateway and at the mint, and its host leaves the allowlist.
+        let st: Shared = Arc::new(scoped_state());
+        let rec = stored(&st, claim_in("team-c", &["anthropic", "grafana"], None)).await;
+        let answer = gateway_answer(&st, rec.uid).await;
+        assert!(answer.inject.is_empty(), "no placed route: {answer:?}");
+        let hosts: Vec<&str> = answer.egress.iter().map(|e| e.host.as_str()).collect();
+        assert_eq!(
+            hosts,
+            ["grafana.example"],
+            "only the unscoped audience's host"
+        );
+        let (status, body, text) = ask(&st, rec.uid, Some(&gateway_peer()), "anthropic").await;
+        assert_eq!(
+            (status, code(&body)),
+            (StatusCode::BAD_REQUEST, "unknown_audience"),
+            "the gateway's credential ask is refused: {text}"
+        );
+        assert!(!text.contains(SECRET_VALUE));
+    }
+
+    #[tokio::test]
+    async fn a_scoped_audiences_credential_is_still_placed_for_a_listed_namespace() {
+        let st: Shared = Arc::new(scoped_state());
+        let rec = stored(&st, claim_in("team-b", &["anthropic"], None)).await;
+        let (status, body, _) = ask(&st, rec.uid, Some(&gateway_peer()), "anthropic").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    #[tokio::test]
+    async fn an_unscoped_audience_is_unchanged_in_every_namespace() {
+        let st: Shared = Arc::new(scoped_state());
+        for ns in ["sandboxes", "team-a", "team-z"] {
+            let rec = stored(&st, claim_in(ns, &["claude"], None)).await;
+            let answer = gateway_answer(&st, rec.uid).await;
+            assert_eq!(answer.inject.len(), 1, "{ns}");
+            assert_eq!(answer.inject[0].audience, "claude", "{ns}");
+        }
+    }
+
+    #[tokio::test]
+    async fn me_routes_carry_the_rules_of_the_claims_namespace() {
+        let st = Arc::new(scoped_state());
+        let node = st.naming.node_id("ek1");
+        st.store
+            .put_node(NodeRecord {
+                ek_hash: "ek1".into(),
+                node_id: node.clone(),
+                dmi_uuid: Uuid::new_v4(),
+                hostname: "pool-1".into(),
+                provider: None,
+                banned: false,
+                registered_at: Timestamp::now(),
+            })
+            .await
+            .unwrap();
+        let st: Shared = st;
+        stored(&st, claim_in("team-b", &["anthropic"], Some(node))).await;
+        let (status, body, _) = call(
+            &st,
+            "GET",
+            "/v1/me",
+            Some(&st.naming.node_id("ek1")),
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let me: Me = serde_json::from_value(body).unwrap();
+        let route = me
+            .routes
+            .iter()
+            .find(|r| r.audience.as_deref() == Some("anthropic"))
+            .expect("the anthropic route");
+        assert_eq!(route.rules, vec![rule("GET", "/b/**")]);
+    }
+
+    // ----- ADR-0053 phase 2: the verified bundle as the source of the grants -----
+
+    fn grant_of(
+        rules: &[(&str, &str)],
+        endpoints: &[&str],
+        ttl: Option<u32>,
+    ) -> mediatore_policy::types::AudienceGrant {
+        let mut g = mediatore_testkit::policy::fresh_bundle(Timestamp::now(), 1)
+            .payload
+            .content
+            .audiences[0]
+            .clone();
+        g.name = "internal-git".into();
+        g.rules = rules
+            .iter()
+            .map(|(m, p)| mediatore_policy::types::EndpointRule {
+                method: (*m).into(),
+                path: (*p).into(),
+            })
+            .collect();
+        g.endpoints = endpoints.iter().map(|e| (*e).to_owned()).collect();
+        g.ttl_seconds = ttl;
+        g
+    }
+
+    /// A reflector holding one bundle (policy uid returned) whose only grant is `grant`, the
+    /// first list of its namespace done, and the state `placed_internal_git` under `enforce`
+    /// with `ceiling` as the audience's own rules.
+    struct Enforced {
+        st: AppState,
+        uid: String,
+        reflector: mediatore_claims::policy::BundleReflector,
+        payload: mediatore_policy::BundlePayload,
+        namespace: String,
+    }
+
+    impl Enforced {
+        async fn new(
+            ceiling: &[(&str, &str)],
+            grant: mediatore_policy::types::AudienceGrant,
+            mode: mediatore_claims::policy::EgressMode,
+        ) -> Self {
+            let now = Timestamp::now();
+            let mut content = mediatore_testkit::policy::fresh_bundle(now, 1)
+                .payload
+                .content;
+            content.audiences = vec![grant];
+            let signed = mediatore_testkit::policy::signed_bundle(now, 2, content);
+            let uid = signed.payload.content.policy.uid.clone();
+            let namespace = signed.payload.content.policy.namespace.clone();
+            let reflector = mediatore_claims::policy::BundleReflector::new(
+                mediatore_store::MemoryStore::shared(),
+                signed.keys,
+                vec![namespace.clone()],
+            );
+            reflector.resynced(&namespace, &std::collections::HashSet::new());
+            let cm = mediatore_testkit::policy::bundle_configmap(
+                &namespace,
+                "agent-bundle",
+                &signed.envelope,
+            );
+            let outcome = reflector.applied_at(&cm, now).await;
+            assert!(
+                matches!(outcome, mediatore_claims::policy::Outcome::Admitted { .. }),
+                "{outcome:?}"
+            );
+            let mut st = placed_internal_git(placed_state());
+            st.rules.insert(
+                "internal-git".into(),
+                ceiling.iter().map(|(m, p)| rule(m, p)).collect(),
+            );
+            st.policy_egress = Some(PolicyEgress {
+                bundles: reflector.cache(),
+                mode: mediatore_claims::policy::EgressMode::Shadow,
+                audiences: mode,
+            });
+            Self {
+                st,
+                uid,
+                reflector,
+                payload: signed.payload,
+                namespace,
+            }
+        }
+
+        /// The same policy at `version`, `grant` replacing the old one.
+        async fn tighten(&self, version: u64, grant: mediatore_policy::types::AudienceGrant) {
+            let mut content = self.payload.content.clone();
+            content.audiences = vec![grant];
+            let now = Timestamp::now();
+            let signed = mediatore_testkit::policy::signed_bundle(now, version, content);
+            let cm = mediatore_testkit::policy::bundle_configmap(
+                &self.namespace,
+                "agent-bundle",
+                &signed.envelope,
+            );
+            let outcome = self.reflector.applied_at(&cm, now).await;
+            assert!(
+                matches!(outcome, mediatore_claims::policy::Outcome::Admitted { .. }),
+                "{outcome:?}"
+            );
+        }
+    }
+
+    fn under(uid: &str) -> ClaimRecord {
+        let mut rec = claim(&["internal-git"], None);
+        rec.policy_uid = Some(uid.to_owned());
+        rec
+    }
+
+    #[tokio::test]
+    async fn the_effective_rules_are_the_bundles_inside_the_ceiling_on_the_gateways_answer() {
+        use mediatore_claims::policy::EgressMode::Enforce;
+        let grant = grant_of(
+            &[("GET", "/repos/team-a/**"), ("GET", "/other/**")],
+            &["git.example:443"],
+            None,
+        );
+        let e = Enforced::new(&[("GET", "/repos/**")], grant, Enforce).await;
+        let uid = e.uid.clone();
+        let st: Shared = Arc::new(e.st);
+        let rec = stored(&st, under(&uid)).await;
+        let answer = gateway_answer(&st, rec.uid).await;
+        assert_eq!(answer.inject.len(), 1);
+        assert_eq!(
+            answer.inject[0].rules,
+            vec![rule("GET", "/repos/team-a/**")],
+            "the rule the ceiling does not cover is dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_grant_none_of_whose_rules_survive_the_ceiling_leaves_the_audience_unusable() {
+        use mediatore_claims::policy::EgressMode::Enforce;
+        let grant = grant_of(&[("GET", "/other/**")], &["git.example:443"], None);
+        let e = Enforced::new(&[("GET", "/repos/**")], grant, Enforce).await;
+        let uid = e.uid.clone();
+        let st: Shared = Arc::new(e.st);
+        let rec = stored(&st, under(&uid)).await;
+        let answer = gateway_answer(&st, rec.uid).await;
+        assert!(
+            answer.inject.is_empty(),
+            "never an empty (every path) rule list: {answer:?}"
+        );
+        let (status, body, _) = ask(&st, rec.uid, Some(&gateway_peer()), "internal-git").await;
+        assert_eq!(
+            (status, code(&body)),
+            (StatusCode::BAD_REQUEST, "unknown_audience")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_endpoint_the_grant_omits_is_not_routed_and_not_in_the_allowlist() {
+        use mediatore_claims::policy::EgressMode::Enforce;
+        let grant = grant_of(&[("GET", "/repos/**")], &["elsewhere.example:443"], None);
+        let e = Enforced::new(&[], grant, Enforce).await;
+        let uid = e.uid.clone();
+        let st: Shared = Arc::new(e.st);
+        let rec = stored(&st, under(&uid)).await;
+        let answer = gateway_answer(&st, rec.uid).await;
+        assert!(answer.inject.is_empty(), "{answer:?}");
+        assert!(answer.egress.is_empty(), "{answer:?}");
+    }
+
+    #[tokio::test]
+    async fn a_credential_lives_at_most_the_grants_ttl() {
+        use mediatore_claims::policy::EgressMode::Enforce;
+        let grant = grant_of(&[("GET", "/repos/**")], &["git.example:443"], Some(60));
+        let e = Enforced::new(&[], grant, Enforce).await;
+        let uid = e.uid.clone();
+        let st: Shared = Arc::new(e.st);
+        let rec = stored(&st, under(&uid)).await;
+        let (status, body, _) = ask(&st, rec.uid, Some(&gateway_peer()), "internal-git").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let c: GatewayCredential = serde_json::from_value(body).unwrap();
+        assert!(
+            c.expires_at <= Timestamp::now() + SignedDuration::from_secs(61),
+            "the 5 minute secret ttl is cut to the grant's 60 seconds: {}",
+            c.expires_at
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tightened_bundle_narrows_a_running_claims_routes_at_its_next_ask() {
+        use mediatore_claims::policy::EgressMode::Enforce;
+        let wide = grant_of(&[("GET", "/repos/**")], &["git.example:443"], None);
+        let e = Enforced::new(&[], wide, Enforce).await;
+        let uid = e.uid.clone();
+        e.tighten(
+            3,
+            grant_of(&[("GET", "/repos/team-a/**")], &["git.example:443"], None),
+        )
+        .await;
+        // The claim was created under version 2; the current bundle is version 3.
+        let st: Shared = Arc::new(e.st);
+        let rec = stored(&st, under(&uid)).await;
+        let answer = gateway_answer(&st, rec.uid).await;
+        assert_eq!(
+            answer.inject[0].rules,
+            vec![rule("GET", "/repos/team-a/**")]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_expired_or_missing_bundle_takes_the_audiences_away() {
+        use mediatore_claims::policy::EgressMode::Enforce;
+        let grant = grant_of(&[("GET", "/repos/**")], &["git.example:443"], None);
+        let e = Enforced::new(&[], grant, Enforce).await;
+        let uid = e.uid.clone();
+        // Expired: the sweep drops it for every reader at once.
+        let dropped = e
+            .reflector
+            .sweep(Timestamp::now() + SignedDuration::from_hours(2));
+        assert_eq!(dropped, 1);
+        let st: Shared = Arc::new(e.st);
+        let expired = stored(&st, under(&uid)).await;
+        assert_eq!(gateway_answer(&st, expired.uid).await.inject, vec![]);
+        let (status, body, _) = ask(&st, expired.uid, Some(&gateway_peer()), "internal-git").await;
+        assert_eq!(
+            (status, code(&body)),
+            (StatusCode::BAD_REQUEST, "unknown_audience")
+        );
+        // No policy on the claim: the same.
+        let none = stored(&st, claim(&["internal-git"], None)).await;
+        assert_eq!(gateway_answer(&st, none.uid).await.inject, vec![]);
+    }
+
+    #[tokio::test]
+    async fn shadow_serves_phase_1_whatever_the_bundle_says() {
+        use mediatore_claims::policy::EgressMode::Shadow;
+        let grant = grant_of(
+            &[("GET", "/other/**")],
+            &["elsewhere.example:443"],
+            Some(60),
+        );
+        let e = Enforced::new(&[("GET", "/repos/**")], grant, Shadow).await;
+        let st: Shared = Arc::new(e.st);
+        let rec = stored(&st, claim(&["internal-git"], None)).await; // no policy at all
+        let answer = gateway_answer(&st, rec.uid).await;
+        assert_eq!(answer.inject.len(), 1, "unchanged: {answer:?}");
+        let (status, ..) = ask(&st, rec.uid, Some(&gateway_peer()), "internal-git").await;
+        assert_eq!(status, StatusCode::OK);
     }
 
     // ----- what the guest and the gateway are told -----

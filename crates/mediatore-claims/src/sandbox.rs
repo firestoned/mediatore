@@ -644,19 +644,77 @@ pub fn mirror_status(
 }
 
 impl Watcher {
-    /// Why a spec is refused before any claim exists: an audience or an issuer mediatore
-    /// is not configured for (decision 7; fail closed), or a TTL the schema should have
-    /// caught.
-    fn refuse(&self, spec: &AgentSandboxSpec) -> Option<String> {
-        if spec.ttl_seconds == 0 {
-            return Some("ttlSeconds must be positive".into());
+    /// Whether `policy.audiences` is `enforce` and there are bundles to enforce (ADR-0053
+    /// decision 9).
+    fn enforcing_audiences(&self) -> bool {
+        self.cfg.audiences_mode == crate::policy::EgressMode::Enforce && self.bundles.is_some()
+    }
+
+    /// Under `enforce`, before every watched namespace was listed a policy may simply not have been
+    /// read yet: the sandbox is held, never failed for a policy it cannot yet be judged by (ADR-0053
+    /// decision 10). Its spec is immutable, so a failure here would be for good.
+    fn awaiting_bundles(&self, sandbox: &str, namespace: &str) -> bool {
+        let waiting =
+            self.enforcing_audiences() && !self.bundles.as_ref().is_some_and(|b| b.synced_all());
+        if waiting {
+            tracing::info!(%sandbox, %namespace, "policy bundles not all read yet; holding the sandbox (ADR-0053)");
         }
+        waiting
+    }
+
+    /// ADR-0053 decision 10, the declarative path of `POST /v1/claims`'s checks: under `enforce` the
+    /// sandbox names a policy that resolves to a verified, unexpired bundle granting every audience
+    /// it asks for, and its lifetime fits the lease. An audience the bundle does not grant reads as
+    /// one that is not configured, so a refusal tells the requester nothing about another policy.
+    fn refuse_under_policy(&self, spec: &AgentSandboxSpec, namespace: &str) -> Option<String> {
+        if !self.enforcing_audiences() {
+            return None;
+        }
+        let Some(policy) = spec.policy_ref.as_ref() else {
+            return Some(
+                "policyRef is required: name the policy this sandbox is under (ADR-0053)".into(),
+            );
+        };
+        let bundle = self
+            .bundles
+            .as_ref()?
+            .resolve(namespace, &policy.name, Timestamp::now());
+        let Some(bundle) = bundle else {
+            return Some(format!(
+                "policy {} has no verified bundle (ADR-0053)",
+                policy.name
+            ));
+        };
         if let Some(a) = spec
             .audiences
             .iter()
-            .find(|a| !self.cfg.audiences.iter().any(|c| &c.name == *a))
+            .find(|a| !self.cfg.grants(namespace, a, &bundle))
         {
             return Some(format!("audience {a} is not configured"));
+        }
+        if i64::from(spec.ttl_seconds) > i64::from(bundle.content.lease.max_duration_seconds) {
+            return Some("ttlSeconds is above the policy's lease (ADR-0053)".into());
+        }
+        None
+    }
+
+    /// Why a spec is refused before any claim exists: an audience or an issuer mediatore
+    /// is not configured for (decision 7; fail closed), or a TTL the schema should have
+    /// caught.
+    fn refuse(&self, spec: &AgentSandboxSpec, namespace: &str) -> Option<String> {
+        if spec.ttl_seconds == 0 {
+            return Some("ttlSeconds must be positive".into());
+        }
+        if let Some(a) = spec.audiences.iter().find(|a| {
+            !self.cfg.audiences.iter().any(|c| &c.name == *a)
+                || !self.cfg.scope_allows(a, namespace)
+        }) {
+            // An audience this namespace may not use reads exactly as one that does not exist
+            // (ADR-0053 decision 4).
+            return Some(format!("audience {a} is not configured"));
+        }
+        if let Some(reason) = self.refuse_under_policy(spec, namespace) {
+            return Some(reason);
         }
         if !self.cfg.issuers.iter().any(|i| i == &spec.subject.issuer) {
             return Some(format!("issuer {} is not configured", spec.subject.issuer));
@@ -828,10 +886,14 @@ impl Watcher {
         if current.claim_ref.is_some() {
             return Ok(None);
         }
-        let Some(reason) = self.refuse(&sb.spec) else {
+        let namespace = sb.namespace().unwrap_or_default();
+        if self.awaiting_bundles(&sb.name_any(), &namespace) {
+            return Ok(Some(Action::requeue(self.cfg.requeue)));
+        }
+        let Some(reason) = self.refuse(&sb.spec, &namespace) else {
             return Ok(None);
         };
-        tracing::warn!(sandbox = %sb.name_any(), namespace = %sb.namespace().unwrap_or_default(), %reason, "sandbox refused; no claim created");
+        tracing::warn!(sandbox = %sb.name_any(), %namespace, %reason, "sandbox refused; no claim created");
         self.drop_session(sb).await?;
         self.mirror(
             sb,
@@ -954,7 +1016,7 @@ impl Watcher {
             let version = bundle.as_ref().map(|b| b.meta.version);
             let findings = shadow::compare_with(
                 &sb.spec,
-                &self.cfg.audiences,
+                &self.cfg.audiences_in(&namespace),
                 bundle.as_deref(),
                 self.cfg.egress_mode,
             );
@@ -2515,6 +2577,83 @@ mod tests {
         assert_eq!(r.entries.names(), Vec::<String>::new());
     }
 
+    fn scoped_cfg(namespaces: &[&str]) -> WatcherConfig {
+        let rules = vec![mediatore_proto::EndpointRule {
+            method: "GET".into(),
+            path: "/a/**".into(),
+        }];
+        WatcherConfig {
+            scopes: [(
+                "api.example".to_owned(),
+                namespaces
+                    .iter()
+                    .map(|n| ((*n).to_owned(), rules.clone()))
+                    .collect(),
+            )]
+            .into_iter()
+            .collect(),
+            ..cfg()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_declarative_sandbox_naming_a_scoped_audience_in_an_unlisted_namespace_is_refused() {
+        // ADR-0053 decision 4: the declarative path (a sandbox created through the Kubernetes API) does not
+        // go through POST /v1/claims, so the reconciler refuses it too, as it refuses an unknown audience.
+        let r = rig(scoped_cfg(&["team-a"]));
+        let sb = sandbox(true, false); // namespace "sandboxes"
+        r.claims.put_sandbox(sb.clone());
+        r.watcher.reconcile_sandbox(&sb).await.unwrap();
+        let st = r
+            .claims
+            .sandbox("sandboxes", "sb-1")
+            .unwrap()
+            .status
+            .unwrap();
+        assert_eq!(st.phase, SandboxPhase::Failed);
+        assert_eq!(
+            st.reason.as_deref(),
+            Some("audience api.example is not configured"),
+            "the same words as an audience that does not exist"
+        );
+        assert!(r.claims.claim("sandboxes", "sb-1").is_none(), "no claim");
+    }
+
+    #[tokio::test]
+    async fn a_declarative_sandbox_in_a_listed_namespace_is_not_refused_for_its_audience() {
+        let r = rig(scoped_cfg(&["sandboxes", "team-a"]));
+        let sb = sandbox(true, false);
+        r.claims.put_sandbox(sb.clone());
+        r.watcher.reconcile_sandbox(&sb).await.unwrap();
+        let st = r.claims.sandbox("sandboxes", "sb-1").unwrap().status;
+        assert_ne!(
+            st.and_then(|s| s.reason).as_deref(),
+            Some("audience api.example is not configured")
+        );
+        assert!(
+            r.claims.claim("sandboxes", "sb-1").is_some(),
+            "a claim is created"
+        );
+    }
+
+    #[test]
+    fn the_shadow_comparison_reads_the_rules_of_the_sandboxs_namespace() {
+        let c = scoped_cfg(&["team-a"]);
+        let a = c.audiences_in("team-a");
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].rules[0].path, "/a/**");
+        assert!(
+            c.audiences_in("team-b").is_empty(),
+            "not usable there, so not compared"
+        );
+        let open = cfg();
+        assert_eq!(
+            open.audiences_in("anything").len(),
+            1,
+            "unscoped: unchanged"
+        );
+    }
+
     #[tokio::test]
     async fn an_audience_or_issuer_outside_the_configuration_fails_the_sandbox_without_a_claim() {
         for (mutate, want) in [
@@ -2713,7 +2852,7 @@ mod tests {
             let r = rig(cfg);
             let mut sb = sandbox(true, false);
             sb.spec.workload.image = image.into();
-            assert_eq!(r.watcher.refuse(&sb.spec), None, "{image}");
+            assert_eq!(r.watcher.refuse(&sb.spec, "sandboxes"), None, "{image}");
         }
     }
 
@@ -3497,5 +3636,159 @@ mod tests {
     fn an_empty_fake_knows_no_sandbox() {
         let fake = FakeClaims::default();
         assert!(fake.sandbox("x", "y").is_none());
+    }
+
+    fn enforcing_cfg() -> WatcherConfig {
+        WatcherConfig {
+            audiences_mode: crate::policy::EgressMode::Enforce,
+            ..cfg_with_git()
+        }
+    }
+
+    #[tokio::test]
+    async fn under_enforce_a_conformant_sandbox_is_admitted_and_its_record_carries_the_policy() {
+        let a = admitted_bundle(5).await;
+        let sb = a.sb.clone();
+        let namespace = sb.namespace().unwrap();
+        let r = rig_with(enforcing_cfg(), Some(a.cache()));
+        r.claims.put_sandbox(sb.clone());
+        r.watcher.reconcile_sandbox(&sb).await.unwrap();
+        let claim = r
+            .claims
+            .claim(&namespace, "sb-1")
+            .expect("a claim is created");
+        let rec = r
+            .store
+            .get_claim(claim_uid_of(&claim).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            rec.policy_uid.as_deref(),
+            Some(a.payload.content.policy.uid.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn under_enforce_a_sandbox_without_a_policy_ref_is_refused_without_a_claim() {
+        let a = admitted_bundle(5).await;
+        let mut sb = a.sb.clone();
+        sb.spec.policy_ref = None;
+        let namespace = sb.namespace().unwrap();
+        let r = rig_with(enforcing_cfg(), Some(a.cache()));
+        r.claims.put_sandbox(sb.clone());
+        r.watcher.reconcile_sandbox(&sb).await.unwrap();
+        let st = r
+            .claims
+            .sandbox(&namespace, "sb-1")
+            .unwrap()
+            .status
+            .unwrap();
+        assert_eq!(st.phase, SandboxPhase::Failed);
+        assert!(st.reason.unwrap().contains("policyRef is required"));
+        assert!(r.claims.claim(&namespace, "sb-1").is_none());
+    }
+
+    #[tokio::test]
+    async fn under_enforce_a_policy_with_no_verified_bundle_is_refused() {
+        let a = admitted_bundle(5).await;
+        let mut sb = a.sb.clone();
+        sb.spec.policy_ref = Some(LocalObjectReference {
+            name: "no-such-policy".into(),
+        });
+        let namespace = sb.namespace().unwrap();
+        let r = rig_with(enforcing_cfg(), Some(a.cache()));
+        r.claims.put_sandbox(sb.clone());
+        r.watcher.reconcile_sandbox(&sb).await.unwrap();
+        let st = r
+            .claims
+            .sandbox(&namespace, "sb-1")
+            .unwrap()
+            .status
+            .unwrap();
+        assert_eq!(st.phase, SandboxPhase::Failed);
+        assert!(st.reason.unwrap().contains("no verified bundle"));
+        assert!(r.claims.claim(&namespace, "sb-1").is_none());
+    }
+
+    #[tokio::test]
+    async fn before_the_bundles_are_read_an_enforcing_watcher_holds_the_sandbox_and_does_not_fail_it()
+     {
+        // An unsynced cache: the policy may simply not have been read yet. The spec is immutable, so a
+        // failure now would be for good.
+        let a = admitted_bundle(5).await;
+        let sb = a.sb.clone();
+        let namespace = sb.namespace().unwrap();
+        let unsynced = Arc::new(BundleCache::watching(vec![namespace.clone()]));
+        let r = rig_with(enforcing_cfg(), Some(unsynced));
+        r.claims.put_sandbox(sb.clone());
+        let action = r.watcher.reconcile_sandbox(&sb).await.unwrap();
+        assert_eq!(action, Action::requeue(Duration::from_millis(5)));
+        let phase = r
+            .claims
+            .sandbox(&namespace, "sb-1")
+            .and_then(|s| s.status)
+            .map(|s| s.phase);
+        assert_ne!(phase, Some(SandboxPhase::Failed));
+        assert!(
+            r.claims.claim(&namespace, "sb-1").is_none(),
+            "nothing is created yet"
+        );
+    }
+
+    #[tokio::test]
+    async fn under_enforce_an_audience_the_bundle_does_not_grant_reads_as_not_configured() {
+        let a = admitted_bundle(5).await;
+        let mut sb = a.sb.clone();
+        sb.spec.audiences = vec!["internal-git".into(), "api.example".into()];
+        let namespace = sb.namespace().unwrap();
+        let r = rig_with(enforcing_cfg(), Some(a.cache()));
+        r.claims.put_sandbox(sb.clone());
+        r.watcher.reconcile_sandbox(&sb).await.unwrap();
+        let st = r
+            .claims
+            .sandbox(&namespace, "sb-1")
+            .unwrap()
+            .status
+            .unwrap();
+        assert_eq!(st.phase, SandboxPhase::Failed);
+        assert_eq!(
+            st.reason.as_deref(),
+            Some("audience api.example is not configured")
+        );
+    }
+
+    #[tokio::test]
+    async fn under_enforce_a_ttl_above_the_policys_lease_is_refused() {
+        let a = admitted_bundle(5).await;
+        let lease = a.payload.content.lease.max_duration_seconds;
+        let mut sb = a.sb.clone();
+        sb.spec.ttl_seconds = lease + 1;
+        let namespace = sb.namespace().unwrap();
+        let r = rig_with(enforcing_cfg(), Some(a.cache()));
+        r.claims.put_sandbox(sb.clone());
+        r.watcher.reconcile_sandbox(&sb).await.unwrap();
+        let st = r
+            .claims
+            .sandbox(&namespace, "sb-1")
+            .unwrap()
+            .status
+            .unwrap();
+        assert_eq!(st.phase, SandboxPhase::Failed);
+        assert!(st.reason.unwrap().contains("above the policy's lease"));
+    }
+
+    #[tokio::test]
+    async fn without_enforce_none_of_this_applies_a_sandbox_with_no_policy_is_served_as_before() {
+        let a = admitted_bundle(5).await;
+        let mut sb = a.sb.clone();
+        sb.spec.policy_ref = None;
+        let namespace = sb.namespace().unwrap();
+        let r = rig_with(cfg_with_git(), Some(a.cache()));
+        r.claims.put_sandbox(sb.clone());
+        r.watcher.reconcile_sandbox(&sb).await.unwrap();
+        assert!(
+            r.claims.claim(&namespace, "sb-1").is_some(),
+            "shadow refuses nothing"
+        );
     }
 }

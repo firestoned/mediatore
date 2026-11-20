@@ -152,6 +152,19 @@ impl Harness {
     }
 
     async fn start_opts(namespaces: Namespaces, logs: Option<LogLimits>) -> Self {
+        Self::start_full(namespaces, logs, std::collections::BTreeMap::new(), None).await
+    }
+
+    /// `scopes`: the audiences scoped to namespaces, with their rules per namespace (ADR-0053).
+    async fn start_full(
+        namespaces: Namespaces,
+        logs: Option<LogLimits>,
+        scopes: std::collections::BTreeMap<
+            String,
+            std::collections::BTreeMap<String, Vec<mediatore_proto::EndpointRule>>,
+        >,
+        policy: Option<mediatore_api::PolicyEgress>,
+    ) -> Self {
         let idp = FakeIdp::start().await;
         let sts = Sts::new(
             "https://mediatore.test",
@@ -166,6 +179,7 @@ impl Harness {
             logs,
             log_limiter: Limiter::per_second(1),
             accept_plain_gateway_identity: false,
+            scopes,
             store: MemoryStore::shared(),
             spire: Arc::new(mediatore_spire::MemoryEntries::default()),
             naming: Naming {
@@ -204,7 +218,7 @@ impl Harness {
             .into_iter()
             .collect(),
             reachable_registries: None,
-            policy_egress: None,
+            policy_egress: policy,
             sandboxes: None,
             namespaces,
             sealer: Some(Arc::new(LocalKeySealer::new([9u8; 32]))),
@@ -1928,4 +1942,257 @@ async fn without_a_map_the_single_namespace_is_open_and_any_other_is_403() {
             .status(),
         200
     );
+}
+
+// ----- ADR-0053: an audience scoped to namespaces, over real listeners ---------------------------------------
+
+impl Harness {
+    async fn create_naming(
+        &self,
+        token: &str,
+        namespace: &str,
+        audience: &str,
+    ) -> reqwest::Response {
+        self.http
+            .post(format!("{}/v1/claims", self.user_url))
+            .bearer_auth(token)
+            .json(&serde_json::json!({
+                "pool_ref": "pool-a",
+                "ttl_seconds": 3600,
+                "audiences": [audience],
+                "namespace": namespace,
+                "workload": { "image": "registry.internal:5000/sandbox:latest" },
+            }))
+            .send()
+            .await
+            .expect("create")
+    }
+}
+
+#[tokio::test]
+async fn a_scoped_audience_is_usable_in_its_namespace_and_unknown_in_another() {
+    // `grafana.test` is scoped to team-a. A person who may claim in infra (the admin) names it there and is told
+    // exactly what they are told for an audience that does not exist: the response is no oracle for which
+    // audiences exist in another namespace.
+    let grants = std::collections::BTreeMap::from([(
+        AUDIENCE.to_owned(),
+        std::collections::BTreeMap::from([(
+            "team-a".to_owned(),
+            vec![mediatore_proto::EndpointRule {
+                method: "GET".into(),
+                path: "/api/**".into(),
+            }],
+        )]),
+    )]);
+    let h = Harness::start_full(tenant_map(), None, grants, None).await;
+    let tenant = h.login_in("octocat", &[TEAM_A_GROUP]);
+    let admin = h.login_in("hexley", &[ADMIN_GROUP]);
+
+    let ok = h.create_naming(&tenant, "team-a", AUDIENCE).await;
+    assert_eq!(ok.status(), 201, "the listed namespace");
+
+    let (status, hidden) = refusal(h.create_naming(&admin, "infra", AUDIENCE).await).await;
+    let (status_missing, missing) =
+        refusal(h.create_naming(&admin, "infra", "nonexistent.test").await).await;
+    assert_eq!((status, status_missing), (400, 400));
+    assert_eq!(hidden.error, "unknown_audience");
+    assert_eq!(hidden.error, missing.error, "one code for both");
+    assert_eq!(
+        hidden.detail.as_deref(),
+        Some(AUDIENCE),
+        "it echoes the caller's own value and nothing else"
+    );
+    assert_eq!(missing.detail.as_deref(), Some("nonexistent.test"));
+
+    // The namespace check of ADR-0046 comes first: a tenant outside infra's groups is refused there, not told
+    // anything about the audience.
+    let (status, body) = refusal(h.create_naming(&tenant, "infra", AUDIENCE).await).await;
+    assert_eq!((status, body.error.as_str()), (403, "forbidden"));
+
+    // An unscoped audience is unchanged: usable from either namespace.
+    let ok = h.create_naming(&admin, "infra", DELEGATED).await;
+    assert_ne!(
+        ok.status(),
+        403,
+        "an unscoped audience is not refused for its namespace"
+    );
+}
+
+// ----- ADR-0053 phase 2: the verified bundle as the source of the grants, over real listeners ----------------
+
+/// A reflector holding one bundle whose only grant is `grafana.test` (both endpoints, `GET /api/**`,
+/// no `ttlSeconds`), and the policy's name. `synced` says whether the namespace's first list is done.
+async fn bundle_policy(
+    audiences: mediatore_claims::policy::EgressMode,
+    synced: bool,
+) -> (mediatore_api::PolicyEgress, String) {
+    let now = jiff::Timestamp::now();
+    let mut content = mediatore_testkit::policy::fresh_bundle(now, 1)
+        .payload
+        .content;
+    let mut grant = content.audiences[0].clone();
+    grant.name = AUDIENCE.into();
+    grant.endpoints = vec!["api.home.example:443".into(), "192.0.2.10:8443".into()];
+    grant.rules = vec![mediatore_policy::types::EndpointRule {
+        method: "GET".into(),
+        path: "/api/**".into(),
+    }];
+    grant.ttl_seconds = None;
+    content.audiences = vec![grant];
+    let signed = mediatore_testkit::policy::signed_bundle(now, 2, content);
+    let policy = signed.payload.content.policy.clone();
+    let reflector = mediatore_claims::policy::BundleReflector::new(
+        MemoryStore::shared(),
+        signed.keys,
+        vec![policy.namespace.clone()],
+    );
+    if synced {
+        reflector.resynced(&policy.namespace, &std::collections::HashSet::new());
+    }
+    let cm = mediatore_testkit::policy::bundle_configmap(
+        &policy.namespace,
+        "agent-bundle",
+        &signed.envelope,
+    );
+    reflector.applied_at(&cm, now).await;
+    (
+        mediatore_api::PolicyEgress {
+            bundles: reflector.cache(),
+            mode: mediatore_claims::policy::EgressMode::Shadow,
+            audiences,
+        },
+        policy.name,
+    )
+}
+
+impl Harness {
+    async fn create_body(&self, token: &str, body: serde_json::Value) -> reqwest::Response {
+        self.http
+            .post(format!("{}/v1/claims", self.user_url))
+            .bearer_auth(token)
+            .json(&body)
+            .send()
+            .await
+            .expect("create")
+    }
+}
+
+fn claim_body(audience: &str, policy: Option<&str>, ttl: u32) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "pool_ref": "pool-a",
+        "ttl_seconds": ttl,
+        "audiences": [audience],
+        "workload": { "image": "registry.internal:5000/sandbox:latest" },
+    });
+    if let Some(p) = policy {
+        body["policy_ref"] = p.into();
+    }
+    body
+}
+
+#[tokio::test]
+async fn under_enforce_a_claim_needs_a_known_policy_that_grants_what_it_asks_for() {
+    use mediatore_claims::policy::EgressMode::Enforce;
+    let (pe, policy) = bundle_policy(Enforce, true).await;
+    let h = Harness::start_full(
+        Namespaces::Single("sandboxes".into()),
+        None,
+        std::collections::BTreeMap::new(),
+        Some(pe),
+    )
+    .await;
+    let token = h.login("octocat");
+
+    let (status, body) = refusal(
+        h.create_body(&token, claim_body(AUDIENCE, None, 3600))
+            .await,
+    )
+    .await;
+    assert_eq!((status, body.error.as_str()), (400, "policy_required"));
+
+    let (status, body) = refusal(
+        h.create_body(&token, claim_body(AUDIENCE, Some("no-such-policy"), 3600))
+            .await,
+    )
+    .await;
+    assert_eq!((status, body.error.as_str()), (400, "unknown_policy"));
+
+    // An audience the bundle does not grant is told exactly what a missing audience is told.
+    let (status, ungranted) = refusal(
+        h.create_body(&token, claim_body(DELEGATED, Some(&policy), 3600))
+            .await,
+    )
+    .await;
+    let (_, missing) = refusal(
+        h.create_body(&token, claim_body("nonexistent.test", Some(&policy), 3600))
+            .await,
+    )
+    .await;
+    assert_eq!(
+        (status, ungranted.error.as_str()),
+        (400, "unknown_audience")
+    );
+    assert_eq!(ungranted.error, missing.error, "one code for both");
+    assert_eq!(
+        ungranted.detail.as_deref(),
+        Some(DELEGATED),
+        "the caller's own value only"
+    );
+
+    // A lifetime above the bundle's lease.
+    let (status, body) = refusal(
+        h.create_body(&token, claim_body(AUDIENCE, Some(&policy), 10_000_000))
+            .await,
+    )
+    .await;
+    assert_eq!((status, body.error.as_str()), (400, "ttl_exceeds_policy"));
+
+    // And the one that fits.
+    let ok = h
+        .create_body(&token, claim_body(AUDIENCE, Some(&policy), 3600))
+        .await;
+    assert_eq!(
+        ok.status(),
+        201,
+        "a named policy that grants it, inside its lease"
+    );
+}
+
+#[tokio::test]
+async fn under_enforce_before_the_bundles_are_read_nothing_is_created() {
+    use mediatore_claims::policy::EgressMode::Enforce;
+    // "No bundle yet" is never read as "no policy": 503 and nothing is created.
+    let (pe, policy) = bundle_policy(Enforce, false).await;
+    let h = Harness::start_full(
+        Namespaces::Single("sandboxes".into()),
+        None,
+        std::collections::BTreeMap::new(),
+        Some(pe),
+    )
+    .await;
+    let token = h.login("octocat");
+    let (status, body) = refusal(
+        h.create_body(&token, claim_body(AUDIENCE, Some(&policy), 3600))
+            .await,
+    )
+    .await;
+    assert_eq!((status, body.error.as_str()), (503, "policy_not_synced"));
+}
+
+#[tokio::test]
+async fn in_shadow_a_claim_with_no_policy_is_created_as_before() {
+    use mediatore_claims::policy::EgressMode::Shadow;
+    let (pe, _) = bundle_policy(Shadow, true).await;
+    let h = Harness::start_full(
+        Namespaces::Single("sandboxes".into()),
+        None,
+        std::collections::BTreeMap::new(),
+        Some(pe),
+    )
+    .await;
+    let token = h.login("octocat");
+    let ok = h
+        .create_body(&token, claim_body(AUDIENCE, None, 3600))
+        .await;
+    assert_eq!(ok.status(), 201, "shadow refuses nothing");
 }

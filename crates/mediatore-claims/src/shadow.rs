@@ -239,8 +239,20 @@ pub fn compare_with(
 /// `false`, and the rule is reported.
 #[must_use]
 pub fn covers(bundle: &mediatore_policy::types::EndpointRule, broker: &EndpointRule) -> bool {
-    let method = bundle.method == "*" || bundle.method.eq_ignore_ascii_case(&broker.method);
-    method && glob_covers(&segments(&bundle.path), &segments(&broker.path))
+    admits(&bundle.method, &bundle.path, &broker.method, &broker.path)
+}
+
+/// Whether `ceiling` admits every request `rule` admits (ADR-0053 decision 3): the ceiling of an
+/// audience against a namespace's grant. The same sound-not-complete test as [`covers`]; a covering
+/// it cannot prove is `false`, so a grant is refused rather than guessed at.
+#[must_use]
+pub fn rule_covers(ceiling: &EndpointRule, rule: &EndpointRule) -> bool {
+    admits(&ceiling.method, &ceiling.path, &rule.method, &rule.path)
+}
+
+fn admits(c_method: &str, c_path: &str, r_method: &str, r_path: &str) -> bool {
+    let method = c_method == "*" || c_method.eq_ignore_ascii_case(r_method);
+    method && glob_covers(&segments(c_path), &segments(r_path))
 }
 
 /// A path split into its non-empty segments, as the proxy matches them.

@@ -122,6 +122,15 @@ nft list chain inet mediatore_host output | grep counter   # the drop counter ri
 Run the same as the workload's uid inside a claim, and from a neighbour towards the VM. `nft -c -f <file>` checks a ruleset without
 loading it, which is how to test a change on a live VM first.
 
+## Pitfalls found by testing it
+
+- **Sysctl file order.** The last file read wins, and a base image may ship its own (`99-*-hardening.conf` set `net.ipv4.ip_forward = 1`).
+  Name your file so it sorts after them (`999-...`), and read the value back on a booted VM.
+- **Directory modes in the cloud-config.** Write modes as decimal (`493` for `0755`). A `directories` entry spelled `0755` produced a mode
+  like `d-wxr----x` on a real VM: the `systemd-resolved` user could not read its drop-in directory, so `LLMNR=no` was never applied, and
+  an existing system directory was changed too. Do not list a directory that already exists, and check `ls -ld` after the first boot.
+- **A listener is a defect even when the input chain drops it.** Read `ss -tuln` on a booted VM, not the unit files.
+
 ## What this does not cover
 
 - **A hostile hypervisor or a port group that bridges VMs.** If the virtualisation layer lets sandboxes see each other's frames, rules
@@ -134,7 +143,7 @@ loading it, which is how to test a change on a live VM first.
 
 ## Status
 
-Proposed practice with a reference implementation. A dry run (`nft -c`) and a live load on one idle pool VM showed the gateway
+Proposed practice with a reference implementation. Run 1 on the infra pools of three clusters passed the neighbour matrix (unprivileged user and root: only the gateway's listed ports connect) and found the two pitfalls above; a repeat as the workload uid inside a real claim (one VM, cluster-01) reached the gateway's two claim ports only and no neighbour. Before that, a dry run (`nft -c`) and a live load on one idle pool VM showed the gateway
 reachable and every neighbour, other segment and public address blocked. Not yet proven: the layer-0 unit across a real boot, the
-ARP drop side (no neighbour sent a request in the test), and the rules as the workload uid. The full test is tracked in the
+ARP drop side (no neighbour sent a request in the test), and the rules as the workload uid on clusters 02 and 03. The full test is tracked in the
 `sc90-agent-sandbox` repository under `testing/network-lockdown/`.

@@ -96,6 +96,7 @@ impl Harness {
             logs: None,
             log_limiter: Limiter::per_second(1),
             accept_plain_gateway_identity: false,
+            scopes: std::collections::BTreeMap::new(),
             store: store.clone(),
             spire: entries.clone(),
             naming: Naming {
