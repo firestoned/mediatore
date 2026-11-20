@@ -140,6 +140,75 @@ pub fn direct_egress(bundle: &BundlePayload) -> DirectEgress {
     out
 }
 
+/// What a claim may do with one audience under a verified bundle (ADR-0053 decision 11): the
+/// bundle's grant bounded by the broker's own configuration, never wider than either.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectiveAudience {
+    /// What the proxy and the gateway admit at the audience's endpoints.
+    pub rules: Vec<mediatore_proto::EndpointRule>,
+    /// The endpoints the claim may reach for it: the audience's `egress` the grant lists.
+    pub egress: Vec<Endpoint>,
+    /// The longest a token or placed credential may live, when the grant sets `ttlSeconds`.
+    pub ttl_cap: Option<i64>,
+}
+
+/// ADR-0053 decision 11: the effective grant of `grant` for an audience the broker configures
+/// with `ceiling` (its top-level `rules`), `file_grant` (its `namespaces` entry for the claim's
+/// namespace, when it has one) and `egress`.
+///
+/// - **Rules.** A bundle rule is kept only if a ceiling rule covers it and, when there is a file
+///   grant, a rule of that covers it too. A grant with no rules reads as notaio reads it, every
+///   method and path, so the effective rules are the file grant or else the ceiling. A grant with
+///   rules **none of which survive** is `None`: the audience is unusable, because an empty list would
+///   mean every path.
+/// - **Endpoints.** `egress` intersected with the grant's `endpoints` (spelled `host:port`).
+/// - **Lifetime.** The grant's `ttlSeconds`.
+#[must_use]
+pub fn effective_grant(
+    ceiling: &[mediatore_proto::EndpointRule],
+    file_grant: Option<&[mediatore_proto::EndpointRule]>,
+    egress: &[Endpoint],
+    grant: &mediatore_policy::types::AudienceGrant,
+) -> Option<EffectiveAudience> {
+    use crate::shadow::rule_covers;
+    let inside = |rule: &mediatore_proto::EndpointRule| {
+        (ceiling.is_empty() || ceiling.iter().any(|c| rule_covers(c, rule)))
+            && file_grant.is_none_or(|f| f.iter().any(|g| rule_covers(g, rule)))
+    };
+    let rules = if grant.rules.is_empty() {
+        file_grant.unwrap_or(ceiling).to_vec()
+    } else {
+        let kept: Vec<_> = grant
+            .rules
+            .iter()
+            .map(|r| mediatore_proto::EndpointRule {
+                method: r.method.clone(),
+                path: r.path.clone(),
+            })
+            .filter(inside)
+            .collect();
+        if kept.is_empty() {
+            return None;
+        }
+        kept
+    };
+    let egress = egress
+        .iter()
+        .filter(|e| {
+            grant
+                .endpoints
+                .iter()
+                .any(|g| g.eq_ignore_ascii_case(&e.to_string()))
+        })
+        .cloned()
+        .collect();
+    Some(EffectiveAudience {
+        rules,
+        egress,
+        ttl_cap: grant.ttl_seconds.map(i64::from),
+    })
+}
+
 /// A policy, as `(namespace, name)`.
 pub type PolicyKey = (String, String);
 
@@ -993,5 +1062,106 @@ mod tests {
                 .is_none(),
             "an expired bundle is never handed out"
         );
+    }
+
+    // ----- ADR-0053 decision 11: the effective grant -----
+
+    fn rule(method: &str, path: &str) -> mediatore_proto::EndpointRule {
+        mediatore_proto::EndpointRule {
+            method: method.into(),
+            path: path.into(),
+        }
+    }
+
+    fn grant(
+        rules: &[(&str, &str)],
+        endpoints: &[&str],
+        ttl: Option<u32>,
+    ) -> mediatore_policy::types::AudienceGrant {
+        let mut g = mediatore_testkit::policy::fresh_bundle(Timestamp::now(), 1)
+            .payload
+            .content
+            .audiences[0]
+            .clone();
+        g.rules = rules
+            .iter()
+            .map(|(m, p)| mediatore_policy::types::EndpointRule {
+                method: (*m).into(),
+                path: (*p).into(),
+            })
+            .collect();
+        g.endpoints = endpoints.iter().map(|e| (*e).to_owned()).collect();
+        g.ttl_seconds = ttl;
+        g
+    }
+
+    fn ep(s: &str) -> Endpoint {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn a_bundle_rule_the_ceiling_does_not_cover_is_dropped() {
+        let ceiling = [rule("GET", "/a/**")];
+        let g = grant(&[("GET", "/a/x"), ("GET", "/b/y")], &["h.test:443"], None);
+        let e = effective_grant(&ceiling, None, &[ep("h.test:443")], &g).unwrap();
+        assert_eq!(e.rules, vec![rule("GET", "/a/x")]);
+    }
+
+    #[test]
+    fn a_grant_with_rules_none_of_which_survive_the_ceiling_makes_the_audience_unusable() {
+        // An empty list would mean every path; the broker never produces one from a non-empty grant.
+        let ceiling = [rule("GET", "/a/**")];
+        let g = grant(&[("GET", "/b/**"), ("POST", "/a/x")], &["h.test:443"], None);
+        assert!(effective_grant(&ceiling, None, &[ep("h.test:443")], &g).is_none());
+    }
+
+    #[test]
+    fn a_grant_with_no_rules_reads_as_the_ceiling() {
+        let ceiling = [rule("GET", "/a/**")];
+        let g = grant(&[], &["h.test:443"], None);
+        let e = effective_grant(&ceiling, None, &[ep("h.test:443")], &g).unwrap();
+        assert_eq!(e.rules, ceiling.to_vec());
+        // And with no ceiling either, the broker's own reading holds: every path.
+        let open = effective_grant(&[], None, &[ep("h.test:443")], &g).unwrap();
+        assert_eq!(open.rules, vec![]);
+    }
+
+    #[test]
+    fn a_file_grant_and_a_bundle_grant_intersect() {
+        let ceiling = [rule("*", "/**")];
+        let file = [rule("GET", "/a/**")];
+        let g = grant(&[("GET", "/a/x"), ("GET", "/b/y")], &["h.test:443"], None);
+        let e = effective_grant(&ceiling, Some(&file), &[ep("h.test:443")], &g).unwrap();
+        assert_eq!(
+            e.rules,
+            vec![rule("GET", "/a/x")],
+            "the file grant bounds the bundle's"
+        );
+        let none = grant(&[], &["h.test:443"], None);
+        let e = effective_grant(&ceiling, Some(&file), &[ep("h.test:443")], &none).unwrap();
+        assert_eq!(
+            e.rules,
+            file.to_vec(),
+            "a grant with no rules is the file grant"
+        );
+    }
+
+    #[test]
+    fn endpoints_are_the_intersection_and_the_lifetime_the_grants() {
+        let g = grant(&[("GET", "/**")], &["a.test:443"], Some(120));
+        let e = effective_grant(&[], None, &[ep("a.test:443"), ep("b.test:443")], &g).unwrap();
+        assert_eq!(
+            e.egress,
+            vec![ep("a.test:443")],
+            "an endpoint the grant omits is dropped"
+        );
+        assert_eq!(e.ttl_cap, Some(120));
+        let none = grant(&[("GET", "/**")], &[], None);
+        let e = effective_grant(&[], None, &[ep("a.test:443")], &none).unwrap();
+        assert!(
+            e.egress.is_empty(),
+            "a grant listing no endpoint admits none"
+        );
+        assert_eq!(e.ttl_cap, None);
     }
 }

@@ -68,6 +68,7 @@ The remaining fields describe the route the egress proxy and the gateway enforce
 | `refresh` | how the broker renews a delegated bearer from its refresh token; absent, the claim cannot outlast the bearer |
 | `credential` | `bearer` (default) or `basic` (a user name and secret, joined `user:secret`, placed as `Authorization: Basic`) |
 | `inject` | `proxy` (default) or `gateway` |
+| `namespaces` | optional: a map from a namespace to its `rules` (a grant). Absent, the audience is usable from every namespace; present, only from the namespaces listed, and the top-level `rules` is the ceiling every grant must sit inside (ADR-0053, [Multi-tenant authorization](../guides/multi-tenant-authorization.md#6-which-audiences-a-namespace-may-use-adr-0053)) |
 
 **Path rules are segment-wise globs.** A segment is exactly `*` (one segment), exactly `**` (zero or more), or a literal
 compared for equality. `*.git` is therefore a literal segment, not a pattern: the rule that admits

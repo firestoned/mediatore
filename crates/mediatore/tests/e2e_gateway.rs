@@ -84,6 +84,7 @@ fn state(idp: &FakeIdp, policy_egress: Option<mediatore_api::PolicyEgress>) -> A
         logs: None,
         log_limiter: Limiter::per_second(1),
         accept_plain_gateway_identity: false,
+        scopes: std::collections::BTreeMap::new(),
         store: MemoryStore::shared(),
         spire: Arc::new(mediatore_spire::MemoryEntries::default()),
         naming: Naming {
@@ -652,7 +653,11 @@ async fn enforcing_serves_a_policys_direct_egress_and_shadow_serves_none_of_it()
             &authorizer_svid(),
             CacheConfig::default(),
             None,
-            Some(mediatore_api::PolicyEgress { bundles, mode }),
+            Some(mediatore_api::PolicyEgress {
+                bundles,
+                mode,
+                audiences: mediatore_claims::policy::EgressMode::Shadow,
+            }),
         )
         .await;
         let (_, claim) = h.bound_claim().await;
@@ -749,6 +754,7 @@ async fn a_claim_with_no_policy_or_a_bundle_the_cache_does_not_hold_gets_the_aud
             Some(mediatore_api::PolicyEgress {
                 bundles,
                 mode: mediatore_claims::policy::EgressMode::Enforce,
+                audiences: mediatore_claims::policy::EgressMode::Shadow,
             }),
         )
         .await;

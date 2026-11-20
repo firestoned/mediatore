@@ -289,7 +289,50 @@ on an older broker, is the fail-open case: that broker drops the keys silently a
 no `required_group` gates nothing. To roll back to v0.2.10, remove the new keys first. v0.3.0 is
 the floor.
 
-## 6. Checking an access decision
+## 6. Which audiences a namespace may use (ADR-0053)
+
+Section 5 decides where a person may claim. This decides what a claim in that namespace may reach. By
+default an audience is usable from every namespace with its `rules`. Scope it with `namespaces`, each
+entry giving that namespace's rules (its **grant**), under the audience's own `rules`, which is then the
+platform's **ceiling**:
+
+```yaml
+audiences:
+  - name: artifactory
+    via: delegated
+    credential: basic
+    inject: gateway
+    max_ttl: 300
+    egress: ["artifactory.example.com:443"]
+    rules:                                   # the ceiling: no namespace may be granted more than this
+      - {method: GET,  path: "/artifactory/api/docker/**"}
+      - {method: HEAD, path: "/artifactory/api/docker/**"}
+    namespaces:
+      team-a:
+        rules:                               # team-a's grant
+          - {method: GET,  path: "/artifactory/api/docker/app-team-a-docker/v2/**"}
+          - {method: HEAD, path: "/artifactory/api/docker/app-team-a-docker/v2/**"}
+      team-b:
+        rules:
+          - {method: GET,  path: "/artifactory/api/docker/app-team-b-docker/v2/**"}
+```
+
+- A namespace not listed cannot claim the audience. Asking for it is `400 unknown_audience`, the same
+  answer as an audience that does not exist, so the response says nothing about what exists elsewhere.
+- The host, credential kind, lifetime and CA are the audience's and are written once.
+- A grant the ceiling does not cover, an empty grant, a namespace key that is not a namespace you let anyone
+  claim in (section 5), or two audiences on one host without disjoint namespaces, stops the broker at start with
+  a message naming the audience and the namespace. Without a top-level `rules` there is no ceiling.
+- An audience with no `namespaces` stays open to every namespace. With the namespace map set, the broker logs
+  each such audience by name at start (`audience unscoped`).
+- The configuration is read at start, so adding or removing a namespace is a rollout, and a bound claim loses a
+  removed audience at its next token or gateway ask.
+- **Grants from the policy bundle.** With `policy.audiences: enforce` the per-namespace grants come from the verified
+  `SandboxPolicy` bundle the claim names instead (phase 2 of ADR-0053, see [the policy bundle](the-policy-bundle.md)): the platform
+  writes a policy per tenant namespace, the tenant can read it and cannot change it, and nothing restarts. The audience's own
+  `rules` stay as the ceiling, and a `namespaces` entry, if you keep one, intersects with the bundle.
+
+## 7. Checking an access decision
 
 - **The token.** Decode `groups` as above and compare it, character for character, with the gate.
 - **The broker's answer.** A `403` with `not in a required group` (`not in required group ...`

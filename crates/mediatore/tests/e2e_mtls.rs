@@ -68,6 +68,7 @@ fn state(idp: &FakeIdp, dev_mode: bool) -> Arc<AppState> {
         logs: None,
         log_limiter: Limiter::per_second(1),
         accept_plain_gateway_identity: false,
+        scopes: std::collections::BTreeMap::new(),
         store: MemoryStore::shared(),
         spire: Arc::new(mediatore_spire::MemoryEntries::default()),
         naming: Naming {

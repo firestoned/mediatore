@@ -109,9 +109,37 @@ pub struct AudienceConfig {
     /// What the delegated credential is (ADR-0041): `bearer` (default) or `basic`.
     #[serde(default)]
     pub credential: Credential,
+    /// ADR-0053: the namespaces this audience is usable from, each with its own `rules`. Absent,
+    /// the audience is usable from every namespace with the top-level `rules` (unchanged).
+    /// Present, the map is the whole of where it is usable, and the top-level `rules` must be empty.
+    #[serde(default)]
+    pub namespaces: Option<std::collections::BTreeMap<String, NamespaceRules>>,
+}
+
+/// One namespace of an audience's `namespaces` (ADR-0053 decision 1). A typo in the field is a
+/// start error, never an entry with no rules.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NamespaceRules {
+    /// What the workload may ask of the audience from this namespace. Must be non-empty: an
+    /// empty list means every method and path (ADR-0053 decision 3).
+    #[serde(default)]
+    pub rules: Vec<EndpointRule>,
 }
 
 impl AudienceConfig {
+    /// The per-namespace rules of a scoped audience, `None` for an unscoped one (ADR-0053 decision 4). The one
+    /// place the broker reads them from: the API, the proxy's routes, the gateway's routes and the watcher
+    /// each hold this map and ask it for the claim's namespace; a namespace it lacks is not usable there.
+    #[must_use]
+    pub fn scoped_rules(&self) -> Option<std::collections::BTreeMap<String, Vec<EndpointRule>>> {
+        self.namespaces.as_ref().map(|m| {
+            m.iter()
+                .map(|(ns, n)| (ns.clone(), n.rules.clone()))
+                .collect()
+        })
+    }
+
     /// The request header this audience's credential goes in, lowercase: `secret_header` for
     /// `via: secret`, `header` for `via: delegated`, `authorization` (a bearer) otherwise.
     fn credential_header(&self) -> &str {
@@ -491,6 +519,11 @@ pub struct PolicySection {
     /// serves the union. Per broker deployment, so per environment.
     #[serde(default)]
     pub egress: mediatore_claims::policy::EgressMode,
+    /// Whether a claim must be under a verified bundle that grants what it asks for (ADR-0053
+    /// decisions 9 to 16): `shadow` (the default) logs each refusal `enforce` would make,
+    /// `enforce` refuses. Per broker deployment, so per environment.
+    #[serde(default)]
+    pub audiences: mediatore_claims::policy::EgressMode,
 }
 
 /// The wrapping key for refresh material (ADR-0012 decision 3): exactly one of the local
@@ -723,9 +756,10 @@ impl Config {
             for e in &a.egress {
                 if let Some(other) = owner.insert(e, &a.name)
                     && other != a.name
+                    && !self.audiences_may_share(other, &a.name)
                 {
                     anyhow::bail!(
-                        "egress endpoint {e} is declared by audiences {other:?} and {:?}: the egress proxy must choose one token per endpoint (ADR-0025)",
+                        "egress endpoint {e} is declared by audiences {other:?} and {:?}: the egress proxy must choose one token per endpoint (ADR-0025); two audiences may share one only when both are scoped by `namespaces` to disjoint sets and neither is `inject: gateway` (ADR-0053 decision 6)",
                         a.name
                     );
                 }
@@ -791,23 +825,98 @@ impl Config {
                 }
             }
             for r in &a.rules {
-                let method_ok = r.method == "*"
-                    || (!r.method.is_empty() && r.method.chars().all(|c| c.is_ascii_alphabetic()));
-                if !method_ok || !r.path.starts_with('/') {
+                Self::check_rule(&a.name, r)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// A rule is a method or `*` with an absolute path glob.
+    fn check_rule(audience: &str, r: &EndpointRule) -> anyhow::Result<()> {
+        let method_ok = r.method == "*"
+            || (!r.method.is_empty() && r.method.chars().all(|c| c.is_ascii_alphabetic()));
+        if !method_ok || !r.path.starts_with('/') {
+            anyhow::bail!(
+                "audience {audience:?}: rule {{ method: {:?}, path: {:?} }} needs an HTTP method or `*` and an absolute path glob",
+                r.method,
+                r.path
+            );
+        }
+        if let Err(e) = r.validate() {
+            anyhow::bail!(
+                "audience {audience:?}: rule {{ method: {:?}, path: {:?} }}: {e}",
+                r.method,
+                r.path
+            );
+        }
+        Ok(())
+    }
+
+    /// ADR-0053 decision 6: two audiences may declare one endpoint only when both are scoped to
+    /// disjoint namespaces, so a claim never has two for one endpoint. A gateway-placed audience
+    /// never shares: the registry-by-host map of ADR-0043 names one audience per host.
+    fn audiences_may_share(&self, a: &str, b: &str) -> bool {
+        let find = |n: &str| self.audiences.iter().find(|x| x.name == n);
+        let (Some(a), Some(b)) = (find(a), find(b)) else {
+            return false;
+        };
+        if a.inject == Inject::Gateway || b.inject == Inject::Gateway {
+            return false;
+        }
+        match (&a.namespaces, &b.namespaces) {
+            (Some(x), Some(y)) => x.keys().all(|k| !y.contains_key(k)),
+            _ => false,
+        }
+    }
+
+    /// ADR-0053 decisions 3 and 6, refused at start: the shape of every `namespaces`. The keys are
+    /// checked against the claimable namespaces of `sandboxes` (the map's keys, or the one namespace).
+    fn check_audience_scopes(&self) -> anyhow::Result<()> {
+        let claimable: Vec<String> = match &self.sandboxes.namespaces {
+            Some(m) => m.keys().cloned().collect(),
+            None => vec![self.sandboxes.single_namespace()],
+        };
+        for a in &self.audiences {
+            let Some(map) = &a.namespaces else { continue };
+            let name = &a.name;
+            if map.is_empty() {
+                anyhow::bail!(
+                    "audience {name:?}: `namespaces` is empty: list at least one namespace, or leave the key out for an audience usable from every namespace (ADR-0053 decision 3)"
+                );
+            }
+            for (ns, entry) in map {
+                if !mediatore_proto::is_dns_label(ns) {
                     anyhow::bail!(
-                        "audience {:?}: rule {{ method: {:?}, path: {:?} }} needs an HTTP method or `*` and an absolute path glob",
-                        a.name,
-                        r.method,
-                        r.path
+                        "audience {name:?}: namespaces key {ns:?} is not an RFC 1123 label (ADR-0053 decision 6)"
                     );
                 }
-                if let Err(e) = r.validate() {
+                if !claimable.contains(ns) {
                     anyhow::bail!(
-                        "audience {:?}: rule {{ method: {:?}, path: {:?} }}: {e}",
-                        a.name,
-                        r.method,
-                        r.path
+                        "audience {name:?}: namespaces key {ns:?} is not a namespace `sandboxes` lets anyone claim in: a typo, not a policy (ADR-0053 decision 6)"
                     );
+                }
+                if entry.rules.is_empty() {
+                    anyhow::bail!(
+                        "audience {name:?}: namespaces.{ns}.rules is empty: an empty list admits every method and path; write `{{method: \"*\", path: \"/**\"}}` to say so (ADR-0053 decision 3)"
+                    );
+                }
+                for r in &entry.rules {
+                    Self::check_rule(name, r)?;
+                    // The top-level `rules` is the platform's ceiling (ADR-0053 decision 3): a grant a
+                    // ceiling does not cover is refused, so a mistaken or hostile grant is bounded. An
+                    // empty ceiling is no ceiling, as an empty `rules` has always meant every path.
+                    if !a.rules.is_empty()
+                        && !a
+                            .rules
+                            .iter()
+                            .any(|c| mediatore_claims::shadow::rule_covers(c, r))
+                    {
+                        anyhow::bail!(
+                            "audience {name:?}: namespaces.{ns} rule {{ method: {:?}, path: {:?} }} is outside the audience's `rules`, its ceiling; widen the ceiling or narrow the grant (ADR-0053 decision 3)",
+                            r.method,
+                            r.path
+                        );
+                    }
                 }
             }
         }
@@ -895,7 +1004,7 @@ impl Config {
                     "audience {name:?}: egress names more than one upstream host; a gateway-placed audience has one upstream, and a credential is bound to the authority that needs it (ADR-0040 decision 1)"
                 );
             }
-            if a.rules.is_empty() {
+            if a.rules.is_empty() && a.namespaces.is_none() {
                 anyhow::bail!(
                     "audience {name:?}: `inject: gateway` needs `rules`; under proxy no rules means every method and path, and a placed credential does not get that default (ADR-0040 decision 1)"
                 );
@@ -1030,6 +1139,7 @@ impl Config {
             );
         }
         cfg.sandboxes.validate()?;
+        cfg.check_audience_scopes()?;
         if let Some(e) = cfg.spire.as_ref().map(|s| &s.entries) {
             if e.class_name.trim().is_empty() {
                 anyhow::bail!("spire.entries.class_name must not be empty");
@@ -1151,6 +1261,20 @@ impl Config {
             );
         } else {
             tracing::info!("workload output not stored: logs.enabled is false (ADR-0045)");
+        }
+        // ADR-0053 decision 7: a scoped audience says where it is usable; with the namespace map set, an
+        // unscoped one is called out once, by name only.
+        for a in &self.audiences {
+            match &a.namespaces {
+                Some(m) => {
+                    let names = m.keys().cloned().collect::<Vec<_>>().join(", ");
+                    tracing::info!(audience = %a.name, namespaces = %names, "audience scoped to namespaces");
+                }
+                None if self.sandboxes.namespaces.is_some() => {
+                    tracing::warn!(audience = %a.name, "audience unscoped: usable from every namespace");
+                }
+                None => {}
+            }
         }
         match self.namespaces() {
             Namespaces::Single(ns) => {
@@ -2222,6 +2346,28 @@ listen: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }
     }
 
     #[test]
+    fn the_policy_audiences_switch_defaults_to_shadow_and_is_independent_of_the_egress_switch() {
+        use mediatore_claims::policy::EgressMode;
+        let k = conformance_key();
+        let keys = format!("  trusted_keys: [{{ id: \"notaio:v1\", public_key: \"{k}\" }}]\n");
+        let default = with_policy(&format!("policy:\n{keys}"))
+            .unwrap()
+            .policy
+            .unwrap();
+        assert_eq!(default.audiences, EgressMode::Shadow);
+        let on = with_policy(&format!("policy:\n{keys}  audiences: enforce\n"))
+            .unwrap()
+            .policy
+            .unwrap();
+        assert_eq!(
+            (on.audiences, on.egress),
+            (EgressMode::Enforce, EgressMode::Shadow)
+        );
+        // Fail closed: a value the broker does not know is a refused start, not shadow.
+        assert!(with_policy(&format!("policy:\n{keys}  audiences: enforced\n")).is_err());
+    }
+
+    #[test]
     fn a_bad_policy_section_refuses_the_start() {
         let k = conformance_key();
         let key = format!("{{ id: \"notaio:v1\", public_key: \"{k}\" }}");
@@ -2881,8 +3027,13 @@ listen: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }
     }
 
     fn two_issuers(extra: &str) -> Config {
+        let dev = if extra.contains("audiences:") {
+            DEV.replace("audiences: []\n", "")
+        } else {
+            DEV.to_owned()
+        };
         Config::parse(&format!(
-            "{DEV}issuers:\n  - {{ url: \"https://dex.example.com\", backend: sts, client_id: m, required_groups: [\"example-org:APP_EXAMPLE_ADMIN\", APP_EXAMPLE_ADMIN] }}\n  - {{ url: \"https://accounts.example.com\", backend: sts, client_id: m, allow_any_authenticated: true }}\n  - {{ url: \"https://old.example.com\", backend: sts, client_id: m, required_group: LEGACY }}\n{extra}"
+            "{dev}issuers:\n  - {{ url: \"https://dex.example.com\", backend: sts, client_id: m, required_groups: [\"example-org:APP_EXAMPLE_ADMIN\", APP_EXAMPLE_ADMIN] }}\n  - {{ url: \"https://accounts.example.com\", backend: sts, client_id: m, allow_any_authenticated: true }}\n  - {{ url: \"https://old.example.com\", backend: sts, client_id: m, required_group: LEGACY }}\n{extra}"
         ).replace("issuers: []\n", ""))
         .unwrap()
     }
@@ -2933,6 +3084,32 @@ listen: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }
         for secret in ["eyJ", "Bearer", "client_secret", "refresh_token"] {
             assert!(!logs.contains(secret), "{secret} in {logs}");
         }
+    }
+
+    #[test]
+    fn startup_names_each_unscoped_audience_when_the_namespace_map_is_set() {
+        // ADR-0053 decision 7: names only, no rules and no host.
+        let map = "sandboxes:\n  namespaces:\n    team-a: { groups: [ga] }\n";
+        let two = "audiences:\n  - { name: open-one, via: none, egress: [\"open.example.test:443\"] }\n  - name: locked\n    via: none\n    egress: [\"locked.example.test:443\"]\n    namespaces:\n      team-a:\n        rules:\n          - { method: GET, path: \"/a/**\" }\n";
+        let logs = startup_log(&two_issuers(&format!("{map}{two}")));
+        let warn = logs
+            .lines()
+            .find(|l| l.contains("audience unscoped"))
+            .unwrap_or_else(|| panic!("an unscoped line in {logs}"));
+        assert!(
+            warn.contains("open-one") && !warn.contains("locked"),
+            "{warn}"
+        );
+        assert!(logs.contains("audience scoped to namespaces") && logs.contains("locked"));
+        assert!(
+            !logs.contains("/a/**") && !logs.contains("example.test"),
+            "{logs}"
+        );
+        // Without the map there is one namespace and nothing to say.
+        let logs = startup_log(&two_issuers(&format!(
+            "sandboxes: {{ namespace: team-a }}\n{two}"
+        )));
+        assert!(!logs.contains("audience unscoped"), "{logs}");
     }
 
     // ----- what ships still parses (ADR-0046 decision 17) -----------------------------------------------------
@@ -3093,5 +3270,209 @@ listen: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }
             skipped <= 1,
             "only the elided sketch is skipped, got {skipped}"
         );
+    }
+
+    // ADR-0053: an audience scoped to namespaces, each with its own rules.
+
+    const SCOPED_SANDBOXES: &str =
+        "sandboxes: { namespaces: { team-a: { groups: [ga] }, team-b: { groups: [gb] } } }\n";
+    const SCOPED_OK: &str = "  - name: repo\n    via: none\n    egress: [\"repo.example.test:443\"]\n    namespaces:\n      team-a:\n        rules:\n          - { method: GET, path: \"/a/**\" }\n      team-b:\n        rules:\n          - { method: GET, path: \"/b/**\" }\n";
+
+    fn scoped_cfg(audiences: &str) -> String {
+        format!("{INJECT_BASE}{SCOPED_SANDBOXES}audiences:\n{audiences}")
+    }
+
+    fn scoped_err(audiences: &str) -> String {
+        Config::parse(&scoped_cfg(audiences))
+            .unwrap_err()
+            .to_string()
+    }
+
+    #[test]
+    fn an_audience_without_namespaces_behaves_as_before() {
+        let cfg = Config::parse(&inject_cfg(INJECT_OK)).unwrap();
+        let a = &cfg.audiences[0];
+        assert!(a.namespaces.is_none());
+        assert!(
+            a.scoped_rules().is_none(),
+            "unscoped: usable from every namespace"
+        );
+        assert_eq!(a.rules.len(), 1);
+    }
+
+    #[test]
+    fn scoped_rules_hold_the_namespaces_own_rules_and_nothing_for_an_unlisted_one() {
+        let cfg = Config::parse(&scoped_cfg(SCOPED_OK)).unwrap();
+        let per = cfg.audiences[0].scoped_rules().expect("scoped");
+        assert_eq!(per["team-a"][0].path, "/a/**");
+        assert_eq!(per["team-b"][0].path, "/b/**");
+        assert!(!per.contains_key("team-c"), "unlisted is not usable");
+        assert!(!per.contains_key(""));
+    }
+
+    #[test]
+    fn top_level_rules_with_namespaces_are_the_ceiling_and_grants_inside_it_start() {
+        let ceiling = SCOPED_OK.replace(
+            "    namespaces:",
+            "    rules:\n      - { method: GET, path: \"/**\" }\n    namespaces:",
+        );
+        assert!(Config::parse(&scoped_cfg(&ceiling)).is_ok());
+        // `*` covers any method; a path glob covers what it matches.
+        let any = SCOPED_OK.replace(
+            "    namespaces:",
+            "    rules:\n      - { method: \"*\", path: \"/*/**\" }\n    namespaces:",
+        );
+        assert!(Config::parse(&scoped_cfg(&any)).is_ok());
+    }
+
+    #[test]
+    fn a_grant_outside_the_ceiling_refuses_to_start() {
+        // The grant's path is outside the ceiling.
+        let narrow = SCOPED_OK.replace(
+            "    namespaces:",
+            "    rules:\n      - { method: GET, path: \"/a/**\" }\n    namespaces:",
+        );
+        let err = scoped_err(&narrow);
+        assert!(
+            err.contains("namespaces.team-b") && err.contains("ceiling") && err.contains("/b/**"),
+            "{err}"
+        );
+        // The grant's method is outside the ceiling.
+        let method = SCOPED_OK.replace(
+            "    namespaces:",
+            "    rules:\n      - { method: HEAD, path: \"/**\" }\n    namespaces:",
+        );
+        assert!(scoped_err(&method).contains("ceiling"));
+        // A grant wider than the ceiling in the same namespace (`**` against `*`) is not provable.
+        let wider = "  - name: repo\n    via: none\n    egress: [\"repo.example.test:443\"]\n    rules:\n      - { method: GET, path: \"/a/*\" }\n    namespaces:\n      team-a:\n        rules:\n          - { method: GET, path: \"/a/**\" }\n";
+        assert!(scoped_err(wider).contains("ceiling"));
+    }
+
+    #[test]
+    fn with_no_top_level_rules_there_is_no_ceiling() {
+        // As an empty `rules` has always meant every path: a grant is then bounded only by itself.
+        assert!(Config::parse(&scoped_cfg(SCOPED_OK)).is_ok());
+    }
+
+    #[test]
+    fn an_empty_namespaces_map_refuses_to_start() {
+        let empty = "  - name: repo\n    via: none\n    egress: [\"repo.example.test:443\"]\n    namespaces: {}\n";
+        let err = scoped_err(empty);
+        assert!(err.contains("\"repo\"") && err.contains("empty"), "{err}");
+    }
+
+    #[test]
+    fn a_namespace_entry_with_no_rules_refuses_to_start() {
+        let none = SCOPED_OK.replace(
+            "        rules:\n          - { method: GET, path: \"/b/**\" }\n",
+            "        rules: []\n",
+        );
+        assert!(none != SCOPED_OK);
+        let err = scoped_err(&none);
+        assert!(
+            err.contains("namespaces.team-b.rules") && err.contains("every method"),
+            "{err}"
+        );
+        let missing = SCOPED_OK.replace(
+            "        rules:\n          - { method: GET, path: \"/b/**\" }\n",
+            "        {}\n",
+        );
+        assert!(scoped_err(&missing).contains("namespaces.team-b.rules"));
+    }
+
+    #[test]
+    fn a_misspelled_rules_key_in_a_namespace_refuses_to_start() {
+        let typo = SCOPED_OK.replace(
+            "        rules:\n          - { method: GET, path: \"/b/**\" }",
+            "        rule:\n          - { method: GET, path: \"/b/**\" }",
+        );
+        let err = scoped_err(&typo);
+        assert!(
+            err.contains("unknown field") && err.contains("rule"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_rule_under_a_namespace_gets_the_same_checks_as_a_top_level_one() {
+        let bad = SCOPED_OK.replace("/a/**", "a/**");
+        let err = scoped_err(&bad);
+        assert!(err.contains("absolute path"), "{err}");
+    }
+
+    #[test]
+    fn a_namespace_key_that_is_not_a_label_refuses_to_start() {
+        let bad = SCOPED_OK.replace("      team-a:", "      Team_A:");
+        let err = scoped_err(&bad);
+        assert!(err.contains("RFC 1123") && err.contains("Team_A"), "{err}");
+    }
+
+    #[test]
+    fn a_namespace_key_outside_sandboxes_namespaces_refuses_to_start() {
+        let outside = SCOPED_OK.replace("      team-a:", "      team-z:");
+        let err = scoped_err(&outside);
+        assert!(
+            err.contains("team-z") && err.contains("claim in") && err.contains("ADR-0053"),
+            "{err}"
+        );
+        // The single-namespace form: the key must be that namespace.
+        let single = format!(
+            "{INJECT_BASE}sandboxes: {{ namespace: team-a }}\naudiences:\n{}",
+            SCOPED_OK.replace("      team-b:", "      team-c:")
+        );
+        let err = Config::parse(&single).unwrap_err().to_string();
+        assert!(err.contains("team-c"), "{err}");
+        let ok = format!(
+            "{INJECT_BASE}sandboxes: {{ namespace: team-a }}\naudiences:\n  - name: repo\n    via: none\n    egress: [\"repo.example.test:443\"]\n    namespaces:\n      team-a:\n        rules:\n          - {{ method: GET, path: \"/a/**\" }}\n"
+        );
+        assert!(Config::parse(&ok).is_ok());
+    }
+
+    #[test]
+    fn scoped_audiences_sharing_an_endpoint_in_overlapping_namespaces_refuse_to_start() {
+        let second = "  - name: repo2\n    via: none\n    egress: [\"repo.example.test:443\"]\n    namespaces:\n      team-b:\n        rules:\n          - { method: GET, path: \"/b2/**\" }\n";
+        let err = scoped_err(&format!("{SCOPED_OK}{second}"));
+        assert!(
+            err.contains("repo.example.test:443") && err.contains("ADR-0053"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn scoped_audiences_sharing_a_host_in_disjoint_namespaces_start() {
+        let one = "  - name: repo-a\n    via: none\n    egress: [\"repo.example.test:443\"]\n    namespaces:\n      team-a:\n        rules:\n          - { method: GET, path: \"/a/**\" }\n";
+        let two = "  - name: repo-b\n    via: none\n    egress: [\"repo.example.test:443\"]\n    namespaces:\n      team-b:\n        rules:\n          - { method: GET, path: \"/b/**\" }\n";
+        assert!(Config::parse(&scoped_cfg(&format!("{one}{two}"))).is_ok());
+        // One of them unscoped: it is usable in team-a too, so the endpoint has two audiences there.
+        let open = "  - name: repo-open\n    via: none\n    egress: [\"repo.example.test:443\"]\n";
+        assert!(Config::parse(&scoped_cfg(&format!("{one}{open}"))).is_err());
+    }
+
+    #[test]
+    fn two_gateway_placed_audiences_never_share_a_host_even_in_disjoint_namespaces() {
+        let placed = |name: &str, ns: &str| {
+            format!(
+                "  - name: {name}\n    via: delegated\n    inject: gateway\n    max_ttl: 300\n    egress: [\"api.example.test:443\"]\n    namespaces:\n      {ns}:\n        rules:\n          - {{ method: GET, path: \"/{ns}/**\" }}\n"
+            )
+        };
+        let err = scoped_err(&format!(
+            "{}{}",
+            placed("p-a", "team-a"),
+            placed("p-b", "team-b")
+        ));
+        assert!(err.contains("api.example.test:443"), "{err}");
+    }
+
+    #[test]
+    fn a_scoped_gateway_placed_audience_needs_no_top_level_rules() {
+        let placed = "  - name: reg\n    via: delegated\n    credential: basic\n    inject: gateway\n    max_ttl: 300\n    egress: [\"reg.example.test:443\"]\n    namespaces:\n      team-a:\n        rules:\n          - { method: GET, path: \"/v2/team-a/**\" }\n";
+        let cfg = Config::parse(&scoped_cfg(placed)).unwrap();
+        assert_eq!(cfg.gateway_placed().len(), 1);
+        // The placed audience still needs rules: an entry without them is the start error of decision 3.
+        let empty = placed.replace(
+            "        rules:\n          - { method: GET, path: \"/v2/team-a/**\" }\n",
+            "        rules: []\n",
+        );
+        assert!(scoped_err(&empty).contains("namespaces.team-a.rules"));
     }
 }

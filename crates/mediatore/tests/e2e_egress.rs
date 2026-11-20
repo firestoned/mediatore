@@ -149,6 +149,7 @@ fn state(idp: &FakeIdp, upstream: &TlsUpstream, keyed_upstream: &TlsUpstream) ->
         logs: None,
         log_limiter: Limiter::per_second(1),
         accept_plain_gateway_identity: false,
+        scopes: std::collections::BTreeMap::new(),
         store: MemoryStore::shared(),
         spire: Arc::new(mediatore_spire::MemoryEntries::default()),
         naming: Naming {

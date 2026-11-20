@@ -13,6 +13,10 @@
 # the bundle's account. A change to the policy publishes a newer version the broker
 # admits; the earlier bundle delivered again is refused by the version floor, and still
 # refused after a broker restart, because the floor lives in the store with the claims.
+# Then ADR-0053 phase 2: the broker is restarted with `policy.audiences: enforce`, and a
+# sandbox with no policyRef, one naming a policy with no bundle, one asking for an audience
+# the bundle lacks and one asking for more than the policy's lease are each Failed with
+# their reason and get no claim, while a conformant one still gets its claim.
 #
 #   policy-e2e.sh <admin kubeconfig> <broker SA kubeconfig> <state dir>
 set -euo pipefail
@@ -231,4 +235,50 @@ for sb in sb-ok sb-gap sb-none sb-orphan; do
 done
 echo "still refused on ${BROKER_POD#pod/}: the floor came back from the store"
 
-say "PASS: ADR-0026 holds against a real cluster (notaio from its release signing with OpenBao, the bundle admitted and recorded, the comparison's verdicts and codes, a newer version followed, a replay refused by the floor across a restart, nothing refused on the bundle's account)"
+say "ADR-0053 phase 2: policy.audiences: enforce, the bundle decides what a sandbox may have"
+{
+  cat dev/kind/broker/mediatore.yaml
+  printf 'policy:\n  trusted_keys:\n    - { id: "%s", public_key: "%s" }\n  namespaces: [%s]\n  audiences: enforce\n' "$KEY_ID" "$PUBLIC_KEY" "$NS"
+} > "$DIR/mediatore-enforce.yaml"
+"${K[@]}" -n "$BROKER_NS" create configmap mediatore-config --from-file=mediatore.yaml="$DIR/mediatore-enforce.yaml" \
+  --dry-run=client -o yaml | "${K[@]}" apply -f - >/dev/null
+restart_broker
+wait_for "$TIMEOUT" "'policy bundle admitted' version=$V2 under enforce" log_has "policy bundle admitted" "version=$V2"
+log_has "policy.audiences" "mode=enforce" || fail "the broker did not log policy.audiences mode=enforce"
+echo "broker restarted on ${BROKER_POD#pod/} with policy.audiences: enforce"
+
+manifest_ttl() { manifest "$1" "$2" "$3" | sed 's/ttlSeconds: 600/ttlSeconds: 2592000/'; }
+manifest sb-e-ok '["internal-git"]' "$POLICY" | "${KSA[@]}" create -f - >/dev/null
+manifest sb-e-none '["internal-git"]' "" | "${KSA[@]}" create -f - >/dev/null
+manifest sb-e-orphan '["internal-git"]' unsigned | "${KSA[@]}" create -f - >/dev/null
+manifest sb-e-gap '["internal-git", "e2e"]' "$POLICY" | "${KSA[@]}" create -f - >/dev/null
+manifest_ttl sb-e-ttl '["internal-git"]' "$POLICY" | "${KSA[@]}" create -f - >/dev/null
+has_phase() { [ -n "$(field "$1" '.status.phase')" ]; }
+has_verdict_claim_sb_e_ok() { "${K[@]}" -n "$NS" get virtualmachineclaim sb-e-ok >/dev/null 2>&1; }
+for sb in sb-e-ok sb-e-none sb-e-orphan sb-e-gap sb-e-ttl; do
+  wait_for "$TIMEOUT" "$sb with a phase" has_phase "$sb"
+done
+wait_for "$TIMEOUT" "sb-e-ok with a claim" has_verdict_claim_sb_e_ok
+is_failed() { [ "$(field "$1" '.status.phase')" = Failed ]; }
+refused() { # <sandbox> <reason substring>
+  local reason phase
+  wait_for "$TIMEOUT" "$1 Failed" is_failed "$1"
+  reason=$(field "$1" '.status.reason'); phase=$(field "$1" '.status.phase')
+  echo "$reason" | grep -qF "$2" || fail "$1: expected '$2' in the reason, got '$phase: $reason'"
+  "${K[@]}" -n "$NS" get virtualmachineclaim "$1" >/dev/null 2>&1 && fail "$1 was refused and still has a claim"
+  echo "$1: $reason (no claim)"
+}
+refused sb-e-none "policyRef is required"
+refused sb-e-orphan "no verified bundle"
+refused sb-e-gap "audience e2e is not configured"
+refused sb-e-ttl "above the policy's lease"
+"${K[@]}" -n "$NS" get virtualmachineclaim sb-e-ok >/dev/null 2>&1 || fail "sb-e-ok is conformant and was refused, or never got its claim"
+[ "$(field sb-e-ok '.status.phase')" != Failed ] || fail "sb-e-ok failed: $(field sb-e-ok '.status.reason')"
+wait_for "$TIMEOUT" "'claim refused' or the record of sb-e-ok" log_has "record created" "bundle_version=Some($V2)"
+echo "enforce: four refusals with their reasons and no claim, the conformant sandbox admitted under v$V2"
+for sb in sb-ok sb-gap sb-none sb-orphan; do
+  "${K[@]}" -n "$NS" get virtualmachineclaim "$sb" >/dev/null 2>&1 || fail "$sb, created before enforce, lost its claim"
+done
+echo "the four claims made before enforce are untouched: a refusal is only before a claim exists"
+
+say "PASS: ADR-0026 and ADR-0053 phase 2 hold against a real cluster (notaio from its release signing with OpenBao, the bundle admitted and recorded, the comparison's verdicts and codes, a newer version followed, a replay refused by the floor across a restart, nothing refused on the bundle's account)"

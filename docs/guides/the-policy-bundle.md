@@ -80,6 +80,8 @@ policy:
   trusted_keys:
     - { id: "notaio:v1", public_key: "<base64 Ed25519 public key>" }
   namespaces: [sandboxes]        # default: sandboxes.namespace (no default once sandboxes.namespaces is set)
+  egress: shadow                 # ADR-0030: a bundle's direct egress at the gateway: shadow | enforce
+  audiences: shadow              # ADR-0053: the bundle as the source of a claim's audiences: shadow | enforce
 ```
 
 During a key rotation list the old and the new version side by side until every bundle
@@ -204,9 +206,33 @@ end to end in kind: notaio from its release signing with OpenBao, the bundle adm
 recorded, four sandboxes with their verdicts and their claims, a newer version followed,
 the earlier one replayed and refused before and after a broker restart.
 
+## Enforcing a claim's audiences (`policy.audiences`)
+
+Shadow mode is the default and changes nothing. With `policy.audiences: enforce` (ADR-0053 decisions 9 to 16) the verified bundle
+of the sandbox's policy decides what a claim may use:
+
+- the claim must name a policy (`policy_ref`, `--policy`): `400 policy_required`, and a declarative `AgentSandbox` without one fails;
+- the policy must resolve to a verified, unexpired bundle: `400 unknown_policy`. Until every watched namespace has been listed once the
+  answer is `503 policy_not_synced` and nothing is created, and a declarative sandbox is held rather than failed;
+- every audience must be one the bundle grants, else `400 unknown_audience`, the same answer as an audience that does not exist;
+- `ttl_seconds` must fit the bundle's `lease.maxDurationSeconds`: `400 ttl_exceeds_policy`.
+
+What the claim then gets is the bundle's grant **bounded by the broker's own configuration**, never wider than either: a bundle rule is
+kept only if the audience's own `rules` in `mediatore.yaml` (its ceiling) cover it, and a grant with no rules reads as the ceiling; a grant
+whose rules all fall outside the ceiling makes the audience unusable (never an empty, every-path list); the audience's endpoints are those
+the grant lists; and a credential lives at most the grant's `ttlSeconds`. The proxy's routes, the gateway's routes, the tunnel allowlist and
+every token or credential read the **current** bundle at each ask, so a policy that tightens narrows running claims on their next ask, and a
+bundle that is missing, expired or unverified takes the audiences away (fail closed). A claim created before `enforce`, with no recorded
+policy, loses its audiences the same way.
+
+Roll it out as ADR-0030's egress was: `shadow` everywhere, read the `P001` to `P005`, `P010` and `P011` lines and conditions for a week,
+make sure no live claim lacks a policy, then `enforce` in dev and each tier in turn. Setting `shadow` again restores today's behaviour on the
+next ask. The cost is a dependency: under `enforce` a notaio outage longer than the bundle lifetime (15 minutes by default), or a broker clock
+ahead of notaio's by more than the refresh margin, takes the audiences away from every claim under a policy.
+
 ## What comes next
 
-The enforcing step makes `spec.policyRef` required, turns the codes into refusals at the
-claim and at every mint, decides who may name which policy, and removes `egress` and
-`rules` from the broker's configuration in favour of the bundle. Until then, the
-condition is the list of what would break.
+`policy.audiences` enforces a claim's audiences, rules, endpoints and lifetimes (above). Still shadow-only: eligibility by group from the
+bundle, a default policy per namespace applied without being named, and removing `egress` and `rules` from the broker's configuration (the
+audience's `rules` stay as the ceiling for now). Until `policy.audiences` is `enforce` in your environment, the condition on the sandbox is the
+list of what would break.

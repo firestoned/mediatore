@@ -163,14 +163,10 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
         validator: validator(&cfg).await?,
         sts,
         audiences: cfg.audiences.iter().map(|a| a.name.clone()).collect(),
-        obo_audiences: cfg
-            .audiences
-            .iter()
-            .filter(|a| a.via == Backend::EntraObo)
-            .map(|a| a.name.clone())
-            .collect(),
+        obo_audiences: obo_audiences(&cfg),
         egress: per_audience(&cfg, |a| a.egress.clone()),
         rules: per_audience(&cfg, |a| a.rules.clone()),
+        scopes: audience_scopes(&cfg),
         cas: audience_cas(&cfg)?,
         no_credential: no_credential_audiences(&cfg),
         secrets: audience_secrets(&cfg)?,
@@ -241,9 +237,11 @@ fn policy_egress(
     // Named at start so an operator reads the mode off the log (the homelab rollout of
     // 2026-11-08 had to infer it from the start succeeding).
     tracing::info!(mode = %policy.egress, namespaces = ?policy.namespaces, "policy.egress: a bundle's direct egress is served under enforce, logged under shadow (ADR-0030)");
+    tracing::info!(mode = %policy.audiences, "policy.audiences: a claim must be under a verified bundle that grants what it asks for under enforce, each refusal logged under shadow (ADR-0053)");
     Some(mediatore_api::PolicyEgress {
         bundles: reflector.cache(),
         mode: policy.egress,
+        audiences: policy.audiences,
     })
 }
 
@@ -312,6 +310,7 @@ async fn claim_watcher(
                     rules: a.rules.clone(),
                 })
                 .collect(),
+            scopes: audience_scopes(cfg),
             issuers: cfg.issuers.iter().map(|i| i.url.clone()).collect(),
             reachable_registries: cfg.reachable_registries(),
             placed_registries: cfg.placed_registries(),
@@ -319,6 +318,7 @@ async fn claim_watcher(
             logs_enabled: cfg.logs.enabled,
             logs_retention: cfg.log_retention(),
             egress_mode: cfg.policy.as_ref().map(|p| p.egress).unwrap_or_default(),
+            audiences_mode: cfg.policy.as_ref().map(|p| p.audiences).unwrap_or_default(),
             delegated_audiences: cfg
                 .audiences
                 .iter()
@@ -415,6 +415,28 @@ fn store(
 }
 
 /// One value per audience, by name.
+/// The audiences served by Entra On-Behalf-Of (ADR-0016).
+fn obo_audiences(cfg: &Config) -> Vec<String> {
+    cfg.audiences
+        .iter()
+        .filter(|a| a.via == Backend::EntraObo)
+        .map(|a| a.name.clone())
+        .collect()
+}
+
+/// ADR-0053: the rules of each scoped audience per namespace; an unscoped audience is absent.
+fn audience_scopes(
+    cfg: &Config,
+) -> std::collections::BTreeMap<
+    String,
+    std::collections::BTreeMap<String, Vec<mediatore_proto::EndpointRule>>,
+> {
+    cfg.audiences
+        .iter()
+        .filter_map(|a| a.scoped_rules().map(|m| (a.name.clone(), m)))
+        .collect()
+}
+
 fn per_audience<T>(
     cfg: &Config,
     f: impl Fn(&config::AudienceConfig) -> T,
