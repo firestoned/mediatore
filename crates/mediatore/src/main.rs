@@ -154,7 +154,8 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
         // A workload's output (ADR-0045 decision 11): the ring's cap when `logs.enabled`, else
         // `None` and both routes fail closed with `501`.
         logs: cfg.log_limits(),
-        log_limiter: mediatore_api::Limiter::per_second(1),
+        log_limiter: mediatore_api::Limiter::per_second(2),
+        log_wakes: mediatore_api::LogWakes::default(),
         // The transition switch of ADR-0053 decision 7: off unless the config says otherwise.
         accept_plain_gateway_identity: cfg.accept_plain_gateway_identity,
         store,

@@ -4259,6 +4259,7 @@ mod tests {
             stream: mediatore_proto::LogStream::Stdout,
             ts: Timestamp::from_second(1_700_000_000 + i64::try_from(seq).unwrap()).unwrap(),
             text: text.into(),
+            partial: false,
         }
     }
 
@@ -5086,6 +5087,38 @@ mod tests {
         let chunk = store.read_logs(claim, None).await.unwrap();
         assert_eq!(seqs(&chunk.entries), vec![1, 2, 3]);
         assert!(matches!(&chunk.entries[0], LogEntry::Record(r) if r.text == PRINTED));
+    }
+
+    /// ADR-0045 decision 9, amended 2026-11-20: the mark of a line that goes on is part of
+    /// the sealed record, so it reads back as it was written, whole and from a cursor.
+    #[tokio::test]
+    async fn a_partial_record_keeps_its_mark_through_the_sealed_ring() {
+        let (state, claim) = fake::seed(false);
+        let store = fake::store(&state);
+        let rec = store.get_claim(claim).await.unwrap();
+        let limits = LogLimits {
+            max_bytes: mediatore_proto::DEFAULT_LOG_MAX_BYTES,
+        };
+        let mut pieces = log_batch(1, 3, "piece");
+        pieces.records[0].partial = true;
+        pieces.records[1].partial = true;
+        store.append_logs(&rec, &pieces, &limits).await.unwrap();
+        let marks = |entries: &[LogEntry]| -> Vec<bool> {
+            entries
+                .iter()
+                .filter_map(|e| match e {
+                    LogEntry::Record(r) => Some(r.partial),
+                    LogEntry::Gap(_) => None,
+                })
+                .collect()
+        };
+        let chunk = store.read_logs(claim, None).await.unwrap();
+        assert_eq!(seqs(&chunk.entries), vec![1, 2, 3]);
+        assert_eq!(marks(&chunk.entries), vec![true, true, false]);
+        let chunk = store.read_logs(claim, Some(1)).await.unwrap();
+        assert_eq!(marks(&chunk.entries), vec![true, false]);
+        let chunk = store.read_logs_tail(claim, None, 1).await.unwrap();
+        assert_eq!(marks(&chunk.entries), vec![false]);
     }
 
     #[tokio::test]
