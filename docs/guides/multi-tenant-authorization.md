@@ -159,11 +159,16 @@ path of [section 5](#5-groups-per-namespace-v030) comes on top of this):
    `agentsandboxes`, and read-only on `virtualmachinepools` and `virtualmachineclaims`. A team
    that can create a `VirtualMachineClaim` by hand takes a pool VM with no broker identity, no
    policy and no egress, so it should not be able to.
-4. **Policies in one platform namespace.** Keep `SandboxPolicy`, `ExposureCeiling` and the
-   published bundles in the namespace the broker lists under `policy.namespaces`. A sandbox in any
-   namespace names its policy by `policyRef` and is resolved from its own namespace first, then
-   from those. Teams change policy by pull request, never in the cluster. Prefix policy names per
-   team, because a name is global across the policy namespaces.
+4. **Say where each namespace's policies are.** A sandbox names its policy by `policyRef`, and the
+   broker looks the name up in the namespaces that sandbox's namespace draws from: its own alone,
+   unless `policy.sources` lists others for it
+   ([the policy bundle](the-policy-bundle.md#which-policies-a-namespace-may-name),
+   [ADR-0054](../adr/0054-which-policies-a-namespace-may-name.md)). To keep `SandboxPolicy`,
+   `ExposureCeiling` and the published bundles in one platform namespace, list that namespace under
+   `policy.namespaces` and give each tenant namespace a `policy.sources` entry naming it. Under
+   `policy.egress: enforce` every tenant that draws from a namespace may name every policy in it, so
+   a tenant whose policies must not be used by another gets a policy namespace of its own. Teams
+   change policy by pull request, never in the cluster.
 5. **Create the sandbox in the team's namespace** with `kubectl apply`. With one claim namespace,
    `POST /v1/claims` and the CLI create sandboxes in `sandboxes.namespace` only.
 
@@ -215,8 +220,10 @@ twice: the gate cannot say "this group may claim here". The decision:
   access to other tenants' sandboxes through the API.
 - **Pool and policy stay same-namespace, and policy stays in one namespace.** A tenant namespace
   still needs its own pool and its own `Provider` ([section 4](#4-onboarding-a-tenant-namespace-with-one-claim-namespace)).
-  There is one global policy namespace: the map does not widen `policy.namespaces`, and no
-  per-tenant policy `Role` is added. **With the map set, an empty `policy.namespaces` is a start
+  The map does not widen `policy.namespaces`, and no per-tenant policy `Role` is added by it. Which
+  policy namespaces a tenant's sandboxes draw from is `policy.sources`, its own namespace alone when
+  nothing is written ([ADR-0054](../adr/0054-which-policies-a-namespace-may-name.md)); a build
+  before that ADR looked in every listed policy namespace. **With the map set, an empty `policy.namespaces` is a start
   error** telling you to list the policy namespaces: it no longer defaults to the claims' namespace,
   because there is none. Without the map the old default stands.
 - **The declarative path is not governed by the map.** A person with `create agentsandboxes` in a

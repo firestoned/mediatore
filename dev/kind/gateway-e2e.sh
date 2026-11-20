@@ -60,9 +60,10 @@ DESTINATION=$DEST_HOST:8443
 # ADR-0030: the destination's second port, a policy's direct egress entry the gateway can
 # enforce exactly; and one it cannot (rules), never served.
 DIRECT=$DEST_HOST:8081
-# ADR-0054: a second watched policy namespace, holding nothing, that $NS is remapped to
-# draw from so the claim's bundle falls outside its sources.
-NSX=mediatore-e2e-gateway-policies
+# ADR-0054 decision 6: a second sandbox namespace beside $NS, holding a sandbox that names
+# $NS's policy; mapped to draw from $NS, then unmapped, so the two claims are judged side by
+# side. Only the AgentSandbox and its claim live there; the probe pods stay in $NS.
+NSB=mediatore-e2e-gateway-b
 RULED=only-some.$NS.svc.cluster.local:443
 POLICY=e2e-gateway
 BUNDLE_CM=$POLICY-bundle
@@ -101,7 +102,7 @@ verdict()     { sandbox "$1" | jq -r '.status.conditions[]? | select(.type == "P
 verdict_has() { verdict sb-gw | grep -F "$1" | grep -qF "${2:-}"; }
 bundle_version() { "${K[@]}" -n "$NS" get configmap "$BUNDLE_CM" -o jsonpath="{.metadata.annotations.$VERSION_ANN}" 2>/dev/null || true; }
 
-PROBES=(probe-claim probe-node probe-enforce probe-withdrawn probe-warm probe-outage-1 probe-outage-2 probe-released)
+PROBES=(probe-claim probe-node probe-enforce probe-b-mapped probe-b-unmapped probe-a-kept probe-warm probe-outage-1 probe-outage-2 probe-released)
 
 dump() {
   printf '\n--- broker (last 40 lines)\n'; broker_logs | tail -40
@@ -124,9 +125,10 @@ FILES=$(mktemp -d)
 cleanup() {
   rm -rf "$FILES"
   "${K[@]}" -n "$NS" delete agentsandbox --all --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  "${K[@]}" -n "$NSB" delete agentsandbox --all --ignore-not-found --wait=false >/dev/null 2>&1 || true
   "${K[@]}" -n "$NS" delete pod node probe-listener "${PROBES[@]}" --ignore-not-found --wait=false >/dev/null 2>&1 || true
   "${K[@]}" -n "$NS" delete configmap forward-files --ignore-not-found >/dev/null 2>&1 || true
-  "${K[@]}" delete clusterspiffeid mediatore-e2e-gateway-node mediatore-e2e-gateway-claim mediatore-e2e-gateway-listener-probe --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  "${K[@]}" delete clusterspiffeid mediatore-e2e-gateway-node mediatore-e2e-gateway-claim mediatore-e2e-gateway-claim-b mediatore-e2e-gateway-listener-probe --ignore-not-found --wait=false >/dev/null 2>&1 || true
   "${K[@]}" delete clusterstaticentries -l "$ENTRY_SELECTOR" --ignore-not-found --wait=false >/dev/null 2>&1 || true
   "${K[@]}" -n "$BROKER_NS" scale deploy/mediatore --replicas=1 >/dev/null 2>&1 || true
 }
@@ -135,7 +137,7 @@ cleanup() {
 policy_teardown() {
   [ -n "$POLICY_STATE" ] || return 0
   "${K[@]}" -n "$NS" delete sandboxpolicy "$POLICY" exposureceiling "$POLICY" configmap "$BUNDLE_CM" --ignore-not-found --wait=false >/dev/null 2>&1 || true
-  "${K[@]}" delete namespace "$NSX" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  "${K[@]}" delete namespace "$NSB" --ignore-not-found --wait=false >/dev/null 2>&1 || true
   "${K[@]}" apply -k dev/kind/broker >/dev/null 2>&1 || true
   "${K[@]}" -n "$BROKER_NS" rollout restart deploy/mediatore >/dev/null 2>&1 || true
   "${K[@]}" -n "$BROKER_NS" rollout status deploy/mediatore --timeout=120s >/dev/null 2>&1 || true
@@ -165,7 +167,8 @@ wait_for_end() {
   done
   fail "$pod: still running after ${TIMEOUT}s"
 }
-# A sandbox-shaped pod with role label <role>: the real egress proxy as a sidecar (the
+# A sandbox-shaped pod with role label <role> (`claim`, `claim-b` or `node`; the part before
+# the dash is the SVID kind it must start on): the real egress proxy as a sidecar (the
 # claim SVID through the CSI volume, the routes, the gateways and the phantom from the
 # ConfigMap, its forwarder dialling the gateway) and the workload beside it with no socket,
 # driving the proxy through the checks given. <credential> is `phantom` to present the
@@ -250,8 +253,8 @@ YAML
   pod_logs "$name" | grep -F "probe " || true
   # The identity first: a proxy on the wrong SVID fails every check for a reason that is
   # not the one under test (dev/kind/spire/fallback-patch.yaml).
-  proxy_logs "$name" | grep -F "SVID from the Workload API" | grep -qF "spiffe_id=spiffe://$TD/banlieue/$role/" \
-    || fail "$name: the proxy did not start on a $role SVID ($(proxy_logs "$name" | grep -F "SVID from the Workload API" | grep -o 'spiffe_id=[^ ]*' || echo 'none logged'))"
+  proxy_logs "$name" | grep -F "SVID from the Workload API" | grep -qF "spiffe_id=spiffe://$TD/banlieue/${role%%-*}/" \
+    || fail "$name: the proxy did not start on a ${role%%-*} SVID ($(proxy_logs "$name" | grep -F "SVID from the Workload API" | grep -o 'spiffe_id=[^ ]*' || echo 'none logged'))"
   [ "$(pod_phase "$name")" = Succeeded ] || fail "$name did not end as expected"
 }
 
@@ -268,7 +271,16 @@ broker_policy_config() { # <shadow|enforce> [watched namespaces] [further lines 
   "${K[@]}" -n "$BROKER_NS" create configmap mediatore-config --from-file=mediatore.yaml="$FILES/mediatore.yaml" \
     --dry-run=client -o yaml | "${K[@]}" apply -f - >/dev/null
   "${K[@]}" -n "$BROKER_NS" rollout restart deploy/mediatore >/dev/null
-  "${K[@]}" -n "$BROKER_NS" rollout status deploy/mediatore --timeout=120s >/dev/null
+  # A start check that refuses the config leaves the new pod crash-looping: its own log says
+  # why, and the teardown restores the broker before any dump could read it.
+  if ! "${K[@]}" -n "$BROKER_NS" rollout status deploy/mediatore --timeout=120s >/dev/null; then
+    local newest
+    newest=$("${K[@]}" -n "$BROKER_NS" get pods -l app.kubernetes.io/name=mediatore --sort-by=.metadata.creationTimestamp -o name 2>/dev/null | tail -1)
+    printf '\n--- %s (the restart that did not come up)\n' "$newest"
+    "${K[@]}" -n "$BROKER_NS" logs "$newest" --tail=20 2>/dev/null | plain || true
+    "${K[@]}" -n "$BROKER_NS" logs "$newest" --previous --tail=20 2>/dev/null | plain || true
+    fail "the broker did not come up on the $1 config"
+  fi
   BROKER_POD=$(broker_pod)
   [ -n "$BROKER_POD" ] || fail "no Running broker pod in $BROKER_NS"
   wait_for "$TIMEOUT" "'policy bundle reflector running' in the broker log" log_has "policy bundle reflector running"
@@ -641,7 +653,15 @@ echo "handshake refused before any check; no gateway carried the tunnel"
 
 if [ -n "$POLICY_STATE" ]; then
   say "enforce (ADR-0030 decisions 1, 3, 6): the switch flipped, the second port opens, the ruled entry never served"
-  broker_policy_config enforce
+  # $NSB is mapped to draw from itself and $NS from here on, for the ADR-0054 step below;
+  # nothing in $NS changes by it ($NS draws from itself, the default). Every source must be
+  # watched (a start check), so $NSB is watched too, with the broker's read Role in it; it
+  # holds no bundle.
+  "${K[@]}" create namespace "$NSB" --dry-run=client -o yaml | "${K[@]}" apply -f - >/dev/null
+  mkdir -p "$POLICY_STATE/policy-bundles-$NSB"
+  printf 'namespace: %s\nresources:\n  - ../../deploy/policy-bundles\n' "$NSB" > "$POLICY_STATE/policy-bundles-$NSB/kustomization.yaml"
+  "${K[@]}" apply -k "$POLICY_STATE/policy-bundles-$NSB" >/dev/null
+  broker_policy_config enforce "$NS, $NSB" "$(printf '  sources:\n    %s:\n      namespaces: [%s, %s]' "$NSB" "$NSB" "$NS")"
   wait_for "$TIMEOUT" "lease mediatore-watcher held by ${BROKER_POD#pod/}" holder_is_pod
   wait_for "$TIMEOUT" "'claim watcher running' in the new broker log" log_has "claim watcher running"
   wait_for "$TIMEOUT" "'policy bundle admitted' version=$BUNDLE_V in the new broker log" log_has "policy bundle admitted" "version=$BUNDLE_V"
@@ -662,23 +682,72 @@ if [ -n "$POLICY_STATE" ]; then
   wait_for "$LOG_WAIT" "the second port's request line" direct_has "destination request" "host=$DIRECT"
   echo "enforce: a tunnel to $DIRECT opened and answered, bare, on the credential-less route; $RULED and the other host refused; $DESTINATION as before"
 
-  say "ADR-0054 decision 6: $NS remapped to draw from $NSX alone; on the next ask $DIRECT is withdrawn, the audience endpoints stand"
-  "${K[@]}" create namespace "$NSX" --dry-run=client -o yaml | "${K[@]}" apply -f - >/dev/null
-  mkdir -p "$POLICY_STATE/policy-bundles-$NSX"
-  printf 'namespace: %s\nresources:\n  - ../../deploy/policy-bundles\n' "$NSX" > "$POLICY_STATE/policy-bundles-$NSX/kustomization.yaml"
-  "${K[@]}" apply -k "$POLICY_STATE/policy-bundles-$NSX" >/dev/null
-  broker_policy_config enforce "$NS, $NSX" "$(printf '  sources:\n    %s:\n      namespaces: [%s]' "$NS" "$NSX")"
+  say "ADR-0054 decision 6: a second sandbox in $NSB naming $NS's policy, admitted while $NSB draws from $NS, its second port open"
+  wait_for "$TIMEOUT" "'policy sources' with $NSB drawing from $NSB and $NS in the broker log" log_has "policy sources:" "namespace=$NSB sources=$NSB, $NS"
+  "${KSA[@]}" create -f - >/dev/null <<YAML
+apiVersion: mediatore.io/v1beta1
+kind: AgentSandbox
+metadata:
+  name: sb-b
+  namespace: $NSB
+spec:
+  subject: { issuer: "$ISSUER", id: "octocat" }
+  poolRef: { name: e2e }
+  ttlSeconds: 900
+  audiences: ["e2e-egress"]
+  workload: { image: "registry.internal:5000/sandbox:e2e", args: ["sh"] }
+  policyRef: { name: $POLICY }
+YAML
+  has_claim_b() { "${K[@]}" -n "$NSB" get virtualmachineclaim sb-b >/dev/null 2>&1; }
+  wait_for "$TIMEOUT" "claim sb-b in $NSB" has_claim_b
+  CLAIM_B=$("${K[@]}" -n "$NSB" get virtualmachineclaim sb-b -o jsonpath='{.metadata.uid}')
+  wait_for "$TIMEOUT" "'record created' for sb-b in the broker log" log_has "record created" "$CLAIM_B"
+  jq -Rs '{status: {phase: "Bound", virtualMachineRef: {name: "member-2"}, tpmEndorsementCertificates: [.], boundAt: "2026-11-04T10:00:00Z", expiresAt: "2026-11-04T10:15:00Z"}}' < "$EK_PEM" \
+    | "${K[@]}" -n "$NSB" patch virtualmachineclaim sb-b --subresource=status --type=merge --patch-file=/dev/stdin >/dev/null
+  ready_b() { [ "$("${K[@]}" -n "$NSB" get agentsandbox sb-b -o jsonpath='{.status.ready}' 2>/dev/null)" = "true" ]; }
+  wait_for "$TIMEOUT" "sb-b Ready" ready_b
+  "${K[@]}" apply -f - >/dev/null <<YAML
+apiVersion: spire.spiffe.io/v1alpha1
+kind: ClusterSPIFFEID
+metadata:
+  name: mediatore-e2e-gateway-claim-b
+spec:
+  className: spire-server-spire
+  spiffeIDTemplate: "spiffe://{{ .TrustDomain }}/banlieue/claim/$CLAIM_B"
+  podSelector:
+    matchLabels: { mediatore.dev/e2e-role: claim-b }
+  namespaceSelector:
+    matchLabels: { kubernetes.io/metadata.name: $NS }
+  ttl: 1h
+YAML
+  probe probe-b-mapped claim-b phantom \
+    "$DIRECT=200" \
+    "$DESTINATION=200"
+  wait_for "$LOG_WAIT" "Envoy's 200 for sb-b's second port" envoy_has "tunnel peer=spiffe://$TD/banlieue/claim/$CLAIM_B" "authority=$DIRECT" "status=200"
+  echo "claim $CLAIM_B in $NSB bound; $DIRECT open for it through the mapping"
+
+  say "ADR-0054 decision 6, side by side: $NSB unmapped; on the next ask sb-b's $DIRECT is withdrawn, sb-gw's in $NS stays open"
+  broker_policy_config enforce "$NS, $NSB" "$(printf '  sources:\n    %s:\n      namespaces: [%s]' "$NSB" "$NSB")"
   wait_for "$TIMEOUT" "lease mediatore-watcher held by ${BROKER_POD#pod/}" holder_is_pod
-  wait_for "$TIMEOUT" "'policy sources' naming $NSX for $NS in the new broker log" log_has "policy sources:" "sources=$NSX"
-  # The authorizer's fresh answer from before the restart must age out, so the next tunnel asks.
+  wait_for "$TIMEOUT" "'claim watcher running' in the new broker log" log_has "claim watcher running"
+  wait_for "$TIMEOUT" "'policy sources' with $NSB drawing from itself alone in the new broker log" log_has "policy sources:" "namespace=$NSB sources=$NSB"
+  broker_logs | grep -F "policy sources:" | grep -qF "namespace=$NSB sources=$NSB, " && fail "$NSB still draws from more than itself"
+  # The authorizer's fresh answers from before the restart must age out, so the next tunnels ask.
   sleep $((FRESH_SECS + 1))
-  probe probe-withdrawn claim phantom \
+  probe probe-b-unmapped claim-b phantom \
     "$DIRECT=502:gateway_refused" \
     "$DESTINATION=200"
-  wait_for "$LOG_WAIT" "the broker's warn line for the claim's bundle outside its sources" log_has "outside its namespace's policy sources" "claim_uid=$CLAIM_UID"
-  wait_for "$LOG_WAIT" "Envoy's 403 for the second port after the remap" envoy_has "tunnel peer=spiffe://$TD/banlieue/claim/$CLAIM_UID" "authority=$DIRECT" "status=403"
-  wait_for "$LOG_WAIT" "the authorizer's not_allowed for the second port after the remap" authz_has "authority=$DIRECT" "verdict=deny" "reason=not_allowed"
-  echo "remapped: $DIRECT refused at the real Envoy, $DESTINATION still served, the broker's decision-6 line logged"
+  probe probe-a-kept claim phantom \
+    "$DIRECT=200" \
+    "$DESTINATION=200"
+  wait_for "$LOG_WAIT" "the broker's warn line for sb-b's bundle outside its sources" log_has "outside its namespace's policy sources" "claim_uid=$CLAIM_B"
+  broker_logs | grep -F "outside its namespace's policy sources" | grep -qF "claim_uid=$CLAIM_UID" && fail "sb-gw, whose namespace draws from the policy's, was judged outside its sources"
+  wait_for "$LOG_WAIT" "Envoy's 403 for sb-b's second port after the unmapping" envoy_has "tunnel peer=spiffe://$TD/banlieue/claim/$CLAIM_B" "authority=$DIRECT" "status=403"
+  wait_for "$LOG_WAIT" "the authorizer's not_allowed for sb-b's second port" authz_has "claim_uid=$CLAIM_B" "authority=$DIRECT" "reason=not_allowed"
+  pod_logs probe-a-kept | grep -F "status=200" | grep -qF "destination reached: host=$DIRECT" || fail "sb-gw's second port did not answer after $NSB was unmapped"
+  echo "side by side: $DIRECT refused at the real Envoy for sb-b ($NSB) with the broker's decision-6 line, still open for sb-gw ($NS); $DESTINATION served to both"
+  "${K[@]}" -n "$NSB" delete agentsandbox sb-b --wait=false >/dev/null
+  "${K[@]}" delete clusterspiffeid mediatore-e2e-gateway-claim-b --ignore-not-found --wait=false >/dev/null
 fi
 
 say "the broker gone: the cached allowlist stands in, then the outage is a refusal"
@@ -711,5 +780,5 @@ wait_for "$LOG_WAIT" "the authorizer's claim_gone" authz_has "claim_uid=$CLAIM_U
 wait_for "$LOG_WAIT" "the gateway's claim_gone in the proxy's log" proxy_has probe-released "the gateway refused the tunnel" "claim_gone"
 echo "cut off: the broker's 404 dropped the cache; the workload sees 502 gateway_refused"
 
-[ -z "$POLICY_STATE" ] || say "PASS: ADR-0030 holds against a real Envoy: under shadow the gateway's answer is today's and the broker logs what it would add; under enforce the bundle's exact entry opens at the gateway and the destination answers through it, an entry with rules is never served (P007), the audience endpoints stand"
+[ -z "$POLICY_STATE" ] || say "PASS: ADR-0030 holds against a real Envoy: under shadow the gateway's answer is today's and the broker logs what it would add; under enforce the bundle's exact entry opens at the gateway and the destination answers through it, an entry with rules is never served (P007), the audience endpoints stand; and ADR-0054 decision 6: two sandboxes in two namespaces naming one policy, the second port withdrawn for the one whose namespace no longer draws from the policy's and open for the other"
 say "PASS: ADR-0028 decisions 2 to 5, 7 and 8 hold against a real Envoy through the real forwarder (SDS identity, the validator, the proxy's tunnel through the authorizer with the token swapped in, the cache bounds, the outage, the release)"

@@ -148,16 +148,23 @@ the same for a named pool and a selected one, and is empty while the sandbox is 
 
 `spec.policyRef` (`policy_ref` on `POST /v1/claims`, `--policy` on `mediatore sandbox
 create`) names the notaio `SandboxPolicy` the sandbox is under, in the sandbox's own
-namespace ([ADR-0026](../adr/0026-notaio-bundles-verified-in-shadow.md) decision 6). It is
-optional and refuses nothing: under `policy.egress: enforce`
+namespace, or in the policy namespaces the operator mapped that namespace to
+([ADR-0026](../adr/0026-notaio-bundles-verified-in-shadow.md) decision 6,
+[ADR-0054](../adr/0054-which-policies-a-namespace-may-name.md)). It is
+optional. Under `policy.egress: enforce`
 ([ADR-0030](../adr/0030-policy-egress-enforced-at-the-gateway.md)) the bundle's direct
 egress entries are opened at the gateway; under `shadow`, the default, it grants nothing
 beyond the broker's configuration, and the bundle notaio signs for the named policy is
 read in shadow. What
 naming one does is put on the claim record the policy's uid and the version of the verified
 bundle current when the claim was created, and give the comparison below something to
-compare with. A sandbox naming a policy with no verified bundle (no such policy, or none
-the broker trusts) is admitted exactly like one naming none, with nothing recorded. Like
+compare with. Under `shadow`, a sandbox naming a policy with no verified bundle (no such
+policy, none the broker trusts, or one in a namespace yours does not draw from) is admitted
+exactly like one naming none, with nothing recorded. Under `enforce` it is refused:
+`POST /v1/claims` answers `400 policy_not_resolved`, and a declarative `AgentSandbox` goes
+`Failed` with a reason that starts with `policy_not_resolved`; no claim is created. The
+answer is the same whether the policy exists nowhere or somewhere your namespace may not
+use, so ask the operator which policies your namespace draws from. Like
 the rest of the spec, the field is immutable.
 
 `spec.workload.restart` (`restart` in `workload` on `POST /v1/claims`, `--restart` on
@@ -191,7 +198,7 @@ the newest `logs.max_bytes` (default 1 MiB) of it.
 With a `policy` section configured, every sandbox carries a `PolicyConformant` condition:
 `True` when the broker's configuration allows the sandbox nothing the bundle does not,
 `False` with a code per gap in its message, `Unknown` until the broker has read the
-namespace's bundles. [The policy bundle, in shadow](the-policy-bundle.md) has the codes
+bundles of the namespaces yours draws from. [The policy bundle, in shadow](the-policy-bundle.md) has the codes
 and how to read them. None of it changes what the sandbox gets; only `policy.egress:
 enforce` does, above.
 

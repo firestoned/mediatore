@@ -61,7 +61,15 @@ kubectl -n sandboxes get sbpolicy,exposureceilings
 kubectl -n sandboxes get configmap claude-agent-bundle -o jsonpath='{.metadata.annotations.sandbox\.firestoned\.io/bundle-version}'
 kubectl -n banlieue-system logs deploy/mediatore | grep 'policy bundle admitted'
 kubectl -n banlieue-system get policyfloors
+kubectl -n banlieue-system logs deploy/mediatore | grep -E 'policy sources:|no policy source'
+# namespace=banlieue-system sources=sandboxes, and no "no policy source" warning
 ```
+
+The sandboxes are created in `banlieue-system` and their policies are in `sandboxes`, so the
+broker's configuration needs `policy.sources.banlieue-system.namespaces: [sandboxes]`
+(ADR-0054). Without it a claim naming a policy is `400 policy_not_resolved` under
+`policy.egress: enforce`, and reports `P011` under `shadow`; the broker's log then has
+`policy held by a watched namespace outside this sandbox's sources`.
 
 A policy that must name two audiences does not fit `standard` (K5.3 R1, lint `L005`):
 decide `lab` with `dataScope: LabOnly` ceilings or a custom profile, under review in the

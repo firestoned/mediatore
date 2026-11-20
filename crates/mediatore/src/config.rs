@@ -3373,7 +3373,8 @@ listen: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }
         );
         let logs = startup_log(&with("").unwrap());
         assert!(!logs.contains("policy sources"), "{logs}");
-        // Compared to a bool first, so a failure prints neither a marker nor the log.
+        // Nothing shaped like a credential in what the start logs. The markers are compared to
+        // a bool first, so a failure prints neither the marker nor the log.
         let credential_free = ["eyJ", "Bearer", "client_secret", "refresh_token"]
             .iter()
             .all(|marker| !logs.contains(marker));
