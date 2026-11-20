@@ -32,6 +32,10 @@ const ACCEPT: &str = "application/vnd.oci.image.manifest.v1+json, application/vn
 /// one write per mebibyte and not one per network chunk.
 const BLOB_WRITE_BUFFER: usize = 1 << 20;
 
+/// The most a manifest or a token endpoint's answer may weigh: 4 MiB, far above any real one. Both are held in
+/// memory whole, so a registry that streams without end is cut off here.
+const MAX_BODY: u64 = 4 << 20;
+
 /// The platform the guest selects from an index: `linux` and this machine's architecture
 /// in the registry's spelling.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -363,14 +367,17 @@ impl Puller {
     /// With them, redirects are followed here so each hop is routed again, and one that
     /// leaves a declared registry for a host that is not declared is refused (ADR-0038
     /// decision 2). `add` decorates each request; its flag says the hop is still on the
-    /// original host, which is the only place a credential goes.
+    /// original scheme, host and port, which is the only place a credential goes. The URL
+    /// returned beside the response is the one that answered, after every redirect.
     async fn send_following(
         &self,
         url: &str,
         add: impl Fn(reqwest::RequestBuilder, bool) -> reqwest::RequestBuilder,
-    ) -> anyhow::Result<reqwest::Response> {
+    ) -> anyhow::Result<(reqwest::Response, reqwest::Url)> {
         let Some(relay) = &self.relay else {
-            return Ok(add(self.http.get(url), true).send().await?);
+            let resp = add(self.http.get(url), true).send().await?;
+            let at = resp.url().clone();
+            return Ok((resp, at));
         };
         let origin = reqwest::Url::parse(url)?;
         let mut current = origin.clone();
@@ -380,18 +387,17 @@ impl Puller {
             if let Some(h) = &routed.host_header {
                 req = req.header(reqwest::header::HOST, h);
             }
-            let resp = add(req, current.host_str() == origin.host_str())
-                .send()
-                .await?;
+            // Scheme, host and port: the same name on another port or in the clear is another server.
+            let resp = add(req, current.origin() == origin.origin()).send().await?;
             if !resp.status().is_redirection() {
-                return Ok(resp);
+                return Ok((resp, current));
             }
             let Some(location) = resp
                 .headers()
                 .get(reqwest::header::LOCATION)
                 .and_then(|v| v.to_str().ok())
             else {
-                return Ok(resp);
+                return Ok((resp, current));
             };
             let next = current.join(location)?;
             let next_host = next.host_str().unwrap_or_default().to_ascii_lowercase();
@@ -423,7 +429,8 @@ impl Puller {
 
     /// GET `url`, answering one challenge: a bearer one with a token from its realm (the
     /// credential presented there, when there is one), a `Basic` one with the credential
-    /// itself.
+    /// itself. `url` is on the registry of the reference, and only a 401 from that scheme,
+    /// host and port is a challenge: one from wherever a redirect led is a refusal.
     async fn get(
         &self,
         session: &mut Session,
@@ -451,8 +458,9 @@ impl Puller {
             );
             return Ok(resp);
         }
+        let registry = reqwest::Url::parse(url)?;
         for attempt in 0..2 {
-            let resp = self
+            let (resp, at) = self
                 .send_following(url, |mut req, same_host| {
                     if let Some(a) = accept {
                         req = req.header(reqwest::header::ACCEPT, a);
@@ -473,6 +481,13 @@ impl Puller {
             if resp.status() != reqwest::StatusCode::UNAUTHORIZED || attempt == 1 {
                 return Ok(resp);
             }
+            // The host a redirect led to does not get to name a realm the credential is then presented at, nor to
+            // switch the credential onto the requests. Only the origin is printed: a content URL can carry a signature.
+            anyhow::ensure!(
+                at.origin() == registry.origin(),
+                "{url}: 401 from {}, which is not the registry; its challenge is not answered",
+                at.origin().ascii_serialization()
+            );
             let header = resp
                 .headers()
                 .get(reqwest::header::WWW_AUTHENTICATE)
@@ -481,7 +496,7 @@ impl Puller {
                 .ok_or_else(|| anyhow::anyhow!("{url}: 401 without a challenge"))?;
             match parse_challenge(&header) {
                 Some(Challenge::Bearer(c)) => {
-                    session.token = Some(self.token(&c, session.basic.as_ref()).await?);
+                    session.token = Some(self.token(&c, session.basic.as_ref(), &registry).await?);
                 }
                 Some(Challenge::Basic) => {
                     anyhow::ensure!(
@@ -496,10 +511,13 @@ impl Puller {
         unreachable!("two attempts, each returns");
     }
 
+    /// The bearer token the challenge `c` of `registry` asks for. The realm is HTTPS, or the
+    /// registry itself is one listed as plain HTTP, and then no credential goes to the realm.
     async fn token(
         &self,
         c: &BearerChallenge,
         basic: Option<&(String, Secret)>,
+        registry: &reqwest::Url,
     ) -> anyhow::Result<String> {
         #[derive(Deserialize)]
         struct TokenResponse {
@@ -516,8 +534,17 @@ impl Puller {
             query.push(("scope", s.as_str()));
         }
         let mut realm = reqwest::Url::parse(&c.realm)?;
+        let basic = match realm.scheme() {
+            "https" => basic,
+            // A registry listed as plain may name a plain realm, and nothing secret goes there (ADR-0022 decision 3).
+            "http" if registry.scheme() == "http" => basic.filter(|_| self.plain_http_credentials),
+            _ => anyhow::bail!(
+                "token endpoint {}: the realm of a registry reached over HTTPS must be https; refused",
+                c.realm
+            ),
+        };
         realm.query_pairs_mut().extend_pairs(&query);
-        let resp = self
+        let (resp, _) = self
             .send_following(realm.as_str(), |mut req, same_host| {
                 if same_host && let Some((user, password)) = basic {
                     req = req.basic_auth(user, Some(&password.0));
@@ -536,7 +563,10 @@ impl Puller {
                 " (no credential configured for this registry)"
             }
         );
-        let t: TokenResponse = resp.json().await?;
+        let body = read_capped(resp, &format!("token endpoint {}", c.realm)).await?;
+        // The parser's own message can quote what it read, and what it read here is a token.
+        let t: TokenResponse = serde_json::from_slice(&body)
+            .map_err(|_| anyhow::anyhow!("token endpoint {} did not answer with JSON", c.realm))?;
         t.token
             .or(t.access_token)
             .ok_or_else(|| anyhow::anyhow!("token endpoint {} returned no token", c.realm))
@@ -565,7 +595,7 @@ impl Puller {
             .unwrap_or_default()
             .trim()
             .to_string();
-        let body = resp.bytes().await?;
+        let body = read_capped(resp, &format!("{reference}: manifest {by}")).await?;
         let digest = format!("sha256:{}", hex::encode(Sha256::digest(&body)));
         if is_digest(by) {
             anyhow::ensure!(
@@ -788,6 +818,24 @@ fn build_client(pem: Option<&[u8]>, relay: Option<&Relay>) -> anyhow::Result<req
     Ok(builder.build()?)
 }
 
+/// The whole body of `resp`, refused past [`MAX_BODY`]: by its declared length when it has
+/// one, and as it arrives either way. `what` names it in the error.
+async fn read_capped(mut resp: reqwest::Response, what: &str) -> anyhow::Result<Vec<u8>> {
+    anyhow::ensure!(
+        resp.content_length().is_none_or(|n| n <= MAX_BODY),
+        "{what}: the body is larger than {MAX_BODY} bytes; refused"
+    );
+    let mut body = Vec::new();
+    while let Some(chunk) = resp.chunk().await? {
+        anyhow::ensure!(
+            body.len() as u64 + chunk.len() as u64 <= MAX_BODY,
+            "{what}: the body is larger than {MAX_BODY} bytes; refused"
+        );
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 fn parse_challenge(header: &str) -> Option<Challenge> {
     let header = header.trim();
     if header == "Basic" || header.starts_with("Basic ") {
@@ -842,7 +890,37 @@ fn relative(path: &Path) -> anyhow::Result<PathBuf> {
     Ok(out)
 }
 
-/// Remove whatever is at `p`, file, link or tree. Missing is fine.
+/// The directory an entry lands in, with every symlink followed, when it exists: the only
+/// place a removal for that entry may happen. `root` is the canonical rootfs; a directory
+/// that resolves outside it (through a link an earlier entry or layer left) refuses the
+/// layer, naming `entry`. `None` when there is no such directory, so nothing to remove.
+fn resolve_inside(root: &Path, dir: &Path, entry: &Path) -> anyhow::Result<Option<PathBuf>> {
+    match dir.canonicalize() {
+        Ok(real) => {
+            anyhow::ensure!(
+                real.starts_with(root),
+                "entry {} escapes the rootfs",
+                entry.display()
+            );
+            Ok(Some(real))
+        }
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(e) => Err(anyhow::anyhow!(
+            "entry {}: its directory cannot be resolved: {e}",
+            entry.display()
+        )),
+    }
+}
+
+/// Remove whatever is at `p`, file, link or tree. Missing is fine. The last component is
+/// never followed: a link is removed, not what it points at.
 fn remove_any(p: &Path) -> std::io::Result<()> {
     match std::fs::symlink_metadata(p) {
         Ok(m) if m.is_dir() => std::fs::remove_dir_all(p),
@@ -867,6 +945,8 @@ fn apply_layer(staged: &Path, encoding: LayerEncoding, rootfs: &Path) -> anyhow:
     archive.set_preserve_ownerships(false);
     archive.set_overwrite(true);
     let mut applied = Applied::default();
+    // Resolved once: what every removal below is held inside.
+    let root = rootfs.canonicalize()?;
     for entry in archive.entries()? {
         let mut entry = entry?;
         let path = entry.path()?.into_owned();
@@ -878,8 +958,15 @@ fn apply_layer(staged: &Path, encoding: LayerEncoding, rootfs: &Path) -> anyhow:
         let parent = rel
             .parent()
             .map_or_else(|| rootfs.to_path_buf(), |p| rootfs.join(p));
+        // The removals below run before `unpack_in` checks anything, and the kernel resolves `parent` through
+        // whatever link an earlier entry or layer made of one of its components. So the directory is resolved
+        // first and must be inside the rootfs; the removals then use the resolved path, and never follow the
+        // last component.
+        let parent = resolve_inside(&root, &parent, &path)?;
         if name == ".wh..wh..opq" {
-            if let Ok(children) = std::fs::read_dir(&parent) {
+            if let Some(dir) = &parent
+                && let Ok(children) = std::fs::read_dir(dir)
+            {
                 for c in children {
                     remove_any(&c?.path())?;
                 }
@@ -888,7 +975,15 @@ fn apply_layer(staged: &Path, encoding: LayerEncoding, rootfs: &Path) -> anyhow:
             continue;
         }
         if let Some(target) = name.strip_prefix(".wh.") {
-            remove_any(&parent.join(target))?;
+            // `.wh.` and `.wh..` would name the directory itself, `.wh...` the one above it.
+            anyhow::ensure!(
+                !matches!(target, "" | "." | ".."),
+                "entry {} is a whiteout of no name",
+                path.display()
+            );
+            if let Some(dir) = &parent {
+                remove_any(&dir.join(target))?;
+            }
             applied.entries += 1;
             continue;
         }
@@ -908,12 +1003,14 @@ fn apply_layer(staged: &Path, encoding: LayerEncoding, rootfs: &Path) -> anyhow:
         }
         // Overlay semantics: a directory replaces a file or link and a file replaces a
         // tree, instead of writing through what the lower layer left there.
-        let dest = rootfs.join(&rel);
-        if let Ok(m) = std::fs::symlink_metadata(&dest) {
-            if is_dir != m.is_dir() {
-                remove_any(&dest)?;
-            } else if !is_dir {
-                std::fs::remove_file(&dest)?;
+        if let Some(dir) = &parent {
+            let dest = dir.join(name);
+            if let Ok(m) = std::fs::symlink_metadata(&dest) {
+                if is_dir != m.is_dir() {
+                    remove_any(&dest)?;
+                } else if !is_dir {
+                    std::fs::remove_file(&dest)?;
+                }
             }
         }
         anyhow::ensure!(
@@ -1996,5 +2093,344 @@ mod tests {
             content.blob_requests() >= 1,
             "the redirect was followed directly"
         );
+    }
+
+    /// Apply `layer` onto the scratch rootfs directly, as the pull does once the blob is staged.
+    fn apply(s: &Scratch, layer: &Layer) -> anyhow::Result<Applied> {
+        let staged = s.scratch.join("layer");
+        std::fs::write(&staged, layer.tar()).unwrap();
+        apply_layer(&staged, LayerEncoding::Tar, &s.rootfs)
+    }
+
+    /// A directory outside any rootfs holding `victim` and `tree/leaf`.
+    fn outside_with_victims() -> PathBuf {
+        let outside = mediatore_testkit::tempdir();
+        std::fs::write(outside.join("victim"), b"state").unwrap();
+        std::fs::create_dir(outside.join("tree")).unwrap();
+        std::fs::write(outside.join("tree/leaf"), b"state").unwrap();
+        outside
+    }
+
+    fn assert_victims_intact(outside: &Path) {
+        assert_eq!(
+            std::fs::read(outside.join("victim")).unwrap(),
+            b"state",
+            "the file outside the rootfs is untouched"
+        );
+        assert_eq!(
+            std::fs::read(outside.join("tree/leaf")).unwrap(),
+            b"state",
+            "the tree outside the rootfs is untouched"
+        );
+    }
+
+    #[test]
+    fn a_whiteout_through_an_absolute_link_out_of_the_rootfs_removes_nothing_and_refuses_the_layer()
+    {
+        let outside = outside_with_victims();
+        let s = scratch();
+        let layer = Layer::new()
+            .symlink("x", outside.to_str().unwrap())
+            .whiteout("x/victim");
+        let err = apply(&s, &layer).unwrap_err().to_string();
+        assert!(err.contains("escapes the rootfs"), "{err}");
+        assert!(err.contains(".wh.victim"), "the entry is named: {err}");
+        assert_victims_intact(&outside);
+        // The same when the link comes from a layer below.
+        let s = scratch();
+        apply(&s, &Layer::new().symlink("x", outside.to_str().unwrap())).unwrap();
+        let err = apply(&s, &Layer::new().whiteout("x/tree"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("escapes the rootfs"), "{err}");
+        assert_victims_intact(&outside);
+    }
+
+    #[test]
+    fn a_whiteout_through_a_relative_link_out_of_the_rootfs_removes_nothing_and_refuses_the_layer()
+    {
+        let s = scratch();
+        let victim = s.rootfs.parent().unwrap().join("victim");
+        std::fs::write(&victim, b"state").unwrap();
+        let layer = Layer::new().symlink("up", "..").whiteout("up/victim");
+        let err = apply(&s, &layer).unwrap_err().to_string();
+        assert!(err.contains("escapes the rootfs"), "{err}");
+        assert_eq!(std::fs::read(&victim).unwrap(), b"state");
+        // One level down, where `..` alone would stay inside.
+        let s = scratch();
+        let victim = s.rootfs.parent().unwrap().join("victim");
+        std::fs::write(&victim, b"state").unwrap();
+        let layer = Layer::new()
+            .dir("a", 0o755)
+            .symlink("a/up", "../..")
+            .whiteout("a/up/victim");
+        let err = apply(&s, &layer).unwrap_err().to_string();
+        assert!(err.contains("escapes the rootfs"), "{err}");
+        assert_eq!(std::fs::read(&victim).unwrap(), b"state");
+    }
+
+    #[test]
+    fn an_opaque_whiteout_through_a_link_out_of_the_rootfs_empties_nothing() {
+        let outside = outside_with_victims();
+        let s = scratch();
+        let layer = Layer::new()
+            .symlink("x", outside.to_str().unwrap())
+            .opaque("x");
+        let err = apply(&s, &layer).unwrap_err().to_string();
+        assert!(err.contains("escapes the rootfs"), "{err}");
+        assert_victims_intact(&outside);
+    }
+
+    #[test]
+    fn an_entry_through_a_link_out_of_the_rootfs_removes_nothing_before_it_is_refused() {
+        // The overlay rule (a file replaces what is there) runs before the unpack: a file over a file, a file
+        // over a tree and a directory over a file, each through the link.
+        for entry in [
+            Layer::new().file("x/victim", 0o644, b"planted"),
+            Layer::new().file("x/tree", 0o644, b"planted"),
+            Layer::new().dir("x/victim", 0o755),
+        ] {
+            let outside = outside_with_victims();
+            let s = scratch();
+            apply(&s, &Layer::new().symlink("x", outside.to_str().unwrap())).unwrap();
+            let err = apply(&s, &entry).unwrap_err().to_string();
+            assert!(err.contains("escapes the rootfs"), "{err}");
+            assert_victims_intact(&outside);
+        }
+    }
+
+    #[test]
+    fn whiteouts_inside_the_rootfs_still_remove_through_a_link_that_stays_inside() {
+        let s = scratch();
+        let lower = Layer::new()
+            .dir("usr/bin", 0o755)
+            .file("usr/bin/old", 0o755, b"old")
+            .file("usr/bin/keep", 0o755, b"keep")
+            .dir("var", 0o755)
+            .file("var/a", 0o644, b"a")
+            .symlink("bin", "usr/bin");
+        apply(&s, &lower).unwrap();
+        let upper = Layer::new()
+            .whiteout("bin/old")
+            .whiteout("usr/bin/never-there")
+            .whiteout("no-such-dir/x")
+            .opaque("var")
+            .opaque("no-such-dir");
+        let applied = apply(&s, &upper).unwrap();
+        assert_eq!(applied.entries, 5);
+        assert!(!s.rootfs.join("usr/bin/old").exists());
+        assert!(s.rootfs.join("usr/bin/keep").exists());
+        assert!(s.rootfs.join("var").is_dir());
+        assert!(
+            std::fs::read_dir(s.rootfs.join("var"))
+                .unwrap()
+                .next()
+                .is_none(),
+            "the opaque whiteout emptied it"
+        );
+        assert!(!s.rootfs.join("no-such-dir").exists());
+    }
+
+    #[test]
+    fn a_whiteout_of_a_link_removes_the_link_and_not_what_it_points_at() {
+        let outside = outside_with_victims();
+        let s = scratch();
+        let lower = Layer::new()
+            .dir("data", 0o755)
+            .file("data/keep", 0o644, b"kept")
+            .symlink("alias", "data")
+            .symlink("out", outside.to_str().unwrap())
+            .dir("opq", 0o755)
+            .symlink("opq/out", outside.to_str().unwrap());
+        apply(&s, &lower).unwrap();
+        let upper = Layer::new().whiteout("alias").whiteout("out").opaque("opq");
+        apply(&s, &upper).unwrap();
+        for gone in ["alias", "out", "opq/out"] {
+            assert!(
+                std::fs::symlink_metadata(s.rootfs.join(gone)).is_err(),
+                "the link {gone} is removed"
+            );
+        }
+        assert_eq!(
+            std::fs::read(s.rootfs.join("data/keep")).unwrap(),
+            b"kept",
+            "what the link pointed at stays"
+        );
+        assert_victims_intact(&outside);
+    }
+
+    #[test]
+    fn a_whiteout_of_no_name_or_of_dot_dot_is_refused() {
+        for name in [".wh.", ".wh..", ".wh...", "sub/.wh..."] {
+            let s = scratch();
+            let beside = s.rootfs.parent().unwrap().join("beside");
+            std::fs::write(&beside, b"state").unwrap();
+            std::fs::create_dir(s.rootfs.join("sub")).unwrap();
+            std::fs::write(s.rootfs.join("kept"), b"kept").unwrap();
+            let err = apply(&s, &Layer::new().raw_file(name, b""))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("whiteout of no name"), "{name}: {err}");
+            assert_eq!(std::fs::read(&beside).unwrap(), b"state", "{name}");
+            assert_eq!(
+                std::fs::read(s.rootfs.join("kept")).unwrap(),
+                b"kept",
+                "{name}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bearer_challenge_from_the_host_a_redirect_led_to_is_not_answered() {
+        // The registry hands the blob to another host, and that host answers 401 with a realm of its own: the
+        // puller must not go and ask that realm for a token (with the credential, when the claim carries one).
+        let reg = FakeRegistry::start().await;
+        let content = FakeRegistry::start().await;
+        let img = one_layer_image();
+        reg.push("team/tool", "v1", &img);
+        content.push("team/tool", "v1", &img);
+        content.require_token(true);
+        reg.redirect_blobs_to(&format!("http://{}", content.host()));
+        let s = scratch();
+        let err = puller(&reg)
+            .pull(
+                &reference(&reg, "team/tool:v1"),
+                None,
+                &s.rootfs,
+                &s.scratch,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not the registry"), "{err}");
+        assert!(
+            err.contains(&content.host()),
+            "the refusal names who answered: {err}"
+        );
+        assert_eq!(content.token_requests(), 0, "its realm was never called");
+        assert_eq!(reg.token_requests(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_bearer_challenge_from_another_declared_host_is_not_answered_either() {
+        // The same with the redirects followed here (ADR-0038): a declared content host is still not the registry.
+        let reg = FakeRegistry::start().await;
+        let content = FakeRegistry::start().await;
+        let img = one_layer_image();
+        reg.push("team/tool", "v1", &img);
+        content.push("team/tool", "v1", &img);
+        content.require_token(true);
+        reg.redirect_blobs_to("http://content.relay.test");
+        let s = scratch();
+        let puller = relay_puller(
+            &["registry.relay.test", "content.relay.test"],
+            &[
+                relay_entry("registry.relay.test", port_of(&reg)),
+                relay_entry("content.relay.test", port_of(&content)),
+            ],
+        );
+        let err = puller
+            .pull(
+                &r("registry.relay.test/team/tool:v1"),
+                None,
+                &s.rootfs,
+                &s.scratch,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("not the registry") && err.contains("content.relay.test"),
+            "{err}"
+        );
+        assert_eq!(content.token_requests(), 0, "its realm was never called");
+    }
+
+    #[test]
+    fn the_same_host_on_another_port_or_scheme_is_not_the_original_origin() {
+        // What decides whether a hop still gets the credential, and whether a 401 is the registry's own.
+        let o = |s: &str| reqwest::Url::parse(s).unwrap().origin();
+        assert_eq!(
+            o("https://registry.example/v2/"),
+            o("https://registry.example:443/token")
+        );
+        assert_ne!(
+            o("https://registry.example/v2/"),
+            o("https://registry.example:8443/v2/")
+        );
+        assert_ne!(
+            o("https://registry.example/v2/"),
+            o("http://registry.example/v2/")
+        );
+        assert_ne!(
+            o("https://registry.example:5000/v2/"),
+            o("http://registry.example:5000/v2/")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_http_realm_is_refused_for_a_registry_reached_over_https() {
+        // The fake registry always names its realm with `http://`; over TLS that is the downgrade to refuse.
+        let reg = FakeRegistry::start_tls().await;
+        reg.require_token(true);
+        reg.push("team/tool", "v1", &one_layer_image());
+        let ca = reg.ca_pem().expect("a TLS registry has a CA");
+        let s = scratch();
+        let err = Puller::new(&[])
+            .unwrap()
+            .with_registry_ca(ca.as_bytes())
+            .unwrap()
+            .pull(
+                &reference(&reg, "team/tool:v1"),
+                None,
+                &s.rootfs,
+                &s.scratch,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must be https"), "{err}");
+        assert_eq!(reg.token_requests(), 0, "the realm was never called");
+    }
+
+    #[tokio::test]
+    async fn a_manifest_over_the_body_cap_is_refused() {
+        let reg = FakeRegistry::start().await;
+        let mut img = one_layer_image();
+        // Valid JSON padding, so only the size can be what refuses it.
+        let pad = usize::try_from(MAX_BODY).unwrap() + 1 - img.manifest.bytes.len();
+        img.manifest.bytes.extend(std::iter::repeat_n(b' ', pad));
+        reg.push("team/tool", "v1", &img);
+        let s = scratch();
+        let err = puller(&reg)
+            .pull(
+                &reference(&reg, "team/tool:v1"),
+                None,
+                &s.rootfs,
+                &s.scratch,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("manifest") && err.contains("larger than"),
+            "{err}"
+        );
+        assert_eq!(reg.blob_requests(), 0, "no layer was fetched");
+        // Exactly at the cap it is read.
+        let mut img = one_layer_image();
+        let pad = usize::try_from(MAX_BODY).unwrap() - img.manifest.bytes.len();
+        img.manifest.bytes.extend(std::iter::repeat_n(b' ', pad));
+        reg.push("team/tool", "v2", &img);
+        let s = scratch();
+        puller(&reg)
+            .pull(
+                &reference(&reg, "team/tool:v2"),
+                None,
+                &s.rootfs,
+                &s.scratch,
+            )
+            .await
+            .unwrap();
     }
 }

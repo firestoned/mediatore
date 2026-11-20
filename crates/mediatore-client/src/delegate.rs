@@ -350,8 +350,8 @@ mod tests {
     fn prompt_and_store_are_sources_and_a_basic_token_joins_a_user_and_a_secret() {
         assert_eq!("prompt".parse::<Source>().unwrap(), Source::Prompt);
         assert_eq!("store".parse::<Source>().unwrap(), Source::Store);
-        let (aud, src) = parse_delegate("rbcgithub=prompt").unwrap();
-        assert_eq!((aud.as_str(), src), ("rbcgithub", Source::Prompt));
+        let (aud, src) = parse_delegate("examplegit=prompt").unwrap();
+        assert_eq!((aud.as_str(), src), ("examplegit", Source::Prompt));
         assert_eq!(join_basic("alice", "p:w").unwrap(), "alice:p:w");
         for (u, p, why) in [
             ("", "x", "user name is empty"),

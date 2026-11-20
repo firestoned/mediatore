@@ -21,6 +21,13 @@ ExecStart=/usr/bin/mediatore guest
 EnvironmentFile=-/etc/mediatore-guest/env
 Restart=on-failure
 RestartSec=5
+# The whole cgroup ends with the guest, not the main process alone: a workload that
+# outlived nsjail (it can clear its parent-death signal) does not outlive the unit.
+KillMode=control-group
+# Ten seconds for the guest's own teardown after SIGTERM, no more.
+TimeoutStopSec=10
+# Then SIGKILL to whatever is left in the cgroup.
+SendSIGKILL=yes
 RuntimeDirectory=mediatore-guest
 NoNewPrivileges=no
 

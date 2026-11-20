@@ -17,10 +17,12 @@ resources:
   - ingress.yaml
   - networkpolicy.yaml
 images:
-  # Pin what you deploy: a digest from `crane digest ghcr.io/firestoned/mediatore:latest`,
-  # or a sha-<commit> tag the build workflow pushes on every merge.
+  # Pin what you deploy, by digest: the one a release's mediatore-<version>.yaml carries,
+  # verified as docs/guides/deploying.md shows. The zeros are a placeholder no registry
+  # serves, so an unedited copy of this overlay pulls nothing instead of whatever a
+  # moving tag points at.
   - name: ghcr.io/firestoned/mediatore
-    newTag: latest
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000 # placeholder: a release digest
 configMapGenerator:
   - name: mediatore-config
     files:

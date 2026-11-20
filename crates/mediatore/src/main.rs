@@ -133,19 +133,7 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
     let store = store(&cfg, client.as_ref(), sealer.clone())?;
     let sandboxes = sandbox_front(&cfg, client.as_ref())?;
 
-    let sts = match &cfg.sts {
-        Some(s) => {
-            let pem = std::fs::read(&s.signing_key_file)?;
-            let max = cfg.audiences.iter().map(|a| a.max_ttl).max().unwrap_or(900);
-            Some(Sts::new(
-                &s.issuer,
-                &s.kid,
-                &pem,
-                jiff::SignedDuration::from_secs(max),
-            )?)
-        }
-        None => None,
-    };
+    let sts = sts(&cfg)?;
 
     let registries = registries(&cfg)?;
 
@@ -575,6 +563,25 @@ async fn validator(cfg: &Config) -> anyhow::Result<Validator> {
 /// The refresh-material sealer (ADR-0012 decision 3): the local key file, or `OpenBao`
 /// transit (ADR-0015). Either is read and probed now, so a bad Secret, role, policy or
 /// key fails the start, not the first claim. `Config::parse` guarantees exactly one is set.
+/// The STS when one is configured (ADR-0003): no token outlives the longest `max_ttl`, and
+/// each audience is held to its own.
+fn sts(cfg: &Config) -> anyhow::Result<Option<Sts>> {
+    let Some(s) = &cfg.sts else {
+        return Ok(None);
+    };
+    let pem = std::fs::read(&s.signing_key_file)?;
+    let max = cfg.audiences.iter().map(|a| a.max_ttl).max().unwrap_or(900);
+    let sts = Sts::new(
+        &s.issuer,
+        &s.kid,
+        &pem,
+        jiff::SignedDuration::from_secs(max),
+    )?;
+    Ok(Some(cfg.audiences.iter().fold(sts, |sts, a| {
+        sts.with_audience_max_ttl(&a.name, jiff::SignedDuration::from_secs(a.max_ttl))
+    })))
+}
+
 async fn sealer(cfg: &Config) -> anyhow::Result<Option<Arc<dyn Sealer>>> {
     let Some(sealing) = &cfg.store.sealing else {
         tracing::info!("sealing: no key configured; refresh material cannot be persisted");
@@ -993,7 +1000,7 @@ mod tests {
             "/run/spire/sockets/agent.sock",
             &files,
             &mediatore_guest::egress::UpstreamArgs {
-                ca: Some("/etc/ssl/certs/rbc-ca-bundle.crt".into()),
+                ca: Some("/etc/ssl/certs/example-ca-bundle.crt".into()),
                 min_tls: mediatore_proto::tls::UpstreamTls::Tls12,
             },
         ));
@@ -1002,7 +1009,7 @@ mod tests {
             Ok(Cmd::EgressProxy(a)) => {
                 assert_eq!(
                     a.upstream_ca.as_deref(),
-                    Some(std::path::Path::new("/etc/ssl/certs/rbc-ca-bundle.crt"))
+                    Some(std::path::Path::new("/etc/ssl/certs/example-ca-bundle.crt"))
                 );
                 assert_eq!(a.upstream_min_tls, mediatore_proto::tls::UpstreamTls::Tls12);
             }

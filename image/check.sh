@@ -32,6 +32,7 @@ check "nftables, for the jail's ruleset (ADR-0020)" 'nft --version >/dev/null'
 check "nsjail, the jail itself, linked against what the image has" \
   'test -x /usr/bin/nsjail && ! ldd /usr/bin/nsjail | grep -q "not found" && /usr/bin/nsjail --help 2>&1 | grep -q -- "--chroot"'
 check "mount and umount, for the sandbox tmpfs (ADR-0021)" 'command -v mount && command -v umount'
+check "kill, for the sandbox user's processes at the end of a claim (ADR-0020 decision 6)" 'test -x /usr/bin/kill || test -x /bin/kill'
 check "the sandbox root and the agent's configuration directory, 0755, in the immutable root" \
   'test "$(stat -c %a /mnt/sandbox)" = 755 && test "$(stat -c %a /etc/spire)" = 755'
 check "tpm2-tools, for the EK certificate export (banlieue examples/21)" 'command -v tpm2_nvread'
@@ -57,6 +58,8 @@ check "no other listener the base shipped (snmpd, lldpd, rpcbind)" \
   '! command -v snmpd && ! command -v lldpd && ! command -v rpcbind'
 check "Yama's ptrace scope raised in the image's sysctl (ADR-0025, roadmap 06)" \
   'grep -qx "kernel.yama.ptrace_scope = 1" /etc/sysctl.d/99-mediatore.conf'
+check "the kernel hardening in the image's sysctl: no MPTCP, no io_uring, kernel addresses and the kernel log restricted, no unprivileged bpf, the BPF JIT hardened" \
+  'for k in "net.mptcp.enabled = 0" "kernel.io_uring_disabled = 2" "kernel.kptr_restrict = 2" "kernel.dmesg_restrict = 1" "kernel.unprivileged_bpf_disabled = 1" "net.core.bpf_jit_harden = 2"; do grep -qx "$k" /etc/sysctl.d/99-mediatore.conf || exit 1; done'
 check "no private key material (banlieue ADR-0108 decision 2)" \
   '! grep -rl "PRIVATE KEY" /etc /usr/share/mediatore /var/lib 2>/dev/null | grep -q .'
 

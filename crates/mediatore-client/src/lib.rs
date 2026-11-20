@@ -64,26 +64,24 @@ impl Session {
         Ok(serde_json::from_str(&text)?)
     }
 
-    /// Write the session at `path`, owner-readable only.
+    /// Write the session at `path`, owner-readable only, whatever was there before: the
+    /// text goes to a new file of mode 0600 beside it, which is then renamed over `path`. A
+    /// file left there with wider permissions is replaced, not reused, and a symlink there
+    /// is replaced, not followed. A directory this creates is 0700.
+    ///
+    /// # Errors
+    /// The directory or the file cannot be written.
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
         let text = serde_json::to_string_pretty(self)?;
         #[cfg(unix)]
-        {
-            use std::io::Write as _;
-            use std::os::unix::fs::OpenOptionsExt as _;
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(path)?;
-            f.write_all(text.as_bytes())?;
-        }
+        write_owner_only(path, text.as_bytes())?;
         #[cfg(not(unix))]
-        std::fs::write(path, text)?;
+        {
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            std::fs::write(path, text)?;
+        }
         Ok(())
     }
 
@@ -92,6 +90,57 @@ impl Session {
     pub fn is_fresh(&self, margin_secs: i64) -> bool {
         self.expires_at - margin_secs > now_unix()
     }
+}
+
+/// Mode of the session file: its owner alone.
+#[cfg(unix)]
+const SESSION_FILE_MODE: u32 = 0o600;
+/// Mode of a directory `save` creates for it.
+#[cfg(unix)]
+const SESSION_DIR_MODE: u32 = 0o700;
+
+/// Put `bytes` at `path` through a temporary file in the same directory, created new (so
+/// never an existing file or a symlink) with [`SESSION_FILE_MODE`], then renamed over
+/// `path`. Missing directories are created with [`SESSION_DIR_MODE`]; one that exists keeps
+/// its mode.
+#[cfg(unix)]
+fn write_owner_only(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+
+    let name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("{}: not a file path", path.display()))?;
+    let dir = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(SESSION_DIR_MODE)
+        .create(dir)
+        .map_err(|e| anyhow::anyhow!("{}: {e}", dir.display()))?;
+    let mut tmp_name = std::ffi::OsString::from(".");
+    tmp_name.push(name);
+    tmp_name.push(format!(".{}.tmp", random_token()?));
+    let tmp = dir.join(tmp_name);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(SESSION_FILE_MODE)
+        .open(&tmp)
+        .map_err(|e| anyhow::anyhow!("{}: {e}", tmp.display()))?;
+    let written = file
+        .write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .and_then(|()| std::fs::rename(&tmp, path));
+    drop(file);
+    if let Err(e) = written {
+        // The temporary file is this call's own: do not leave a copy of the session behind.
+        let _ = std::fs::remove_file(&tmp);
+        anyhow::bail!("{}: {e}", path.display());
+    }
+    Ok(())
 }
 
 fn now_unix() -> i64 {
@@ -417,6 +466,33 @@ pub async fn login(opts: &LoginOptions, open_url: impl FnOnce(&str)) -> anyhow::
     })
 }
 
+/// The user API's base URL as the client keeps it (no trailing `/`), once it is fit to carry
+/// a credential: `https`, or `http` to this machine only (`localhost`, or a loopback address
+/// such as `127.0.0.1` or `[::1]`), which is what a local run and the tests use. Every request
+/// carries the ID token as its bearer and a claim carries the refresh token, so anything else
+/// would put both on the network in the clear.
+///
+/// # Errors
+/// Not a URL, or a scheme and host that are neither of those. The message names the scheme
+/// and the host only, never the whole URL (it may hold userinfo).
+fn checked_base(base: &str) -> anyhow::Result<String> {
+    let url = reqwest::Url::parse(base)
+        .map_err(|e| anyhow::anyhow!("--mediatore is not a URL ({e}); expected https://<host>"))?;
+    let host = url.host_str().unwrap_or_default();
+    let unbracketed = host.trim_start_matches('[').trim_end_matches(']');
+    let loopback = unbracketed.eq_ignore_ascii_case("localhost")
+        || unbracketed
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    let scheme = url.scheme();
+    if scheme != "https" && !(scheme == "http" && loopback) {
+        anyhow::bail!(
+            "--mediatore {scheme}://{host} is refused: the ID token and the delegated refresh token are only sent over https (plain http is accepted for localhost and loopback addresses only)"
+        );
+    }
+    Ok(base.trim_end_matches('/').to_owned())
+}
+
 /// mediatore's user API.
 pub struct Api {
     base: String,
@@ -425,19 +501,47 @@ pub struct Api {
 
 impl Api {
     /// A client for the user API at `base` (`https://mediatore.example`).
+    ///
+    /// # Errors
+    /// A `base` that is not `https` and not on this machine ([`checked_base`]).
     pub fn new(base: &str) -> anyhow::Result<Self> {
         Ok(Self {
-            base: base.trim_end_matches('/').to_owned(),
+            base: checked_base(base)?,
             http: http()?,
         })
     }
 
     /// A client for the user API at `base` that trusts exactly the CA certificates in
     /// `pem` (a broker behind a private PKI).
+    ///
+    /// # Errors
+    /// A `base` that is not `https` and not on this machine ([`checked_base`]), or a `pem`
+    /// that holds no certificate.
     pub fn with_ca(base: &str, pem: &[u8]) -> anyhow::Result<Self> {
         Ok(Self {
-            base: base.trim_end_matches('/').to_owned(),
+            base: checked_base(base)?,
             http: http_with_ca(pem)?,
+        })
+    }
+
+    /// A client for a user API served over plain `http` on another host: a test cluster
+    /// whose user listener has no TLS in front of it. The ID token and anything delegated
+    /// cross that hop in clear, so this is never a default and never taken from the URL
+    /// alone: the caller asked for it by name (`--allow-plain-http`).
+    ///
+    /// # Errors
+    /// A `base` that is not an `http` or `https` URL.
+    pub fn plain_http(base: &str) -> anyhow::Result<Self> {
+        let url = reqwest::Url::parse(base).map_err(|e| {
+            anyhow::anyhow!("--mediatore is not a URL ({e}); expected http://<host>")
+        })?;
+        anyhow::ensure!(
+            matches!(url.scheme(), "http" | "https"),
+            "--mediatore must be an http or https URL"
+        );
+        Ok(Self {
+            base: base.trim_end_matches('/').to_owned(),
+            http: http()?,
         })
     }
 
@@ -761,20 +865,146 @@ mod tests {
         assert!(err.to_string().contains("state"), "{err}");
     }
 
-    #[tokio::test]
-    async fn the_session_file_round_trips_owner_only() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("target-test")
-            .join(uuid::Uuid::new_v4().to_string());
-        let path = dir.join("session.json");
-        let s = Session {
+    fn sample_session() -> Session {
+        Session {
             issuer: "https://dex.home.example".into(),
             client_id: "mediatore".into(),
             login: "octocat".into(),
             id_token: "a.b.c".into(),
             refresh_token: Some("rt".into()),
             expires_at: 0,
-        };
+        }
+    }
+
+    /// A directory of this test's own, not yet created.
+    fn scratch_dir() -> PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target-test")
+            .join(uuid::Uuid::new_v4().to_string())
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::symlink_metadata(path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
+    // ----- the session file (red-team review 2026-11-19, A minor) -----
+
+    #[cfg(unix)]
+    #[test]
+    fn a_session_file_left_world_readable_ends_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = scratch_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session.json");
+        std::fs::write(&path, "{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(mode_of(&path), 0o644);
+
+        sample_session().save(&path).unwrap();
+        assert_eq!(mode_of(&path), 0o600, "the old file's mode was kept");
+        assert_eq!(Session::load(&path).unwrap().login, "octocat");
+        // Saved again over its own file, and no temporary file is left beside it.
+        sample_session().save(&path).unwrap();
+        assert_eq!(mode_of(&path), 0o600);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_at_the_session_path_is_replaced_not_followed() {
+        let dir = scratch_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let elsewhere = dir.join("elsewhere.txt");
+        std::fs::write(&elsewhere, "not a session").unwrap();
+        let path = dir.join("session.json");
+        std::os::unix::fs::symlink(&elsewhere, &path).unwrap();
+
+        sample_session().save(&path).unwrap();
+        let meta = std::fs::symlink_metadata(&path).unwrap();
+        assert!(meta.file_type().is_file(), "the symlink is still there");
+        assert_eq!(mode_of(&path), 0o600);
+        assert_eq!(
+            std::fs::read_to_string(&elsewhere).unwrap(),
+            "not a session",
+            "the session was written through the symlink"
+        );
+        assert_eq!(Session::load(&path).unwrap().login, "octocat");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_the_save_creates_is_the_owners_alone() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = scratch_dir();
+        let path = dir.join("mediatore").join("session.json");
+        sample_session().save(&path).unwrap();
+        assert_eq!(mode_of(&dir.join("mediatore")), 0o700);
+        assert_eq!(mode_of(&path), 0o600);
+
+        // One that exists keeps its mode: it is not the CLI's to change.
+        let shared = dir.join("shared");
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
+        sample_session().save(&shared.join("session.json")).unwrap();
+        assert_eq!(mode_of(&shared), 0o755);
+        assert_eq!(mode_of(&shared.join("session.json")), 0o600);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ----- where the credentials may go (red-team review 2026-11-19, A minor) -----
+
+    #[test]
+    fn a_broker_url_that_is_not_https_is_refused_unless_it_is_this_machine() {
+        for ok in [
+            "https://mediatore.example",
+            "https://mediatore.example:8443/",
+            "https://192.0.2.10",
+            "http://127.0.0.1:8080",
+            "http://127.0.0.1:8080/",
+            "http://localhost:8080",
+            "http://LOCALHOST",
+            "http://[::1]:8080",
+        ] {
+            let base = checked_base(ok).unwrap();
+            assert_eq!(base, ok.trim_end_matches('/'));
+            assert!(Api::new(ok).is_ok(), "{ok}");
+        }
+        for refused in [
+            "http://mediatore.example",
+            "http://192.0.2.10:8080",
+            "http://localhost.example.com",
+            "http://127.0.0.1.example.com",
+            "http://[2001:db8::1]:8080",
+            "ftp://localhost",
+            "mediatore.example",
+            "",
+        ] {
+            assert!(checked_base(refused).is_err(), "{refused:?} was accepted");
+            assert!(Api::new(refused).is_err(), "{refused:?} was accepted");
+            // Refused before the CA is even read.
+            assert!(Api::with_ca(refused, b"").is_err(), "{refused:?}");
+        }
+        let e = checked_base("http://octocat@mediatore.example/x")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("https"), "{e}");
+        assert!(e.contains("http://mediatore.example"), "{e}");
+        assert!(!e.contains("octocat"), "the message carries the userinfo");
+    }
+
+    #[tokio::test]
+    async fn the_session_file_round_trips_owner_only() {
+        let dir = scratch_dir();
+        let path = dir.join("session.json");
+        let s = sample_session();
         s.save(&path).unwrap();
         #[cfg(unix)]
         {

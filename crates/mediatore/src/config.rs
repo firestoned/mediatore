@@ -791,6 +791,14 @@ impl Config {
                         r.path
                     );
                 }
+                if let Err(e) = r.validate() {
+                    anyhow::bail!(
+                        "audience {:?}: rule {{ method: {:?}, path: {:?} }}: {e}",
+                        a.name,
+                        r.method,
+                        r.path
+                    );
+                }
             }
         }
         Ok(())
@@ -993,6 +1001,7 @@ impl Config {
         cfg.check_inject()?;
         cfg.check_entra()?;
         cfg.check_gates()?;
+        cfg.check_issuer_urls()?;
         if !cfg.dev_mode && cfg.spire.is_none() {
             anyhow::bail!("`spire` (workload_api_socket, entries) is required outside dev_mode");
         }
@@ -1072,6 +1081,18 @@ impl Config {
     fn check_gates(&self) -> anyhow::Result<()> {
         for issuer in &self.issuers {
             issuer.gate()?;
+        }
+        Ok(())
+    }
+
+    /// An issuer is reached over `https` outside `dev_mode`: its discovery document names the
+    /// keys every login is verified with and the endpoint refresh tokens are posted to, so a
+    /// plain `http` issuer hands both to whoever sits on the path.
+    fn check_issuer_urls(&self) -> anyhow::Result<()> {
+        for issuer in &self.issuers {
+            if !self.dev_mode && !issuer.url.starts_with("https://") {
+                anyhow::bail!("issuer {}: url must be https outside dev_mode", issuer.url);
+            }
         }
         Ok(())
     }
@@ -1520,6 +1541,19 @@ listen: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }
     }
 
     #[test]
+    fn a_rule_with_two_double_stars_fails_the_config() {
+        let err = Config::parse(
+            "trust_domain: sandbox.test\nissuers: []\nlisten: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }\ndev_mode: true\nsts: { issuer: https://mediatore.test, kid: k, signing_key_file: /k }\naudiences:\n  - { name: a, via: sts, egress: [\"a.home.example:443\"], rules: [{ method: GET, path: \"/a/**/b/**\" }] }\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("audience \"a\"") && err.contains("**"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn an_endpoint_declared_by_two_audiences_fails_the_config() {
         let err = Config::parse(
             "trust_domain: sandbox.test\nissuers: []\nlisten: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }\ndev_mode: true\nsts: { issuer: https://mediatore.test, kid: k, signing_key_file: /k }\naudiences:\n  - { name: a, via: sts, egress: [\"api.home.example:443\"] }\n  - { name: b, via: sts, egress: [\"api.home.example:443\", \"b.home.example:443\"] }\n",
@@ -1823,6 +1857,30 @@ listen: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }
         let prod = "trust_domain: sandbox.test\nissuers: []\naudiences: []\nlisten: { user: 0.0.0.0:8080, sandbox: 0.0.0.0:8443 }\nspire:\n  workload_api_socket: unix:///run/spire/sockets/spire-agent.sock\n  entries:\n    class_name: spire-server-spire\nstore:\n  sealing:\n    transit: { url: http://openbao.home.example:8200, key: k, role: r }\n";
         let err = Config::parse(prod).unwrap_err();
         assert!(err.to_string().contains("must be https"), "{err}");
+    }
+
+    #[test]
+    fn an_issuer_url_is_https_outside_dev_mode() {
+        let issuer = |url: &str| {
+            format!(
+                "issuers:\n  - url: {url}\n    backend: sts\n    client_id: mediatore\n    allow_any_authenticated: true\n"
+            )
+        };
+        let prod = "trust_domain: sandbox.test\naudiences: []\nlisten: { user: 0.0.0.0:8080, sandbox: 0.0.0.0:8443 }\nspire:\n  workload_api_socket: unix:///run/spire/sockets/spire-agent.sock\n  entries:\n    class_name: spire-server-spire\n";
+        let dev = "trust_domain: sandbox.test\naudiences: []\nlisten: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }\ndev_mode: true\n";
+        for plain in ["http://idp.example.com", "idp.example.com"] {
+            let err = Config::parse(&format!("{prod}{}", issuer(plain))).unwrap_err();
+            let err = err.to_string();
+            assert!(
+                err.contains(&format!("issuer {plain}")) && err.contains("must be https"),
+                "{err}"
+            );
+        }
+        let cfg = Config::parse(&format!("{prod}{}", issuer("https://idp.example.com"))).unwrap();
+        assert_eq!(cfg.issuers[0].url, "https://idp.example.com");
+        // http reaches an issuer only under dev_mode (the demo's fake one on loopback).
+        let cfg = Config::parse(&format!("{dev}{}", issuer("http://127.0.0.1:18082"))).unwrap();
+        assert_eq!(cfg.issuers[0].url, "http://127.0.0.1:18082");
     }
 
     #[test]

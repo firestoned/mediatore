@@ -4,8 +4,10 @@
 # Dependabot auto-merge, following banlieue's design:
 #   - the e2e gate (reusable e2e.yaml) must pass before anything merges;
 #   - patch / minor -> enable auto-merge (squash);
-#   - major -> leave OPEN and comment for manual review; a human approval
-#     re-triggers this workflow and counts as the sign-off;
+#   - major -> leave OPEN and comment for manual review; an approval by the
+#     owner, a member or a collaborator re-triggers this workflow and counts
+#     as the sign-off (anyone with a GitHub account can submit an approving
+#     review on a public repository, so the reviewer's association is checked);
 #   - any failure leaves the PR untouched. Fail-safe: this workflow can only
 #     ever ENABLE a merge on an explicit green run.
 #
@@ -22,19 +24,25 @@ on:
 permissions:
   contents: read
 
+# A newer push to the PR cancels the older run of the same PR. Review events
+# run in a group of their own, keyed by the review's state, and never cancel:
+# a comment or a drive-by review must not be able to stop an in-flight gate.
 concurrency:
-  group: dependabot-automerge-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+  group: dependabot-automerge-${{ github.event.pull_request.number }}-${{ github.event_name }}-${{ github.event.review.state || 'push' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   metadata:
     name: Fetch Dependabot metadata
     # Gate on the PR author (stable for the PR's life), not github.actor.
-    # On review events, only an approval is a merge signal.
+    # On review events, only an approval is a merge signal, and only from an
+    # author GitHub associates with this repository.
     if: >-
       github.event.pull_request.user.login == 'dependabot[bot]'
       && (github.event_name != 'pull_request_review'
-          || github.event.review.state == 'approved')
+          || (github.event.review.state == 'approved'
+              && contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'),
+                          github.event.review.author_association)))
     runs-on: ubuntu-latest
     permissions:
       pull-requests: read
@@ -49,21 +57,25 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
       # The single place that decides "may this merge itself?":
-      # patch/minor yes; a human approval yes (it IS the manual review a held
-      # major was waiting for); everything else holds.
+      # patch/minor yes; an approval by the owner, a member or a collaborator
+      # yes (it IS the manual review a held major was waiting for); everything
+      # else holds. Event fields reach the script through env, never inline.
       - name: Classify
         id: classify
         env:
           UPDATE_TYPE: ${{ steps.meta.outputs.update-type }}
           EVENT: ${{ github.event_name }}
           REVIEW_STATE: ${{ github.event.review.state }}
+          REVIEW_ASSOCIATION: ${{ github.event.review.author_association }}
         run: |
           allow=false
           case "$UPDATE_TYPE" in
             version-update:semver-patch|version-update:semver-minor) allow=true ;;
           esac
           if [ "$EVENT" = "pull_request_review" ] && [ "$REVIEW_STATE" = "approved" ]; then
-            allow=true
+            case "$REVIEW_ASSOCIATION" in
+              OWNER|MEMBER|COLLABORATOR) allow=true ;;
+            esac
           fi
           echo "auto-merge=$allow" >> "$GITHUB_OUTPUT"
 
@@ -105,4 +117,4 @@ jobs:
           UPDATE_TYPE: ${{ needs.metadata.outputs.update-type }}
         run: |
           gh pr comment "$PR_URL" --body \
-            "Held for manual review (update-type: \`$UPDATE_TYPE\`). The e2e gate passed; approving this PR will enable auto-merge."
+            "Held for manual review (update-type: \`$UPDATE_TYPE\`). The e2e gate passed; an approval by the owner, a member or a collaborator will enable auto-merge."

@@ -29,8 +29,8 @@ EXPECTED_KINDS = {
     "Service": 2,
     "ClusterSPIFFEID": 1,
     "ConfigMap": 1,
-    "ValidatingAdmissionPolicy": 2,
-    "ValidatingAdmissionPolicyBinding": 2,
+    "ValidatingAdmissionPolicy": 3,
+    "ValidatingAdmissionPolicyBinding": 3,
 }
 
 

@@ -33,6 +33,17 @@ use tokio::sync::RwLock;
 /// How long a fetched JWKS may be served from cache before it is re-fetched.
 const JWKS_CACHE_TTL_SECS: u64 = 300;
 
+/// The least time between two fetches of one issuer's keys while a previously fetched set is
+/// held. A `kid` the held set does not have is answered from that set, with no fetch, until
+/// this long after the last fetch began; and after a fetch that failed, the next one waits
+/// this long. An unauthenticated caller choosing `kid` values cannot ask the issuer more often.
+const JWKS_REFETCH_INTERVAL_SECS: u64 = 30;
+
+/// How old a key set may get while the issuer cannot be asked for a newer one. Past the cache
+/// TTL a set is served only when its re-fetch failed, and never past this: then validation
+/// fails with the outage.
+const JWKS_MAX_STALE_SECS: u64 = 3600;
+
 /// How long a connection to an issuer may take to open. An issuer that does not answer is an
 /// outage ([`IdpError::Upstream`]), never a request that waits for ever.
 const IDP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -41,6 +52,16 @@ const IDP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Every call here is a small request with a small answer (discovery, the JWKS, one token
 /// grant); none is a stream. It also bounds how long the per-issuer fetch gate is held.
 const IDP_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Clock skew allowed between the issuer and the broker, in seconds, on both `exp` and `nbf`:
+/// a token is accepted up to this long after it expired and up to this long before it becomes
+/// valid. Stated here on purpose, so it does not move with the library's default.
+const CLOCK_SKEW_LEEWAY_SECS: u64 = 60;
+
+/// The registered claims a token must carry to be looked at. Without `aud` in this list the
+/// library skips the audience check for a token that has no `aud` at all, and the same holds
+/// for `iss`.
+const REQUIRED_CLAIMS: &[&str] = &["exp", "aud", "iss"];
 
 /// Which exchange mechanism serves an issuer, or mints for an audience.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -307,6 +328,18 @@ fn peek_issuer(token: &str) -> Result<String, IdpError> {
         .ok_or_else(|| IdpError::Invalid("missing iss".into()))
 }
 
+/// Refuse an endpoint the discovery document names over plain HTTP when the issuer itself is
+/// HTTPS: an `https` issuer never sends the broker to fetch keys or post a grant in clear.
+/// An `http` issuer (`dev_mode` only, the configuration refuses it otherwise) is left alone.
+fn require_https_endpoint(issuer_url: &str, what: &str, endpoint: &str) -> Result<(), IdpError> {
+    if issuer_url.starts_with("https://") && !endpoint.starts_with("https://") {
+        return Err(IdpError::Upstream(format!(
+            "discovery document's {what} is not https for an https issuer"
+        )));
+    }
+    Ok(())
+}
+
 /// What the discovery document told us, with the JWKS, and when. Shared behind an `Arc`: a
 /// validation borrows the key it needs, nothing is copied per request.
 struct CachedIssuer {
@@ -321,8 +354,14 @@ struct CachedIssuer {
 
 impl CachedIssuer {
     /// Within [`JWKS_CACHE_TTL_SECS`] of its fetch.
-    fn is_fresh(&self) -> bool {
-        self.fetched_at.elapsed().as_secs() < JWKS_CACHE_TTL_SECS
+    fn is_fresh(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.fetched_at).as_secs() < JWKS_CACHE_TTL_SECS
+    }
+
+    /// Within [`JWKS_MAX_STALE_SECS`] of its fetch: it may still stand in for a fetch that
+    /// failed or that the refetch interval does not allow yet.
+    fn within_max_stale(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.fetched_at).as_secs() < JWKS_MAX_STALE_SECS
     }
 
     /// The key that signed `kid`; with no `kid`, the set's first key.
@@ -342,6 +381,39 @@ impl CachedIssuer {
 struct FetchGate {
     /// When the last fetch failed and with what, `None` after a success.
     failed: Option<(Instant, String)>,
+    /// When the last fetch began, whatever came of it; what the refetch interval counts from.
+    last_attempt: Option<Instant>,
+}
+
+impl FetchGate {
+    /// Whether the last fetch began less than [`JWKS_REFETCH_INTERVAL_SECS`] ago.
+    fn fetched_within_interval(&self, now: Instant) -> bool {
+        self.last_attempt.is_some_and(|at| {
+            now.saturating_duration_since(at).as_secs() < JWKS_REFETCH_INTERVAL_SECS
+        })
+    }
+}
+
+/// The monotonic clock the key cache reads: the process clock, which a test moves ahead
+/// instead of sleeping. Clones share the offset, as clones of a [`Validator`] share the cache.
+#[derive(Clone, Default)]
+struct Clock {
+    /// Seconds added to the process clock; never set outside tests.
+    ahead_secs: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl Clock {
+    fn now(&self) -> Instant {
+        Instant::now()
+            + Duration::from_secs(self.ahead_secs.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Move the clock ahead by `by`, whole seconds.
+    #[cfg(test)]
+    fn advance(&self, by: Duration) {
+        self.ahead_secs
+            .fetch_add(by.as_secs(), std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// What a refresh yields (ADR-0013 decision 4).
@@ -386,6 +458,8 @@ pub struct Validator {
     jwks: Arc<RwLock<HashMap<String, Arc<CachedIssuer>>>>,
     /// One fetch gate per configured issuer, keyed by issuer URL; fixed at construction.
     fetch_gates: Arc<HashMap<String, tokio::sync::Mutex<FetchGate>>>,
+    /// What the key cache's TTL, refetch interval and maximum staleness are measured with.
+    clock: Clock,
 }
 
 impl std::fmt::Debug for Validator {
@@ -457,6 +531,7 @@ impl Validator {
             session_secrets: HashMap::new(),
             jwks: Arc::new(RwLock::new(HashMap::new())),
             fetch_gates: Arc::new(fetch_gates),
+            clock: Clock::default(),
         }
     }
 
@@ -522,14 +597,30 @@ impl Validator {
     ///
     /// One caller per issuer fetches at a time (the issuer's [`FetchGate`]); a caller that
     /// waited takes what the fetch it waited for brought back when that answers its question:
-    /// any fetch that began after it asked, or, unforced, any set still within the TTL. So a
-    /// forced caller (a `kid` miss) always leaves with a set whose fetch began after it asked,
-    /// exactly as when every caller fetched for itself; nothing delays or skips a forced fetch.
+    /// any fetch that began after it asked, or, unforced, any set still within the TTL.
+    ///
+    /// What changed from "a forced caller (a `kid` miss) always leaves with a set whose fetch
+    /// began after it asked; nothing delays or skips a forced fetch": that guarantee let anyone
+    /// who could send a bearer naming a configured `iss` and a made-up `kid` have the issuer
+    /// asked once per request. It now holds only outside [`JWKS_REFETCH_INTERVAL_SECS`]:
+    ///
+    /// * While a set is held that is no older than [`JWKS_MAX_STALE_SECS`], no fetch begins
+    ///   within the interval of the last one. A caller inside it, forced or not, is answered
+    ///   from the held set: for a `kid` miss that is "no key for this kid". A key the issuer
+    ///   rotated in is picked up by the first miss after the interval, so it is refused for at
+    ///   most the interval.
+    /// * A fetch that fails leaves the held set in place. An unforced caller (the cache TTL ran
+    ///   out) is served that set, said at `warn`, and the issuer is asked again after the
+    ///   interval, until the set is older than the maximum staleness; from then on the outage
+    ///   is the caller's, as it always was with nothing cached. A forced caller whose own fetch
+    ///   failed is told of the outage: the held set does not have its key.
+    /// * With no set to serve nothing is rate limited: every caller that arrives after a
+    ///   failed fetch tries again, and those that waited through it share its error.
     async fn discover(&self, issuer_url: &str, force: bool) -> Result<Arc<CachedIssuer>, IdpError> {
-        let asked = Instant::now();
+        let asked = self.clock.now();
         if !force
             && let Some(cached) = self.cached(issuer_url).await
-            && cached.is_fresh()
+            && cached.is_fresh(asked)
         {
             return Ok(cached);
         }
@@ -539,10 +630,19 @@ impl Validator {
             return self.fetch(issuer_url).await;
         };
         let mut gate = gate.lock().await;
-        if let Some(cached) = self.cached(issuer_url).await
-            && (cached.started_at >= asked || (!force && cached.is_fresh()))
+        let now = self.clock.now();
+        let cached = self.cached(issuer_url).await;
+        if let Some(cached) = &cached
+            && (cached.started_at >= asked || (!force && cached.is_fresh(now)))
         {
-            return Ok(cached);
+            return Ok(cached.clone());
+        }
+        // The held set, while it may stand in for a fetch.
+        let previous = cached.filter(|c| c.within_max_stale(now));
+        if let Some(previous) = &previous
+            && gate.fetched_within_interval(now)
+        {
+            return Ok(previous.clone());
         }
         if let Some((at, why)) = &gate.failed
             && *at >= asked
@@ -550,18 +650,35 @@ impl Validator {
             // The fetch this caller waited for failed: its outage is this caller's too.
             return Err(IdpError::Upstream(why.clone()));
         }
-        let fetched = self.fetch(issuer_url).await;
-        gate.failed = match &fetched {
-            Ok(_) => None,
-            Err(IdpError::Upstream(why)) => Some((Instant::now(), why.clone())),
-            Err(e) => Some((Instant::now(), e.to_string())),
-        };
-        fetched
+        gate.last_attempt = Some(now);
+        match self.fetch(issuer_url).await {
+            Ok(fetched) => {
+                gate.failed = None;
+                Ok(fetched)
+            }
+            Err(e) => {
+                let why = match &e {
+                    IdpError::Upstream(why) => why.clone(),
+                    other => other.to_string(),
+                };
+                gate.failed = Some((self.clock.now(), why.clone()));
+                let Some(previous) = previous else {
+                    return Err(e);
+                };
+                tracing::warn!(
+                    issuer = issuer_url,
+                    error = %why,
+                    retry_after_secs = JWKS_REFETCH_INTERVAL_SECS,
+                    "the issuer's keys could not be re-fetched; the previous set stays in use"
+                );
+                if force { Err(e) } else { Ok(previous) }
+            }
+        }
     }
 
     /// Fetch the discovery document and the JWKS it names, and cache them.
     async fn fetch(&self, issuer_url: &str) -> Result<Arc<CachedIssuer>, IdpError> {
-        let started_at = Instant::now();
+        let started_at = self.clock.now();
         let discovery_url = format!(
             "{}/.well-known/openid-configuration",
             issuer_url.trim_end_matches('/')
@@ -581,10 +698,14 @@ impl Validator {
             .get("jwks_uri")
             .and_then(|v| v.as_str())
             .ok_or_else(|| IdpError::Upstream("discovery document has no jwks_uri".into()))?;
+        require_https_endpoint(issuer_url, "jwks_uri", jwks_uri)?;
         let token_endpoint = discovery
             .get("token_endpoint")
             .and_then(|v| v.as_str())
             .map(ToOwned::to_owned);
+        if let Some(endpoint) = &token_endpoint {
+            require_https_endpoint(issuer_url, "token_endpoint", endpoint)?;
+        }
 
         let set: JwkSet = self
             .http_for(issuer_url)
@@ -603,7 +724,7 @@ impl Validator {
             set,
             token_endpoint,
             started_at,
-            fetched_at: Instant::now(),
+            fetched_at: self.clock.now(),
         });
         self.jwks
             .write()
@@ -612,8 +733,9 @@ impl Validator {
         Ok(cached)
     }
 
-    /// The issuer's keys with the one that signed `kid` among them, re-fetching the JWKS once
-    /// on a miss (key rotation). The caller borrows the key with [`CachedIssuer::key`].
+    /// The issuer's keys with the one that signed `kid` among them, re-fetching the JWKS on a
+    /// miss (key rotation) when the refetch interval allows it, see [`Self::discover`]. The
+    /// caller borrows the key with [`CachedIssuer::key`].
     async fn key_for(
         &self,
         issuer_url: &str,
@@ -631,8 +753,10 @@ impl Validator {
         }
     }
 
-    /// Full validation: signature via the issuer's JWKS, `aud` == `client_id`, `exp`/`nbf`,
-    /// subject claim present, group gate satisfied.
+    /// Full validation: signature via the issuer's JWKS, `iss` and `aud` present with
+    /// `aud` == `client_id`, `exp` present and not passed, `nbf` not in the future when the
+    /// token carries one (both within `CLOCK_SKEW_LEEWAY_SECS`), subject claim present,
+    /// group gate satisfied.
     pub async fn validate(&self, token: &str) -> Result<Validated, IdpError> {
         let issuer = self.issuer_for(token)?.clone();
         self.validate_as(&issuer, token).await
@@ -861,6 +985,9 @@ impl Validator {
         let mut validation = Validation::new(algorithm_of(jwk)?);
         validation.set_audience(&[&issuer.client_id]);
         validation.set_issuer(&[&issuer.url]);
+        validation.set_required_spec_claims(REQUIRED_CLAIMS);
+        validation.validate_nbf = true;
+        validation.leeway = CLOCK_SKEW_LEEWAY_SECS;
         let data = jsonwebtoken::decode::<serde_json::Value>(token, &key, &validation)
             .map_err(|e| IdpError::Invalid(e.to_string()))?;
         let claims = data.claims;
@@ -870,6 +997,16 @@ impl Validator {
             .and_then(|v| v.as_str())
             .ok_or_else(|| IdpError::Invalid(format!("missing claim {}", issuer.subject_claim)))?
             .to_owned();
+        // An address the issuer has not verified is whatever its holder typed: as the subject
+        // it would let one account take another's name (ADR-0017).
+        if issuer.subject_claim == "email"
+            && claims
+                .get("email_verified")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+        {
+            return Err(IdpError::Invalid("email is not verified".into()));
+        }
 
         let groups = if let Some(claim) = &issuer.groups_claim {
             string_array(&claims, claim)
@@ -1369,6 +1506,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_token_with_no_audience_is_invalid() {
+        let idp = FakeIdp::start().await;
+        let v = Validator::new(vec![issuer_config(&idp)]);
+        // Correctly signed, the right issuer, the right group: only `aud` is absent.
+        let token = idp.token(serde_json::json!({
+            "preferred_username": "octocat",
+            "groups": ["firestoned:sandbox-users"],
+        }));
+        assert!(matches!(
+            v.validate(&token).await,
+            Err(IdpError::Invalid(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_email_subject_needs_the_issuer_to_have_verified_it() {
+        let idp = FakeIdp::start().await;
+        let mut by_email = issuer_config(&idp);
+        by_email.subject_claim = "email".into();
+        let v = Validator::new(vec![by_email]);
+        let login = |verified: Option<bool>| {
+            let mut claims = serde_json::json!({
+                "aud": "mediatore",
+                "email": "octocat@example.com",
+                "preferred_username": "octocat",
+                "groups": ["firestoned:sandbox-users"],
+            });
+            if let Some(v) = verified {
+                claims["email_verified"] = v.into();
+            }
+            idp.token(claims)
+        };
+        let out = v.validate(&login(Some(true))).await.unwrap();
+        assert_eq!(out.subject.id, "octocat@example.com");
+        for unverified in [Some(false), None] {
+            assert!(matches!(
+                v.validate(&login(unverified)).await,
+                Err(IdpError::Invalid(_))
+            ));
+        }
+        // A subject that is not the address does not ask for the flag.
+        let v = Validator::new(vec![issuer_config(&idp)]);
+        assert!(v.validate(&login(None)).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_token_not_yet_valid_is_invalid_and_one_within_the_leeway_is_not() {
+        let idp = FakeIdp::start().await;
+        let v = Validator::new(vec![issuer_config(&idp)]);
+        let starting_in = |secs: i64| {
+            idp.token(serde_json::json!({
+                "aud": "mediatore",
+                "preferred_username": "octocat",
+                "groups": ["firestoned:sandbox-users"],
+                "nbf": jiff::Timestamp::now().as_second() + secs,
+                "exp": jiff::Timestamp::now().as_second() + 7200,
+            }))
+        };
+        assert!(matches!(
+            v.validate(&starting_in(3600)).await,
+            Err(IdpError::Invalid(_))
+        ));
+        let skew = i64::try_from(CLOCK_SKEW_LEEWAY_SECS).unwrap();
+        let out = v.validate(&starting_in(skew / 2)).await.unwrap();
+        assert_eq!(out.subject.id, "octocat");
+    }
+
+    #[test]
+    fn an_https_issuer_is_not_sent_to_a_plain_http_endpoint() {
+        let https = "https://idp.example.com";
+        for what in ["jwks_uri", "token_endpoint"] {
+            let plain = "http://idp.example.com/x";
+            let err = require_https_endpoint(https, what, plain).unwrap_err();
+            assert!(
+                matches!(&err, IdpError::Upstream(why) if why.contains(what)),
+                "{err}"
+            );
+            assert!(require_https_endpoint(https, what, "https://idp.example.com/x").is_ok());
+            // Not a URL with a scheme at all: refused with the rest.
+            assert!(require_https_endpoint(https, what, "idp.example.com/x").is_err());
+            // The dev-mode issuer over plain HTTP keeps its plain HTTP endpoints.
+            let dev = "http://127.0.0.1:5556";
+            assert!(require_https_endpoint(dev, what, "http://127.0.0.1:5556/x").is_ok());
+        }
+    }
+
+    #[tokio::test]
     async fn garbage_is_invalid() {
         let v = Validator::new(vec![]);
         assert!(v.validate("not-a-jwt").await.is_err());
@@ -1565,27 +1789,292 @@ mod tests {
         assert_eq!((idp.discovery_fetches(), idp.jwks_fetches()), (1, 1));
     }
 
+    /// One second past the refetch interval.
+    fn past_the_interval() -> Duration {
+        Duration::from_secs(JWKS_REFETCH_INTERVAL_SECS + 1)
+    }
+
     #[tokio::test]
-    async fn an_unknown_kid_refetches_once_and_is_then_refused_every_time() {
+    async fn many_unknown_kids_refetch_the_keys_once_an_interval_and_are_refused_every_time() {
         let idp = FakeIdp::start().await;
         let v = Validator::new(vec![issuer_config(&idp)]);
-        let unknown = with_kid(&login_token(&idp), "rotated-in-elsewhere");
-        // A cold cache: the fetch, the miss, the forced fetch, the refusal.
+        let token = login_token(&idp);
+        // A cold cache: the fetch, the miss, and no second fetch inside the interval.
         assert!(matches!(
-            v.validate(&unknown).await,
+            v.validate(&with_kid(&token, "made-up-0")).await,
             Err(IdpError::Invalid(_))
         ));
+        assert_eq!((idp.discovery_fetches(), idp.jwks_fetches()), (1, 1));
+        // A warm cache: any number of made-up kids ask the issuer nothing.
+        for i in 1..20 {
+            assert!(matches!(
+                v.validate(&with_kid(&token, &format!("made-up-{i}"))).await,
+                Err(IdpError::Invalid(_))
+            ));
+        }
+        assert_eq!((idp.discovery_fetches(), idp.jwks_fetches()), (1, 1));
+        // Past the interval the first miss asks once, and the rest are answered from that.
+        v.clock.advance(past_the_interval());
+        for i in 20..40 {
+            assert!(matches!(
+                v.validate(&with_kid(&token, &format!("made-up-{i}"))).await,
+                Err(IdpError::Invalid(_))
+            ));
+        }
         assert_eq!((idp.discovery_fetches(), idp.jwks_fetches()), (2, 2));
-        // A warm cache: the miss still asks the issuer again, at once, exactly once. A key
-        // the issuer rotated in is accepted on the validation that first meets it.
+        // The published key is served from what the last fetch brought back.
+        v.validate(&token).await.unwrap();
+        assert_eq!((idp.discovery_fetches(), idp.jwks_fetches()), (2, 2));
+    }
+
+    /// What a [`StubIssuer`] answers with.
+    struct StubState {
+        /// The JWKS document it publishes.
+        jwks: serde_json::Value,
+        /// Answer `503` to discovery and to the JWKS.
+        failing: bool,
+        /// How many times discovery was asked for, answered or refused: one per fetch.
+        discoveries: usize,
+    }
+
+    /// An issuer that is discovery and a JWKS and nothing else, whose published keys a test
+    /// replaces and which a test takes down: the two things the test kit's fake issuer does
+    /// not do. Each connection serves one request and is closed, so taking it down is seen by
+    /// the very next fetch.
+    struct StubIssuer {
+        url: String,
+        state: Arc<std::sync::Mutex<StubState>>,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for StubIssuer {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+
+    /// The status line and body for one request to a [`StubIssuer`].
+    fn stub_answer(
+        state: &std::sync::Mutex<StubState>,
+        issuer: &str,
+        path: &str,
+    ) -> (&'static str, String) {
+        let mut st = state.lock().unwrap();
+        let body = match path {
+            "/.well-known/openid-configuration" => {
+                st.discoveries += 1;
+                serde_json::json!({
+                    "issuer": issuer,
+                    "jwks_uri": format!("{issuer}/jwks"),
+                    "token_endpoint": format!("{issuer}/token"),
+                })
+            }
+            "/jwks" => st.jwks.clone(),
+            _ => return ("404 Not Found", "{}".to_owned()),
+        };
+        if st.failing {
+            ("503 Service Unavailable", "{}".to_owned())
+        } else {
+            ("200 OK", body.to_string())
+        }
+    }
+
+    impl StubIssuer {
+        async fn start(jwks: serde_json::Value) -> Self {
+            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let state = Arc::new(std::sync::Mutex::new(StubState {
+                jwks,
+                failing: false,
+                discoveries: 0,
+            }));
+            let (served, issuer) = (state.clone(), url.clone());
+            let task = tokio::spawn(async move {
+                while let Ok((mut socket, _)) = listener.accept().await {
+                    let (served, issuer) = (served.clone(), issuer.clone());
+                    tokio::spawn(async move {
+                        let mut request = Vec::new();
+                        let mut chunk = [0u8; 1024];
+                        while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                            match socket.read(&mut chunk).await {
+                                Ok(n) if n > 0 => request.extend_from_slice(&chunk[..n]),
+                                _ => return,
+                            }
+                        }
+                        let request = String::from_utf8_lossy(&request).into_owned();
+                        let path = request.split_whitespace().nth(1).unwrap_or_default();
+                        let (status, body) = stub_answer(&served, &issuer, path);
+                        let reply = format!(
+                            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = socket.write_all(reply.as_bytes()).await;
+                        let _ = socket.shutdown().await;
+                    });
+                }
+            });
+            Self {
+                url,
+                state,
+                server: task,
+            }
+        }
+
+        fn set_failing(&self, failing: bool) {
+            self.state.lock().unwrap().failing = failing;
+        }
+
+        fn publish(&self, jwks: serde_json::Value) {
+            self.state.lock().unwrap().jwks = jwks;
+        }
+
+        fn discoveries(&self) -> usize {
+            self.state.lock().unwrap().discoveries
+        }
+
+        /// This issuer as the configuration names it: no group gate.
+        fn config(&self) -> IssuerConfig {
+            let mut cfg = gate_cfg(&serde_json::json!({ "allow_any_authenticated": true }));
+            cfg.url.clone_from(&self.url);
+            cfg
+        }
+
+        /// A login token of this issuer, signed with the test kit's issuer key.
+        fn token(&self) -> String {
+            mediatore_testkit::mint(
+                &self.url,
+                serde_json::json!({ "aud": "mediatore", "preferred_username": "octocat" }),
+            )
+        }
+    }
+
+    /// The JWKS document the test kit's fake issuer publishes (the public half of the key
+    /// [`mediatore_testkit::mint`] signs with), its key renamed to `kid` when one is given.
+    async fn test_jwks(kid: Option<&str>) -> serde_json::Value {
+        let idp = FakeIdp::start().await;
+        let v = Validator::new(vec![issuer_config(&idp)]);
+        let set = v.discover(&idp.issuer, false).await.unwrap().set.clone();
+        let mut jwks = serde_json::to_value(&set).unwrap();
+        if let Some(kid) = kid {
+            jwks["keys"][0]["kid"] = serde_json::json!(kid);
+        }
+        jwks
+    }
+
+    #[tokio::test]
+    async fn a_failing_issuer_after_a_good_fetch_still_validates_with_the_cached_keys() {
+        let issuer = StubIssuer::start(test_jwks(None).await).await;
+        let v = Validator::new(vec![issuer.config()]);
+        let token = issuer.token();
+        v.validate(&token).await.unwrap();
+        assert_eq!(issuer.discoveries(), 1);
+
+        // The issuer goes away and the cache TTL runs out: the re-fetch fails, the keys
+        // already held go on validating.
+        issuer.set_failing(true);
+        v.clock
+            .advance(Duration::from_secs(JWKS_CACHE_TTL_SECS + 1));
+        assert_eq!(v.validate(&token).await.unwrap().subject.id, "octocat");
+        assert_eq!(issuer.discoveries(), 2, "the re-fetch was tried");
+        // Inside the interval the failing issuer is left alone.
+        for _ in 0..5 {
+            v.validate(&token).await.unwrap();
+        }
+        assert_eq!(issuer.discoveries(), 2);
+        // Past it, it is asked again, once, and the held keys still serve.
+        v.clock.advance(past_the_interval());
+        v.validate(&token).await.unwrap();
+        v.validate(&token).await.unwrap();
+        assert_eq!(issuer.discoveries(), 3);
+
+        // Back up: the next try past the interval takes a fresh set, and that one is cached.
+        issuer.set_failing(false);
+        v.clock.advance(past_the_interval());
+        v.validate(&token).await.unwrap();
+        v.validate(&token).await.unwrap();
+        assert_eq!(issuer.discoveries(), 4);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_kid_while_the_issuer_is_down_is_an_outage_once_and_the_cached_keys_still_serve()
+     {
+        let issuer = StubIssuer::start(test_jwks(None).await).await;
+        let v = Validator::new(vec![issuer.config()]);
+        let token = issuer.token();
+        v.validate(&token).await.unwrap();
+        issuer.set_failing(true);
+        v.clock.advance(past_the_interval());
+        // The cache is within its TTL; the miss is what asks, and the issuer does not answer.
         assert!(matches!(
-            v.validate(&unknown).await,
+            v.validate(&with_kid(&token, "rotated-in-elsewhere")).await,
+            Err(IdpError::Upstream(_))
+        ));
+        assert_eq!(issuer.discoveries(), 2);
+        // The next misses are inside the interval: refused from the held set, nothing asked.
+        assert!(matches!(
+            v.validate(&with_kid(&token, "rotated-in-elsewhere")).await,
             Err(IdpError::Invalid(_))
         ));
-        assert_eq!((idp.discovery_fetches(), idp.jwks_fetches()), (3, 3));
-        // The published key is served from what the last fetch brought back.
-        v.validate(&login_token(&idp)).await.unwrap();
-        assert_eq!((idp.discovery_fetches(), idp.jwks_fetches()), (3, 3));
+        v.validate(&token).await.unwrap();
+        assert_eq!(issuer.discoveries(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_rotated_in_key_is_accepted_by_the_first_validation_after_the_interval() {
+        // The issuer publishes its key under another name: the token's kid is unknown.
+        let issuer = StubIssuer::start(test_jwks(Some("retired")).await).await;
+        let v = Validator::new(vec![issuer.config()]);
+        let token = issuer.token();
+        assert!(matches!(
+            v.validate(&token).await,
+            Err(IdpError::Invalid(_))
+        ));
+        assert_eq!(issuer.discoveries(), 1);
+
+        // The key is rotated in. Inside the interval the held set still answers.
+        issuer.publish(test_jwks(None).await);
+        assert!(matches!(
+            v.validate(&token).await,
+            Err(IdpError::Invalid(_))
+        ));
+        assert_eq!(issuer.discoveries(), 1, "no fetch inside the interval");
+
+        // Past it, the first miss fetches and the token validates on that same call.
+        v.clock.advance(past_the_interval());
+        assert_eq!(v.validate(&token).await.unwrap().subject.id, "octocat");
+        assert_eq!(issuer.discoveries(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_key_set_past_the_maximum_staleness_is_not_served() {
+        let issuer = StubIssuer::start(test_jwks(None).await).await;
+        let v = Validator::new(vec![issuer.config()]);
+        let token = issuer.token();
+        v.validate(&token).await.unwrap();
+        issuer.set_failing(true);
+
+        // Just inside the maximum: stale, the re-fetch fails, the held keys serve.
+        let margin = past_the_interval().as_secs();
+        v.clock
+            .advance(Duration::from_secs(JWKS_MAX_STALE_SECS - margin));
+        v.validate(&token).await.unwrap();
+        assert_eq!(issuer.discoveries(), 2);
+
+        // Past it: the outage is the caller's, and every caller asks, as with a cold cache.
+        v.clock.advance(Duration::from_secs(margin + 1));
+        for asked in 3..=4 {
+            assert!(matches!(
+                v.validate(&token).await,
+                Err(IdpError::Upstream(_))
+            ));
+            assert_eq!(issuer.discoveries(), asked);
+        }
+
+        // And the issuer coming back is seen at once.
+        issuer.set_failing(false);
+        v.validate(&token).await.unwrap();
     }
 
     #[tokio::test]

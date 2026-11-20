@@ -70,6 +70,10 @@ NOTAIO_VERSION         ?= 0.3.3
 NOTAIO_CRDS_SHA256     := f26c2d9e7aa967f7ca815e6da269a1e1f1bf21213a787c3cfbf68663fbffc5c9
 NOTAIO_MANIFEST_SHA256 := 3581bd524a822e3cb773d05a4587ad28d139b7073613711654bb598b8eedbd2c
 
+# cargo-cyclonedx, what `make sbom` installs when the host has none: an exact version,
+# built with its own lockfile, in the job that uploads the release binary.
+CARGO_CYCLONEDX_VERSION ?= 0.5.9
+
 # CALM (FINOS Common Architecture Language Model) configuration
 CALM_CLI_VERSION  ?= 1.37.0
 CALM_ARCH          := docs/architecture/calm/architecture.json
@@ -112,7 +116,7 @@ ci-preempt: ## Cancel the CI runs CI_PREEMPT_EVENT supersedes (push: the runs of
 # ----- Supply chain ----------------------------------------------------------
 
 sbom: ## Generate CycloneDX SBOM(s) for the workspace (*.cdx.json per crate)
-	@command -v cargo-cyclonedx >/dev/null 2>&1 || cargo install cargo-cyclonedx --locked
+	@command -v cargo-cyclonedx >/dev/null 2>&1 || cargo install cargo-cyclonedx --locked --version $(CARGO_CYCLONEDX_VERSION)
 	cargo cyclonedx --format json
 	@echo "✓ CycloneDX SBOM(s) generated"
 
@@ -437,7 +441,7 @@ kind-spire: kind-create kind-openbao ## Apply SPIRE (server, controller manager,
 
 kind-deploy: kind-create ## Apply the broker's CRD, ServiceAccount, RBAC and admission policies; mint its kubeconfig
 	@$(KIND_KUBECTL) get ns banlieue-system >/dev/null 2>&1 || $(KIND_KUBECTL) create ns banlieue-system
-	$(KIND_KUBECTL) apply -n banlieue-system -f deploy/base/crds -f deploy/base/serviceaccount.yaml -f deploy/base/rbac.yaml -f deploy/base/admission/clusterstaticentry-mediatore.yaml -f deploy/base/admission/agentsandbox-subject.yaml
+	$(KIND_KUBECTL) apply -n banlieue-system -f deploy/base/crds -f deploy/base/serviceaccount.yaml -f deploy/base/rbac.yaml -f deploy/base/admission/clusterstaticentry-mediatore.yaml -f deploy/base/admission/agentsandbox-subject.yaml -f deploy/base/admission/agentsandbox-status.yaml
 	@./dev/kind/sa-kubeconfig.sh $(KIND_KUBECONFIG) $(KIND_SA_KUBECONFIG)
 	@./dev/kind/admission-settled.sh $(KIND_SA_KUBECONFIG) $(SPIRE_TRUST_DOMAIN)
 
@@ -577,7 +581,7 @@ kind-e2e-logs: ## What a failing live suite needs: entries, policy, broker and c
 	-$(KIND_KUBECTL) -n mediatore-e2e-tpm logs deploy/member -c spire-agent --tail=80
 	-$(KIND_KUBECTL) -n mediatore-e2e-tpm logs deploy/member -c guest --tail=40
 	-$(KIND_KUBECTL) -n $(SPIRE_NAMESPACE) exec spire-server-0 -c spire-server -- spire-server agent list
-	-$(KIND_KUBECTL) get validatingadmissionpolicy mediatore-clusterstaticentry mediatore-agentsandbox-subject -o yaml
+	-$(KIND_KUBECTL) get validatingadmissionpolicy mediatore-clusterstaticentry mediatore-agentsandbox-subject mediatore-agentsandbox-status -o yaml
 	-$(KIND_KUBECTL) -n $(SPIRE_NAMESPACE) logs statefulset/spire-server -c spire-controller-manager --tail=200
 	-$(KIND_KUBECTL) -n $(SPIRE_NAMESPACE) logs statefulset/spire-server -c spire-server --tail=100
 	-$(KIND_KUBECTL) get pods -A

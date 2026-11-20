@@ -4,7 +4,8 @@
 # Build gate: license headers, signed commits, fmt, clippy, tests, cargo-audit,
 # cargo-deny, the one static binary with CycloneDX SBOMs, the server container
 # image and the two VM images, sandbox and gateway (SBOM'd, Cosign-signed and
-# provenance-attested on push/release).
+# provenance-attested on push/release). A pull request builds and checks the three
+# images in jobs that hold contents: read and never log in to a registry.
 #
 # Mirrors banlieue's build.yaml at mediatore's scale. Deliberately not ported yet:
 # the grype/VEX triage loop and the SLSA generator (they depend on banlieue-vex
@@ -312,14 +313,74 @@ jobs:
   # + SBOM'd on non-PR.
   # linux/amd64 only for now: arm64 follows banlieue's staged-binary pattern
   # once there is a release to justify it.
+  # Two jobs, since a job's permissions cannot depend on the event: docker-check on a
+  # pull request (contents: read, no login), docker on every other event (the write
+  # scopes). The same split for the two VM images below.
   # ───────────────────────────────────────────────────────────────────────────
-  docker:
+  docker-check:
     name: 🐳 Server Image
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    needs: [test, clippy, dist]
+    # A pull request builds and checks and nothing else: no registry login, no write
+    # scope, no OIDC token. An action version a pull request proposes runs here with a
+    # read-only token (the publish job below is skipped on this event).
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The dist job's binary (BINARY_FROM=host), as the publish job takes it.
+      - name: Download the binary
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: mediatore-linux-amd64-musl
+          path: dist
+
+      - name: Restore the executable bit (artifacts drop it)
+        run: make dist-chmod
+
+      # Buildx alone, at the commit firestoned/github-actions' docker/setup-docker pins:
+      # that composite always logs in to GHCR, and a pull request must not. Back to the
+      # composite once it can skip the login.
+      - name: Set up Docker Buildx (no registry login)
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ghcr.io/${{ github.repository }}
+          flavor: |
+            latest=false
+          tags: |
+            type=ref,event=pr
+
+      - name: Build (never pushed)
+        id: docker_build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: false
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: BINARY_FROM=host
+          # Read only: main alone writes the cache.
+          cache-from: type=gha
+          sbom: true
+          provenance: true
+
+  docker:
+    name: 🐳 Server Image (publish)
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     needs: [test, clippy, dist]
     permissions:
       contents: read
-      packages: write # GHCR push (non-PR only)
+      packages: write # GHCR push
       id-token: write # keyless Cosign
     outputs:
       digest: ${{ steps.docker_build.outputs.digest }}
@@ -404,15 +465,77 @@ jobs:
 
   # ───────────────────────────────────────────────────────────────────────────
   # Sandbox VM image (ADR-0023): the Kairos derivative every pool member boots.
-  # Built and checked on every event, pushed + signed + SBOM'd on non-PR.
+  # Built and checked on a pull request (the -check job), pushed + signed + SBOM'd on
+  # non-PR (the publish job).
   # ───────────────────────────────────────────────────────────────────────────
-  guest-image:
+  guest-image-check:
     name: 🖥️ Sandbox VM Image
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    needs: [test, clippy, dist]
+    # A pull request builds and checks and nothing else: no registry login, no write
+    # scope, no OIDC token. An action version a pull request proposes runs here with a
+    # read-only token (the publish job below is skipped on this event).
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The dist job's binary (BINARY_FROM=host), as the publish job takes it.
+      - name: Download the binary
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: mediatore-linux-amd64-musl
+          path: dist
+
+      - name: Restore the executable bit (artifacts drop it)
+        run: make dist-chmod
+
+      # Buildx alone, at the commit firestoned/github-actions' docker/setup-docker pins:
+      # that composite always logs in to GHCR, and a pull request must not. Back to the
+      # composite once it can skip the login.
+      - name: Set up Docker Buildx (no registry login)
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      - name: Docker metadata
+        id: guest_meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ghcr.io/${{ github.repository }}-guest
+          flavor: |
+            latest=false
+          tags: |
+            type=ref,event=pr
+
+      - name: Build (never pushed)
+        id: guest_build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: image/Dockerfile
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: ${{ steps.guest_meta.outputs.tags }}
+          labels: ${{ steps.guest_meta.outputs.labels }}
+          build-args: BINARY_FROM=host
+          # Read only: main alone writes the cache.
+          cache-from: type=gha,scope=guest
+          sbom: false
+          provenance: false
+
+      - name: Check the image (what ADR-0023 promises, no listener)
+        run: make guest-image-check GUEST_IMAGE="${{ fromJSON(steps.guest_meta.outputs.json).tags[0] }}"
+
+  guest-image:
+    name: 🖥️ Sandbox VM Image (publish)
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     needs: [test, clippy, dist]
     permissions:
       contents: read
-      packages: write # GHCR push (non-PR only)
+      packages: write # GHCR push
       id-token: write # keyless Cosign
     outputs:
       digest: ${{ steps.guest_build.outputs.digest }}
@@ -471,10 +594,6 @@ jobs:
           sbom: ${{ github.event_name != 'pull_request' }}
           provenance: ${{ github.event_name != 'pull_request' }}
 
-      - name: Check the image (what ADR-0023 promises, no listener)
-        if: github.event_name == 'pull_request'
-        run: make guest-image-check GUEST_IMAGE="${{ fromJSON(steps.guest_meta.outputs.json).tags[0] }}"
-
       - name: Install Cosign
         if: github.event_name != 'pull_request'
         uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
@@ -503,15 +622,77 @@ jobs:
   # ───────────────────────────────────────────────────────────────────────────
   # Egress gateway VM image (ADR-0028 decision 10): the Kairos derivative with Envoy
   # that the three proxy VMs boot.
-  # Built and checked on every event, pushed + signed + SBOM'd on non-PR.
+  # Built and checked on a pull request (the -check job), pushed + signed + SBOM'd on
+  # non-PR (the publish job).
   # ───────────────────────────────────────────────────────────────────────────
-  gateway-image:
+  gateway-image-check:
     name: 🚪 Gateway VM Image
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    needs: [test, clippy, dist]
+    # A pull request builds and checks and nothing else: no registry login, no write
+    # scope, no OIDC token. An action version a pull request proposes runs here with a
+    # read-only token (the publish job below is skipped on this event).
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The dist job's binary (BINARY_FROM=host), as the publish job takes it.
+      - name: Download the binary
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: mediatore-linux-amd64-musl
+          path: dist
+
+      - name: Restore the executable bit (artifacts drop it)
+        run: make dist-chmod
+
+      # Buildx alone, at the commit firestoned/github-actions' docker/setup-docker pins:
+      # that composite always logs in to GHCR, and a pull request must not. Back to the
+      # composite once it can skip the login.
+      - name: Set up Docker Buildx (no registry login)
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      - name: Docker metadata
+        id: gateway_meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ghcr.io/${{ github.repository }}-gateway
+          flavor: |
+            latest=false
+          tags: |
+            type=ref,event=pr
+
+      - name: Build (never pushed)
+        id: gateway_build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: image/gateway/Dockerfile
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: ${{ steps.gateway_meta.outputs.tags }}
+          labels: ${{ steps.gateway_meta.outputs.labels }}
+          build-args: BINARY_FROM=host
+          # Read only: main alone writes the cache.
+          cache-from: type=gha,scope=gateway
+          sbom: false
+          provenance: false
+
+      - name: Check the image (ADR-0028 decision 8 and ADR-0027, and the kind bootstrap against the image's template)
+        run: make gateway-image-check GATEWAY_IMAGE="${{ fromJSON(steps.gateway_meta.outputs.json).tags[0] }}"
+
+  gateway-image:
+    name: 🚪 Gateway VM Image (publish)
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     needs: [test, clippy, dist]
     permissions:
       contents: read
-      packages: write # GHCR push (non-PR only)
+      packages: write # GHCR push
       id-token: write # keyless Cosign
     outputs:
       digest: ${{ steps.gateway_build.outputs.digest }}
@@ -569,10 +750,6 @@ jobs:
           cache-to: ${{ github.event_name == 'push' && 'type=gha,mode=max,scope=gateway' || '' }}
           sbom: ${{ github.event_name != 'pull_request' }}
           provenance: ${{ github.event_name != 'pull_request' }}
-
-      - name: Check the image (ADR-0028 decision 8 and ADR-0027, and the kind bootstrap against the image's template)
-        if: github.event_name == 'pull_request'
-        run: make gateway-image-check GATEWAY_IMAGE="${{ fromJSON(steps.gateway_meta.outputs.json).tags[0] }}"
 
       - name: Install Cosign
         if: github.event_name != 'pull_request'

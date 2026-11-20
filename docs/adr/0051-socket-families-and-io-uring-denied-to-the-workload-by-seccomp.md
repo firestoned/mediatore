@@ -166,6 +166,31 @@ the image runs.
   The kind tiers run with `--dev-skip-setup` and start no jail, so the proof is the live
   test below on the build host.
 
+*Amended 2026-11-19: two things the filter leaves, found in review after it was built.*
+
+*First, the protocol. The filter checks the domain and the type of a `socket()` call and not
+its third argument, so an inet stream socket opened with a protocol other than TCP (MPTCP,
+protocol 262) passes it. That socket is still bounded by the layer below: the uid-keyed
+nftables table drops its packets as it drops plain TCP (tested on the image's kernel line,
+6.12, on 2026-11-19), and the image sets `net.mptcp.enabled = 0`
+(`image/sysctl/99-mediatore.conf`). The filter should say it too, so the bound does not rest
+on a kernel's behaviour staying as it is: in `crates/mediatore-guest/src/seccomp.rs`, a
+constant `INET_STREAM_PROTOCOLS` (`0` and `IPPROTO_TCP`, 6) beside `INET_FAMILIES`, and one
+more rule per inet family in the `EPERM` filter, next to the type rules. The unit test is
+`an_inet_stream_socket_whose_protocol_is_not_tcp_is_refused_with_eperm`, and the live test in
+`crates/mediatore/tests/jail_exec_live.rs` gains an MPTCP `socket()` that fails. Not built.*
+
+*Second, user namespaces. `DENIED_SYSCALLS` refuses `unshare` and `setns`, and the filter has
+no rule for `clone` or `clone3`. A rule on `clone` could compare its flags, but `clone3` takes
+them in a structure behind a pointer, which a seccomp filter cannot read, so the filter cannot
+refuse a child user namespace created that way. The bound belongs in the image instead:
+`user.max_user_namespaces = 0` in its sysctl layer, asserted in `image/check.sh`. That key is
+not set yet: it needs a boot of the image showing that `nsjail` (which runs as root and
+creates no user namespace) and the SPIRE agent still start. Until then a child user namespace
+is the workload's to create; `no_new_privs`, Landlock and this filter are expected to carry
+across one, which is reasoning from how each is inherited and not a test of this repository
+(threat model R-42).*
+
 ## Test plan (red first)
 
 Unit, on every platform, in the source file:

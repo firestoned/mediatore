@@ -33,9 +33,13 @@ updates:
       cargo:
         patterns: ["*"]
 
-  # Container base images (Dockerfile FROM lines).
+  # Container base images (Dockerfile FROM lines): the server image, the sandbox VM
+  # image and the gateway VM image.
   - package-ecosystem: "docker"
-    directory: "/"
+    directories:
+      - "/"
+      - "/image"
+      - "/image/gateway"
     schedule:
       interval: "weekly"
     cooldown:

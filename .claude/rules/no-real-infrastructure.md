@@ -24,5 +24,5 @@ Real values come from the environment at runtime (config files, env vars), never
 defaults. Before finishing any task, sweep the diff:
 
 ```sh
-git diff --cached -U0 | rg -i 'jeb\.ca|rbc\.|\b(?:\d{1,3}\.){3}\d{1,3}\b' | rg -v '127\.0\.0\.1|0\.0\.0\.0|192\.0\.2\.|198\.51\.100\.|203\.0\.113\.'
+git diff --cached -U0 | rg -i 'jeb\.ca|\brbc\b|rbc-|rbc\.|\b(?:\d{1,3}\.){3}\d{1,3}\b' | rg -v '127\.0\.0\.1|0\.0\.0\.0|192\.0\.2\.|198\.51\.100\.|203\.0\.113\.'
 ```

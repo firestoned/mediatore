@@ -1038,14 +1038,29 @@ impl Watcher {
             }
             Some(_) | None => {
                 // Nothing of ours remains, or a claim we never owned. A record written for
-                // a claim that banlieue already deleted is released here; idempotent.
+                // a claim that banlieue already deleted is released here, when it is this
+                // sandbox's own; idempotent.
                 if let Some(uid) = sb
                     .status
                     .as_ref()
                     .and_then(|s| s.claim_uid.as_deref())
                     .and_then(|u| Uuid::parse_str(u).ok())
                 {
-                    self.reconciler.release(uid).await?;
+                    // The status is not proof of whose claim that is: the store finds a
+                    // record by claim UID wherever its sandbox lives, so a status naming
+                    // another sandbox's claim would release that one. Only a record
+                    // written for this very sandbox is released here.
+                    let own = sandbox_uid_of(sb);
+                    match self.reconciler.store.get_claim(uid).await {
+                        Ok(rec) if own.is_some() && rec.sandbox_uid == own => {
+                            self.reconciler.release(uid).await?;
+                        }
+                        Ok(_) => {
+                            tracing::warn!(sandbox = %name, %namespace, claim_uid = %uid, "sandbox status names a claim whose record is another sandbox's; not released");
+                        }
+                        Err(StoreError::NotFound(_)) => {}
+                        Err(e) => return Err(e.into()),
+                    }
                     // ADR-0034 decision 4: a sandbox that had a record keeps its finalizer
                     // for the retention window; the store's sweep releases it, with the
                     // audit line. One that was never bound goes now.
@@ -1538,41 +1553,117 @@ mod tests {
         assert_eq!(AgentSandbox::version(&()), "v1beta1");
     }
 
-    /// ADR-0049 decision 3: the subject policy governs every served version, named
-    /// explicitly, so no version reaches the API server unpinned.
-    #[test]
-    fn the_admission_policy_matches_every_served_version() {
+    /// The documents of an admission file under `deploy/base/admission`.
+    fn admission_docs(file: &str) -> Vec<serde_json::Value> {
         let path = format!(
-            "{}/../../deploy/base/admission/agentsandbox-subject.yaml",
+            "{}/../../deploy/base/admission/{file}",
             env!("CARGO_MANIFEST_DIR")
         );
-        let docs: Vec<serde_json::Value> =
-            serde_saphyr::from_multiple(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        serde_saphyr::from_multiple(&std::fs::read_to_string(&path).unwrap()).unwrap()
+    }
+
+    /// ADR-0049 decision 3: the policies on `AgentSandbox` (its subject, and who writes its
+    /// status) govern every served version, named explicitly, so no version reaches the
+    /// API server unpinned.
+    #[test]
+    fn the_admission_policy_matches_every_served_version() {
+        for file in ["agentsandbox-subject.yaml", "agentsandbox-status.yaml"] {
+            let docs = admission_docs(file);
+            let policy = docs
+                .iter()
+                .find(|d| d["kind"] == "ValidatingAdmissionPolicy")
+                .expect("the policy");
+            let constraints = &policy["spec"]["matchConstraints"];
+            assert_eq!(constraints["matchPolicy"], "Equivalent", "{file}");
+            let rules = constraints["resourceRules"].as_array().unwrap();
+            assert_eq!(rules.len(), 1, "{file}");
+            let mut matched: Vec<&str> = rules[0]["apiVersions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect();
+            matched.sort_unstable();
+            let crd = crd();
+            let mut served: Vec<&str> = crd
+                .spec
+                .versions
+                .iter()
+                .filter(|v| v.served)
+                .map(|v| v.name.as_str())
+                .collect();
+            served.sort_unstable();
+            assert_eq!(matched, served, "{file}");
+        }
+    }
+
+    /// The status carries the claim record (ADR-0034), so the status subresource is the
+    /// broker's alone whatever a namespace Role grants: one policy, failing closed, on
+    /// every write of `agentsandboxes/status`, admitting the broker's `ServiceAccount` as
+    /// the other policies spell it, and bound with `Deny`.
+    #[test]
+    fn the_status_policy_admits_the_broker_alone_and_denies() {
+        let docs = admission_docs("agentsandbox-status.yaml");
         let policy = docs
             .iter()
             .find(|d| d["kind"] == "ValidatingAdmissionPolicy")
             .expect("the policy");
-        let constraints = &policy["spec"]["matchConstraints"];
-        assert_eq!(constraints["matchPolicy"], "Equivalent");
-        let rules = constraints["resourceRules"].as_array().unwrap();
-        assert_eq!(rules.len(), 1);
-        let mut matched: Vec<&str> = rules[0]["apiVersions"]
-            .as_array()
+        assert_eq!(policy["spec"]["failurePolicy"], "Fail");
+        assert!(
+            policy["spec"]["matchConditions"].is_null(),
+            "a match condition would let a request past the policy"
+        );
+        let rule = &policy["spec"]["matchConstraints"]["resourceRules"][0];
+        assert_eq!(rule["apiGroups"], json!(["mediatore.io"]));
+        assert_eq!(rule["resources"], json!(["agentsandboxes/status"]));
+        assert_eq!(rule["operations"], json!(["UPDATE"]));
+        let validations = policy["spec"]["validations"].as_array().unwrap();
+        assert_eq!(validations.len(), 1);
+        assert_eq!(
+            validations[0]["expression"],
+            "request.userInfo.username == 'system:serviceaccount:banlieue-system:mediatore'"
+        );
+        // The same spelling as the policy on the broker's entries: one name to change.
+        let entries = admission_docs("clusterstaticentry-mediatore.yaml");
+        assert_eq!(
+            entries[0]["spec"]["matchConditions"][0]["expression"],
+            validations[0]["expression"]
+        );
+        let binding = docs
+            .iter()
+            .find(|d| d["kind"] == "ValidatingAdmissionPolicyBinding")
+            .expect("the binding");
+        assert_eq!(binding["spec"]["policyName"], policy["metadata"]["name"]);
+        assert_eq!(binding["spec"]["validationActions"], json!(["Deny"]));
+        assert!(
+            binding["spec"]["matchResources"].is_null(),
+            "bound everywhere: a namespace left out would be ungoverned"
+        );
+    }
+
+    #[test]
+    fn the_base_kustomization_lists_every_admission_policy() {
+        // A policy file the base does not list is a control `kubectl apply -k deploy/base`
+        // never installs.
+        let root = format!("{}/../../deploy/base", env!("CARGO_MANIFEST_DIR"));
+        let kustomization = std::fs::read_to_string(format!("{root}/kustomization.yaml")).unwrap();
+        let mut files: Vec<String> = std::fs::read_dir(format!("{root}/admission"))
             .unwrap()
-            .iter()
-            .filter_map(|v| v.as_str())
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .filter(|f| {
+                std::path::Path::new(f)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("yaml"))
+            })
             .collect();
-        matched.sort_unstable();
-        let crd = crd();
-        let mut served: Vec<&str> = crd
-            .spec
-            .versions
-            .iter()
-            .filter(|v| v.served)
-            .map(|v| v.name.as_str())
-            .collect();
-        served.sort_unstable();
-        assert_eq!(matched, served);
+        files.sort_unstable();
+        assert!(files.iter().any(|f| f == "agentsandbox-status.yaml"));
+        for file in files {
+            assert!(
+                kustomization.contains(&format!("- admission/{file}")),
+                "deploy/base/kustomization.yaml does not list admission/{file}"
+            );
+        }
     }
 
     #[test]
@@ -2442,6 +2533,124 @@ mod tests {
             r.watcher.reconcile_sandbox(&bare).await.unwrap(),
             Action::await_change()
         );
+    }
+
+    /// A second sandbox, `sb-2` in namespace `other`, finalized and being deleted, whose
+    /// status names `claim_uid`: what a principal holding `agentsandboxes/status` in its
+    /// own namespace can write.
+    fn deleting_stranger(claim_uid: Uuid) -> AgentSandbox {
+        let mut sb = sandbox(true, true);
+        sb.metadata.name = Some("sb-2".into());
+        sb.metadata.namespace = Some("other".into());
+        sb.metadata.uid = Some("1b2c3d4e-5f60-4718-892a-3b4c5d6e7f80".into());
+        sb.status = Some(AgentSandboxStatus {
+            phase: SandboxPhase::Bound,
+            claim_ref: Some(LocalObjectReference {
+                name: "sb-2".into(),
+            }),
+            claim_uid: Some(claim_uid.to_string()),
+            ..AgentSandboxStatus::default()
+        });
+        sb
+    }
+
+    #[tokio::test]
+    async fn deleting_a_sandbox_whose_status_names_another_sandboxes_claim_releases_nothing() {
+        let r = rig(cfg());
+        settle(&r, &sandbox(false, false)).await;
+        r.claims.patch_claim_status(
+            "sandboxes",
+            "sb-1",
+            &json!({ "phase": "Bound", "tpmEndorsementCertificates": [RSA_EK_PEM] }),
+        );
+        r.store.put_node(node(RSA_EK_HASH, false)).await.unwrap();
+        let claim = r.claims.claim("sandboxes", "sb-1").unwrap();
+        let uid = claim_uid_of(&claim).unwrap();
+        r.watcher.reconcile_claim(&claim).await.unwrap();
+        assert_eq!(r.entries.names(), vec![claim_entry_name(uid)]);
+
+        let stranger = deleting_stranger(uid);
+        r.claims.put_sandbox(stranger.clone());
+        assert_eq!(
+            r.watcher.reconcile_sandbox(&stranger).await.unwrap(),
+            Action::await_change()
+        );
+        let rec = r.store.get_claim(uid).await.unwrap();
+        assert!(
+            rec.revoked_at.is_none(),
+            "the other sandbox's record is not revoked"
+        );
+        assert_eq!(
+            r.entries.names(),
+            vec![claim_entry_name(uid)],
+            "its entry is not retracted"
+        );
+        assert!(
+            r.claims.claim("sandboxes", "sb-1").is_some(),
+            "its claim is not deleted"
+        );
+        // The forger's own sandbox, which holds no record, goes as one never bound does.
+        assert_eq!(
+            r.claims.sandbox("other", "sb-2").unwrap().finalizers(),
+            &Vec::<String>::new()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_record_naming_no_sandbox_is_not_released_through_a_sandboxes_status() {
+        // Fail closed: a record that says nothing of its sandbox is nobody's to release
+        // from a status.
+        let r = rig(cfg());
+        let own = sandbox(true, true);
+        let uid = Uuid::new_v4();
+        let mut rec = record_for(&own, uid, None);
+        rec.sandbox_uid = None;
+        r.store.put_claim(rec).await.unwrap();
+        let mut deleting = own;
+        deleting.status = Some(AgentSandboxStatus {
+            claim_uid: Some(uid.to_string()),
+            ..AgentSandboxStatus::default()
+        });
+        r.claims.put_sandbox(deleting.clone());
+        r.watcher.reconcile_sandbox(&deleting).await.unwrap();
+        assert!(r.store.get_claim(uid).await.unwrap().revoked_at.is_none());
+    }
+
+    /// A `status.claimRef` nobody but the broker should have written skips the refusal of
+    /// `refuse`, and still gets nothing: with no owned claim behind it the sandbox is
+    /// failed as one whose claim is gone, and no claim and no record are made.
+    #[tokio::test]
+    async fn a_forged_claim_ref_on_a_sandbox_that_would_be_refused_creates_no_claim() {
+        let r = rig(WatcherConfig {
+            audiences: vec![],
+            ..cfg()
+        });
+        let mut sb = sandbox(true, false);
+        sb.status = Some(AgentSandboxStatus {
+            phase: SandboxPhase::Bound,
+            claim_ref: Some(LocalObjectReference {
+                name: "sb-1".into(),
+            }),
+            ..AgentSandboxStatus::default()
+        });
+        r.claims.put_sandbox(sb.clone());
+        assert_eq!(
+            r.watcher.reconcile_sandbox(&sb).await.unwrap(),
+            Action::await_change()
+        );
+        let st = r
+            .claims
+            .sandbox("sandboxes", "sb-1")
+            .unwrap()
+            .status
+            .unwrap();
+        assert_eq!(st.phase, SandboxPhase::Failed);
+        assert!(!st.ready);
+        assert!(
+            r.claims.claim("sandboxes", "sb-1").is_none(),
+            "no claim for an audience this broker is not configured for"
+        );
+        assert!(r.store.list_claims().await.unwrap().is_empty());
     }
 
     /// A reflector over the testkit's freshly signed bundle, admitted at the real clock

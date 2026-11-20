@@ -173,7 +173,8 @@ tokens cut off. A one-shot agent is `--restart on-failure`.
 `mediatore sandbox create`; [ADR-0045](../adr/0045-a-sandbox-workloads-output-streamed-to-its-owner.md))
 is the opt-in to output capture: the guest tees what the workload prints to stdout and
 stderr, redacts it in the VM and ships it to the broker, and `mediatore sandbox logs <name>`
-(`-f` to follow, `--tail`, `--since`, `--timestamps`) reads it back, stdout lines to stdout and
+(`-f` to follow, `--tail`, `--since`, `--timestamps`, `--raw` to print control characters as the
+workload wrote them instead of spelled out) reads it back, stdout lines to stdout and
 stderr lines to stderr, for the claim's life and for `logs.retention_secs` after it ends. Only
 the claim's subject can read it; a declarative requester has no token with that subject and
 cannot. Without the opt-in nothing is captured and the output lands on the VM console alone,

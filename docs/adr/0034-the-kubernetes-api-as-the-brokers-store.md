@@ -74,6 +74,13 @@ It need not. Every table of ADR-0012 has a natural home in the API:
    released marker is the status record), and its envelope's `expires_at` is bounded by the
    claim's creation plus its `ttl_seconds`, swept every 15 seconds
    (`crates/mediatore-claims/src/watch.rs`). The issuer's own session is unchanged.*
+   *Amended 2026-11-19: the issuer's own session carries an expiry too, the later of its
+   creation plus the claim's `ttl_seconds` and the claim's deadline, and a live claim's is
+   never swept early. The sweep also removes a claimed Secret whose sandbox no longer exists
+   (past the parked grace) or whose record has ended. An update over a released record is a
+   `Conflict` and writes nothing, in both stores, and an update writes the status before the
+   Secrets; closing the window between that read and the write needs a compare-and-set on
+   the resource version, which changes the store contract and is not decided here.*
 
 3. **`SandboxNode` and `PolicyFloor`, two CRDs in the broker's namespace.** `SandboxNode`
    is named by the EK hash and holds what `nodes` held: the node's SPIFFE ID, the DMI UUID

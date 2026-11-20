@@ -30,12 +30,12 @@ is an exact string comparison of that value against the token's groups: the `gro
 `groups.iter().any(|g| g == required)`, else `IdpError::Forbidden("not in required group ...")`).
 The spelling of a group is the connector's, not the group's:
 
-- Dex's GitHub connector emits `<org>:<team>`, for example `rbc-cm:APP_EXAMPLE_ADMIN`.
+- Dex's GitHub connector emits `<org>:<team>`, for example `example-org:APP_EXAMPLE_ADMIN`.
 - Dex's LDAP connector, and Entra, emit the bare name, `APP_EXAMPLE_ADMIN`.
 
 The two never compare equal and the broker strips nothing. The failure that motivated this: a
 service ID logs in through the LDAP connector (a Dex password grant, no browser), its token carries
-`APP_EXAMPLE_ADMIN`, the issuer's `required_group` is `rbc-cm:APP_EXAMPLE_ADMIN` because the people
+`APP_EXAMPLE_ADMIN`, the issuer's `required_group` is `example-org:APP_EXAMPLE_ADMIN` because the people
 log in through GitHub, and the service ID is refused with `403` ("not in required group"). It can
 never pass: one string cannot admit both spellings, and the operator cannot list the second.
 
@@ -93,7 +93,7 @@ What is already true and this ADR builds on (verified in the source):
 
 2. **Exact, case-sensitive match, no prefix stripping, both spellings listed when both are
    wanted.** A listed value must equal a groups-claim element byte for byte. The operator writes
-   `required_groups: [rbc-cm:APP_EXAMPLE_ADMIN, APP_EXAMPLE_ADMIN]` to admit the GitHub people and
+   `required_groups: [example-org:APP_EXAMPLE_ADMIN, APP_EXAMPLE_ADMIN]` to admit the GitHub people and
    the LDAP service ID, and that is the whole mechanism. A normaliser that strips `<org>:` is
    rejected below: it would make `org-a:ADMIN` and `org-b:ADMIN` the same group, and the broker would
    be guessing what a connector meant. One shared function, `groups_intersect(held, wanted)`, in
@@ -114,7 +114,7 @@ What is already true and this ADR builds on (verified in the source):
      # `namespace:` is not written here: with the map set it is a start error (below).
      namespaces:                           # new, optional
        infra:
-         groups: [rbc-cm:APP_EXAMPLE_ADMIN, APP_EXAMPLE_ADMIN]   # any-of, exact (decisions 1, 2)
+         groups: [example-org:APP_EXAMPLE_ADMIN, APP_EXAMPLE_ADMIN]   # any-of, exact (decisions 1, 2)
        team-a:
          groups: [APP_EXAMPLE_TEAM_A_USER]
    ```
@@ -462,7 +462,7 @@ What is already true and this ADR builds on (verified in the source):
   from a token's groups which namespace a claim is created in, with its own `ServiceAccount` that can
   create in all of them. **A mistake in the mapping grants cross-tenant claims**: a group listed
   under the wrong namespace, a group spelling that matches a broader population than intended, or
-  an operator listing `rbc-cm:APP_EXAMPLE_ADMIN` and the bare `APP_EXAMPLE_ADMIN` where the bare name
+  an operator listing `example-org:APP_EXAMPLE_ADMIN` and the bare `APP_EXAMPLE_ADMIN` where the bare name
   is held by people the operator did not mean. Exact match and no normalisation (decision 2) keep
   the failure on the side of "listed explicitly", and the start-time validation (decision 14) turns
   the typos into start errors, but the mapping is a security configuration and is reviewed as one.
@@ -586,4 +586,4 @@ Answered by the maintainer on 2026-11-17 and folded into the decisions above.
   RUSTSEC-2026-0543 (`chrono`), which failed on `main` too and was not caused by this change
   (cleared 2026-11-17 by #131, chrono replaced with jiff across the workspace).
 - [x] Infrastructure sweep of the diff (`rules/no-real-infrastructure.md`): placeholders only in the
-  docs, tests and examples (`rbc-cm:APP_EXAMPLE_ADMIN`, `APP_EXAMPLE_TEAM_A_USER`, `team-a`).
+  docs, tests and examples (`example-org:APP_EXAMPLE_ADMIN`, `APP_EXAMPLE_TEAM_A_USER`, `team-a`).

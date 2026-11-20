@@ -20,8 +20,16 @@ ARG TPM_PLUGIN_AGENT_IMG=ghcr.io/spiffe/spire-tpm-plugin-tpm-attestor-agent:v1.1
 ARG TPM_PLUGIN_AGENT_SHA=ffb7e266c7a10a7b1bdb349409d6c2ded8090715770287813055431cb692575c
 # nsjail is in no Debian archive: built from source at a pinned commit (the 3.6 tag).
 ARG NSJAIL_COMMIT=f78475530b46d0186111a9096b30725f816b55fe
+# The compile stage's toolchain image (BINARY_FROM=container alone uses it; CI and the
+# release copy dist/mediatore). A moving tag until it carries a digest: pin it here as
+# <tag>@sha256:<digest>, from `crane digest docker.io/library/rust:1-slim`.
+ARG RUST_IMG=rust:1-slim
+# The image nsjail is compiled in; its binary is copied into the rootfs, so this is a
+# build input of the published image. A moving tag until it carries a digest: pin it here,
+# from `crane digest docker.io/library/debian:13-slim`.
+ARG NSJAIL_BUILD_IMG=debian:13-slim
 
-FROM rust:1-slim AS build-container
+FROM ${RUST_IMG} AS build-container
 RUN rustup target add x86_64-unknown-linux-musl && apt-get update && apt-get install -y --no-install-recommends musl-tools && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY . .
@@ -33,7 +41,7 @@ COPY dist/mediatore /mediatore
 
 FROM build-${BINARY_FROM} AS build
 
-FROM debian:13-slim AS nsjail
+FROM ${NSJAIL_BUILD_IMG} AS nsjail
 ARG NSJAIL_COMMIT
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates git make pkg-config gcc g++ \

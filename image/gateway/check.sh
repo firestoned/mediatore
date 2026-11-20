@@ -70,6 +70,8 @@ check "the Envoys require the table and the interface first (fail closed)" \
   'for u in envoy-gateway envoy-relay envoy-inject; do grep -q "^Requires=.*mediatore-gateway-nft.service" /etc/systemd/system/$u.service && grep -q "^Requires=.*mediatore-gateway-network.service" /etc/systemd/system/$u.service || exit 1; done'
 check "forwarding off in the image's sysctl (ADR-0028 decision 8)" \
   'grep -qx "net.ipv4.ip_forward = 0" /etc/sysctl.d/99-mediatore-gateway.conf && grep -qx "net.ipv6.conf.all.forwarding = 0" /etc/sysctl.d/99-mediatore-gateway.conf'
+check "Yama's ptrace scope and the kernel hardening in the image's sysctl: no MPTCP, no io_uring, kernel addresses and the kernel log restricted, no unprivileged bpf, the BPF JIT hardened" \
+  'grep -qx "kernel.yama.ptrace_scope = 1" /etc/sysctl.d/99-mediatore-gateway.conf && for k in "net.mptcp.enabled = 0" "kernel.io_uring_disabled = 2" "kernel.kptr_restrict = 2" "kernel.dmesg_restrict = 1" "kernel.unprivileged_bpf_disabled = 1" "net.core.bpf_jit_harden = 2"; do grep -qx "$k" /etc/sysctl.d/99-mediatore-gateway.conf || exit 1; done'
 check "the host table drops input and forward by default and admits the sandbox ports alone" \
   'grep -q "type filter hook input priority filter; policy drop;" /usr/share/mediatore-gateway/nftables.conf.in && grep -q "type filter hook forward priority filter; policy drop;" /usr/share/mediatore-gateway/nftables.conf.in && grep -q "iifname \"@SANDBOX_IF@\" tcp dport @DATA_PORT@" /usr/share/mediatore-gateway/nftables.conf.in && grep -q "ct count over @RELAY_CAP@" /usr/share/mediatore-gateway/nftables.conf.in && grep -q "flags dynamic" /usr/share/mediatore-gateway/nftables.conf.in'
 check "no sshd, ssh and the distribution's nftables unit masked" \

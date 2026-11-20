@@ -31,8 +31,12 @@ ARG ENVOY_IMG=docker.io/envoyproxy/envoy:v1.40.2@sha256:49d3e8b6246d1a804acffaeb
 ARG SPIRE_AGENT_IMG=ghcr.io/spiffe/spire-agent:1.15.3@sha256:41b0dcd8b258a69db9e2768292a060766fb76fd866e4bc925849981ea1b825ff
 ARG TPM_PLUGIN_AGENT_IMG=ghcr.io/spiffe/spire-tpm-plugin-tpm-attestor-agent:v1.11.3@sha256:4dba6dc77fcec06b66962b632b6453636d49d51a38946efb0bc6fed29e4b75b1
 ARG TPM_PLUGIN_AGENT_SHA=ffb7e266c7a10a7b1bdb349409d6c2ded8090715770287813055431cb692575c
+# The compile stage's toolchain image (BINARY_FROM=container alone uses it; CI and the
+# release copy dist/mediatore). A moving tag until it carries a digest: pin it here as
+# <tag>@sha256:<digest>, from `crane digest docker.io/library/rust:1-slim`.
+ARG RUST_IMG=rust:1-slim
 
-FROM rust:1-slim AS build-container
+FROM ${RUST_IMG} AS build-container
 RUN rustup target add x86_64-unknown-linux-musl && apt-get update && apt-get install -y --no-install-recommends musl-tools && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY . .

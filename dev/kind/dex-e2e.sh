@@ -127,6 +127,9 @@ spec:
         - --audience=$AUDIENCE
         - --image=registry.internal:5000/sandbox:e2e
         - --arg=sh
+      env:
+        # The tier's user API has no TLS in front of it: the CLI sends a login there only when told to.
+        - { name: MEDIATORE_ALLOW_PLAIN_HTTP, value: "true" }
       volumeMounts:
         - { name: work, mountPath: /work }
         - { name: dex-ca, mountPath: /etc/mediatore-dex, readOnly: true }

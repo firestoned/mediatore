@@ -12,9 +12,15 @@
 #   kubectl -n banlieue-imagebuild create secret generic mediatore-guest-deployment \
 #     --from-file=cloud-config.yaml=<your copy of image/cloud-config-deployment.example.yaml>
 #
-# Pin the image by the digest of a release of ghcr.io/firestoned/mediatore-guest (the
-# Build workflow signs and attests it; `gh attestation verify oci://<image> --repo
-# firestoned/mediatore`). banlieue's phase layer (its examples/17) is deliberately absent:
+# Pin the image by the digest of a release of ghcr.io/firestoned/mediatore-guest. The
+# Build workflow signs and attests it; verify against that workflow at the release's tag,
+# not the repository alone:
+#
+#   gh attestation verify oci://<image>@sha256:<digest> --repo firestoned/mediatore \
+#     --signer-workflow firestoned/mediatore/.github/workflows/build.yaml \
+#     --source-ref refs/tags/v<version> | tee
+#
+# (docs/guides/deploying.md has the matching `cosign verify`.) banlieue's phase layer (its examples/17) is deliberately absent:
 # the guest announces GuestReady itself once attested and registered (ADR-0019).
 ---
 apiVersion: banlieue.io/v1alpha1

@@ -107,7 +107,13 @@ come from, when the ruleset is loaded, and what happens when it cannot be.
    decision 5: `POST /v1/me/report`, with the host table's hash and the image digest.*
 
 6. **Teardown deletes the table**, after the jail is stopped, best effort like the rest of
-   the teardown: the next claim replaces it anyway.
+   the teardown: the next claim replaces it anyway. *Amended 2026-11-19:* "stopped" means
+   every process of the sandbox uid is gone, not `nsjail` alone. A workload can clear its
+   parent-death signal and outlive `nsjail`, so the guest kills the uid's processes from its
+   own view of `/proc` after `nsjail` is reaped and again at teardown, and deletes the table
+   and the user only when none is left; if one survives the kill, both stay and the guest
+   says so (`user::kill_all`, `supervise::cleanup_after`). A table left loaded costs nothing
+   on a VM that is about to be destroyed.
 
 7. **Second layer, restated.** Guest root can flush the table (ADR-0010 decision 4). The
    enforcement that holds against guest root is outside the guest: the segment and the
