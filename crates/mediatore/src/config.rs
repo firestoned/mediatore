@@ -606,6 +606,11 @@ pub struct AudienceDefinitionsSection {
     /// last good value for two of these.
     #[serde(default = "default_credential_refresh_secs")]
     pub credential_refresh_secs: u64,
+    /// The platform's `OpenBao`, for platform audiences whose credential is a KV v2 path
+    /// (decision 5), logged in to as the broker's `ServiceAccount`. Absent, such an audience has
+    /// no credential and says so in the log.
+    #[serde(default)]
+    pub openbao: Option<mediatore_openbao::KvConfig>,
 }
 
 const fn default_credential_refresh_secs() -> u64 {
@@ -1539,6 +1544,15 @@ impl Config {
             anyhow::bail!(
                 "policy.audience_definitions.platform_namespace: {:?} is not an RFC 1123 label (ADR-0055 decision 10)",
                 d.platform_namespace
+            );
+        }
+        if let Some(o) = &d.openbao
+            && !self.dev_mode
+            && !o.url.starts_with("https://")
+        {
+            anyhow::bail!(
+                "policy.audience_definitions.openbao.url must be https outside dev_mode (ADR-0055); got {}",
+                o.url
             );
         }
         if d.credential_refresh_secs == 0 {
@@ -3449,6 +3463,36 @@ listen: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }
         assert!(
             with(&audience_definitions("    mode: shadow\n")).is_err(),
             "no default namespace"
+        );
+    }
+
+    #[test]
+    fn the_audience_openbao_is_https_outside_dev_mode_and_refuses_a_typo() {
+        let body = "    mode: shadow\n    platform_namespace: p\n    openbao: { url: \"http://openbao.home.example:8200\", role: mediatore }\n";
+        // DEV is dev_mode: plain http is allowed there.
+        let cfg = with(&audience_definitions(body)).unwrap();
+        let o = cfg
+            .policy
+            .clone()
+            .unwrap()
+            .audience_definitions
+            .unwrap()
+            .openbao
+            .unwrap();
+        assert_eq!(
+            (o.role.as_str(), o.auth_mount.as_str()),
+            ("mediatore", "kubernetes")
+        );
+        let mut cfg = with(&audience_definitions(body)).unwrap();
+        cfg.dev_mode = false;
+        let err = cfg.check_audience_definitions().unwrap_err().to_string();
+        assert!(err.contains("must be https outside dev_mode"), "{err}");
+        assert!(
+            with(&audience_definitions(
+                "    mode: shadow\n    platform_namespace: p\n    openbao: { url: \"https://o\", role: r, key: k }\n"
+            ))
+            .is_err(),
+            "a transit key has no place here"
         );
     }
 

@@ -111,20 +111,31 @@ This ADR is how the broker reads it.
    (decision 8) before `bundles`.
 
 5. **Credentials are read live and never leave the broker except where they are placed.**
-   - **`secretRef`** (a team audience, or a platform audience in `platform_namespace`): read
-     through the Kubernetes API from the audience's own namespace, and watched by name so a
-     rotation (an External Secrets refresh) reaches the catalog without a restart. The broker
-     holds `get`, `list` and `watch` on exactly those Secrets, through a `Role` with
+   Every audience with a credential source is read again every `credential_refresh_secs`
+   (default 60) and at once when the catalog changes, so a rotation (an External Secrets
+   refresh, a new KV version) is served within one period and without a restart.
+   - **`secretRef`** (a team audience, or a platform audience in `platform_namespace`): a `get` by
+     name through the Kubernetes API in the audience's own namespace. Polling needs neither `list`
+     nor `watch`, so the broker holds `get` alone, on exactly those Secrets, through a `Role` with
      `resourceNames` in each namespace, created at onboarding with the namespace (a kustomize
-     component, `deploy/audience-credentials`); the broker cannot create or widen it.
-   - **`openbao`** (platform audiences only): a KV v2 read with the identity the broker already
-     uses for OpenBao (ADR-0015, Kubernetes auth), under a policy that grants `read` on the
-     platform's audience paths and nothing else. Re-read every `credential_refresh_secs` (default
-     60) so a rotation is live.
+     component, `deploy/audience-credentials`); the broker cannot create or widen it. An empty
+     `resourceNames` would grant every Secret in the namespace, so the component ships a name that
+     matches nothing and each overlay replaces the list.
+   - **`openbao`** (platform audiences only): a KV v2 read (`GET /v1/<mount>/data/<path>`) with the
+     identity the broker already uses for OpenBao (ADR-0015, Kubernetes auth), configured under
+     `policy.audience_definitions.openbao` (`url`, `ca_file`, `role`, `auth_mount`, `token_file`,
+     `https` outside `dev_mode`), under a policy that grants `read` on the platform's audience paths
+     and nothing else. The login happens at start, so a wrong URL, CA or role stops the start.
+     Without the subsection an `openbao` audience has no credential, and the log says so.
    - **A failed read keeps the last good value for at most two refresh periods**, then the audience
      is unusable (`503 credential_unavailable` at the token route, the gateway's credential route
-     refusing) until a read succeeds, each transition logged. Never logged, never in a bundle,
-     never in a route; zeroized when replaced (ADR-0032 decision 3's handling, unchanged).
+     refusing) until a read succeeds; a source that changed drops the old value at once. Each
+     transition is logged once, with the audience and the kind of failure (`not found`, `denied`,
+     `unavailable`, `malformed`), never the Secret's name, the path or the value. The value is held
+     as ADR-0032 holds one (a type that prints redacted, never logged, never in a bundle or a
+     route); it is not zeroized when replaced.
+   - Under `shadow` the credentials are read too and only the outcome is logged, so the RBAC and
+     the OpenBao policy are proven before `bundles` serves from them.
 
 6. **Placement, format and rules are the definition's.** `placement` decides gateway or proxy
    (ADR-0040), `format` bearer or basic (ADR-0041), `header` and `extraHeaders` what is set. The

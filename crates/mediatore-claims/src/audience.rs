@@ -344,6 +344,11 @@ impl AudienceCatalog {
             .filter(|a| a.not_after > now)
     }
 
+    /// Every live definition, in every namespace.
+    pub fn all_live(&self, now: Timestamp) -> impl Iterator<Item = &Arc<Audience>> + '_ {
+        self.audiences.values().filter(move |a| a.not_after > now)
+    }
+
     /// The live definitions a claim in `namespace` can see: every platform audience and the team
     /// audiences of `namespace`.
     pub fn visible_from<'a>(
@@ -582,6 +587,8 @@ pub fn shadow_report(
 #[derive(Debug)]
 pub struct LiveCatalog {
     current: RwLock<Arc<AudienceCatalog>>,
+    /// Bumped on every swap, for the credential refresh to read a new audience at once.
+    changed: tokio::sync::watch::Sender<u64>,
     synced: RwLock<HashSet<String>>,
     namespaces: Vec<String>,
 }
@@ -592,6 +599,7 @@ impl LiveCatalog {
     pub fn new(platform_namespace: String, namespaces: Vec<String>) -> Self {
         Self {
             current: RwLock::new(Arc::new(AudienceCatalog::new(platform_namespace))),
+            changed: tokio::sync::watch::Sender::new(0),
             synced: RwLock::new(HashSet::new()),
             namespaces,
         }
@@ -634,7 +642,15 @@ impl LiveCatalog {
         let mut current = self.current.write().unwrap_or_else(PoisonError::into_inner);
         let (next, out) = f(&current);
         *current = Arc::new(next);
+        drop(current);
+        self.changed.send_modify(|n| *n = n.wrapping_add(1));
         out
+    }
+
+    /// Told of every swap.
+    #[must_use]
+    pub fn changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.changed.subscribe()
     }
 
     fn mark_synced(&self, namespace: &str) {

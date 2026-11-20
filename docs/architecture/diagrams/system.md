@@ -109,6 +109,7 @@ flowchart LR
     system-notaio -->|HTTPS| service-kubernetes-api
     service-mediatore-watcher -->|HTTPS| service-kubernetes-api
     service-mediatore-watcher -->|HTTPS| service-kubernetes-api
+    system-mediatore -->|HTTPS| service-kubernetes-api
     subgraph sg_system-notaio [System Notaio]
         data-asset-policy-bundles
         data-asset-audience-bundles
@@ -134,6 +135,7 @@ flowchart LR
     service-egress-proxy -->|HTTPS| ecosystem-downstream-api
     actor-sandbox-user --> data-asset-claim-store
     system-mediatore -->|TLS| service-openbao
+    system-mediatore -->|HTTPS| service-openbao
     actor-sandbox-user --> data-asset-cluster-static-entries
     service-spire-server -->|HTTPS| service-openbao
     service-egress-proxy -->|mTLS| service-envoy-inject

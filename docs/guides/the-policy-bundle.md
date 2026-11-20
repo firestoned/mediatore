@@ -351,6 +351,9 @@ policy:
     mode: shadow                         # config (default) | shadow | bundles
     platform_namespace: sandbox-platform # must match NOTAIO_AUDIENCE_PLATFORM_NAMESPACE
     credential_refresh_secs: 60          # default 60
+    # openbao:                           # only for platform audiences whose credential is in OpenBao KV
+    #   url: https://openbao.home.example:8200
+    #   role: mediatore                  # the Kubernetes auth role (auth_mount, token_file, ca_file as for transit)
 ```
 
 - **`config`** (or no `audience_definitions`): `audiences[]` serves and no audience bundle is read.
@@ -375,6 +378,18 @@ admitted` with the namespace, name, kind and version of each bundle it takes, `a
 refused; nothing changed` for one that does not verify, and `audience definition not taken` with the
 rule (`L022`, `L023`, `L026`, `L017`) for one that verifies but breaks a rule; that one also withdraws
 any earlier definition of the audience.
+
+Each admitted audience with a credential source has its credential read, under `shadow` as well,
+so the access is proven before `bundles` serves from it: a team audience's Secret with a `get` by
+name in its own namespace, a platform audience's from its Secret in the platform namespace or from
+OpenBao KV. Every `credential_refresh_secs`, and at once when a definition changes. The broker needs
+the `deploy/audience-credentials` Role in each namespace that holds such a Secret, with
+`resourceNames` replaced by those Secrets' names (an empty list would grant them all, so the
+component ships a name that matches nothing). The log says `audience credential read (ADR-0055)` the
+first time and after a failure, and `audience credential not read (ADR-0055)` with `reason` (`not
+found`, `denied`, `unavailable`, `malformed`, `no reader for this source`) when a read fails; never
+the Secret's name, the path or the value. A failed read keeps the last good value for two refresh
+periods, then the audience has no credential until a read succeeds.
 
 Under `shadow`, once every namespace has been listed, each audience gets one `audience shadow
 (ADR-0055)` line whenever its verdict changes: `matches the file`, `differs from the file in:` and

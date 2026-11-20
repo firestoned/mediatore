@@ -14,6 +14,7 @@ use clap::{Parser, Subcommand};
 use mediatore_api::{AppState, Limiter};
 use mediatore_claims::Reconciler;
 use mediatore_claims::audience::AudienceReflector;
+use mediatore_claims::credential::{CredentialCache, CredentialReader, Readers};
 use mediatore_claims::kubestore::KubeStore;
 use mediatore_claims::lease::LeaseConfig;
 use mediatore_claims::policy::{BundleCache, BundleReflector};
@@ -141,7 +142,7 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
     // The reflector needs the store the state is about to own, and the state needs the
     // reflector's cache (ADR-0030): built first.
     let reflector = bundle_reflector(&cfg, &store, client.is_some())?;
-    let audiences = audience_reflector(&cfg, &store, client.is_some())?;
+    let audiences = audience_definitions(&cfg, &store, client.as_ref()).await?;
     let policy_egress = policy_egress(&cfg, reflector.as_deref());
 
     let state = Arc::new(AppState {
@@ -215,7 +216,7 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
                 .map_err(std::io::Error::other)
         };
         let aud = async {
-            run_audience_reflector(audience_client, audiences)
+            run_audience_definitions(audience_client, audiences)
                 .await
                 .map_err(std::io::Error::other)
         };
@@ -275,16 +276,26 @@ fn bundle_reflector(
     ))))
 }
 
-/// The audience reflector (ADR-0055 decision 1) under `shadow`: notaio's audience bundles read
-/// beside the file, each comparison logged; the file still serves. `None` under `config`, and
-/// without a cluster. `bundles` never starts yet (the configuration refuses it).
-fn audience_reflector(
+/// What ADR-0055 runs beside the file: the reflector that fills the audience catalog and the
+/// cache its audiences' credentials are read into, with the readers.
+struct AudienceDefinitions {
+    reflector: Arc<AudienceReflector>,
+    credentials: Arc<CredentialCache>,
+    reader: Arc<dyn CredentialReader>,
+}
+
+/// The audience reflector and the credential reads (ADR-0055 decisions 1 and 5) under `shadow`:
+/// notaio's audience bundles read beside the file, each comparison logged, each credential read
+/// and the outcome logged; the file still serves. `None` under `config`, and without a cluster.
+/// `bundles` never starts yet (the configuration refuses it). With `openbao` configured the login
+/// happens here, so a wrong URL, CA or role stops the start.
+async fn audience_definitions(
     cfg: &Config,
     store: &Arc<dyn ClaimStore>,
-    has_cluster: bool,
-) -> anyhow::Result<Option<Arc<AudienceReflector>>> {
+    client: Option<&kube::Client>,
+) -> anyhow::Result<Option<AudienceDefinitions>> {
     let mode = cfg.audience_mode();
-    let (Some(policy), true) = (cfg.policy.as_ref(), has_cluster) else {
+    let (Some(policy), Some(client)) = (cfg.policy.as_ref(), client) else {
         return Ok(None);
     };
     let Some(defs) = policy.audience_definitions.as_ref() else {
@@ -308,20 +319,41 @@ fn audience_reflector(
         namespaces,
     )
     .with_shadow(cfg.audience_shapes());
-    Ok(Some(Arc::new(reflector)))
+    let openbao: Option<Box<dyn CredentialReader>> = match &defs.openbao {
+        Some(o) => Some(Box::new(
+            mediatore_claims::credential::OpenBaoKv::connect(o).await?,
+        )),
+        None => None,
+    };
+    let refresh = jiff::SignedDuration::from_secs(
+        i64::try_from(defs.credential_refresh_secs)
+            .map_err(|_| anyhow::anyhow!("credential_refresh_secs is too large"))?,
+    );
+    Ok(Some(AudienceDefinitions {
+        reflector: Arc::new(reflector),
+        credentials: Arc::new(CredentialCache::new(refresh)),
+        reader: Arc::new(Readers {
+            kube: Some(Box::new(mediatore_claims::credential::KubeSecrets::new(
+                client.clone(),
+            ))),
+            openbao,
+        }),
+    }))
 }
 
-/// The audience reflector on every replica, until shutdown; nothing without one. A watch that
-/// ends is an error, so the pod restarts with the cause in its log.
-async fn run_audience_reflector(
+/// The audience reflector and the credential refresh on every replica, until shutdown; nothing
+/// without them. A watch that ends is an error, so the pod restarts with the cause in its log.
+async fn run_audience_definitions(
     client: kube::Client,
-    reflector: Option<Arc<AudienceReflector>>,
+    audiences: Option<AudienceDefinitions>,
 ) -> anyhow::Result<()> {
-    let Some(reflector) = reflector else {
+    let Some(a) = audiences else {
         return Ok(());
     };
+    let live = a.reflector.live();
     tokio::select! {
-        r = mediatore_claims::audience::run(client, reflector) => r,
+        r = mediatore_claims::audience::run(client, a.reflector) => r,
+        r = mediatore_claims::credential::run(live, a.credentials, a.reader) => r,
         () = shutdown() => Ok(()),
     }
 }

@@ -22,6 +22,7 @@ use uuid::Uuid;
 
 pub mod audience;
 pub mod crd_formats;
+pub mod credential;
 #[cfg(test)]
 pub(crate) mod fakes;
 pub mod kubestore;

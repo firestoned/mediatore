@@ -1,0 +1,46 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+#
+# The broker's read of the Secrets its audiences' credentials are in (ADR-0055 decision 5):
+# in one namespace, `get` on exactly the Secrets named, and nothing else. The broker polls each
+# credential every `policy.audience_definitions.credential_refresh_secs`, so it needs neither
+# `list` nor `watch`, and it can neither write a Secret nor read one it is not given here.
+#
+# One copy per namespace that holds an audience's credential: a team namespace with team
+# audiences, and the platform audience namespace when a platform audience uses `secretRef`. It
+# is created with the namespace, by whoever onboards the team, never by the broker.
+#
+# `resourceNames` MUST be replaced with the Secrets that namespace's SandboxAudiences name in
+# `credential.source.secretRef.name`. An empty list would grant every Secret in the namespace,
+# so the list shipped here names one that should not exist; an overlay replaces it:
+#
+#   resources: [../../audience-credentials]
+#   namespace: team-a
+#   patches:
+#     - target: { kind: Role, name: mediatore-audience-credentials }
+#       patch: |-
+#         - op: replace
+#           path: /rules/0/resourceNames
+#           value: [artifactory-token]
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: mediatore-audience-credentials
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["replace-me-with-the-audience-secret-names"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: mediatore-audience-credentials
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: mediatore-audience-credentials
+subjects:
+  - kind: ServiceAccount
+    name: mediatore
+    namespace: banlieue-system
