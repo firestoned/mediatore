@@ -7,6 +7,8 @@
 the Kubernetes API as the store (the `AgentSandbox` status as the record, a Secret per
 sandbox for the sealed session, `SandboxNode` and `PolicyFloor` resources, the finalizer as
 the retention window, no database and no SQLite in the binary); the items are at the end.
+Reopened 2026-11-19 for ADR-0057 (the record written by compare-and-set and bound to its
+sandbox: built, its items and what is left at the end).
 What stands below was done 2026-10-14. Built [ADR-0012](../../docs/adr/0012-persistent-store.md):
 claims, nodes and revocations survive a broker restart; threat-model accepted risk **R-5**
 deleted. Under [ADR-0008](../../docs/adr/0008-agentsandbox-crd-owned-by-mediatore.md) the
@@ -74,3 +76,28 @@ datastore.
       pass (TB-9, A-11, R-26).
 - [ ] The live proof: a recycled pool with `kubectl get sandboxnodes` settling at the pool's
       size, on v0.2.5 or later (no RBAC change: the role already has `delete`).
+
+## ADR-0057: a record written by compare-and-set and bound to its sandbox (2026-11-19)
+
+- [x] [ADR-0057](../../docs/adr/0057-a-claims-record-written-by-compare-and-set-and-bound-to-its-sandbox.md)
+      accepted and implemented (2026-11-19): `RecordVersion` on every read, `update_claim`
+      conditional on it in both stores, `modify_claim` (four attempts) and each caller's second
+      decision, the release with no precondition, the status before the Secrets in every write
+- [x] `status.record.sandboxUid` and `namespace`, compared on every read; the CRD re-rendered
+      in both served versions (apply it before the broker)
+- [x] The session envelope bound to its slot (format 2), format 1 still read, a delegation's
+      expiry inside the envelope, the transit probe refusing a key that does not bind the slot
+- [x] The new cases shared by both stores (`crates/mediatore-store/src/shared_cases.rs`), the
+      fake API server refusing a stale resource version
+- [x] The store guide (the order of an upgrade, `503 record_busy`) and the threat model: full
+      pass, TB-9 and TB-10, R-46 and R-47 new, R-36 corrected
+- [x] The reconciler's half of the binding: a sandbox whose record names another sandbox is
+      `Failed` (`record_not_own`) and its claim deleted (`refuse_foreign_record`; its test
+      passed in the day's second gate run)
+- [ ] The two live steps in the kind tiers: a stale resource version refused with `409` as the
+      broker's ServiceAccount (`dev/kind/sandbox-e2e.sh`), a session Secret carrying format `2`
+      after the first issue (`dev/kind/dex-e2e.sh`); and the conflict count per caller
+- [ ] The rest of the conformance suite over `KubeStore` on the fake API server
+- [ ] Reading format 1, and a record without `sandboxUid`, removed the release after
+- Deferred, not built: decision 8, a MAC over the record (threat model R-46 carries its three
+  triggers)

@@ -156,6 +156,13 @@ from the Workload API`, `claim watcher running` on the replica that holds the Le
 `/healthz` on the user API answers true only while the API server answers the store;
 the Ingress routes to it.
 
+An upgrade across the change of ADR-0057 has an order (the detail is in
+[the store](the-store.md)): apply the CRDs first (`kubectl apply -f deploy/base/crds`), since
+the record gains two fields the API server would otherwise prune, then replace the broker in
+one step, old replicas at zero before the new ones start. A broker from before the change
+cannot open an envelope the new one sealed, and if it rewrites the Secret it leaves it
+unopenable, so the two never run side by side.
+
 ## 4. Prove the cluster side as the broker's ServiceAccount
 
 Before a single sandbox, run the live admission round trip from your machine, as the
@@ -478,7 +485,10 @@ about the size of the pool plus the grace's worth of churn.
 With the pool attesting, the environment's egress goes through the three gateway VMs of
 banlieue ADR-0109 and [ADR-0028](../adr/0028-egress-gateway-envoy-with-spiffe-identity.md):
 Envoy with the identity `spiffe://<td>/gateway`, authorizing every tunnel on the caller's
-claim against the broker, and beside it the control relay of
+claim against the broker through the authorizer beside it, which holds an identity of its
+own, `spiffe://<td>/gateway/authorizer`
+([ADR-0053](../adr/0053-the-gateways-authorizer-has-an-identity-of-its-own.md)), and beside
+those the control relay of
 [ADR-0027](../adr/0027-control-plane-relay-on-the-egress-gateway.md), through which a pool
 VM reaches the SPIRE server and the broker at all (the segment has no route and no
 resolver). Everything is image content and ordinary banlieue objects; banlieue gains no
@@ -527,21 +537,108 @@ kubectl apply -k ~/.config/mediatore/gateway
 **The identity.** Each gateway attests with its vTPM like a pool member (the same
 `deploy/spire-tpm` component, its host's CA in the ConfigMap), and the SPIRE server logs
 its agent ID, `spiffe://<td>/spire/agent/tpm/<ek-hash>` (`spire-server agent list` shows
-it). That hash goes into two `ClusterStaticEntry` objects per VM
-(`deploy/gateway/clusterstaticentries.yaml`): `spiffe://<td>/gateway` for `unix:user:envoy`
-(the data plane, over SDS) and for `unix:user:mediatore-gateway` (the authorizer), since one
-entry's selectors are a conjunction. You apply them, not the broker: its admission policy
-constrains only its own ServiceAccount. The relay gets no entry. The data plane refuses
+it). That hash goes into the `ClusterStaticEntry` objects of that VM
+(`deploy/gateway/clusterstaticentries.yaml`), one per user since one entry's selectors are
+a conjunction, and two identities between them (ADR-0053):
+
+| Entry | `spiffeID` | selector | held by |
+| --- | --- | --- | --- |
+| `gateway-NN-envoy` | `spiffe://<td>/gateway` | `unix:user:envoy` | the data plane, over SDS |
+| `gateway-NN-envoy-inject` | `spiffe://<td>/gateway` | `unix:user:envoy-inject` | the inject listener, where an audience is gateway-placed |
+| `gateway-NN-authorizer` | `spiffe://<td>/gateway/authorizer` | `unix:user:mediatore-gateway` | the authorizer, as a client of the broker |
+
+`spiffe://<td>/gateway` is the name every sandbox's forwarder verifies and no peer of the
+broker: the broker's sandbox listener refuses it at the handshake and its two gateway
+routes answer the authorizer's ID alone. The authorizer asks the agent for its own SVID by
+ID and does not start without it (Envoy then refuses every tunnel), so never give its user
+the listeners' ID, nor a listener's user the authorizer's. You apply the entries, not the
+broker, and `deploy/base/admission/clusterstaticentry-gateway.yaml` pins their shape for
+whoever does: these two IDs, each with its own users' selector, one selector per entry, and
+nothing else under `/gateway`. The relay gets no entry. The data plane refuses
 every peer that is not a claim of the trust domain before any check runs, so a sandbox
 cannot reach the relay's upstreams through it, and the authorizer asks the broker over
-`GET /v1/gateway/claims/{uid}` with the gateway SVID, on the egress side. The agent ID is
+`GET /v1/gateway/claims/{uid}` with its own SVID, on the egress side. The agent ID is
 the vTPM's, not the VM's name: a gateway recreated (a provider change, a host move, a
-deleted VM) comes back with a new vTPM, a new EK and a new agent ID, and its two entries
+deleted VM) comes back with a new vTPM, a new EK and a new agent ID, and its entries
 name a parent that no longer attests until you regenerate them from the new hash
 (`openssl x509 -pubkey -noout < ek.pem | openssl pkey -pubin -outform der | sha256sum` on
 the first RSA certificate in `.status.tpmEndorsementCertificates` gives it without the
 server). Its Envoy then has no SVID to serve and `8443` stays closed, or flaps if the
 attestation itself fails (above).
+
+**What a gateway's own processes may dial.** The host table has an output chain keyed on the
+socket's owner (ADR-0053 decisions 5 and 6), rendered from the same env file as the rest and
+loaded in the same transaction: no table, no listener. Established traffic is accepted
+first, so each rule is about a new connection.
+
+| User | New connections admitted |
+| --- | --- |
+| `mediatore-gateway` (the authorizer) | `BROKER_ADDRESS` at `BROKER_PORT`, nothing else |
+| `envoy-relay` | its four upstreams (`SPIRE_SERVER_*`, `BROKER_*`, `SPIRE_BUNDLE_*`, `REGISTRY_*`), each by address and port, nothing else |
+| `spire` (the agent) | `SPIRE_SERVER_ADDRESS` at `SPIRE_SERVER_PORT`, nothing else |
+| `envoy`, `envoy-inject` | any IPv4 destination that is not loopback or one of the VM's own addresses, link-local (`169.254.0.0/16`), one of the four control-plane addresses of the env file, or an entry of `EGRESS_DENY_ELEMENTS`; no IPv6. The tunnel Envoy keeps one loopback exception, the authorizer's check port, while that is loopback TCP |
+| every other user, root included | as before, except `BROKER_ADDRESS`, on any port |
+
+No user opens a new connection by the sandbox interface. Three consequences for your env
+file. `MEDIATORE_URL` must be `https://BROKER_ADDRESS` (with `:BROKER_PORT` unless that is
+`443`): an address, never a name, and the authorizer's unit refuses to start when the two
+differ. The agent's `server_address` and `server_port` in `/etc/spire/agent.conf` must be
+`SPIRE_SERVER_ADDRESS` and `SPIRE_SERVER_PORT`. And the refused destinations hold whatever
+a name resolved to, at connect time: a claim's allowed name that resolves to the gateway's
+loopback, to the segment or to the broker is a `503` for that tunnel and a counted,
+logged drop on the gateway (`nft list table inet mediatore_gateway`; the log prefixes begin
+`mediatore-gateway out`). Three keys are optional, each rendering a safe default when your
+env file predates them:
+
+- `EGRESS_DENY_ELEMENTS` (default empty): more addresses and ranges neither Envoy may dial,
+  as `, 10.0.0.0/8, 198.51.100.40`. Put your Kubernetes API, secrets store and identity
+  provider here at least; a blanket refusal of private space is yours to choose, since an
+  audience may be an on-premises host. Until you fill it those addresses are your datacenter
+  firewall's to refuse on the three egress addresses.
+- `CHECK_TCP_ELEMENTS` (default `elements = { 9001 }`): the tunnel Envoy's one loopback
+  port. Empty once the data plane asks the check socket (`env.inject.example` empties it).
+- `RESOLVER_ELEMENTS` (default empty): the Envoys' resolver, only where the rules would
+  refuse it, as `elements = { 127.0.0.53 }` for a stub on loopback or an address inside a
+  range you denied. Read `/etc/resolv.conf` on a booted gateway before you rely on the
+  default: with a loopback stub and this key empty, no tunnel resolves a name.
+
+What the chain does not bound: root on the gateway, which can rewrite the table; an
+internal address you did not list; a name that resolves to a public address you did not
+intend (the TLS inside the tunnel is the control there); and unix sockets, so the agent's
+socket stays reachable to both Envoys, whose SVID now opens no route at the broker. A
+deployment that renders its own copy of the table has none of this until its copy follows.
+
+**Moving gateways that predate ADR-0053.** Before it, the authorizer held the listeners'
+ID. The broker, the entries and the image cannot change at one instant, so the order is:
+
+1. *The broker.* The release that carries ADR-0053 answers the authorizer's ID alone. Where
+   the entries are changed in the same window as the broker, go to step 2 and accept that
+   tunnels are refused for the minutes in between. Where they are another team's change on
+   another day, set `accept_plain_gateway_identity: true` in the broker's config first: the
+   handshake and the two gateway routes then accept either ID, the broker says so at start,
+   and every ask under the old one is a `warn` line naming the peer, the route and the claim
+   UID. With the key on, the separation between a gateway's listeners and its authorizer is
+   not in force.
+2. *The entries and the image, one gateway VM at a time.* Replace that VM's
+   `gateway-NN-mediatore-gateway` entry with `gateway-NN-authorizer` (delete the old object:
+   the old image takes whichever SVID the agent hands it first, so never leave a user with
+   both), and boot the new image. A new image whose entry is missing does not start its
+   authorizer and serves nothing; an old image whose entry was replaced is refused by a
+   broker without the switch. Both are closed and both are loud. A gateway that is refused
+   keeps serving the allowlists it had already cached for at most its stale bound (300 s by
+   default), as in a broker outage, and nothing after.
+3. *The admission policy* for gateway entries
+   (`deploy/base/admission/clusterstaticentry-gateway.yaml`) belongs after the last entry of
+   the old shape is gone. It is part of `deploy/base`, so applying the base with the broker's
+   release installs it at step 1 unless your overlay leaves it out until then. It does not
+   judge the entries that exist, but from the moment it is installed an entry of the old
+   shape can no longer be created or updated (a recreated gateway's new agent ID, say): that
+   gateway then moves to the new shape instead.
+4. *The switch back to `false`*, once no such `warn` line has appeared for a full claim
+   lifetime. The key is removed in the following release, and a config still carrying it
+   then refuses to start.
+
+Rolling an image back means rolling its entry back, or the switch.
 
 A gateway drops ICMP, so `ping` proves nothing about one; a TCP connect to its relay
 ports from the segment, or `nft list table inet mediatore_gateway` on its console, does.
@@ -697,6 +794,14 @@ audiences:
 **Rollout.** As for ADR-0040: broker and authorizer first, then the gateways (the authorizer needs `--socket-dir-mode 2750` and, from v0.2.9, a unit with `RestrictSUIDSGID=yes` is fine because the directory mode is changed only when it differs), then the pool image, then the audience. On a first boot, make sure the `envoy-inject` group exists before the step that installs files with that group.
 
 ## What the NetworkPolicy allows
+
+The object itself is in `deploy/base` (`networkpolicy.yaml`), so the release's install
+manifest carries it: ingress to the broker's pods is denied by default, with `8443` and
+`8080` opened to placeholder peers (a documentation CIDR and a namespace name no cluster
+has) that admit nothing. Until your overlay patches them with the sandbox segment's CIDR
+and the ingress controller's namespace, as the example overlay's `networkpolicy.yaml`
+does (listed under `patches`, not `resources`; it also adds the egress rules), an
+enforcing CNI lets nobody reach the broker.
 
 | Direction | Peer | Port | Why |
 | --- | --- | --- | --- |

@@ -90,6 +90,13 @@ Anthropic flow, under any placement, needs an egress allowance first (open quest
    headers (`anthropic-version`), with the claim's deadline, and `GET /v1/me` carries
    `credential: gateway` and the inject port on the audience's routes.
 
+   *Amended 2026-11-19 by
+   [ADR-0053](0053-the-gateways-authorizer-has-an-identity-of-its-own.md)
+   (decision 3): "the gateway" that this route and the egress route answer is the authorizer's
+   own identity, `spiffe://<td>/gateway/authorizer`, and no longer the listeners'
+   `spiffe://<td>/gateway`, which both Envoys keep and which is no peer of the broker. The
+   identity column of decision 3's process table reads the same way for the authorizer.*
+
 3. **The inject listener is its own Envoy, `envoy-inject`: a process and a user of its own.** Three
    processes divide the gateway, so that the one that carries every tunnel never holds a credential:
 
@@ -210,6 +217,24 @@ Anthropic flow, under any placement, needs an egress allowance first (open quest
    Landlock plan does not change), the pool VM's host table admits the same destinations (decision
    13), and the gateway's sandbox filter admits `INJECT_PORT` to the sandbox range under the same
    per-source cap as the other ports.
+
+   *Amended 2026-11-19, the header rule. "Strips the phantom and any `x-api-key` the client sent"
+   is now narrower for the workload and wider in the names it covers. The proxy keeps a fixed
+   list of credential-bearing header names, `CREDENTIAL_HEADERS`
+   (`crates/mediatore-guest/src/egress.rs`: `cookie`, `proxy-authorization`, `x-api-key`,
+   `api-key`, `apikey`, `x-auth-token`, `x-access-token`, `x-goog-api-key`, `private-token`,
+   `job-token`, `deploy-token`, `x-amz-security-token`, `x-vault-token`,
+   `ocp-apim-subscription-key`), matched whatever their case. In one of those headers that no
+   route owns, a value of the workload's own is refused, `401 unknown_credential`, on every
+   kind of route (`carries_unowned_credential`), so a credential baked into an image is not
+   carried to the gateway or to an upstream; the phantom there is let through and the header is
+   dropped as the request leaves (`rewrite`). Headers the request names in `Connection` are
+   dropped with the fixed hop-by-hop list (`strip_hop_by_hop`), so a header the workload names
+   there is sent neither to the gateway nor to an upstream. This is a floor and not a filter of
+   credentials: a header of another name, the query string and the body are not looked at.
+   Units `a_credential_header_no_route_owns_is_refused_on_every_kind_of_route`,
+   `a_route_that_owns_a_listed_header_takes_the_phantom_there_and_refuses_anything_else`,
+   `headers_named_in_connection_are_dropped_with_the_fixed_hop_by_hop_list`.*
 
 8. **The credential source is unchanged, and transit is configured for sealing.** The first source
    is `via: delegated` (ADR-0035): the requester's session, delegated with `--delegate`, sealed under

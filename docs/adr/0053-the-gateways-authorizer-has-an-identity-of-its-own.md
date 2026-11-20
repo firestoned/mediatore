@@ -3,7 +3,10 @@
 
 # ADR-0053: The gateway's authorizer has an identity of its own
 
-**Status:** Proposed · **Date:** 2026-11-19
+**Status:** Accepted, implemented 2026-11-19 (amended at implementation, each amendment dated at
+its decision; proven by the quality gate, the kind gateway tiers and the two image checks; nothing
+is proven on a booted gateway VM yet, so decisions 2, 5 and 6 are built and not verified there:
+*What was proven, and what was not*) · **Date:** 2026-11-19
 
 Roadmap 10 (the gateway). Carries the separation of
 [ADR-0040](0040-the-gateway-places-an-audiences-credential-the-pool-never-holds-it.md) decision 6
@@ -19,7 +22,8 @@ credential route, the identity column of the process table),
 table gains an output chain) and
 [ADR-0006](0006-registration-entries-as-clusterstaticentry.md) decision 6 (a second admission
 policy, for entries the broker does not declare). Changes no token shape, no storage contract and
-no route's path or body. Nothing is implemented; this text is for review before any code.
+no route's path or body. Implemented 2026-11-19; where the code differs from the text below, a
+dated amendment at the decision says what the code does and why.
 
 ## Context
 
@@ -118,6 +122,11 @@ Constraints that shape the decision:
    and `--dev-spiffe-id` (`crates/mediatore-gateway/src/serve.rs`) carry the new ID in the dev
    loop and the tests.
 
+   *Amended 2026-11-19 at implementation: the selection is `WorkloadApiSource::connect_as`
+   (`crates/mediatore-tls/src/material.rs`), asked for the path `AUTHORIZER_PATH`, and the
+   check that the identity in hand is the authorizer's is `ensure_authorizer` (both in
+   `crates/mediatore-gateway/src/broker.rs`), which the dev path in `serve.rs` runs too.*
+
 3. **The broker's two gateway routes require the authorizer's ID exactly, and the plain gateway
    ID is no longer a peer of the broker at all.** In `crates/mediatore-api/src/lib.rs`:
    `claim_egress` and `gateway_credential` test `is_gateway_authorizer(peer)`; any other peer,
@@ -130,6 +139,12 @@ Constraints that shape the decision:
    audit line and the answers are those of ADR-0028 decision 4 and ADR-0040 decision 2,
    unchanged. A listener's identity is from now on a name the sandboxes verify and nothing the
    broker serves.
+
+   *Amended 2026-11-19 at implementation: the guard is one function,
+   `require_gateway_authorizer`, called first in `claim_egress` and in `gateway_credential`,
+   and the listener's list is `sandbox_authorizer(naming, accept_plain_gateway_identity)`: the
+   switch of decision 7 is an argument of both, so there is one place where the plain ID can
+   be let in and it is the same for the handshake and the routes.*
 
 4. **An admission policy pins the shape of a gateway entry, for whoever applies one.** The
    existing policy is not widened: its `spiffeID` rule anchors on `/banlieue/(node|claim)/`, so
@@ -152,6 +167,12 @@ Constraints that shape the decision:
    bound on a cluster administrator, who can remove it, nor on SPIRE's own admin API. The
    comment at the head of `deploy/gateway/clusterstaticentries.yaml`, which says no policy
    constrains these entries, is corrected with it.
+
+   *Amended 2026-11-19 at implementation: the policy is
+   `mediatore-clusterstaticentry-gateway`, thirteen validations, with its binding in the same
+   file. It is in the base, so it is applied with the broker and not as a later step: see the
+   amendment of decision 7. It judges `ClusterStaticEntry` objects only: a `ClusterSPIFFEID`
+   template that renders a name under `/gateway` is outside it (open question 2).*
 
 5. **The gateway's host table gains an output chain keyed on the socket's owner.**
    `image/gateway/nftables.conf.in` gains `chain output`, rendered from the same env files and
@@ -181,6 +202,30 @@ Constraints that shape the decision:
    resolver's, the clock's, the log forwarder's); see open question 4. With the authorizer's ID
    (decision 3) this gives the compartment two independent enforcers: the broker refuses a
    listener's name, and the kernel refuses a listener's packets.
+
+   *Amended 2026-11-19 at implementation: the chain is `chain output` with one sub-chain per
+   named user (`output_authorizer`, `output_relay`, `output_agent`, `output_envoy`, and
+   `output_listener`, which `envoy-inject` jumps to and the tunnel Envoy falls through to after
+   its one exception). Three things differ from the table above.*
+
+   - *The loopback exception is by destination, not by a rule on who may reach the port. The
+     tunnel Envoy's user is admitted to `127.0.0.1` at the ports of the set `check_tcp`
+     (rendered from an optional key, `CHECK_TCP_ELEMENTS`, default `elements = { 9001 }`; a
+     deployment whose check is the unix socket renders it empty). No rule restricts that port to
+     the Envoy's user: root and the users the table does not name reach it as they did before
+     this ADR. The check answers an allowlist question and never a credential (ADR-0040
+     decision 6), so what is left open is what was open; it closes with open question 7.*
+   - *A second optional key, `RESOLVER_ELEMENTS`, empty by default, was added beyond this text:
+     addresses the two Envoys' users may reach on port 53, tested before the loopback refusal.
+     It is the escape hatch of open question 6 for an image that resolves through a loopback
+     stub, and it is empty until a booted image says it is needed.*
+   - *`MEDIATORE_URL` naming `BROKER_ADDRESS` is enforced as open question 5 recommended: an
+     `ExecStartPre` on `image/gateway/systemd/mediatore-gateway.service` refuses the start
+     unless the URL is `https://<BROKER_ADDRESS>` with `BROKER_PORT` (the port may be left out
+     at 443), and `image/gateway/check.sh` asserts it for the example env.*
+
+   *Optional keys are written in the template as `@NAME:-default@`, which `image/gateway/render`
+   fills with the default when the env files do not carry the key.*
 
 6. **The same chain bounds the address a resolved name may lead to, and says what it does not
    bound.** The refused column for `envoy` and `envoy-inject` is applied by the kernel at
@@ -222,9 +267,29 @@ Constraints that shape the decision:
       start its authorizer and serves nothing; an old image whose entry was replaced is refused
       by a broker without the switch, and the authorizer then denies what it has cached
       (`broker_refused`). Both failures are closed and both are loud.
+
+      *Amended 2026-11-19 at implementation: the last clause is not what the code does.
+      Decision 3 moved the refusal of the plain ID into the handshake, and over mutual TLS a
+      client that is refused there sees a failed connection, which it cannot tell from an
+      outage. So the authorizer reports `broker_unreachable`, not `broker_refused`, and a warm
+      cache keeps serving the allowlists it holds for up to the stale bound (`--stale-secs`,
+      300 seconds), never past a claim's deadline; a claim with nothing cached is denied at
+      once. `broker_refused` now occurs only on an HTTP `403`, which an authorizer holding the
+      right ID does not get from these routes. The window is the one an outage already had and
+      it serves allowlists the broker gave while the authorizer was still a peer; it is recorded
+      as an accepted risk in the threat model. Telling the two apart would need the broker to
+      complete the handshake and refuse at the route, which is the old behaviour for the plain
+      ID and what decision 3 removed on purpose.*
    3. *The admission policy of decision 4*, applied once the last old entry is gone (a
       `ValidatingAdmissionPolicy` does not judge objects that already exist, but it would refuse
       an update to one).
+
+      *Amended 2026-11-19 at implementation: the policy is in `deploy/base`, so it lands with
+      the broker at step 1, not here. An old `gateway-NN-mediatore-gateway` entry that already
+      exists keeps working until it is replaced (the policy does not judge it), and from step 1
+      on it can be deleted and can no longer be updated or applied again. An environment that
+      needs to re-apply the old shape during the transition must leave the policy out of its
+      overlay until this step, on purpose.*
    4. *The switch set back to `false`*, when no `warn` line has appeared for a full claim
       lifetime, and at the latest before the next release.
 
@@ -255,6 +320,14 @@ Constraints that shape the decision:
 
 Every control below is proposed. None exists yet; each is marked *(not built)* with the file it
 will live in, and the threat model is not changed until the pass that follows implementation.
+
+*Amended 2026-11-19 at implementation:* the controls below are built, and the threat model's
+TB-3, TB-6, TB-13, TB-14 and TB-17 carry them with their tests since the pass of the same day; the
+*(not built)* marks are left as the proposal read. Two rows are not as written. "A refused
+authorizer keeps serving what it had cached" is true for up to the stale bound (decision 7's
+amendment), and is an accepted risk there, not a control. "The chain cuts something the VM needs"
+is still *not proven*: no gateway VM has booted this table. The entries case of the TB-3 table
+runs in the kind gateway tier, not the entries tier.
 
 **TB-6, gateway to the broker's sandbox API (the two gateway routes)**
 
@@ -428,6 +501,38 @@ resolver; and the migration of decision 7 is walked once in each direction (swit
 off). Until that run has passed, decisions 2 and 5 are not to be called verified, whatever
 `make check` and CI say.
 
+## What was proven, and what was not
+
+Proven on 2026-11-19, on the build host:
+
+- **The quality gate** (`make check`): the unit and end-to-end tests named above, with these
+  differences. The forwarder's refusal of the authorizer's ID is a negative case in
+  `crates/mediatore/tests/e2e_forward.rs` and has no unit test of its own in `forward.rs`.
+  Added beyond the list: `a_source_asked_for_one_id_fails_the_connect_within_the_wait_and_names_the_id`
+  (`material.rs`), `startup_warns_while_the_plain_gateway_identity_is_accepted_and_says_nothing_otherwise`
+  (`config.rs`), and `the_transition_switch_admits_the_plain_gateway_identity_to_the_gateway_routes_only`
+  (`e2e_mtls.rs`).
+- **The kind gateway tiers** (`make kind-e2e-gateway`, `make kind-e2e-gateway-policy`): the pod's
+  two containers hold two identities from two `ClusterSPIFFEID` fixtures told apart by container
+  name; the authorizer's log line names `spiffe://<td>/gateway/authorizer`; a client holding the
+  listeners' identity is refused by the broker in the handshake; and server-side dry runs of
+  gateway entries are judged by the admission policy, three admitted (the two listeners' shapes
+  and the authorizer's) and the others refused: as an administrator, swapped selectors, a
+  selector of neither kind, two selectors, other paths under `/gateway`, `admin`, a long TTL and
+  DNS names; as the broker's ServiceAccount, both gateway IDs.
+  The existing probes pass unchanged. The dry runs are in the gateway tier, not the entries tier.
+- **The image checks** (`make gateway-image-check`, with `make gateway-render-check`): the built
+  gateway image carries the output chain and its five sub-chains, the users the table names, the
+  optional sets in their default and filled forms, and the `MEDIATORE_URL` guard.
+
+Not proven: anything on a booted gateway VM. The tier's gateway is a pod, so no `unix:user`
+selector, no host table and no systemd unit has run. The kernel's drops per user, the resolver
+(open question 6), the agent and the relay still reaching their upstreams under the chain, and
+the migration of decision 7 walked in each direction are all still to be observed, and the core
+cluster has not run this change. Until then decisions 2, 5 and 6 are built and not verified.
+Which certificate validator Envoy runs under the SDS secret is not established by this change
+either (the templates name none); it is recorded in the threat model.
+
 ## Open questions
 
 1. **`/gateway/authorizer` or a sibling such as `/gateway-authorizer`?** The nested form reads
@@ -435,14 +540,18 @@ off). Until that run has passed, decisions 2 and 5 are not to be called verified
    taken in by a prefix match on `/gateway`. *Recommendation:* the nested form, because every
    matcher in the repository is exact and the tests of decision 1 pin it; choose the sibling if
    the maintainer expects an Envoy-side matcher on the gateway ID (a SAN prefix, as the claim
-   matcher is) at any point.
+   matcher is) at any point. (Answered 2026-11-19 by the implementation: the nested form,
+   pinned exact in both directions by
+   `the_authorizer_identity_is_exactly_one_id_and_is_not_the_gateway_identity`.)
 2. **Should the admission policy of decision 4 exist at all, given that it binds nobody who can
    delete it?** *Recommendation:* yes. Its job is to stop the one mistake that undoes this ADR
    without any error (the old second entry re-applied from an old manifest), and it documents
    the two shapes in a place the API server enforces. A companion rule for `ClusterSPIFFEID`
    templates under `/gateway` (the kind fixture's kind, and another way to the same name) is
    worth a line in the same file; it is left out of the decision until the maintainer says
-   whether that kind is in use outside the tier.
+   whether that kind is in use outside the tier. (Answered 2026-11-19 by the implementation:
+   the policy exists, in the base. The companion rule for `ClusterSPIFFEID` is not built and
+   stays open.)
 3. **The transition switch, or a hard cut with no dual acceptance?** *Recommendation:* ship the
    switch, default off, removed one release later (decision 7). A hard cut is the purer
    fail-closed choice and is what a single-operator environment should do in practice; without
@@ -450,34 +559,44 @@ off). Until that run has passed, decisions 2 and 5 are not to be called verified
    whole egress path for as long as the three changes are apart, and the pressure that creates
    is to delay the fix. If the maintainer prefers no switch, decision 7 loses the key and
    step 4, and the release notes carry the order (entries and image per VM, then the broker)
-   with the outage stated.
+   with the outage stated. (Answered 2026-11-19 by the implementation: the switch,
+   `accept_plain_gateway_identity`, default off, a `warn` at start and at each use. Its removal
+   in the following release is still to do.)
 4. **Default policy of the output chain: `accept` or `drop`?** The pool VM's table is
    default-drop (ADR-0029). On the gateway that would mean enumerating every system user that
    opens a connection (the resolver, the clock, the log forwarder, the upgrade path), none of
    which this repository has listed. *Recommendation:* `accept` in this ADR with allowlists for
    the five named users, and a follow-up to move to `drop` once the live run has produced the
-   list. A wrong guess here is a gateway that boots and serves nothing, found only on a VM.
+   list. A wrong guess here is a gateway that boots and serves nothing, found only on a VM. (Answered
+   2026-11-19 by the implementation: `accept`. The move to `drop` is not built and waits for the
+   live run; what `accept` leaves is an accepted risk in the threat model.)
 5. **How is "`MEDIATORE_URL` names `BROKER_ADDRESS`" enforced?** The table is rendered from an
    address and the authorizer dials a URL. *Recommendation:* the image check for the example,
    and the authorizer's unit refusing to start when the URL's host is not the address (a small
    `ExecStartPre`), in preference to deriving one from the other in the template language,
-   which `image/gateway/render` deliberately does not have.
+   which `image/gateway/render` deliberately does not have. (Answered 2026-11-19 by the
+   implementation: both, as recommended.)
 6. **Does the tunnel Envoy's resolver sit on loopback in the image?** If the base image runs a
    local stub resolver, the loopback refusal needs one more exception (the stub's address, port
    53) or Envoy's bootstrap names the egress resolver directly. *Recommendation:* name the
    resolver in the bootstrap from a new env key and keep loopback closed; to be settled by
-   reading the booted image, not assumed.
+   reading the booted image, not assumed. (Open. Not settled: no image has booted under the
+   chain. `RESOLVER_ELEMENTS` exists, empty, for the case where the answer is a loopback stub.)
 7. **Should the tunnel check move to the unix socket by default in the same change?** With the
    check on loopback TCP the table needs a loopback exception for the tunnel Envoy's user and a
    rule that only that user may reach the port. With the unix socket as the default
    (ADR-0040 decision 6 already ships it for inject) there is no loopback rule to get wrong.
    *Recommendation:* yes, in the same image release, as its own small change, so that the
-   exception in decision 5 is temporary.
+   exception in decision 5 is temporary. (Open, not built: the loopback TCP check is still the
+   default, the unix socket is used only where `env.inject.example` is the env in front, and the
+   exception of decision 5 stays until this is done.)
 8. **Is `EGRESS_DENY_ELEMENTS` in scope here or a follow-up?** *Recommendation:* in scope, as
    an empty-by-default key, because the chain it extends is new in this ADR and the Kubernetes
    API and the secrets store are the addresses an operator will most want in it; what goes in
-   it is the deployment's.
+   it is the deployment's. (Answered 2026-11-19 by the implementation: in scope, empty by
+   default.)
 9. **Per-gateway identities and binding an ask to the serving gateway (decision 8).**
    *Recommendation:* a separate ADR, after this one is live. It needs the broker to learn which
    gateway holds a claim's connection, which is a new contract between the gateway and the
-   broker, and it is the change that would actually narrow R-27.
+   broker, and it is the change that would actually narrow R-27. (Open: no such ADR is
+   written. R-27 says what is left.)

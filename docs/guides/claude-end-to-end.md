@@ -137,12 +137,20 @@ The identities the flow uses, and who declares them:
 | `spiffe://<td>/spire/agent/tpm/<ek-hash>` | the attestor, at the VM's first boot | the EK certificate chaining to a host's CA |
 | `spiffe://<td>/banlieue/node/<ek-hash>` | the broker, as a `ClusterStaticEntry` when banlieue publishes the member's certificates | the agent above as parent, `unix:uid:0` and `unix:path:/usr/bin/mediatore` on the member |
 | `spiffe://<td>/banlieue/claim/<claim uid>` | the broker, when the claim binds | the member's agent as parent, the sandbox user `sb-<hash>` |
-| `spiffe://<td>/gateway` | the operator, two `ClusterStaticEntry` per gateway VM (`deploy/gateway/clusterstaticentries.yaml`), regenerated whenever a gateway VM is recreated (a new vTPM is a new agent ID) | `unix:user:envoy` and `unix:user:mediatore-gateway` under the gateway's agent |
+| `spiffe://<td>/gateway` | the operator, one `ClusterStaticEntry` per listener per gateway VM, `gateway-NN-envoy` and, where an audience is gateway-placed, `gateway-NN-envoy-inject` (`deploy/gateway/clusterstaticentries.yaml`), regenerated whenever a gateway VM is recreated (a new vTPM is a new agent ID) | `unix:user:envoy`, and `unix:user:envoy-inject`, under the gateway's agent |
+| `spiffe://<td>/gateway/authorizer` ([ADR-0053](../adr/0053-the-gateways-authorizer-has-an-identity-of-its-own.md)) | the operator, one `ClusterStaticEntry` per gateway VM, `gateway-NN-authorizer`, in the same file and regenerated with the others | `unix:user:mediatore-gateway` under the gateway's agent |
 | `spiffe://<td>/mediatore` | `deploy/base/clusterspiffeid.yaml` | the broker's pods |
 
 The admission policy `mediatore-clusterstaticentry` constrains what the broker's
 ServiceAccount may declare to the two `banlieue/` shapes; the gateway entries are applied by
-hand because of it. The TPM path is proven by `make kind-e2e-tpm` on the build host before
+hand because of it. A second policy, `mediatore-clusterstaticentry-gateway`, in the same base
+and applied with the broker's overlay, judges those hand-applied entries whoever applies them:
+it admits the listeners' ID for `unix:user:envoy` or `unix:user:envoy-inject` and the
+authorizer's ID for `unix:user:mediatore-gateway`, one selector each, and nothing else under
+`/gateway`. The authorizer's entry from before ADR-0053 (the listeners' ID with the selector
+`unix:user:mediatore-gateway`) is refused by it, and a broker without
+`accept_plain_gateway_identity` refuses an authorizer that still holds that ID: the order of
+the move is in [deploying](deploying.md). The TPM path is proven by `make kind-e2e-tpm` on the build host before
 any change to it merges (`.claude/rules/testing.md`).
 
 ## C. notaio: the policy certified

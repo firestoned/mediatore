@@ -3,7 +3,7 @@
 
 # ADR-0034: The Kubernetes API as the broker's store: the resource is the record, no database
 
-**Status:** Implemented · **Date:** 2026-11-09 (accepted, implemented and cut over on the homelab the same day, v0.2.0: `docs/guides/testing.md`, run 6) · **Amended:** 2026-11-16 by [ADR-0043](0043-a-persons-registry-credential-is-placed-at-the-gateway-the-vm-never-sees-it.md) (decision 2: a delegation's Secret is deleted at release, not emptied, and its envelope expires with the claim's TTL)
+**Status:** Implemented · **Date:** 2026-11-09 (accepted, implemented and cut over on the homelab the same day, v0.2.0: `docs/guides/testing.md`, run 6) · **Amended:** 2026-11-16 by [ADR-0043](0043-a-persons-registry-credential-is-placed-at-the-gateway-the-vm-never-sees-it.md) (decision 2: a delegation's Secret is deleted at release, not emptied, and its envelope expires with the claim's TTL) · 2026-11-19 by [ADR-0057](0057-a-claims-record-written-by-compare-and-set-and-bound-to-its-sandbox.md) (decisions 1 and 2: an update of a record is conditional on the resource version it was read at, the status is written before the Secrets, and a session envelope is bound to its slot)
 
 Roadmap 05 reopened (the store). Supersedes the engine decisions of
 [ADR-0012](0012-persistent-store.md) (one sqlx query set over SQLite or PostgreSQL, the
@@ -53,6 +53,13 @@ It need not. Every table of ADR-0012 has a natural home in the API:
    patches, which carry no resourceVersion and compose from any replica. The admission
    policy that freezes `spec` is untouched; `status` is the broker's alone.
 
+   *Amended 2026-11-19 by
+   [ADR-0057](0057-a-claims-record-written-by-compare-and-set-and-bound-to-its-sandbox.md): the
+   sentence on writes is reversed. An update of an existing record names the resource version
+   it was read at and a stale one is a `Conflict`; only the release carries no precondition.
+   The record also names its sandbox (`sandboxUid`, `namespace`) and one that names another
+   object is not read.*
+
 2. **The sealed session is a Secret, owned by its sandbox.** `POST /v1/claims` parks the
    delegated session as a Secret named by the sandbox's UID in the broker's namespace,
    with an owner reference to the `AgentSandbox` so it is garbage-collected with it. The
@@ -81,6 +88,11 @@ It need not. Every table of ADR-0012 has a natural home in the API:
    `Conflict` and writes nothing, in both stores, and an update writes the status before the
    Secrets; closing the window between that read and the write needs a compare-and-set on
    the resource version, which changes the store contract and is not decided here.*
+   *Amended 2026-11-19 by
+   [ADR-0057](0057-a-claims-record-written-by-compare-and-set-and-bound-to-its-sandbox.md): that
+   compare-and-set is decided and built there, with the order of every write (status first, an
+   update never creates a Secret) and the binding of a session envelope to its slot as well as
+   its sandbox.*
 
 3. **`SandboxNode` and `PolicyFloor`, two CRDs in the broker's namespace.** `SandboxNode`
    is named by the EK hash and holds what `nodes` held: the node's SPIFFE ID, the DMI UUID
