@@ -71,6 +71,16 @@ fn authorizer_svid() -> String {
 }
 
 fn state(idp: &FakeIdp, policy_egress: Option<mediatore_api::PolicyEgress>) -> Arc<AppState> {
+    state_in(idp, "sandboxes", policy_egress)
+}
+
+/// [`state`] with the single namespace claims are created in (ADR-0054: the namespace a
+/// record carries decides which policy namespaces it draws from).
+fn state_in(
+    idp: &FakeIdp,
+    namespace: &str,
+    policy_egress: Option<mediatore_api::PolicyEgress>,
+) -> Arc<AppState> {
     let sts = Sts::new(
         "https://mediatore.test",
         "e2e-1",
@@ -121,7 +131,7 @@ fn state(idp: &FakeIdp, policy_egress: Option<mediatore_api::PolicyEgress>) -> A
         reachable_registries: None,
         policy_egress,
         sandboxes: None,
-        namespaces: Namespaces::Single("sandboxes".into()),
+        namespaces: Namespaces::Single(namespace.into()),
         sealer: None,
         limiter: Limiter::new(10),
         dev_mode: true,
@@ -157,10 +167,21 @@ impl Harness {
         broker_url: Option<&str>,
         policy_egress: Option<mediatore_api::PolicyEgress>,
     ) -> Self {
+        Self::start_in("sandboxes", identity, cfg, broker_url, policy_egress).await
+    }
+
+    /// [`start_with`](Self::start_with) with claims created in `namespace`.
+    async fn start_in(
+        namespace: &str,
+        identity: &str,
+        cfg: CacheConfig,
+        broker_url: Option<&str>,
+        policy_egress: Option<mediatore_api::PolicyEgress>,
+    ) -> Self {
         mediatore_proto::tls::ensure_provider();
         let ca = TestCa::new(TRUST_DOMAIN);
         let idp = FakeIdp::start().await;
-        let st = state(&idp, policy_egress);
+        let st = state_in(&idp, namespace, policy_egress);
         let store = st.store.clone();
 
         let user = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -586,8 +607,37 @@ async fn cache_with_direct_egress(
     entries: &[(&str, bool)],
     now: jiff::Timestamp,
 ) -> (Arc<mediatore_claims::policy::BundleCache>, String) {
+    cache_with_direct_egress_in(None, entries, now).await
+}
+
+/// The namespace the testkit's conformance policy is signed for.
+const POLICY_NS: &str = "conformance";
+
+/// The mapping under which `sandbox_namespace` draws its policies from `policy_namespace`
+/// (`policy.sources`, ADR-0054 decision 2).
+fn drawing(
+    sandbox_namespace: &str,
+    policy_namespace: &str,
+) -> mediatore_claims::policy::PolicySources {
+    mediatore_claims::policy::PolicySources::new(std::collections::BTreeMap::from([(
+        sandbox_namespace.to_owned(),
+        vec![policy_namespace.to_owned()],
+    )]))
+}
+
+/// [`cache_with_direct_egress`] with the policy signed for `namespace` instead of the
+/// conformance one when given: the same name, a policy of that namespace's own.
+async fn cache_with_direct_egress_in(
+    namespace: Option<&str>,
+    entries: &[(&str, bool)],
+    now: jiff::Timestamp,
+) -> (Arc<mediatore_claims::policy::BundleCache>, String) {
     let base = mediatore_testkit::policy::fresh_bundle(now, 1).payload;
     let mut content = base.content.clone();
+    if let Some(namespace) = namespace {
+        content.policy.namespace = namespace.to_owned();
+        content.policy.uid = uuid::Uuid::new_v4().to_string();
+    }
     content.egress = entries
         .iter()
         .map(
@@ -618,6 +668,11 @@ async fn cache_with_direct_egress(
     assert!(
         matches!(outcome, mediatore_claims::policy::Outcome::Admitted { .. }),
         "{outcome:?}"
+    );
+    // The namespace's first list completed: a name asked of it is answered.
+    reflector.resynced(
+        &namespace,
+        &std::collections::HashSet::from(["agent-bundle".to_owned()]),
     );
     (reflector.cache(), uid)
 }
@@ -653,9 +708,12 @@ async fn enforcing_serves_a_policys_direct_egress_and_shadow_serves_none_of_it()
             &authorizer_svid(),
             CacheConfig::default(),
             None,
+            // The claims live in `sandboxes` and the policy in its own namespace: the
+            // operator's `policy.sources` entry says the one draws from the other (ADR-0054).
             Some(mediatore_api::PolicyEgress {
                 bundles,
                 mode,
+                sources: drawing("sandboxes", POLICY_NS),
                 audiences: mediatore_claims::policy::EgressMode::Shadow,
             }),
         )
@@ -754,6 +812,7 @@ async fn a_claim_with_no_policy_or_a_bundle_the_cache_does_not_hold_gets_the_aud
             Some(mediatore_api::PolicyEgress {
                 bundles,
                 mode: mediatore_claims::policy::EgressMode::Enforce,
+                sources: drawing("sandboxes", POLICY_NS),
                 audiences: mediatore_claims::policy::EgressMode::Shadow,
             }),
         )
@@ -777,4 +836,155 @@ async fn a_claim_with_no_policy_or_a_bundle_the_cache_does_not_hold_gets_the_aud
             "{named:?}"
         );
     }
+}
+
+// ----- ADR-0054: which policies a namespace may name -----
+
+/// A broker under `enforce` whose claims are created in `team-a` and whose one bundle is a
+/// policy of `team-b` holding [`DIRECT`], with `sources`; a bound claim of it carrying that
+/// policy's uid, as a record written through the fallback of ADR-0026 does.
+async fn team_a_under_a_policy_of_team_b(
+    sources: mediatore_claims::policy::PolicySources,
+) -> (Harness, uuid::Uuid) {
+    let (bundles, policy_uid) =
+        cache_with_direct_egress_in(Some("team-b"), &[(DIRECT, false)], jiff::Timestamp::now())
+            .await;
+    let h = Harness::start_in(
+        "team-a",
+        &authorizer_svid(),
+        CacheConfig::default(),
+        None,
+        Some(mediatore_api::PolicyEgress {
+            bundles,
+            mode: mediatore_claims::policy::EgressMode::Enforce,
+            sources,
+            audiences: mediatore_claims::policy::EgressMode::Shadow,
+        }),
+    )
+    .await;
+    let (_, claim) = h.bound_claim().await;
+    let uid = claim.uid.expect("uid");
+    let rec = h.store.get_claim(uid).await.expect("record");
+    assert_eq!(rec.namespace, "team-a", "the record carries its namespace");
+    name_policy(&h, &uid, &policy_uid).await;
+    (h, uid)
+}
+
+#[tokio::test]
+async fn a_claim_in_team_a_gets_nothing_from_a_policy_of_team_b() {
+    let (h, uid) =
+        team_a_under_a_policy_of_team_b(mediatore_claims::policy::PolicySources::default()).await;
+    let peer = claim_svid(&uid);
+    // The gateway's answer: the policy's host stays closed, the audience's stay open.
+    assert_eq!(
+        h.check(&peer, "CONNECT", DIRECT).await,
+        (403, "not_allowed".into())
+    );
+    assert_eq!(
+        h.check(&peer, "CONNECT", ALLOWED[0]).await,
+        (200, String::new())
+    );
+    // The guest's side: no route and no egress entry for it either.
+    let me = h.me().await;
+    assert!(
+        !me.egress.contains(&DIRECT.parse().unwrap()),
+        "nothing of team-b's policy in the guest's ruleset"
+    );
+    assert!(
+        !me.routes.iter().any(|r| r.endpoint.to_string() == DIRECT),
+        "and no route for it"
+    );
+    assert_eq!(
+        me.routes
+            .iter()
+            .filter(|r| r.audience.as_deref() == Some(AUDIENCE))
+            .count(),
+        ALLOWED.len(),
+        "the audience routes stand"
+    );
+}
+
+#[tokio::test]
+async fn a_mapped_policy_namespace_serves_its_direct_egress_under_enforce() {
+    let (h, uid) = team_a_under_a_policy_of_team_b(drawing("team-a", "team-b")).await;
+    let peer = claim_svid(&uid);
+    assert_eq!(
+        h.check(&peer, "CONNECT", DIRECT).await,
+        (200, String::new())
+    );
+    let me = h.me().await;
+    assert!(me.egress.contains(&DIRECT.parse().unwrap()));
+    assert_eq!(
+        me.routes
+            .iter()
+            .filter(|r| r.endpoint.to_string() == DIRECT)
+            .count(),
+        1
+    );
+    // An entry for another namespace gives team-a nothing.
+    let (h, uid) = team_a_under_a_policy_of_team_b(drawing("infra", "team-b")).await;
+    assert_eq!(
+        h.check(&claim_svid(&uid), "CONNECT", DIRECT).await,
+        (403, "not_allowed".into())
+    );
+}
+
+#[tokio::test]
+async fn under_enforce_a_claim_naming_a_policy_outside_its_sources_is_400_and_parks_nothing() {
+    // Over real HTTP: the conformance policy is verified and read, in a namespace the
+    // claim's own (`sandboxes`) does not draw from.
+    let (bundles, _) = cache_with_direct_egress(&[(DIRECT, false)], jiff::Timestamp::now()).await;
+    let h = Harness::start_with(
+        &authorizer_svid(),
+        CacheConfig::default(),
+        None,
+        Some(mediatore_api::PolicyEgress {
+            bundles,
+            mode: mediatore_claims::policy::EgressMode::Enforce,
+            sources: mediatore_claims::policy::PolicySources::default(),
+            audiences: mediatore_claims::policy::EgressMode::Shadow,
+        }),
+    )
+    .await;
+    let resp = h
+        .http
+        .post(format!("{}/v1/claims", h.user_url))
+        .bearer_auth(h.login("octocat"))
+        .json(&ClaimRequest {
+            namespace: None,
+            pool_ref: Some("pool-a".into()),
+            pool_selector: None,
+            selection: None,
+            ttl_seconds: 3600,
+            audiences: vec![AUDIENCE.into()],
+            workload: Workload {
+                image: "registry.internal:5000/sandbox:latest".into(),
+                args: vec![],
+                restart: mediatore_proto::RestartPolicy::Always,
+                logs: false,
+            },
+            refresh_token: None,
+            policy_ref: Some("agent".into()),
+            delegations: vec![],
+        })
+        .send()
+        .await
+        .expect("create claim");
+    assert_eq!(resp.status(), 400);
+    let text = resp.text().await.expect("body");
+    let body: serde_json::Value = serde_json::from_str(&text).expect("an error body");
+    assert_eq!(body["error"], "policy_not_resolved");
+    assert_eq!(
+        body["detail"],
+        "no verified bundle for policy agent in the namespaces sandboxes draws its policies from"
+    );
+    // The 400 names no other namespace.
+    assert!(
+        !text.contains(POLICY_NS),
+        "the answer does not say where the policy is held"
+    );
+    assert!(
+        h.store.list_claims().await.expect("list").is_empty(),
+        "nothing was written for the refused request"
+    );
 }

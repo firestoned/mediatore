@@ -242,6 +242,9 @@ fn policy_egress(
         bundles: reflector.cache(),
         mode: policy.egress,
         audiences: policy.audiences,
+        // Which policy namespaces a record's namespace draws from (ADR-0054): the same
+        // mapping the watcher resolves with, checked again when a bundle is served.
+        sources: cfg.policy_sources(),
     })
 }
 
@@ -319,6 +322,7 @@ async fn claim_watcher(
             logs_retention: cfg.log_retention(),
             egress_mode: cfg.policy.as_ref().map(|p| p.egress).unwrap_or_default(),
             audiences_mode: cfg.policy.as_ref().map(|p| p.audiences).unwrap_or_default(),
+            policy_sources: cfg.policy_sources(),
             delegated_audiences: cfg
                 .audiences
                 .iter()

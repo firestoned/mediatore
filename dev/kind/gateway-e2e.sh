@@ -60,6 +60,9 @@ DESTINATION=$DEST_HOST:8443
 # ADR-0030: the destination's second port, a policy's direct egress entry the gateway can
 # enforce exactly; and one it cannot (rules), never served.
 DIRECT=$DEST_HOST:8081
+# ADR-0054: a second watched policy namespace, holding nothing, that $NS is remapped to
+# draw from so the claim's bundle falls outside its sources.
+NSX=mediatore-e2e-gateway-policies
 RULED=only-some.$NS.svc.cluster.local:443
 POLICY=e2e-gateway
 BUNDLE_CM=$POLICY-bundle
@@ -98,7 +101,7 @@ verdict()     { sandbox "$1" | jq -r '.status.conditions[]? | select(.type == "P
 verdict_has() { verdict sb-gw | grep -F "$1" | grep -qF "${2:-}"; }
 bundle_version() { "${K[@]}" -n "$NS" get configmap "$BUNDLE_CM" -o jsonpath="{.metadata.annotations.$VERSION_ANN}" 2>/dev/null || true; }
 
-PROBES=(probe-claim probe-node probe-enforce probe-warm probe-outage-1 probe-outage-2 probe-released)
+PROBES=(probe-claim probe-node probe-enforce probe-withdrawn probe-warm probe-outage-1 probe-outage-2 probe-released)
 
 dump() {
   printf '\n--- broker (last 40 lines)\n'; broker_logs | tail -40
@@ -132,6 +135,7 @@ cleanup() {
 policy_teardown() {
   [ -n "$POLICY_STATE" ] || return 0
   "${K[@]}" -n "$NS" delete sandboxpolicy "$POLICY" exposureceiling "$POLICY" configmap "$BUNDLE_CM" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  "${K[@]}" delete namespace "$NSX" --ignore-not-found --wait=false >/dev/null 2>&1 || true
   "${K[@]}" apply -k dev/kind/broker >/dev/null 2>&1 || true
   "${K[@]}" -n "$BROKER_NS" rollout restart deploy/mediatore >/dev/null 2>&1 || true
   "${K[@]}" -n "$BROKER_NS" rollout status deploy/mediatore --timeout=120s >/dev/null 2>&1 || true
@@ -253,12 +257,13 @@ YAML
 
 # ADR-0030: the broker's configuration with a `policy` section trusting notaio's key, the
 # bundles read from this namespace, the switch as given; applied and the broker restarted.
-broker_policy_config() { # <shadow|enforce>
+broker_policy_config() { # <shadow|enforce> [watched namespaces] [further lines of the section]
   local key_id public_key
   read -r key_id public_key < "$POLICY_STATE/notaio/public-key.txt"
   {
     cat dev/kind/broker/mediatore.yaml
-    printf 'policy:\n  trusted_keys:\n    - { id: "%s", public_key: "%s" }\n  namespaces: [%s]\n  egress: %s\n' "$key_id" "$public_key" "$NS" "$1"
+    printf 'policy:\n  trusted_keys:\n    - { id: "%s", public_key: "%s" }\n  namespaces: [%s]\n  egress: %s\n' "$key_id" "$public_key" "${2:-$NS}" "$1"
+    [ -n "${3:-}" ] && printf '%s\n' "$3"
   } > "$FILES/mediatore.yaml"
   "${K[@]}" -n "$BROKER_NS" create configmap mediatore-config --from-file=mediatore.yaml="$FILES/mediatore.yaml" \
     --dry-run=client -o yaml | "${K[@]}" apply -f - >/dev/null
@@ -656,6 +661,24 @@ if [ -n "$POLICY_STATE" ]; then
   wait_for "$LOG_WAIT" "the authorizer's not_allowed for the ruled entry" authz_has "authority=$RULED" "verdict=deny" "reason=not_allowed"
   wait_for "$LOG_WAIT" "the second port's request line" direct_has "destination request" "host=$DIRECT"
   echo "enforce: a tunnel to $DIRECT opened and answered, bare, on the credential-less route; $RULED and the other host refused; $DESTINATION as before"
+
+  say "ADR-0054 decision 6: $NS remapped to draw from $NSX alone; on the next ask $DIRECT is withdrawn, the audience endpoints stand"
+  "${K[@]}" create namespace "$NSX" --dry-run=client -o yaml | "${K[@]}" apply -f - >/dev/null
+  mkdir -p "$POLICY_STATE/policy-bundles-$NSX"
+  printf 'namespace: %s\nresources:\n  - ../../deploy/policy-bundles\n' "$NSX" > "$POLICY_STATE/policy-bundles-$NSX/kustomization.yaml"
+  "${K[@]}" apply -k "$POLICY_STATE/policy-bundles-$NSX" >/dev/null
+  broker_policy_config enforce "$NS, $NSX" "$(printf '  sources:\n    %s:\n      namespaces: [%s]' "$NS" "$NSX")"
+  wait_for "$TIMEOUT" "lease mediatore-watcher held by ${BROKER_POD#pod/}" holder_is_pod
+  wait_for "$TIMEOUT" "'policy sources' naming $NSX for $NS in the new broker log" log_has "policy sources:" "sources=$NSX"
+  # The authorizer's fresh answer from before the restart must age out, so the next tunnel asks.
+  sleep $((FRESH_SECS + 1))
+  probe probe-withdrawn claim phantom \
+    "$DIRECT=502:gateway_refused" \
+    "$DESTINATION=200"
+  wait_for "$LOG_WAIT" "the broker's warn line for the claim's bundle outside its sources" log_has "outside its namespace's policy sources" "claim_uid=$CLAIM_UID"
+  wait_for "$LOG_WAIT" "Envoy's 403 for the second port after the remap" envoy_has "tunnel peer=spiffe://$TD/banlieue/claim/$CLAIM_UID" "authority=$DIRECT" "status=403"
+  wait_for "$LOG_WAIT" "the authorizer's not_allowed for the second port after the remap" authz_has "authority=$DIRECT" "verdict=deny" "reason=not_allowed"
+  echo "remapped: $DIRECT refused at the real Envoy, $DESTINATION still served, the broker's decision-6 line logged"
 fi
 
 say "the broker gone: the cached allowlist stands in, then the outage is a refusal"

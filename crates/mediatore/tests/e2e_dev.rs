@@ -2060,6 +2060,14 @@ async fn bundle_policy(
             bundles: reflector.cache(),
             mode: mediatore_claims::policy::EgressMode::Shadow,
             audiences,
+            // The claims live in `sandboxes` and the bundle is signed for its own namespace:
+            // the operator's `policy.sources` entry says the one draws from the other (ADR-0054).
+            sources: mediatore_claims::policy::PolicySources::new(
+                std::collections::BTreeMap::from([(
+                    "sandboxes".to_owned(),
+                    vec![policy.namespace.clone()],
+                )]),
+            ),
         },
         policy.name,
     )

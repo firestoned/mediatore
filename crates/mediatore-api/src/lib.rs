@@ -188,9 +188,10 @@ fn enforcing(st: &AppState) -> Option<&PolicyEgress> {
 /// itself; the reconciler records it for a sandbox), `None` when nothing is enforced.
 ///
 /// - the claim names a policy (`400 policy_required`);
-/// - every watched namespace has completed its first list, or `503 policy_not_synced` and nothing is
-///   created: "no bundle yet" is never read as "no policy";
-/// - the policy resolves to a verified, unexpired bundle (`400 unknown_policy`);
+/// - every policy source of the namespace has completed its first list, or `503 policy_not_synced`
+///   and nothing is created: "no bundle yet" is never read as "no policy";
+/// - the policy resolves to a verified, unexpired bundle in the namespace's sources (ADR-0054;
+///   `400 unknown_policy`, the same answer for a name nowhere, outside them or held twice);
 /// - the bundle grants every audience asked for, in a way the ceiling leaves usable (`400
 ///   unknown_audience`, the same answer as an audience that does not exist);
 /// - `ttl_seconds` fits the bundle's lease (`400 ttl_exceeds_policy`).
@@ -208,15 +209,27 @@ fn admit_under_policy(
             "name the policy this sandbox is under (policy_ref)",
         ));
     };
-    if !pe.bundles.synced_all() {
-        return Err(ApiError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "policy_not_synced",
-            Some("the policy bundles have not all been read yet; try again shortly".to_owned()),
-        ));
-    }
-    let Some(bundle) = pe.bundles.resolve(namespace, name, Timestamp::now()) else {
-        return Err(ApiError::bad_request("unknown_policy", name.to_owned()));
+    // In the namespace's sources alone (ADR-0054): a grant comes only from a policy this
+    // namespace draws from. One answer whether the name is nowhere, outside the sources or
+    // held twice. A source of this namespace not yet listed on this replica is `503` and
+    // nothing is created: "no bundle yet" is never read as "no policy". Another namespace's
+    // unread source does not hold this one (ADR-0054 decision 4).
+    let bundle = match pe
+        .bundles
+        .resolve(&pe.sources, namespace, name, Timestamp::now())
+    {
+        mediatore_claims::policy::Resolution::Found(bundle) => bundle,
+        mediatore_claims::policy::Resolution::NotRead => {
+            return Err(ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "policy_not_synced",
+                Some("the policy bundles have not all been read yet; try again shortly".to_owned()),
+            ));
+        }
+        mediatore_claims::policy::Resolution::NotFound
+        | mediatore_claims::policy::Resolution::Ambiguous => {
+            return Err(ApiError::bad_request("unknown_policy", name.to_owned()));
+        }
     };
     if let Some(bad) = req
         .audiences
@@ -272,12 +285,12 @@ fn effective_in(
 }
 
 /// The claim's current verified bundle (ADR-0053 decision 12): found by the policy `uid` the
-/// record holds, never the version it was created under; `None` for a claim with no policy and
-/// for a bundle that is missing, expired or no longer verified.
+/// record holds, never the version it was created under; `None` for a claim with no policy, for
+/// a bundle that is missing, expired or no longer verified, and for one signed for a namespace
+/// outside the record's policy sources ([`claims_bundle`], ADR-0054 decision 6).
 fn claim_bundle(st: &AppState, rec: &ClaimRecord) -> Option<Arc<mediatore_policy::BundlePayload>> {
     let pe = enforcing(st)?;
-    pe.bundles
-        .by_uid(rec.policy_uid.as_deref()?, Timestamp::now())
+    claims_bundle(pe, rec)
 }
 
 /// What the claim may do with `audience` now: [`effective_in`] on its own namespace and its
@@ -847,6 +860,9 @@ async fn create_claim(
             "logs are not enabled on this broker",
         ));
     }
+    // A policy that does not resolve in the namespace's sources (ADR-0054 decision 4): said
+    // now, before a session is built or parked. The reconciler remains the control.
+    refuse_unresolved_policy(&st, &validated, &namespace, req.policy_ref.as_deref())?;
     let session = session_for(&st, &validated, &req, &bearer_token).await?;
     let delegations = delegations_for(&st, &req)?;
     let sealer = match (
@@ -892,6 +908,53 @@ async fn create_claim(
         &delegations,
     )
     .await
+}
+
+/// The front door's early answer of ADR-0054 decision 4: under `policy.egress: enforce`, a
+/// `policy_ref` that does not resolve in the sources of the resolved namespace is
+/// `400 policy_not_resolved`, with the sentence the reconciler puts in `status.reason`
+/// (`mediatore_claims::policy::not_resolved`, the one function for both). The answer is the
+/// same for a policy that exists nowhere, one in a namespace this one does not draw from and
+/// one held twice; where the name is held goes to the broker's log alone. When this replica
+/// has not read the sources it does not guess: the sandbox is created and the reconciler
+/// holds it. Under `shadow` nothing is refused and the log says what `enforce` would refuse.
+/// Nothing to do without a `policy` section, under `dev_mode` (no bundle is read), or for a
+/// request naming no policy.
+fn refuse_unresolved_policy(
+    st: &AppState,
+    validated: &Validated,
+    namespace: &str,
+    policy: Option<&str>,
+) -> Result<(), ApiError> {
+    use mediatore_claims::policy::{EgressMode, POLICY_NOT_RESOLVED, Resolution, not_resolved};
+    let (Some(pe), Some(policy)) = (st.policy_egress.as_ref(), policy) else {
+        return Ok(());
+    };
+    let now = Timestamp::now();
+    let resolution = pe.bundles.resolve(&pe.sources, namespace, policy, now);
+    if matches!(resolution, Resolution::Found(_) | Resolution::NotRead) {
+        return Ok(());
+    }
+    // Names from configuration and the cache, for the operator: never part of the answer.
+    let held_outside = pe
+        .bundles
+        .held_outside(&pe.sources, namespace, policy, now)
+        .join(", ");
+    let sources = pe.sources.sources_of(namespace).join(", ");
+    let ambiguous = matches!(resolution, Resolution::Ambiguous);
+    match pe.mode {
+        EgressMode::Enforce => {
+            tracing::warn!(subject = %validated.subject.id, %namespace, %policy, %sources, %held_outside, ambiguous, "claim refused: the policy named does not resolve in the namespace's policy sources (ADR-0054)");
+            Err(ApiError::bad_request(
+                POLICY_NOT_RESOLVED,
+                not_resolved(policy, namespace),
+            ))
+        }
+        EgressMode::Shadow => {
+            tracing::info!(subject = %validated.subject.id, %namespace, %policy, %sources, %held_outside, ambiguous, "policy.egress is shadow: enforce would refuse this claim, the policy named does not resolve in the namespace's policy sources (ADR-0054)");
+            Ok(())
+        }
+    }
 }
 
 /// Resolve a create's namespace and write the audit line (ADR-0046 decision 13): subject,
@@ -2294,6 +2357,35 @@ pub struct PolicyEgress {
     /// `policy.audiences` (ADR-0053 decisions 9 to 16): under `Enforce` a claim is admitted, minted
     /// for and routed only under a verified bundle that grants what it uses.
     pub audiences: mediatore_claims::policy::EgressMode,
+    /// `policy.sources` (ADR-0054): which policy namespaces each sandbox namespace draws
+    /// from. What a record is served is checked against it again at the time it is served.
+    pub sources: mediatore_claims::policy::PolicySources,
+}
+
+/// The claim's bundle, usable for what the broker serves (ADR-0030 decision 2, ADR-0054
+/// decision 6): found by the `policy_uid` on the record, verified and unexpired, and signed
+/// for a namespace the record's own namespace draws its policies from. A bundle outside
+/// those sources is treated as missing, with one `warn` line: a record written before
+/// ADR-0054 or by an older replica may hold a uid found across the watched namespaces, and
+/// a source the operator removed stops serving on the next ask.
+fn claims_bundle(
+    pe: &PolicyEgress,
+    rec: &ClaimRecord,
+) -> Option<Arc<mediatore_claims::policy::BundlePayload>> {
+    let uid = rec.policy_uid.as_deref()?;
+    let bundle = pe.bundles.by_uid(uid, Timestamp::now())?;
+    let policy_namespace = bundle.content.policy.namespace.as_str();
+    if !pe.sources.draws_from(&rec.namespace, policy_namespace) {
+        tracing::warn!(
+            claim_uid = %rec.uid,
+            policy_uid = uid,
+            sandbox_namespace = %rec.namespace,
+            %policy_namespace,
+            "the claim's bundle is outside its namespace's policy sources: treated as missing, nothing is served from it (ADR-0054)"
+        );
+        return None;
+    }
+    Some(bundle)
 }
 
 /// The `host:port` pairs a claim may reach: the union of its audiences' `egress` and, when
@@ -2316,7 +2408,8 @@ fn egress_of(st: &AppState, rec: &ClaimRecord) -> Vec<Endpoint> {
 /// The direct egress of the claim's bundle that the broker serves beyond `audience`
 /// (ADR-0030 decisions 1 to 4): in `enforce`, the servable entries not already an
 /// audience's, sorted; in `shadow`, none, with the log line saying what enforce would add.
-/// Empty without a `policy` section, a policy on the record or a usable bundle.
+/// Empty without a `policy` section, a policy on the record or a usable bundle
+/// ([`claims_bundle`]: one signed for a namespace outside the record's sources is not).
 fn served_direct_egress(st: &AppState, rec: &ClaimRecord, audience: &[Endpoint]) -> Vec<Endpoint> {
     let Some(pe) = st.policy_egress.as_ref() else {
         return vec![];
@@ -2324,7 +2417,7 @@ fn served_direct_egress(st: &AppState, rec: &ClaimRecord, audience: &[Endpoint])
     let Some(uid) = rec.policy_uid.as_deref() else {
         return vec![];
     };
-    let Some(bundle) = pe.bundles.by_uid(uid, Timestamp::now()) else {
+    let Some(bundle) = claims_bundle(pe, rec) else {
         return vec![];
     };
     let direct = mediatore_claims::policy::direct_egress(&bundle);
@@ -3011,16 +3104,14 @@ async fn delegated_token(
 /// Whether the claim's policy admits `audience` for a gateway-placed credential (ADR-0040
 /// decision 2). Without a `policy` section there is nothing to compare. Under
 /// `policy.egress: enforce` the claim must name a policy whose verified, unexpired bundle
-/// lists the audience, and fails closed otherwise (no policy on the claim, no bundle, or an
-/// audience the bundle omits); under `shadow` the gap is logged and nothing is refused.
+/// lists the audience, and fails closed otherwise (no policy on the claim, no bundle, a bundle
+/// outside the sources of the claim's namespace (ADR-0054 decision 6), or an audience the
+/// bundle omits); under `shadow` the gap is logged and nothing is refused.
 fn policy_admits(st: &AppState, rec: &ClaimRecord, audience: &str) -> Result<(), ApiError> {
     let Some(pe) = st.policy_egress.as_ref() else {
         return Ok(());
     };
-    let admitted = rec
-        .policy_uid
-        .as_deref()
-        .and_then(|uid| pe.bundles.by_uid(uid, Timestamp::now()))
+    let admitted = claims_bundle(pe, rec)
         .is_some_and(|b| b.content.audiences.iter().any(|g| g.name == audience));
     match pe.mode {
         mediatore_claims::policy::EgressMode::Enforce if !admitted => {
@@ -4192,9 +4283,29 @@ mod tests {
 
     // ----- the policy bundle under `policy.egress: enforce` -----
 
+    /// The mapping under which the records of [`claim`] (namespace `sandboxes`) draw their
+    /// policies from `policy_namespace` (ADR-0054 decision 2).
+    fn sandboxes_draw_from(policy_namespace: &str) -> mediatore_claims::policy::PolicySources {
+        mediatore_claims::policy::PolicySources::new(BTreeMap::from([(
+            "sandboxes".to_owned(),
+            vec![policy_namespace.to_owned()],
+        )]))
+    }
+
     /// An admitted bundle for the conformance policy listing exactly `audiences`, and the policy's uid.
+    /// The records of these tests live in `sandboxes` and the policy in its own namespace, so
+    /// the broker is configured with the `policy.sources` entry that says so.
     async fn bundle_for(
         audiences: &[&str],
+        mode: mediatore_claims::policy::EgressMode,
+    ) -> (PolicyEgress, String) {
+        bundle_shaped(audiences, None, mode).await
+    }
+
+    /// [`bundle_for`], with the bundle's direct `egress[]` replaced by `direct` when given.
+    async fn bundle_shaped(
+        audiences: &[&str],
+        direct: Option<&[&str]>,
         mode: mediatore_claims::policy::EgressMode,
     ) -> (PolicyEgress, String) {
         let now = Timestamp::now();
@@ -4203,6 +4314,15 @@ mod tests {
         content
             .audiences
             .retain(|a| audiences.contains(&a.name.as_str()));
+        if let Some(direct) = direct {
+            content.egress = direct
+                .iter()
+                .map(|endpoint| mediatore_policy::types::EgressRule {
+                    endpoint: (*endpoint).into(),
+                    rules: vec![],
+                })
+                .collect();
+        }
         let signed = mediatore_testkit::policy::signed_bundle(now, 2, content);
         let uid = signed.payload.content.policy.uid.clone();
         let namespace = signed.payload.content.policy.namespace.clone();
@@ -4221,10 +4341,16 @@ mod tests {
             matches!(outcome, mediatore_claims::policy::Outcome::Admitted { .. }),
             "{outcome:?}"
         );
+        // The namespace's first list completed: a name asked of it is answered.
+        reflector.resynced(
+            &namespace,
+            &std::collections::HashSet::from(["agent-bundle".to_owned()]),
+        );
         (
             PolicyEgress {
                 bundles: reflector.cache(),
                 mode,
+                sources: sandboxes_draw_from(&namespace),
                 audiences: mediatore_claims::policy::EgressMode::Shadow,
             },
             uid,
@@ -4653,6 +4779,8 @@ mod tests {
                 bundles: reflector.cache(),
                 mode: mediatore_claims::policy::EgressMode::Shadow,
                 audiences: mode,
+                // The records live in `sandboxes`, the bundle in its own namespace (ADR-0054).
+                sources: sandboxes_draw_from(&namespace),
             });
             Self {
                 st,
@@ -4706,6 +4834,34 @@ mod tests {
             answer.inject[0].rules,
             vec![rule("GET", "/repos/team-a/**")],
             "the rule the ceiling does not cover is dropped"
+        );
+    }
+
+    /// ADR-0053's grants and ADR-0054 together: under `policy.audiences: enforce` a record whose
+    /// bundle is signed for a namespace outside its namespace's sources is granted nothing from
+    /// it. The same bundle and record as above; only the `policy.sources` entry is gone, so
+    /// `sandboxes` draws from itself alone.
+    #[tokio::test]
+    async fn a_grant_from_a_bundle_outside_the_records_sources_is_not_served() {
+        use mediatore_claims::policy::EgressMode::Enforce;
+        let grant = grant_of(&[("GET", "/repos/team-a/**")], &["git.example:443"], None);
+        let e = Enforced::new(&[("GET", "/repos/**")], grant, Enforce).await;
+        let uid = e.uid.clone();
+        let mut st = e.st;
+        st.policy_egress.as_mut().expect("a policy section").sources =
+            mediatore_claims::policy::PolicySources::default();
+        let st: Shared = Arc::new(st);
+        let rec = stored(&st, under(&uid)).await;
+        let answer = gateway_answer(&st, rec.uid).await;
+        assert!(
+            answer.inject.is_empty(),
+            "no placed route from a bundle outside the sources: {answer:?}"
+        );
+        let (status, body, _) = ask(&st, rec.uid, Some(&gateway_peer()), "internal-git").await;
+        assert_eq!(
+            (status, code(&body)),
+            (StatusCode::BAD_REQUEST, "unknown_audience"),
+            "the answer of an audience the policy does not grant"
         );
     }
 
@@ -6267,6 +6423,335 @@ mod tests {
     }
 
     // ----- ADR-0057: compare-and-set callers, the slot, the sealed expiry -----
+
+    // ----- ADR-0054: which policies a namespace may name ----------------------------------------------------------
+
+    mod policy_sources {
+        use super::*;
+        use mediatore_claims::policy::{BundleCache, EgressMode, PolicySources};
+
+        /// A host only the bundle's direct `egress[]` names.
+        const POLICY_DIRECT: &str = "repo.home.example:443";
+        /// The namespace the testkit's conformance policy is signed for.
+        const POLICY_NS: &str = "conformance";
+        /// The conformance policy's name.
+        const POLICY: &str = "agent";
+
+        /// What the gateway is answered for `rec` (`GET /v1/gateway/claims/{uid}`): its tunnels.
+        async fn tunnels(st: &Shared, rec: &ClaimRecord) -> Vec<String> {
+            let (status, body, _) = call(
+                st,
+                "GET",
+                &format!("/v1/gateway/claims/{}", rec.uid),
+                Some(&gateway_peer()),
+                serde_json::Value::Null,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "the gateway's ask is answered");
+            let answer: mediatore_proto::ClaimEgress = serde_json::from_value(body).unwrap();
+            answer.egress.iter().map(ToString::to_string).collect()
+        }
+
+        /// A broker whose bundle (signed for `conformance`) holds [`POLICY_DIRECT`], with a stored
+        /// record in `sandboxes` carrying that policy's uid, under `sources`.
+        async fn serving(mode: EgressMode, sources: PolicySources) -> (Shared, ClaimRecord) {
+            let (pe, uid) = bundle_shaped(&["internal-git"], Some(&[POLICY_DIRECT]), mode).await;
+            let mut st = base_state();
+            st.policy_egress = Some(PolicyEgress { sources, ..pe });
+            let st: Shared = Arc::new(st);
+            let mut rec = claim(&[], None);
+            rec.policy_uid = Some(uid);
+            let rec = stored(&st, rec).await;
+            (st, rec)
+        }
+
+        #[tokio::test]
+        async fn a_record_holding_a_uid_from_outside_its_sources_gets_the_audience_endpoints_only()
+        {
+            capture_logs();
+            // The record is in `sandboxes`, its uid is a policy of `conformance`, and nothing says
+            // `sandboxes` draws from there: what the fallback of ADR-0026 wrote before ADR-0054.
+            let (st, rec) = serving(EgressMode::Enforce, PolicySources::default()).await;
+            assert_eq!(
+                tunnels(&st, &rec).await,
+                Vec::<String>::new(),
+                "no audience, and nothing from the bundle"
+            );
+            assert_eq!(
+                egress_of(&st, &rec),
+                Vec::<Endpoint>::new(),
+                "the guest's list is the same"
+            );
+            let logs = captured();
+            let line = logs
+                .lines()
+                .find(|l| l.contains("outside its namespace's policy sources"))
+                .expect("the warn line of decision 6");
+            assert!(line.contains("WARN"), "a warning");
+            assert!(
+                line.contains("sandbox_namespace=sandboxes")
+                    && line.contains(&format!("policy_namespace={POLICY_NS}")),
+                "the line names the two namespaces"
+            );
+            assert!(
+                line.contains("claim_uid=") && line.contains("policy_uid="),
+                "and the claim and the policy"
+            );
+            // A record in the policy's own namespace needs no entry.
+            let mut own = claim(&[], None);
+            own.namespace = POLICY_NS.into();
+            own.policy_uid.clone_from(&rec.policy_uid);
+            let own = stored(&st, own).await;
+            assert_eq!(tunnels(&st, &own).await, [POLICY_DIRECT]);
+        }
+
+        #[tokio::test]
+        async fn a_mapped_policy_namespace_serves_its_direct_egress_under_enforce() {
+            let (st, rec) = serving(EgressMode::Enforce, sandboxes_draw_from(POLICY_NS)).await;
+            assert_eq!(tunnels(&st, &rec).await, [POLICY_DIRECT]);
+            // An entry is the whole of the sources: one naming another namespace serves nothing,
+            // even though `conformance` is watched.
+            let (st, rec) = serving(EgressMode::Enforce, sandboxes_draw_from("team-b")).await;
+            assert_eq!(tunnels(&st, &rec).await, Vec::<String>::new());
+            // Shadow serves no direct egress whatever the mapping (ADR-0030).
+            let (st, rec) = serving(EgressMode::Shadow, sandboxes_draw_from(POLICY_NS)).await;
+            assert_eq!(tunnels(&st, &rec).await, Vec::<String>::new());
+        }
+
+        #[tokio::test]
+        async fn removing_a_source_withdraws_the_direct_egress_on_the_next_ask() {
+            // One store, one record, one cache; the broker as it ran with the entry, then as it
+            // runs after the operator removed it.
+            let (with_entry, rec) =
+                serving(EgressMode::Enforce, sandboxes_draw_from(POLICY_NS)).await;
+            assert_eq!(tunnels(&with_entry, &rec).await, [POLICY_DIRECT]);
+            let pe = with_entry.policy_egress.clone().expect("a policy section");
+            let mut restarted = base_state();
+            restarted.store = with_entry.store.clone();
+            restarted.policy_egress = Some(PolicyEgress {
+                sources: PolicySources::default(),
+                audiences: mediatore_claims::policy::EgressMode::Shadow,
+                ..pe
+            });
+            let restarted: Shared = Arc::new(restarted);
+            assert_eq!(
+                tunnels(&restarted, &rec).await,
+                Vec::<String>::new(),
+                "a running sandbox loses the reach on the gateway's next ask"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_placed_audience_is_refused_when_the_bundle_is_outside_the_records_sources() {
+            let gw = gateway_peer();
+            // The bundle lists the audience; only the sources differ between the two brokers.
+            for (sources, expected) in [
+                (sandboxes_draw_from(POLICY_NS), StatusCode::OK),
+                (PolicySources::default(), StatusCode::FORBIDDEN),
+            ] {
+                let (pe, uid) = bundle_for(&["internal-git"], EgressMode::Enforce).await;
+                let mut st = placed_internal_git(placed_state());
+                st.policy_egress = Some(PolicyEgress { sources, ..pe });
+                let st: Shared = Arc::new(st);
+                let mut rec = claim(&["internal-git"], None);
+                rec.policy_uid = Some(uid);
+                let rec = stored(&st, rec).await;
+                let (status, body, text) = ask(&st, rec.uid, Some(&gw), "internal-git").await;
+                assert_eq!(status, expected);
+                if expected == StatusCode::FORBIDDEN {
+                    assert_eq!(code(&body), "forbidden");
+                    assert!(!text.contains(SECRET_VALUE), "no credential in a refusal");
+                    assert!(
+                        !text.contains(POLICY_NS),
+                        "the refusal names no other namespace"
+                    );
+                }
+            }
+        }
+
+        /// A front door over `namespaces` with the conformance bundle read from `conformance`.
+        async fn policed_broker(
+            namespaces: Namespaces,
+            mode: EgressMode,
+            sources: PolicySources,
+        ) -> Broker {
+            let (pe, _) = bundle_for(&["internal-git"], mode).await;
+            with_policy(
+                broker(namespaces, false).await,
+                PolicyEgress { sources, ..pe },
+            )
+        }
+
+        fn with_policy(mut b: Broker, pe: PolicyEgress) -> Broker {
+            Arc::get_mut(&mut b.st)
+                .expect("the state is not shared yet")
+                .policy_egress = Some(pe);
+            b
+        }
+
+        /// A create in `namespace` naming `policy`.
+        async fn create_naming(
+            b: &Broker,
+            token: &str,
+            namespace: &str,
+            policy: &str,
+        ) -> (StatusCode, serde_json::Value, String) {
+            let mut body = request(Some(namespace));
+            body["policy_ref"] = serde_json::Value::String(policy.to_owned());
+            b.user("POST", "/v1/claims", token, &[], body).await
+        }
+
+        #[tokio::test]
+        async fn under_enforce_a_claim_naming_a_policy_outside_its_sources_is_400_and_parks_nothing()
+         {
+            capture_logs();
+            let b =
+                policed_broker(tenant_map(), EgressMode::Enforce, PolicySources::default()).await;
+            let token = b.token("octocat", &[TEAM_A]);
+            let (status, body, _) = create_naming(&b, &token, "team-a", POLICY).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(code(&body), "policy_not_resolved");
+            // The one sentence, the reconciler's `status.reason` after its code.
+            let detail = body["detail"].as_str().unwrap_or_default();
+            assert_eq!(
+                detail,
+                "no verified bundle for policy agent in the namespaces team-a draws its policies from"
+            );
+            assert_eq!(
+                detail,
+                mediatore_claims::policy::not_resolved(POLICY, "team-a")
+            );
+            assert_eq!(
+                b.front.all().len(),
+                0,
+                "no sandbox is created, so nothing is parked under one"
+            );
+            // Where the name is held is the operator's to read, in the broker's log.
+            let logs = captured();
+            let line = logs
+                .lines()
+                .find(|l| l.contains("claim refused: the policy named does not resolve"))
+                .expect("the operator's line");
+            assert!(line.contains(&format!("held_outside={POLICY_NS}")));
+            // A policy the namespace does draw from is admitted by the same door.
+            let b = policed_broker(
+                tenant_map(),
+                EgressMode::Enforce,
+                PolicySources::new(BTreeMap::from([(
+                    "team-a".to_owned(),
+                    vec![POLICY_NS.to_owned()],
+                )])),
+            )
+            .await;
+            let token = b.token("octocat", &[TEAM_A]);
+            let made = create_naming(&b, &token, "team-a", POLICY).await;
+            assert_eq!(made.0, StatusCode::CREATED);
+            let all = b.front.all();
+            assert_eq!(all.len(), 1);
+            assert_eq!(
+                all[0].spec.policy_ref.as_ref().map(|p| p.name.as_str()),
+                Some(POLICY)
+            );
+            // A request naming no policy is not this check's business.
+            assert_eq!(
+                b.create(&token, Some("team-a")).await.0,
+                StatusCode::CREATED
+            );
+        }
+
+        #[tokio::test]
+        async fn the_400_names_no_other_namespace() {
+            // Elsewhere: `agent` is a verified policy of `conformance`. Nowhere: no bundle at all.
+            let elsewhere =
+                policed_broker(tenant_map(), EgressMode::Enforce, PolicySources::default()).await;
+            let nowhere = with_policy(
+                broker(tenant_map(), false).await,
+                PolicyEgress {
+                    bundles: Arc::new(BundleCache::watching(vec![POLICY_NS.to_owned()])),
+                    mode: EgressMode::Enforce,
+                    sources: PolicySources::default(),
+                    audiences: mediatore_claims::policy::EgressMode::Shadow,
+                },
+            );
+            let mut answers = Vec::new();
+            for b in [&elsewhere, &nowhere] {
+                let token = b.token("octocat", &[TEAM_A]);
+                let (status, _, text) = create_naming(b, &token, "team-a", POLICY).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST);
+                assert!(
+                    !text.contains(POLICY_NS) && !text.contains("infra"),
+                    "no namespace but the requester's own"
+                );
+                answers.push(text);
+            }
+            assert_eq!(
+                answers[0], answers[1],
+                "a policy elsewhere and a policy nowhere are told apart by nobody outside"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_replica_that_has_not_read_the_sources_does_not_guess_at_the_front_door() {
+            // `team-a` is watched and its first list has not completed here: neither a 400 nor
+            // a verdict; the sandbox is created and the reconciler holds it.
+            let b = with_policy(
+                broker(tenant_map(), false).await,
+                PolicyEgress {
+                    bundles: Arc::new(BundleCache::watching(vec!["team-a".to_owned()])),
+                    mode: EgressMode::Enforce,
+                    sources: PolicySources::default(),
+                    audiences: mediatore_claims::policy::EgressMode::Shadow,
+                },
+            );
+            let token = b.token("octocat", &[TEAM_A]);
+            let made = create_naming(&b, &token, "team-a", POLICY).await;
+            assert_eq!(made.0, StatusCode::CREATED);
+            assert_eq!(b.front.all().len(), 1);
+        }
+
+        #[tokio::test]
+        async fn under_shadow_nothing_is_refused_and_the_log_says_what_enforce_would_refuse() {
+            capture_logs();
+            // At the front door: created, with the line an operator reads before switching.
+            let b =
+                policed_broker(tenant_map(), EgressMode::Shadow, PolicySources::default()).await;
+            let token = b.token("octocat", &[TEAM_A]);
+            let made = create_naming(&b, &token, "team-a", POLICY).await;
+            assert_eq!(made.0, StatusCode::CREATED);
+            assert_eq!(b.front.all().len(), 1);
+            let logs = captured();
+            let line = logs
+                .lines()
+                .find(|l| l.contains("enforce would refuse this claim"))
+                .expect("the shadow line of the front door");
+            assert!(line.contains("namespace=team-a") && line.contains("policy=agent"));
+            assert!(line.contains(&format!("held_outside={POLICY_NS}")));
+            // At the gateway: a placed credential under a bundle outside the record's sources is
+            // issued, and both gaps are logged.
+            capture_logs();
+            let (pe, uid) = bundle_for(&["internal-git"], EgressMode::Shadow).await;
+            let mut st = placed_internal_git(placed_state());
+            st.policy_egress = Some(PolicyEgress {
+                sources: PolicySources::default(),
+                audiences: mediatore_claims::policy::EgressMode::Shadow,
+                ..pe
+            });
+            let st: Shared = Arc::new(st);
+            let mut rec = claim(&["internal-git"], None);
+            rec.policy_uid = Some(uid);
+            let rec = stored(&st, rec).await;
+            assert_eq!(
+                ask(&st, rec.uid, Some(&gateway_peer()), "internal-git")
+                    .await
+                    .0,
+                StatusCode::OK,
+                "shadow refuses nothing"
+            );
+            let logs = captured();
+            assert!(logs.contains("outside its namespace's policy sources"));
+            assert!(logs.contains("the bundle would not admit this audience"));
+        }
+    }
 
     /// A store whose records are contended: every `update_claim` meets `on_update`, and
     /// everything else is the in-memory store's.

@@ -18,6 +18,12 @@
 # the bundle lacks and one asking for more than the policy's lease are each Failed with
 # their reason and get no claim, while a conformant one still gets its claim.
 #
+# ADR-0054 last: a second policy namespace the broker reads, whose policy the sandbox
+# namespace may not name until `policy.sources` says it draws from there. Without the
+# entry a sandbox naming it reports P011 in shadow (and is still created), and is Failed
+# with policy_not_resolved under enforce, with no claim and the same reason as a policy
+# that exists nowhere; with the entry and a restart it is admitted and recorded.
+#
 #   policy-e2e.sh <admin kubeconfig> <broker SA kubeconfig> <state dir>
 set -euo pipefail
 cd "$(dirname "$0")/../.."
@@ -29,6 +35,10 @@ K=(kubectl --kubeconfig "$ADMIN_KUBECONFIG")
 KSA=(kubectl --kubeconfig "$SA_KUBECONFIG")
 BROKER_NS=banlieue-system
 NS=mediatore-e2e-sandbox
+# A policy namespace beside the sandbox one (ADR-0054): read by the broker, drawn from only
+# when policy.sources says so.
+NSP=mediatore-e2e-policies
+OTHER=infra
 ISSUER=https://issuer.example.com
 TIMEOUT=${MEDIATORE_KIND_TIMEOUT:-180}
 POLICY=agent
@@ -57,12 +67,17 @@ dump() {
   printf '\n--- broker (last 60 lines)\n'; broker_logs | tail -60
   printf '\n--- notaio (last 30 lines)\n'; "${K[@]}" -n notaio-system logs deploy/notaio --tail=30 2>/dev/null | plain || true
   printf '\n--- %s\n' "$NS"; "${K[@]}" -n "$NS" get sandboxpolicies,exposureceilings,configmaps,agentsandboxes,virtualmachineclaims 2>/dev/null || true
-  printf '\n--- verdicts\n'; for sb in sb-ok sb-gap sb-none sb-orphan; do printf '%s: %s\n' "$sb" "$(verdict "$sb")"; done
+  printf '\n--- %s\n' "$NSP"; "${K[@]}" -n "$NSP" get sandboxpolicies,exposureceilings,configmaps 2>/dev/null || true
+  printf '\n--- verdicts\n'
+  for sb in sb-ok sb-gap sb-none sb-orphan sb-elsewhere sb-elsewhere-enf sb-nowhere-enf sb-own-enf sb-mapped; do
+    printf '%s: %s | %s %s\n' "$sb" "$(verdict "$sb")" "$(field "$sb" '.status.phase')" "$(field "$sb" '.status.reason')"
+  done
 }
 
 cleanup() {
   "${K[@]}" -n "$NS" delete configmap "$REPLAY_CM" --ignore-not-found --wait=false >/dev/null 2>&1 || true
   "${K[@]}" delete namespace "$NS" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  "${K[@]}" delete namespace "$NSP" --ignore-not-found --wait=false >/dev/null 2>&1 || true
   # The broker's configuration as the overlay ships it, for the tiers after this one.
   "${K[@]}" apply -k dev/kind/broker >/dev/null 2>&1 || true
   "${K[@]}" -n "$BROKER_NS" rollout restart deploy/mediatore >/dev/null 2>&1 || true
@@ -116,13 +131,19 @@ echo "roles in $NS: notaio writes bundles, the broker reads them"
 
 say "broker: the policy section trusting notaio's key, bundles read from $NS"
 read -r KEY_ID PUBLIC_KEY < "$DIR/public-key.txt"
-{
-  cat dev/kind/broker/mediatore.yaml
-  printf 'policy:\n  trusted_keys:\n    - { id: "%s", public_key: "%s" }\n  namespaces: [%s]\n' "$KEY_ID" "$PUBLIC_KEY" "$NS"
-} > "$DIR/mediatore.yaml"
-"${K[@]}" -n "$BROKER_NS" create configmap mediatore-config --from-file=mediatore.yaml="$DIR/mediatore.yaml" \
-  --dry-run=client -o yaml | "${K[@]}" apply -f - >/dev/null
-restart_broker
+# The overlay's configuration plus a policy section reading <namespaces>, with any further
+# lines of that section (egress, sources) as the second argument; applied and restarted.
+policy_config() {
+  {
+    cat dev/kind/broker/mediatore.yaml
+    printf 'policy:\n  trusted_keys:\n    - { id: "%s", public_key: "%s" }\n  namespaces: [%s]\n' "$KEY_ID" "$PUBLIC_KEY" "$1"
+    [ -n "${2:-}" ] && printf '%s\n' "$2"
+  } > "$DIR/mediatore.yaml"
+  "${K[@]}" -n "$BROKER_NS" create configmap mediatore-config --from-file=mediatore.yaml="$DIR/mediatore.yaml" \
+    --dry-run=client -o yaml | "${K[@]}" apply -f - >/dev/null
+  restart_broker
+}
+policy_config "$NS"
 echo "reflector running on ${BROKER_POD#pod/} trusting $KEY_ID"
 
 say "notaio: a policy and its ceiling publish a signed bundle"
@@ -281,4 +302,65 @@ for sb in sb-ok sb-gap sb-none sb-orphan; do
 done
 echo "the four claims made before enforce are untouched: a refusal is only before a claim exists"
 
-say "PASS: ADR-0026 and ADR-0053 phase 2 hold against a real cluster (notaio from its release signing with OpenBao, the bundle admitted and recorded, the comparison's verdicts and codes, a newer version followed, a replay refused by the floor across a restart, nothing refused on the bundle's account)"
+
+say "ADR-0054: policy $OTHER in $NSP, a namespace the broker reads but $NS does not draw from"
+"${K[@]}" delete namespace "$NSP" --ignore-not-found --wait=true >/dev/null
+"${K[@]}" create namespace "$NSP" >/dev/null
+"${K[@]}" -n "$NSP" apply -f dev/kind/notaio/notaio-bundles.yaml >/dev/null
+mkdir -p "$STATE/policy-bundles-$NSP"
+printf 'namespace: %s\nresources:\n  - ../../deploy/policy-bundles\n' "$NSP" > "$STATE/policy-bundles-$NSP/kustomization.yaml"
+"${K[@]}" apply -k "$STATE/policy-bundles-$NSP" >/dev/null
+policy_config "$NS, $NSP" "  egress: shadow"
+# The same content as $POLICY, so a sandbox admitted under it has no gap.
+"${K[@]}" -n "$NS" get exposureceiling "$POLICY" -o json \
+  | jq --arg ns "$NSP" --arg n "$OTHER" '{apiVersion, kind, metadata: {name: $n, namespace: $ns}, spec}' \
+  | "${K[@]}" apply -f - >/dev/null
+"${K[@]}" -n "$NS" get sandboxpolicy "$POLICY" -o json \
+  | jq --arg ns "$NSP" --arg n "$OTHER" '{apiVersion, kind, metadata: {name: $n, namespace: $ns}, spec}' \
+  | "${K[@]}" apply -f - >/dev/null
+other_published() { [ -n "$("${K[@]}" -n "$NSP" get configmap "$OTHER-bundle" -o jsonpath="{.metadata.annotations.$VERSION_ANN}" 2>/dev/null)" ]; }
+wait_for "$TIMEOUT" "ConfigMap $NSP/$OTHER-bundle with a bundle version" other_published
+wait_for "$TIMEOUT" "'policy bundle admitted' for $OTHER in the broker log" log_has "policy bundle admitted" "policy=$OTHER"
+
+say "ADR-0054 shadow, no sources entry: P011, the sandbox still created, the log names where the policy is held"
+manifest sb-elsewhere '["internal-git"]' "$OTHER" | "${KSA[@]}" create -f - >/dev/null
+wait_for "$TIMEOUT" "sb-elsewhere with a claim and a PolicyConformant condition" has_verdict sb-elsewhere
+expect sb-elsewhere "False Gaps" "P011"
+[ -z "$(field sb-elsewhere '.status.reason')" ] || fail "sb-elsewhere refused in shadow: $(field sb-elsewhere '.status.reason')"
+wait_for "$TIMEOUT" "the 'outside this sandbox's sources' line in the broker log" log_has "outside this sandbox's sources" "held_in=$NSP"
+log_has "policy sources:" "namespace=$NS" || fail "no 'policy sources' start line for $NS"
+echo "shadow: reported, nothing refused"
+
+say "ADR-0054 enforce, no sources entry: refused before any claim, the same reason as a policy nowhere"
+policy_config "$NS, $NSP" "  egress: enforce"
+manifest sb-elsewhere-enf '["internal-git"]' "$OTHER" | "${KSA[@]}" create -f - >/dev/null
+manifest sb-nowhere-enf '["internal-git"]' unsigned | "${KSA[@]}" create -f - >/dev/null
+manifest sb-own-enf '["internal-git"]' "$POLICY" | "${KSA[@]}" create -f - >/dev/null
+for sb in sb-elsewhere-enf sb-nowhere-enf; do
+  wait_for "$TIMEOUT" "$sb Failed" is_failed "$sb"
+  sleep 2
+  "${K[@]}" -n "$NS" get virtualmachineclaim "$sb" >/dev/null 2>&1 && fail "$sb has a claim although its policy does not resolve"
+  echo "$sb: $(field "$sb" '.status.reason')"
+done
+want="policy_not_resolved: no verified bundle for policy $OTHER in the namespaces $NS draws its policies from"
+[ "$(field sb-elsewhere-enf '.status.reason')" = "$want" ] || fail "sb-elsewhere-enf: expected '$want'"
+# Elsewhere and nowhere read alike once the name is swapped: the answer never says where
+# else a policy exists.
+[ "$(field sb-nowhere-enf '.status.reason' | sed "s/policy unsigned /policy $OTHER /")" = "$want" ] \
+  || fail "the refusal for a policy nowhere differs from the one for a policy elsewhere"
+field sb-elsewhere-enf '.status.reason' | grep -qF "$NSP" && fail "the reason names $NSP"
+wait_for "$TIMEOUT" "sb-own-enf with a claim and a PolicyConformant condition" has_verdict sb-own-enf
+expect sb-own-enf "True Conformant" "v"
+echo "enforce: the other namespace's policy refused, the own namespace's admitted"
+
+say "ADR-0054 enforce with policy.sources.$NS = [$NS, $NSP]: the same name admitted and recorded"
+policy_config "$NS, $NSP" "$(printf '  egress: enforce\n  sources:\n    %s:\n      namespaces: [%s, %s]' "$NS" "$NS" "$NSP")"
+log_has "policy sources:" "sources=$NS, $NSP" || fail "no 'policy sources' start line naming $NS, $NSP"
+manifest sb-mapped '["internal-git"]' "$OTHER" | "${KSA[@]}" create -f - >/dev/null
+wait_for "$TIMEOUT" "sb-mapped with a claim and a PolicyConformant condition" has_verdict sb-mapped
+expect sb-mapped "True Conformant" "v"
+[ -z "$(field sb-mapped '.status.reason')" ] || fail "sb-mapped refused: $(field sb-mapped '.status.reason')"
+wait_for "$TIMEOUT" "'record created' for sb-mapped with a bundle version" log_has "record created" "bundle_version=Some("
+echo "mapped: admitted under $NSP/$OTHER"
+
+say "PASS: ADR-0026 holds against a real cluster (notaio from its release signing with OpenBao, the bundle admitted and recorded, the comparison's verdicts and codes, a newer version followed, a replay refused by the floor across a restart, nothing refused on the bundle's account), ADR-0053 phase 2 (under policy.audiences: enforce the bundle decides what a sandbox may have) and ADR-0054 (another namespace's policy P011 in shadow, refused under enforce with the reason of a policy nowhere, admitted once policy.sources maps it)"
