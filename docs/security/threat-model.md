@@ -6,7 +6,8 @@ SPDX-License-Identifier: Apache-2.0
 
 > **Status:** Living document. Last full pass **2026-11-20**, against the
 > architecture defined by **ADR-0001 … ADR-0049, ADR-0051 to ADR-0054 and ADR-0057** (ADR-0050,
-> ADR-0055 and ADR-0056 are Proposed and not modeled; ADR-0009 and ADR-0010 are
+> ADR-0056 and ADR-0059 are Proposed and not modeled; ADR-0055 is accepted and being implemented,
+> not yet modeled; ADR-0009 and ADR-0010 are
 > adopted platform ADRs; ADR-0020 is mediatore's share of ADR-0010's in-guest
 > layer). ADR-0042 is accepted with its implementation deferred and is not modeled. The pass of 2026-11-20 is for an
 > amendment to ADR-0045 dated that day, not for a new ADR, so the range above is the one ADR-0054's pass left: a workload's output

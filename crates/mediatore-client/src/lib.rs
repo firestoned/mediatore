@@ -332,6 +332,33 @@ fn decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// The page the loopback listener answers a successful callback with. It counts down and
+/// then tries `window.close()`. Browsers allow that only for a tab a script opened (or one
+/// with a single page of history), and this tab was opened by the CLI and redirected
+/// through the issuer, so the close is often refused: the text then asks the user to close
+/// the tab. Static text only; nothing from the request is echoed into the page.
+const LOGGED_IN_PAGE: &str = r#"<!doctype html>
+<html><head><meta charset="utf-8"><title>mediatore: logged in</title></head>
+<body style="font-family: system-ui, sans-serif; margin: 3em;">
+<p>Logged in.</p>
+<p id="m">This tab closes in <span id="n">3</span> seconds.</p>
+<script>
+let n = 3;
+const t = setInterval(() => {
+  n -= 1;
+  document.getElementById("n").textContent = n;
+  if (n > 0) return;
+  clearInterval(t);
+  window.close();
+  setTimeout(() => {
+    document.getElementById("m").textContent = "You can close this tab.";
+  }, 300);
+}, 1000);
+</script>
+<noscript><p>You can close this tab.</p></noscript>
+</body></html>
+"#;
+
 /// Accept one `GET /callback?code=...&state=...` on `listener`, answer it, and return the
 /// code and state.
 async fn accept_callback(listener: tokio::net::TcpListener) -> anyhow::Result<(String, String)> {
@@ -363,7 +390,7 @@ async fn accept_callback(listener: tokio::net::TcpListener) -> anyhow::Result<(S
         }
     }
     let (status, body) = if code.is_some() {
-        ("200 OK", "<p>Logged in. You can close this window.</p>")
+        ("200 OK", LOGGED_IN_PAGE)
     } else {
         ("400 Bad Request", "<p>No code in the callback.</p>")
     };
@@ -688,6 +715,40 @@ mod tests {
             ca_pem: None,
             redirect: Redirect::default(),
         }
+    }
+
+    /// Send `request_line` to a fresh callback listener; return its parse and the raw reply.
+    async fn callback_reply(request_line: &str) -> (anyhow::Result<(String, String)>, String) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(accept_callback(listener));
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(format!("{request_line}\r\nHost: x\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut reply = String::new();
+        stream.read_to_string(&mut reply).await.unwrap();
+        (server.await.unwrap(), reply)
+    }
+
+    #[tokio::test]
+    async fn the_success_page_counts_down_and_tries_to_close_the_tab() {
+        let (parsed, reply) = callback_reply("GET /callback?code=c1&state=s1 HTTP/1.1").await;
+        assert_eq!(parsed.unwrap(), ("c1".to_owned(), "s1".to_owned()));
+        assert!(reply.starts_with("HTTP/1.1 200 OK"));
+        assert!(reply.contains("window.close()"));
+        assert!(reply.contains("You can close this tab."));
+        let (_, body) = reply.split_once("\r\n\r\n").unwrap();
+        assert!(reply.contains(&format!("Content-Length: {}\r\n", body.len())));
+    }
+
+    #[tokio::test]
+    async fn the_error_page_does_not_close_the_tab() {
+        let (parsed, reply) = callback_reply("GET /callback?state=s1 HTTP/1.1").await;
+        assert!(parsed.is_err());
+        assert!(reply.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(!reply.contains("window.close"));
     }
 
     /// The "browser": follows the authorization URL to the issuer, which redirects to the
