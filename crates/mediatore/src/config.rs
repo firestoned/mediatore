@@ -1560,15 +1560,10 @@ impl Config {
                 "policy.audience_definitions.credential_refresh_secs must be positive (ADR-0055 decision 5)"
             );
         }
-        if d.mode == AudienceMode::Bundles {
-            if !self.audiences.is_empty() {
-                anyhow::bail!(
-                    "policy.audience_definitions.mode is bundles but audiences[] lists {} audience(s): under bundles every definition comes from notaio; run shadow until no difference is logged, then remove audiences[] (ADR-0055 decision 8)",
-                    self.audiences.len()
-                );
-            }
+        if d.mode == AudienceMode::Bundles && !self.audiences.is_empty() {
             anyhow::bail!(
-                "policy.audience_definitions.mode: bundles is not implemented yet; use shadow (ADR-0055)"
+                "policy.audience_definitions.mode is bundles but audiences[] lists {} audience(s): under bundles every definition comes from notaio; run shadow until no difference is logged, then remove audiences[] (ADR-0055 decision 8)",
+                self.audiences.len()
             );
         }
         Ok(())
@@ -3497,7 +3492,7 @@ listen: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }
     }
 
     #[test]
-    fn bundles_refuses_an_audiences_list_and_is_not_served_yet() {
+    fn bundles_refuses_an_audiences_list_and_starts_without_one() {
         let body = "    mode: bundles\n    platform_namespace: p\n";
         let err = Config::parse(&format!(
             "{}audiences:\n  - {{ name: a, via: none }}\n{}",
@@ -3510,8 +3505,8 @@ listen: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }
             err.contains("audiences[]") && err.contains("shadow"),
             "{err}"
         );
-        let err = refused(&audience_definitions(body));
-        assert!(err.contains("not implemented"), "{err}");
+        let cfg = with(&audience_definitions(body)).unwrap();
+        assert_eq!(cfg.audience_mode(), AudienceMode::Bundles);
     }
 
     #[test]

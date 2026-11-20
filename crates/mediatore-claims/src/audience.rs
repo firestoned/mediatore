@@ -124,6 +124,9 @@ pub enum Inadmissible {
     /// A zero `maxTtlSeconds`.
     #[error("maxTtlSeconds is zero")]
     NoTtl,
+    /// Something this broker cannot serve yet; refused rather than served without it.
+    #[error("{0} is not served by this broker yet")]
+    NotBuilt(&'static str),
 }
 
 impl Inadmissible {
@@ -137,6 +140,7 @@ impl Inadmissible {
             Self::Endpoint(_) | Self::Rule { .. } => "L017",
             Self::NoSource => "NoSource",
             Self::NoTtl => "NoTtl",
+            Self::NotBuilt(_) => "NotBuilt",
         }
     }
 }
@@ -220,6 +224,14 @@ pub fn audience_of(
     }
     if d.max_ttl_seconds == 0 {
         return Err(Inadmissible::NoTtl);
+    }
+    if d.ca_ref.is_some() {
+        return Err(Inadmissible::NotBuilt("a CA reference (caRef)"));
+    }
+    if d.credential.backend == Backend::Secret && d.credential.format == CredentialFormat::Basic {
+        return Err(Inadmissible::NotBuilt(
+            "an operator-held credential in basic format",
+        ));
     }
     let mut endpoints = d
         .endpoints
@@ -635,6 +647,17 @@ impl LiveCatalog {
     pub fn all_synced(&self) -> bool {
         let listed = self.synced.read().unwrap_or_else(PoisonError::into_inner);
         self.namespaces.iter().all(|n| listed.contains(n))
+    }
+
+    /// Whether a claim in `namespace` can be answered: the platform namespace and `namespace`
+    /// have completed their first list, so an audience missing from the snapshot is missing, not
+    /// unread. A namespace audiences are not read in holds none and is not waited for.
+    #[must_use]
+    pub fn ready_for(&self, namespace: &str) -> bool {
+        let platform = self.snapshot().platform_namespace().to_owned();
+        [platform.as_str(), namespace]
+            .iter()
+            .all(|n| !self.namespaces.iter().any(|w| w == n) || self.synced(n))
     }
 
     /// Swap in the next snapshot, built from the current one.
@@ -1123,6 +1146,21 @@ mod tests {
     }
 
     #[test]
+    fn what_the_broker_cannot_serve_yet_is_refused_rather_than_half_served() {
+        let mut d = definition("a.example.com:443");
+        d.ca_ref = Some(mediatore_policy::types::ConfigMapKeyRef {
+            name: "private-ca".into(),
+            key: "ca.pem".into(),
+        });
+        let r = audience_of(&payload("team-a", "a", d), PLATFORM).unwrap_err();
+        assert_eq!(r.code(), "NotBuilt", "{r}");
+        let mut d = definition("a.example.com:443");
+        d.credential.format = CredentialFormat::Basic;
+        let r = audience_of(&payload("team-a", "a", d), PLATFORM).unwrap_err();
+        assert_eq!(r.code(), "NotBuilt", "{r}");
+    }
+
+    #[test]
     fn endpoints_are_lowercased_and_deduplicated() {
         let mut d = definition("Registry.Example.com:443");
         d.endpoints.push("registry.example.com:443".into());
@@ -1442,6 +1480,23 @@ mod tests {
             assert!(!r.live().all_synced());
             r.resynced(PLATFORM, &seen);
             assert!(r.live().all_synced());
+        }
+
+        #[tokio::test]
+        async fn a_namespace_is_ready_once_it_and_the_platform_namespace_are_listed() {
+            let (_, r) = rig();
+            let live = r.live();
+            assert!(!live.ready_for(TEAM));
+            r.resynced(TEAM, &HashSet::new());
+            assert!(
+                !live.ready_for(TEAM),
+                "the platform namespace is not listed yet"
+            );
+            r.resynced(PLATFORM, &HashSet::new());
+            assert!(live.ready_for(TEAM));
+            assert!(live.ready_for(PLATFORM));
+            // A namespace audiences are not read in holds none, and is not waited for.
+            assert!(live.ready_for("elsewhere"));
         }
 
         #[tokio::test]

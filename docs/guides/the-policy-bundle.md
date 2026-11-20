@@ -360,8 +360,13 @@ policy:
 - **`shadow`**: the broker reads audience bundles in the platform namespace and in every sandbox
   namespace, verifies each (payload type, a trusted key, schema, digest, lifetime) and keeps a version
   floor per audience in the store beside the policy floors. `audiences[]` still serves.
-- **`bundles`**: the catalog serves and `audiences[]` must be empty. **Not built yet**: the broker
-  refuses to start with it.
+- **`bundles`**: the catalog serves, in the API (`POST /v1/claims`, `POST /v1/token`, `GET /v1/me`,
+  the gateway's allowlist and credential routes) and in the watcher, and `audiences[]` must be
+  empty. A definition change reaches a claim at its next ask, with no restart. Until the platform
+  namespace and a claim's namespace have been listed after a start, the API answers `503
+  audiences_not_synced` and the watcher holds the sandbox. A `secret` audience whose credential is
+  not readable answers `503 credential_unavailable`. Not served yet, and refused when admitted
+  (`NotBuilt`): a `caRef`, and an operator-held credential in `basic` format.
 
 An audience in the platform namespace is a platform audience, usable from every namespace; one in any
 other namespace is a team audience, usable only by claims in that namespace. The kind comes from the
@@ -397,7 +402,8 @@ the fields (`backend`, `placement`, `format`, `header`, `extra_headers`, `endpoi
 `max_ttl`), `in the file, no platform definition`, or `would appear:` for a definition the file does
 not have. A matching verdict is `info`; the others are `warn`. Neither a credential nor where it is
 read from is ever logged. Run `shadow` until no audience logs a difference before `bundles` is built
-and switched on.
+and switched on: remove `audiences[]` and set `mode: bundles`. That switch is the last rollout an
+audience needs.
 
 ## What comes next
 

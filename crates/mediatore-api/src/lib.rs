@@ -55,6 +55,9 @@ use mediatore_sts::{MintRequest, Sts};
 use mediatore_tls::PeerSpiffeId;
 use uuid::Uuid;
 
+mod audiences;
+pub use audiences::{AudienceCatalogSource, AudienceView, CatalogView};
+
 /// Hex characters of the claim UID used in the generated object name.
 const CLAIM_NAME_SUFFIX_LEN: usize = 8;
 
@@ -138,6 +141,11 @@ pub struct AppState {
     /// `gateway_inject_port` (ADR-0040 decision 7): the port of the gateways' inject listener,
     /// carried on every route of a gateway-placed audience on `GET /v1/me`.
     pub inject_port: Option<u16>,
+    /// ADR-0055: under `policy.audience_definitions.mode: bundles`, the audience catalog and its
+    /// credentials, which then serve in place of the per-audience maps above (empty in that
+    /// mode). `None` under `config` and `shadow`: the maps serve. Read through
+    /// [`AppState::view`], never directly.
+    pub audience_catalog: Option<AudienceCatalogSource>,
     /// A workload's output at the broker (ADR-0045 decisions 4 and 11): the cap of each claim's
     /// ring when `logs.enabled`, `None` when it is not. `None` fails closed: `POST /v1/me/logs`
     /// and `GET /v1/claims/{name}/logs` answer `501`, and a claim with `workload.logs: true` is
@@ -176,6 +184,20 @@ impl AppState {
             Some(per) => per.get(namespace).cloned().unwrap_or_default(),
             None => self.rules.get(audience).cloned().unwrap_or_default(),
         }
+    }
+}
+
+/// ADR-0055: under the catalog, `503 audiences_not_synced` until the platform namespace and
+/// `namespace` have completed their first list. A broker just started has not read every
+/// definition yet, and "unknown audience" then would be wrong, and for a guest's routes lasting.
+fn audiences_ready(st: &AppState, namespace: &str) -> Result<(), ApiError> {
+    match &st.audience_catalog {
+        Some(c) if !c.live.ready_for(namespace) => Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "audiences_not_synced",
+            Some("the broker has not read every audience definition yet; retry".to_owned()),
+        )),
+        _ => Ok(()),
     }
 }
 
@@ -263,15 +285,18 @@ fn effective_in(
     audience: &str,
     bundle: Option<&mediatore_policy::BundlePayload>,
 ) -> Option<mediatore_claims::policy::EffectiveAudience> {
-    if !st.scope_allows(audience, namespace) {
+    let v = st.view(namespace);
+    if !v.scope_allows(audience) {
         return None;
     }
-    let egress = st.egress.get(audience).map_or(&[][..], Vec::as_slice);
+    let egress = v.egress(audience);
+    // ADR-0055 decision 6: a catalog definition's `maxTtlSeconds` caps every credential.
+    let max_ttl = v.max_ttl(audience);
     if enforcing(st).is_none() {
         return Some(mediatore_claims::policy::EffectiveAudience {
-            rules: st.rules_in(audience, namespace),
+            rules: v.rules_in(audience),
             egress: egress.to_vec(),
-            ttl_cap: None,
+            ttl_cap: max_ttl,
         });
     }
     let grant = bundle?
@@ -279,13 +304,17 @@ fn effective_in(
         .audiences
         .iter()
         .find(|g| g.name == audience)?;
-    let ceiling = st.rules.get(audience).map_or(&[][..], Vec::as_slice);
-    let file = st
-        .scopes
-        .get(audience)
-        .and_then(|per| per.get(namespace))
-        .map(Vec::as_slice);
-    mediatore_claims::policy::effective_grant(ceiling, file, egress, grant)
+    let mut eff = mediatore_claims::policy::effective_grant(
+        v.ceiling(audience),
+        v.file_grant(audience),
+        egress,
+        grant,
+    )?;
+    eff.ttl_cap = match (eff.ttl_cap, max_ttl) {
+        (Some(g), Some(m)) => Some(g.min(m)),
+        (g, m) => g.or(m),
+    };
+    Some(eff)
 }
 
 /// The claim's current verified bundle (ADR-0053 decision 12): found by the policy `uid` the
@@ -921,17 +950,15 @@ async fn create_claim(
     // In `dev_mode` the same check runs on the dev token's groups (decision 12): the testkit's
     // fake IdP puts the groups it was given in the token, and no header supplies any.
     let namespace = resolve_create(&st, &validated, req.namespace.as_deref())?;
+    audiences_ready(&st, &namespace)?;
     // Exactly one of pool_ref and pool_selector (ADR-0044 decision 2): the CRD would refuse
     // the sandbox; say so now, and never read "neither" as "any pool".
     req.pool()
         .map_err(|e| ApiError::bad_request("invalid_pool", e.to_string()))?;
     // An audience this namespace may not use is answered as one that does not exist (ADR-0053
     // decision 4): the response does not say which audiences exist elsewhere.
-    if let Some(bad) = req
-        .audiences
-        .iter()
-        .find(|a| !st.audiences.contains(a) || !st.scope_allows(a, &namespace))
-    {
+    let view = st.view(&namespace);
+    if let Some(bad) = req.audiences.iter().find(|a| !view.usable(a)) {
         return Err(ApiError::bad_request("unknown_audience", bad.clone()));
     }
     // ADR-0053 decision 10: under `policy.audiences: enforce`, a verified bundle that grants it all.
@@ -959,8 +986,8 @@ async fn create_claim(
     // A policy that does not resolve in the namespace's sources (ADR-0054 decision 4): said
     // now, before a session is built or parked. The reconciler remains the control.
     refuse_unresolved_policy(&st, &validated, &namespace, req.policy_ref.as_deref())?;
-    let session = session_for(&st, &validated, &req, &bearer_token).await?;
-    let delegations = delegations_for(&st, &req)?;
+    let session = session_for(&st, &validated, &req, &namespace, &bearer_token).await?;
+    let delegations = delegations_for(&st, &req, &namespace)?;
     let sealer = match (
         session.is_some() || !delegations.is_empty(),
         st.sealer.as_ref(),
@@ -1222,8 +1249,10 @@ async fn session_for(
     st: &AppState,
     validated: &Validated,
     req: &ClaimRequest,
+    namespace: &str,
     bearer_token: &str,
 ) -> Result<Option<Secret>, ApiError> {
+    let view = st.view(namespace);
     match (&validated.issuer.session, &req.refresh_token) {
         (Some(_), None) => {
             return Err(ApiError::bad_request(
@@ -1240,7 +1269,7 @@ async fn session_for(
         _ => {}
     }
     if validated.issuer.entra.is_none() {
-        if let Some(bad) = req.audiences.iter().find(|a| st.obo_audiences.contains(a)) {
+        if let Some(bad) = req.audiences.iter().find(|a| view.is_obo(a)) {
             return Err(ApiError::bad_request(
                 "audience_needs_entra",
                 format!("audience {bad} is served On-Behalf-Of and needs an Entra login"),
@@ -1251,7 +1280,7 @@ async fn session_for(
     let resource = req
         .audiences
         .iter()
-        .find(|a| st.obo_audiences.contains(a))
+        .find(|a| view.is_obo(a))
         .cloned()
         .unwrap_or_else(|| validated.issuer.client_id.clone());
     let refresh = st
@@ -1267,10 +1296,15 @@ async fn session_for(
 /// decision 2): a `delegated` audience needs exactly one with a bearer, nothing else may
 /// carry one, a bearer the caller says dies before the claim's deadline is refused, and a
 /// pending one (the transit shape) is not served yet.
-fn delegations_for(st: &AppState, req: &ClaimRequest) -> Result<Vec<Delegation>, ApiError> {
+fn delegations_for(
+    st: &AppState,
+    req: &ClaimRequest,
+    namespace: &str,
+) -> Result<Vec<Delegation>, ApiError> {
+    let view = st.view(namespace);
     let mut out = Vec::new();
     for d in &req.delegations {
-        if !st.delegated.contains_key(&d.audience) || !req.audiences.contains(&d.audience) {
+        if view.delegated(&d.audience).is_none() || !req.audiences.contains(&d.audience) {
             return Err(ApiError::bad_request(
                 "delegation_refused",
                 format!(
@@ -1296,7 +1330,7 @@ fn delegations_for(st: &AppState, req: &ClaimRequest) -> Result<Vec<Delegation>,
                 format!("audience {} is delegated without a token", d.audience),
             ));
         }
-        if st.delegated.get(&d.audience).is_some_and(|a| a.basic)
+        if view.delegated(&d.audience).is_some_and(|a| a.basic)
             && let Some(t) = d.token.as_ref()
             && let Err(why) = basic_parts(&t.0)
         {
@@ -1324,7 +1358,7 @@ fn delegations_for(st: &AppState, req: &ClaimRequest) -> Result<Vec<Delegation>,
     if let Some(missing) = req
         .audiences
         .iter()
-        .find(|a| st.delegated.contains_key(*a) && !out.iter().any(|d| &d.audience == *a))
+        .find(|a| view.delegated(a).is_some() && !out.iter().any(|d| &d.audience == *a))
     {
         return Err(ApiError::bad_request(
             "delegation_required",
@@ -2322,6 +2356,7 @@ async fn me(
     peer: Option<Extension<PeerSpiffeId>>,
 ) -> Result<Json<Me>, ApiError> {
     let rec = claim_of_node_peer(&st, &headers, peer.as_ref().map(|e| &e.0)).await?;
+    audiences_ready(&st, &rec.namespace)?;
     let expires_at = rec
         .expires_at
         .ok_or_else(|| ApiError::internal("bound claim has no deadline".to_owned()))?;
@@ -2339,9 +2374,12 @@ async fn me(
     // audience and that audience's rules; the config guarantees one audience per endpoint.
     // A direct entry gets a route with no audience and no credential (decision 8): the
     // proxy forwards bare, and the gateway, not the proxy, is what admits it.
+    let view = st.view(&rec.namespace);
     let mut routes: Vec<Route> = claim_audiences(&st, &rec)
-        .flat_map(|a| {
-            let eff = effective(&st, &rec, a).unwrap_or_else(|| unreachable!("filtered"));
+        // `effective` reads the catalog again: a definition withdrawn in between is skipped,
+        // never assumed present (ADR-0055 decision 2).
+        .filter_map(|a| effective(&st, &rec, a).map(|eff| (a, eff)))
+        .flat_map(|(a, eff)| {
             let rules = eff.rules;
             eff.egress.into_iter().map(move |e| (a, e, rules.clone()))
         })
@@ -2349,10 +2387,10 @@ async fn me(
             audience: Some(a.clone()),
             endpoint: e,
             rules,
-            ca_pem: st.cas.get(a).cloned(),
-            credential: if st.no_credential.contains(a) {
+            ca_pem: view.ca(a),
+            credential: if view.no_credential(a) {
                 Credential::None
-            } else if st.inject.contains_key(a) {
+            } else if view.inject(a).is_some() {
                 // ADR-0040: the gateway places it; the proxy never asks for a token.
                 Credential::Gateway
             } else {
@@ -2361,24 +2399,18 @@ async fn me(
             // ADR-0032 decision 2 and ADR-0035: where a `via: secret` or a delegated
             // credential goes, when not `Authorization`; the proxy owns that header on
             // every route (ADR-0025 decision 3).
-            credential_header: st
-                .secrets
-                .get(a)
+            credential_header: view
+                .secret(a)
                 .filter(|sec| sec.header != "authorization")
                 .map(|sec| sec.header.clone())
                 .or_else(|| {
-                    st.delegated
-                        .get(a)
+                    view.delegated(a)
                         .filter(|d| d.header != "authorization")
                         .map(|d| d.header.clone())
                 }),
             // ADR-0040: the gateways' inject port, on the routes of an audience placed
             // there; every other route is placed by the proxy.
-            inject_port: st
-                .inject
-                .contains_key(a)
-                .then_some(st.inject_port)
-                .flatten(),
+            inject_port: view.inject(a).is_some().then_some(st.inject_port).flatten(),
         })
         .chain(direct.into_iter().map(|e| Route {
             audience: None,
@@ -2571,8 +2603,9 @@ fn served_direct_egress(st: &AppState, rec: &ClaimRecord, audience: &[Endpoint])
 /// inject listener, where the rules are enforced and the credential is placed, and through no
 /// other path.
 fn placed_endpoints(st: &AppState, rec: &ClaimRecord) -> Vec<Endpoint> {
+    let view = st.view(&rec.namespace);
     claim_audiences(st, rec)
-        .filter_map(|a| st.inject.get(a).map(|routes| (a, routes)))
+        .filter_map(|a| view.inject(a).map(|routes| (a, routes)))
         .flat_map(|(a, routes)| {
             let allowed = effective(st, rec, a).map(|e| e.egress).unwrap_or_default();
             routes
@@ -2625,6 +2658,7 @@ async fn claim_egress(
         tracing::debug!(claim_uid = %uid, "gateway asked about a claim that is not live");
         return Err(unknown());
     };
+    audiences_ready(&st, &rec.namespace)?;
     let egress = egress_of(&st, &rec);
     tracing::debug!(claim_uid = %uid, endpoints = egress.len(), "claim egress answered to the gateway");
     Ok(Json(ClaimEgress {
@@ -2643,11 +2677,13 @@ fn inject_of(st: &AppState, rec: &ClaimRecord) -> Vec<InjectRoute> {
     // bundle's grant bounded by the ceiling; only the endpoints the grant lists are routed
     // (ADR-0053 decisions 5 and 11).
     let rewrite = enforcing(st).is_some();
+    let view = st.view(&rec.namespace);
     let mut routes: Vec<InjectRoute> = claim_audiences(st, rec)
-        .filter_map(|a| st.inject.get(a).map(|rs| (a, rs)))
-        .flat_map(|(a, rs)| {
-            let eff = effective(st, rec, a).unwrap_or_else(|| unreachable!("filtered"));
-            let scoped = rewrite || st.scopes.contains_key(a);
+        .filter_map(|a| view.inject(a).map(|rs| (a, rs)))
+        // A definition withdrawn between the two reads is skipped (ADR-0055 decision 2).
+        .filter_map(|(a, rs)| effective(st, rec, a).map(|eff| (a, rs, eff)))
+        .flat_map(|(a, rs, eff)| {
+            let scoped = rewrite || view.is_scoped(a);
             rs.iter()
                 .filter(|r| !rewrite || eff.egress.contains(&r.endpoint))
                 .map(|r| {
@@ -2883,12 +2919,12 @@ enum Placement {
 }
 
 /// The backend that serves `audience`, for the audit line, in the order `issue_token` tries them.
-fn backend_of(st: &AppState, audience: &str) -> &'static str {
-    if st.delegated.contains_key(audience) {
+fn backend_of(view: &AudienceView<'_>, audience: &str) -> &'static str {
+    if view.delegated(audience).is_some() {
         "delegated"
-    } else if st.secrets.contains_key(audience) {
+    } else if view.secret(audience).is_some() || view.credential_unavailable(audience) {
         "secret"
-    } else if st.obo_audiences.iter().any(|a| a == audience) {
+    } else if view.is_obo(audience) {
         "entra-obo"
     } else {
         "sts"
@@ -2911,11 +2947,29 @@ fn still_configured<'a>(
             "the claim's issuer is no longer configured",
         ));
     };
-    if !st.audiences.iter().any(|a| a == audience) {
+    if !st.view(&rec.namespace).exists(audience) {
         tracing::warn!(%claim_uid, %audience, "token refused: the audience is no longer configured");
         return Err(ApiError::forbidden("the audience is no longer configured"));
     }
     Ok(issuer)
+}
+
+/// ADR-0055 decision 5: a `secret` audience whose credential has not been read, or not within two
+/// refresh periods, has nothing to hand out until a read succeeds: `503 credential_unavailable`.
+fn credential_available(
+    view: &AudienceView<'_>,
+    audience: &str,
+    claim_uid: Uuid,
+) -> Result<(), ApiError> {
+    if !view.credential_unavailable(audience) {
+        return Ok(());
+    }
+    tracing::warn!(%claim_uid, %audience, "token refused: the audience's credential is unavailable (ADR-0055)");
+    Err(ApiError::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "credential_unavailable",
+        Some("the audience's credential cannot be read now".to_owned()),
+    ))
 }
 
 /// A credential's stated expiry, never later than the claim's own deadline: nothing the
@@ -2966,15 +3020,17 @@ async fn issue_token_capped(
     let issuer = still_configured(st, &rec, &audience, claim_uid)?;
     // No backend states an expiry later than the claim's own deadline.
     let claim_end = rec.expires_at;
+    let view = st.view(&rec.namespace);
+    credential_available(&view, &audience, claim_uid)?;
     // ADR-0035: the caller's own credential, opened from the record's envelope for this
     // audience, handed with the header it goes in; it dies with the credential, the claim or
     // `max_ttl`, whichever is first.
-    if let Some(d) = st.delegated.get(&audience) {
+    if let Some(d) = view.delegated(&audience) {
         return delegated_token(st, &rec, d, audience, claim_uid, placement).await;
     }
     // ADR-0032: an operator-held credential is handed as it is, with the header it goes in;
     // the proxy keeps it for `max_ttl` and asks again, through this same gate.
-    if let Some(sec) = st.secrets.get(&audience) {
+    if let Some(sec) = view.secret(&audience) {
         if placement == Placement::Proxy {
             tracing::info!(%claim_uid, %audience, subject = %rec.subject.id, backend = "secret", header = %sec.header, "token issued");
         }
@@ -2986,7 +3042,7 @@ async fn issue_token_capped(
     // upstream first, for the audience's resource. One refresh at a time per claim, over
     // the record as it is once the lock is held: the previous one may have rotated the
     // envelope, or released the claim.
-    let obo = st.obo_audiences.iter().any(|a| a == &audience);
+    let obo = view.is_obo(&audience);
     if obo && issuer.entra.is_none() {
         return Err(ApiError::forbidden(
             "audience is served On-Behalf-Of and this claim has no Entra session",
@@ -3093,6 +3149,7 @@ async fn token_claim(
     if !rec.is_live(Timestamp::now()) {
         return Err(ApiError::forbidden("claim revoked or expired"));
     }
+    audiences_ready(st, &rec.namespace)?;
     if !claim_audiences(st, &rec).any(|a| a == audience) {
         return Err(ApiError::bad_request(
             "unknown_audience",
@@ -3101,7 +3158,8 @@ async fn token_claim(
     }
     // ADR-0025 decision 8: an audience reached without a credential has no token to give;
     // the proxy never asks, and nothing else holding the claim SVID gets one either.
-    if st.no_credential.contains(audience) {
+    let view = st.view(&rec.namespace);
+    if view.no_credential(audience) {
         tracing::debug!(%claim_uid, audience = %audience.to_owned(), "token refused: the audience is served without a credential");
         return Err(ApiError::new(
             StatusCode::FORBIDDEN,
@@ -3112,7 +3170,7 @@ async fn token_claim(
     // ADR-0040 decision 2: an audience whose credential the gateway places is not the pool
     // VM's to hold, so the claim SVID that is asking gets none, however the proxy is built.
     // Refused before the rate limit: a refusal spends no token.
-    if st.inject.contains_key(audience) {
+    if view.inject(audience).is_some() {
         tracing::debug!(%claim_uid, audience = %audience.to_owned(), "token refused: the credential is placed at the gateway");
         return Err(ApiError::new(
             StatusCode::FORBIDDEN,
@@ -3278,11 +3336,13 @@ async fn gateway_credential(
         tracing::debug!(%claim_uid, "gateway asked for a credential of a claim that is not live");
         return Err(unknown());
     }
+    audiences_ready(&st, &rec.namespace)?;
     let audience = req.audience;
     if !claim_audiences(&st, &rec).any(|a| a == &audience) {
         return Err(ApiError::bad_request("unknown_audience", audience));
     }
-    if !st.inject.contains_key(&audience) {
+    let view = st.view(&rec.namespace);
+    if view.inject(&audience).is_none() {
         return Err(ApiError::new(
             StatusCode::FORBIDDEN,
             error_code::NOT_PLACED_AT_GATEWAY,
@@ -3297,7 +3357,7 @@ async fn gateway_credential(
             Some("too many credential requests for this claim".to_owned()),
         ));
     }
-    let backend = backend_of(&st, &audience);
+    let backend = backend_of(&view, &audience);
     let actor = st.naming.claim_id(claim_uid);
     let issued = issue_token(&st, &actor, claim_uid, rec, audience, Placement::Gateway).await?;
     let credential = GatewayCredential::from_token_response(issued, Timestamp::now());
@@ -3498,6 +3558,7 @@ mod tests {
             gateways: vec![],
             inject: BTreeMap::new(),
             inject_port: None,
+            audience_catalog: None,
             logs: None,
             log_limiter: Limiter::per_second(2),
             log_wakes: LogWakes::default(),
@@ -7441,5 +7502,346 @@ mod tests {
             0,
             "a batch for a claim nobody follows makes no entry"
         );
+    }
+
+    // ----- ADR-0055: the audience catalog serves -----
+
+    mod catalog {
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+
+        use mediatore_claims::audience::AudienceReflector;
+        use mediatore_claims::credential::{
+            CredentialCache, CredentialReader, Material, ReadError,
+        };
+        use mediatore_policy::types::{
+            AudienceCredential, AudienceDefinition, Backend as B, CredentialFormat,
+            CredentialSource, Placement as P, SecretRef,
+        };
+        use mediatore_testkit::policy::{audience_configmap, signed_audience};
+
+        use super::*;
+
+        const PLATFORM: &str = "sandbox-platform";
+
+        /// Answers each Secret by `(namespace, name)` from a table the test changes.
+        #[derive(Default)]
+        struct Table(Mutex<HashMap<(String, String), String>>);
+
+        impl Table {
+            fn set(&self, ns: &str, name: &str, value: &str) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .insert((ns.into(), name.into()), value.into());
+            }
+            fn clear(&self) {
+                self.0.lock().unwrap().clear();
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl CredentialReader for Table {
+            async fn read(
+                &self,
+                namespace: &str,
+                source: &CredentialSource,
+                _f: CredentialFormat,
+            ) -> Result<Material, ReadError> {
+                let CredentialSource::SecretRef(r) = source else {
+                    return Err(ReadError::NoReader);
+                };
+                self.0
+                    .lock()
+                    .unwrap()
+                    .get(&(namespace.to_owned(), r.name.clone()))
+                    .map(|v| Material {
+                        secret: Secret(v.clone()),
+                        username: None,
+                    })
+                    .ok_or(ReadError::NotFound)
+            }
+        }
+
+        fn def(backend: B, placement: P, endpoint: &str) -> AudienceDefinition {
+            AudienceDefinition {
+                credential: AudienceCredential {
+                    backend,
+                    placement,
+                    format: CredentialFormat::Bearer,
+                    source: (backend == B::Secret).then(|| {
+                        CredentialSource::SecretRef(SecretRef {
+                            name: "cred".into(),
+                            token_key: "token".into(),
+                            username_key: None,
+                        })
+                    }),
+                    header: None,
+                    extra_headers: Vec::new(),
+                    refresh: None,
+                },
+                endpoints: vec![endpoint.into()],
+                rules: vec![mediatore_policy::types::EndpointRule {
+                    method: "GET".into(),
+                    path: "/**".into(),
+                }],
+                max_ttl_seconds: 120,
+                ca_ref: None,
+            }
+        }
+
+        struct Rig {
+            st: Shared,
+            reflector: AudienceReflector,
+            cache: Arc<CredentialCache>,
+            table: Table,
+        }
+
+        impl Rig {
+            /// A catalog whose namespaces have all completed their first list.
+            fn new() -> Self {
+                let rig = Self::unlisted();
+                for ns in [PLATFORM, "team-a", "team-b"] {
+                    rig.reflector
+                        .resynced(ns, &std::collections::HashSet::new());
+                }
+                rig
+            }
+
+            /// A catalog whose namespaces have not been listed yet: a broker just started.
+            fn unlisted() -> Self {
+                let keys = signed_audience(
+                    Timestamp::now(),
+                    1,
+                    PLATFORM,
+                    "x",
+                    def(B::None, P::Proxy, "x.example.com:443"),
+                )
+                .keys;
+                let reflector = AudienceReflector::new(
+                    mediatore_store::MemoryStore::shared(),
+                    keys,
+                    PLATFORM.into(),
+                    vec![PLATFORM.into(), "team-a".into(), "team-b".into()],
+                );
+                let cache = Arc::new(CredentialCache::new(SignedDuration::from_secs(60)));
+                let mut st = base_state();
+                st.audience_catalog = Some(AudienceCatalogSource {
+                    live: reflector.live(),
+                    credentials: cache.clone(),
+                });
+                Self {
+                    st: Arc::new(st),
+                    reflector,
+                    cache,
+                    table: Table::default(),
+                }
+            }
+
+            async fn define(&self, ns: &str, name: &str, d: AudienceDefinition) {
+                let a = signed_audience(Timestamp::now(), 1, ns, name, d);
+                let out = self
+                    .reflector
+                    .applied(&audience_configmap(ns, name, &a.envelope))
+                    .await;
+                assert!(
+                    matches!(
+                        out,
+                        mediatore_claims::audience::AudienceOutcome::Admitted { .. }
+                    ),
+                    "{out:?}"
+                );
+            }
+
+            async fn refresh(&self) {
+                self.cache
+                    .refresh(
+                        &self.reflector.live().snapshot(),
+                        &self.table,
+                        Timestamp::now(),
+                    )
+                    .await;
+            }
+        }
+
+        #[tokio::test]
+        async fn a_team_audience_serves_its_own_namespace_and_is_unknown_from_another() {
+            let rig = Rig::new();
+            rig.define(
+                "team-a",
+                "registry",
+                def(B::Secret, P::Proxy, "r.team-a.example:443"),
+            )
+            .await;
+            rig.table.set("team-a", "cred", "team-a-token");
+            rig.refresh().await;
+
+            let mine = stored(&rig.st, claim_in("team-a", &["registry"], None)).await;
+            let (status, body, _) = token_for(&rig.st, &mine, "registry").await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["access_token"], "team-a-token");
+
+            let theirs = stored(&rig.st, claim_in("team-b", &["registry"], None)).await;
+            let (status, body, text) = token_for(&rig.st, &theirs, "registry").await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(code(&body), "unknown_audience");
+            assert!(!text.contains("team-a-token"));
+            assert!(!rig.st.view("team-b").usable("registry"));
+            assert!(rig.st.view("team-a").usable("registry"));
+        }
+
+        #[tokio::test]
+        async fn a_platform_audience_serves_every_namespace_with_its_ttl_cap() {
+            let rig = Rig::new();
+            rig.define(
+                PLATFORM,
+                "shared",
+                def(B::Secret, P::Proxy, "shared.example:443"),
+            )
+            .await;
+            rig.table.set(PLATFORM, "cred", "platform-token");
+            rig.refresh().await;
+            for ns in ["team-a", "team-b"] {
+                let rec = stored(&rig.st, claim_in(ns, &["shared"], None)).await;
+                let (status, body, _) = token_for(&rig.st, &rec, "shared").await;
+                assert_eq!(status, StatusCode::OK, "{ns}: {body}");
+                assert_eq!(body["access_token"], "platform-token");
+                let expires: Timestamp = body["expires_at"].as_str().unwrap().parse().unwrap();
+                assert!(
+                    expires <= Timestamp::now() + SignedDuration::from_secs(121),
+                    "maxTtlSeconds caps the credential: {expires}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn a_credential_not_read_is_a_503_and_a_rotation_is_served_next() {
+            let rig = Rig::new();
+            rig.define(
+                "team-a",
+                "registry",
+                def(B::Secret, P::Proxy, "r.example:443"),
+            )
+            .await;
+            let rec = stored(&rig.st, claim_in("team-a", &["registry"], None)).await;
+            let (status, body, _) = token_for(&rig.st, &rec, "registry").await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+            assert_eq!(code(&body), "credential_unavailable");
+
+            rig.table.set("team-a", "cred", "v1");
+            rig.refresh().await;
+            assert_eq!(
+                token_for(&rig.st, &rec, "registry").await.1["access_token"],
+                "v1"
+            );
+            rig.table.set("team-a", "cred", "v2");
+            rig.refresh().await;
+            // The proxy's bucket allows one a minute per claim: a fresh claim asks again.
+            let again = stored(&rig.st, claim_in("team-a", &["registry"], None)).await;
+            assert_eq!(
+                token_for(&rig.st, &again, "registry").await.1["access_token"],
+                "v2"
+            );
+            // A source that stops answering keeps the last value within the window.
+            rig.table.clear();
+            rig.refresh().await;
+            let third = stored(&rig.st, claim_in("team-a", &["registry"], None)).await;
+            assert_eq!(
+                token_for(&rig.st, &third, "registry").await.1["access_token"],
+                "v2"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_gateway_placed_team_audience_is_placed_for_its_namespaces_claims_only() {
+            let rig = Rig::new();
+            rig.define(
+                "team-a",
+                "git",
+                def(B::Secret, P::Gateway, "git.team-a.example:443"),
+            )
+            .await;
+            rig.table.set("team-a", "cred", "git-token");
+            rig.refresh().await;
+
+            let mine = stored(&rig.st, claim_in("team-a", &["git"], None)).await;
+            let answer = gateway_answer(&rig.st, mine.uid).await;
+            assert_eq!(answer.inject.len(), 1);
+            assert_eq!(answer.inject[0].endpoint.host, "git.team-a.example");
+            let (status, body, _) = ask(&rig.st, mine.uid, Some(&gateway_peer()), "git").await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["value"], "Bearer git-token");
+            // The pool VM never gets it.
+            let (status, body, _) = token_for(&rig.st, &mine, "git").await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+            let theirs = stored(&rig.st, claim_in("team-b", &["git"], None)).await;
+            assert_eq!(gateway_answer(&rig.st, theirs.uid).await.inject, vec![]);
+            let (status, body, text) = ask(&rig.st, theirs.uid, Some(&gateway_peer()), "git").await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert!(!text.contains("git-token"));
+        }
+
+        #[tokio::test]
+        async fn until_the_namespaces_are_listed_the_answer_is_a_503_not_a_refusal() {
+            let rig = Rig::unlisted();
+            let rec = stored(&rig.st, claim_in("team-a", &["registry"], None)).await;
+            let (status, body, _) = token_for(&rig.st, &rec, "registry").await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+            assert_eq!(code(&body), "audiences_not_synced");
+            let (status, body, _) = ask(&rig.st, rec.uid, Some(&gateway_peer()), "registry").await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+            let (status, body, _) = call(
+                &rig.st,
+                "GET",
+                &format!("/v1/gateway/claims/{}", rec.uid),
+                Some(&gateway_peer()),
+                serde_json::Value::Null,
+            )
+            .await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        }
+
+        #[tokio::test]
+        async fn a_team_audience_with_a_platform_name_breaks_it_in_that_namespace_only() {
+            let rig = Rig::new();
+            rig.define(
+                PLATFORM,
+                "shared",
+                def(B::None, P::Proxy, "shared.example:443"),
+            )
+            .await;
+            rig.define(
+                "team-a",
+                "shared",
+                def(B::None, P::Proxy, "mine.example:443"),
+            )
+            .await;
+            assert!(!rig.st.view("team-a").usable("shared"));
+            assert!(rig.st.view("team-b").usable("shared"));
+        }
+
+        #[tokio::test]
+        async fn a_withdrawn_definition_is_gone_at_the_next_ask() {
+            let rig = Rig::new();
+            rig.define("team-a", "open", def(B::None, P::Proxy, "o.example:443"))
+                .await;
+            let rec = stored(&rig.st, claim_in("team-a", &["open"], None)).await;
+            assert_eq!(gateway_answer(&rig.st, rec.uid).await.egress.len(), 1);
+            let cm = audience_configmap(
+                "team-a",
+                "open",
+                &signed_audience(
+                    Timestamp::now(),
+                    1,
+                    "team-a",
+                    "open",
+                    def(B::None, P::Proxy, "o.example:443"),
+                )
+                .envelope,
+            );
+            assert!(rig.reflector.deleted(&cm));
+            assert_eq!(gateway_answer(&rig.st, rec.uid).await.egress, vec![]);
+        }
     }
 }

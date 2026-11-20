@@ -71,8 +71,11 @@ This ADR is how the broker reads it.
    credentials form an immutable snapshot, an `AudienceCatalog`
    (`crates/mediatore-claims/src/audience.rs`), swapped atomically when a bundle is admitted,
    replaced, expires or is withdrawn, or when a credential changes. It replaces the per-audience
-   maps on `AppState` and `WatcherConfig.audiences`. Every reader takes one snapshot per request
-   and asks `catalog.resolve(namespace, name)`: a team audience of that name in that namespace,
+   maps on `AppState` and `WatcherConfig.audiences` under `bundles` (built as `AppState::view`,
+   an `AudienceView` of one namespace, and `WatcherConfig.catalog`). Every decision reads the
+   snapshot current when it is made; two decisions in one request may read two snapshots, each a
+   whole verified state, so a definition withdrawn between them is refused or skipped by the
+   later one, never assumed present. Every reader asks `catalog.resolve(namespace, name)`: a team audience of that name in that namespace,
    else a platform audience of that name, else none. Both present is a refusal, never resolved by
    order, and logged with the two namespaces. notaio refuses the newcomer of a collision on a name
    or an endpoint (`L024`, `L025`: the object with no published bundle yet, both if neither), so a
@@ -148,6 +151,16 @@ This ADR is how the broker reads it.
    its `rules` must sit inside the definition's and an empty list means the definition's (notaio
    `L028` refuses a wider grant; the broker filters what is outside, as `effective_grant` does
    today, so neither side alone is trusted).
+   Until the platform namespace and a claim's own namespace have completed their first list, the
+   catalog cannot say an audience is missing: the API answers `503 audiences_not_synced` and the
+   watcher holds the sandbox, as it does for unread policy bundles (ADR-0054 decision 4).
+
+   Not served yet, and refused at admission with `NotBuilt` rather than served without it: a
+   definition with a `caRef` (no CA ConfigMap is read yet) and an operator-held credential in
+   `basic` format. ADR-0043's check that a sandbox pulling from a gateway-placed registry names
+   that registry's audience is derived from `audiences[]` and is not made under `bundles`; the
+   pull fails later instead.
+
 7. **What a running claim sees.** A change reaches a claim at its next use: its next token, its
    next `GET /v1/me`, the gateway's next ask after its fresh window (ADR-0028). An audience
    withdrawn, expired or no longer resolvable is gone at that point: no token, no route, the

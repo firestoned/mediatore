@@ -165,6 +165,37 @@ impl Harness {
         >,
         policy: Option<mediatore_api::PolicyEgress>,
     ) -> Self {
+        Self::start_all(namespaces, logs, scopes, policy, None).await
+    }
+
+    /// The broker under `policy.audience_definitions.mode: bundles` (ADR-0055): the catalog
+    /// serves and the file's audience maps are empty, as the configuration requires.
+    async fn start_catalog(
+        namespaces: Namespaces,
+        catalog: mediatore_api::AudienceCatalogSource,
+    ) -> Self {
+        Self::start_all(
+            namespaces,
+            None,
+            std::collections::BTreeMap::new(),
+            None,
+            Some(catalog),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_lines)] // every AppState field, listed in full
+    async fn start_all(
+        namespaces: Namespaces,
+        logs: Option<LogLimits>,
+        scopes: std::collections::BTreeMap<
+            String,
+            std::collections::BTreeMap<String, Vec<mediatore_proto::EndpointRule>>,
+        >,
+        policy: Option<mediatore_api::PolicyEgress>,
+        catalog: Option<mediatore_api::AudienceCatalogSource>,
+    ) -> Self {
+        let file = catalog.is_none();
         let idp = FakeIdp::start().await;
         let sts = Sts::new(
             "https://mediatore.test",
@@ -176,6 +207,7 @@ impl Harness {
         let state = Arc::new(AppState {
             inject: std::collections::BTreeMap::new(),
             inject_port: None,
+            audience_catalog: catalog,
             logs,
             log_limiter: Limiter::per_second(2),
             log_wakes: mediatore_api::LogWakes::default(),
@@ -200,14 +232,30 @@ impl Harness {
                 groups_claim: None,
             }]),
             sts: Some(sts),
-            audiences: vec![AUDIENCE.into(), DELEGATED.into()],
+            audiences: if file {
+                vec![AUDIENCE.into(), DELEGATED.into()]
+            } else {
+                vec![]
+            },
             obo_audiences: vec![],
-            egress: egress_map(),
-            rules: rules_map(),
+            egress: if file {
+                egress_map()
+            } else {
+                std::collections::BTreeMap::new()
+            },
+            rules: if file {
+                rules_map()
+            } else {
+                std::collections::BTreeMap::new()
+            },
             cas: std::collections::BTreeMap::new(),
             no_credential: std::collections::BTreeSet::new(),
             secrets: std::collections::BTreeMap::new(),
-            delegated: delegated_map(),
+            delegated: if file {
+                delegated_map()
+            } else {
+                std::collections::BTreeMap::new()
+            },
             registries: [(
                 "registry.internal:5000".to_owned(),
                 mediatore_proto::RegistryCredential {
@@ -2360,4 +2408,111 @@ async fn in_shadow_a_claim_with_no_policy_is_created_as_before() {
         .create_body(&token, claim_body(AUDIENCE, None, 3600))
         .await;
     assert_eq!(ok.status(), 201, "shadow refuses nothing");
+}
+
+// ----- ADR-0055: audiences from signed SandboxAudience bundles, over real listeners ----------------
+
+const PLATFORM: &str = "sandbox-platform";
+
+fn audience_definition(endpoint: &str) -> mediatore_policy::types::AudienceDefinition {
+    use mediatore_policy::types::{
+        AudienceCredential, AudienceDefinition, Backend as B, CredentialFormat, Placement,
+    };
+    AudienceDefinition {
+        credential: AudienceCredential {
+            // `none`: a team audience may not mint with the platform's keys (L022).
+            backend: B::None,
+            placement: Placement::Proxy,
+            format: CredentialFormat::Bearer,
+            source: None,
+            header: None,
+            extra_headers: Vec::new(),
+            refresh: None,
+        },
+        endpoints: vec![endpoint.into()],
+        rules: Vec::new(),
+        max_ttl_seconds: 300,
+        ca_ref: None,
+    }
+}
+
+/// A catalog listed in every namespace, holding `team.test` in team-a and `shared.test` in the
+/// platform namespace, both reached without a credential.
+async fn two_namespace_catalog() -> mediatore_api::AudienceCatalogSource {
+    let now = jiff::Timestamp::now();
+    let team = mediatore_testkit::policy::signed_audience(
+        now,
+        1,
+        "team-a",
+        "team.test",
+        audience_definition("team.home.example:443"),
+    );
+    let shared = mediatore_testkit::policy::signed_audience(
+        now,
+        1,
+        PLATFORM,
+        "shared.test",
+        audience_definition("shared.home.example:443"),
+    );
+    // The testkit signs every bundle under one key; a third signing hands over its keys.
+    let keys = mediatore_testkit::policy::signed_audience(
+        now,
+        1,
+        PLATFORM,
+        "keys.test",
+        audience_definition("keys.home.example:443"),
+    )
+    .keys;
+    let reflector = mediatore_claims::audience::AudienceReflector::new(
+        MemoryStore::shared(),
+        keys,
+        PLATFORM.into(),
+        vec![PLATFORM.into(), "infra".into(), "team-a".into()],
+    );
+    for ns in [PLATFORM, "infra", "team-a"] {
+        reflector.resynced(ns, &std::collections::HashSet::new());
+    }
+    for (ns, name, a) in [
+        ("team-a", "team.test", &team),
+        (PLATFORM, "shared.test", &shared),
+    ] {
+        let cm = mediatore_testkit::policy::audience_configmap(ns, name, &a.envelope);
+        assert!(matches!(
+            reflector.applied(&cm).await,
+            mediatore_claims::audience::AudienceOutcome::Admitted { .. }
+        ));
+    }
+    mediatore_api::AudienceCatalogSource {
+        live: reflector.live(),
+        credentials: Arc::new(mediatore_claims::credential::CredentialCache::new(
+            SignedDuration::from_secs(60),
+        )),
+    }
+}
+
+#[tokio::test]
+async fn a_team_audience_is_claimed_in_its_namespace_and_unknown_from_another() {
+    let h = Harness::start_catalog(tenant_map(), two_namespace_catalog().await).await;
+    let tenant = h.login_in("octocat", &[TEAM_A_GROUP]);
+    let admin = h.login_in("hexley", &[ADMIN_GROUP]);
+
+    let ok = h.create_naming(&tenant, "team-a", "team.test").await;
+    assert_eq!(ok.status(), 201, "a team audience in its own namespace");
+
+    // From infra, the team audience reads exactly as one that exists nowhere.
+    let (status, hidden) = refusal(h.create_naming(&admin, "infra", "team.test").await).await;
+    let (missing_status, missing) =
+        refusal(h.create_naming(&admin, "infra", "nonexistent.test").await).await;
+    assert_eq!((status, missing_status), (400, 400));
+    assert_eq!(hidden.error, "unknown_audience");
+    assert_eq!(hidden.error, missing.error);
+
+    // The platform audience serves both namespaces.
+    for (token, ns) in [(&tenant, "team-a"), (&admin, "infra")] {
+        let created = h.create_naming(token, ns, "shared.test").await;
+        assert_eq!(created.status(), 201, "{ns}");
+    }
+    // The file's audiences are gone under bundles.
+    let (status, body) = refusal(h.create_naming(&admin, "infra", AUDIENCE).await).await;
+    assert_eq!((status, body.error.as_str()), (400, "unknown_audience"));
 }

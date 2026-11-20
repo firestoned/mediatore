@@ -730,10 +730,11 @@ impl Watcher {
         if spec.ttl_seconds == 0 {
             return Some("ttlSeconds must be positive".into());
         }
-        if let Some(a) = spec.audiences.iter().find(|a| {
-            !self.cfg.audiences.iter().any(|c| &c.name == *a)
-                || !self.cfg.scope_allows(a, namespace)
-        }) {
+        if let Some(a) = spec
+            .audiences
+            .iter()
+            .find(|a| !self.cfg.usable(a, namespace))
+        {
             // An audience this namespace may not use reads exactly as one that does not exist
             // (ADR-0053 decision 4).
             return Some(format!("audience {a} is not configured"));
@@ -918,6 +919,10 @@ impl Watcher {
         }
         let namespace = sb.namespace().unwrap_or_default();
         if self.awaiting_bundles(&sb.name_any(), &namespace) {
+            return Ok(Some(Action::requeue(self.cfg.requeue)));
+        }
+        if self.cfg.audiences_unread(&namespace) {
+            tracing::info!(sandbox = %sb.name_any(), %namespace, "audience definitions not all read yet; holding the sandbox (ADR-0055)");
             return Ok(Some(Action::requeue(self.cfg.requeue)));
         }
         let Some(reason) = self.refuse(&sb.spec, &namespace) else {
@@ -1374,12 +1379,11 @@ impl Watcher {
     /// The first audience of the sandbox served from a delegated credential (ADR-0035)
     /// that the record holds no delegation for.
     fn delegation_missing(&self, sb: &AgentSandbox, record: &ClaimRecord) -> Option<String> {
+        let namespace = sb.namespace().unwrap_or_default();
         sb.spec
             .audiences
             .iter()
-            .find(|a| {
-                self.cfg.delegated_audiences.contains(*a) && !record.delegations.contains_key(*a)
-            })
+            .find(|a| self.cfg.is_delegated(a, &namespace) && !record.delegations.contains_key(*a))
             .cloned()
     }
 

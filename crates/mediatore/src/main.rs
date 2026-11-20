@@ -143,6 +143,7 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
     // reflector's cache (ADR-0030): built first.
     let reflector = bundle_reflector(&cfg, &store, client.is_some())?;
     let audiences = audience_definitions(&cfg, &store, client.as_ref()).await?;
+    let audience_catalog = serving_catalog(&cfg, audiences.as_ref());
     let policy_egress = policy_egress(&cfg, reflector.as_deref());
 
     let state = Arc::new(AppState {
@@ -154,6 +155,7 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
             .map(|a| (a.name.clone(), a.inject_routes()))
             .collect(),
         inject_port: cfg.gateway_inject_port,
+        audience_catalog: audience_catalog.clone(),
         // A workload's output (ADR-0045 decision 11): the ring's cap when `logs.enabled`, else
         // `None` and both routes fail closed with `501`.
         logs: cfg.log_limits(),
@@ -284,11 +286,12 @@ struct AudienceDefinitions {
     reader: Arc<dyn CredentialReader>,
 }
 
-/// The audience reflector and the credential reads (ADR-0055 decisions 1 and 5) under `shadow`:
-/// notaio's audience bundles read beside the file, each comparison logged, each credential read
-/// and the outcome logged; the file still serves. `None` under `config`, and without a cluster.
-/// `bundles` never starts yet (the configuration refuses it). With `openbao` configured the login
-/// happens here, so a wrong URL, CA or role stops the start.
+/// The audience reflector and the credential reads (ADR-0055 decisions 1 and 5). Under `shadow`
+/// notaio's audience bundles are read beside the file, each comparison logged, each credential
+/// read and the outcome logged; the file still serves. Under `bundles` the same catalog and
+/// credentials serve (the caller hands them to the API and the watcher). `None` under `config`,
+/// and without a cluster. With `openbao` configured the login happens here, so a wrong URL, CA or
+/// role stops the start.
 async fn audience_definitions(
     cfg: &Config,
     store: &Arc<dyn ClaimStore>,
@@ -317,8 +320,12 @@ async fn audience_definitions(
         keys,
         defs.platform_namespace.clone(),
         namespaces,
-    )
-    .with_shadow(cfg.audience_shapes());
+    );
+    let reflector = if mode == config::AudienceMode::Shadow {
+        reflector.with_shadow(cfg.audience_shapes())
+    } else {
+        reflector
+    };
     let openbao: Option<Box<dyn CredentialReader>> = match &defs.openbao {
         Some(o) => Some(Box::new(
             mediatore_claims::credential::OpenBaoKv::connect(o).await?,
@@ -339,6 +346,20 @@ async fn audience_definitions(
             openbao,
         }),
     }))
+}
+
+/// ADR-0055 decision 8: under `bundles` the catalog and its credentials serve, in the API and the
+/// watcher; under `config` and `shadow` they do not.
+fn serving_catalog(
+    cfg: &Config,
+    audiences: Option<&AudienceDefinitions>,
+) -> Option<mediatore_api::AudienceCatalogSource> {
+    audiences
+        .filter(|_| cfg.audience_mode() == config::AudienceMode::Bundles)
+        .map(|a| mediatore_api::AudienceCatalogSource {
+            live: a.reflector.live(),
+            credentials: a.credentials.clone(),
+        })
 }
 
 /// The audience reflector and the credential refresh on every replica, until shutdown; nothing
@@ -421,6 +442,8 @@ async fn claim_watcher(
                 .filter(|a| a.via == mediatore_entra::Backend::Delegated)
                 .map(|a| a.name.clone())
                 .collect(),
+            // ADR-0055: under `bundles`, the catalog the API reads, answering for the watcher too.
+            catalog: state.audience_catalog.as_ref().map(|c| c.live.clone()),
             ..WatcherConfig::default()
         },
     );
