@@ -37,6 +37,10 @@ check "the sandbox root and the agent's configuration directory, 0755, in the im
   'test "$(stat -c %a /mnt/sandbox)" = 755 && test "$(stat -c %a /etc/spire)" = 755'
 check "tpm2-tools, for the EK certificate export (banlieue examples/21)" 'command -v tpm2_nvread'
 check "qemu-guest-agent, the libvirt channel for GuestReady (ADR-0019)" 'command -v qemu-ga'
+check "the guest agent's allow-list (R-43): /etc/qemu/qemu-ga.conf names the eight commands the hypervisor side sends, and no exec, file write, password or ssh key command" \
+  'f=/etc/qemu/qemu-ga.conf; test -f $f && grep -qx "\[general\]" $f && test "$(grep -c "^allow-rpcs=" $f)" -eq 1 && l=$(sed -n "s/^allow-rpcs=//p" $f) && for c in guest-sync-delimited guest-sync guest-ping guest-info guest-file-open guest-file-read guest-file-close guest-network-get-interfaces; do printf "%s\n" "$l" | tr "," "\n" | grep -qx "$c" || exit 1; done && test "$(printf "%s\n" "$l" | tr "," "\n" | wc -l)" -eq 8 && ! grep -v "^#" $f | grep -Eq "guest-exec|guest-file-write|guest-set-user-password|guest-ssh-|block-rpcs|blacklist"'
+check "the agent itself reports that allow-list: allow-rpcs is a key this qemu-ga reads, not one it ignores" \
+  'qemu-ga --dump-conf | grep "^allow-rpcs=" | grep -q "guest-file-read" && ! qemu-ga --dump-conf | grep "^allow-rpcs=" | grep -Eq "guest-exec|guest-file-write|guest-set-user-password|guest-ssh-"'
 check "the spire user, in the TPM device group" 'id -nG spire | tr " " "\n" | grep -qx tss'
 check "the four units installed" \
   'test -f /etc/systemd/system/spire-agent.service && test -f /etc/systemd/system/mediatore-guest.service && test -f /etc/systemd/system/mediatore-host-nft.service && test -f /etc/systemd/system/spire-bundle-fetch.service'

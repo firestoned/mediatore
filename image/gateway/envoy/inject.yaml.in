@@ -17,8 +17,10 @@
 #
 # - One listener, on the sandbox address and its own unprivileged port. TLS 1.3, a client certificate
 #   required; the server certificate is the gateway's own SVID and the trust bundle comes over SDS from the
-#   local SPIRE agent (rotated without a restart). A peer is accepted only if its URI SAN is under
-#   spiffe://<td>/banlieue/claim/. HTTP/1.1 only. No CONNECT, no upgrade, no dynamic forward proxy.
+#   local SPIRE agent (rotated without a restart). A peer is accepted only if a URI SAN of its certificate is
+#   under spiffe://<td>/banlieue/claim/ (a SAN matcher; the validator itself is the one the SDS validation
+#   context carries, as in gateway.yaml.in). No session resumption. HTTP/1.1 only. No CONNECT, no upgrade, no
+#   dynamic forward proxy.
 # - The virtual host's domain is the bare exact host (INJECT_DOMAIN: the host alone for port 443, host:port
 #   for any other, since the guest proxy sends Host without a port). strip_any_host_port stays OFF: on default
 #   Envoy a Host that carries a port against a bare domain is a 404 (fail closed), with it on a request for
@@ -51,6 +53,10 @@ static_resources:
             typed_config:
               "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
               require_client_certificate: true
+              # No tickets and no session cache: a resumed session would skip the client certificate's validation
+              # against the bundle as it is now.
+              disable_stateless_session_resumption: true
+              disable_stateful_session_resumption: true
               common_tls_context:
                 tls_params:
                   tls_minimum_protocol_version: TLSv1_3

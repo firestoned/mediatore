@@ -29,5 +29,11 @@ hex.workspace = true
 mediatore-openbao.workspace = true
 base64.workspace = true
 
+[features]
+# The storage contract's shared cases (ADR-0057 decision 6), run by mediatore-claims over the
+# Kubernetes store on its fake API server, and the format 1 envelope the migration tests
+# need. Test builds only: never a feature of a shipped binary.
+test-support = []
+
 [lints]
 workspace = true

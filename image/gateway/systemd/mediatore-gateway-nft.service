@@ -4,8 +4,11 @@
 [Unit]
 Description=The egress gateway's host table (ADR-0027 decision 5, ADR-0028 decision 8)
 # Default-drop input, the sandbox ports admitted with the per-source cap, nothing new on
-# egress, forward dropped. Rendered from the env files and loaded in one transaction
-# before either Envoy starts; a table that does not load means no listener (fail closed).
+# egress, forward dropped, and an output chain keyed on each service user (ADR-0053
+# decision 5): who may open a connection to the broker, to the control plane, to loopback.
+# Rendered from the env files and loaded in one transaction before either Envoy starts; a
+# table that does not load (a user it names missing, a value that is no address) means no
+# listener (fail closed).
 Before=envoy-gateway.service envoy-relay.service mediatore-gateway.service
 ConditionPathExists=|/run/cos/active_mode
 ConditionPathExists=|/run/cos/passive_mode

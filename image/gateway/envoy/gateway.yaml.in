@@ -7,8 +7,15 @@
 # committed as envoy.yaml and checked for drift; /etc/mediatore-gateway/env on a VM, at
 # every start of envoy-gateway.service). No admin block: the admin interface is off. One
 # listener, on the sandbox address: mutual TLS 1.3 with the gateway's own SVID and the
-# trust bundle from the local SPIRE agent over SDS (rotated without a restart), the SPIFFE
-# validator refusing any peer not under spiffe://<td>/banlieue/claim/, CONNECT only. Each
+# trust bundle from the local SPIRE agent over SDS (rotated without a restart), a URI SAN
+# matcher refusing any peer with no SAN under spiffe://<td>/banlieue/claim/, no session
+# resumption (every connection is a full handshake against the current bundle), CONNECT
+# only. This file names no certificate validator: the bundle is the SDS validation context
+# spiffe://<td>, and the validator is whichever one that secret carries (the agent's sds
+# settings decide between Envoy's SPIFFE validator and its default one), combined with the
+# matcher here. The matcher passes on any URI SAN while Envoy reports the first as the
+# peer's identity, so "one URI SAN per certificate" is the issuing CA's property (SPIRE puts
+# one in an SVID) unless the SPIFFE validator is the one in force. Each
 # CONNECT is checked with the authorizer beside Envoy, mediatore gateway, with Envoy's own
 # Check call over gRPC on loopback (ext_authz with grpc_service): the check carries the
 # peer's identity from its verified certificate, the method and the authority, nothing the
@@ -32,6 +39,10 @@ static_resources:
             typed_config:
               "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
               require_client_certificate: true
+              # No tickets and no session cache: a resumed session would skip the client
+              # certificate's validation against the bundle as it is now.
+              disable_stateless_session_resumption: true
+              disable_stateful_session_resumption: true
               common_tls_context:
                 tls_params:
                   tls_minimum_protocol_version: TLSv1_3

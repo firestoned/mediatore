@@ -273,6 +273,10 @@ pub struct AgentSandboxStatus {
 /// The condition type the shadow comparison writes.
 pub const POLICY_CONFORMANT: &str = "PolicyConformant";
 
+/// The reason code of a sandbox failed because its `status.record` names another sandbox
+/// (ADR-0057 decision 7). The code leads `status.reason`, as `delegation_required` does.
+pub const RECORD_NOT_OWN: &str = "record_not_own";
+
 impl From<&SandboxSubject> for Subject {
     fn from(s: &SandboxSubject) -> Self {
         Self {
@@ -581,6 +585,7 @@ pub fn record_for(
         report: None,
         exit: None,
         delegations: std::collections::BTreeMap::new(),
+        version: None,
     }
 }
 
@@ -729,26 +734,8 @@ impl Watcher {
             return Ok(Action::await_change());
         }
         let current = sb.status.clone().unwrap_or_default();
-        // Refused before any claim exists, and only then: once a claim was created the
-        // request was accepted under the configuration of that moment, and a later config
-        // change must not flap a bound sandbox between Failed and its mirrored status.
-        if current.claim_ref.is_none()
-            && let Some(reason) = self.refuse(&sb.spec)
-        {
-            tracing::warn!(sandbox = %name, %namespace, %reason, "sandbox refused; no claim created");
-            self.drop_session(sb).await?;
-            self.mirror(
-                sb,
-                AgentSandboxStatus {
-                    phase: SandboxPhase::Failed,
-                    reason: Some(reason),
-                    observed_generation: sb.metadata.generation,
-                    conditions: self.conditions(sb, &current.conditions),
-                    ..AgentSandboxStatus::default()
-                },
-            )
-            .await?;
-            return Ok(Action::await_change());
+        if let Some(refused) = self.refuse_before_the_claim(sb, &current).await? {
+            return Ok(refused);
         }
         let claim = match self.claims.get_claim(&namespace, &name).await? {
             Some(claim) if owned_by(&claim, sb) => claim,
@@ -822,6 +809,111 @@ impl Watcher {
         } else {
             Ok(Action::await_change())
         }
+    }
+
+    /// The refusals that come before the claim is looked at: a record that is not the
+    /// sandbox's own ([`Self::refuse_foreign_record`]), then a spec this broker does not serve
+    /// ([`Self::refuse`]). `Some` is the pass's answer.
+    async fn refuse_before_the_claim(
+        &self,
+        sb: &AgentSandbox,
+        current: &AgentSandboxStatus,
+    ) -> Result<Option<Action>, WatchError> {
+        if let Some(refused) = self.refuse_foreign_record(sb, current).await? {
+            return Ok(Some(refused));
+        }
+        // Refused before any claim exists, and only then: once a claim was created the
+        // request was accepted under the configuration of that moment, and a later config
+        // change must not flap a bound sandbox between Failed and its mirrored status.
+        if current.claim_ref.is_some() {
+            return Ok(None);
+        }
+        let Some(reason) = self.refuse(&sb.spec) else {
+            return Ok(None);
+        };
+        tracing::warn!(sandbox = %sb.name_any(), namespace = %sb.namespace().unwrap_or_default(), %reason, "sandbox refused; no claim created");
+        self.drop_session(sb).await?;
+        self.mirror(
+            sb,
+            AgentSandboxStatus {
+                phase: SandboxPhase::Failed,
+                reason: Some(reason),
+                observed_generation: sb.metadata.generation,
+                conditions: self.conditions(sb, &current.conditions),
+                ..AgentSandboxStatus::default()
+            },
+        )
+        .await?;
+        Ok(Some(Action::await_change()))
+    }
+
+    /// ADR-0057 decision 7: a sandbox whose `status.record` names another sandbox (a status
+    /// carried onto this object by a restore or a copied manifest), or only half of one, has
+    /// no record and gets none. The store would refuse the write with a `Conflict` on every
+    /// pass, so the refusal is made here, before anything is consumed: no record is written,
+    /// the parked session is not taken, the owned claim is deleted if there is one, and the
+    /// sandbox is `Failed`. Settled after that: a pass that finds no claim deletes nothing
+    /// and patches nothing. A record from before the ADR (neither field) and the sandbox's
+    /// own are not refused.
+    async fn refuse_foreign_record(
+        &self,
+        sb: &AgentSandbox,
+        current: &AgentSandboxStatus,
+    ) -> Result<Option<Action>, WatchError> {
+        if !crate::kubestore::carries_foreign_record(sb) {
+            return Ok(None);
+        }
+        let name = sb.name_any();
+        let namespace = sb.namespace().unwrap_or_default();
+        let reason = format!(
+            "{RECORD_NOT_OWN}: status.record names another sandbox (ADR-0057 decision 7); no record is written for this one and its claim is deleted, never recreated"
+        );
+        // Said once: the status patch below raises the event of the next pass.
+        if current.phase != SandboxPhase::Failed || current.reason.as_ref() != Some(&reason) {
+            tracing::warn!(
+                sandbox = %name,
+                %namespace,
+                sandbox_uid = sb.metadata.uid.as_deref().unwrap_or("-"),
+                record_sandbox_uid = current
+                    .record
+                    .as_ref()
+                    .and_then(|r| r.sandbox_uid.as_deref())
+                    .unwrap_or("-"),
+                "sandbox refused: its status.record names another sandbox; no record written, no session taken"
+            );
+        }
+        // The claim stays named once it was seen, so that a status later rid of the foreign
+        // record meets "claim gone" and never a second VM.
+        let mut claim_ref = current.claim_ref.clone();
+        if let Some(claim) = self.claims.get_claim(&namespace, &name).await?
+            && owned_by(&claim, sb)
+        {
+            // One held by banlieue's finalizer is already going: deleted once.
+            if claim.metadata.deletion_timestamp.is_none() {
+                self.claims.delete_claim(&namespace, &name).await?;
+                tracing::info!(sandbox = %name, %namespace, "claim of a sandbox whose record is not its own deleted");
+            }
+            if claim_ref.is_none() {
+                claim_ref = Some(LocalObjectReference {
+                    name: claim.name_any(),
+                });
+            }
+        }
+        self.mirror(
+            sb,
+            AgentSandboxStatus {
+                phase: SandboxPhase::Failed,
+                claim_ref,
+                entry_set: false,
+                ready: false,
+                reason: Some(reason),
+                observed_generation: sb.metadata.generation,
+                conditions: self.conditions(sb, &current.conditions),
+                ..current.clone()
+            },
+        )
+        .await?;
+        Ok(Some(Action::await_change()))
     }
 
     /// The verified bundle of the policy `sb` names, if it names one and the cache holds one
@@ -1296,6 +1388,7 @@ mod tests {
                 key_id: "k".into(),
                 nonce: vec![0; 12],
                 ciphertext: vec![1, 2, 3],
+                format: mediatore_store::seal::FORMAT_SLOT,
             },
             created_at: Timestamp::now(),
             audience: None,
@@ -1403,6 +1496,324 @@ mod tests {
             .await
             .unwrap();
         assert!(rec.delegations.contains_key("api.example"));
+    }
+
+    const OTHER_UID: &str = "1b2c3d4e-5f60-4718-892a-3b4c5d6e7f80";
+
+    /// A `status.record` for claim `claim_uid` naming `sandbox_uid` in `namespace`, as the
+    /// store writes one.
+    fn record_naming(
+        claim_uid: Uuid,
+        sandbox_uid: Option<&str>,
+        namespace: Option<&str>,
+    ) -> crate::kubestore::RecordStatus {
+        serde_json::from_value(json!({
+            "claimUid": claim_uid.to_string(),
+            "sandboxUid": sandbox_uid,
+            "namespace": namespace,
+            "createdAt": "2026-10-14T10:00:00Z",
+        }))
+        .expect("a record status")
+    }
+
+    /// `sb-1`, finalized, with `record` on its status and nothing else: what a restore or a
+    /// copied manifest leaves on a new object.
+    fn sandbox_carrying(record: crate::kubestore::RecordStatus) -> AgentSandbox {
+        let mut sb = sandbox(true, false);
+        sb.status = Some(AgentSandboxStatus {
+            record: Some(record),
+            ..AgentSandboxStatus::default()
+        });
+        sb
+    }
+
+    /// `sb` as the fake holds it now, with `record` on its status again. The fake's status
+    /// patch replaces the whole status, where the API server's merge patch keeps the record
+    /// the mirror leaves out of it.
+    fn held_with_record(
+        r: &Rig,
+        sb: &AgentSandbox,
+        record: crate::kubestore::RecordStatus,
+    ) -> AgentSandbox {
+        let mut held = r
+            .claims
+            .sandbox("sandboxes", &sb.name_any())
+            .expect("the sandbox is in the fake");
+        held.status.get_or_insert_default().record = Some(record);
+        r.claims.put_sandbox(held.clone());
+        held
+    }
+
+    /// The other sandbox, `sb-2`, settled on `r` up to a bound claim with its entry set.
+    /// Returns its claim's UID.
+    async fn a_bound_other_sandbox(r: &Rig) -> Uuid {
+        let mut other = sandbox(true, false);
+        other.metadata.name = Some("sb-2".into());
+        other.metadata.uid = Some(OTHER_UID.into());
+        r.claims.put_sandbox(other.clone());
+        r.watcher.reconcile_sandbox(&other).await.unwrap();
+        r.claims.patch_claim_status(
+            "sandboxes",
+            "sb-2",
+            &json!({ "phase": "Bound", "tpmEndorsementCertificates": [RSA_EK_PEM] }),
+        );
+        r.store.put_node(node(RSA_EK_HASH, false)).await.unwrap();
+        let claim = r.claims.claim("sandboxes", "sb-2").expect("claim created");
+        let uid = claim_uid_of(&claim).unwrap();
+        r.watcher.reconcile_claim(&claim).await.unwrap();
+        assert_eq!(r.entries.names(), vec![claim_entry_name(uid)]);
+        uid
+    }
+
+    /// The claim `sb` owns, as banlieue holds one that was created for it.
+    fn owned_claim(sb: &AgentSandbox) -> VirtualMachineClaim {
+        let mut claim = claim_for(sb).unwrap();
+        claim.metadata.uid = Some(Uuid::new_v4().to_string());
+        claim
+    }
+
+    /// What every refusal over a record that is not the sandbox's own leaves behind.
+    async fn assert_failed_over_a_foreign_record(r: &Rig, records_before: usize) {
+        let st = r
+            .claims
+            .sandbox("sandboxes", "sb-1")
+            .unwrap()
+            .status
+            .unwrap();
+        assert_eq!(st.phase, SandboxPhase::Failed);
+        assert!(!st.ready && !st.entry_set);
+        assert!(
+            st.reason
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with(RECORD_NOT_OWN),
+            "{:?}",
+            st.reason
+        );
+        assert_eq!(st.observed_generation, Some(1));
+        assert!(
+            r.claims.claim("sandboxes", "sb-1").is_none(),
+            "the owned claim is deleted"
+        );
+        assert_eq!(
+            r.store.list_claims().await.unwrap().len(),
+            records_before,
+            "no record is written"
+        );
+        let parked = r
+            .store
+            .take_session(Uuid::parse_str(SB_UID).unwrap())
+            .await
+            .unwrap()
+            .is_some();
+        assert!(parked, "the parked session is not taken");
+    }
+
+    #[tokio::test]
+    async fn a_sandbox_whose_record_names_another_sandbox_is_failed_and_its_claim_deleted() {
+        let r = rig(cfg());
+        let other_claim = a_bound_other_sandbox(&r).await;
+        r.store.put_session(parked_session()).await.unwrap();
+        // The other sandbox's status, carried onto this object.
+        let sb = sandbox_carrying(record_naming(
+            other_claim,
+            Some(OTHER_UID),
+            Some("sandboxes"),
+        ));
+        r.claims.put_sandbox(sb.clone());
+        r.claims.put_claim(owned_claim(&sb));
+
+        assert_eq!(
+            r.watcher.reconcile_sandbox(&sb).await.unwrap(),
+            Action::await_change()
+        );
+        assert_eq!(
+            r.claims.deleted(),
+            vec![("sandboxes".to_owned(), "sb-1".to_owned())]
+        );
+        let st = r
+            .claims
+            .sandbox("sandboxes", "sb-1")
+            .unwrap()
+            .status
+            .unwrap();
+        assert_eq!(
+            st.claim_ref.as_ref().map(|c| c.name.as_str()),
+            Some("sb-1"),
+            "the deleted claim stays named: never a second one"
+        );
+        assert_failed_over_a_foreign_record(&r, 1).await;
+        // The other sandbox keeps what is its own.
+        let rec = r.store.get_claim(other_claim).await.unwrap();
+        assert!(
+            rec.revoked_at.is_none() && rec.entry_id.is_some(),
+            "the other sandbox's record is untouched"
+        );
+        assert_eq!(
+            r.entries.names(),
+            vec![claim_entry_name(other_claim)],
+            "its entry is not retracted"
+        );
+        assert!(
+            r.claims.claim("sandboxes", "sb-2").is_some(),
+            "its claim is not deleted"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sandbox_with_a_foreign_record_and_no_claim_is_failed_and_gets_none() {
+        let r = rig(cfg());
+        r.store.put_session(parked_session()).await.unwrap();
+        let sb = sandbox_carrying(record_naming(
+            Uuid::new_v4(),
+            Some(OTHER_UID),
+            Some("sandboxes"),
+        ));
+        r.claims.put_sandbox(sb.clone());
+        assert_eq!(
+            r.watcher.reconcile_sandbox(&sb).await.unwrap(),
+            Action::await_change()
+        );
+        assert!(r.claims.deleted().is_empty(), "no claim, nothing to delete");
+        assert_failed_over_a_foreign_record(&r, 0).await;
+    }
+
+    #[tokio::test]
+    async fn half_a_binding_is_a_foreign_record_too() {
+        // The sandbox's own UID with no namespace, and its own namespace with no UID: a
+        // missing field is never a match.
+        for (sandbox_uid, namespace) in [(Some(SB_UID), None), (None, Some("sandboxes"))] {
+            let r = rig(cfg());
+            r.store.put_session(parked_session()).await.unwrap();
+            let sb = sandbox_carrying(record_naming(Uuid::new_v4(), sandbox_uid, namespace));
+            r.claims.put_sandbox(sb.clone());
+            r.claims.put_claim(owned_claim(&sb));
+            assert_eq!(
+                r.watcher.reconcile_sandbox(&sb).await.unwrap(),
+                Action::await_change()
+            );
+            assert_eq!(r.claims.deleted().len(), 1, "the owned claim is deleted");
+            assert_failed_over_a_foreign_record(&r, 0).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_record_from_before_the_binding_and_the_sandboxes_own_reconcile_as_before() {
+        // The sandbox's own record, then one written before the ADR: neither field.
+        for (sandbox_uid, namespace) in [(Some(SB_UID), Some("sandboxes")), (None, None)] {
+            let r = rig(cfg());
+            r.store.put_session(parked_session()).await.unwrap();
+            let bare = sandbox(true, false);
+            let claim = owned_claim(&bare);
+            let uid = claim_uid_of(&claim).unwrap();
+            let sb = sandbox_carrying(record_naming(uid, sandbox_uid, namespace));
+            r.claims.put_sandbox(sb.clone());
+            r.claims.put_claim(claim);
+            assert_eq!(
+                r.watcher.reconcile_sandbox(&sb).await.unwrap(),
+                Action::await_change()
+            );
+            let st = r
+                .claims
+                .sandbox("sandboxes", "sb-1")
+                .unwrap()
+                .status
+                .unwrap();
+            assert_eq!(st.phase, SandboxPhase::Pending);
+            assert!(st.reason.is_none(), "{:?}", st.reason);
+            assert!(r.claims.deleted().is_empty(), "the claim is kept");
+            assert!(r.claims.claim("sandboxes", "sb-1").is_some());
+            let rec = r.store.get_claim(uid).await.unwrap();
+            assert_eq!(
+                rec.refresh,
+                Some(parked_session().refresh),
+                "the parked session follows the claim into the record"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_second_pass_over_a_sandbox_failed_for_a_foreign_record_does_nothing() {
+        let r = rig(cfg());
+        r.claims.hold_deleted_claims(true);
+        r.store.put_session(parked_session()).await.unwrap();
+        let foreign = record_naming(Uuid::new_v4(), Some(OTHER_UID), Some("sandboxes"));
+        let sb = sandbox_carrying(foreign.clone());
+        r.claims.put_sandbox(sb.clone());
+        r.claims.put_claim(owned_claim(&sb));
+        assert_eq!(
+            r.watcher.reconcile_sandbox(&sb).await.unwrap(),
+            Action::await_change()
+        );
+        assert_eq!(r.claims.deleted().len(), 1);
+        let patches = r.claims.patches();
+
+        // While banlieue's finalizer holds the claim: not deleted again, nothing patched.
+        let failed = held_with_record(&r, &sb, foreign);
+        assert_eq!(
+            r.watcher.reconcile_sandbox(&failed).await.unwrap(),
+            Action::await_change()
+        );
+        assert_eq!(r.claims.deleted().len(), 1, "the claim is deleted once");
+        assert_eq!(r.claims.patches(), patches, "nothing is patched again");
+
+        // The claim is gone: the same steady state, and no second claim.
+        r.claims.remove_claim("sandboxes", "sb-1");
+        assert_eq!(
+            r.watcher.reconcile_sandbox(&failed).await.unwrap(),
+            Action::await_change()
+        );
+        assert_eq!(r.claims.deleted().len(), 1);
+        assert_eq!(r.claims.patches(), patches);
+        assert_failed_over_a_foreign_record(&r, 0).await;
+    }
+
+    #[tokio::test]
+    async fn deleting_a_sandbox_failed_for_a_foreign_record_releases_nothing() {
+        let r = rig(cfg());
+        let other_claim = a_bound_other_sandbox(&r).await;
+        let foreign = record_naming(other_claim, Some(OTHER_UID), Some("sandboxes"));
+        let mut sb = sandbox_carrying(foreign.clone());
+        // The whole status came along, the other sandbox's claim UID included.
+        if let Some(st) = sb.status.as_mut() {
+            st.claim_uid = Some(other_claim.to_string());
+        }
+        r.claims.put_sandbox(sb.clone());
+        r.claims.put_claim(owned_claim(&sb));
+        r.watcher.reconcile_sandbox(&sb).await.unwrap();
+        assert_eq!(r.claims.deleted().len(), 1);
+
+        let mut deleting = held_with_record(&r, &sb, foreign);
+        assert_eq!(
+            deleting.status.as_ref().map(|s| s.phase),
+            Some(SandboxPhase::Failed)
+        );
+        deleting.metadata.deletion_timestamp = Some(Time(k8s_openapi::jiff::Timestamp::UNIX_EPOCH));
+        r.claims.put_sandbox(deleting.clone());
+        assert_eq!(
+            r.watcher.reconcile_sandbox(&deleting).await.unwrap(),
+            Action::await_change()
+        );
+        assert_eq!(
+            r.claims.sandbox("sandboxes", "sb-1").unwrap().finalizers(),
+            &Vec::<String>::new(),
+            "the finalizer is dropped: no record of its own to hold it for"
+        );
+        let rec = r.store.get_claim(other_claim).await.unwrap();
+        assert!(
+            rec.revoked_at.is_none() && rec.entry_id.is_some(),
+            "the other sandbox's record is not released"
+        );
+        assert_eq!(
+            r.entries.names(),
+            vec![claim_entry_name(other_claim)],
+            "its entry is not retracted"
+        );
+        assert!(
+            r.claims.claim("sandboxes", "sb-2").is_some(),
+            "its claim is not deleted"
+        );
+        assert_eq!(r.claims.deleted().len(), 1, "no further claim deletion");
     }
 
     /// Every `format` in `v` (and under it) the apiserver would drop, as a path.

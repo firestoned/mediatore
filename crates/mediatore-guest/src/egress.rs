@@ -32,7 +32,8 @@
 //! a path that is not canonical (a `.` or `..` segment, an empty one, a backslash, an encoded
 //! dot, slash or backslash: the rules match the path as sent), `403` for a request outside the
 //! audience's rules, `401` for an `Authorization` that is not the phantom (the workload has no credential
-//! of its own this layer carries), `502` when the token or the upstream cannot be had. A
+//! of its own this layer carries) and for any header of [`CREDENTIAL_HEADERS`] that no route
+//! owns, `502` when the token or the upstream cannot be had. A
 //! request with no `Authorization` is forwarded bare; `502` with `gateway_refused` when the
 //! gateway answered the tunnel with the environment's no (the authorizer's code is logged),
 //! `gateway_unreachable` when no gateway carried it. Nothing but the audience, the host,
@@ -370,6 +371,8 @@ pub fn judge<'a>(
 /// [`judge`] over the request's headers: every header the proxy owns (`Authorization` and
 /// each route's `credential_header`, ADR-0032 decision 3) is read on every route; a value
 /// that is not the phantom is `401`, the phantom in any of them is the phantom presented.
+/// A header of [`CREDENTIAL_HEADERS`] that no route owns is `401` as well, whatever its
+/// value, on every kind of route.
 ///
 /// Two refusals come before any route is consulted and hold on every kind of route: a
 /// `TRACE` or a `CONNECT` is `405` (this proxy forwards requests, it opens no tunnel for the
@@ -428,12 +431,76 @@ pub fn judge_headers<'a>(
             }
         }
     }
+    if carries_unowned_credential(headers, routes.owned_headers(), phantom) {
+        return Err(Refusal::new(StatusCode::UNAUTHORIZED, "unknown_credential"));
+    }
     let inject = presented && route.injects();
     Ok(Forward {
         route,
         path_and_query,
         inject,
     })
+}
+
+/// Request headers that carry a credential on widely used APIs, beside the ones the proxy
+/// owns (`Authorization` and each route's `credential_header`, [`Routes::owned_headers`]).
+/// The workload has no credential of its own this layer carries (ADR-0025 decision 3): with
+/// one of these it could act on an allowed host as some other account, which is a way to
+/// move data to an account the policy never named. A request that carries any of them is
+/// `401 unknown_credential` on every kind of route (token, `credential: none`, gateway-placed)
+/// and nothing is forwarded.
+///
+/// Refused, not stripped: that is what an `Authorization` that is not the phantom gets, and
+/// a refusal tells the workload's author that the credential was not used, where a silent
+/// strip would send the request bare and leave an upstream `401` or an anonymous answer to
+/// be explained.
+///
+/// A header a route names as its `credential_header` is not judged here: the proxy owns it
+/// on every route, so [`judge_headers`] has already accepted the phantom in it and refused
+/// anything else (ADR-0032 decision 3).
+///
+/// This list is a floor, not a claim of completeness: an upstream may read a credential
+/// from a header of any name, and from the query string or the body, which this proxy does
+/// not parse (a credential in the query is out of scope here; a route's rules and the
+/// upstream's own authorization are what bound it). Names are lower-case, as
+/// [`HeaderName`] holds every name it parses, so the match is case-insensitive on the wire;
+/// [`HeaderName::from_static`] refuses an upper-case name at compile time.
+pub const CREDENTIAL_HEADERS: [HeaderName; 14] = [
+    header::COOKIE,
+    header::PROXY_AUTHORIZATION,
+    HeaderName::from_static("x-api-key"),
+    HeaderName::from_static("api-key"),
+    HeaderName::from_static("apikey"),
+    HeaderName::from_static("x-auth-token"),
+    HeaderName::from_static("x-access-token"),
+    HeaderName::from_static("x-goog-api-key"),
+    HeaderName::from_static("private-token"),
+    HeaderName::from_static("job-token"),
+    HeaderName::from_static("deploy-token"),
+    HeaderName::from_static("x-amz-security-token"),
+    HeaderName::from_static("x-vault-token"),
+    HeaderName::from_static("ocp-apim-subscription-key"),
+];
+
+/// Whether `headers` carry a credential of the workload's own in one of
+/// [`CREDENTIAL_HEADERS`] that is not among `owned`, the headers the proxy owns and has
+/// judged by their value. The phantom there is not the workload's own: a client that sends
+/// its one key in two headers (an SDK given `MEDIATORE_TOKEN` as its API key) is let through,
+/// and [`rewrite`] drops the header, so the phantom never leaves the VM.
+fn carries_unowned_credential(
+    headers: &http::HeaderMap,
+    owned: &[HeaderName],
+    phantom: &Phantom,
+) -> bool {
+    CREDENTIAL_HEADERS
+        .iter()
+        .filter(|denied| !owned.contains(denied))
+        .any(|denied| {
+            headers
+                .get_all(denied)
+                .iter()
+                .any(|v| !phantom.presented_in(denied, v.as_bytes()))
+        })
 }
 
 /// Headers that belong to one hop and never cross the proxy, either way.
@@ -447,6 +514,28 @@ const HOP_BY_HOP: [HeaderName; 8] = [
     header::TRANSFER_ENCODING,
     header::UPGRADE,
 ];
+
+/// Drop from a request's `headers` what belongs to the hop from the workload: the fixed
+/// [`HOP_BY_HOP`] list, and every header the request's own `Connection` names (RFC 9110
+/// section 7.6.1). Without the second part a workload could mark a header as hop-by-hop
+/// that this proxy forwards and the upstream, or something in front of it, drops or keeps
+/// by a different reading. `close` and `keep-alive` in `Connection` name no header that
+/// outlives this: `Connection` itself goes either way, and the connection to the upstream
+/// is this proxy's own.
+fn strip_hop_by_hop(headers: &mut http::HeaderMap) {
+    let named: Vec<HeaderName> = headers
+        .get_all(header::CONNECTION)
+        .iter()
+        .flat_map(|v| v.as_bytes().split(|b| *b == b','))
+        .filter_map(|option| HeaderName::from_bytes(option.trim_ascii()).ok())
+        .collect();
+    for h in &named {
+        headers.remove(h);
+    }
+    for h in HOP_BY_HOP {
+        headers.remove(&h);
+    }
+}
 
 /// Where tokens come from: the broker over the claim SVID in production, a fake in tests.
 #[async_trait::async_trait]
@@ -893,7 +982,8 @@ impl Proxy {
 
 impl Proxy {
     /// A request on a gateway-placed route (ADR-0040 decision 7). It has been judged: the rules
-    /// held, and any credential header it carried was the phantom (a foreign one is `401`).
+    /// held, and any credential header it carried was the phantom (a foreign one is `401`, as
+    /// is any header of [`CREDENTIAL_HEADERS`] no route owns).
     /// It is sent in origin form, with `Host` the audience's authority and no credential, over
     /// the claim's mutual TLS to a gateway's inject port; the gateway terminates the
     /// audience's TLS and places the credential, so this process never asks for a token and
@@ -976,8 +1066,10 @@ fn log_safe(v: &[u8]) -> String {
 /// The request as a gateway's inject port gets it (ADR-0040 decision 7): what [`rewrite`] makes
 /// with no credential placed (origin-form path, `Host` the audience's authority, hop-by-hop and
 /// every owned header dropped, so the phantom never leaves), and `x-api-key` dropped as well
-/// wherever no route owns it. The gateway's authorizer strips the client credential headers too;
-/// this layer does not wait for it.
+/// wherever no route owns it. Since [`CREDENTIAL_HEADERS`] a request with an `x-api-key` no
+/// route owns is refused before it gets here, so that drop is a second line and not the
+/// control. The gateway's authorizer strips the client credential headers too; this layer does
+/// not wait for it.
 fn rewrite_for_gateway(
     req: Request<Incoming>,
     forward: &Forward<'_>,
@@ -1014,7 +1106,8 @@ async fn send_to_gateway(
 }
 
 /// The request as the upstream gets it: origin-form path, `Host` set to the endpoint,
-/// hop-by-hop headers dropped, every header the proxy owns dropped (the phantom never
+/// hop-by-hop headers dropped, the ones the request's `Connection` names among them
+/// ([`strip_hop_by_hop`]), every header the proxy owns dropped (the phantom never
 /// leaves, ADR-0032 decision 3), and the credential placed where the broker said when one
 /// goes in, with the headers that travel beside it.
 fn rewrite(
@@ -1029,13 +1122,15 @@ fn rewrite(
         .parse()
         .unwrap_or_else(|_| http::Uri::from_static("/"));
     parts.version = http::Version::HTTP_11;
-    for h in HOP_BY_HOP {
-        parts.headers.remove(&h);
-    }
+    strip_hop_by_hop(&mut parts.headers);
     if let Ok(v) = HeaderValue::from_str(&host_header(&forward.route.endpoint)) {
         parts.headers.insert(header::HOST, v);
     }
     for h in owned {
+        parts.headers.remove(h);
+    }
+    // What was let through in a credential header no route owns was the phantom: it stays here.
+    for h in CREDENTIAL_HEADERS {
         parts.headers.remove(h);
     }
     if let Some(p) = placed {
@@ -2842,6 +2937,7 @@ mod tests {
     #[tokio::test]
     async fn an_api_key_header_is_never_sent_to_the_gateway_even_where_no_route_owns_it() {
         // The authorizer strips client credential headers too; the guest does not rely on that.
+        // Since `CREDENTIAL_HEADERS` the request is refused here, not sent without the header.
         let ca = TestCa::new(TD);
         let fake = FakeGateway::start(&ca, Script::Echo).await;
         let h = harness(
@@ -2857,21 +2953,325 @@ mod tests {
         let resp = workload()
             .post(format!("{}/{UPSTREAM}/v1/messages", h.base))
             .bearer_auth(h.phantom.expose())
-            .header("x-api-key", "sk-ant-the-workloads-own")
+            .header("x-api-key", "the-workloads-own")
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            401,
+            "refused beside the phantom, not stripped"
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["error"], "unknown_credential");
+        assert!(
+            fake.seen().is_empty(),
+            "nothing reached the gateway, so the header and its value did not either"
+        );
+        assert_eq!(h.tokens.0.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_header_the_workload_names_in_connection_is_not_sent_to_the_gateway() {
+        let ca = TestCa::new(TD);
+        let fake = FakeGateway::start(&ca, Script::Echo).await;
+        let h = harness(
+            &ca,
+            vec![placed(
+                UPSTREAM,
+                Some(fake.addr.port()),
+                &[("POST", "/v1/messages")],
+            )],
+            vec![gw("127.0.0.1:1")],
+        )
+        .await;
+        let resp = workload()
+            .post(format!("{}/{UPSTREAM}/v1/messages", h.base))
+            .bearer_auth(h.phantom.expose())
+            .header("connection", "close, x-foo")
+            .header("x-foo", "one-hop")
+            .header("x-request-id", "r-1")
             .body("{}")
             .send()
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);
         let seen = fake.seen();
-        assert!(seen[0].header("x-api-key").is_none());
+        assert_eq!(seen.len(), 1);
         assert!(
-            seen[0]
-                .headers
-                .iter()
-                .all(|(_, v)| !v.contains("sk-ant-the-workloads-own")),
-            "the value is nowhere in the request"
+            seen[0].header("x-foo").is_none(),
+            "a header the request's Connection names stays on the workload's hop"
         );
+        assert_eq!(
+            seen[0].header("x-request-id"),
+            Some("r-1"),
+            "a header it does not name crosses"
+        );
+        assert!(
+            seen[0].header("connection").is_none(),
+            "the workload's Connection is not the gateway's"
+        );
+    }
+
+    /// One route of each kind (a token, no credential, placed at the gateway), every rule
+    /// open, and a path on each.
+    fn one_route_of_each_kind() -> (Routes, [&'static str; 3]) {
+        let routes = Routes::new(vec![
+            route("internal-git", "git.home.example:443", &[]),
+            Route {
+                audience: None,
+                credential: Credential::None,
+                ..route("-", "repo.home.example:443", &[])
+            },
+            placed(UPSTREAM, Some(3133), &[]),
+        ])
+        .unwrap();
+        (
+            routes,
+            [
+                "/git.home.example/x",
+                "/repo.home.example/x",
+                "/api.anthropic.example/x",
+            ],
+        )
+    }
+
+    #[test]
+    fn a_credential_header_no_route_owns_is_refused_on_every_kind_of_route() {
+        let (routes, targets) = one_route_of_each_kind();
+        let p = phantom();
+        let bearer = HeaderValue::from_str(&format!("Bearer {}", p.expose())).unwrap();
+        for denied in CREDENTIAL_HEADERS {
+            for path in targets {
+                // Alone, and beside the phantom: the phantom does not vouch for it.
+                let mut alone = http::HeaderMap::new();
+                alone.insert(denied.clone(), HeaderValue::from_static("not-the-phantom"));
+                let mut beside = alone.clone();
+                beside.insert(header::AUTHORIZATION, bearer.clone());
+                // The phantom itself there is not a credential of the workload's own: it is
+                // let through, and `rewrite` drops the header.
+                let mut as_phantom = http::HeaderMap::new();
+                as_phantom.insert(denied.clone(), HeaderValue::from_str(p.expose()).unwrap());
+                let let_through =
+                    judge_headers(&routes, &p, &Method::GET, path, &as_phantom).is_ok();
+                assert!(let_through, "the phantom in {denied} on {path}");
+                for headers in [&alone, &beside] {
+                    assert_eq!(
+                        judge_headers(&routes, &p, &Method::GET, path, headers).unwrap_err(),
+                        Refusal::new(StatusCode::UNAUTHORIZED, "unknown_credential"),
+                        "{denied} on {path}"
+                    );
+                }
+            }
+        }
+        // The headers the item was written for are all on the list.
+        for name in [
+            "cookie",
+            "x-api-key",
+            "private-token",
+            "x-auth-token",
+            "x-goog-api-key",
+            "proxy-authorization",
+        ] {
+            assert!(
+                CREDENTIAL_HEADERS.iter().any(|h| h.as_str() == name),
+                "{name} is on the deny-list"
+            );
+        }
+        // The rules are read first, as for a foreign bearer: outside them is 403.
+        let ruled = Routes::new(vec![route(
+            "internal-git",
+            "git.home.example:443",
+            &[("GET", "/platform/**")],
+        )])
+        .unwrap();
+        let mut cookie = http::HeaderMap::new();
+        cookie.insert(header::COOKIE, HeaderValue::from_static("session=x"));
+        assert_eq!(
+            judge_headers(&ruled, &p, &Method::GET, "/git.home.example/other", &cookie)
+                .unwrap_err(),
+            Refusal::new(StatusCode::FORBIDDEN, "outside_rules")
+        );
+    }
+
+    #[test]
+    fn credential_header_names_are_matched_whatever_their_case() {
+        // `HeaderName` holds every parsed name in lower case, which is how hyper hands the
+        // request's headers over: `PRIVATE-TOKEN` on the wire is `private-token` here.
+        let (routes, targets) = one_route_of_each_kind();
+        let p = phantom();
+        for sent in ["PRIVATE-TOKEN", "Cookie", "X-Api-Key", "X-Goog-Api-Key"] {
+            let name = HeaderName::from_bytes(sent.as_bytes()).unwrap();
+            assert_eq!(name.as_str(), sent.to_ascii_lowercase());
+            let mut headers = http::HeaderMap::new();
+            headers.insert(name, HeaderValue::from_static("not-the-phantom"));
+            for path in targets {
+                assert_eq!(
+                    judge_headers(&routes, &p, &Method::GET, path, &headers)
+                        .unwrap_err()
+                        .status,
+                    StatusCode::UNAUTHORIZED,
+                    "{sent} on {path}"
+                );
+            }
+        }
+        for listed in CREDENTIAL_HEADERS {
+            assert_eq!(
+                listed.as_str(),
+                listed.as_str().to_ascii_lowercase(),
+                "the list is lower-case"
+            );
+        }
+    }
+
+    #[test]
+    fn a_route_that_owns_a_listed_header_takes_the_phantom_there_and_refuses_anything_else() {
+        let key = HeaderName::from_static("x-api-key");
+        let p = phantom();
+        // Owned by a token route (ADR-0032) and, in a second set, by a gateway-placed one.
+        let keyed = Routes::new(vec![
+            Route {
+                credential_header: Some("x-api-key".into()),
+                ..route("keyed", "keyed.example.com:443", &[])
+            },
+            route("internal-git", "git.home.example:443", &[]),
+        ])
+        .unwrap();
+        let at_gateway = Routes::new(vec![Route {
+            credential_header: Some("x-api-key".into()),
+            ..placed(UPSTREAM, Some(3133), &[])
+        }])
+        .unwrap();
+        let mut with_phantom = http::HeaderMap::new();
+        with_phantom.insert(key.clone(), HeaderValue::from_str(p.expose()).unwrap());
+        let mut with_another = http::HeaderMap::new();
+        with_another.insert(key, HeaderValue::from_static("not-the-phantom"));
+        // The phantom there, and a listed header no route owns beside it.
+        let mut with_cookie = with_phantom.clone();
+        with_cookie.insert(header::COOKIE, HeaderValue::from_static("session=x"));
+
+        let f = judge_headers(
+            &keyed,
+            &p,
+            &Method::POST,
+            "/keyed.example.com/v1/x",
+            &with_phantom,
+        )
+        .unwrap();
+        assert!(f.inject, "the phantom where the route's credential goes");
+        let g = judge_headers(
+            &at_gateway,
+            &p,
+            &Method::POST,
+            "/api.anthropic.example/v1/x",
+            &with_phantom,
+        )
+        .unwrap();
+        assert!(
+            g.route.placed_at_gateway() && !g.inject,
+            "accepted on a gateway-placed route that owns the header; the gateway places"
+        );
+        for (set, path) in [
+            (&keyed, "/keyed.example.com/v1/x"),
+            (&keyed, "/git.home.example/x"),
+            (&at_gateway, "/api.anthropic.example/v1/x"),
+        ] {
+            for headers in [&with_another, &with_cookie] {
+                assert_eq!(
+                    judge_headers(set, &p, &Method::POST, path, headers).unwrap_err(),
+                    Refusal::new(StatusCode::UNAUTHORIZED, "unknown_credential"),
+                    "{path}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_headers_pass_on_every_kind_of_route() {
+        let (routes, targets) = one_route_of_each_kind();
+        let p = phantom();
+        let mut headers = http::HeaderMap::new();
+        for (name, value) in [
+            ("accept", "application/json"),
+            ("content-type", "application/json"),
+            ("user-agent", "agent/1"),
+            ("x-request-id", "r-1"),
+        ] {
+            headers.insert(
+                HeaderName::from_static(name),
+                HeaderValue::from_static(value),
+            );
+        }
+        for path in targets {
+            assert!(
+                judge_headers(&routes, &p, &Method::GET, path, &headers).is_ok(),
+                "{path}: bare"
+            );
+        }
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {}", p.expose())).unwrap(),
+        );
+        for path in targets {
+            assert!(
+                judge_headers(&routes, &p, &Method::GET, path, &headers).is_ok(),
+                "{path}: with the phantom"
+            );
+        }
+    }
+
+    #[test]
+    fn headers_named_in_connection_are_dropped_with_the_fixed_hop_by_hop_list() {
+        let kept = |h: &http::HeaderMap| -> Vec<String> {
+            let mut sorted: Vec<String> = h.keys().map(ToString::to_string).collect();
+            sorted.sort();
+            sorted
+        };
+        let build = |pairs: &[(&'static str, &'static str)]| -> http::HeaderMap {
+            let mut h = http::HeaderMap::new();
+            for (name, value) in pairs {
+                h.append(
+                    HeaderName::from_static(name),
+                    HeaderValue::from_static(value),
+                );
+            }
+            h
+        };
+        // A named header goes, in whatever case and spacing the option was written, from
+        // every `Connection` line; one it does not name stays.
+        let mut marked = build(&[
+            ("connection", "close, X-Foo"),
+            ("connection", " x-bar ,, "),
+            ("x-foo", "1"),
+            ("x-bar", "2"),
+            ("x-request-id", "r-1"),
+            ("accept", "*/*"),
+        ]);
+        strip_hop_by_hop(&mut marked);
+        assert_eq!(kept(&marked), ["accept", "x-request-id"]);
+        // `keep-alive` and `close` are as before: `Connection` and `Keep-Alive` go, the
+        // rest of the fixed list with them, and nothing else does.
+        for option in ["keep-alive", "close", "Keep-Alive, close"] {
+            let mut plain = build(&[
+                ("connection", option),
+                ("keep-alive", "timeout=5"),
+                ("te", "trailers"),
+                ("upgrade", "h2c"),
+                ("content-type", "application/json"),
+                ("user-agent", "agent/1"),
+            ]);
+            strip_hop_by_hop(&mut plain);
+            assert_eq!(kept(&plain), ["content-type", "user-agent"], "{option}");
+        }
+        // No `Connection`: the fixed list alone.
+        let mut bare = build(&[("te", "trailers"), ("accept", "*/*")]);
+        strip_hop_by_hop(&mut bare);
+        assert_eq!(kept(&bare), ["accept"]);
+        // A value that is not a header name names nothing and breaks nothing.
+        let mut odd = build(&[("connection", "not a name, @"), ("accept", "*/*")]);
+        strip_hop_by_hop(&mut odd);
+        assert_eq!(kept(&odd), ["accept"]);
     }
 
     #[tokio::test]

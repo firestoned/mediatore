@@ -1,15 +1,33 @@
 # Copyright (c) 2026 Erick Bourgeois, mediatore
 # SPDX-License-Identifier: Apache-2.0
 #
-# The gateway identity (ADR-0028 decision 2): spiffe://<td>/gateway on every gateway VM,
-# for two workloads of it, Envoy's data plane (SDS over the agent's socket, as user envoy)
-# and the authorizer (the Workload API, as user mediatore-gateway). One entry per workload
-# per VM, since a SPIRE entry's selectors are a conjunction; the parent is the VM's own
-# agent, spiffe://<td>/spire/agent/tpm/<sha256 of its EK's DER SubjectPublicKeyInfo>,
-# which the SPIRE server logs when the gateway first attests (`spire-server agent list`
-# shows it too). Applied by the platform team, never by the broker, whose admission policy
-# constrains only its own ServiceAccount (deploy/base/admission). The relay (ADR-0027
-# decision 1) has no entry: it holds no identity by design.
+# The gateway's identities (ADR-0028 decision 2, ADR-0053 decision 1), per gateway VM:
+#
+#   spiffe://<td>/gateway             the two listeners, as their server identity: Envoy's
+#                                     data plane (user envoy) and the inject Envoy (user
+#                                     envoy-inject, ADR-0040), each over SDS on the agent's
+#                                     socket. What the forwarder in every sandbox verifies.
+#   spiffe://<td>/gateway/authorizer  the authorizer, mediatore gateway (user
+#                                     mediatore-gateway), as its client identity to the
+#                                     broker. The one gateway identity the broker answers.
+#
+# One entry per user per VM, since a SPIRE entry's selectors are a conjunction; the parent
+# is the VM's own agent, spiffe://<td>/spire/agent/tpm/<sha256 of its EK's DER
+# SubjectPublicKeyInfo>, which the SPIRE server logs when the gateway first attests
+# (`spire-server agent list` shows it too). Applied by the platform team, never by the
+# broker. Their shape is pinned at admission for whoever applies them
+# (deploy/base/admission/clusterstaticentry-gateway.yaml): these two IDs, each with its own
+# users' selectors, and nothing else under /gateway. The listeners must never be given the
+# authorizer's ID, nor the authorizer the listeners': the broker refuses a listener's name,
+# and the authorizer does not start without its own. The relay (ADR-0027 decision 1) has no
+# entry: it holds no identity by design. The envoy-inject entry is inert until a deployment
+# enables that unit.
+#
+# Moving a gateway from the single ID (every VM before ADR-0053): REPLACE its
+# gateway-NN-mediatore-gateway entry with gateway-NN-authorizer, delete the old object, and
+# boot the image that carries the authorizer's own identity; never leave both entries for
+# one user. The order across the broker, the entries and the image is ADR-0053 decision 7
+# and the deploying guide.
 ---
 apiVersion: spire.spiffe.io/v1alpha1
 kind: ClusterStaticEntry
@@ -29,15 +47,30 @@ spec:
 apiVersion: spire.spiffe.io/v1alpha1
 kind: ClusterStaticEntry
 metadata:
-  name: gateway-01-mediatore-gateway
+  name: gateway-01-authorizer
   labels: { mediatore.io/role: gateway }
 spec:
   # the authorizer, mediatore gateway on gateway-01.
   className: spire-server-spire
-  spiffeID: spiffe://sandbox.home.example/gateway
+  spiffeID: spiffe://sandbox.home.example/gateway/authorizer
   parentID: spiffe://sandbox.home.example/spire/agent/tpm/0000000000000000000000000000000000000000000000000000000000000001 # placeholder: gateway-01's EK hash
   selectors:
     - unix:user:mediatore-gateway
+  x509SVIDTTL: 1h
+  hint: gateway-authorizer
+---
+apiVersion: spire.spiffe.io/v1alpha1
+kind: ClusterStaticEntry
+metadata:
+  name: gateway-01-envoy-inject
+  labels: { mediatore.io/role: gateway }
+spec:
+  # the inject listener, Envoy (ADR-0040; off until the deployment enables it) on gateway-01.
+  className: spire-server-spire
+  spiffeID: spiffe://sandbox.home.example/gateway
+  parentID: spiffe://sandbox.home.example/spire/agent/tpm/0000000000000000000000000000000000000000000000000000000000000001 # placeholder: gateway-01's EK hash
+  selectors:
+    - unix:user:envoy-inject
   x509SVIDTTL: 1h
   hint: gateway
 ---
@@ -59,15 +92,30 @@ spec:
 apiVersion: spire.spiffe.io/v1alpha1
 kind: ClusterStaticEntry
 metadata:
-  name: gateway-02-mediatore-gateway
+  name: gateway-02-authorizer
   labels: { mediatore.io/role: gateway }
 spec:
   # the authorizer, mediatore gateway on gateway-02.
   className: spire-server-spire
-  spiffeID: spiffe://sandbox.home.example/gateway
+  spiffeID: spiffe://sandbox.home.example/gateway/authorizer
   parentID: spiffe://sandbox.home.example/spire/agent/tpm/0000000000000000000000000000000000000000000000000000000000000002 # placeholder: gateway-02's EK hash
   selectors:
     - unix:user:mediatore-gateway
+  x509SVIDTTL: 1h
+  hint: gateway-authorizer
+---
+apiVersion: spire.spiffe.io/v1alpha1
+kind: ClusterStaticEntry
+metadata:
+  name: gateway-02-envoy-inject
+  labels: { mediatore.io/role: gateway }
+spec:
+  # the inject listener, Envoy (ADR-0040; off until the deployment enables it) on gateway-02.
+  className: spire-server-spire
+  spiffeID: spiffe://sandbox.home.example/gateway
+  parentID: spiffe://sandbox.home.example/spire/agent/tpm/0000000000000000000000000000000000000000000000000000000000000002 # placeholder: gateway-02's EK hash
+  selectors:
+    - unix:user:envoy-inject
   x509SVIDTTL: 1h
   hint: gateway
 ---
@@ -89,14 +137,29 @@ spec:
 apiVersion: spire.spiffe.io/v1alpha1
 kind: ClusterStaticEntry
 metadata:
-  name: gateway-03-mediatore-gateway
+  name: gateway-03-authorizer
   labels: { mediatore.io/role: gateway }
 spec:
   # the authorizer, mediatore gateway on gateway-03.
   className: spire-server-spire
-  spiffeID: spiffe://sandbox.home.example/gateway
+  spiffeID: spiffe://sandbox.home.example/gateway/authorizer
   parentID: spiffe://sandbox.home.example/spire/agent/tpm/0000000000000000000000000000000000000000000000000000000000000003 # placeholder: gateway-03's EK hash
   selectors:
     - unix:user:mediatore-gateway
+  x509SVIDTTL: 1h
+  hint: gateway-authorizer
+---
+apiVersion: spire.spiffe.io/v1alpha1
+kind: ClusterStaticEntry
+metadata:
+  name: gateway-03-envoy-inject
+  labels: { mediatore.io/role: gateway }
+spec:
+  # the inject listener, Envoy (ADR-0040; off until the deployment enables it) on gateway-03.
+  className: spire-server-spire
+  spiffeID: spiffe://sandbox.home.example/gateway
+  parentID: spiffe://sandbox.home.example/spire/agent/tpm/0000000000000000000000000000000000000000000000000000000000000003 # placeholder: gateway-03's EK hash
+  selectors:
+    - unix:user:envoy-inject
   x509SVIDTTL: 1h
   hint: gateway

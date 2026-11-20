@@ -357,6 +357,10 @@ spec:
                     format: date-time
                     nullable: true
                     type: string
+                  namespace:
+                    description: The namespace of that sandbox, written and compared with `sandboxUid`.
+                    nullable: true
+                    type: string
                   nodeId:
                     description: The bound node's SPIFFE ID, once known.
                     nullable: true
@@ -376,6 +380,14 @@ spec:
                   revokedAt:
                     description: Set on release or revocation; a revoked claim never issues again.
                     format: date-time
+                    nullable: true
+                    type: string
+                  sandboxUid:
+                    description: |-
+                      The `metadata.uid` of the sandbox the record was written for (ADR-0057 decision 7),
+                      set when the record is created and compared with the object on every read: a record
+                      that names another object is not this object's record. Absent on a record written
+                      before the ADR, which is read until its claim ends.
                     nullable: true
                     type: string
                 required:
@@ -737,6 +749,10 @@ spec:
                     format: date-time
                     nullable: true
                     type: string
+                  namespace:
+                    description: The namespace of that sandbox, written and compared with `sandboxUid`.
+                    nullable: true
+                    type: string
                   nodeId:
                     description: The bound node's SPIFFE ID, once known.
                     nullable: true
@@ -756,6 +772,14 @@ spec:
                   revokedAt:
                     description: Set on release or revocation; a revoked claim never issues again.
                     format: date-time
+                    nullable: true
+                    type: string
+                  sandboxUid:
+                    description: |-
+                      The `metadata.uid` of the sandbox the record was written for (ADR-0057 decision 7),
+                      set when the record is created and compared with the object on every read: a record
+                      that names another object is not this object's record. Absent on a record written
+                      before the ADR, which is read until its claim ends.
                     nullable: true
                     type: string
                 required:

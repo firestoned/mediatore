@@ -84,7 +84,13 @@ stages:
           group: 0
           # image/gateway/env.example with your values: the trust domain, the sandbox
           # NIC's name and prefix, the SPIRE server's and the broker's addresses on the
-          # egress side, the broker's URL for the authorizer. Whole-line comments only.
+          # egress side, the broker's URL for the authorizer (https://BROKER_ADDRESS, with
+          # :BROKER_PORT unless 443: the host table's output chain admits the authorizer
+          # nowhere else, ADR-0053 decision 5). EGRESS_DENY_ELEMENTS takes the addresses and
+          # ranges no sandbox should reach through a gateway, as ", 10.0.0.0/8, ...": your
+          # Kubernetes API, secrets store and identity provider at least. The agent.conf
+          # above must name SPIRE_SERVER_ADDRESS and SPIRE_SERVER_PORT: the same chain
+          # admits the agent nowhere else. Whole-line comments only.
           content: |
             TRUST_DOMAIN=sandbox.home.example
             SANDBOX_IF=enp2s0
@@ -103,6 +109,9 @@ stages:
             REGISTRY_PORT=443
             BROKER_ADDRESS=192.0.2.21
             BROKER_PORT=443
+            EGRESS_DENY_ELEMENTS=
+            CHECK_TCP_ELEMENTS=elements = { 9001 }
+            RESOLVER_ELEMENTS=
             AUTHORIZER_ENDPOINT=socket_address: { address: 127.0.0.1, port_value: 9001 }
             SPIRE_SOCKET=/run/spire/sockets/agent.sock
             TUNNEL_MAX_SECS=86400
@@ -119,11 +128,12 @@ stages:
             SPIFFE_ENDPOINT_SOCKET=unix:///run/spire/sockets/agent.sock
             RUST_LOG=info
     # TURN THE INJECT ENVOY ON (ADR-0040): off by default. The unit is in the image and not enabled. To enable it, (1) in the env above, replace
-    # AUTHORIZER_ENDPOINT and INJECT_PORT_ELEMENT with the two lines of image/gateway/env.inject.example, set INJECT_HOST, INJECT_DOMAIN and
+    # AUTHORIZER_ENDPOINT, CHECK_TCP_ELEMENTS and INJECT_PORT_ELEMENT with the three lines of image/gateway/env.inject.example, set INJECT_HOST, INJECT_DOMAIN and
     # INJECT_UPSTREAM_PORT to the upstream, and keep INJECT_PORT equal to the broker's gateway_inject_port; (2) add the step below, which
     # moves the authorizer to its two unix sockets (the data plane's group reaches the check socket only, envoy-inject's group the inject
     # socket only; the setgid directories give each socket its group) and enables the unit; (3) register `unix:user:envoy-inject` on the
-    # gateway's SPIFFE ID (a third entry beside `envoy` and `mediatore-gateway`); (4) open the gateways' path to the upstream. The authorizer's
+    # listeners' SPIFFE ID, spiffe://<td>/gateway (the third entry of each VM in deploy/gateway/clusterstaticentries.yaml; the authorizer's
+    # user holds spiffe://<td>/gateway/authorizer and nothing else, ADR-0053); (4) open the gateways' path to the upstream. The authorizer's
     # listen flags are those of the release that serves the two sockets (ADR-0040 stage C): check them with `mediatore gateway --help`.
     #
     # stages:

@@ -4,7 +4,8 @@
 //! A fake `OpenBao` for the transit sealer (ADR-0015): the Kubernetes login and the transit
 //! `encrypt` and `decrypt` calls over a real HTTP listener, as strict as `OpenBao` is. A
 //! derived key refuses a call without a `context` and a non-derived key refuses one with
-//! it; a ciphertext decrypts only under the context it was encrypted with; every transit
+//! it; a ciphertext decrypts only under the context it was encrypted with, every byte of it
+//! (ADR-0057 decision 9: the session's slot is in those bytes); every transit
 //! call needs a token this fake issued, and a revoked or expired one is 403. Hooks revoke
 //! the tokens, rotate the key, take the server down and count the calls. Since ADR-0016 an
 //! RSA key can be created too, and `sign` answers with an RSA-PSS signature over SHA-256
@@ -31,6 +32,21 @@ struct Key {
     versions: Vec<[u8; 32]>,
     min_decryption_version: usize,
     rsa: Option<Arc<RsaKeyPair>>,
+    /// `Some(n)` for a deliberately broken key that derives from the first `n` bytes of the
+    /// context alone ([`FakeTransit::create_truncating_key`]). `None` is what `OpenBao` does:
+    /// the whole context.
+    context_len: Option<usize>,
+}
+
+impl Key {
+    /// The bytes of `context` this key derives from: all of them, unless it is the broken
+    /// kind.
+    fn bound<'a>(&self, context: &'a [u8]) -> &'a [u8] {
+        match self.context_len {
+            Some(n) if n < context.len() => &context[..n],
+            _ => context,
+        }
+    }
 }
 
 struct TransitState {
@@ -177,7 +193,7 @@ async fn encrypt(
         None => None,
     };
     let secret = match (k.derived, &context) {
-        (true, Some(c)) => subkey(k.versions.last().expect("a version"), c),
+        (true, Some(c)) => subkey(k.versions.last().expect("a version"), k.bound(c)),
         (true, None) => {
             return errors(
                 StatusCode::BAD_REQUEST,
@@ -276,7 +292,7 @@ async fn decrypt(
         return errors(StatusCode::BAD_REQUEST, "invalid ciphertext: too short");
     }
     let secret = match (k.derived, &context) {
-        (true, Some(c)) => subkey(&k.versions[version - 1], c),
+        (true, Some(c)) => subkey(&k.versions[version - 1], k.bound(c)),
         (true, None) => {
             return errors(
                 StatusCode::BAD_REQUEST,
@@ -432,6 +448,24 @@ impl FakeTransit {
                 versions: vec![secret()],
                 min_decryption_version: 1,
                 rsa: None,
+                context_len: None,
+            },
+        );
+    }
+
+    /// Create (or replace) a derived key that is broken on purpose: it derives from the first
+    /// `context_len` bytes of the context and ignores the rest. No `OpenBao` key does this; it
+    /// is what the sealer's start-up probe must refuse (ADR-0057 decision 9: the slot is at
+    /// the end of the context).
+    pub fn create_truncating_key(&self, name: &str, context_len: usize) {
+        self.lock().keys.insert(
+            name.to_owned(),
+            Key {
+                derived: true,
+                versions: vec![secret()],
+                min_decryption_version: 1,
+                rsa: None,
+                context_len: Some(context_len),
             },
         );
     }
@@ -452,8 +486,37 @@ impl FakeTransit {
                 versions: vec![secret()],
                 min_decryption_version: 1,
                 rsa: Some(Arc::new(pair)),
+                context_len: None,
             },
         );
+    }
+
+    /// The ciphertext this fake's `encrypt` answers for `plaintext` under exactly `context`
+    /// with the newest version of the derived key `name`, made here without a call: how a
+    /// test holds an envelope under a context the sealer no longer seals with (format 1,
+    /// ADR-0057 decision 10) or pins the bytes of one it does.
+    ///
+    /// # Panics
+    ///
+    /// If `name` is not a derived key of this fake; this is test scaffolding.
+    #[must_use]
+    pub fn encrypt_under(&self, name: &str, context: &[u8], plaintext: &[u8]) -> String {
+        let s = self.lock();
+        let k = s.keys.get(name).expect("the key exists");
+        assert!(k.derived, "encrypt_under needs a derived key");
+        let key = subkey(k.versions.last().expect("a version"), k.bound(context));
+        let nonce = random(12);
+        let nonce_arr: [u8; 12] = nonce.as_slice().try_into().expect("12 bytes");
+        let mut buf = plaintext.to_vec();
+        key.seal_in_place_append_tag(
+            Nonce::assume_unique_for_key(nonce_arr),
+            Aad::empty(),
+            &mut buf,
+        )
+        .expect("seal");
+        let mut blob = nonce;
+        blob.extend(buf);
+        format!("vault:v{}:{}", k.versions.len(), STANDARD.encode(blob))
     }
 
     /// Rotate `name`: new ciphertexts carry the next version, old ones still decrypt.

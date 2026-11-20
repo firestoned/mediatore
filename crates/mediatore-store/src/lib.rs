@@ -11,6 +11,7 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use jiff::Timestamp;
@@ -24,6 +25,8 @@ use uuid::Uuid;
 #[cfg(test)]
 mod conformance;
 pub mod seal;
+#[cfg(any(test, feature = "test-support"))]
+pub mod shared_cases;
 
 pub use seal::Sealed;
 
@@ -54,6 +57,26 @@ pub const FALLBACK_NAMESPACE: &str = "sandboxes";
 #[must_use]
 pub fn fallback_namespace() -> String {
     FALLBACK_NAMESPACE.to_owned()
+}
+
+/// The version a record was read at (ADR-0057 decision 1): opaque. A store sets it on every
+/// read and checks it on every update; a caller never builds or compares one, it hands back
+/// the record it was given.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordVersion(String);
+
+impl RecordVersion {
+    /// For a store: the version as its backend spells it (a `resourceVersion`, a counter).
+    #[must_use]
+    pub fn new(version: impl Into<String>) -> Self {
+        Self(version.into())
+    }
+
+    /// For a store: the backend's spelling, to name in a conditional write.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 /// One claim mediatore has brokered. The request fields are a copy of the `AgentSandbox`
@@ -115,6 +138,11 @@ pub struct ClaimRecord {
     /// sandbox UID as associated data, like `refresh`. Emptied on release and revocation.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub delegations: BTreeMap<String, DelegatedSession>,
+    /// The version this copy was read at (ADR-0057 decision 1), set by the store on every
+    /// read and never stored: [`ClaimStore::update_claim`] writes only while the stored
+    /// record is still at it. `None` on a record built for [`ClaimStore::put_claim`].
+    #[serde(skip)]
+    pub version: Option<RecordVersion>,
 }
 
 /// One delegated credential on a record (ADR-0035 decision 3): its envelope, and when the
@@ -305,7 +333,8 @@ pub trait LogStore: Send + Sync + 'static {
 /// Storage contract.
 #[async_trait]
 pub trait ClaimStore: LogStore {
-    /// Insert a new claim. Fails with `Conflict` if the UID exists.
+    /// Insert a new claim. Fails with `Conflict` if the UID exists. The record is written
+    /// before any envelope it carries (ADR-0057 decision 4); `rec.version` is ignored.
     async fn put_claim(&self, rec: ClaimRecord) -> Result<(), StoreError>;
     /// Fetch by UID.
     async fn get_claim(&self, uid: Uuid) -> Result<ClaimRecord, StoreError>;
@@ -316,11 +345,22 @@ pub trait ClaimStore: LogStore {
         namespace: &str,
         name: &str,
     ) -> Result<ClaimRecord, StoreError>;
-    /// Replace an existing claim record. A released record is final: an update of one is a
-    /// `Conflict` and writes nothing, so a writer holding a copy read before the release can
-    /// neither clear `revoked_at` nor put back the envelopes the release dropped.
+    /// Replace an existing claim record, compare and set (ADR-0057 decision 2): written only
+    /// while the stored record is still at the version `rec` was read at. `Conflict`, with
+    /// nothing written, when the stored record has moved since, when `rec` carries no version
+    /// (a record that was not read from the store: a caller's bug), and when the stored record
+    /// is released, whatever version `rec` names: a released record is final, so a writer
+    /// holding a copy read before the release can neither clear `revoked_at` nor put back the
+    /// envelopes the release dropped. An update never creates an envelope's storage: one
+    /// that is gone stays gone, and the update is a `Conflict` (the record is written before
+    /// the envelopes, so the record's part of that one update, decided from the current
+    /// version, may have landed). Read again and decide again ([`modify_claim`]).
     async fn update_claim(&self, rec: ClaimRecord) -> Result<(), StoreError>;
-    /// Mark revoked and drop the refresh envelope; idempotent (the first timestamp wins).
+    /// Mark revoked and drop the refresh envelope and every delegation. No precondition
+    /// (ADR-0057 decision 3): it lands over whatever was written before it, moves the
+    /// record's version so that whatever was decided before it is refused after it, and needs
+    /// no sealer. Idempotent: a release of a record read as released keeps the first
+    /// timestamp and still drops whatever envelope is left.
     async fn revoke_claim(&self, uid: Uuid, at: Timestamp) -> Result<(), StoreError>;
     /// The live claim bound to a node (by the node's SPIRE agent SPIFFE ID).
     async fn get_claim_by_node(&self, node_id: &str) -> Result<ClaimRecord, StoreError>;
@@ -381,6 +421,58 @@ pub trait ClaimStore: LogStore {
     async fn ping(&self) -> Result<(), StoreError>;
 }
 
+/// How many times [`modify_claim`] reads, decides and writes before it gives up (ADR-0057
+/// decision 5).
+pub const MODIFY_ATTEMPTS: usize = 4;
+
+/// What [`modify_claim`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Modified {
+    /// The record the closure returned was written.
+    Written,
+    /// The closure had nothing to write for the record as it now is.
+    Unchanged,
+    /// The record is released: nothing was decided and nothing written.
+    Released,
+}
+
+/// Read the record of claim `uid`, hand it to `decide`, write what `decide` returns, and on a
+/// `Conflict` start again from a fresh read, at most [`MODIFY_ATTEMPTS`] times (ADR-0057
+/// decision 5). `decide` sees the fresh record every time, so deciding again is the same code
+/// as deciding; it returns `None` when the record needs no write. A released record is never
+/// handed to `decide`: the answer is [`Modified::Released`]. A record that is gone is
+/// `NotFound`; attempts that all lost are a `Conflict`.
+pub async fn modify_claim<F>(
+    store: &dyn ClaimStore,
+    uid: Uuid,
+    mut decide: F,
+) -> Result<Modified, StoreError>
+where
+    F: FnMut(ClaimRecord) -> Option<ClaimRecord> + Send,
+{
+    for _ in 0..MODIFY_ATTEMPTS {
+        let fresh = store.get_claim(uid).await?;
+        if fresh.revoked_at.is_some() {
+            return Ok(Modified::Released);
+        }
+        let Some(next) = decide(fresh) else {
+            return Ok(Modified::Unchanged);
+        };
+        match store.update_claim(next).await {
+            Ok(()) => return Ok(Modified::Written),
+            Err(StoreError::Conflict(_)) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    // The last attempt may have lost to a release: say so, a caller treats the two apart.
+    if store.get_claim(uid).await?.revoked_at.is_some() {
+        return Ok(Modified::Released);
+    }
+    Err(StoreError::Conflict(format!(
+        "claim {uid}: {MODIFY_ATTEMPTS} attempts each lost to another write"
+    )))
+}
+
 /// `Conflict` when `next` names another policy than `held`: a caller bug, never written.
 fn same_policy(held: Option<&PolicyFloor>, next: &PolicyFloor) -> Result<(), StoreError> {
     match held {
@@ -405,6 +497,9 @@ pub struct MemoryStore {
     sessions: RwLock<HashMap<(Uuid, Option<String>), SessionRecord>>,
     floors: RwLock<HashMap<(String, String), PolicyFloor>>,
     logs: RwLock<HashMap<Uuid, LogRing>>,
+    /// The last record version handed out (ADR-0057 decision 1): every write of a record
+    /// takes the next, so a stored record's version is its own and moves with each write.
+    versions: AtomicU64,
 }
 
 /// One claim's output in memory (ADR-0045 decision 11): the same cap, ownership and sweep
@@ -550,6 +645,12 @@ impl MemoryStore {
     pub fn shared() -> Arc<Self> {
         Arc::new(Self::default())
     }
+
+    /// The version the next write of a record leaves on it.
+    fn next_version(&self) -> RecordVersion {
+        let n = self.versions.fetch_add(1, Ordering::Relaxed) + 1;
+        RecordVersion(n.to_string())
+    }
 }
 
 #[async_trait]
@@ -559,6 +660,8 @@ impl ClaimStore for MemoryStore {
         if m.contains_key(&rec.uid) {
             return Err(StoreError::Conflict(rec.uid.to_string()));
         }
+        let mut rec = rec;
+        rec.version = Some(self.next_version());
         m.insert(rec.uid, rec);
         Ok(())
     }
@@ -600,6 +703,22 @@ impl ClaimStore for MemoryStore {
                 rec.uid
             )));
         }
+        // Compare and set (ADR-0057 decision 2), the same refusals as `KubeStore`: a copy
+        // that was not read from the store, and a copy read before another write landed.
+        let Some(read_at) = rec.version.as_ref() else {
+            return Err(StoreError::Conflict(format!(
+                "claim {}: an update of a record that carries no version",
+                rec.uid
+            )));
+        };
+        if held.version.as_ref() != Some(read_at) {
+            return Err(StoreError::Conflict(format!(
+                "claim {} moved since it was read",
+                rec.uid
+            )));
+        }
+        let mut rec = rec;
+        rec.version = Some(self.next_version());
         m.insert(rec.uid, rec);
         Ok(())
     }
@@ -609,9 +728,24 @@ impl ClaimStore for MemoryStore {
         let rec = m
             .get_mut(&uid)
             .ok_or_else(|| StoreError::NotFound(uid.to_string()))?;
+        // No precondition (ADR-0057 decision 3), and the version moves: a copy read before
+        // this is refused after it.
         rec.revoked_at.get_or_insert(at);
         rec.refresh = None;
         rec.delegations.clear();
+        rec.version = Some(self.next_version());
+        let sandbox_uid = rec.sandbox_uid;
+        // The claims lock is released before the sessions are locked: the sweep takes the
+        // two in the other order.
+        drop(m);
+        // Whatever is still kept for the sandbox goes too, on every release: `KubeStore`
+        // deletes every Secret labelled with the sandbox's UID (ADR-0057 decision 4).
+        if let Some(sandbox_uid) = sandbox_uid {
+            self.sessions
+                .write()
+                .await
+                .retain(|(uid, _), _| *uid != sandbox_uid);
+        }
         Ok(())
     }
 
@@ -743,16 +877,23 @@ impl ClaimStore for MemoryStore {
         // (the operator's rule, ADR-0043 decision 4), which can be before the claim ends.
         for rec in self.claims.write().await.values_mut() {
             let held = rec.delegations.len();
+            let mut gone = 0;
             if rec.is_live(now) {
                 rec.delegations
                     .retain(|_, d| d.expires_at.is_none_or(|e| e > now));
             } else {
                 // An ended claim (revoked, or past its deadline) keeps no envelope, the issuer's session included:
                 // `KubeStore` deletes the Secrets of one. A live claim's session stays, however old it is.
-                swept += usize::from(rec.refresh.take().is_some());
+                gone += usize::from(rec.refresh.take().is_some());
                 rec.delegations.clear();
             }
-            swept += held - rec.delegations.len();
+            gone += held - rec.delegations.len();
+            if gone > 0 {
+                // An envelope the sweep removed is not put back by a copy read before it
+                // (ADR-0057 decision 4: `KubeStore` never creates a Secret in an update).
+                rec.version = Some(self.next_version());
+            }
+            swept += gone;
         }
         Ok(swept)
     }
@@ -798,4 +939,11 @@ mod tests {
     use super::*;
 
     crate::conformance::suite!(memory, MemoryStore::default());
+
+    /// ADR-0057 decision 6: the cases `mediatore-claims` runs over the Kubernetes store too.
+    mod shared_memory {
+        use super::*;
+
+        crate::shared_suite!(MemoryStore::default());
+    }
 }

@@ -104,7 +104,8 @@ pub struct GatewayArgs {
     /// Claims the cache holds; past it, the least recently used goes
     #[arg(long, default_value_t = 4096)]
     pub max_claims: usize,
-    /// Dev only: send this SPIFFE ID as a header instead of mTLS (loopback `dev_mode` broker)
+    /// Dev only: send this SPIFFE ID, which must be `spiffe://<td>/gateway/authorizer`, as a
+    /// header instead of mTLS (loopback `dev_mode` broker)
     #[cfg(feature = "dev")]
     #[arg(long)]
     pub dev_spiffe_id: Option<String>,
@@ -484,6 +485,20 @@ pub async fn serve_unix(
     anyhow::bail!("the authorizer's unix listener ended")
 }
 
+/// The broker client under the authorizer's own identity, `spiffe://<td>/gateway/authorizer`
+/// (ADR-0053 decision 2): its SVID from the Workload API, selected by ID, or under the `dev`
+/// feature the same ID as a header. Any other name, or none in time, is a failed start.
+async fn broker_for(args: &GatewayArgs) -> anyhow::Result<Broker> {
+    #[cfg(feature = "dev")]
+    {
+        if let Some(id) = &args.dev_spiffe_id {
+            crate::broker::ensure_authorizer(&mediatore_tls::SpiffeId::new(id)?)?;
+            return Ok(Broker::dev_header(&args.mediatore_url, id));
+        }
+    }
+    Broker::connect(&args.mediatore_url, &args.workload_api_socket).await
+}
+
 /// `mediatore gateway`: the authorizer, its identity from the Workload API. The tunnel check
 /// on loopback TCP or a unix socket, and, with `--inject-socket`, the inject check on its own.
 pub async fn run(args: GatewayArgs) -> anyhow::Result<()> {
@@ -523,13 +538,7 @@ pub async fn run(args: GatewayArgs) -> anyhow::Result<()> {
         .as_deref()
         .map(|p| socket(p, args.inject_socket_group.as_deref()))
         .transpose()?;
-    #[cfg(feature = "dev")]
-    let broker = match &args.dev_spiffe_id {
-        Some(id) => Broker::dev_header(&args.mediatore_url, id),
-        None => Broker::connect(&args.mediatore_url, &args.workload_api_socket).await?,
-    };
-    #[cfg(not(feature = "dev"))]
-    let broker = Broker::connect(&args.mediatore_url, &args.workload_api_socket).await?;
+    let broker = broker_for(&args).await?;
     let trust_domain = broker.trust_domain()?;
     let cfg = CacheConfig {
         fresh_for: std::time::Duration::from_secs(args.fresh_secs),

@@ -979,6 +979,11 @@ pub struct DelegationPlain {
     /// What renews it, if anything.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refresh_token: Option<Secret>,
+    /// When the stored credential stops being used (ADR-0057 decision 11): sealed with the
+    /// bearer, so the issue path believes this and no expiry kept in clear beside the
+    /// envelope. `None` only in an envelope sealed before the ADR (format 1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<Timestamp>,
 }
 
 /// Claim lifecycle as mirrored from banlieue.

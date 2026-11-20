@@ -62,6 +62,12 @@ fn gateway_svid() -> String {
     format!("spiffe://{TRUST_DOMAIN}/gateway")
 }
 
+/// The authorizer's own identity (ADR-0053 decision 1): the one the broker's gateway routes
+/// answer. The listeners' identity above is a stranger to them.
+fn authorizer_svid() -> String {
+    format!("spiffe://{TRUST_DOMAIN}/gateway/authorizer")
+}
+
 /// The two audiences' egress: the ordinary one with two endpoints, the delegated one with
 /// Anthropic's.
 fn egress_map() -> std::collections::BTreeMap<String, Vec<Endpoint>> {
@@ -159,6 +165,7 @@ impl Harness {
             inject_port: None,
             logs,
             log_limiter: Limiter::per_second(1),
+            accept_plain_gateway_identity: false,
             store: MemoryStore::shared(),
             spire: Arc::new(mediatore_spire::MemoryEntries::default()),
             naming: Naming {
@@ -1097,7 +1104,7 @@ async fn the_gateway_reads_a_claims_egress_and_nobody_else_does() {
     );
     let uid = claim.uid.expect("uid");
     let url = format!("{}/v1/gateway/claims/{uid}", h.sandbox_url);
-    let as_gateway = || h.http.get(&url).header(PEER_HEADER, gateway_svid());
+    let as_gateway = || h.http.get(&url).header(PEER_HEADER, authorizer_svid());
 
     // Pending: no deadline, no identity, nothing a gateway could admit.
     assert_eq!(as_gateway().send().await.expect("pending").status(), 404);
@@ -1137,7 +1144,9 @@ async fn the_gateway_reads_a_claims_egress_and_nobody_else_does() {
     for peer in [
         node_svid(),
         claim_svid(&uid),
+        gateway_svid(),
         format!("{}/x", gateway_svid()),
+        format!("{}/x", authorizer_svid()),
     ] {
         let resp = h
             .http
@@ -1159,7 +1168,7 @@ async fn the_gateway_reads_a_claims_egress_and_nobody_else_does() {
     let resp = h
         .http
         .get(&other)
-        .header(PEER_HEADER, gateway_svid())
+        .header(PEER_HEADER, authorizer_svid())
         .send()
         .await
         .expect("unknown");
@@ -1168,7 +1177,7 @@ async fn the_gateway_reads_a_claims_egress_and_nobody_else_does() {
     let resp = h
         .http
         .get(&bad)
-        .header(PEER_HEADER, gateway_svid())
+        .header(PEER_HEADER, authorizer_svid())
         .send()
         .await
         .expect("bad");

@@ -199,7 +199,14 @@ impl ClaimsApi for FakeClaims {
         let sb = sbs
             .get_mut(&key(namespace, name))
             .ok_or_else(|| WatchError::Api(format!("agentsandboxes \"{name}\" not found")))?;
-        sb.status = Some(status.clone());
+        // A merge patch, as the API server applies it: the reconciler's patch never names the
+        // record (ADR-0034), so the one the store wrote stays.
+        let kept = sb.status.as_ref().and_then(|held| held.record.clone());
+        let mut next = status.clone();
+        if next.record.is_none() {
+            next.record = kept;
+        }
+        sb.status = Some(next);
         *self.patches.lock().unwrap() += 1;
         Ok(())
     }

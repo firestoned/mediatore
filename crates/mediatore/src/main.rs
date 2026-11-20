@@ -155,6 +155,8 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
         // `None` and both routes fail closed with `501`.
         logs: cfg.log_limits(),
         log_limiter: mediatore_api::Limiter::per_second(1),
+        // The transition switch of ADR-0053 decision 7: off unless the config says otherwise.
+        accept_plain_gateway_identity: cfg.accept_plain_gateway_identity,
         store,
         spire,
         naming: naming.clone(),
@@ -195,7 +197,12 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
         (!cfg.dev_mode).then_some(cfg.spire.as_ref()).flatten(),
         client,
     ) {
-        let configs = broker_identity(&spire.workload_api_socket, &naming).await?;
+        let configs = broker_identity(
+            &spire.workload_api_socket,
+            &naming,
+            cfg.accept_plain_gateway_identity,
+        )
+        .await?;
         let s = mediatore_tls::serve(sandbox, configs, sandbox_router, shutdown());
         // One cache: the reflector fills it on this replica, the watcher reads it when it
         // creates a record (ADR-0026 decision 6). Empty, and never filled, without a
@@ -350,10 +357,13 @@ const BROKER_WORKLOAD_API_WAIT: std::time::Duration = std::time::Duration::from_
 /// The broker's own SVID from the Workload API, and the sandbox listener's rotating TLS
 /// config over it (ADR-0007 decisions 1 and 2). Fails closed: no socket, no SVID, or an
 /// SVID that is not `spiffe://<td>/mediatore` (a wrong `ClusterSPIFFEID`) and the process
-/// does not start.
+/// does not start. The listener admits nodes, claims and the gateways' authorizer; the
+/// gateways' listener identity only while `accept_plain_gateway_identity` is on (ADR-0053
+/// decisions 3 and 7).
 async fn broker_identity(
     workload_api_socket: &str,
     naming: &Naming,
+    accept_plain_gateway_identity: bool,
 ) -> anyhow::Result<Arc<mediatore_tls::TlsConfigs>> {
     let source =
         mediatore_tls::WorkloadApiSource::connect(workload_api_socket, BROKER_WORKLOAD_API_WAIT)
@@ -368,7 +378,7 @@ async fn broker_identity(
     tracing::info!(spiffe_id = %own.spiffe_id, "broker identity from the Workload API");
     let configs = mediatore_tls::TlsConfigs::spawn(
         Arc::new(source),
-        mediatore_api::sandbox_authorizer(naming.clone()),
+        mediatore_api::sandbox_authorizer(naming.clone(), accept_plain_gateway_identity),
     )?;
     Ok(configs)
 }

@@ -874,6 +874,7 @@ mod tests {
             report: None,
             exit: None,
             delegations: std::collections::BTreeMap::new(),
+            version: None,
         }
     }
 
@@ -1157,6 +1158,7 @@ mod tests {
             key_id: "k".into(),
             nonce: vec![0; 12],
             ciphertext: vec![1, 2, 3],
+            format: mediatore_store::seal::FORMAT_SLOT,
         };
         let subject = || Subject {
             issuer: "https://idp.example".into(),

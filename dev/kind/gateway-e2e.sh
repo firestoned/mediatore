@@ -4,7 +4,8 @@
 #
 # ADR-0028 against a real Envoy and a real SPIRE (`make kind-e2e-gateway`): the gateway
 # pod from dev/kind/gateway (Envoy on the gateway SVID over SDS, mediatore gateway beside
-# it), the broker from deploy/base, and claim-side pods shaped like a sandbox VM: the real
+# it under its own identity, spiffe://<td>/gateway/authorizer, ADR-0053: the two containers
+# are told apart by name in two ClusterSPIFFEIDs), the broker from deploy/base, and claim-side pods shaped like a sandbox VM: the real
 # `mediatore egress-proxy` as a sidecar with a claim SVID the real agent issued, its
 # forwarder tunnelling every upstream through the gateway (ADR-0028 decision 3, ADR-0027
 # decision 8), and a workload beside it with no socket and no route of its own, driving the
@@ -29,7 +30,10 @@
 # the code in the proxy's log; a proxy holding a node SVID is refused by Envoy's validator
 # before any check and the workload sees 502 gateway_unreachable; with the broker gone the
 # cached allowlist stands in until the stale bound and then the outage is a refusal; a
-# released claim is cut off once its answer is stale; the logs (Envoy's access log, the
+# released claim is cut off once its answer is stale; a client holding the listeners'
+# identity is refused by the broker at the handshake and the gateway entry admission policy
+# admits its two shapes and nothing wider (ADR-0053 decisions 3 and 4, server-side dry
+# runs); the logs (Envoy's access log, the
 # authorizer's decisions, the proxy's forwards, the destination's requests) agree on who
 # reached what.
 set -euo pipefail
@@ -117,9 +121,9 @@ FILES=$(mktemp -d)
 cleanup() {
   rm -rf "$FILES"
   "${K[@]}" -n "$NS" delete agentsandbox --all --ignore-not-found --wait=false >/dev/null 2>&1 || true
-  "${K[@]}" -n "$NS" delete pod node "${PROBES[@]}" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  "${K[@]}" -n "$NS" delete pod node probe-listener "${PROBES[@]}" --ignore-not-found --wait=false >/dev/null 2>&1 || true
   "${K[@]}" -n "$NS" delete configmap forward-files --ignore-not-found >/dev/null 2>&1 || true
-  "${K[@]}" delete clusterspiffeid mediatore-e2e-gateway-node mediatore-e2e-gateway-claim --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  "${K[@]}" delete clusterspiffeid mediatore-e2e-gateway-node mediatore-e2e-gateway-claim mediatore-e2e-gateway-listener-probe --ignore-not-found --wait=false >/dev/null 2>&1 || true
   "${K[@]}" delete clusterstaticentries -l "$ENTRY_SELECTOR" --ignore-not-found --wait=false >/dev/null 2>&1 || true
   "${K[@]}" -n "$BROKER_NS" scale deploy/mediatore --replicas=1 >/dev/null 2>&1 || true
 }
@@ -339,16 +343,134 @@ wait_for "$TIMEOUT" "lease mediatore-watcher held by ${BROKER_POD#pod/}" holder_
 wait_for "$TIMEOUT" "'claim watcher running' in the broker log" log_has "claim watcher running"
 echo "held by ${BROKER_POD#pod/}; controllers running"
 
-say "gateway: Envoy on the gateway SVID over SDS, the authorizer beside it, the TLS destination behind it"
+say "gateway: Envoy on the gateway SVID over SDS, the authorizer beside it on its own, the TLS destination behind it"
 "${K[@]}" -n "$NS" rollout status deploy/gateway --timeout=120s >/dev/null
 "${K[@]}" -n "$NS" rollout status deploy/destination --timeout=120s >/dev/null
 authz_up() { authz_logs | grep -qF "gateway authorizer listening"; }
 wait_for "$TIMEOUT" "'gateway authorizer listening' in the authorizer log" authz_up
-authz_logs | grep -F "gateway SVID from the Workload API" | grep -qF "spiffe_id=spiffe://$TD/gateway" || fail "the authorizer did not get spiffe://$TD/gateway"
+# ADR-0053 decisions 1 and 2: the authorizer's container holds its own ID, exactly (the
+# line ends there: nothing under it), selected by ID from the Workload API. The Envoy
+# container holds spiffe://<td>/gateway, which is what the forwarder verifies further down
+# (gateway_id=) and what the next stage shows the broker refusing.
+authz_logs | grep -F "the authorizer's SVID from the Workload API" | grep -qE "spiffe_id=spiffe://$TD/gateway/authorizer( |\$)" || fail "the authorizer did not get spiffe://$TD/gateway/authorizer"
 envoy_ready() { envoy_logs | grep -qE "all dependencies initialized|starting main dispatch loop"; }
 wait_for "$TIMEOUT" "Envoy's main dispatch loop" envoy_ready
 dest_logs | grep -F "destination listening" | grep -qF "tls=true" || fail "the destination is not serving TLS"
-echo "authorizer as spiffe://$TD/gateway; Envoy up on its bootstrap; the destination on the fixture CA"
+echo "authorizer as spiffe://$TD/gateway/authorizer; Envoy on spiffe://$TD/gateway, up on its bootstrap; the destination on the fixture CA"
+
+say "the listeners' identity is no peer of the broker (ADR-0053 decision 3): a client holding spiffe://$TD/gateway is refused in the handshake"
+# The identity the Envoy container holds, issued by the same agent to a pod of its own, and
+# the shipped token client asking the broker with it. Before ADR-0053 this name completed
+# the handshake and was answered on the gateway route; now it is a stranger to the listener.
+"${K[@]}" -n "$NS" delete pod probe-listener --ignore-not-found --wait=true >/dev/null 2>&1 || true
+"${K[@]}" apply -f - >/dev/null <<YAML
+apiVersion: spire.spiffe.io/v1alpha1
+kind: ClusterSPIFFEID
+metadata:
+  name: mediatore-e2e-gateway-listener-probe
+spec:
+  className: spire-server-spire
+  spiffeIDTemplate: "spiffe://{{ .TrustDomain }}/gateway"
+  podSelector:
+    matchLabels: { mediatore.dev/e2e-role: listener-probe }
+  namespaceSelector:
+    matchLabels: { kubernetes.io/metadata.name: $NS }
+  ttl: 1h
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: probe-listener
+  namespace: $NS
+  labels: { mediatore.dev/e2e-role: listener-probe }
+spec:
+  restartPolicy: Never
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    seccompProfile: { type: RuntimeDefault }
+  containers:
+    - name: workload
+      image: ghcr.io/firestoned/mediatore:kind
+      imagePullPolicy: Never
+      command: ["/usr/bin/mediatore", "token", "--audience", "e2e-egress"]
+      env:
+        - { name: MEDIATORE_URL, value: "https://mediatore-sandbox.banlieue-system.svc" }
+        - { name: SPIFFE_ENDPOINT_SOCKET, value: "unix:///run/spire/sockets/spire-agent.sock" }
+      volumeMounts:
+        - { name: spire-agent-socket, mountPath: /run/spire/sockets, readOnly: true }
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities: { drop: ["ALL"] }
+  volumes:
+    - name: spire-agent-socket
+      csi: { driver: csi.spiffe.io, readOnly: true }
+YAML
+wait_for_end probe-listener
+pod_logs probe-listener | grep -qF "mediatore: " && fail "a client holding the listeners' identity received an HTTP answer from the broker"
+# The broker's own words for it, on exactly that ID (the pattern ends at the ID, so the
+# authorizer's longer one never satisfies it).
+listener_refused() { broker_logs | grep -F "peer authenticated but not authorized here" | grep -qE "spiffe_id=spiffe://$TD/gateway( |\$)"; }
+wait_for "$LOG_WAIT" "the broker refusing spiffe://$TD/gateway at the handshake" listener_refused
+broker_logs | grep -F "mtls connection" | grep -qE "spiffe_id=spiffe://$TD/gateway( |\$)" && fail "spiffe://$TD/gateway completed a handshake with the broker"
+"${K[@]}" -n "$NS" delete pod probe-listener --ignore-not-found --wait=false >/dev/null 2>&1 || true
+"${K[@]}" delete clusterspiffeid mediatore-e2e-gateway-listener-probe --ignore-not-found --wait=false >/dev/null 2>&1 || true
+echo "no HTTP answer; the broker: authenticated, not authorized"
+
+say "gateway entries (ADR-0053 decision 4): the admission policy admits the two shapes and nothing wider, for any principal; the broker's own policy still refuses it both IDs"
+# Server-side dry runs: admission judges each, nothing is ever created. The admin identity
+# is not the broker's, which is the point: this policy binds whoever applies a gateway entry.
+ZEROS=0000000000000000000000000000000000000000000000000000000000000000
+dry_entry() { # <admin|broker> <name> <path after the trust domain> <selectors, a YAML flow list> [<one more spec line>] [<x509SVIDTTL>]
+  local who=$1 name=$2 path=$3 selectors=$4 extra=${5:-} ttl=${6:-1h}
+  local -a kc=("${K[@]}")
+  [ "$who" = broker ] && kc=("${KSA[@]}")
+  "${kc[@]}" create --dry-run=server -o name -f - 2>&1 <<YAML || true
+apiVersion: spire.spiffe.io/v1alpha1
+kind: ClusterStaticEntry
+metadata:
+  name: $name
+spec:
+  className: spire-server-spire
+  spiffeID: spiffe://$TD$path
+  parentID: spiffe://$TD/spire/agent/tpm/$ZEROS
+  selectors: $selectors
+  x509SVIDTTL: $ttl
+  $extra
+YAML
+}
+entry_admitted() { # <dry_entry arguments>
+  local out; out=$(dry_entry "$@")
+  grep -qF "clusterstaticentry.spire.spiffe.io/$2" <<<"$out" || fail "the gateway entry $2 ($3, $4) was not admitted: $out"
+}
+entry_refused() { # <the refusal must carry this> <dry_entry arguments>
+  local why=$1 out; shift; out=$(dry_entry "$@")
+  grep -qF "clusterstaticentry.spire.spiffe.io/$2" <<<"$out" && fail "the entry $2 ($3, $4 ${5:-} ${6:-}) was admitted"
+  grep -qF -- "$why" <<<"$out" || fail "the entry $2 ($3, $4 ${5:-} ${6:-}) was refused, but not for '$why': $out"
+}
+# `kubectl apply` returned when the policy was stored; the API server enforces it a moment later.
+gateway_policy_settled() { dry_entry admin gw-probe-settle /gateway/other '["unix:user:envoy"]' | grep -qF "nothing else lives under /gateway"; }
+wait_for 60 "the gateway entry admission policy enforced" gateway_policy_settled
+entry_admitted admin gw-probe-envoy /gateway '["unix:user:envoy"]'
+entry_admitted admin gw-probe-inject /gateway '["unix:user:envoy-inject"]'
+entry_admitted admin gw-probe-authorizer /gateway/authorizer '["unix:user:mediatore-gateway"]'
+entry_refused "its selector is unix:user:mediatore-gateway" admin gw-probe-a /gateway/authorizer '["unix:user:envoy"]'
+entry_refused "its selector is unix:user:mediatore-gateway" admin gw-probe-b /gateway/authorizer '["unix:user:envoy-inject"]'
+entry_refused "its selector is unix:user:envoy or unix:user:envoy-inject" admin gw-probe-c /gateway '["unix:user:mediatore-gateway"]'
+entry_refused "exactly one selector" admin gw-probe-d /gateway '["unix:user:envoy", "unix:user:envoy-inject"]'
+entry_refused "exactly one selector" admin gw-probe-e /gateway/authorizer '["unix:user:mediatore-gateway", "unix:uid:0"]'
+entry_refused "its selector is unix:user:envoy or unix:user:envoy-inject" admin gw-probe-f /gateway '["unix:uid:0"]'
+entry_refused "nothing else lives under /gateway" admin gw-probe-g /gateway/gateway-01 '["unix:user:envoy"]'
+entry_refused "nothing else lives under /gateway" admin gw-probe-h /gateway/authorizer/1 '["unix:user:mediatore-gateway"]'
+entry_refused "never admin" admin gw-probe-i /gateway/authorizer '["unix:user:mediatore-gateway"]' 'admin: true'
+entry_refused "at most 4h" admin gw-probe-j /gateway '["unix:user:envoy"]' '' 5h
+entry_refused "no DNS names" admin gw-probe-k /gateway '["unix:user:envoy"]' 'dnsNames: ["gateway.home.example"]'
+# The broker's ServiceAccount, under a name its own policy allows: refused by that policy's
+# spiffeID rule, for both IDs, as before ADR-0053 and still.
+entry_refused "spiffeID must be spiffe://<td>/banlieue/node/" broker mediatore-gw-probe-l /gateway '["unix:user:envoy"]'
+entry_refused "spiffeID must be spiffe://<td>/banlieue/node/" broker mediatore-gw-probe-m /gateway/authorizer '["unix:user:mediatore-gateway"]'
+echo "admitted: the listeners' two entries and the authorizer's; refused: swapped selectors, two selectors, other paths, admin, a long TTL, DNS names; the broker's ServiceAccount: neither ID"
 
 say "fixtures: a clean slate, then the node pod registering the fixture EK, a sandbox bound to it"
 cleanup

@@ -18,6 +18,10 @@ pub const EAFNOSUPPORT: i32 = 97;
 pub const ALLOWED_FAMILIES: [u64; 3] = [1, 2, 10];
 /// The inet families whose sockets must also be streams.
 pub const INET_FAMILIES: [u64; 2] = [2, 10];
+/// The protocols an inet socket may name: `0` (the family's default for a stream, TCP) and
+/// `IPPROTO_TCP`. Anything else on a stream type is another transport behind the same type
+/// (MPTCP is protocol 262), which ADR-0051's amendment of 2026-11-19 closes here too.
+pub const INET_STREAM_PROTOCOLS: [u64; 2] = [0, 6];
 /// `SOCK_STREAM`.
 pub const SOCK_STREAM: u64 = 1;
 /// `SOCK_TYPE_MASK`: the kernel's own mask, which drops `SOCK_NONBLOCK` and `SOCK_CLOEXEC`.
@@ -108,7 +112,9 @@ impl Filter {
 /// The two filters of the policy, installed in this order. Their matches are disjoint (a
 /// socket call is refused by the family filter only when its family is not allowed, by the
 /// second only when the family is inet), so the kernel's precedence between them never
-/// decides an errno.
+/// decides an errno. The protocol rule sits in the second filter beside the type rules: it
+/// too matches inet families alone, and a call it shares with a type rule gets `EPERM` from
+/// either.
 #[must_use]
 pub fn filters() -> [Filter; 2] {
     let cond = |arg, op, value| Cond { arg, op, value };
@@ -137,6 +143,17 @@ pub fn filters() -> [Filter; 2] {
                 ],
             });
         }
+    }
+    // socket() on an inet family whose protocol is none of the allowed ones, every `Ne` must
+    // hold: one rule per family, whatever the type (a type that is not a stream is refused
+    // above with the same errno).
+    for domain in INET_FAMILIES {
+        let mut conds = vec![cond(0, Op::Eq, domain)];
+        conds.extend(INET_STREAM_PROTOCOLS.iter().map(|p| cond(2, Op::Ne, *p)));
+        rest.push(Rule {
+            syscall: "socket",
+            conds,
+        });
     }
     rest.extend(DENIED_SYSCALLS.iter().map(|syscall| Rule {
         syscall,
@@ -282,8 +299,16 @@ mod tests {
     const SOCK_NONBLOCK: u64 = 0o4000;
     const SOCK_CLOEXEC: u64 = 0o2_000_000;
 
+    const IPPROTO_TCP: u64 = 6;
+    const IPPROTO_UDP: u64 = 17;
+    const IPPROTO_MPTCP: u64 = 262;
+
     fn socket(domain: u64, ty: u64) -> Option<i32> {
         verdict("socket", [domain, ty, 0, 0, 0, 0])
+    }
+
+    fn socket_with(domain: u64, ty: u64, protocol: u64) -> Option<i32> {
+        verdict("socket", [domain, ty, protocol, 0, 0, 0])
     }
 
     #[test]
@@ -347,6 +372,57 @@ mod tests {
     }
 
     #[test]
+    fn an_inet_stream_socket_whose_protocol_is_not_tcp_is_refused_with_eperm() {
+        assert_eq!(INET_STREAM_PROTOCOLS, [0, IPPROTO_TCP]);
+        for flags in [0, SOCK_NONBLOCK, SOCK_CLOEXEC, SOCK_NONBLOCK | SOCK_CLOEXEC] {
+            let ty = SOCK_STREAM | flags;
+            for domain in [AF_INET, AF_INET6] {
+                for protocol in INET_STREAM_PROTOCOLS {
+                    assert_eq!(
+                        socket_with(domain, ty, protocol),
+                        None,
+                        "{domain} {flags} protocol {protocol}"
+                    );
+                }
+                for protocol in [IPPROTO_MPTCP, 1, IPPROTO_UDP, 132, 255, 0xffff_ffff] {
+                    assert_eq!(
+                        socket_with(domain, ty, protocol),
+                        Some(EPERM),
+                        "{domain} {flags} protocol {protocol}"
+                    );
+                }
+                // The protocol is an `int`: the kernel reads the low half of the register,
+                // and so does the filter.
+                assert_eq!(socket_with(domain, ty, IPPROTO_TCP | (1 << 32)), None);
+                assert_eq!(
+                    socket_with(domain, ty, IPPROTO_MPTCP | (1 << 32)),
+                    Some(EPERM)
+                );
+            }
+            // A local socket's protocol is not this rule's to judge.
+            for protocol in [0, 1, IPPROTO_TCP, IPPROTO_MPTCP] {
+                assert_eq!(
+                    socket_with(AF_UNIX, ty, protocol),
+                    None,
+                    "unix {flags} protocol {protocol}"
+                );
+                assert_eq!(socket_with(AF_UNIX, SOCK_DGRAM | flags, protocol), None);
+            }
+        }
+        // The errnos of the other rules are unchanged by a protocol.
+        assert_eq!(
+            socket_with(AF_VSOCK, SOCK_STREAM, IPPROTO_MPTCP),
+            Some(EAFNOSUPPORT)
+        );
+        assert_eq!(socket_with(AF_INET, SOCK_DGRAM, IPPROTO_UDP), Some(EPERM));
+        assert_eq!(
+            verdict("socketpair", [AF_UNIX, SOCK_STREAM, IPPROTO_MPTCP, 0, 0, 0]),
+            None,
+            "the rule is on socket() alone"
+        );
+    }
+
+    #[test]
     fn io_uring_and_the_listed_syscalls_are_refused_with_eperm() {
         for name in DENIED_SYSCALLS {
             assert_eq!(verdict(name, [0; 6]), Some(EPERM), "{name}");
@@ -366,12 +442,14 @@ mod tests {
         let [a, b] = filters();
         for domain in 0..=64u64 {
             for ty in 0..=15u64 {
-                let args = [domain, ty, 0, 0, 0, 0];
-                for call in ["socket", "socketpair"] {
-                    assert!(
-                        a.verdict(call, args).is_none() || b.verdict(call, args).is_none(),
-                        "{call} {domain} {ty}"
-                    );
+                for protocol in [0, IPPROTO_TCP, IPPROTO_UDP, IPPROTO_MPTCP] {
+                    let args = [domain, ty, protocol, 0, 0, 0];
+                    for call in ["socket", "socketpair"] {
+                        assert!(
+                            a.verdict(call, args).is_none() || b.verdict(call, args).is_none(),
+                            "{call} {domain} {ty} {protocol}"
+                        );
+                    }
                 }
             }
         }

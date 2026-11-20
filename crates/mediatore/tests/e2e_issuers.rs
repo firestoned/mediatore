@@ -98,6 +98,7 @@ impl Harness {
             inject_port: None,
             logs: None,
             log_limiter: Limiter::per_second(1),
+            accept_plain_gateway_identity: false,
             store: store.clone(),
             spire: Arc::new(MemoryEntries::default()),
             naming: Naming {
@@ -397,6 +398,7 @@ async fn claim_through_gate(gate: IssuerGate, groups: &[&str]) -> (u16, String) 
         inject_port: None,
         logs: None,
         log_limiter: Limiter::per_second(1),
+        accept_plain_gateway_identity: false,
         store: MemoryStore::shared(),
         spire: Arc::new(MemoryEntries::default()),
         naming: Naming {

@@ -15,7 +15,6 @@ namespace: banlieue-system
 resources:
   - ../../base
   - ingress.yaml
-  - networkpolicy.yaml
 images:
   # Pin what you deploy, by digest: the one a release's mediatore-<version>.yaml carries,
   # verified as docs/guides/deploying.md shows. The zeros are a placeholder no registry
@@ -30,6 +29,9 @@ configMapGenerator:
 generatorOptions:
   disableNameSuffixHash: true
 patches:
+  # The NetworkPolicy's values: the base ships the object with placeholder peers that
+  # admit nothing, this replaces its rules with the cluster's and adds the egress.
+  - path: networkpolicy.yaml
   # No Traefik here: the user API is an Ingress of the Tailscale class (ingress.yaml).
   - patch: |-
       apiVersion: traefik.io/v1alpha1

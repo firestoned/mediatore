@@ -88,6 +88,37 @@ impl TestCa {
         )
     }
 
+    /// An SVID for `spiffe_id` that stops being valid `lifetime` from now (whole seconds,
+    /// as a certificate's `notAfter` is), to see what a listener does with a connection
+    /// whose peer certificate expires under it.
+    ///
+    /// # Panics
+    /// If `lifetime` does not fit a certificate's validity, or as [`Self::svid`].
+    pub fn svid_valid_for(&self, spiffe_id: &str, lifetime: std::time::Duration) -> Material {
+        let now = OffsetDateTime::now_utc();
+        let lifetime = Duration::try_from(lifetime).expect("a lifetime a certificate can carry");
+        self.svid_valid_between(spiffe_id, now - Duration::minutes(1), now + lifetime)
+    }
+
+    /// The SVID of a gateway's two listeners, `spiffe://<td>/gateway` (ADR-0028 decision 2):
+    /// the name a sandbox's forwarder verifies. Since ADR-0053 it is no peer of the broker,
+    /// and a test that wants the broker to answer a gateway asks as
+    /// [`Self::gateway_authorizer_svid`]; the kit hands out the two names separately so no
+    /// test can pass on a gateway identity looser than the real pair.
+    pub fn gateway_listener_svid(&self) -> Material {
+        self.svid(&format!("spiffe://{}/gateway", self.trust_domain))
+    }
+
+    /// The SVID of a gateway's authorizer, `spiffe://<td>/gateway/authorizer` (ADR-0053
+    /// decision 1): the one gateway identity the broker's sandbox listener and its two
+    /// gateway routes accept, and one no forwarder accepts as a gateway.
+    pub fn gateway_authorizer_svid(&self) -> Material {
+        self.svid(&format!(
+            "spiffe://{}/gateway/authorizer",
+            self.trust_domain
+        ))
+    }
+
     /// An SVID for `spiffe_id` whose validity ended an hour ago.
     pub fn expired_svid(&self, spiffe_id: &str) -> Material {
         let now = OffsetDateTime::now_utc();

@@ -175,6 +175,7 @@ impl Harness {
             inject_port: None,
             logs: None,
             log_limiter: Limiter::per_second(1),
+            accept_plain_gateway_identity: false,
             store: MemoryStore::shared(),
             spire: Arc::new(mediatore_spire::MemoryEntries::default()),
             naming: Naming {
@@ -364,18 +365,22 @@ async fn the_workload_reaches_its_upstream_through_a_gateway_as_the_claim() {
     // valid SVID of the trust domain under the gateway's path, not the gateway's), one real.
     let dead = mediatore_testkit::dead_endpoint().await;
     let rogue = StandInGateway::start(&ca, &format!("{}/rogue", gateway_svid()), vec![]).await;
+    // And one presenting the gateway's authorizer's identity (ADR-0053 decision 1): a real
+    // name of the environment, and no listener's. The forwarder verifies exactly
+    // `spiffe://<td>/gateway`, so a holder of the authorizer's SVID is no gateway to it.
+    let authorizer_named =
+        StandInGateway::start(&ca, &format!("{}/authorizer", gateway_svid()), vec![]).await;
     let live = StandInGateway::start(&ca, &gateway_svid(), vec![upstream.tls.endpoint()]).await;
-    let h = Harness::start(
-        ca,
-        upstream,
-        vec![dead.clone(), rogue.endpoint(), live.endpoint()],
-        None,
-    )
-    .await;
+    let listed = vec![
+        dead.clone(),
+        rogue.endpoint(),
+        authorizer_named.endpoint(),
+        live.endpoint(),
+    ];
+    let h = Harness::start(ca, upstream, listed.clone(), None).await;
     let (_claim, me) = h.bound().await;
     assert_eq!(
-        me.gateways,
-        [dead.clone(), rogue.endpoint(), live.endpoint()],
+        me.gateways, listed,
         "the list reaches the guest on GET /v1/me, in the broker's order (decision 6)"
     );
     let (proxy, phantom, tokens) = h.start_proxy(&me, &claim_svid(&me.claim_uid)).await;
@@ -417,6 +422,11 @@ async fn the_workload_reaches_its_upstream_through_a_gateway_as_the_claim() {
         rogue.tunnels(),
         Vec::new(),
         "an identity that is not spiffe://<td>/gateway never gets a CONNECT"
+    );
+    assert_eq!(
+        authorizer_named.tunnels(),
+        Vec::new(),
+        "a server presenting the authorizer's identity is not a gateway to the forwarder"
     );
 }
 

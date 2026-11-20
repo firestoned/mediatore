@@ -59,7 +59,8 @@ FROM ${KAIROS_BASE}
 ARG TPM_PLUGIN_AGENT_SHA
 
 # tpm2-tools: the EK certificate export banlieue's layer runs (its examples/21).
-# qemu-guest-agent: the libvirt provider reads /run/banlieue through it (ADR-0019).
+# qemu-guest-agent: the libvirt provider reads /run/banlieue through it (ADR-0019); its
+# command set is cut to what that takes by image/qemu-ga.conf, below.
 # nftables: the jail's ruleset (ADR-0020); the base has it, named so a base without it fails.
 # curl, ca-certificates: the boot-time fetch of the SPIRE bundle through the gateway (ADR-0037).
 # libprotobuf32t64, libnl-route-3-200: what the nsjail binary built above links against.
@@ -97,6 +98,9 @@ COPY image/systemd/spire-agent.service image/systemd/mediatore-guest.service ima
 # Yama's ptrace scope raised to 1: the second line behind the jail's PID namespace between
 # the workload and the egress proxy, both the sandbox uid (ADR-0025, roadmap 06).
 COPY image/sysctl/99-mediatore.conf /etc/sysctl.d/99-mediatore.conf
+# The guest agent answers the commands banlieue's provider sends and no other: no exec, no
+# file write (threat model R-43).
+COPY image/qemu-ga.conf /etc/qemu/qemu-ga.conf
 COPY image/spire/agent.conf /usr/share/mediatore/agent.conf.example
 RUN grep -q "plugin_checksum = \"${TPM_PLUGIN_AGENT_SHA}\"" /usr/share/mediatore/agent.conf.example \
     && systemctl enable spire-agent.service mediatore-guest.service mediatore-host-nft.service spire-bundle-fetch.service qemu-guest-agent.service \
