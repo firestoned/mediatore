@@ -5,7 +5,10 @@
 
 **Status:** Implemented · **Date:** 2026-11-01 · **Implemented:** 2026-11-02 (roadmap 09; the threat-model pass of that day) · **Amended:** 2026-11-05 (decision 6: a `policyRef` resolved across the watched namespaces, from the first live run) · 2026-11-09 by
 [ADR-0034](0034-the-kubernetes-api-as-the-brokers-store.md) (decision 5: the floor is a
-`PolicyFloor` resource, moved by compare-and-set on `resourceVersion`)
+`PolicyFloor` resource, moved by compare-and-set on `resourceVersion`) · 2026-11-19 by
+[ADR-0054](0054-which-policies-a-namespace-may-name.md) (decision 6: a `policyRef` is resolved
+in the sources of the sandbox's namespace; the resolution across the watched namespaces is
+withdrawn)
 
 Roadmap 09, the first step of notaio's roadmap 00 (M3, "integrate the consumers"), phase 1.
 Decides notaio's question D3 (where a sandbox names its policy) for this phase. Amends
@@ -114,6 +117,21 @@ where they disagree is from refused sandboxes. This ADR reads the bundle first a
    the policy's `uid` and the bundle version current when the claim was created, for the audit
    and for the enforcing ADR. Who may name which policy (eligibility by group, notaio's K7.2) is
    the enforcing ADR's: in shadow, naming a policy grants nothing.
+
+   *Amended 2026-11-19 by [ADR-0054](0054-which-policies-a-namespace-may-name.md): the
+   resolution across `policy.namespaces` that the 2026-11-05 amendment introduced is
+   withdrawn. A `policyRef` is resolved in the namespaces the sandbox's own namespace draws
+   from: itself alone by default, or the list the operator writes for it under
+   `policy.sources` (`PolicySources` and `BundleCache::resolve`,
+   `crates/mediatore-claims/src/policy.rs`). The deployment that amendment was written for,
+   sandboxes in one namespace and policies in another, writes a `sources` entry.
+   `policy.namespaces` says where bundles are read and nothing else. The question the last
+   sentence deferred is answered at the level of the namespace: whoever may place a sandbox
+   in a namespace may name every policy that namespace draws from. Eligibility by group is
+   still not decided and not built (ADR-0054 decision 7). And "naming a policy grants
+   nothing" holds in shadow only: under `policy.egress: enforce` the name decides the direct
+   egress and the placed audiences a claim gets, and a name that does not resolve is refused
+   at creation.*
 
 7. **The comparison reports every way the broker would allow more than the bundle,** on each
    reconcile of a sandbox and whenever its policy's bundle changes. Each gap has a stable code:

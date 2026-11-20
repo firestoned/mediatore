@@ -176,7 +176,14 @@ policy:
     - { id: "notaio:v1", public_key: "<base64 Ed25519 public key>" }
   namespaces: [sandboxes]      # where the bundle ConfigMaps are read
   egress: enforce              # ADR-0030: a bundle's direct egress joins the gateway allowlist
+  sources:                     # ADR-0054: the sandboxes are created in banlieue-system (section E)
+    banlieue-system:           # and their policies are in sandboxes, so say so
+      namespaces: [sandboxes]
 ```
+
+Without the `sources` entry a sandbox in `banlieue-system` finds no policy in `sandboxes`:
+under `enforce` a claim naming one is `400 policy_not_resolved`
+([the policy bundle](the-policy-bundle.md#which-policies-a-namespace-may-name)).
 
 What the broker does with it: verifies every bundle under those keys, keeps the version
 floor as a `PolicyFloor` (ADR-0034), records on each claim the policy incarnation and the
@@ -269,7 +276,7 @@ audiences:
 sts: { issuer: https://mediatore.<tailnet>, kid: homelab-1, signing_key_file: /etc/mediatore-sts/sts.pem }
 sandboxes: { namespace: banlieue-system }    # where POST /v1/claims creates them; the pool lives there
 store: { sealing: { key_file: /etc/mediatore-sealing/key } }
-policy: { trusted_keys: [...], namespaces: [sandboxes], egress: enforce }    # section C
+policy: { trusted_keys: [...], namespaces: [sandboxes], egress: enforce, sources: { banlieue-system: { namespaces: [sandboxes] } } }    # section C
 gateways: ["198.51.100.1:8443", "198.51.100.2:8443", "198.51.100.3:8443"]  # section F
 registries:
   - { host: "198.51.100.10:5000", reach: segment }                         # the mirror

@@ -54,6 +54,13 @@ are the questions it answers, with the recommendation this roadmap is built on.
    optional in this roadmap: a sandbox without one is reported, not refused. The claim record
    keeps the policy's uid and the bundle version seen at admission. Eligibility by group (the
    admission policy with the `SandboxPolicy` as its parameter) belongs to the enforcing roadmap.
+
+   *Amended 2026-11-19 by [ADR-0054](../../docs/adr/0054-which-policies-a-namespace-may-name.md)
+   (built under roadmap 11): "in the sandbox's namespace" is the default again, after the
+   lookup across `policy.namespaces` that the 2026-11-05 amendment of ADR-0026 added and
+   ADR-0054 withdrew. A sandbox namespace whose policies are kept elsewhere is given them by a
+   `policy.sources` entry in the broker's configuration. Eligibility by namespace is thereby
+   decided; eligibility by group is still open.*
 6. **What is compared, and how a gap is reported.** For each sandbox with a `policyRef` and a
    verified bundle, every place the broker would allow more than the bundle:
    an audience the bundle does not list; a `max_ttl` above the bundle audience's `ttlSeconds`;

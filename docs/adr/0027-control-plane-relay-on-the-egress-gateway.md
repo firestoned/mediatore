@@ -12,7 +12,9 @@ server's CA of the day);
 (decisions 2 and 3: a third fixed leg, the SPIRE bundle endpoint on `RELAY_BUNDLE_PORT`, so a
 pool member fetches its bundle at boot instead of carrying one);
 2026-11-15 by [ADR-0038](0038-the-pull-reaches-the-operators-registry-through-a-fourth-relay-leg.md)
-(decision 2: a fourth fixed leg, the operator's registry on `RELAY_REGISTRY_PORT`, for root only)
+(decision 2: a fourth fixed leg, the operator's registry on `RELAY_REGISTRY_PORT`, for root only);
+2026-11-19 by [ADR-0053](0053-the-gateways-authorizer-has-an-identity-of-its-own.md)
+(decision 5: the gateway's host table gains an output chain)
 
 Roadmap 10. Amends [ADR-0028](0028-egress-gateway-envoy-with-spiffe-identity.md) decisions 4
 and 6 (what the gateway carries, and whether the sandbox reaches the broker directly),
@@ -110,6 +112,14 @@ credential it produces. No layer is relied on alone.
    since the control plane cannot rate-limit by identity: it has none to see. This replaces
    the cgroup filter and service masking added on 2026-10-30, which stay until the table is
    proven, as the stopgap they are.
+
+   *Amended 2026-11-19 by [ADR-0053](0053-the-gateways-authorizer-has-an-identity-of-its-own.md)
+   (its decisions 5 and 6): the gateway's host table gains an output chain beside this input
+   chain, keyed on the owner of the socket, so that the broker's address is reached by the
+   authorizer's and the relay's users and by nobody else, and nothing on a gateway opens a
+   new connection toward the sandbox interface. The input chain of this decision is
+   unchanged. The output chain is asserted in the built image and has not been loaded by a
+   booted gateway VM.*
 
 6. **The sandbox's own ruleset narrows by every uid, not only the sandbox uid.** ADR-0020
    decision 3 filters the `sb-` uid and leaves root-level rules to the image. For the

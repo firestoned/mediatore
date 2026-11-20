@@ -8,7 +8,7 @@
 //! with its reason and changes nothing; an expired one leaves the cache. Nothing here admits,
 //! refuses or mints: in this phase the cache is read by the comparison alone.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Duration;
 
@@ -18,7 +18,9 @@ use k8s_openapi::api::core::v1::ConfigMap;
 use kube::runtime::WatchStreamExt as _;
 use kube::runtime::watcher::{self, Event};
 use kube::{Api, Client, ResourceExt};
-use mediatore_policy::{BundlePayload, Envelope, Refusal, TrustedKeys, admit};
+/// A verified bundle's payload, as the cache hands it out.
+pub use mediatore_policy::BundlePayload;
+use mediatore_policy::{Envelope, Refusal, TrustedKeys, admit};
 use mediatore_proto::Endpoint;
 use mediatore_store::ClaimStore;
 use tokio::sync::broadcast;
@@ -212,6 +214,103 @@ pub fn effective_grant(
 /// A policy, as `(namespace, name)`.
 pub type PolicyKey = (String, String);
 
+/// The error code of a `policyRef` that does not resolve (ADR-0054 decision 4): the front
+/// door's `400` and the first word of the sandbox's `status.reason`.
+pub const POLICY_NOT_RESOLVED: &str = "policy_not_resolved";
+
+/// What a requester is told when the policy named does not resolve, on both paths (ADR-0054
+/// decision 4). One sentence for a policy that exists nowhere, one held by a namespace the
+/// sandbox may not draw from, and one held twice: the answer never says where else a name
+/// exists.
+#[must_use]
+pub fn not_resolved(policy: &str, sandbox_namespace: &str) -> String {
+    format!(
+        "no verified bundle for policy {policy} in the namespaces {sandbox_namespace} draws its policies from"
+    )
+}
+
+/// Which policy namespaces a sandbox namespace draws from (`policy.sources`, ADR-0054
+/// decisions 1 and 2). A namespace with no entry draws from itself and from nowhere else;
+/// an entry is the whole of that namespace's sources, its own included only if listed. The
+/// broker's configuration, never cluster state.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PolicySources {
+    entries: BTreeMap<String, Vec<String>>,
+}
+
+impl PolicySources {
+    /// The mapping as `policy.sources` spells it: sandbox namespace to the policy namespaces
+    /// it draws from. A namespace listed twice in one entry counts once.
+    #[must_use]
+    pub fn new(entries: BTreeMap<String, Vec<String>>) -> Self {
+        let entries = entries
+            .into_iter()
+            .map(|(namespace, listed)| {
+                let mut sources: Vec<String> = Vec::with_capacity(listed.len());
+                for source in listed {
+                    if !sources.contains(&source) {
+                        sources.push(source);
+                    }
+                }
+                (namespace, sources)
+            })
+            .collect();
+        Self { entries }
+    }
+
+    /// The namespaces `sandbox_namespace` finds a policy in: its entry, or itself alone.
+    #[must_use]
+    pub fn sources_of<'a>(&'a self, sandbox_namespace: &'a str) -> Vec<&'a str> {
+        self.entries.get(sandbox_namespace).map_or_else(
+            || vec![sandbox_namespace],
+            |listed| listed.iter().map(String::as_str).collect(),
+        )
+    }
+
+    /// Whether a sandbox in `sandbox_namespace` may run under a policy of `policy_namespace`:
+    /// the one question the reconciler, the front door and the gateway answer all ask.
+    #[must_use]
+    pub fn draws_from(&self, sandbox_namespace: &str, policy_namespace: &str) -> bool {
+        self.entries.get(sandbox_namespace).map_or_else(
+            || sandbox_namespace == policy_namespace,
+            |listed| listed.iter().any(|n| n == policy_namespace),
+        )
+    }
+
+    /// The namespaces that have an entry, for the start log.
+    pub fn mapped(&self) -> impl Iterator<Item = &str> {
+        self.entries.keys().map(String::as_str)
+    }
+}
+
+/// What a `policyRef` came to in the sources of the sandbox's namespace (ADR-0054 decisions
+/// 1, 3 and 4). Anything but `Found` grants nothing; none of them is a lookup somewhere else.
+#[derive(Debug, Clone)]
+pub enum Resolution {
+    /// Exactly one source holds a verified, unexpired bundle of that name.
+    Found(Arc<BundlePayload>),
+    /// No source holds one: the policy is nowhere, expired, or in a namespace this sandbox
+    /// does not draw from.
+    NotFound,
+    /// More than one source holds the name; the order of the list never decides.
+    Ambiguous,
+    /// A source has not completed its first list on this replica: neither a refusal nor a
+    /// pass.
+    NotRead,
+}
+
+impl Resolution {
+    /// The bundle, when the name resolved.
+    #[must_use]
+    pub fn found(&self) -> Option<&Arc<BundlePayload>> {
+        if let Self::Found(bundle) = self {
+            Some(bundle)
+        } else {
+            None
+        }
+    }
+}
+
 /// The verified bundles, by policy. Shared with the comparison; a bundle past its
 /// `notAfter` is never handed out. Every change to a policy's entry (admitted at another
 /// version, dropped) is announced to subscribers, so the sandboxes naming that policy are
@@ -222,8 +321,9 @@ pub struct BundleCache {
     inner: RwLock<HashMap<PolicyKey, Verified>>,
     synced: RwLock<HashSet<String>>,
     changed: broadcast::Sender<PolicyKey>,
-    /// The namespaces the reflector reads (ADR-0026 decision 3), in the order listed: the
-    /// order a `policyRef` is resolved in beyond the sandbox's own namespace (decision 6).
+    /// The namespaces the reflector reads (ADR-0026 decision 3), in the order listed. Where
+    /// bundles are read and nothing more: which of them a sandbox may draw from is
+    /// [`PolicySources`]' (ADR-0054 decision 1).
     namespaces: Vec<String>,
 }
 
@@ -274,33 +374,78 @@ impl BundleCache {
             .contains(namespace)
     }
 
-    /// Whether every watched namespace completed its first list: before that, a policy a
-    /// sandbox names may simply not have been read yet (ADR-0026 decision 7), whichever
-    /// namespace holds it.
-    #[must_use]
-    pub fn synced_all(&self) -> bool {
-        let synced = self.synced.read().unwrap_or_else(PoisonError::into_inner);
-        !self.namespaces.is_empty() && self.namespaces.iter().all(|n| synced.contains(n))
+    /// The sources of `sandbox_namespace` that this cache reads. A source the reflector does
+    /// not watch holds nothing and never will: it is skipped, not waited for.
+    fn watched_sources<'a>(
+        &self,
+        sources: &'a PolicySources,
+        sandbox_namespace: &'a str,
+    ) -> Vec<&'a str> {
+        sources
+            .sources_of(sandbox_namespace)
+            .into_iter()
+            .filter(|s| self.namespaces.iter().any(|w| w == s))
+            .collect()
     }
 
-    /// The verified bundle a sandbox's `policyRef` names (ADR-0026 decision 6, amended
-    /// 2026-11-05): the sandbox's own namespace first, then the watched namespaces in their
-    /// listed order. A pool and its sandboxes need not share a namespace with the policies
-    /// notaio signs for them; the live run found them apart.
+    /// The watched sources of `sandbox_namespace` whose first list has not completed here:
+    /// while one remains, a policy that namespace names may simply not have been read yet
+    /// (ADR-0054 decision 4). No other watched namespace is waited for.
+    #[must_use]
+    pub fn unread_sources(&self, sources: &PolicySources, sandbox_namespace: &str) -> Vec<String> {
+        let listed = self.synced.read().unwrap_or_else(PoisonError::into_inner);
+        self.watched_sources(sources, sandbox_namespace)
+            .into_iter()
+            .filter(|s| !listed.contains(*s))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// The verified bundle a sandbox's `policyRef` names (ADR-0054 decisions 1 to 4, amending
+    /// ADR-0026 decision 6): looked up in the sources of the sandbox's own namespace and in no
+    /// other watched namespace. The one function for the rule, so the reconciler and the
+    /// front door cannot disagree about it. Fail closed: a name two sources hold is
+    /// `Ambiguous`, and while a source is unread the answer is `NotRead`, never a bundle
+    /// found in the sources read so far (the unread one may hold the name too).
     #[must_use]
     pub fn resolve(
         &self,
+        sources: &PolicySources,
         sandbox_namespace: &str,
         name: &str,
         now: Timestamp,
-    ) -> Option<Arc<BundlePayload>> {
-        if let Some(b) = self.get(sandbox_namespace, name, now) {
-            return Some(b);
+    ) -> Resolution {
+        if !self.unread_sources(sources, sandbox_namespace).is_empty() {
+            return Resolution::NotRead;
         }
+        let mut held = self
+            .watched_sources(sources, sandbox_namespace)
+            .into_iter()
+            .filter_map(|s| self.get(s, name, now));
+        match (held.next(), held.next()) {
+            (Some(bundle), None) => Resolution::Found(bundle),
+            (None, _) => Resolution::NotFound,
+            (Some(_), Some(_)) => Resolution::Ambiguous,
+        }
+    }
+
+    /// The watched namespaces outside the sources of `sandbox_namespace` that hold a valid
+    /// bundle named `name`. For the broker's own log (ADR-0054 decision 4): during a migration
+    /// that line is the instruction. Never part of an answer to a requester.
+    #[must_use]
+    pub fn held_outside(
+        &self,
+        sources: &PolicySources,
+        sandbox_namespace: &str,
+        name: &str,
+        now: Timestamp,
+    ) -> Vec<String> {
         self.namespaces
             .iter()
-            .filter(|n| n.as_str() != sandbox_namespace)
-            .find_map(|n| self.get(n, name, now))
+            .filter(|n| !sources.draws_from(sandbox_namespace, n))
+            .filter(|n| self.get(n, name, now).is_some())
+            .cloned()
+            .collect()
     }
 
     fn mark_synced(&self, namespace: &str) {
@@ -686,41 +831,240 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn a_policy_is_resolved_in_the_sandboxs_namespace_first_then_across_the_watched_ones() {
-        // The reflector watches two namespaces; the bundle lives in the second.
-        let suite = suite();
+    // ----- ADR-0054: which policies a namespace may name -----
+
+    /// A reflector over some namespaces with the conformance policy signed now into some of
+    /// them, each copy with a uid of its own.
+    struct Tenants {
+        reflector: BundleReflector,
+        policy: String,
+        now: Timestamp,
+    }
+
+    async fn tenants(watched: &[&str], holding: &[&str]) -> Tenants {
+        let now = Timestamp::now();
+        let fresh = mediatore_testkit::policy::fresh_bundle(now, 1);
+        let policy = fresh.payload.content.policy.name.clone();
         let reflector = BundleReflector::new(
             Arc::new(MemoryStore::default()),
-            keys(&suite),
-            vec!["other".into(), suite.policy.namespace.clone()],
+            fresh.keys,
+            watched.iter().map(|n| (*n).to_owned()).collect(),
         );
-        let cache = reflector.cache();
-        assert_eq!(
-            cache.namespaces(),
-            ["other", suite.policy.namespace.as_str()]
-        );
-        let v = vector(&suite, "accepted-first-sight");
-        reflector
-            .applied_at(&bundle_configmap(&suite, "agent-bundle", v), v.now)
-            .await;
-        let name = suite.policy.name.as_str();
-        // From a sandbox in the policy's own namespace, in another watched one, and in one
-        // the reflector does not read at all (a pool's): the same bundle.
-        for from in [suite.policy.namespace.as_str(), "other", "pool-ns"] {
-            let b = cache.resolve(from, name, v.now).expect(from);
-            assert_eq!(b.content.policy.namespace, suite.policy.namespace);
+        for namespace in holding {
+            let mut content = fresh.payload.content.clone();
+            content.policy.namespace = (*namespace).to_owned();
+            content.policy.uid = uuid::Uuid::new_v4().to_string();
+            let signed = mediatore_testkit::policy::signed_bundle(now, 1, content);
+            let cm = mediatore_testkit::policy::bundle_configmap(
+                namespace,
+                "agent-bundle",
+                &signed.envelope,
+            );
+            let outcome = reflector.applied_at(&cm, now).await;
+            assert!(
+                matches!(outcome, Outcome::Admitted { .. }),
+                "{namespace}: {outcome:?}"
+            );
         }
-        assert!(cache.resolve("pool-ns", "no-such-policy", v.now).is_none());
-        // Synced means every watched namespace listed once, whatever the sandbox's is.
-        assert!(!cache.synced_all());
-        reflector.resynced(
-            &suite.policy.namespace,
-            &HashSet::from(["agent-bundle".to_owned()]),
+        Tenants {
+            reflector,
+            policy,
+            now,
+        }
+    }
+
+    impl Tenants {
+        /// The first list of each of `namespaces` completed.
+        fn listed(&self, namespaces: &[&str]) {
+            for namespace in namespaces {
+                self.reflector
+                    .resynced(namespace, &HashSet::from(["agent-bundle".to_owned()]));
+            }
+        }
+
+        /// What a sandbox in `from` gets for the policy, as a word and the namespace of the
+        /// bundle found.
+        fn asked(&self, sources: &PolicySources, from: &str) -> (&'static str, Option<String>) {
+            outcome_of(
+                &self
+                    .reflector
+                    .cache()
+                    .resolve(sources, from, &self.policy, self.now),
+            )
+        }
+    }
+
+    fn outcome_of(resolution: &Resolution) -> (&'static str, Option<String>) {
+        match resolution {
+            Resolution::Found(b) => ("found", Some(b.content.policy.namespace.clone())),
+            Resolution::NotFound => ("not found", None),
+            Resolution::Ambiguous => ("ambiguous", None),
+            Resolution::NotRead => ("not read", None),
+        }
+    }
+
+    fn sources(entries: &[(&str, &[&str])]) -> PolicySources {
+        PolicySources::new(
+            entries
+                .iter()
+                .map(|(namespace, listed)| {
+                    (
+                        (*namespace).to_owned(),
+                        listed.iter().map(|n| (*n).to_owned()).collect(),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_policy_is_resolved_in_the_sandboxs_own_namespace_and_nowhere_else() {
+        let t = tenants(&["team-a", "team-b"], &["team-a"]).await;
+        t.listed(&["team-a", "team-b"]);
+        let unmapped = PolicySources::default();
+        assert_eq!(unmapped.sources_of("team-a"), ["team-a"]);
+        assert_eq!(
+            t.asked(&unmapped, "team-a"),
+            ("found", Some("team-a".to_owned()))
         );
-        assert!(!cache.synced_all(), "one of two listed");
-        reflector.resynced("other", &HashSet::new());
-        assert!(cache.synced_all());
+        // Another watched namespace, and one the reflector does not read at all (a pool's):
+        // the fallback across `policy.namespaces` is gone.
+        assert_eq!(t.asked(&unmapped, "team-b"), ("not found", None));
+        assert_eq!(t.asked(&unmapped, "pool-ns"), ("not found", None));
+        let cache = t.reflector.cache();
+        let other = cache.resolve(&unmapped, "team-a", "no-such-policy", t.now);
+        assert_eq!(outcome_of(&other), ("not found", None));
+        assert!(
+            other.found().is_none(),
+            "nothing but Found carries a bundle"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_policy_in_another_watched_namespace_is_not_found_without_a_sources_entry() {
+        let t = tenants(&["team-a", "team-b"], &["team-b"]).await;
+        t.listed(&["team-a", "team-b"]);
+        let unmapped = PolicySources::default();
+        assert_eq!(t.asked(&unmapped, "team-a"), ("not found", None));
+        assert!(!unmapped.draws_from("team-a", "team-b"));
+        assert!(unmapped.draws_from("team-b", "team-b"));
+        // The operator's log can say where the name is; the answer above cannot.
+        let cache = t.reflector.cache();
+        assert_eq!(
+            cache.held_outside(&unmapped, "team-a", &t.policy, t.now),
+            ["team-b"]
+        );
+        assert_eq!(
+            cache.held_outside(&unmapped, "team-b", &t.policy, t.now),
+            Vec::<String>::new()
+        );
+        // With the entry, it is found, and nothing is outside any more.
+        let mapped = sources(&[("team-a", &["team-b"])]);
+        assert_eq!(
+            t.asked(&mapped, "team-a"),
+            ("found", Some("team-b".to_owned()))
+        );
+        assert_eq!(
+            cache.held_outside(&mapped, "team-a", &t.policy, t.now),
+            Vec::<String>::new()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sources_entry_is_the_whole_of_a_namespaces_sources_its_own_included_only_if_listed()
+    {
+        // The policy lives in the sandbox namespace itself; the entry names another.
+        let t = tenants(&["infra", "infra-policies"], &["infra"]).await;
+        t.listed(&["infra", "infra-policies"]);
+        let replaced = sources(&[("infra", &["infra-policies"])]);
+        assert_eq!(replaced.sources_of("infra"), ["infra-policies"]);
+        assert!(!replaced.draws_from("infra", "infra"));
+        assert_eq!(t.asked(&replaced, "infra"), ("not found", None));
+        // Listed, its own namespace is a source again.
+        let both = sources(&[("infra", &["infra-policies", "infra"])]);
+        assert_eq!(t.asked(&both, "infra"), ("found", Some("infra".to_owned())));
+        // An entry says nothing about any other namespace.
+        assert_eq!(replaced.sources_of("infra-policies"), ["infra-policies"]);
+        assert_eq!(replaced.mapped().collect::<Vec<_>>(), ["infra"]);
+        // A namespace written twice in one entry is one source, never an ambiguity with itself.
+        let twice = sources(&[("infra", &["infra", "infra"])]);
+        assert_eq!(
+            t.asked(&twice, "infra"),
+            ("found", Some("infra".to_owned()))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_name_held_by_two_sources_is_ambiguous_whatever_the_order() {
+        let t = tenants(&["team-a", "team-b"], &["team-a", "team-b"]).await;
+        t.listed(&["team-a", "team-b"]);
+        for listed in [["team-a", "team-b"], ["team-b", "team-a"]] {
+            let mapped = sources(&[("infra", &listed)]);
+            assert_eq!(t.asked(&mapped, "infra"), ("ambiguous", None), "{listed:?}");
+        }
+        // Each namespace on its own still finds its own.
+        assert_eq!(
+            t.asked(&PolicySources::default(), "team-b"),
+            ("found", Some("team-b".to_owned()))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_namespace_is_not_read_until_its_own_sources_listed_and_no_other_is_waited_for() {
+        let t = tenants(&["team-a", "team-b"], &["team-a"]).await;
+        let unmapped = PolicySources::default();
+        let cache = t.reflector.cache();
+        // Cached already, but the first list has not completed: not an answer yet.
+        assert_eq!(t.asked(&unmapped, "team-a"), ("not read", None));
+        assert_eq!(cache.unread_sources(&unmapped, "team-a"), ["team-a"]);
+        t.listed(&["team-a"]);
+        assert_eq!(
+            t.asked(&unmapped, "team-a"),
+            ("found", Some("team-a".to_owned())),
+            "team-b is still unread and is not this namespace's source"
+        );
+        assert_eq!(
+            cache.unread_sources(&unmapped, "team-a"),
+            Vec::<String>::new()
+        );
+        // A namespace drawing from both waits for both, even with the name already found in
+        // the one that was read: the other may hold it too.
+        let mapped = sources(&[("infra", &["team-a", "team-b"])]);
+        assert_eq!(t.asked(&mapped, "infra"), ("not read", None));
+        assert_eq!(cache.unread_sources(&mapped, "infra"), ["team-b"]);
+        t.listed(&["team-b"]);
+        assert_eq!(
+            t.asked(&mapped, "infra"),
+            ("found", Some("team-a".to_owned()))
+        );
+        // A namespace the reflector does not watch is never waited for: nothing is there.
+        assert_eq!(t.asked(&unmapped, "pool-ns"), ("not found", None));
+    }
+
+    #[tokio::test]
+    async fn an_expired_bundle_in_a_source_is_not_found() {
+        let t = tenants(&["team-a"], &["team-a"]).await;
+        t.listed(&["team-a"]);
+        let unmapped = PolicySources::default();
+        let cache = t.reflector.cache();
+        let later = t.now + jiff::SignedDuration::from_hours(2);
+        assert_eq!(
+            outcome_of(&cache.resolve(&unmapped, "team-a", &t.policy, t.now)),
+            ("found", Some("team-a".to_owned()))
+        );
+        assert_eq!(
+            outcome_of(&cache.resolve(&unmapped, "team-a", &t.policy, later)),
+            ("not found", None)
+        );
+        // Expired on both sides of a mapping is not an ambiguity either.
+        let t = tenants(&["team-a", "team-b"], &["team-a", "team-b"]).await;
+        t.listed(&["team-a", "team-b"]);
+        let mapped = sources(&[("infra", &["team-a", "team-b"])]);
+        let cache = t.reflector.cache();
+        assert_eq!(
+            outcome_of(&cache.resolve(&mapped, "infra", &t.policy, later)),
+            ("not found", None)
+        );
     }
 
     #[tokio::test]

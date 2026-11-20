@@ -50,6 +50,17 @@ build time, outside this repository, which is what this ADR retires on the broke
    held by no cached bundle is "missing", per decision 1. No migration: the record already
    has what is needed.
 
+   *Amended 2026-11-19 by [ADR-0054](0054-which-policies-a-namespace-may-name.md) (decisions
+   1 and 2 here): what is served is bounded by the record's sources at the time it is served.
+   The bundle found by `uid` is usable only when its signed namespace is one of the
+   namespaces the record's namespace draws its policies from, under the configuration the
+   broker is running (`claims_bundle`, `crates/mediatore-api/src/lib.rs`); one that is not is
+   "missing", per decision 1, with a `warn` line. The uid on the record now comes from a
+   lookup in those sources only, and under `enforce` a sandbox naming a policy that does not
+   resolve there is refused at creation instead of running on the audience endpoints. A
+   source the operator removes stops serving on the gateway's next ask, as a tightened
+   policy does.*
+
 3. **Only entries the gateway can enforce exactly are served.** An entry is served when it is
    `host:port` with a DNS host name: no IP literal, no wildcard, a port, matched by the
    gateway on exact equality as every other entry is (ADR-0028 decision 4). An entry that

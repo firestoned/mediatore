@@ -65,8 +65,12 @@ pub enum Code {
     P007,
     /// No `policyRef` on the sandbox.
     P010,
-    /// A `policyRef` to no verified, unexpired bundle in the cache.
+    /// A `policyRef` to no verified, unexpired bundle in the namespaces the sandbox's own
+    /// namespace draws its policies from (ADR-0054 decision 1).
     P011,
+    /// A `policyRef` held by more than one of this namespace's sources (ADR-0054 decision 3):
+    /// the order of the list never decides between them.
+    P012,
 }
 
 impl fmt::Display for Code {
@@ -81,6 +85,7 @@ impl fmt::Display for Code {
             Self::P007 => "P007",
             Self::P010 => "P010",
             Self::P011 => "P011",
+            Self::P012 => "P012",
         })
     }
 }
@@ -105,6 +110,16 @@ fn finding(code: Code, detail: impl Into<String>) -> Finding {
         code,
         detail: detail.into(),
     }
+}
+
+/// The one finding of a `policyRef` that two of the namespace's sources hold (ADR-0054
+/// decision 3). It stands alone, as `P011` does: there is no one bundle to compare with.
+#[must_use]
+pub fn ambiguous(policy: &str) -> Finding {
+    finding(
+        Code::P012,
+        format!("policy {policy} is held by more than one of this namespace's sources"),
+    )
 }
 
 /// Every gap between what `audiences` (the broker's configuration) would allow `spec` and
@@ -384,6 +399,17 @@ mod tests {
             findings[0].to_string(),
             format!("P011 {}", findings[0].detail)
         );
+    }
+
+    #[test]
+    fn an_ambiguous_policy_ref_is_p012_alone_and_names_no_namespace() {
+        let f = ambiguous("agent");
+        assert_eq!(f.code, Code::P012);
+        assert_eq!(
+            f.to_string(),
+            "P012 policy agent is held by more than one of this namespace's sources"
+        );
+        assert_eq!(Code::P012.to_string(), "P012");
     }
 
     #[test]

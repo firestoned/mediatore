@@ -265,6 +265,13 @@ What is already true and this ADR builds on (verified in the source):
    (`the_claim_is_owned_labelled_and_copies_the_spec`, `crates/mediatore-claims/src/sandbox.rs`). The
    `PoolNotFound` itself is banlieue's and is not asserted here.
 
+   *Amended 2026-11-19 by [ADR-0054](0054-which-policies-a-namespace-may-name.md): the policy sentence
+   above no longer holds. A `policyRef` is resolved in the namespaces the sandbox's own namespace draws
+   from, itself alone by default or the list written for it under `policy.sources`; it is not looked up
+   across `policy.namespaces`. The pool half of this decision stands as written. A tenant namespace
+   whose policies are kept in another namespace therefore needs one more thing than decision 10 lists:
+   a `policy.sources` entry naming that namespace.*
+
 9. **The record carries its namespace.** `ClaimRecord` (`crates/mediatore-store`) gains
    `namespace: String`, `#[serde(default = ...)]` to the broker's `sandboxes.namespace` (the single
    namespace) for a record written before (as built, the default is the constant
@@ -549,6 +556,17 @@ Answered by the maintainer on 2026-11-17 and folded into the decisions above.
 5. **Tenant policies stay in one global policy namespace,** for simplicity and compatibility:
    `policy.namespaces` is not widened by the map and no per-tenant bundle Role is added
    (decision 8).
+
+   *Reopened 2026-11-19 by [ADR-0054](0054-which-policies-a-namespace-may-name.md) for
+   `policy.egress: enforce`. The answer was given while naming a policy granted nothing. Under `enforce`
+   the policy a sandbox names decides part of what it reaches, and every tenant whose namespace draws
+   from one policy namespace may name every policy in it: the signed bundle carries no subjects, so
+   the broker has nothing to tell the tenants apart with. ADR-0054 recommends, and its open question 1
+   was answered so, that an operator who needs tenants apart under `enforce` keeps each tenant's
+   policies in a namespace only that tenant draws from (a `policy.namespaces` line, a bundle `Role`
+   and a `policy.sources` entry each); one shared namespace stays right for `shadow`, and for policies
+   every mapped tenant is meant to have. A check by subject (which groups may use a policy) is not
+   built: it waits on notaio's bundle carrying `subjects.groups` (ADR-0054 decision 7).*
 6. **Top-level unknown keys are rejected in this change** (decision 17).
 7. **Decision 19 refuses at start immediately,** with no warn-only release.
 

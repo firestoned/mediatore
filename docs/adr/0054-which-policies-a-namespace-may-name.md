@@ -3,7 +3,13 @@
 
 # ADR-0054: Which policies a namespace may name
 
-**Status:** Proposed · **Date:** 2026-11-19
+**Status:** Accepted, implemented 2026-11-19 (decisions 1 to 6 and 8 to 10; decision 7 defers
+the check by subject, which is not built and waits on notaio's bundle carrying
+`subjects.groups`, its limit an accepted risk in the threat model; the seven open questions were
+each answered by taking the recommendation; amended at implementation, each amendment dated at
+its decision; proven by the unit and end-to-end tests of the quality gate, with what the kind
+tiers showed (both green) and what is not proven under *What was proven, and what was not*;
+nothing has run on a live cluster) · **Date:** 2026-11-19
 
 Roadmap 09 (notaio's bundles, verified in shadow) and roadmap 11 (a policy's direct egress at
 the gateway); the work lands under roadmap 11, which is the one still open. Amends
@@ -17,7 +23,8 @@ with its resolved question 5. Touches the admission of a gateway-placed audience
 decision 2). Changes no token shape, no SPIFFE ID, no CRD field, no request field and no
 storage contract. It does change a trust boundary: which namespace's policies a sandbox may run
 under becomes a rule the broker applies and the operator writes (TB-2, with rows in TB-1 and
-TB-14; see the STRIDE table).
+TB-14; see the STRIDE table). Implemented 2026-11-19; where the code differs from the text
+below, a dated amendment at the decision says what the code does and why.
 
 ## Context
 
@@ -95,6 +102,17 @@ the signed bundle already states. That is what this ADR builds on.
    cannot disagree about it, as `groups_intersect` does for ADR-0046. `policy.namespaces`
    keeps exactly one meaning: where the reflector reads.
 
+   *Amended 2026-11-19 at implementation: built as written, with these particulars.
+   `PolicySources` has `new`, `sources_of` (which returns the list by value), `draws_from`
+   (sandbox namespace, policy namespace: the one question the serving check of decision 6
+   asks) and `mapped` (the keys, for the start log). `bundle_of` returns `None` for a sandbox
+   that names no policy and for a broker that reads no bundle, and a `Resolution` otherwise;
+   `create_claim` is the second caller of `resolve` (decision 4). One thing the proposal did
+   not say: **a source the reflector does not watch is skipped.** It holds nothing and never
+   will, so it counts as `NotFound` and is never waited for as `NotRead`. Decision 8 refuses a
+   listed source that is not watched, so in practice this is the default case: a sandbox
+   namespace with no entry that is not itself in `policy.namespaces` resolves nothing.*
+
 2. **`policy.sources`: an explicit mapping from a sandbox namespace to the policy namespaces it
    draws from, for the operator who keeps policies apart from sandboxes.**
 
@@ -126,12 +144,24 @@ the signed bundle already states. That is what this ADR builds on.
    Files: `PolicySection` and `check_policy` in `crates/mediatore/src/config.rs`; the wiring
    in `crates/mediatore/src/main.rs` (`policy_egress`, `WatcherConfig`).
 
+   *Amended 2026-11-19 at implementation: the key is `policy.sources`, as proposed (open
+   question 3). The entry type is `PolicySourceEntry`, the checks are `check_policy_sources`,
+   called from `check_policy`, and `Config::policy_sources()` builds the one `PolicySources`
+   that `main.rs` hands to both readers: `WatcherConfig.policy_sources` for the reconciler and
+   `PolicyEgress.sources` for the front door and the gateway answer. The mapping travels with
+   the bundle cache and the switch it qualifies; `AppState` gains no field.*
+
 3. **A name held by two of a namespace's sources is refused as ambiguous; the order of a list
    never decides.** First-wins would make the policy a sandbox runs under depend on which
    namespace happens to be written first, and would let a policy added to one source shadow
    the one of the same name in another without either changing. `Resolution::Ambiguous` is
    reported as a new code, `P012` ("the named policy is held by more than one of this
    namespace's sources"), in `crates/mediatore-claims/src/shadow.rs`.
+
+   *Amended 2026-11-19 at implementation: built as `Code::P012` and `shadow::ambiguous`. The
+   finding stands alone, as `P011` does (there is no one bundle to compare with), and its
+   detail names the policy and no namespace
+   (`an_ambiguous_policy_ref_is_p012_alone_and_names_no_namespace`).*
 
 4. **Under `enforce`, a sandbox that names a policy which does not resolve is refused at
    creation; it is never created without a policy.** Today such a sandbox is created with no
@@ -165,6 +195,40 @@ the signed bundle already states. That is what this ADR builds on.
    - A sandbox that names **no** policy is unchanged: created, audience endpoints only,
      `P010`. Making `policyRef` required is still the enforcing ADR's (R-17).
 
+   *Amended 2026-11-19 at implementation: built in `refuse_unresolved_policy`, `refuse_policy`
+   and `hold_until_read` (`crates/mediatore-claims/src/sandbox.rs`) and in
+   `refuse_unresolved_policy` (`crates/mediatore-api/src/lib.rs`). Five things are more
+   specific than the text above.*
+
+   - *One unread source holds the answer. While any watched source of the sandbox's namespace
+     has not completed its first list, the resolution is `NotRead`, even when a source already
+     read holds the name: the unread one may hold it too, and the answer would then be
+     `Ambiguous`, not `Found`. The per-source question is `BundleCache::unread_sources`, which
+     replaces `synced_all`; the condition's message names the sources still unread.*
+   - *The hold is stricter than what it replaces. Before this ADR an unread cache still let
+     the sandbox be created, without a policy on its record. Under `enforce` nothing is
+     created and nothing written until the sources are read; under `shadow` the sandbox is
+     created as before and its verdict is `Unknown`. A watched source whose first list never
+     completes therefore holds every sandbox that names a policy from it: fail closed, and
+     recorded as an accepted risk in the threat model.*
+   - *`record_of` returns `Recorded` (`Record`, `SourcesNotRead`, `PolicyNotResolved`), so
+     under `enforce` no record is written for a sandbox naming a policy without the policy's
+     uid. `refuse_policy` deletes a claim an earlier pass created, drops the parked session
+     and never recreates the claim.*
+   - *A sandbox whose claim already has its record is not judged again (`recorded_already`).
+     It was admitted by an earlier pass, possibly one whose status patch never landed; a
+     policy that later expires, is deleted or leaves the namespace's sources does not fail a
+     running sandbox at the reconciler. What that sandbox is then served is decision 6's:
+     the audience endpoints only.*
+   - *The operator's line is `say_where_the_policy_is`: a `warn`, in both modes, for a name
+     held by a watched namespace outside the sources, said once per sandbox. At the front
+     door the `400` body is the same for a policy elsewhere, nowhere and held twice
+     (`policy::not_resolved` builds the sentence for both paths, and
+     `under_enforce_a_claim_naming_a_policy_outside_its_sources_is_400_and_parks_nothing`
+     compares the answer with it); the difference is in the broker's log (`held_outside`,
+     `sources`, `ambiguous`). Under `shadow` the front door logs "enforce would refuse this
+     claim" and creates the sandbox.*
+
 5. **`shadow` applies the same rule and refuses nothing.** In `shadow` the resolution is the
    one of decisions 1 to 3; an unresolved name is reported (`P011`, `P012`, the operator's log
    line of decision 4) and the sandbox is created as today, its record without a
@@ -184,6 +248,14 @@ the signed bundle already states. That is what this ADR builds on.
    then takes effect on running sandboxes within the gateway's bound, as a tightened policy
    does (ADR-0030 decision 2); and the creation rule stops being the only place the boundary
    is held.
+
+   *Amended 2026-11-19 at implementation: the check is one function, `claims_bundle(pe, rec)`
+   (`crates/mediatore-api/src/lib.rs`), which both `served_direct_egress` and `policy_admits`
+   call. It asks `PolicySources::draws_from` with the record's namespace and the bundle's
+   signed namespace, under the configuration the broker is running, so no record is migrated.
+   The sources are a field of `PolicyEgress` (decision 2's amendment). The `warn` line is
+   written on every ask that meets such a record, not once per claim: it is not rate limited,
+   and the gateway's cache bounds how often an ask arrives.*
 
 7. **Eligibility by subject (which groups may use a policy) is not decided here; it belongs
    with notaio's signed bundle, in an ADR of its own.** The reasons, in order of weight:
@@ -209,6 +281,14 @@ the signed bundle already states. That is what this ADR builds on.
    tenant's policies in a namespace only that tenant draws from. A shared policy namespace
    remains right for policies every mapped tenant is meant to have.
 
+   *Not built, 2026-11-19. Nothing in the tree reads a policy's subjects: no check of a
+   caller's groups against a policy exists at the front door, at the reconciler or at serving
+   time. It waits on two things outside this repository's code: notaio compiling
+   `spec.subjects.groups` into the signed bundle (a schema change there, then a tag bump
+   here), and the group spelling question of ADR-0046 decision 2 settled for that list. The
+   ADR of its own is not written. Until then the statement in bold above is the whole of the
+   eligibility rule, and it is an accepted risk in the threat model.*
+
 8. **Validation at start, and the log of what was resolved.** Refused at start, the message
    naming the key and the value (`check_policy`, `crates/mediatore/src/config.rs`):
    - a `sources` entry naming a namespace that `policy.namespaces` does not list (the broker
@@ -224,6 +304,12 @@ the signed bundle already states. That is what this ADR builds on.
    `warn` each such namespace whose sources include no watched namespace, since every
    `policyRef` there will be refused under `enforce` (decision 4) or reported under `shadow`.
    Names from configuration, never a token.
+
+   *Amended 2026-11-19 at implementation: the checks are `check_policy_sources` and the start
+   lines `Config::log_policy_sources`, both in `crates/mediatore/src/config.rs`. A duplicate
+   key, a missing `namespaces` and an unknown field are refused by the parse; the rest by the
+   function, after `policy.namespaces` has its default filled in, so the default watched
+   namespace counts as watched. The `warn` never refuses the start (open question 4).*
 
 9. **Migration: the broker and its configuration in one rollout, shadow first.**
    - *Sandboxes and policies in one namespace* (the default, and the kind tiers): nothing to
@@ -253,6 +339,14 @@ the signed bundle already states. That is what this ADR builds on.
 
 None of these controls exists yet. Each names the file it will live in; the threat-model pass
 after implementation cites them only once they are built and tested.
+
+*Amended 2026-11-19 at implementation:* the controls below are built, and the threat model's
+TB-1, TB-2 and TB-14 carry them with their tests since the pass of the same day; the *(not yet
+built)* marks are left as the proposal read. The serving check is `claims_bundle`, which the two
+functions named in the first row call. The last row is accepted there as R-54, and the pass
+adds a second accepted risk the table did not foresee, R-55: under `enforce` a watched source
+whose first list never completes holds every sandbox that names a policy from it (decision 4's
+amendment).
 
 | Threat | STRIDE | Control (not yet built) |
 | --- | --- | --- |
@@ -399,7 +493,79 @@ Live, in kind, on the build host:
 
 `make check` green on the build host, and the threat-model pass, before the status moves.
 
+## What was proven, and what was not
+
+Proven on 2026-11-19, on the build host:
+
+- **The quality gate** (`make check`): the unit and end-to-end tests named above exist under
+  those names and pass. Added beyond the list:
+  `a_policy_sources_entry_is_the_whole_of_that_namespaces_sources` (`config.rs`),
+  `an_ambiguous_policy_ref_is_p012_alone_and_names_no_namespace` (`shadow.rs`),
+  `a_claim_whose_record_exists_is_not_judged_again_when_its_policy_goes` and
+  `a_sandbox_in_the_pools_namespace_finds_its_policy_through_a_sources_entry` (`sandbox.rs`),
+  and `a_replica_that_has_not_read_the_sources_does_not_guess_at_the_front_door` (the API's
+  `mod policy_sources`, `crates/mediatore-api/src/lib.rs`). The API cases are in that module;
+  three of them run again over real HTTP in `crates/mediatore/tests/e2e_gateway.rs`:
+  `a_claim_in_team_a_gets_nothing_from_a_policy_of_team_b`,
+  `a_mapped_policy_namespace_serves_its_direct_egress_under_enforce` and
+  `under_enforce_a_claim_naming_a_policy_outside_its_sources_is_400_and_parks_nothing`.
+- **The kind policy tiers, both green on the build host (2026-11-19):**
+  `make kind-e2e-ci KIND_E2E_SUITES="kind-e2e-policy kind-e2e-gateway-policy"`, against a real
+  API server, notaio signing with OpenBao, and a real Envoy.
+  - `kind-e2e-policy` (`dev/kind/policy-e2e.sh`): a policy held in a second namespace the broker
+    reads. Under `shadow` with no `sources` entry the sandbox naming it reports `P011`, is
+    still created with its claim, and the broker's log says where the policy is held. Under
+    `enforce` with no entry the sandbox is `Failed` with `policy_not_resolved`, no
+    `VirtualMachineClaim` exists, and the reason is the one a policy that exists nowhere gets;
+    a policy in the sandbox's own namespace is still admitted and conformant. With the
+    `policy.sources` entry and a restart, the start log names both sources and the same name
+    is admitted, conformant, and recorded with a bundle version.
+  - `kind-e2e-gateway-policy` (`dev/kind/gateway-e2e.sh`, run again green on 2026-11-20 in
+    this form): decision 6 at the real Envoy, two sandboxes in two namespaces naming one
+    policy. Under `enforce`, a second sandbox namespace mapped by `policy.sources` to draw from
+    itself and the policy's namespace had its sandbox admitted, bound and its tunnel to the
+    bundle's second port answered `200`. That namespace was then unmapped and the broker
+    restarted: on the next ask its claim's tunnel to the port was refused (`403` in Envoy's
+    access log, `not_allowed` from the authorizer, `502 gateway_refused` at the workload) with
+    the broker's line that the claim's bundle is outside its namespace's sources, while the
+    first sandbox, whose namespace holds the policy, kept the port (`200`) and never drew that
+    line. The audience's own destination answered both.
+- **With the audience-scoping ADR-0053 (2026-11-20).** That ADR's phase 2, merged while this
+  one was in review, takes a claim's grants from its bundle under `policy.audiences: enforce`.
+  On the rebase its lookups were brought under this ADR: the front door's `admit_under_policy`
+  and the reconciler's `refuse_under_policy` resolve in the namespace's sources (an unread
+  source of that namespace is `503 policy_not_synced` or a hold, another namespace's is not),
+  and `claim_bundle` reads the bundle through `claims_bundle`, so a grant comes only from a
+  policy the namespace draws from. Tests:
+  `a_grant_from_a_bundle_outside_the_records_sources_is_not_served` (`lib.rs`) and
+  `under_enforce_a_policy_outside_the_namespaces_sources_grants_nothing` (`sandbox.rs`);
+  `make check` on the build host, 1096 passed.
+
+Not proven:
+
+- **Decision 7 is not built.** No test and no control exists for eligibility by subject.
+- **What the two kind scenarios are, and are not.** `dev/kind/policy-e2e.sh` adds a second policy
+  namespace, the `P011` verdict under `shadow`, the `Failed` sandbox under `enforce` with the
+  reason of a policy that exists nowhere, and the same name admitted and recorded after a
+  `sources` entry and a restart. `dev/kind/gateway-e2e.sh` runs two sandboxes in two
+  namespaces side by side, as this ADR asked; the withdrawal it shows comes from a `sources`
+  entry removed across a restart, the one way a record comes to hold a uid outside its
+  sources on a build that carries ADR-0054 (a record written before ADR-0054 is not
+  reproduced). In both tiers the existing steps keep sandboxes and policies in one
+  namespace, as before.
+- **Ambiguity at the front door has no API test.** `Resolution::Ambiguous` is covered in
+  `policy.rs` and at the reconciler in `sandbox.rs`; the `400` for a name held twice is the
+  same branch as `NotFound` in `create_claim` and is not driven by a test of its own.
+- **An unread source that never becomes read** (a watch that cannot list, a missing `Role`)
+  is not exercised beyond the hold itself: how an operator notices it is the condition and
+  nothing more.
+- Nothing has run on a live cluster, and the migration of decision 9 has not been walked on
+  a deployment that keeps policies apart from sandboxes.
+
 ## Open questions
+
+*All seven were answered on 2026-11-19, each by taking its recommendation; the answer follows
+each question.*
 
 1. **One policy namespace for several tenants under `enforce`.** Resolved question 5 of
    ADR-0046 chose it; decision 7 says it then shares every policy in it. Three ways out: split
@@ -408,27 +574,36 @@ Live, in kind, on the build host:
    *Recommendation:* split per tenant now and add no `names` list. It uses what exists, it is
    one configuration change per tenant instead of one per policy, and it does not have to be
    unpicked when subjects arrive. If the maintainer holds to one namespace, `names` is the
-   honest interim and the entry type has room for it.
+   honest interim and the entry type has room for it. (Answered 2026-11-19: split per tenant;
+   no `names` list is built. A policy namespace shared by several tenants under `enforce`
+   shares every policy in it, which the threat model records as an accepted risk.)
 2. **Ask notaio to compile `subjects.groups` into the bundle, and plan the follow-on ADR
    here?** *Recommendation:* yes, as a request on notaio's roadmap 00 (D3), with the group
    spelling question of ADR-0046 decision 2 settled there first. The broker's check is small
-   once the signed data exists.
+   once the signed data exists. (Answered 2026-11-19: yes. The follow-on ADR is not written
+   and the check is not built: decision 7.)
 3. **The key's name and place.** `policy.sources.<namespace>.namespaces` reads well beside
    `policy.namespaces` but the two are easy to confuse. *Recommendation:* keep it under
    `policy` (decision 2's reasons) and let the maintainer pick the word; `policy.draws_from`
-   is the alternative.
+   is the alternative. (Answered 2026-11-19: `policy.sources`.)
 4. **Should a claimable namespace with no watched source refuse the start under `enforce`?**
    *Recommendation:* no, a `warn` line (decision 8). A tenant with audiences and no policy is
    legitimate, and its `policyRef`s are already refused one by one. Refuse at start only if
-   the maintainer wants ADR-0046's stricter reading.
+   the maintainer wants ADR-0046's stricter reading. (Answered 2026-11-19: no, a `warn` line,
+   `Config::log_policy_sources`.)
 5. **`400` at the front door, or only the `Failed` sandbox?** The early answer is kinder to a
    person at a terminal; it is also a second call site for the rule. *Recommendation:* keep
-   both, with the one function and the test that pins the two messages equal.
+   both, with the one function and the test that pins the two messages equal. (Answered
+   2026-11-19: both, as decision 4 is built.)
 6. **Does removing a source withdraw reach from running sandboxes (decision 6), or apply to
    new claims only?** *Recommendation:* withdraw. It matches how a tightened bundle behaves,
    and a mapping an operator narrows in a hurry should not wait out every sandbox's TTL.
+   (Answered 2026-11-19: withdraw, at serving time by `claims_bundle`;
+   `removing_a_source_withdraws_the_direct_egress_on_the_next_ask`. The reconciler does not
+   fail the running sandbox: decision 4's amendment.)
 7. **Is one release of warning wanted before the fallback goes?** A build that keeps the
    fallback in `shadow` and logs each use would let the one affected shape find its `sources`
    entry from its own log. *Recommendation:* no. The `warn` line at start and the unchanged
    behaviour of `shadow` (nothing refused) already give that, and ADR-0046 resolved question 7
-   set the precedent of no warn-only release.
+   set the precedent of no warn-only release. (Answered 2026-11-19: no. The fallback is gone
+   in the build that carries this ADR.)

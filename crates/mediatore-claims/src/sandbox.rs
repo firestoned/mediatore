@@ -39,6 +39,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::policy::{BundleCache, EgressMode, POLICY_NOT_RESOLVED, Resolution, not_resolved};
 use crate::shadow;
 use crate::watch::{WatchError, Watcher, claim_uid_of, phase_of};
 
@@ -643,6 +644,19 @@ pub fn mirror_status(
     }
 }
 
+/// What a pass got when it asked for the record of the sandbox's claim
+/// ([`Watcher::record_of`]).
+enum Recorded {
+    /// The record: the one the store held, or the one this pass wrote.
+    Record(Box<ClaimRecord>),
+    /// Under `enforce`, the sandbox names a policy and a source of its namespace has not
+    /// been read on this replica: nothing is written until it has (ADR-0054 decision 4).
+    SourcesNotRead,
+    /// Under `enforce`, the policy named does not resolve any more: no record, and the
+    /// claim goes (ADR-0054 decision 4).
+    PolicyNotResolved,
+}
+
 impl Watcher {
     /// Whether `policy.audiences` is `enforce` and there are bundles to enforce (ADR-0053
     /// decision 9).
@@ -650,12 +664,17 @@ impl Watcher {
         self.cfg.audiences_mode == crate::policy::EgressMode::Enforce && self.bundles.is_some()
     }
 
-    /// Under `enforce`, before every watched namespace was listed a policy may simply not have been
-    /// read yet: the sandbox is held, never failed for a policy it cannot yet be judged by (ADR-0053
-    /// decision 10). Its spec is immutable, so a failure here would be for good.
+    /// Under `enforce`, before the namespace's policy sources were listed a policy may simply not
+    /// have been read yet: the sandbox is held, never failed for a policy it cannot yet be judged
+    /// by (ADR-0053 decision 10). Its spec is immutable, so a failure here would be for good. Only
+    /// the sandbox's own sources count (ADR-0054 decision 4): another namespace's unread source
+    /// holds nothing here.
     fn awaiting_bundles(&self, sandbox: &str, namespace: &str) -> bool {
-        let waiting =
-            self.enforcing_audiences() && !self.bundles.as_ref().is_some_and(|b| b.synced_all());
+        let waiting = self.enforcing_audiences()
+            && self.bundles.as_ref().is_some_and(|b| {
+                !b.unread_sources(&self.cfg.policy_sources, namespace)
+                    .is_empty()
+            });
         if waiting {
             tracing::info!(%sandbox, %namespace, "policy bundles not all read yet; holding the sandbox (ADR-0053)");
         }
@@ -675,14 +694,20 @@ impl Watcher {
                 "policyRef is required: name the policy this sandbox is under (ADR-0053)".into(),
             );
         };
-        let bundle = self
-            .bundles
-            .as_ref()?
-            .resolve(namespace, &policy.name, Timestamp::now());
-        let Some(bundle) = bundle else {
+        // Resolved in the namespace's sources (ADR-0054), never across every watched namespace:
+        // a grant comes only from a policy this namespace draws from. Unresolved reads as it
+        // does under `policy.egress: enforce`, one sentence whether the name is nowhere, outside
+        // the sources or held twice. Unread sources were held by `awaiting_bundles` before this.
+        let resolution = self.bundles.as_ref()?.resolve(
+            &self.cfg.policy_sources,
+            namespace,
+            &policy.name,
+            Timestamp::now(),
+        );
+        let Resolution::Found(bundle) = resolution else {
             return Some(format!(
-                "policy {} has no verified bundle (ADR-0053)",
-                policy.name
+                "{POLICY_NOT_RESOLVED}: {}",
+                not_resolved(&policy.name, namespace)
             ));
         };
         if let Some(a) = spec
@@ -844,7 +869,11 @@ impl Watcher {
             tracing::warn!(sandbox = %name, %namespace, "owned claim without a UUID uid; held");
             return Ok(Action::await_change());
         };
-        let record = self.record_of(sb, uid).await?;
+        let record = match self.record_of(sb, uid).await? {
+            Recorded::Record(record) => *record,
+            Recorded::SourcesNotRead => return self.hold_until_read(sb, &current).await,
+            Recorded::PolicyNotResolved => return self.refuse_policy(sb, &current).await,
+        };
         if let Some(refused) = self
             .refuse_without_delegation(sb, &claim, &record, &current)
             .await?
@@ -871,7 +900,8 @@ impl Watcher {
 
     /// The refusals that come before the claim is looked at: a record that is not the
     /// sandbox's own ([`Self::refuse_foreign_record`]), then a spec this broker does not serve
-    /// ([`Self::refuse`]). `Some` is the pass's answer.
+    /// ([`Self::refuse`]), then a policy that does not resolve in the namespace's sources
+    /// ([`Self::refuse_unresolved_policy`], ADR-0054 decision 4). `Some` is the pass's answer.
     async fn refuse_before_the_claim(
         &self,
         sb: &AgentSandbox,
@@ -891,7 +921,7 @@ impl Watcher {
             return Ok(Some(Action::requeue(self.cfg.requeue)));
         }
         let Some(reason) = self.refuse(&sb.spec, &namespace) else {
-            return Ok(None);
+            return self.refuse_unresolved_policy(sb, current).await;
         };
         tracing::warn!(sandbox = %sb.name_any(), %namespace, %reason, "sandbox refused; no claim created");
         self.drop_session(sb).await?;
@@ -978,31 +1008,133 @@ impl Watcher {
         Ok(Some(Action::await_change()))
     }
 
-    /// The verified bundle of the policy `sb` names, if it names one and the cache holds one
-    /// that is valid now (ADR-0026 decision 6). Read when the record is created and never
-    /// again: the record says what was current then.
-    /// The verified bundle the sandbox's `policyRef` names, resolved in the sandbox's own
-    /// namespace first and then across the watched ones (ADR-0026 decision 6, amended
-    /// 2026-11-05: a pool's namespace and the policies' need not be one).
-    fn bundle_of(&self, sb: &AgentSandbox) -> Option<Arc<BundlePayload>> {
+    /// What the sandbox's `policyRef` comes to in the sources of its own namespace (ADR-0054
+    /// decision 1, amending ADR-0026 decision 6): `None` when it names no policy or the broker
+    /// reads no bundle. The one caller of [`BundleCache::resolve`] on the creation side; the
+    /// namespace is the one the record carries, which is what the serving check compares.
+    fn bundle_of(&self, sb: &AgentSandbox) -> Option<Resolution> {
         let policy = sb.spec.policy_ref.as_ref()?;
-        self.bundles.as_ref()?.resolve(
-            &sb.namespace().unwrap_or_default(),
+        Some(self.bundles.as_ref()?.resolve(
+            &self.cfg.policy_sources,
+            &crate::kubestore::namespace_of(sb),
             &policy.name,
             Timestamp::now(),
-        )
+        ))
     }
 
-    /// The sandbox's conditions after this pass: `previous` with `PolicyConformant` replaced
-    /// by the comparison's verdict (ADR-0026 decision 7), or untouched without a `policy`
-    /// section. Computed on every pass, a terminal sandbox's included: the verdict is about
-    /// the spec and the bundle, not the claim. `lastTransitionTime` holds while the status
-    /// does. Each gap is logged when the verdict's message changes: a new bundle, a new
-    /// gap, a gap closed.
-    fn conditions(&self, sb: &AgentSandbox, previous: &[Condition]) -> Vec<Condition> {
-        let Some(bundles) = self.bundles.as_ref() else {
-            return previous.to_vec();
+    /// ADR-0054 decision 4, before any claim exists. Under `enforce` a sandbox naming a policy
+    /// that does not resolve in its namespace's sources is refused (never created without a
+    /// policy), and one whose sources are unread is held. Under `shadow` nothing is refused:
+    /// the verdict reports it (decision 5). A sandbox that names no policy, and a broker that
+    /// reads no bundle, are untouched. A sandbox whose claim already has its record was
+    /// admitted by an earlier pass and is not judged again.
+    async fn refuse_unresolved_policy(
+        &self,
+        sb: &AgentSandbox,
+        current: &AgentSandboxStatus,
+    ) -> Result<Option<Action>, WatchError> {
+        let Some(resolution) = self.bundle_of(sb) else {
+            return Ok(None);
         };
+        let enforcing = self.cfg.egress_mode == EgressMode::Enforce;
+        if matches!(resolution, Resolution::Found(_)) {
+            return Ok(None);
+        }
+        if matches!(resolution, Resolution::NotFound) {
+            self.say_where_the_policy_is(sb, current);
+        }
+        // Shadow refuses and holds nothing; the verdict carries P011, P012 or Unknown.
+        if !enforcing || self.recorded_already(sb).await? {
+            return Ok(None);
+        }
+        if matches!(resolution, Resolution::NotRead) {
+            return self.hold_until_read(sb, current).await.map(Some);
+        }
+        self.refuse_policy(sb, current).await.map(Some)
+    }
+
+    /// Whether the sandbox's owned claim exists and its record was written: the request was
+    /// admitted by a pass whose status patch never landed, and it is past the refusals that
+    /// come before a claim.
+    async fn recorded_already(&self, sb: &AgentSandbox) -> Result<bool, WatchError> {
+        let namespace = sb.namespace().unwrap_or_default();
+        let Some(claim) = self.claims.get_claim(&namespace, &sb.name_any()).await? else {
+            return Ok(false);
+        };
+        let Some(uid) = claim_uid_of(&claim).filter(|_| owned_by(&claim, sb)) else {
+            return Ok(false);
+        };
+        match self.reconciler.store.get_claim(uid).await {
+            Ok(_) => Ok(true),
+            Err(StoreError::NotFound(_)) => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// The operator's line of ADR-0054 decision 4: the policy named is held by a watched
+    /// namespace this sandbox's namespace does not draw from. The broker's own log only (the
+    /// requester's answer never says where else a name exists), in both modes, and once: a
+    /// sandbox already failed for it is not said again.
+    fn say_where_the_policy_is(&self, sb: &AgentSandbox, current: &AgentSandboxStatus) {
+        let (Some(bundles), Some(policy)) = (self.bundles.as_ref(), sb.spec.policy_ref.as_ref())
+        else {
+            return;
+        };
+        if current.phase == SandboxPhase::Failed {
+            return;
+        }
+        let namespace = crate::kubestore::namespace_of(sb);
+        let outside = bundles.held_outside(
+            &self.cfg.policy_sources,
+            &namespace,
+            &policy.name,
+            Timestamp::now(),
+        );
+        if outside.is_empty() {
+            return;
+        }
+        tracing::warn!(
+            sandbox = %sb.name_any(),
+            %namespace,
+            policy = %policy.name,
+            held_in = %outside.join(", "),
+            sources = %self.cfg.policy_sources.sources_of(&namespace).join(", "),
+            mode = %self.cfg.egress_mode,
+            "policy held by a watched namespace outside this sandbox's sources: add a policy.sources entry for the sandbox's namespace if it is meant to draw from there (ADR-0054)"
+        );
+    }
+
+    /// Hold a sandbox whose namespace's sources are unread (ADR-0054 decision 4): the verdict
+    /// says `Unknown`/`BundlesNotRead`, nothing is created or written, and the pass comes
+    /// back, since the first list of a namespace raises no event here.
+    async fn hold_until_read(
+        &self,
+        sb: &AgentSandbox,
+        current: &AgentSandboxStatus,
+    ) -> Result<Action, WatchError> {
+        self.mirror(
+            sb,
+            AgentSandboxStatus {
+                observed_generation: sb.metadata.generation,
+                conditions: self.conditions(sb, &current.conditions),
+                ..current.clone()
+            },
+        )
+        .await?;
+        Ok(Action::requeue(self.cfg.requeue))
+    }
+
+    /// Refuse a sandbox whose policy does not resolve, under `enforce` (ADR-0054 decision 4):
+    /// `Failed` with one reason whether the policy is nowhere, in a namespace this one does
+    /// not draw from, or held twice; no record, the parked session dropped, and a claim an
+    /// earlier pass created deleted before it binds a member, never recreated (the shape of
+    /// [`Self::refuse_without_delegation`]). Settled after that: a pass that finds no claim
+    /// deletes nothing and patches nothing.
+    async fn refuse_policy(
+        &self,
+        sb: &AgentSandbox,
+        current: &AgentSandboxStatus,
+    ) -> Result<Action, WatchError> {
         let name = sb.name_any();
         let namespace = sb.namespace().unwrap_or_default();
         let policy = sb
@@ -1010,48 +1142,58 @@ impl Watcher {
             .policy_ref
             .as_ref()
             .map_or("none", |p| p.name.as_str());
-        let held = previous.iter().find(|c| c.type_ == POLICY_CONFORMANT);
-        let (status, reason, message) = if bundles.synced_all() {
-            let bundle = self.bundle_of(sb);
-            let version = bundle.as_ref().map(|b| b.meta.version);
-            let findings = shadow::compare_with(
-                &sb.spec,
-                &self.cfg.audiences_in(&namespace),
-                bundle.as_deref(),
-                self.cfg.egress_mode,
-            );
-            if findings.is_empty() {
-                (
-                    "True",
-                    "Conformant",
-                    format!(
-                        "the broker allows nothing bundle v{} of {policy} does not",
-                        version.unwrap_or_default()
-                    ),
-                )
-            } else {
-                let message = findings
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join("; ");
-                if held.map(|c| c.message.as_str()) != Some(message.as_str()) {
-                    for f in &findings {
-                        tracing::warn!(sandbox = %name, %namespace, policy, bundle_version = ?version, code = %f.code, "policy gap: {}", f.detail);
-                    }
-                }
-                ("False", "Gaps", message)
+        let reason = format!(
+            "{POLICY_NOT_RESOLVED}: {}",
+            not_resolved(policy, &crate::kubestore::namespace_of(sb))
+        );
+        // Said once: the status patch below raises the event of the next pass.
+        if current.phase != SandboxPhase::Failed || current.reason.as_ref() != Some(&reason) {
+            tracing::warn!(sandbox = %name, %namespace, policy, %reason, "sandbox refused; no record written");
+        }
+        self.drop_session(sb).await?;
+        // The claim stays named once it was seen, so that a later pass meets "claim gone"
+        // and never creates a second one.
+        let mut claim_ref = current.claim_ref.clone();
+        if let Some(claim) = self.claims.get_claim(&namespace, &name).await?
+            && owned_by(&claim, sb)
+        {
+            // One held by banlieue's finalizer is already going: deleted once.
+            if claim.metadata.deletion_timestamp.is_none() {
+                self.claims.delete_claim(&namespace, &name).await?;
+                tracing::info!(sandbox = %name, %namespace, "claim of a sandbox whose policy does not resolve deleted");
             }
-        } else {
-            (
-                "Unknown",
-                "BundlesNotRead",
-                format!(
-                    "no bundle has been read from {} yet",
-                    bundles.namespaces().join(", ")
-                ),
-            )
+            if claim_ref.is_none() {
+                claim_ref = Some(LocalObjectReference {
+                    name: claim.name_any(),
+                });
+            }
+        }
+        self.mirror(
+            sb,
+            AgentSandboxStatus {
+                phase: SandboxPhase::Failed,
+                claim_ref,
+                reason: Some(reason),
+                observed_generation: sb.metadata.generation,
+                conditions: self.conditions(sb, &current.conditions),
+                ..AgentSandboxStatus::default()
+            },
+        )
+        .await?;
+        Ok(Action::await_change())
+    }
+
+    /// The sandbox's conditions after this pass: `previous` with `PolicyConformant` replaced
+    /// by the comparison's verdict (ADR-0026 decision 7), or untouched without a `policy`
+    /// section. Computed on every pass, a terminal sandbox's included: the verdict is about
+    /// the spec and the bundle, not the claim. `lastTransitionTime` holds while the status
+    /// does.
+    fn conditions(&self, sb: &AgentSandbox, previous: &[Condition]) -> Vec<Condition> {
+        let Some(bundles) = self.bundles.as_ref() else {
+            return previous.to_vec();
         };
+        let held = previous.iter().find(|c| c.type_ == POLICY_CONFORMANT);
+        let (status, reason, message) = self.verdict(sb, bundles, held);
         let last_transition_time = held.filter(|c| c.status == status).map_or_else(
             || Time(k8s_openapi::jiff::Timestamp::now()),
             |c| c.last_transition_time.clone(),
@@ -1072,15 +1214,95 @@ impl Watcher {
         out
     }
 
+    /// The status, reason and message of `PolicyConformant` for this pass. The policy is
+    /// resolved in the sandbox's sources (ADR-0054): `Unknown` only while one of those is
+    /// unread, whatever the other watched namespaces are doing; `P011` for a name no source
+    /// holds and `P012` for one two hold, each alone; otherwise the comparison with the
+    /// bundle found. Each gap is logged when the verdict's message changes: a new bundle, a
+    /// new gap, a gap closed.
+    fn verdict(
+        &self,
+        sb: &AgentSandbox,
+        bundles: &BundleCache,
+        held: Option<&Condition>,
+    ) -> (&'static str, &'static str, String) {
+        let name = sb.name_any();
+        let namespace = crate::kubestore::namespace_of(sb);
+        let policy = sb
+            .spec
+            .policy_ref
+            .as_ref()
+            .map_or("none", |p| p.name.as_str());
+        let resolution = self.bundle_of(sb);
+        if matches!(resolution, Some(Resolution::NotRead)) {
+            let unread = bundles.unread_sources(&self.cfg.policy_sources, &namespace);
+            return (
+                "Unknown",
+                "BundlesNotRead",
+                format!("no bundle has been read from {} yet", unread.join(", ")),
+            );
+        }
+        let bundle = resolution.as_ref().and_then(Resolution::found);
+        let version = bundle.map(|b| b.meta.version);
+        let findings = if matches!(resolution, Some(Resolution::Ambiguous)) {
+            vec![shadow::ambiguous(policy)]
+        } else {
+            shadow::compare_with(
+                &sb.spec,
+                &self.cfg.audiences_in(&namespace),
+                bundle.map(Arc::as_ref),
+                self.cfg.egress_mode,
+            )
+        };
+        if findings.is_empty() {
+            return (
+                "True",
+                "Conformant",
+                format!(
+                    "the broker allows nothing bundle v{} of {policy} does not",
+                    version.unwrap_or_default()
+                ),
+            );
+        }
+        let message = findings
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; ");
+        if held.map(|c| c.message.as_str()) != Some(message.as_str()) {
+            for f in &findings {
+                tracing::warn!(sandbox = %name, %namespace, policy, bundle_version = ?version, code = %f.code, "policy gap: {}", f.detail);
+            }
+        }
+        ("False", "Gaps", message)
+    }
+
     /// The record for the sandbox's claim, created on first sight. ADR-0013 decision 2:
     /// the delegated session the API parked under the sandbox's UID becomes the record's
     /// envelope, taken once.
-    async fn record_of(&self, sb: &AgentSandbox, uid: Uuid) -> Result<ClaimRecord, WatchError> {
+    ///
+    /// ADR-0054 decision 4: the record is written from the resolution made here. Under
+    /// `enforce` a record for a sandbox that names a policy always carries its `policy_uid`:
+    /// while the namespace's sources are unread nothing is written, and a name that no longer
+    /// resolves (the bundle expired or was dropped since the claim was created) writes
+    /// nothing either. Under `shadow` the record is written as before, without a
+    /// `policy_uid` when the name does not resolve. An existing record is never rewritten.
+    async fn record_of(&self, sb: &AgentSandbox, uid: Uuid) -> Result<Recorded, WatchError> {
         match self.reconciler.store.get_claim(uid).await {
-            Ok(r) => Ok(r),
+            Ok(r) => Ok(Recorded::Record(Box::new(r))),
             Err(StoreError::NotFound(_)) => {
-                let bundle = self.bundle_of(sb);
-                let mut r = record_for(sb, uid, bundle.as_deref());
+                let resolution = self.bundle_of(sb);
+                if self.cfg.egress_mode == EgressMode::Enforce {
+                    match &resolution {
+                        Some(Resolution::NotRead) => return Ok(Recorded::SourcesNotRead),
+                        Some(Resolution::NotFound | Resolution::Ambiguous) => {
+                            return Ok(Recorded::PolicyNotResolved);
+                        }
+                        Some(Resolution::Found(_)) | None => {}
+                    }
+                }
+                let bundle = resolution.as_ref().and_then(Resolution::found);
+                let mut r = record_for(sb, uid, bundle.map(Arc::as_ref));
                 if let Some(sandbox_uid) = r.sandbox_uid {
                     if let Some(session) = self.reconciler.store.take_session(sandbox_uid).await? {
                         r.refresh = Some(session.refresh);
@@ -1111,7 +1333,7 @@ impl Watcher {
                     bundle_version = ?r.bundle_version,
                     "record created"
                 );
-                Ok(r)
+                Ok(Recorded::Record(Box::new(r)))
             }
             Err(e) => Err(e.into()),
         }
@@ -3217,6 +3439,28 @@ mod tests {
             self.reflector.cache()
         }
 
+        /// The same policy name signed into `namespace` as a policy of that namespace's own
+        /// (another uid), admitted there, and that namespace's first list completed.
+        async fn also_in(&self, namespace: &str) {
+            let mut content = self.payload.content.clone();
+            content.policy.namespace = namespace.to_owned();
+            content.policy.uid = Uuid::new_v4().to_string();
+            let fresh = mediatore_testkit::policy::signed_bundle(
+                Timestamp::now(),
+                self.payload.meta.version,
+                content,
+            );
+            let cm = mediatore_testkit::policy::bundle_configmap(
+                namespace,
+                "agent-bundle",
+                &fresh.envelope,
+            );
+            let outcome = self.reflector.applied(&cm).await;
+            assert!(matches!(outcome, Outcome::Admitted { .. }), "{outcome:?}");
+            self.reflector
+                .resynced(namespace, &std::collections::HashSet::from([cm.name_any()]));
+        }
+
         /// A later version of the bundle with `edit` applied to its content, admitted.
         async fn admit(&self, version: u64, edit: impl FnOnce(&mut BundlePayload)) {
             let mut next = self.payload.clone();
@@ -3240,16 +3484,24 @@ mod tests {
     }
 
     async fn admitted_bundle(version: u64) -> Admitted {
+        admitted_watching(version, &[], true).await
+    }
+
+    /// [`admitted_bundle`] with the reflector also reading the namespaces `beside` the
+    /// policy's own (nothing in them yet), and every first list completed only when `listed`.
+    async fn admitted_watching(version: u64, beside: &[&str], listed: bool) -> Admitted {
         let mediatore_testkit::policy::FreshBundle {
             keys,
             envelope,
             payload,
         } = mediatore_testkit::policy::fresh_bundle(Timestamp::now(), version);
         let policy = payload.content.policy.clone();
+        let mut watched = vec![policy.namespace.clone()];
+        watched.extend(beside.iter().map(|n| (*n).to_owned()));
         let reflector = BundleReflector::new(
             Arc::new(mediatore_store::MemoryStore::default()),
             keys,
-            vec![policy.namespace.clone()],
+            watched,
         );
         let cm = mediatore_testkit::policy::bundle_configmap(
             &policy.namespace,
@@ -3263,10 +3515,15 @@ mod tests {
                 version,
             }
         );
-        reflector.resynced(
-            &policy.namespace,
-            &std::collections::HashSet::from([cm.name_any()]),
-        );
+        if listed {
+            reflector.resynced(
+                &policy.namespace,
+                &std::collections::HashSet::from([cm.name_any()]),
+            );
+            for namespace in beside {
+                reflector.resynced(namespace, &std::collections::HashSet::new());
+            }
+        }
         let mut sb = sandbox(true, false);
         sb.metadata.namespace = Some(policy.namespace.clone());
         sb.spec.policy_ref = Some(LocalObjectReference {
@@ -3377,24 +3634,65 @@ mod tests {
         );
     }
 
+    // ----- ADR-0054: which policies a namespace may name -----
+
+    /// `policy.egress: enforce`, the broker otherwise as the conformance bundle allows.
+    fn enforcing() -> WatcherConfig {
+        WatcherConfig {
+            egress_mode: EgressMode::Enforce,
+            ..cfg_with_git()
+        }
+    }
+
+    fn drawing(sandbox_namespace: &str, from: &[&str]) -> crate::policy::PolicySources {
+        crate::policy::PolicySources::new(BTreeMap::from([(
+            sandbox_namespace.to_owned(),
+            from.iter().map(|n| (*n).to_owned()).collect(),
+        )]))
+    }
+
+    fn status_of(r: &Rig, namespace: &str) -> AgentSandboxStatus {
+        r.claims
+            .sandbox(namespace, "sb-1")
+            .expect("the sandbox")
+            .status
+            .expect("a status")
+    }
+
+    async fn session_is_parked(r: &Rig) -> bool {
+        r.store
+            .take_session(Uuid::parse_str(SB_UID).unwrap())
+            .await
+            .unwrap()
+            .is_some()
+    }
+
+    /// The sentence a requester reads, for `policy` named from `namespace`.
+    fn not_resolved_reason(policy: &str, namespace: &str) -> String {
+        format!(
+            "policy_not_resolved: no verified bundle for policy {policy} in the namespaces {namespace} draws its policies from"
+        )
+    }
+
     #[tokio::test]
-    async fn a_sandbox_in_the_pools_namespace_finds_its_policy_in_the_watched_one() {
-        // The live run of 2026-11-05: the pool and its sandboxes in one namespace, notaio's
-        // bundles in another; the policyRef must still resolve, for the record and the verdict.
+    async fn a_sandbox_in_the_pools_namespace_finds_its_policy_through_a_sources_entry() {
+        // The shape of the live run of 2026-11-05: the pool and its sandboxes in one
+        // namespace, notaio's bundles in another. Since ADR-0054 the operator says so
+        // (`policy.sources`); the watched list alone no longer does.
         let a = admitted_bundle(3).await;
         let mut sb = a.sb.clone();
         sb.metadata.namespace = Some("pool-ns".into());
-        let r = rig_with(cfg_with_git(), Some(a.cache()));
+        let r = rig_with(
+            WatcherConfig {
+                policy_sources: drawing("pool-ns", &["conformance"]),
+                ..enforcing()
+            },
+            Some(a.cache()),
+        );
         r.claims.put_sandbox(sb.clone());
         r.watcher.reconcile_sandbox(&sb).await.unwrap();
-        let held = r.claims.sandbox("pool-ns", "sb-1").unwrap();
-        let c = conformant(&held);
-        assert_eq!(
-            (c.status.as_str(), c.reason.as_str()),
-            ("True", "Conformant"),
-            "{}",
-            c.message
-        );
+        let st = status_of(&r, "pool-ns");
+        assert_eq!(st.phase, SandboxPhase::Pending, "{:?}", st.reason);
         let claim = r.claims.claim("pool-ns", "sb-1").expect("claim created");
         let rec = r
             .store
@@ -3406,6 +3704,402 @@ mod tests {
             rec.policy_uid.as_deref(),
             Some(a.payload.content.policy.uid.as_str())
         );
+        assert_eq!(rec.namespace, "pool-ns");
+    }
+
+    #[tokio::test]
+    async fn under_enforce_a_policy_ref_that_does_not_resolve_is_refused_before_any_claim_exists() {
+        // The policy is real and verified, in a watched namespace this sandbox's namespace
+        // does not draw from.
+        let a = admitted_watching(1, &["team-a"], true).await;
+        let policy = a.payload.content.policy.name.clone();
+        let mut sb = a.sb.clone();
+        sb.metadata.namespace = Some("team-a".into());
+        let r = rig_with(enforcing(), Some(a.cache()));
+        r.store.put_session(parked_session()).await.unwrap();
+        r.claims.put_sandbox(sb.clone());
+        assert_eq!(
+            r.watcher.reconcile_sandbox(&sb).await.unwrap(),
+            Action::await_change()
+        );
+        let st = status_of(&r, "team-a");
+        assert_eq!(st.phase, SandboxPhase::Failed);
+        assert_eq!(
+            st.reason.as_deref(),
+            Some(not_resolved_reason(&policy, "team-a").as_str())
+        );
+        assert!(st.claim_ref.is_none() && st.claim_uid.is_none());
+        assert_eq!(st.observed_generation, Some(1));
+        let held = r.claims.sandbox("team-a", "sb-1").unwrap();
+        let c = conformant(&held);
+        assert_eq!((c.status.as_str(), c.reason.as_str()), ("False", "Gaps"));
+        assert!(c.message.starts_with("P011"), "{}", c.message);
+        assert!(
+            r.claims.claim("team-a", "sb-1").is_none(),
+            "no claim is created"
+        );
+        assert!(
+            r.store.list_claims().await.unwrap().is_empty(),
+            "no record is written"
+        );
+        assert!(
+            !session_is_parked(&r).await,
+            "the parked session is dropped, as for every other refusal"
+        );
+        // Settled: another pass creates nothing and patches nothing.
+        let before = r.claims.patches();
+        r.watcher.reconcile_sandbox(&held).await.unwrap();
+        assert_eq!(r.claims.patches(), before);
+        assert!(r.claims.claim("team-a", "sb-1").is_none());
+    }
+
+    #[tokio::test]
+    async fn the_refusal_is_the_same_for_a_policy_elsewhere_and_a_policy_nowhere() {
+        let a = admitted_watching(1, &["team-a"], true).await;
+        let mut sb = a.sb.clone();
+        sb.metadata.namespace = Some("team-a".into());
+        // Elsewhere: the cache holds the policy, in `conformance`. Nowhere: the same watched
+        // namespaces, read, holding nothing.
+        let empty = BundleReflector::new(
+            Arc::new(mediatore_store::MemoryStore::default()),
+            mediatore_testkit::policy::fresh_bundle(Timestamp::now(), 1).keys,
+            vec!["conformance".into(), "team-a".into()],
+        );
+        for namespace in ["conformance", "team-a"] {
+            empty.resynced(namespace, &std::collections::HashSet::new());
+        }
+        let mut answers = Vec::new();
+        for cache in [a.cache(), empty.cache()] {
+            let r = rig_with(enforcing(), Some(cache));
+            r.claims.put_sandbox(sb.clone());
+            r.watcher.reconcile_sandbox(&sb).await.unwrap();
+            let held = r.claims.sandbox("team-a", "sb-1").unwrap();
+            let c = conformant(&held);
+            let st = held.status.clone().unwrap();
+            assert!(r.claims.claim("team-a", "sb-1").is_none());
+            answers.push((
+                st.phase,
+                st.reason.unwrap_or_default(),
+                c.status.clone(),
+                c.reason.clone(),
+                c.message.clone(),
+            ));
+        }
+        assert_eq!(answers[0], answers[1]);
+        assert_eq!(answers[0].0, SandboxPhase::Failed);
+        assert!(
+            !answers[0].1.contains("conformance") && !answers[0].4.contains("conformance"),
+            "the answer does not say where else the name exists"
+        );
+    }
+
+    #[tokio::test]
+    async fn under_enforce_an_ambiguous_policy_ref_is_refused_with_p012() {
+        let a = admitted_watching(1, &["team-b"], true).await;
+        a.also_in("team-b").await;
+        let policy = a.payload.content.policy.name.clone();
+        let mut sb = a.sb.clone();
+        sb.metadata.namespace = Some("infra".into());
+        for listed in [["conformance", "team-b"], ["team-b", "conformance"]] {
+            let r = rig_with(
+                WatcherConfig {
+                    policy_sources: drawing("infra", &listed),
+                    ..enforcing()
+                },
+                Some(a.cache()),
+            );
+            r.claims.put_sandbox(sb.clone());
+            r.watcher.reconcile_sandbox(&sb).await.unwrap();
+            let st = status_of(&r, "infra");
+            assert_eq!(st.phase, SandboxPhase::Failed, "{listed:?}");
+            assert_eq!(
+                st.reason.as_deref(),
+                Some(not_resolved_reason(&policy, "infra").as_str()),
+                "{listed:?}"
+            );
+            let held = r.claims.sandbox("infra", "sb-1").unwrap();
+            let c = conformant(&held);
+            assert_eq!((c.status.as_str(), c.reason.as_str()), ("False", "Gaps"));
+            assert!(c.message.starts_with("P012"), "{listed:?}: {}", c.message);
+            assert!(r.claims.claim("infra", "sb-1").is_none(), "{listed:?}");
+            assert!(
+                r.store.list_claims().await.unwrap().is_empty(),
+                "{listed:?}: no record is written"
+            );
+        }
+        // Each namespace on its own still runs under its own policy of that name.
+        let r = rig_with(enforcing(), Some(a.cache()));
+        r.claims.put_sandbox(a.sb.clone());
+        r.watcher.reconcile_sandbox(&a.sb).await.unwrap();
+        assert_eq!(status_of(&r, "conformance").phase, SandboxPhase::Pending);
+    }
+
+    #[tokio::test]
+    async fn under_shadow_the_same_sandbox_is_created_and_reports_p011() {
+        let a = admitted_watching(1, &["team-a"], true).await;
+        let mut sb = a.sb.clone();
+        sb.metadata.namespace = Some("team-a".into());
+        let r = rig_with(cfg_with_git(), Some(a.cache()));
+        r.claims.put_sandbox(sb.clone());
+        r.watcher.reconcile_sandbox(&sb).await.unwrap();
+        let st = status_of(&r, "team-a");
+        assert_eq!(st.phase, SandboxPhase::Pending);
+        assert!(st.reason.is_none(), "shadow refuses nothing");
+        let held = r.claims.sandbox("team-a", "sb-1").unwrap();
+        let c = conformant(&held);
+        assert_eq!((c.status.as_str(), c.reason.as_str()), ("False", "Gaps"));
+        assert!(c.message.starts_with("P011"), "{}", c.message);
+        // Created as before, and its record names no policy: nothing for a later switch to
+        // enforce to start serving (decision 5).
+        let claim = r.claims.claim("team-a", "sb-1").expect("claim created");
+        let rec = r
+            .store
+            .get_claim(claim_uid_of(&claim).unwrap())
+            .await
+            .unwrap();
+        assert!(rec.policy_uid.is_none() && rec.bundle_version.is_none());
+
+        // The ambiguous name under shadow: created too, reported as P012.
+        let a = admitted_watching(1, &["team-b"], true).await;
+        a.also_in("team-b").await;
+        let mut sb = a.sb.clone();
+        sb.metadata.namespace = Some("infra".into());
+        let r = rig_with(
+            WatcherConfig {
+                policy_sources: drawing("infra", &["conformance", "team-b"]),
+                ..cfg_with_git()
+            },
+            Some(a.cache()),
+        );
+        r.claims.put_sandbox(sb.clone());
+        r.watcher.reconcile_sandbox(&sb).await.unwrap();
+        assert_eq!(status_of(&r, "infra").phase, SandboxPhase::Pending);
+        let held = r.claims.sandbox("infra", "sb-1").unwrap();
+        assert!(conformant(&held).message.starts_with("P012"));
+        let claim = r.claims.claim("infra", "sb-1").expect("claim created");
+        let rec = r
+            .store
+            .get_claim(claim_uid_of(&claim).unwrap())
+            .await
+            .unwrap();
+        assert!(rec.policy_uid.is_none(), "never the first of the two");
+    }
+
+    #[tokio::test]
+    async fn under_enforce_a_sandbox_is_held_while_its_sources_are_unread_and_no_claim_is_created()
+    {
+        // The bundle is already cached; the namespace's first list has not completed.
+        let a = admitted_watching(1, &["team-b"], false).await;
+        let r = rig_with(enforcing(), Some(a.cache()));
+        r.store.put_session(parked_session()).await.unwrap();
+        r.claims.put_sandbox(a.sb.clone());
+        assert_eq!(
+            r.watcher.reconcile_sandbox(&a.sb).await.unwrap(),
+            Action::requeue(Duration::from_millis(5)),
+            "held, and asked again: a first list raises no event"
+        );
+        let held = r.claims.sandbox("conformance", "sb-1").unwrap();
+        let c = conformant(&held);
+        assert_eq!(
+            (c.status.as_str(), c.reason.as_str()),
+            ("Unknown", "BundlesNotRead")
+        );
+        assert!(
+            c.message.contains("conformance") && !c.message.contains("team-b"),
+            "only this namespace's sources are waited for: {}",
+            c.message
+        );
+        let st = held.status.clone().unwrap();
+        assert_eq!(st.phase, SandboxPhase::Pending);
+        assert!(st.reason.is_none() && st.claim_ref.is_none());
+        assert!(r.claims.claim("conformance", "sb-1").is_none());
+        assert!(
+            r.store.list_claims().await.unwrap().is_empty(),
+            "no record is written while the sources are unread"
+        );
+        // Its own namespace listed (team-b still is not): admitted, with the policy recorded
+        // and the session it parked.
+        a.reflector.resynced(
+            "conformance",
+            &std::collections::HashSet::from([format!("{}-bundle", a.payload.content.policy.name)]),
+        );
+        assert_eq!(
+            r.watcher.reconcile_sandbox(&held).await.unwrap(),
+            Action::await_change()
+        );
+        let claim = r.claims.claim("conformance", "sb-1").expect("claim");
+        let rec = r
+            .store
+            .get_claim(claim_uid_of(&claim).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            rec.policy_uid.as_deref(),
+            Some(a.payload.content.policy.uid.as_str())
+        );
+        assert_eq!(rec.refresh, Some(parked_session().refresh));
+    }
+
+    #[tokio::test]
+    async fn under_enforce_a_record_for_a_sandbox_naming_a_policy_always_carries_its_uid() {
+        let a = admitted_bundle(4).await;
+        let r = rig_with(enforcing(), Some(a.cache()));
+        r.claims.put_sandbox(a.sb.clone());
+        r.watcher.reconcile_sandbox(&a.sb).await.unwrap();
+        let records = r.store.list_claims().await.unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].policy_uid.as_deref(),
+            Some(a.payload.content.policy.uid.as_str())
+        );
+        assert_eq!(records[0].bundle_version, Some(4));
+        // Every way the name fails to resolve writes no record at all, never one without
+        // the uid: elsewhere, nowhere, and unread.
+        let elsewhere = admitted_watching(1, &["team-a"], true).await;
+        let mut away = elsewhere.sb.clone();
+        away.metadata.namespace = Some("team-a".into());
+        let mut unsigned = a.sb.clone();
+        unsigned.spec.policy_ref = Some(LocalObjectReference {
+            name: "unsigned".into(),
+        });
+        let unread = admitted_watching(1, &[], false).await;
+        for (what, cache, sb) in [
+            ("elsewhere", elsewhere.cache(), away),
+            ("nowhere", a.cache(), unsigned),
+            ("unread", unread.cache(), unread.sb.clone()),
+        ] {
+            let r = rig_with(enforcing(), Some(cache));
+            r.claims.put_sandbox(sb.clone());
+            r.watcher.reconcile_sandbox(&sb).await.unwrap();
+            assert!(
+                r.store.list_claims().await.unwrap().is_empty(),
+                "{what}: no record without the policy's uid"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bundle_gone_between_admission_and_the_record_refuses_the_sandbox_and_deletes_the_claim()
+     {
+        // With the status naming the claim (the pass that created it landed its patch) and
+        // without (it did not): the claim exists, its record was never written, and the
+        // bundle has expired since.
+        for status_landed in [true, false] {
+            let a = admitted_bundle(1).await;
+            let policy = a.payload.content.policy.name.clone();
+            let mut sb = a.sb.clone();
+            if status_landed {
+                sb.status = Some(AgentSandboxStatus {
+                    claim_ref: Some(LocalObjectReference {
+                        name: "sb-1".into(),
+                    }),
+                    ..AgentSandboxStatus::default()
+                });
+            }
+            let r = rig_with(enforcing(), Some(a.cache()));
+            r.store.put_session(parked_session()).await.unwrap();
+            r.claims.put_sandbox(sb.clone());
+            r.claims.put_claim(owned_claim(&sb));
+            assert_eq!(
+                a.reflector
+                    .sweep(Timestamp::now() + jiff::SignedDuration::from_hours(2)),
+                1,
+                "the bundle expired"
+            );
+
+            assert_eq!(
+                r.watcher.reconcile_sandbox(&sb).await.unwrap(),
+                Action::await_change(),
+                "status_landed={status_landed}"
+            );
+            let st = status_of(&r, "conformance");
+            assert_eq!(st.phase, SandboxPhase::Failed, "{status_landed}");
+            assert_eq!(
+                st.reason.as_deref(),
+                Some(not_resolved_reason(&policy, "conformance").as_str()),
+                "status_landed={status_landed}"
+            );
+            assert!(
+                r.claims.claim("conformance", "sb-1").is_none(),
+                "status_landed={status_landed}: the claim is deleted"
+            );
+            assert!(
+                r.store.list_claims().await.unwrap().is_empty(),
+                "status_landed={status_landed}: no record is written"
+            );
+            assert!(!session_is_parked(&r).await, "{status_landed}");
+            // Never recreated: the claim stays named, and the next pass meets "claim gone".
+            assert!(st.claim_ref.is_some(), "status_landed={status_landed}");
+            let held = r.claims.sandbox("conformance", "sb-1").unwrap();
+            r.watcher.reconcile_sandbox(&held).await.unwrap();
+            assert!(r.claims.claim("conformance", "sb-1").is_none());
+            let st = status_of(&r, "conformance");
+            assert_eq!(st.phase, SandboxPhase::Failed);
+            assert!(
+                st.reason
+                    .as_deref()
+                    .unwrap_or_default()
+                    .starts_with("policy_not_resolved"),
+                "the reason outlives the claim"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_claim_whose_record_exists_is_not_judged_again_when_its_policy_goes() {
+        // Admitted and recorded; the status patch never landed; the bundle then expires. The
+        // request was accepted under the bundle of that moment: nothing is deleted here, and
+        // what the record may still reach is the serving check's (decision 6).
+        let a = admitted_bundle(1).await;
+        let r = rig_with(enforcing(), Some(a.cache()));
+        r.claims.put_sandbox(a.sb.clone());
+        r.watcher.reconcile_sandbox(&a.sb).await.unwrap();
+        assert_eq!(r.store.list_claims().await.unwrap().len(), 1);
+        a.reflector
+            .sweep(Timestamp::now() + jiff::SignedDuration::from_hours(2));
+        // The object as it was before the pass that created the claim: no status.
+        r.watcher.reconcile_sandbox(&a.sb).await.unwrap();
+        assert!(r.claims.claim("conformance", "sb-1").is_some());
+        assert_eq!(r.store.list_claims().await.unwrap().len(), 1);
+        assert_eq!(status_of(&r, "conformance").phase, SandboxPhase::Pending);
+    }
+
+    #[tokio::test]
+    async fn a_sandbox_without_a_policy_ref_is_created_as_before() {
+        let a = admitted_bundle(1).await;
+        // Enforcing, with the namespace read and with it unread: no policy named, nothing to
+        // resolve, nothing to wait for.
+        let unread = Arc::new(BundleCache::watching(vec!["conformance".into()]));
+        for (what, cache) in [("read", a.cache()), ("unread", unread)] {
+            let mut sb = a.sb.clone();
+            sb.spec.policy_ref = None;
+            let r = rig_with(enforcing(), Some(cache));
+            r.claims.put_sandbox(sb.clone());
+            assert_eq!(
+                r.watcher.reconcile_sandbox(&sb).await.unwrap(),
+                Action::await_change(),
+                "{what}"
+            );
+            let st = status_of(&r, "conformance");
+            assert_eq!(st.phase, SandboxPhase::Pending, "{what}");
+            assert!(st.reason.is_none(), "{what}");
+            let held = r.claims.sandbox("conformance", "sb-1").unwrap();
+            assert!(
+                conformant(&held).message.starts_with("P010"),
+                "{what}: {}",
+                conformant(&held).message
+            );
+            let claim = r.claims.claim("conformance", "sb-1").expect("claim");
+            let rec = r
+                .store
+                .get_claim(claim_uid_of(&claim).unwrap())
+                .await
+                .unwrap();
+            assert!(
+                rec.policy_uid.is_none() && rec.bundle_version.is_none(),
+                "{what}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -3502,7 +4196,9 @@ mod tests {
     #[tokio::test]
     async fn unknown_until_the_namespace_was_listed_and_absent_without_a_policy_section() {
         let a = admitted_bundle(1).await;
-        let r = rig_with(cfg_with_git(), Some(Arc::new(BundleCache::default())));
+        // The sandbox's own namespace is watched and its first list has not completed.
+        let unread = Arc::new(BundleCache::watching(vec!["conformance".into()]));
+        let r = rig_with(cfg_with_git(), Some(unread));
         r.claims.put_sandbox(a.sb.clone());
         r.watcher.reconcile_sandbox(&a.sb).await.unwrap();
         let held = r.claims.sandbox("conformance", "sb-1").unwrap();
@@ -3511,6 +4207,9 @@ mod tests {
             (c.status.as_str(), c.reason.as_str()),
             ("Unknown", "BundlesNotRead")
         );
+        assert!(c.message.contains("conformance"), "{}", c.message);
+        // Shadow holds nothing: the sandbox is created as before (ADR-0054 decision 5).
+        assert!(r.claims.claim("conformance", "sb-1").is_some());
 
         let r = rig(cfg_with_git());
         r.claims.put_sandbox(a.sb.clone());
@@ -3708,6 +4407,55 @@ mod tests {
         assert_eq!(st.phase, SandboxPhase::Failed);
         assert!(st.reason.unwrap().contains("no verified bundle"));
         assert!(r.claims.claim(&namespace, "sb-1").is_none());
+    }
+
+    /// ADR-0053's enforce and ADR-0054 together: the grants come only from a policy in the
+    /// sandbox namespace's sources. The same policy, named from `team-b`, is refused while
+    /// `team-b` draws from itself alone (the reason of a policy nowhere, naming no other
+    /// namespace) and admitted once a `policy.sources` entry maps it to the policy's namespace.
+    #[tokio::test]
+    async fn under_enforce_a_policy_outside_the_namespaces_sources_grants_nothing() {
+        let a = admitted_bundle(5).await;
+        let policy_ns = a.sb.namespace().unwrap();
+        let mut sb = a.sb.clone();
+        sb.metadata.namespace = Some("team-b".into());
+
+        let r = rig_with(enforcing_cfg(), Some(a.cache()));
+        r.claims.put_sandbox(sb.clone());
+        r.watcher.reconcile_sandbox(&sb).await.unwrap();
+        let st = r.claims.sandbox("team-b", "sb-1").unwrap().status.unwrap();
+        assert_eq!(st.phase, SandboxPhase::Failed);
+        let reason = st.reason.unwrap();
+        assert!(reason.contains("no verified bundle"), "{reason}");
+        assert!(
+            !reason.contains(&policy_ns),
+            "the reason never says where else the name is held"
+        );
+        assert!(r.claims.claim("team-b", "sb-1").is_none());
+
+        let mapped = WatcherConfig {
+            policy_sources: crate::policy::PolicySources::new(BTreeMap::from([(
+                "team-b".to_owned(),
+                vec![policy_ns.clone()],
+            )])),
+            ..enforcing_cfg()
+        };
+        let r = rig_with(mapped, Some(a.cache()));
+        r.claims.put_sandbox(sb.clone());
+        r.watcher.reconcile_sandbox(&sb).await.unwrap();
+        let claim = r
+            .claims
+            .claim("team-b", "sb-1")
+            .expect("admitted through the sources entry");
+        let rec = r
+            .store
+            .get_claim(claim_uid_of(&claim).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            rec.policy_uid.as_deref(),
+            Some(a.payload.content.policy.uid.as_str())
+        );
     }
 
     #[tokio::test]

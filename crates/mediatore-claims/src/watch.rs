@@ -84,6 +84,9 @@ pub struct WatcherConfig {
     /// `policy.audiences` (ADR-0053 decisions 9 to 16): under `Enforce` a sandbox is refused unless
     /// its policy resolves to a verified bundle that grants what it asks for.
     pub audiences_mode: crate::policy::EgressMode,
+    /// `policy.sources` (ADR-0054): which policy namespaces each sandbox namespace draws
+    /// from. The default maps nothing, so every namespace draws from itself alone.
+    pub policy_sources: crate::policy::PolicySources,
     /// The audiences served from the requester's own credential (`via: delegated`,
     /// ADR-0035). A sandbox naming one whose delegation did not reach its record is
     /// refused before the claim binds a VM.
@@ -165,6 +168,7 @@ impl Default for WatcherConfig {
             retention: Duration::from_hours(1),
             egress_mode: crate::policy::EgressMode::default(),
             audiences_mode: crate::policy::EgressMode::default(),
+            policy_sources: crate::policy::PolicySources::default(),
             delegated_audiences: std::collections::BTreeSet::new(),
             node_grace: Duration::from_mins(10),
             logs_enabled: false,

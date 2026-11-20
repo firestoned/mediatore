@@ -524,6 +524,70 @@ pub struct PolicySection {
     /// `enforce` refuses. Per broker deployment, so per environment.
     #[serde(default)]
     pub audiences: mediatore_claims::policy::EgressMode,
+    /// Sandbox namespace to the policy namespaces it draws from (ADR-0054 decision 2).
+    /// Optional: a namespace with no entry finds a policy in itself and nowhere else, and an
+    /// entry is the whole of that namespace's sources (its own included only if listed).
+    /// `namespaces` above says where bundles are read; this says who may run under them.
+    /// No mapping is spelled by leaving the key out: present and empty does not start.
+    #[serde(default)]
+    pub sources: Option<std::collections::BTreeMap<String, PolicySourceEntry>>,
+}
+
+/// One sandbox namespace of `policy.sources`. A struct, not a bare list, so a typo in the
+/// field is a start error (ADR-0054 decision 2).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolicySourceEntry {
+    /// The policy namespaces this sandbox namespace draws from: required, non-empty, each
+    /// one of `policy.namespaces`, none listed twice.
+    pub namespaces: Vec<String>,
+}
+
+/// ADR-0054 decision 8, each refusal naming the key and the value: `policy.sources` present
+/// and empty, a key or a listed namespace that is not an RFC 1123 label, an empty list, a
+/// namespace listed twice in one entry, and a listed namespace the reflector does not read
+/// (`policy.namespaces`, already filled in and checked). A duplicate key, a missing
+/// `namespaces` and an unknown field are refused by the parse.
+fn check_policy_sources(policy: &PolicySection) -> anyhow::Result<()> {
+    let Some(sources) = policy.sources.as_ref() else {
+        return Ok(());
+    };
+    if sources.is_empty() {
+        anyhow::bail!(
+            "policy.sources is empty: list at least one sandbox namespace, or leave the key out so that each namespace draws its policies from itself (ADR-0054 decision 8)"
+        );
+    }
+    for (ns, entry) in sources {
+        if !mediatore_proto::is_dns_label(ns) {
+            anyhow::bail!(
+                "policy.sources: key {ns:?} is not an RFC 1123 label (lowercase letters, digits and `-`, at most 63) (ADR-0054 decision 8)"
+            );
+        }
+        if entry.namespaces.is_empty() {
+            anyhow::bail!(
+                "policy.sources.{ns}.namespaces is empty: an empty list is neither \"no policies\" nor \"any\"; list the policy namespaces {ns} draws from, or remove the entry (ADR-0054 decision 8)"
+            );
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for source in &entry.namespaces {
+            if !mediatore_proto::is_dns_label(source) {
+                anyhow::bail!(
+                    "policy.sources.{ns}.namespaces: {source:?} is not an RFC 1123 label (ADR-0054 decision 8)"
+                );
+            }
+            if !seen.insert(source.as_str()) {
+                anyhow::bail!(
+                    "policy.sources.{ns}.namespaces: {source} is listed twice (ADR-0054 decision 8)"
+                );
+            }
+            if !policy.namespaces.contains(source) {
+                anyhow::bail!(
+                    "policy.sources.{ns}.namespaces: {source} is not in policy.namespaces, so no bundle is read there and the entry could never resolve: add it to policy.namespaces (with its Role) or correct the name (ADR-0054 decision 8)"
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The wrapping key for refresh material (ADR-0012 decision 3): exactly one of the local
@@ -1293,6 +1357,7 @@ impl Config {
                 );
             }
         }
+        self.log_policy_sources();
     }
 
     /// ADR-0045 decision 4: `logs.max_bytes` within its floor (one segment) and ceiling, checked
@@ -1377,7 +1442,58 @@ impl Config {
                 anyhow::bail!("policy.namespaces: {ns} is listed twice");
             }
         }
-        Ok(())
+        check_policy_sources(policy)
+    }
+
+    /// `policy.sources` as the reconciler, the front door and the gateway answer read it
+    /// (ADR-0054 decision 1). Without a `policy` section, or without the key, the mapping is
+    /// empty: every namespace draws from itself alone.
+    #[must_use]
+    pub fn policy_sources(&self) -> mediatore_claims::policy::PolicySources {
+        let entries = self
+            .policy
+            .as_ref()
+            .and_then(|p| p.sources.as_ref())
+            .map(|sources| {
+                sources
+                    .iter()
+                    .map(|(ns, entry)| (ns.clone(), entry.namespaces.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        mediatore_claims::policy::PolicySources::new(entries)
+    }
+
+    /// The start lines of ADR-0054 decision 8: per namespace the broker knows (the claim
+    /// map's, or the single namespace, and every `policy.sources` key), where it draws its
+    /// policies from at `info`; and at `warn` each one whose sources include no watched
+    /// namespace, since every `policyRef` there is refused under `enforce` and reported under
+    /// `shadow`. A warning, never a refused start: a tenant with audiences and no policy is
+    /// legitimate. Names from configuration, never a token. Nothing without a `policy`
+    /// section.
+    fn log_policy_sources(&self) {
+        let Some(policy) = self.policy.as_ref() else {
+            return;
+        };
+        let sources = self.policy_sources();
+        let mut known: std::collections::BTreeSet<String> =
+            sources.mapped().map(str::to_owned).collect();
+        match self.namespaces() {
+            Namespaces::Single(ns) => {
+                known.insert(ns);
+            }
+            Namespaces::Map(map) => known.extend(map.into_keys()),
+        }
+        for ns in &known {
+            let drawn = sources.sources_of(ns);
+            tracing::info!(namespace = %ns, sources = %drawn.join(", "), "policy sources: where this namespace draws its policies from (ADR-0054)");
+            if !drawn
+                .iter()
+                .any(|d| policy.namespaces.iter().any(|w| w == d))
+            {
+                tracing::warn!(namespace = %ns, sources = %drawn.join(", "), watched = %policy.namespaces.join(", "), mode = %policy.egress, "no policy source of this namespace is in policy.namespaces: every policyRef there is refused under enforce and reported (P011) under shadow; add a policy.sources entry for it, or watch its own namespace (ADR-0054)");
+            }
+        }
     }
 }
 
@@ -3038,6 +3154,236 @@ listen: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }
         .unwrap()
     }
 
+    // ----- ADR-0054: policy.sources ---------------------------------------------------------------------------------
+
+    /// A `policy` section reading `watched`, with `rest` appended under it (two-space indent).
+    fn policy_reading(watched: &str, rest: &str) -> String {
+        format!(
+            "policy:\n  trusted_keys: [{{ id: \"notaio:v1\", public_key: \"{}\" }}]\n  namespaces: [{watched}]\n{rest}",
+            conformance_key()
+        )
+    }
+
+    const TENANTS: &str = "sandboxes:\n  namespaces:\n    infra: { groups: [ADMIN] }\n    team-a: { groups: [A] }\n    team-b: { groups: [B] }\n";
+
+    #[test]
+    fn a_config_without_policy_sources_draws_each_namespace_from_itself() {
+        let cfg = with(&policy_reading("sandboxes, team-b", "")).unwrap();
+        assert!(cfg.policy.as_ref().unwrap().sources.is_none());
+        let sources = cfg.policy_sources();
+        assert_eq!(sources, mediatore_claims::policy::PolicySources::default());
+        assert_eq!(sources.sources_of("sandboxes"), ["sandboxes"]);
+        assert_eq!(sources.sources_of("team-b"), ["team-b"]);
+        assert!(!sources.draws_from("sandboxes", "team-b"));
+        // And without a policy section at all there is nothing to draw from or to map.
+        assert_eq!(
+            with("").unwrap().policy_sources(),
+            mediatore_claims::policy::PolicySources::default()
+        );
+    }
+
+    #[test]
+    fn a_policy_sources_entry_is_the_whole_of_that_namespaces_sources() {
+        let cfg = with(&format!(
+            "{TENANTS}{}",
+            policy_reading(
+                "team-a, team-b, infra-policies",
+                "  egress: enforce\n  sources:\n    infra:\n      namespaces: [infra-policies]\n"
+            )
+        ))
+        .unwrap();
+        let sources = cfg.policy_sources();
+        assert_eq!(sources.sources_of("infra"), ["infra-policies"]);
+        assert!(!sources.draws_from("infra", "infra"));
+        assert_eq!(sources.sources_of("team-a"), ["team-a"]);
+        // Where bundles are read is unchanged by the mapping.
+        assert_eq!(
+            cfg.policy.unwrap().namespaces,
+            ["team-a", "team-b", "infra-policies"]
+        );
+    }
+
+    #[test]
+    fn policy_sources_naming_an_unwatched_namespace_refuses_to_start() {
+        let err = refused(&policy_reading(
+            "sandboxes",
+            "  sources:\n    sandboxes: { namespaces: [infra-policies] }\n",
+        ));
+        assert!(
+            err.contains("policy.sources.sandboxes.namespaces")
+                && err.contains("infra-policies")
+                && err.contains("policy.namespaces"),
+            "{err}"
+        );
+        // The default watched namespace (filled in at load) counts as watched.
+        let cfg = with(&format!(
+            "policy:\n  trusted_keys: [{{ id: \"notaio:v1\", public_key: \"{}\" }}]\n  sources:\n    pool-ns: {{ namespaces: [sandboxes] }}\n",
+            conformance_key()
+        ))
+        .unwrap();
+        assert_eq!(cfg.policy_sources().sources_of("pool-ns"), ["sandboxes"]);
+    }
+
+    #[test]
+    fn policy_sources_present_and_empty_refuses_to_start() {
+        let err = refused(&policy_reading("sandboxes", "  sources: {}\n"));
+        assert!(err.contains("policy.sources is empty"), "{err}");
+    }
+
+    #[test]
+    fn a_sources_entry_with_an_empty_list_refuses_to_start() {
+        let err = refused(&policy_reading(
+            "sandboxes",
+            "  sources:\n    sandboxes: { namespaces: [] }\n",
+        ));
+        assert!(
+            err.contains("policy.sources.sandboxes.namespaces is empty"),
+            "{err}"
+        );
+        // No `namespaces` key at all is not an empty entry either: the parse refuses it.
+        assert!(
+            with(&policy_reading(
+                "sandboxes",
+                "  sources:\n    sandboxes: {}\n"
+            ))
+            .is_err(),
+            "an entry without namespaces does not start"
+        );
+    }
+
+    #[test]
+    fn a_sources_entry_with_a_duplicate_namespace_refuses_to_start() {
+        let err = refused(&policy_reading(
+            "sandboxes, team-b",
+            "  sources:\n    sandboxes: { namespaces: [team-b, team-b] }\n",
+        ));
+        assert!(
+            err.contains("policy.sources.sandboxes.namespaces") && err.contains("listed twice"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_sources_entry_with_a_non_dns_label_refuses_to_start() {
+        for bad in ["Team_A", "team.a", "-a"] {
+            let err = refused(&policy_reading(
+                "sandboxes",
+                &format!("  sources:\n    \"{bad}\": {{ namespaces: [sandboxes] }}\n"),
+            ));
+            assert!(
+                err.contains("policy.sources: key") && err.contains("RFC 1123"),
+                "key {bad}: {err}"
+            );
+            let err = refused(&policy_reading(
+                "sandboxes",
+                &format!("  sources:\n    sandboxes: {{ namespaces: [\"{bad}\"] }}\n"),
+            ));
+            assert!(
+                err.contains("policy.sources.sandboxes.namespaces") && err.contains("RFC 1123"),
+                "listed {bad}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_sources_entry_with_a_duplicate_key_refuses_to_start() {
+        let err = refused(&policy_reading(
+            "sandboxes, team-b",
+            "  sources:\n    sandboxes: { namespaces: [sandboxes] }\n    sandboxes: { namespaces: [team-b] }\n",
+        ));
+        assert!(
+            err.contains("sandboxes") || err.to_lowercase().contains("duplicate"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_sources_entry_with_a_typo_in_an_entry_field_refuses_to_start() {
+        for entry in [
+            "{ namespace: [sandboxes] }",
+            "{ namespaces: [sandboxes], names: [agent] }",
+        ] {
+            assert!(
+                with(&policy_reading(
+                    "sandboxes",
+                    &format!("  sources:\n    sandboxes: {entry}\n")
+                ))
+                .is_err(),
+                "{entry} does not start"
+            );
+        }
+        // A bare list is not the entry's shape either.
+        assert!(
+            with(&policy_reading(
+                "sandboxes",
+                "  sources:\n    sandboxes: [sandboxes]\n"
+            ))
+            .is_err(),
+            "a bare list does not start"
+        );
+    }
+
+    #[test]
+    fn startup_logs_where_each_namespace_draws_its_policies_from_and_warns_on_none() {
+        // team-a draws from itself (watched); infra from infra-policies (mapped, watched);
+        // team-b has no entry and is not watched: every policyRef there will be refused.
+        let cfg = with(&format!(
+            "{TENANTS}{}",
+            policy_reading(
+                "team-a, infra-policies",
+                "  egress: enforce\n  sources:\n    infra: { namespaces: [infra-policies] }\n"
+            )
+        ))
+        .unwrap();
+        let logs = startup_log(&cfg);
+        let line = |level: &str, ns: &str| -> Option<String> {
+            logs.lines()
+                .find(|l| {
+                    l.contains(level)
+                        && l.contains(&format!("namespace={ns} "))
+                        && l.contains("sources=")
+                })
+                .map(str::to_owned)
+        };
+        let infra = line("INFO", "infra").expect("an info line for infra");
+        assert!(infra.contains("sources=infra-policies"), "{infra}");
+        let own = line("INFO", "team-a").expect("an info line for team-a");
+        assert!(own.contains("sources=team-a"), "{own}");
+        let unwatched = line("INFO", "team-b").expect("an info line for team-b");
+        assert!(unwatched.contains("sources=team-b"), "{unwatched}");
+        let warned = line("WARN", "team-b").expect("a warning for team-b");
+        assert!(
+            warned.contains("no policy source of this namespace is in policy.namespaces")
+                && warned.contains("mode=enforce"),
+            "{warned}"
+        );
+        assert!(line("WARN", "infra").is_none(), "{logs}");
+        assert!(line("WARN", "team-a").is_none(), "{logs}");
+        // A warning, never a refused start (open question 4): the config above parsed.
+        // The single-namespace form with its default policy namespace warns about nothing,
+        // and without a policy section nothing is said at all.
+        let logs = startup_log(&with(&policy_reading("sandboxes", "")).unwrap());
+        assert!(
+            logs.contains("namespace=sandboxes sources=sandboxes"),
+            "{logs}"
+        );
+        assert!(
+            !logs.contains("no policy source of this namespace"),
+            "{logs}"
+        );
+        let logs = startup_log(&with("").unwrap());
+        assert!(!logs.contains("policy sources"), "{logs}");
+        // Nothing shaped like a credential in what the start logs. The markers are compared to
+        // a bool first, so a failure prints neither the marker nor the log.
+        let credential_free = ["eyJ", "Bearer", "client_secret", "refresh_token"]
+            .iter()
+            .all(|marker| !logs.contains(marker));
+        assert!(
+            credential_free,
+            "the startup log carries a credential marker"
+        );
+    }
+
     #[test]
     fn startup_logs_the_gate_form_per_issuer() {
         let logs = startup_log(&two_issuers(""));
@@ -3081,9 +3427,14 @@ listen: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }
         );
         assert!(logs.contains("APP_EXAMPLE_TEAM_A_USER"), "{logs}");
         assert!(!logs.contains("single open namespace"), "{logs}");
-        for secret in ["eyJ", "Bearer", "client_secret", "refresh_token"] {
-            assert!(!logs.contains(secret), "{secret} in {logs}");
-        }
+        // Compared to a bool first, so a failure prints neither a marker nor the log.
+        let credential_free = ["eyJ", "Bearer", "client_secret", "refresh_token"]
+            .iter()
+            .all(|marker| !logs.contains(marker));
+        assert!(
+            credential_free,
+            "the startup log carries a credential marker"
+        );
     }
 
     #[test]

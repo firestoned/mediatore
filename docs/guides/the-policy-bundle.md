@@ -82,6 +82,7 @@ policy:
   namespaces: [sandboxes]        # default: sandboxes.namespace (no default once sandboxes.namespaces is set)
   egress: shadow                 # ADR-0030: a bundle's direct egress at the gateway: shadow | enforce
   audiences: shadow              # ADR-0053: the bundle as the source of a claim's audiences: shadow | enforce
+  # sources: { ... }             # optional: which of those namespaces a sandbox namespace draws from (below)
 ```
 
 During a key rotation list the old and the new version side by side until every bundle
@@ -119,9 +120,11 @@ gateway's answer shrinks to the audience endpoints on its next ask). Keep both o
 ## Naming a policy on a sandbox
 
 `spec.policyRef` names the `SandboxPolicy` the sandbox is under, looked up in the
-sandbox's own namespace first and then in the broker's `policy.namespaces` in their listed
-order (ADR-0026 decision 6 as amended 2026-11-05): the pool and its sandboxes may live in
-the controller's namespace while the policies live in `sandboxes`. It is optional in this
+namespaces the sandbox's own namespace draws its policies from: its own namespace alone,
+unless the operator wrote a `policy.sources` entry for it
+([which policies a namespace may name](#which-policies-a-namespace-may-name),
+[ADR-0054](../adr/0054-which-policies-a-namespace-may-name.md)). A build before ADR-0054
+also looked in every namespace of `policy.namespaces`; that is gone. It is optional in this
 release and, like the rest of the spec, immutable after creation.
 
 ```yaml
@@ -145,8 +148,105 @@ When the reconciler creates the claim record it looks the policy up in the bundl
 holds and writes the policy's uid and the bundle's version on the record
 (`status.record.policyUid`, `status.record.bundleVersion` on the `AgentSandbox`), for the
 audit and for the enforcing step.
-A sandbox naming a policy with no verified bundle is admitted exactly like one naming
-none, with nothing recorded; the record is never rewritten by a later bundle.
+While `policy.egress` is `shadow`, a sandbox naming a policy with no verified bundle in
+its namespace's sources is admitted exactly like one naming none, with nothing recorded;
+under `enforce` it is refused (below). The record is never rewritten by a later bundle.
+
+## Which policies a namespace may name
+
+`policy.namespaces` says where the broker reads bundles, and nothing else. Which of those
+namespaces a sandbox may take its policy from is a second, separate statement
+([ADR-0054](../adr/0054-which-policies-a-namespace-may-name.md)):
+
+- with nothing written, a sandbox finds a policy in **its own namespace only**;
+- `policy.sources` gives a sandbox namespace the list of policy namespaces it draws from.
+
+```yaml
+# mediatore.yaml
+policy:
+  trusted_keys: [ ... ]
+  namespaces: [team-a, team-b, infra-policies]   # where bundles are read
+  egress: enforce
+  sources:                                       # optional
+    infra:
+      namespaces: [infra-policies]               # the whole of where infra finds a policy
+```
+
+Here `team-a` and `team-b` have no entry: each draws from itself and from nowhere else.
+`infra` has one, and the list is the whole of its sources: an entry replaces the default,
+it does not add to it, so list the namespace itself if its own policies are to stay
+nameable. Every listed namespace must also be in `policy.namespaces`, with the bundle
+`Role` there, or the broker refuses to start. So do an empty `sources`, an entry with an
+empty list or no `namespaces`, a namespace listed twice, a name that is not a DNS label,
+a duplicate key and an unknown field: leaving the key out is how you say "no mapping".
+
+The mapping is the broker's configuration and never a label or an annotation in the
+cluster, for the reason the keys are: whoever could write that object would choose which
+policies a tenant runs under. Review it as you review the keys.
+
+**Within one policy namespace nothing separates tenants.** Whoever may place a sandbox in
+a namespace may name every policy that namespace draws from; the broker does not check
+which groups a policy was written for (the signed bundle does not carry them). If two
+tenants draw from one policy namespace under `enforce`, both get every policy in it. To
+keep tenants apart, give each its own policy namespace and let only that tenant draw from
+it; share a namespace only for policies every tenant mapped to it is meant to have.
+
+At start the broker logs, per namespace it knows, `policy sources: where this namespace
+draws its policies from` with `namespace=` and `sources=`, and a warning, `no policy source
+of this namespace is in policy.namespaces`, for one whose sources the broker does not read:
+every `policyRef` there will be reported or refused. The warning does not stop the start.
+
+What a name that does not resolve gets depends on the switch:
+
+| | `policy.egress: shadow` (default) | `policy.egress: enforce` |
+| --- | --- | --- |
+| the name is in none of the namespace's sources (nowhere, expired, or only in a namespace it does not draw from) | created; `P011`; nothing recorded | refused: `400 policy_not_resolved` from `POST /v1/claims`, or the `AgentSandbox` goes `Failed` with `policy_not_resolved: no verified bundle for policy <name> in the namespaces <namespace> draws its policies from`; no claim is created |
+| two of the namespace's sources hold the name | created; `P012`; nothing recorded | refused, the same answer; the order of the list never decides |
+| a source has not been read yet on this replica | created; `Unknown` | held with `Unknown` / `BundlesNotRead` until it has; no claim meanwhile |
+| no `policyRef` | created; `P010` | created; `P010`; the audience endpoints only |
+
+The answer to the requester is the same whether the policy exists nowhere or in a namespace
+theirs does not draw from: it never says where else a name exists. The broker's own log
+does, for the operator: `policy held by a watched namespace outside this sandbox's sources`
+with `held_in=` and `sources=`. Under `shadow` the API logs `enforce would refuse this
+claim` for a request it would refuse.
+
+Under `enforce` the check is made again whenever the broker answers a gateway: a claim
+whose bundle was signed for a namespace outside its own namespace's sources is served the
+audience endpoints only and no gateway-placed credential, and the broker logs `the claim's
+bundle is outside its namespace's policy sources`. So removing a source takes effect on
+running sandboxes on the gateway's next ask, as a tightened policy does; it does not fail
+them. A sandbox held as `Unknown` / `BundlesNotRead` for longer than a broker start is a
+watched namespace the broker cannot list: check the bundle `Role` there.
+
+### Upgrading to a build with ADR-0054
+
+Sandboxes and policies in one namespace: nothing to write, nothing changes.
+
+Sandboxes in one namespace and policies in another (for example a pool in the controller's
+namespace and policies in `sandboxes`): this build stops finding those policies until you
+say so.
+
+1. Add the entry, the policy namespace being one already in `policy.namespaces`:
+
+    ```yaml
+    policy:
+      namespaces: [sandboxes]
+      sources:
+        banlieue-system:                 # the namespace the sandboxes are created in
+          namespaces: [sandboxes]        # where their policies are
+    ```
+
+2. Roll the image and the configuration out together. An older broker refuses to start on
+   the `sources` key it does not know; a newer one without the entry applies the
+   own-namespace default. A rollback removes the key with the image.
+3. Read the start log: one `policy sources` line per namespace, and no warning.
+4. Without the entry, under `shadow`, new sandboxes report `P011` where they reported a
+   comparison. Under `enforce`, new sandboxes naming a policy are refused, and running ones
+   lose the policy's direct egress and their gateway-placed credentials on the gateway's
+   next ask.
+5. Before turning `enforce` on with this build, or back on: one week of `shadow` with no
+   `P011`, no `P012` and no `outside this sandbox's sources` line that you did not expect.
 
 ## Reading the findings
 
@@ -159,7 +259,7 @@ not the claim.
 | --- | --- | --- |
 | `True` | `Conformant` | the broker's configuration allows this sandbox nothing the bundle does not |
 | `False` | `Gaps` | the message lists each gap as `<code> <detail>`, separated by `;` |
-| `Unknown` | `BundlesNotRead` | the broker has not finished reading the bundles of the watched namespaces yet |
+| `Unknown` | `BundlesNotRead` | the broker has not finished reading the bundles of the namespaces this sandbox's namespace draws from; the message names the ones still unread |
 
 ```
 $ kubectl -n agents get agentsandbox ledgers-2026-10-14 \
@@ -179,7 +279,8 @@ policy and the bundle version when it appears or changes:
 | `P005` | a sandbox `ttlSeconds` above the bundle's `lease.maxDurationSeconds` |
 | `P006` | nothing: the bundle holds direct `egress[]`, which the broker does not provide while `policy.egress` is `shadow` (under `enforce` it does, and only an entry it cannot serve is reported, as `P007`) |
 | `P010` | no `policyRef` on the sandbox |
-| `P011` | a `policyRef` to no verified, unexpired bundle |
+| `P011` | a `policyRef` to no verified, unexpired bundle in the namespaces the sandbox's namespace draws its policies from |
+| `P012` | a `policyRef` that more than one of those namespaces holds: the name is ambiguous and no bundle is compared |
 
 Reading them: `P001` to `P005` are the places where `audiences[]` in `mediatore.yaml`, or
 the request itself, is looser than the reviewed policy; each becomes a refusal one for one
@@ -190,7 +291,11 @@ proxy gets a route for each with no credential ([ADR-0030](../adr/0030-policy-eg
 [ADR-0025](../adr/0025-phantom-token-egress-proxy.md) decision 8), and what cannot be
 served (rules, a wildcard, an IP literal) is `P007`. `P010` says the sandbox is
 outside the policy altogether; `P011` that it names one notaio has not published a bundle
-for, or one the broker does not trust: check the broker's log for the refusal.
+for, one the broker does not trust, or one in a namespace the sandbox's namespace does not
+draw from: check the broker's log for the refusal, or for the `outside this sandbox's
+sources` line. `P012` is two policies of one name in two of the namespace's sources: rename
+one, or drop a source. Under `policy.egress: enforce`, `P011` and `P012` come with a
+refused sandbox ([above](#which-policies-a-namespace-may-name)).
 
 Two things the comparison deliberately does not claim. A bundle rule covers a broker rule
 only when it admits every request the broker rule does: the same method or `*`, and a
@@ -232,7 +337,8 @@ ahead of notaio's by more than the refresh margin, takes the audiences away from
 
 ## What comes next
 
-`policy.audiences` enforces a claim's audiences, rules, endpoints and lifetimes (above). Still shadow-only: eligibility by group from the
-bundle, a default policy per namespace applied without being named, and removing `egress` and `rules` from the broker's configuration (the
-audience's `rules` stay as the ceiling for now). Until `policy.audiences` is `enforce` in your environment, the condition on the sandbox is the
+`policy.audiences` enforces a claim's audiences, rules, endpoints and lifetimes (above), and `policy.sources` decides which namespace may
+name which policy (above, ADR-0054). Still shadow-only: eligibility by group from the bundle (ADR-0054 decision 7, not built), a default
+policy per namespace applied without being named, and removing `egress` and `rules` from the broker's configuration (the audience's
+`rules` stay as the ceiling for now). Until `policy.audiences` is `enforce` in your environment, the condition on the sandbox is the
 list of what would break.
