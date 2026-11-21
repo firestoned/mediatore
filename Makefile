@@ -66,9 +66,9 @@ testkit             = $(if $(KIND_PREBUILT),./dist/$(1)$(if $(2), $(2)),cargo ru
 # the version, and the SHA-256 of each manifest from the release's checksums.sha256
 # (itself sigstore-signed; `cosign verify-blob` by hand after a bump, notaio's install
 # guide has the identity). A bump is these three lines.
-NOTAIO_VERSION         ?= 0.3.3
-NOTAIO_CRDS_SHA256     := f26c2d9e7aa967f7ca815e6da269a1e1f1bf21213a787c3cfbf68663fbffc5c9
-NOTAIO_MANIFEST_SHA256 := 3581bd524a822e3cb773d05a4587ad28d139b7073613711654bb598b8eedbd2c
+NOTAIO_VERSION         ?= 0.7.0-rc.1
+NOTAIO_CRDS_SHA256     := e6f08509d7083a3be60f7c5f62be50e960917412ebb81129bc2d9d7767928231
+NOTAIO_MANIFEST_SHA256 := 2ce29b2bd44cfea5d7b5e6ea546bb0c77f4781a6975e3605db04f730c61ab5f8
 
 # cargo-cyclonedx, what `make sbom` installs when the host has none: an exact version,
 # built with its own lockfile, in the job that uploads the release binary.
@@ -539,6 +539,11 @@ kind-e2e-gateway-policy: kind-banlieue-crds kind-broker kind-notaio kind-gateway
 	$(KIND_KUBECTL) -n banlieue-system rollout status deploy/mediatore --timeout=300s
 	./dev/kind/gateway-e2e.sh $(KIND_KUBECONFIG) $(KIND_SA_KUBECONFIG) $(SPIRE_TRUST_DOMAIN) $(KIND_DIR)/ek.pem $(KIND_DIR)/ek.hash $(KIND_DIR)/gateway/ca.pem $(KIND_DIR)
 
+kind-e2e-gateway-audience: kind-banlieue-crds kind-broker kind-notaio kind-gateway ## ADR-0055 live: the gateway-policy tier, then the broker in policy.audience_definitions.mode: bundles; a team SandboxAudience's Secret placed on the claim's tunnel and rotated with no broker restart, a platform audience read from OpenBao KV, the team audience refused from another namespace
+	$(KIND_KUBECTL) -n banlieue-system rollout restart deploy/mediatore
+	$(KIND_KUBECTL) -n banlieue-system rollout status deploy/mediatore --timeout=300s
+	./dev/kind/gateway-e2e.sh $(KIND_KUBECONFIG) $(KIND_SA_KUBECONFIG) $(SPIRE_TRUST_DOMAIN) $(KIND_DIR)/ek.pem $(KIND_DIR)/ek.hash $(KIND_DIR)/gateway/ca.pem $(KIND_DIR) audiences
+
 kind-e2e-dex: kind-banlieue-crds kind-broker ## ADR-0013 live: the real CLI logs in at a real Dex and delegates the session, every token issue refreshes it, a group removal and a revocation at Dex release the claim
 	$(KIND_KUBECTL) -n banlieue-system rollout restart deploy/mediatore
 	$(KIND_KUBECTL) -n banlieue-system rollout status deploy/mediatore --timeout=300s
@@ -549,7 +554,7 @@ kind-e2e-tpm: kind-vtpm kind-banlieue-crds kind-broker ## ADR-0018 live: an agen
 	$(KIND_KUBECTL) -n banlieue-system rollout status deploy/mediatore --timeout=300s
 	TPM_PLUGIN_AGENT_IMG=$(TPM_PLUGIN_AGENT_IMG) UPSTREAM_ROOT=$(KIND_DIR)/openbao/upstream-root.pem ./dev/kind/tpm-e2e.sh $(KIND_KUBECONFIG) $(SPIRE_TRUST_DOMAIN) $(KIND_VTPM_DIR)
 
-kind-e2e: kind-e2e-entries kind-e2e-mtls kind-e2e-watcher kind-e2e-sandbox kind-e2e-dex kind-e2e-policy kind-e2e-gateway kind-e2e-gateway-policy ## Every live suite against kind that needs nothing of the host (grows with the roadmap); kind-e2e-tpm needs a vTPM
+kind-e2e: kind-e2e-entries kind-e2e-mtls kind-e2e-watcher kind-e2e-sandbox kind-e2e-dex kind-e2e-policy kind-e2e-gateway kind-e2e-gateway-audience ## Every live suite against kind that needs nothing of the host (grows with the roadmap); kind-e2e-tpm needs a vTPM
 
 kind-e2e-ci: ## CI shape: $(KIND_E2E_SUITES), cluster state on failure, cluster deleted after
 	@$(MAKE) $(KIND_E2E_SUITES) || { $(MAKE) kind-e2e-logs; $(MAKE) kind-delete; exit 1; }

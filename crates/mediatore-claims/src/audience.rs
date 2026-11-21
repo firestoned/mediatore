@@ -809,7 +809,7 @@ impl AudienceReflector {
                 tracing::info!(
                     namespace = %namespace,
                     audience = %name,
-                    kind = kind.as_str(),
+                    kind = %kind.as_str(),
                     version,
                     not_after = %a.not_after,
                     "audience definition admitted"

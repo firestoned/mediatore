@@ -24,6 +24,15 @@
 # rules is still refused (P007) and the audience endpoints stand. The rest of the run is the
 # same in both modes, which is what "shadow serves today's answer" means.
 #
+# With `audiences` as well (`make kind-e2e-gateway-audience`, ADR-0055), after those stages:
+# notaio's platform audience namespace is set; a team SandboxAudience defines e2e-egress in the
+# claim's namespace (a `secret` backend, a Secret there, the broker's `resourceNames` Role) and
+# a platform one in the platform namespace reads OpenBao KV; the broker is restarted once into
+# `policy.audience_definitions.mode: bundles` with `audiences[]` removed. The claim's tunnel then
+# carries the team Secret (the destination logs its fingerprint, never the value), the Secret is
+# rotated and the next tunnel carries the new one with the same broker pod, and a sandbox in
+# another namespace naming the team audience is refused as one not configured.
+#
 # What it proves: the workload's request reaches its one destination through the proxy's
 # tunnel, with the STS token swapped in, and the destination answers; a second host and a
 # second port are refused by the authorizer and the workload sees 502 gateway_refused with
@@ -47,6 +56,8 @@ EK_HASH=$(tr -d '\n' < "${5:?ek hash file}")
 DEST_CA_PEM=${6:?destination ca pem}
 # Set: the ADR-0030 stages, with notaio's key in <state dir>/notaio/public-key.txt.
 POLICY_STATE=${7:-}
+# `audiences`: the ADR-0055 stage after them (needs the state dir).
+AUDIENCES=${8:-}
 K=(kubectl --kubeconfig "$ADMIN_KUBECONFIG")
 KSA=(kubectl --kubeconfig "$SA_KUBECONFIG")
 BROKER_NS=banlieue-system
@@ -102,7 +113,7 @@ verdict()     { sandbox "$1" | jq -r '.status.conditions[]? | select(.type == "P
 verdict_has() { verdict sb-gw | grep -F "$1" | grep -qF "${2:-}"; }
 bundle_version() { "${K[@]}" -n "$NS" get configmap "$BUNDLE_CM" -o jsonpath="{.metadata.annotations.$VERSION_ANN}" 2>/dev/null || true; }
 
-PROBES=(probe-claim probe-node probe-enforce probe-b-mapped probe-b-unmapped probe-a-kept probe-warm probe-outage-1 probe-outage-2 probe-released)
+PROBES=(probe-claim probe-node probe-enforce probe-b-mapped probe-b-unmapped probe-a-kept probe-aud-1 probe-aud-2 probe-warm probe-outage-1 probe-outage-2 probe-released)
 
 dump() {
   printf '\n--- broker (last 40 lines)\n'; broker_logs | tail -40
@@ -142,7 +153,17 @@ policy_teardown() {
   "${K[@]}" -n "$BROKER_NS" rollout restart deploy/mediatore >/dev/null 2>&1 || true
   "${K[@]}" -n "$BROKER_NS" rollout status deploy/mediatore --timeout=120s >/dev/null 2>&1 || true
 }
-trap 'cleanup; policy_teardown' EXIT
+# ADR-0055's fixtures removed and notaio's audience switch off again, before the broker is restored.
+NSPLAT=mediatore-e2e-platform
+audience_teardown() {
+  [ -n "$AUDIENCES" ] || return 0
+  "${K[@]}" -n "$NS" delete sandboxaudience e2e-egress --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  "${K[@]}" -n "$NS" delete secret e2e-egress-token --ignore-not-found >/dev/null 2>&1 || true
+  "${K[@]}" -n "$NS" delete role,rolebinding mediatore-audience-credentials --ignore-not-found >/dev/null 2>&1 || true
+  "${K[@]}" -n notaio-system set env deployment/notaio NOTAIO_AUDIENCE_PLATFORM_NAMESPACE- >/dev/null 2>&1 || true
+  "${K[@]}" delete namespace "$NSPLAT" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+}
+trap 'cleanup; audience_teardown; policy_teardown' EXIT
 
 wait_for() { # <seconds> <description> <command...>
   local secs=$1 what=$2 i; shift 2
@@ -264,7 +285,12 @@ broker_policy_config() { # <shadow|enforce> [watched namespaces] [further lines 
   local key_id public_key
   read -r key_id public_key < "$POLICY_STATE/notaio/public-key.txt"
   {
-    cat dev/kind/broker/mediatore.yaml
+    if [ -n "${BUNDLES_MODE:-}" ]; then
+      # ADR-0055 decision 8: under `bundles` the file lists no audience.
+      awk '/^audiences:/ { skip = 1; next } skip && /^[^ #-]/ { skip = 0 } !skip' dev/kind/broker/mediatore.yaml
+    else
+      cat dev/kind/broker/mediatore.yaml
+    fi
     printf 'policy:\n  trusted_keys:\n    - { id: "%s", public_key: "%s" }\n  namespaces: [%s]\n  egress: %s\n' "$key_id" "$public_key" "${2:-$NS}" "$1"
     [ -n "${3:-}" ] && printf '%s\n' "$3"
   } > "$FILES/mediatore.yaml"
@@ -310,6 +336,8 @@ spec:
       access: Read
       maxTtlSeconds: 900
       endpoints: ["$DESTINATION"]
+      # The policy is on the `lab` profile: its audiences must be classified LabOnly (notaio L020).
+      dataScope: LabOnly
   egressHosts: ["$DIRECT", "$RULED"]
   tools: []
   maxLeaseSeconds: 3600
@@ -750,6 +778,145 @@ YAML
   "${K[@]}" delete clusterspiffeid mediatore-e2e-gateway-claim-b --ignore-not-found --wait=false >/dev/null
 fi
 
+if [ -n "$AUDIENCES" ]; then
+  fingerprint() { printf '%s' "$1" | { sha256sum 2>/dev/null || shasum -a 256; } | cut -c1-16; }
+  ROOT=$(jq -r .root_token "$POLICY_STATE/openbao/init.json")
+  bao_root() { "${K[@]}" -n "$BROKER_NS" exec deploy/mediatore-openbao -- env BAO_TOKEN="$ROOT" bao "$@"; }
+
+  say "ADR-0055: a team SandboxAudience for e2e-egress in $NS, its Secret and the broker's resourceNames Role; a platform one in $NSPLAT from OpenBao KV"
+  "${K[@]}" create namespace "$NSPLAT" --dry-run=client -o yaml | "${K[@]}" apply -f - >/dev/null
+  "${K[@]}" -n "$NSPLAT" apply -f dev/kind/notaio/notaio-bundles.yaml >/dev/null
+  for ns in "$NSPLAT" mediatore-e2e-sandbox; do
+    "${K[@]}" get namespace "$ns" >/dev/null 2>&1 || continue
+    mkdir -p "$POLICY_STATE/policy-bundles-$ns"
+    printf 'namespace: %s\nresources:\n  - ../../deploy/policy-bundles\n' "$ns" > "$POLICY_STATE/policy-bundles-$ns/kustomization.yaml"
+    "${K[@]}" apply -k "$POLICY_STATE/policy-bundles-$ns" >/dev/null
+  done
+  TEAM_V1=e2e-team-token-v1
+  TEAM_V2=e2e-team-token-v2
+  "${K[@]}" -n "$NS" create secret generic e2e-egress-token --from-literal=token="$TEAM_V1" \
+    --dry-run=client -o yaml | "${K[@]}" apply -f - >/dev/null
+  mkdir -p "$POLICY_STATE/audience-credentials"
+  cat > "$POLICY_STATE/audience-credentials/kustomization.yaml" <<YAML
+namespace: $NS
+resources:
+  - ../../deploy/audience-credentials
+patches:
+  - target: { kind: Role, name: mediatore-audience-credentials }
+    patch: |-
+      - op: replace
+        path: /rules/0/resourceNames
+        value: [e2e-egress-token]
+YAML
+  "${K[@]}" apply -k "$POLICY_STATE/audience-credentials" >/dev/null
+  bao_root kv put audiences/platform/e2e token=e2e-platform-token >/dev/null
+  "${K[@]}" apply -f - >/dev/null <<YAML
+apiVersion: sandbox.firestoned.io/v1alpha2
+kind: SandboxAudience
+metadata:
+  name: e2e-egress
+  namespace: $NS
+spec:
+  credential:
+    backend: secret
+    placement: proxy
+    format: bearer
+    source:
+      secretRef: { name: e2e-egress-token, tokenKey: token }
+  endpoints: ["$DESTINATION"]
+  rules: []
+  maxTtlSeconds: 900
+---
+apiVersion: sandbox.firestoned.io/v1alpha2
+kind: SandboxAudience
+metadata:
+  name: e2e-platform
+  namespace: $NSPLAT
+spec:
+  credential:
+    backend: secret
+    placement: gateway
+    format: bearer
+    source:
+      openbao: { mount: audiences, path: platform/e2e, key: token }
+  endpoints: ["platform.$NS.svc.cluster.local:443"]
+  rules:
+    - { method: GET, path: "/**" }
+  maxTtlSeconds: 300
+YAML
+  # Only now the switch: a policy granting e2e-egress needs its definition visible (notaio L027).
+  "${K[@]}" -n notaio-system set env deployment/notaio NOTAIO_AUDIENCE_PLATFORM_NAMESPACE="$NSPLAT" >/dev/null
+  "${K[@]}" -n notaio-system rollout status deployment/notaio --timeout=180s >/dev/null
+  audience_published() { "${K[@]}" -n "$1" get configmap "$2-audience" -o jsonpath='{.data.audience\.dsse\.json}' 2>/dev/null | grep -q payload; }
+  wait_for "$TIMEOUT" "notaio's $NS/e2e-egress-audience" audience_published "$NS" e2e-egress
+  wait_for "$TIMEOUT" "notaio's $NSPLAT/e2e-platform-audience" audience_published "$NSPLAT" e2e-platform
+  echo "notaio published both audience bundles; platform audience namespace $NSPLAT"
+
+  say "ADR-0055: the broker restarted once into policy.audience_definitions.mode: bundles, audiences[] removed"
+  BUNDLES_MODE=1 broker_policy_config enforce "$NS" "$(cat <<CFG
+  audience_definitions:
+    mode: bundles
+    platform_namespace: $NSPLAT
+    credential_refresh_secs: 5
+    openbao:
+      url: https://mediatore-openbao.$BROKER_NS.svc:8200
+      ca_file: /etc/mediatore-openbao/ca.pem
+      role: mediatore
+CFG
+)"
+  wait_for "$TIMEOUT" "'policy.audience_definitions' mode=bundles in the broker log" log_has "policy.audience_definitions (ADR-0055)" "mode=bundles"
+  wait_for "$TIMEOUT" "the team definition admitted" log_has "audience definition admitted" "audience=e2e-egress"
+  broker_logs | grep -F "audience definition admitted" | grep -F "audience=e2e-egress" | grep -qF "kind=team" || fail "e2e-egress was not admitted as a team audience"
+  wait_for "$TIMEOUT" "the platform definition admitted" log_has "audience definition admitted" "audience=e2e-platform"
+  wait_for "$TIMEOUT" "the team Secret read" log_has "audience credential read (ADR-0055)" "audience=e2e-egress"
+  wait_for "$TIMEOUT" "the platform credential read from OpenBao KV" log_has "audience credential read (ADR-0055)" "audience=e2e-platform"
+  broker_logs | grep -qF "$TEAM_V1" && fail "the broker logged the team credential"
+  broker_logs | grep -qF "e2e-platform-token" && fail "the broker logged the platform credential"
+  wait_for "$TIMEOUT" "lease mediatore-watcher held by ${BROKER_POD#pod/}" holder_is_pod
+  AUD_POD=$BROKER_POD
+  AUD_RESTARTS=$("${K[@]}" -n "$BROKER_NS" get "$AUD_POD" -o jsonpath='{.status.containerStatuses[0].restartCount}')
+  echo "bundles on ${AUD_POD#pod/}: e2e-egress (team, $NS) and e2e-platform (platform, $NSPLAT, OpenBao KV) admitted and their credentials read"
+
+  say "ADR-0055: the claim's tunnel carries the team Secret; rotated, the next one carries the new value, the broker untouched"
+  sleep $((FRESH_SECS + 1))
+  probe probe-aud-1 claim phantom "$DESTINATION=200"
+  FP1=$(fingerprint "Bearer $TEAM_V1")
+  wait_for "$LOG_WAIT" "the destination seeing the team credential ($FP1)" dest_has "destination request" "credential_sha256=$FP1"
+  "${K[@]}" -n "$NS" create secret generic e2e-egress-token --from-literal=token="$TEAM_V2" \
+    --dry-run=client -o yaml | "${K[@]}" apply -f - >/dev/null
+  # Two refresh periods: the next read has certainly happened.
+  sleep 11
+  probe probe-aud-2 claim phantom "$DESTINATION=200"
+  FP2=$(fingerprint "Bearer $TEAM_V2")
+  wait_for "$LOG_WAIT" "the destination seeing the rotated credential ($FP2)" dest_has "destination request" "credential_sha256=$FP2"
+  [ "$(broker_pod)" = "$AUD_POD" ] || fail "the broker pod changed during the rotation"
+  [ "$("${K[@]}" -n "$BROKER_NS" get "$AUD_POD" -o jsonpath='{.status.containerStatuses[0].restartCount}')" = "$AUD_RESTARTS" ] \
+    || fail "the broker restarted during the rotation"
+  echo "the destination saw $FP1, then $FP2 after the rotation, on ${AUD_POD#pod/} with no restart"
+
+  say "ADR-0055 decision 3: a sandbox in $NSB naming the team audience of $NS is refused as one not configured"
+  "${KSA[@]}" create -f - >/dev/null <<YAML
+apiVersion: mediatore.io/v1beta1
+kind: AgentSandbox
+metadata:
+  name: sb-c
+  namespace: $NSB
+spec:
+  subject: { issuer: "$ISSUER", id: "octocat" }
+  poolRef: { name: e2e }
+  ttlSeconds: 900
+  audiences: ["e2e-egress"]
+  workload: { image: "registry.internal:5000/sandbox:e2e", args: ["sh"] }
+YAML
+  refused_c() { [ "$("${K[@]}" -n "$NSB" get agentsandbox sb-c -o jsonpath='{.status.phase}' 2>/dev/null)" = "Failed" ]; }
+  wait_for "$TIMEOUT" "sb-c Failed" refused_c
+  reason_c=$("${K[@]}" -n "$NSB" get agentsandbox sb-c -o jsonpath='{.status.reason}')
+  [ "$reason_c" = "audience e2e-egress is not configured" ] || fail "sb-c refused for another reason: $reason_c"
+  "${K[@]}" -n "$NSB" get virtualmachineclaim sb-c >/dev/null 2>&1 && fail "sb-c got a claim"
+  "${K[@]}" -n "$NSB" delete agentsandbox sb-c --wait=false >/dev/null
+  echo "sb-c in $NSB: Failed, \"$reason_c\", no claim"
+fi
+
 say "the broker gone: the cached allowlist stands in, then the outage is a refusal"
 # A fresh answer in the cache right before the broker goes, so the stale window the next
 # probe must start inside begins now and not at the claim probe's last tunnel.
@@ -780,5 +947,6 @@ wait_for "$LOG_WAIT" "the authorizer's claim_gone" authz_has "claim_uid=$CLAIM_U
 wait_for "$LOG_WAIT" "the gateway's claim_gone in the proxy's log" proxy_has probe-released "the gateway refused the tunnel" "claim_gone"
 echo "cut off: the broker's 404 dropped the cache; the workload sees 502 gateway_refused"
 
+[ -z "$AUDIENCES" ] || say "PASS: ADR-0055 holds against a real Envoy: notaio's signed audience bundles serve under bundles mode, a team SandboxAudience's Secret reaches the claim's destination and its rotation is served with no broker restart, a platform audience is read from OpenBao KV, the team audience is refused from another namespace, and no credential is logged"
 [ -z "$POLICY_STATE" ] || say "PASS: ADR-0030 holds against a real Envoy: under shadow the gateway's answer is today's and the broker logs what it would add; under enforce the bundle's exact entry opens at the gateway and the destination answers through it, an entry with rules is never served (P007), the audience endpoints stand; and ADR-0054 decision 6: two sandboxes in two namespaces naming one policy, the second port withdrawn for the one whose namespace no longer draws from the policy's and open for the other"
 say "PASS: ADR-0028 decisions 2 to 5, 7 and 8 hold against a real Envoy through the real forwarder (SDS identity, the validator, the proxy's tunnel through the authorizer with the token swapped in, the cache bounds, the outage, the release)"

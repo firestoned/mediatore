@@ -797,7 +797,9 @@ pub struct Config {
     pub spire: Option<SpireConfig>,
     /// Trusted upstream issuers.
     pub issuers: Vec<IssuerConfig>,
-    /// Audiences mediatore will mint for.
+    /// Audiences mediatore will mint for. Absent is none: under
+    /// `policy.audience_definitions.mode: bundles` the file lists none (ADR-0055 decision 8).
+    #[serde(default)]
     pub audiences: Vec<AudienceConfig>,
     /// STS material; required when any audience uses `sts`.
     #[serde(default)]
@@ -1579,7 +1581,8 @@ impl Config {
     }
 
     /// The namespaces audience bundles are read in (ADR-0055 decision 1): the platform namespace,
-    /// then every namespace a sandbox may live in, each once. Empty without the section.
+    /// then every namespace a sandbox may live in and every policy namespace, each once. Empty
+    /// without the section.
     #[must_use]
     pub fn audience_namespaces(&self) -> Vec<String> {
         let Some(d) = self
@@ -1594,7 +1597,14 @@ impl Config {
             Namespaces::Single(ns) => vec![ns],
             Namespaces::Map(m) => m.into_keys().collect(),
         };
-        for ns in sandboxes {
+        // A team audience is granted by a policy of its own namespace (decision 3), and the
+        // watcher reconciles a sandbox in any namespace: the policy namespaces are read too.
+        let policies = self
+            .policy
+            .as_ref()
+            .map(|p| p.namespaces.clone())
+            .unwrap_or_default();
+        for ns in sandboxes.into_iter().chain(policies) {
             if !out.contains(&ns) {
                 out.push(ns);
             }
@@ -3422,6 +3432,17 @@ listen: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }
             cfg.audience_namespaces(),
             ["sandbox-platform", "infra", "team-a", "team-b"]
         );
+        // A policy namespace is read too: a team audience is granted by a policy of its own
+        // namespace (ADR-0055 decision 3), and the watcher reconciles sandboxes anywhere.
+        let cfg = with(&policy_reading(
+            "sandboxes, team-x",
+            "  audience_definitions: { mode: shadow, platform_namespace: sandbox-platform }\n",
+        ))
+        .unwrap();
+        assert_eq!(
+            cfg.audience_namespaces(),
+            ["sandbox-platform", "sandboxes", "team-x"]
+        );
         let d = cfg.policy.unwrap().audience_definitions.unwrap();
         assert_eq!(d.credential_refresh_secs, 60);
 
@@ -3489,6 +3510,19 @@ listen: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }
             .is_err(),
             "a transit key has no place here"
         );
+    }
+
+    #[test]
+    fn a_configuration_without_an_audiences_key_parses_as_one_with_none() {
+        // ADR-0055 decision 8: the migration ends by removing `audiences[]` from the file.
+        let cfg = Config::parse(&format!(
+            "{}{}",
+            DEV.replace("audiences: []\n", ""),
+            audience_definitions("    mode: bundles\n    platform_namespace: p\n")
+        ))
+        .unwrap();
+        assert!(cfg.audiences.is_empty());
+        assert_eq!(cfg.audience_mode(), AudienceMode::Bundles);
     }
 
     #[test]

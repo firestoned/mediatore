@@ -299,7 +299,15 @@ fn effective_in(
             ttl_cap: max_ttl,
         });
     }
-    let grant = bundle?
+    let bundle = bundle?;
+    // ADR-0055 decision 3: a team audience is granted only by a policy of its own namespace,
+    // never by one reached through `policy.sources`.
+    if let Some(home) = v.team_namespace(audience)
+        && bundle.content.policy.namespace != home
+    {
+        return None;
+    }
+    let grant = bundle
         .content
         .audiences
         .iter()
@@ -7601,7 +7609,7 @@ mod tests {
             /// A catalog whose namespaces have all completed their first list.
             fn new() -> Self {
                 let rig = Self::unlisted();
-                for ns in [PLATFORM, "team-a", "team-b"] {
+                for ns in [PLATFORM, "team-a", "team-b", "conformance"] {
                     rig.reflector
                         .resynced(ns, &std::collections::HashSet::new());
                 }
@@ -7622,7 +7630,12 @@ mod tests {
                     mediatore_store::MemoryStore::shared(),
                     keys,
                     PLATFORM.into(),
-                    vec![PLATFORM.into(), "team-a".into(), "team-b".into()],
+                    vec![
+                        PLATFORM.into(),
+                        "team-a".into(),
+                        "team-b".into(),
+                        "conformance".into(),
+                    ],
                 );
                 let cache = Arc::new(CredentialCache::new(SignedDuration::from_secs(60)));
                 let mut st = base_state();
@@ -7800,6 +7813,58 @@ mod tests {
             )
             .await;
             assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        }
+
+        /// ADR-0055 decision 3: under `enforce`, a team audience is granted only by a policy of its
+        /// own namespace; a policy reached through `policy.sources` grants it nothing, as it may a
+        /// platform audience.
+        #[tokio::test]
+        async fn a_team_audience_is_granted_only_by_a_policy_of_its_own_namespace() {
+            let (pe, _) = bundle_for(
+                &["internal-git"],
+                mediatore_claims::policy::EgressMode::Shadow,
+            )
+            .await;
+            let bundle = mediatore_testkit::policy::fresh_bundle(Timestamp::now(), 1).payload;
+            assert_eq!(bundle.content.policy.namespace, "conformance");
+            let endpoint = bundle.content.audiences[0].endpoints[0].clone();
+            let enforce = |st: &mut AppState| {
+                st.policy_egress = Some(PolicyEgress {
+                    audiences: mediatore_claims::policy::EgressMode::Enforce,
+                    ..pe.clone()
+                });
+            };
+
+            // team-a's own internal-git, granted by the policy of `conformance`: nothing.
+            let rig = Rig::new();
+            rig.define("team-a", "internal-git", def(B::None, P::Proxy, &endpoint))
+                .await;
+            let mut st = base_state();
+            st.audience_catalog = rig.st.audience_catalog.clone();
+            enforce(&mut st);
+            assert!(effective_in(&st, "team-a", "internal-git", Some(&bundle)).is_none());
+
+            // The team audience of `conformance` itself, granted by its own policy: granted.
+            let rig = Rig::new();
+            rig.define(
+                "conformance",
+                "internal-git",
+                def(B::None, P::Proxy, &endpoint),
+            )
+            .await;
+            let mut st = base_state();
+            st.audience_catalog = rig.st.audience_catalog.clone();
+            enforce(&mut st);
+            assert!(effective_in(&st, "conformance", "internal-git", Some(&bundle)).is_some());
+
+            // A platform audience of that name, granted by the mapped policy: granted.
+            let rig = Rig::new();
+            rig.define(PLATFORM, "internal-git", def(B::None, P::Proxy, &endpoint))
+                .await;
+            let mut st = base_state();
+            st.audience_catalog = rig.st.audience_catalog.clone();
+            enforce(&mut st);
+            assert!(effective_in(&st, "team-a", "internal-git", Some(&bundle)).is_some());
         }
 
         #[tokio::test]

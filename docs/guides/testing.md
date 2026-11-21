@@ -125,6 +125,7 @@ Suites today:
 | `make kind-e2e-policy` | 0026 | notaio installed from its release manifests and signing with the kind OpenBao, its bundle admitted by the broker and recorded on each claim, the `PolicyConformant` verdicts and codes on four sandboxes, a newer bundle followed, the earlier one delivered again refused by the version floor before and after a broker restart, nothing refused on the bundle's account, below |
 | `make kind-e2e-gateway` | 0028 | the real egress proxy tunnelling a claim's requests through a real Envoy on the gateway SVID to its one destination and nothing else, the authorizer's cache through a broker outage, the cut-off on release, below |
 | `make kind-e2e-gateway-policy` | 0030 | the gateway tier under a notaio bundle: a direct egress entry refused under `policy.egress: shadow` and opened at the real Envoy under `enforce`, an entry with rules never served, below |
+| `make kind-e2e-gateway-audience` | 0055 | the gateway-policy tier, then notaio's audience bundles serving under `policy.audience_definitions.mode: bundles`: a team `SandboxAudience`'s Secret reaching the claim's destination through the real Envoy and rotated with no broker restart (the destination logs a fingerprint of the credential, never the value), a platform audience read from OpenBao KV, the team audience refused from another namespace; replaces `kind-e2e-gateway-policy` in `make kind-e2e`, below |
 | `make kind-e2e-tpm` | 0018 | an agent attesting with a vTPM behind the kind node through the `tpm` plugin, on `image/spire/agent.conf`, refused under a CA that never signed its EK and listed under the EK's hash under the right one, the member's certificate becoming the node entry under that agent, the guest registering over the SVID it issues and only then announcing `GuestReady` (ADR-0019), a fresh pod re-attesting as the same agent; since ADR-0031 the agent's bundle is the OpenBao PKI root alone and the server's `bundle show` is asserted to be that root and nothing self-signed of its own; not part of `make kind-e2e` and not in CI (it needs `sudo`, swtpm and the kernel's vtpm proxy on the host), below |
 
 ### The store: the Kubernetes API, proven by every tier
@@ -392,6 +393,18 @@ names and either gateway ID as the broker's ServiceAccount are refused. The tier
 pod: it has no `unix:user` selector, no host table and no systemd unit, so the output chain
 and the entries of a gateway VM are not what it proves. The checks are listed in the script; a
 mismatch names the authority, the status and what was expected.
+
+`make kind-e2e-gateway-audience` (ADR-0055) runs all of that and then the audience stage: notaio's
+platform audience namespace is set, a team `SandboxAudience` defines `e2e-egress` in the claim's
+namespace (a `secret` backend, a Secret there, the `deploy/audience-credentials` Role naming it) and a
+platform one reads OpenBao KV (`openbao-setup.sh` grants the broker `read` on `audiences/data/platform/*`
+and nothing else), and the broker is restarted once into `bundles` with `audiences[]` removed. The
+probe's tunnel then reaches the destination with the team Secret (the destination logs
+`credential_sha256=` and the first 16 hex digits, never the value); the Secret is rotated and the
+next tunnel carries the new one with the broker pod and its restart count unchanged; a sandbox in the
+second namespace naming the team audience is `Failed` with `audience e2e-egress is not configured` and
+no claim; and neither credential appears in the broker's log. The kind notaio is v0.7.0-rc.1, the
+first with `SandboxAudience`.
 
 `make kind-e2e-gateway-policy` is the same run under a policy (ADR-0030): notaio (from
 `make kind-notaio`) publishes the bundle of a policy whose direct `egress[]` names the

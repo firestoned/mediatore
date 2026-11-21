@@ -40,6 +40,8 @@ pub struct CatalogView {
     delegated: BTreeMap<String, DelegatedAudience>,
     inject: BTreeMap<String, Vec<InjectRoute>>,
     max_ttl: BTreeMap<String, i64>,
+    /// The namespace of each team audience: the only one whose policies may grant it.
+    team: BTreeMap<String, String>,
 }
 
 fn header_of(a: &Audience) -> String {
@@ -95,6 +97,9 @@ impl CatalogView {
         self.egress.insert(name.clone(), a.endpoints.clone());
         self.rules.insert(name.clone(), a.rules.clone());
         self.max_ttl.insert(name.clone(), ttl);
+        if a.kind == mediatore_claims::audience::AudienceKind::Team {
+            self.team.insert(name.clone(), a.namespace.clone());
+        }
         let header = header_of(a);
         let extra_headers = extra_headers_of(a);
         match a.definition.credential.backend {
@@ -275,6 +280,16 @@ impl AudienceView<'_> {
         match &self.source {
             Source::File(_) => None,
             Source::Catalog(v) => v.max_ttl.get(audience).copied(),
+        }
+    }
+
+    /// For a team audience, its namespace: the one namespace whose policies may grant it (ADR-0055
+    /// decision 3). `None` for a platform audience and for the file.
+    #[must_use]
+    pub fn team_namespace(&self, audience: &str) -> Option<&str> {
+        match &self.source {
+            Source::File(_) => None,
+            Source::Catalog(v) => v.team.get(audience).map(String::as_str),
         }
     }
 

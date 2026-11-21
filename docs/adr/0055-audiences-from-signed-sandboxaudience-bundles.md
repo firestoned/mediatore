@@ -3,7 +3,7 @@
 
 # ADR-0055: Audiences from signed SandboxAudience bundles, platform or team, read live
 
-**Status:** Accepted · **Date:** 2026-11-20
+**Status:** Accepted, implemented 2026-11-20 (amended at implementation, each amendment in its decision: decision 1 reads the policy namespaces too and names the floor objects, decision 2 refuses both sides of a collision from the namespaces that see both and reads a snapshot per decision, decision 4 lists the checks built, decision 5 polls with `get` and does not zeroize; a `caRef` and a `basic` operator-held credential are refused, `NotBuilt`; threat-model pass of 2026-11-20, R-56 to R-60) · **Date:** 2026-11-20
 
 Roadmap 04 (audiences and backends) and roadmap 11 (policy at the gateway). The consumer side of
 notaio's [ADR-0020](https://github.com/firestoned/notaio/blob/main/docs/adr/0020-sandbox-audience.md)
@@ -55,8 +55,10 @@ This ADR is how the broker reads it.
    ```
 
    The broker reads `<audience>-audience` ConfigMaps (`audience.dsse.json`) in the platform
-   namespace and in every namespace a sandbox may live in (the keys of `sandboxes.namespaces`, or
-   `sandboxes.namespace`), with the reflector that reads policy bundles. An envelope is admitted
+   namespace, in every namespace a sandbox may live in (the keys of `sandboxes.namespaces`, or
+   `sandboxes.namespace`) and in every policy namespace (`policy.namespaces`: a team audience is
+   granted by a policy of its own namespace, and the watcher reconciles a sandbox wherever it is
+   created), with a reflector beside the one that reads policy bundles and under the same `Role`. An envelope is admitted
    only if it verifies under notaio ADR-0002 decision 5 with the audience payload type
    (`application/vnd.firestoned.sandboxaudience.bundle.v1+json`), a trusted key, the schema, the
    digest, the lifetime and a version floor kept per audience namespace and name with the rules of
@@ -262,3 +264,21 @@ Tests first, red before the code.
   the gateway and rotated without a restart; a platform audience from OpenBao KV; a team audience
   refused from another namespace.
 - `make check`, `make calm-validate`, `make calm-diagrams`; the threat model pass.
+
+## What was proven (2026-11-20)
+
+- `make check` on the build host: the audience conformance vectors through `admit_audience`, the
+  catalog and the reflector, the credential cache against a table reader and against the fake
+  OpenBao's KV, the API's view over the routers (team and platform audiences, `503
+  credential_unavailable`, `503 audiences_not_synced`, rotation, gateway placement, collisions,
+  withdrawal, a team audience granted only by its own namespace's policy), the watcher's checks,
+  the three modes and their start checks, and an e2e over real listeners with a tenant map.
+- `make kind-e2e-policy` and `make kind-e2e-gateway-audience` on the build host, notaio
+  v0.7.0-rc.1: both audience bundles published by notaio and admitted; the claim's tunnel through
+  the real Envoy carrying the team Secret, then after a rotation the new one, on the same broker
+  pod with no restart; the platform credential read from OpenBao KV; a sandbox of another
+  namespace naming the team audience `Failed` with the reason of one not configured; neither
+  credential in the broker's log.
+- Not proven on a cluster: a gateway-placed team audience (the API tests cover it), a platform
+  audience served to a claim (read, not served, in kind), and any live deployment.
+

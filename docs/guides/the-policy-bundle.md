@@ -357,8 +357,8 @@ policy:
 ```
 
 - **`config`** (or no `audience_definitions`): `audiences[]` serves and no audience bundle is read.
-- **`shadow`**: the broker reads audience bundles in the platform namespace and in every sandbox
-  namespace, verifies each (payload type, a trusted key, schema, digest, lifetime) and keeps a version
+- **`shadow`**: the broker reads audience bundles in the platform namespace, in every sandbox
+  namespace and in every `policy.namespaces` entry, verifies each (payload type, a trusted key, schema, digest, lifetime) and keeps a version
   floor per audience in the store beside the policy floors. `audiences[]` still serves.
 - **`bundles`**: the catalog serves, in the API (`POST /v1/claims`, `POST /v1/token`, `GET /v1/me`,
   the gateway's allowlist and credential routes) and in the watcher, and `audiences[]` must be

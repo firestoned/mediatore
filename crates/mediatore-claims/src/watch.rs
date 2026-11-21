@@ -171,8 +171,11 @@ impl WatcherConfig {
         };
         if self.catalog.is_some() {
             // ADR-0055 decision 6: the definition's rules are the ceiling, its endpoints the egress.
+            // Decision 3: a team audience only by a policy of its own namespace.
             return self.resolved(audience, namespace).is_some_and(|a| {
-                crate::policy::effective_grant(&a.rules, None, &a.endpoints, grant).is_some()
+                (a.kind == crate::audience::AudienceKind::Platform
+                    || bundle.content.policy.namespace == a.namespace)
+                    && crate::policy::effective_grant(&a.rules, None, &a.endpoints, grant).is_some()
             });
         }
         let Some(configured) = self.audiences.iter().find(|a| a.name == audience) else {
@@ -1562,7 +1565,12 @@ mod tests {
                 mediatore_store::MemoryStore::shared(),
                 keys,
                 PLATFORM.into(),
-                vec![PLATFORM.into(), "team-a".into(), "team-b".into()],
+                vec![
+                    PLATFORM.into(),
+                    "team-a".into(),
+                    "team-b".into(),
+                    "conformance".into(),
+                ],
             );
             for (ns, name, d) in entries {
                 let a = signed_audience(Timestamp::now(), 1, ns, name, d.clone());
@@ -1610,19 +1618,41 @@ mod tests {
             assert!(!cfg.usable("registry", "team-b"));
         }
 
+        /// ADR-0055 decision 3: a team audience is granted only by a policy of its own namespace;
+        /// a platform audience by a policy of any namespace the sandbox draws from.
         #[tokio::test]
-        async fn a_grant_is_bounded_by_the_definition_seen_from_the_namespace() {
+        async fn a_team_audience_is_granted_only_by_a_policy_of_its_own_namespace() {
             let bundle = fresh_bundle(Timestamp::now(), 1).payload;
+            let policy_ns = bundle.content.policy.namespace.clone();
             let granted = &bundle.content.audiences[0];
             let endpoint = granted.endpoints[0].clone();
-            let cfg = WatcherConfig {
-                catalog: Some(
-                    live(&[("team-a", &granted.name, def(Backend::None, &endpoint))]).await,
-                ),
-                ..WatcherConfig::default()
+            let team = |ns: &str| (ns.to_owned(), def(Backend::None, &endpoint));
+            let cfg_with = |entries: Vec<(String, AudienceDefinition)>| async move {
+                let entries: Vec<(&str, &str, AudienceDefinition)> = entries
+                    .iter()
+                    .map(|(ns, d)| (ns.as_str(), granted.name.as_str(), d.clone()))
+                    .collect();
+                WatcherConfig {
+                    catalog: Some(live(&entries).await),
+                    ..WatcherConfig::default()
+                }
             };
-            assert!(cfg.grants("team-a", &granted.name, &bundle));
+            let cfg = cfg_with(vec![team("team-a")]).await;
+            assert!(
+                !cfg.grants("team-a", &granted.name, &bundle),
+                "another namespace's policy"
+            );
             assert!(!cfg.grants("team-b", &granted.name, &bundle));
+            let cfg = cfg_with(vec![team(&policy_ns)]).await;
+            assert!(
+                cfg.grants(&policy_ns, &granted.name, &bundle),
+                "its own namespace's policy"
+            );
+            let cfg = cfg_with(vec![team(PLATFORM)]).await;
+            assert!(
+                cfg.grants("team-a", &granted.name, &bundle),
+                "a platform audience"
+            );
         }
     }
 }
