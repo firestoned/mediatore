@@ -113,7 +113,7 @@ serde-saphyr   = "2.1"
 # (ADR-0007, ADR-0012). The RustCrypto backend carried a second P-256 stack on the
 # unpatched crypto-bigint 0.5 line (RUSTSEC-2026-0387) and the `rsa` crate
 # (RUSTSEC-2023-0071); neither is in the tree now.
-jsonwebtoken = { version = "11", features = ["aws_lc_rs"] }
+jsonwebtoken = { version = "12", features = ["aws_lc_rs"] }
 p256         = "0.14"
 base64       = "0.23"
 security-framework = "3"
