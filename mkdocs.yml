@@ -219,8 +219,9 @@ nav:
       - "ADR-0049: AgentSandbox is served as v1alpha1 and v1beta1": adr/0049-agentsandbox-served-as-v1alpha1-and-v1beta1.md
       - "ADR-0053: The gateway's authorizer has an identity of its own": adr/0053-the-gateways-authorizer-has-an-identity-of-its-own.md
       - "ADR-0054: Which policies a namespace may name": adr/0054-which-policies-a-namespace-may-name.md
-      - "ADR-0055: Which pools' members become nodes: an operator list, and credentials served by namespace": adr/0055-which-pools-members-become-nodes.md
+      - "ADR-0055: Audiences from signed SandboxAudience bundles, platform or team, read live": adr/0055-audiences-from-signed-sandboxaudience-bundles.md
       - "ADR-0056: The broker in a namespace of its own, and admission policies that do not depend on its name": adr/0056-the-broker-in-a-namespace-of-its-own.md
       - "ADR-0057: A claim's record written by compare-and-set and bound to its sandbox": adr/0057-a-claims-record-written-by-compare-and-set-and-bound-to-its-sandbox.md
+      - "ADR-0059: Which pools' members become nodes": adr/0059-which-pools-members-become-nodes.md
   - Security:
       - Threat model: security/threat-model.md

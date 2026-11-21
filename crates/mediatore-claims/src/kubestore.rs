@@ -1977,9 +1977,17 @@ fn sandbox_node_of(rec: &NodeRecord) -> SandboxNode {
     node
 }
 
-/// The `PolicyFloor` name for a policy.
+/// The `PolicyFloor` name for a policy, `<namespace>.<name>`, which always has a dot. An
+/// audience's floor (notaio's `audience/<name>`, ADR-0055) cannot be named that way, `/` being
+/// refused in a resource name, so it is `aud-` and a hash of the namespace and the floor name:
+/// one label, no dot, so never a policy floor's name. The spec carries both names, and a read
+/// checks them.
 #[must_use]
 pub fn floor_name(namespace: &str, name: &str) -> String {
+    if name.contains('/') {
+        let digest = Sha256::digest(format!("{namespace}/{name}").as_bytes());
+        return format!("aud-{}", &hex::encode(digest)[..40]);
+    }
     format!("{namespace}.{name}")
 }
 
@@ -2612,13 +2620,23 @@ impl ClaimStore for KubeStore {
         namespace: &str,
         name: &str,
     ) -> Result<Option<mediatore_store::PolicyFloor>, StoreError> {
-        self.floors()
+        let Some(held) = self
+            .floors()
             .get_opt(&floor_name(namespace, name))
             .await
             .map_err(|e| backend(&e))?
-            .as_ref()
-            .map(floor_of)
-            .transpose()
+        else {
+            return Ok(None);
+        };
+        let floor = floor_of(&held)?;
+        if floor.namespace != namespace || floor.name != name {
+            // Never act on another floor's state: refuse rather than read it as this one's.
+            return Err(StoreError::Backend(format!(
+                "policyfloor for {namespace}/{name} names {}/{}",
+                floor.namespace, floor.name
+            )));
+        }
+        Ok(Some(floor))
     }
 
     async fn advance_policy_floor(
@@ -4160,6 +4178,24 @@ mod tests {
         let res = PolicyFloor::new(&floor_name("sandboxes", "agents"), spec);
         assert_eq!(res.metadata.name.as_deref(), Some("sandboxes.agents"));
         assert_eq!(floor_of(&res).unwrap(), floor);
+    }
+
+    #[test]
+    fn an_audience_floor_has_a_name_no_policy_floor_can_have() {
+        // ADR-0055: notaio keys an audience's floor `audience/<name>`, and `/` is not allowed in
+        // a resource name. Every policy floor's name has a dot; an audience floor's has none.
+        let a = floor_name("sandboxes", "audience/agents");
+        assert!(a.starts_with("aud-"), "{a}");
+        assert!(a.len() <= 63, "{a}");
+        assert!(
+            a.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
+            "{a}"
+        );
+        assert_eq!(a, floor_name("sandboxes", "audience/agents"));
+        assert_ne!(a, floor_name("elsewhere", "audience/agents"));
+        assert_ne!(a, floor_name("sandboxes", "audience/other"));
+        assert!(floor_name("sandboxes", "agents").contains('.'));
     }
 
     #[test]

@@ -20,7 +20,9 @@ use mediatore_spire::{EntryKind, EntryManager, Naming};
 use mediatore_store::{ClaimStore, Modified, StoreError, modify_claim};
 use uuid::Uuid;
 
+pub mod audience;
 pub mod crd_formats;
+pub mod credential;
 #[cfg(test)]
 pub(crate) mod fakes;
 pub mod kubestore;

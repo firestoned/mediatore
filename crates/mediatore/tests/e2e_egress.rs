@@ -146,6 +146,7 @@ fn state(idp: &FakeIdp, upstream: &TlsUpstream, keyed_upstream: &TlsUpstream) ->
     Arc::new(AppState {
         inject: std::collections::BTreeMap::new(),
         inject_port: None,
+        audience_catalog: None,
         logs: None,
         log_limiter: Limiter::per_second(2),
         log_wakes: mediatore_api::LogWakes::default(),

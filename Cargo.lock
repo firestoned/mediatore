@@ -1995,6 +1995,7 @@ dependencies = [
  "mediatore-entra",
  "mediatore-gateway",
  "mediatore-guest",
+ "mediatore-openbao",
  "mediatore-policy",
  "mediatore-proto",
  "mediatore-spire",
@@ -2062,6 +2063,7 @@ dependencies = [
  "jiff",
  "k8s-openapi",
  "kube",
+ "mediatore-openbao",
  "mediatore-policy",
  "mediatore-proto",
  "mediatore-spire",
@@ -2073,6 +2075,7 @@ dependencies = [
  "serde-saphyr",
  "serde_json",
  "sha2",
+ "tempfile",
  "thiserror",
  "tokio",
  "tower-test",
@@ -2316,6 +2319,7 @@ dependencies = [
  "reqwest",
  "rustls",
  "sandboxpolicy-bundle",
+ "sandboxpolicy-types",
  "serde_json",
  "sha2",
  "tar",
@@ -3149,8 +3153,8 @@ dependencies = [
 
 [[package]]
 name = "sandboxpolicy-bundle"
-version = "0.5.2"
-source = "git+https://github.com/firestoned/notaio?tag=v0.6.0#296c5695f18623a29cbfc7e815de766c1c968226"
+version = "0.7.0"
+source = "git+https://github.com/firestoned/notaio?tag=v0.7.0#a5514bd2a8ebd5d732897246da8a9472fecba52e"
 dependencies = [
  "base64 0.23.1",
  "ed25519-dalek",
@@ -3164,8 +3168,8 @@ dependencies = [
 
 [[package]]
 name = "sandboxpolicy-types"
-version = "0.5.2"
-source = "git+https://github.com/firestoned/notaio?tag=v0.6.0#296c5695f18623a29cbfc7e815de766c1c968226"
+version = "0.7.0"
+source = "git+https://github.com/firestoned/notaio?tag=v0.7.0#a5514bd2a8ebd5d732897246da8a9472fecba52e"
 dependencies = [
  "serde",
  "serde_json",

@@ -14,9 +14,11 @@ use k8s_openapi::api::core::v1::ConfigMap;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use sandboxpolicy_bundle::conformance;
 use sandboxpolicy_bundle::{
-    BundleContent, BundleMeta, BundlePayload, Ed25519Signer, Envelope, TrustedKeys, VerifyOptions,
+    AudienceBundleContent, AudienceBundlePayload, AudienceRef, BundleContent, BundleMeta,
+    BundlePayload, Ed25519Signer, Envelope, TrustedKeys, VerifyOptions, sign_audience_bundle,
     sign_bundle, verify_bundle,
 };
+use sandboxpolicy_types::AudienceDefinition;
 
 /// The key id the fresh bundle is signed under.
 pub const KEY_ID: &str = "testkit:v1";
@@ -109,4 +111,70 @@ pub fn bundle_configmap(namespace: &str, name: &str, envelope: &Envelope) -> Con
         )])),
         ..ConfigMap::default()
     }
+}
+
+/// An audience bundle signed by [`signed_audience`] (ADR-0055), with the keys that verify it.
+pub struct FreshAudience {
+    /// Trusts [`KEY_ID`] and nothing else: the same keys as [`fresh_bundle`]'s.
+    pub keys: TrustedKeys,
+    /// The signed envelope, as notaio writes it into `<audience>-audience`.
+    pub envelope: Envelope,
+    /// What the envelope carries.
+    pub payload: AudienceBundlePayload,
+}
+
+/// `definition` as the audience `namespace`/`name` at `version`, issued an hour before `now`
+/// and valid an hour after it, signed under [`KEY_ID`]. The incarnation is
+/// `uid-<namespace>-<name>`, so a test that wants a new incarnation names it differently.
+///
+/// # Panics
+/// If the definition has no canonical form, which a definition of strings and integers never
+/// lacks.
+#[must_use]
+pub fn signed_audience(
+    now: Timestamp,
+    version: u64,
+    namespace: &str,
+    name: &str,
+    definition: AudienceDefinition,
+) -> FreshAudience {
+    let payload = AudienceBundlePayload::new(
+        BundleMeta {
+            version,
+            issued_at: now - SignedDuration::from_hours(1),
+            not_after: now + SignedDuration::from_hours(1),
+        },
+        AudienceBundleContent {
+            audience: AudienceRef {
+                namespace: namespace.into(),
+                name: name.into(),
+                uid: format!("uid-{namespace}-{name}"),
+            },
+            definition,
+        },
+    )
+    .expect("the definition is canonical");
+    let signer = Ed25519Signer::from_seed(KEY_ID, [0x42; 32]);
+    let mut keys = TrustedKeys::new();
+    keys.insert(KEY_ID, signer.verifying_key_bytes())
+        .expect("a 32-byte key");
+    let envelope = sign_audience_bundle(&payload, &signer).expect("signs");
+    FreshAudience {
+        keys,
+        envelope,
+        payload,
+    }
+}
+
+/// The `ConfigMap` notaio writes for an audience bundle: `<audience>-audience`, labelled
+/// `managed-by=notaio`, the envelope under `audience.dsse.json`.
+///
+/// # Panics
+/// If the envelope does not serialize, which a signed one always does.
+#[must_use]
+pub fn audience_configmap(namespace: &str, audience: &str, envelope: &Envelope) -> ConfigMap {
+    let mut cm = bundle_configmap(namespace, &format!("{audience}-audience"), envelope);
+    let text = serde_json::to_string(envelope).expect("an envelope serializes");
+    cm.data = Some(BTreeMap::from([("audience.dsse.json".to_string(), text)]));
+    cm
 }
