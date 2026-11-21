@@ -449,7 +449,7 @@ mod tests {
     async fn the_broker_reaches_notaios_verdict_on_every_audience_vector() {
         let suite = audience_suite();
         let keys = audience_keys(&suite);
-        // v0.7.0-rc.1 ships 15; a tag bump that ships fewer is worth a look before it passes.
+        // v0.7.0-rc.1, rc.2 and v0.7.0 ship 15; a tag bump that ships fewer is worth a look before it passes.
         assert!(suite.vectors.len() >= 15, "{} vectors", suite.vectors.len());
         let mut failed = Vec::new();
         for v in &suite.vectors {

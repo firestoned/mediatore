@@ -79,10 +79,15 @@ This ADR is how the broker reads it.
    whole verified state, so a definition withdrawn between them is refused or skipped by the
    later one, never assumed present. Every reader asks `catalog.resolve(namespace, name)`: a team audience of that name in that namespace,
    else a platform audience of that name, else none. Both present is a refusal, never resolved by
-   order, and logged with the two namespaces. notaio refuses the newcomer of a collision on a name
-   or an endpoint (`L024`, `L025`: the object with no published bundle yet, both if neither), so a
-   platform audience added later does not take a team's working audience away and the broker
-   normally never sees two; its own refusal is the backstop for what notaio missed. The broker
+   order, and logged with the two namespaces. notaio refuses one side of every collision on a name
+   or an endpoint (`L024`, `L025`; notaio ADR-0020 decision 6 as amended 2026-11-21), by each
+   audience's standing: a new audience (never published) always loses and refuses nothing; a
+   changed one (published, then edited) gives way to a stable one; of two changed audiences of
+   different tenants the platform's is kept and the team's refused; two of the same kind, or two
+   stable, are both refused. So a platform audience added later does not take a team's working
+   audience away, a refused team audience parked on a platform audience's name cannot stop the
+   platform's next edit from being signed, and the broker normally never sees two; its own
+   refusal is the backstop for what notaio missed. The broker
    cannot tell a newcomer (it reads bundles in no fixed order, and each replica in its own), so its
    backstop refuses both sides of a collision, and only from the namespaces that see both: a team
    audience with a platform audience's name breaks that name in the team's namespace and nowhere
@@ -101,7 +106,12 @@ This ADR is how the broker reads it.
 4. **The broker checks again what notaio checks** (`.claude/rules/testing.md`: the consumer does
    not trust that the producer was right). A team audience whose backend is not `secret` or
    `none`, whose credential source is OpenBao, or whose header is not a lowercase token or is
-   reserved (notaio's `L026` list), is not admitted, nor is any audience with an endpoint that is
+   reserved (notaio's `L026` list), is not admitted, nor is any audience with an extra header
+   whose value is empty, not printable ASCII (inner spaces and tabs only) or edged with
+   whitespace (notaio's `L026` as amended 2026-11-21: no CR, no LF, so a value cannot split the
+   request; values are published in clear, so a value is never a credential), or a rule path that
+   no admitted request can have (a dot segment, an empty segment or an encoded separator, which
+   both enforcement points refuse before any rule, `path_is_canonical`), nor is any audience with an endpoint that is
    not an exact DNS `host:port`, a rule the proxy cannot match, a `secret` backend with no source or
    a zero `maxTtlSeconds`; each with one `warn` line naming the audience and the rule, never the
    reference. An endpoint shared with another audience visible from the same namespace is refused
@@ -279,6 +289,14 @@ Tests first, red before the code.
   pod with no restart; the platform credential read from OpenBao KV; a sandbox of another
   namespace naming the team audience `Failed` with the reason of one not configured; neither
   credential in the broker's log.
+- Again on 2026-11-21 with notaio v0.7.0-rc.2 (the amended collision rule, `L026` on header
+  values, `L017` refusing a rule path `path_is_canonical` refuses), the pin both crates and the
+  kind tier move to: `make check`, `make kind-e2e-policy` and `make kind-e2e-gateway-audience`
+  green, the same fingerprints for the two Secret values.
+- Again on 2026-11-21 with notaio v0.7.0, the release (controller changes only since rc.2: a
+  version past 2^53 - 1 is not issued, a ConfigMap notaio does not manage is left untouched, the
+  OpenBao response is bounded), the pin both crates and the kind tier move to: `make check`,
+  `make kind-e2e-policy` and `make kind-e2e-gateway-audience` green, the same fingerprints.
 - Not proven on a cluster: a gateway-placed team audience (the API tests cover it), a platform
   audience served to a claim (read, not served, in kind), and any live deployment.
 

@@ -108,6 +108,12 @@ pub enum Inadmissible {
     /// A header that is not a lowercase token or is reserved.
     #[error("header {0:?} is not a lowercase token, or is reserved")]
     Header(String),
+    /// An extra header whose value is empty, not printable ASCII, or edged with whitespace
+    /// (notaio ADR-0020 as amended, L026). Names the header, never the value.
+    #[error(
+        "the value of extra header {0:?} is empty, not printable ASCII, or edged with whitespace"
+    )]
+    HeaderValue(String),
     /// An endpoint that is not an exact DNS `host:port`.
     #[error("endpoint {0:?} is not an exact DNS host:port")]
     Endpoint(String),
@@ -136,7 +142,7 @@ impl Inadmissible {
         match self {
             Self::TeamBackend => "L022",
             Self::TeamOpenBao => "L023",
-            Self::Header(_) => "L026",
+            Self::Header(_) | Self::HeaderValue(_) => "L026",
             Self::Endpoint(_) | Self::Rule { .. } => "L017",
             Self::NoSource => "NoSource",
             Self::NoTtl => "NoTtl",
@@ -151,6 +157,16 @@ fn header_ok(h: &str) -> bool {
         && h.bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || TCHAR_SYMBOLS.contains(&b))
         && !RESERVED_HEADERS.contains(&h)
+}
+
+/// notaio's L026 for a value: non-empty, printable ASCII with inner spaces and tabs only, nothing
+/// that could end the header line (no CR, no LF, no other control character).
+fn header_value_ok(v: &str) -> bool {
+    let edge = |c: char| c == ' ' || c == '\t';
+    !v.is_empty()
+        && !v.starts_with(edge)
+        && !v.ends_with(edge)
+        && v.bytes().all(|b| b == b'\t' || (0x20..=0x7e).contains(&b))
 }
 
 fn endpoint(s: &str) -> Result<Endpoint, Inadmissible> {
@@ -174,6 +190,14 @@ fn rule(r: &mediatore_policy::types::EndpointRule) -> Result<EndpointRule, Inadm
     if !method_ok || !r.path.starts_with('/') {
         return Err(refuse(
             "needs an HTTP method or `*` and an absolute path glob".into(),
+        ));
+    }
+    // The enforcement points refuse such a request path before any rule (`path_is_canonical`),
+    // so a rule spelled that way matches nothing and would only mislead a coverage check.
+    if !mediatore_proto::path_is_canonical(&r.path) {
+        return Err(refuse(
+            "a dot segment, an empty segment or an encoded separator, which no admitted request has"
+                .into(),
         ));
     }
     let out = EndpointRule {
@@ -221,6 +245,14 @@ pub fn audience_of(
         if !header_ok(h) {
             return Err(Inadmissible::Header(h.clone()));
         }
+    }
+    if let Some(h) = d
+        .credential
+        .extra_headers
+        .iter()
+        .find(|h| !header_value_ok(&h.value))
+    {
+        return Err(Inadmissible::HeaderValue(h.name.clone()));
     }
     if d.max_ttl_seconds == 0 {
         return Err(Inadmissible::NoTtl);
@@ -1121,6 +1153,70 @@ mod tests {
         }
         let mut d = definition("a.example.com:443");
         d.credential.header = Some("x-api-key".into());
+        assert!(audience_of(&payload("team-a", "a", d), PLATFORM).is_ok());
+    }
+
+    /// notaio ADR-0020 as amended 2026-11-21 (L026): an extra header's value is non-empty,
+    /// printable ASCII with inner spaces and tabs only, no leading or trailing whitespace, so a
+    /// CR or an LF can never split the request. Checked here too: neither side is trusted alone.
+    #[test]
+    fn an_extra_header_value_with_a_control_character_or_edge_whitespace_is_refused() {
+        let with = |v: &str| {
+            let mut d = definition("a.example.com:443");
+            d.credential.extra_headers = vec![HeaderPair {
+                name: "anthropic-version".into(),
+                value: v.into(),
+            }];
+            audience_of(&payload("team-a", "a", d), PLATFORM)
+        };
+        for bad in [
+            "",
+            "2023-06-01\r\nx-injected: 1",
+            "a\nb",
+            "a\u{0}b",
+            "a\u{7f}b",
+            " leading",
+            "trailing ",
+            "\ttab-led",
+            "caf\u{e9}",
+        ] {
+            let r = with(bad).unwrap_err();
+            assert_eq!(r.code(), "L026", "{bad:?}");
+            assert!(
+                !r.to_string().contains(bad) || bad.is_empty(),
+                "the value is never echoed: {r}"
+            );
+        }
+        for good in ["2023-06-01", "oauth-2025-04-20", "a b\tc", "x"] {
+            assert!(with(good).is_ok(), "{good:?}");
+        }
+    }
+
+    /// A rule path the enforcement points would refuse as a request (`path_is_canonical`) can
+    /// never match, and would read as inside a wider rule to a coverage check: refused at
+    /// admission rather than kept as a dead rule.
+    #[test]
+    fn a_rule_path_with_a_dot_segment_or_an_encoded_separator_is_refused() {
+        for bad in [
+            "/v2/../admin/**",
+            "/v2/./x",
+            "/a%2fb/**",
+            "/a/%2e%2e/b",
+            "/a//b",
+        ] {
+            let mut d = definition("a.example.com:443");
+            d.rules = vec![mediatore_policy::types::EndpointRule {
+                method: "GET".into(),
+                path: bad.into(),
+            }];
+            let r = audience_of(&payload("team-a", "a", d), PLATFORM).unwrap_err();
+            assert_eq!(r.code(), "L017", "{bad:?}");
+        }
+        let mut d = definition("a.example.com:443");
+        d.rules = vec![mediatore_policy::types::EndpointRule {
+            method: "GET".into(),
+            path: "/v2/**".into(),
+        }];
         assert!(audience_of(&payload("team-a", "a", d), PLATFORM).is_ok());
     }
 
