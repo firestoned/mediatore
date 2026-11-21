@@ -13,6 +13,8 @@ use std::sync::Arc;
 use clap::{Parser, Subcommand};
 use mediatore_api::{AppState, Limiter};
 use mediatore_claims::Reconciler;
+use mediatore_claims::audience::AudienceReflector;
+use mediatore_claims::credential::{CredentialCache, CredentialReader, Readers};
 use mediatore_claims::kubestore::KubeStore;
 use mediatore_claims::lease::LeaseConfig;
 use mediatore_claims::policy::{BundleCache, BundleReflector};
@@ -140,6 +142,8 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
     // The reflector needs the store the state is about to own, and the state needs the
     // reflector's cache (ADR-0030): built first.
     let reflector = bundle_reflector(&cfg, &store, client.is_some())?;
+    let audiences = audience_definitions(&cfg, &store, client.as_ref()).await?;
+    let audience_catalog = serving_catalog(&cfg, audiences.as_ref());
     let policy_egress = policy_egress(&cfg, reflector.as_deref());
 
     let state = Arc::new(AppState {
@@ -151,6 +155,7 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
             .map(|a| (a.name.clone(), a.inject_routes()))
             .collect(),
         inject_port: cfg.gateway_inject_port,
+        audience_catalog: audience_catalog.clone(),
         // A workload's output (ADR-0045 decision 11): the ring's cap when `logs.enabled`, else
         // `None` and both routes fail closed with `501`.
         logs: cfg.log_limits(),
@@ -206,8 +211,14 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
         // `policy` section.
         let bundles = reflector.as_ref().map(|r| r.cache());
         let policy_client = client.clone();
+        let audience_client = client.clone();
         let p = async {
             policy_reflector(policy_client, reflector)
+                .await
+                .map_err(std::io::Error::other)
+        };
+        let aud = async {
+            run_audience_definitions(audience_client, audiences)
                 .await
                 .map_err(std::io::Error::other)
         };
@@ -216,7 +227,7 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
                 .await
                 .map_err(std::io::Error::other)
         };
-        tokio::try_join!(u, s, w, p)?;
+        tokio::try_join!(u, s, w, p, aud)?;
     } else {
         if cfg.policy.is_some() {
             tracing::warn!("policy configured but no cluster client (dev_mode): no bundle is read");
@@ -265,6 +276,107 @@ fn bundle_reflector(
         keys,
         policy.namespaces.clone(),
     ))))
+}
+
+/// What ADR-0055 runs beside the file: the reflector that fills the audience catalog and the
+/// cache its audiences' credentials are read into, with the readers.
+struct AudienceDefinitions {
+    reflector: Arc<AudienceReflector>,
+    credentials: Arc<CredentialCache>,
+    reader: Arc<dyn CredentialReader>,
+}
+
+/// The audience reflector and the credential reads (ADR-0055 decisions 1 and 5). Under `shadow`
+/// notaio's audience bundles are read beside the file, each comparison logged, each credential
+/// read and the outcome logged; the file still serves. Under `bundles` the same catalog and
+/// credentials serve (the caller hands them to the API and the watcher). `None` under `config`,
+/// and without a cluster. With `openbao` configured the login happens here, so a wrong URL, CA or
+/// role stops the start.
+async fn audience_definitions(
+    cfg: &Config,
+    store: &Arc<dyn ClaimStore>,
+    client: Option<&kube::Client>,
+) -> anyhow::Result<Option<AudienceDefinitions>> {
+    let mode = cfg.audience_mode();
+    let (Some(policy), Some(client)) = (cfg.policy.as_ref(), client) else {
+        return Ok(None);
+    };
+    let Some(defs) = policy.audience_definitions.as_ref() else {
+        return Ok(None);
+    };
+    let namespaces = cfg.audience_namespaces();
+    tracing::info!(
+        mode = %mode,
+        platform_namespace = %defs.platform_namespace,
+        namespaces = ?namespaces,
+        "policy.audience_definitions (ADR-0055)"
+    );
+    if mode == config::AudienceMode::Config {
+        return Ok(None);
+    }
+    let keys = mediatore_policy::trusted_keys(&policy.trusted_keys)?;
+    let reflector = AudienceReflector::new(
+        store.clone(),
+        keys,
+        defs.platform_namespace.clone(),
+        namespaces,
+    );
+    let reflector = if mode == config::AudienceMode::Shadow {
+        reflector.with_shadow(cfg.audience_shapes())
+    } else {
+        reflector
+    };
+    let openbao: Option<Box<dyn CredentialReader>> = match &defs.openbao {
+        Some(o) => Some(Box::new(
+            mediatore_claims::credential::OpenBaoKv::connect(o).await?,
+        )),
+        None => None,
+    };
+    let refresh = jiff::SignedDuration::from_secs(
+        i64::try_from(defs.credential_refresh_secs)
+            .map_err(|_| anyhow::anyhow!("credential_refresh_secs is too large"))?,
+    );
+    Ok(Some(AudienceDefinitions {
+        reflector: Arc::new(reflector),
+        credentials: Arc::new(CredentialCache::new(refresh)),
+        reader: Arc::new(Readers {
+            kube: Some(Box::new(mediatore_claims::credential::KubeSecrets::new(
+                client.clone(),
+            ))),
+            openbao,
+        }),
+    }))
+}
+
+/// ADR-0055 decision 8: under `bundles` the catalog and its credentials serve, in the API and the
+/// watcher; under `config` and `shadow` they do not.
+fn serving_catalog(
+    cfg: &Config,
+    audiences: Option<&AudienceDefinitions>,
+) -> Option<mediatore_api::AudienceCatalogSource> {
+    audiences
+        .filter(|_| cfg.audience_mode() == config::AudienceMode::Bundles)
+        .map(|a| mediatore_api::AudienceCatalogSource {
+            live: a.reflector.live(),
+            credentials: a.credentials.clone(),
+        })
+}
+
+/// The audience reflector and the credential refresh on every replica, until shutdown; nothing
+/// without them. A watch that ends is an error, so the pod restarts with the cause in its log.
+async fn run_audience_definitions(
+    client: kube::Client,
+    audiences: Option<AudienceDefinitions>,
+) -> anyhow::Result<()> {
+    let Some(a) = audiences else {
+        return Ok(());
+    };
+    let live = a.reflector.live();
+    tokio::select! {
+        r = mediatore_claims::audience::run(client, a.reflector) => r,
+        r = mediatore_claims::credential::run(live, a.credentials, a.reader) => r,
+        () = shutdown() => Ok(()),
+    }
 }
 
 /// The reflector on every replica, outside the Lease: each replica needs the cache it will
@@ -330,6 +442,8 @@ async fn claim_watcher(
                 .filter(|a| a.via == mediatore_entra::Backend::Delegated)
                 .map(|a| a.name.clone())
                 .collect(),
+            // ADR-0055: under `bundles`, the catalog the API reads, answering for the watcher too.
+            catalog: state.audience_catalog.as_ref().map(|c| c.live.clone()),
             ..WatcherConfig::default()
         },
     );

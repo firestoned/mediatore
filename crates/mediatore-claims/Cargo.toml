@@ -22,6 +22,8 @@ mediatore-proto.workspace = true
 mediatore-store.workspace = true
 mediatore-spire.workspace = true
 mediatore-policy.workspace = true
+# A platform audience's credential from OpenBao KV (ADR-0055 decision 5).
+mediatore-openbao.workspace = true
 kube.workspace = true
 k8s-openapi.workspace = true
 tokio.workspace = true
@@ -44,6 +46,7 @@ hex.workspace = true
 base64.workspace = true
 
 [dev-dependencies]
+tempfile.workspace = true
 mediatore-testkit.workspace = true
 # The storage contract's shared cases (ADR-0057 decision 6), run over the Kubernetes store.
 mediatore-store = { workspace = true, features = ["test-support"] }

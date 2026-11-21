@@ -1,9 +1,13 @@
 <!-- Copyright (c) 2026 Erick Bourgeois, mediatore -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# ADR-0055: Which pools' members become nodes: an operator list, and credentials served by namespace
+# ADR-0059: Which pools' members become nodes: an operator list, and credentials served by namespace
 
-**Status:** Proposed · **Date:** 2026-11-19
+**Status:** Proposed, to be rewritten (renumbered from ADR-0055 on 2026-11-20. Decided the same day,
+not yet written in below: the list becomes an object notaio signs, beside `SandboxAudience`
+(notaio ADR-0020), never in a tenant namespace; the registry half of decision 7 moves to a
+`SandboxPolicy` grant, ADR-0060; audiences are ADR-0055's. The open questions keep their
+answers) · **Date:** 2026-11-19
 
 Roadmap 03 (the claim watcher) and roadmap 08 (the `AgentSandbox` CRD), with roadmap 04 for the
 audiences. This is the *Revisit when* of accepted risk R-44 (`docs/security/threat-model.md` §8).
@@ -155,35 +159,33 @@ condition is met by the first operator who uses the map as intended.
    outside the list, at the cost of one member destroyed. Control: `Watcher::refuse`,
    `crates/mediatore-claims/src/sandbox.rs`.
 
-7. **An audience and a registry gain `namespaces`, the namespaces they are served to.**
-   `audiences[].namespaces: [<ns>, ...]` and `registries[].namespaces: [<ns>, ...]`, optional.
-   Absent, the entry is served to every namespace, as now. Present, a claim whose record's
-   namespace (`ClaimRecord.namespace`, ADR-0046 decision 9) is not listed is treated as if the
-   entry did not exist, at each place the entry is read:
-   - `refuse()`: `audience <a> is not configured`, the same text as for an audience that does
-     not exist, so the refusal is no oracle for another tenant's audiences;
-   - `still_configured`, which `POST /v1/token` and the gateway's credential route both pass
-     through (`issue_token`): `403`, with the claim UID, the audience and the namespace logged;
-   - `me`: no route for that audience's endpoints and no `registry_credential` from a registry
-     entry not served to the claim's namespace; with `gateways` set, the registry is also not
-     reachable for that namespace (`reachable_registries`, `placed_registries`), so the sandbox
-     is refused before a claim exists and not at the pull.
+7. **A registry gains `namespaces`, the namespaces its credential is served to. Audiences are
+   ADR-0053's.** *Amended 2026-11-20.* As written this decision gave audiences a `namespaces`
+   list as well; the audience-scoping ADR-0053, merged first, gives an audience a `namespaces`
+   map (each namespace with its own rules), refuses an audience outside it as not configured at
+   every place it is named or used, and under `policy.audiences: enforce` makes an unscoped
+   audience usable only under a policy that grants it. This ADR adds nothing for audiences.
 
-   With a namespace map set, an audience `via: secret` with `inject: proxy` and a registry entry
-   that carries a credential must each say one of `namespaces: [...]` or `all_namespaces: true`,
-   or the broker does not start: no gate must be written down, as ADR-0046 decision 19 required
-   of an issuer. `via: sts`, `via: delegated` and `via: entra-obo` audiences mint or open something
-   that is the subject's own; they may carry `namespaces` and need not. Control:
-   `AudienceConfig`, `RegistryConfig` and `Config::validate` in `crates/mediatore/src/config.rs`;
-   `Watcher::refuse` in `crates/mediatore-claims/src/sandbox.rs`; `still_configured` and `me` in
-   `crates/mediatore-api/src/lib.rs`.
+   `registries[].namespaces: [<ns>, ...]`, optional. Absent, the registry is served to every
+   namespace, as now. Present, a claim whose record's namespace (`ClaimRecord.namespace`,
+   ADR-0046 decision 9) is not listed is treated as if the entry did not exist: `me` attaches
+   no `registry_credential` from it, and with `gateways` set the registry is not reachable or
+   placed for that namespace (`reachable_registries`, `placed_registries`), so a sandbox there
+   naming an image on it is refused before a claim exists and not at the pull. Under a namespace
+   map a registry that carries a credential and no `namespaces` is served everywhere and named in
+   one `warn` line at start, as ADR-0053 decision 7 does for an unscoped audience; it is not a
+   refusal (open question 5, answered by that precedent). Control: `RegistryConfig` and
+   `Config::validate` in `crates/mediatore/src/config.rs`; `Watcher::refuse` in
+   `crates/mediatore-claims/src/sandbox.rs`; `me` in `crates/mediatore-api/src/lib.rs`.
 
 8. **A credential shared by every namespace should be gateway-placed, and the broker says so at
    start.** Scoping bounds which sandboxes are handed a credential; it does not change that a
    proxy-placed credential is in a pool VM's memory, outside the jail, where the member's root
    reads it (A-23). ADR-0040's placement keeps it off every pool VM whatever image the member
-   runs. So: an audience with `via: secret`, `inject: proxy` and `all_namespaces: true` under a
-   namespace map logs one `warn` line at start naming the audience and ADR-0040. It is a warning
+   runs. So: an audience with `via: secret` and `inject: proxy` that a namespace map leaves
+   usable from more than one namespace (unscoped, or scoped to several) logs one `warn` line at
+   start naming the audience and ADR-0040 (*amended 2026-11-20*: there is no `all_namespaces`
+   marker; ADR-0053's unscoped audience is the shared one). It is a warning
    and not a refusal, because an operator without gateways has no other placement. For a
    registry the equivalents are an anonymous mirror on the segment (ADR-0029) or a credential
    listed for one namespace. Control: the start log in `crates/mediatore/src/main.rs`; the
@@ -223,11 +225,11 @@ condition is met by the first operator who uses the map as intended.
     without `sandboxes.pools` (decision 3); `pools` present and empty, a namespace key with an
     empty list, a duplicate pool under one namespace, a namespace or pool name that is not an RFC
     1123 name, an unknown field in an entry, an empty `image_revisions`; a namespace of the map
-    with no pool listed (it could never bind); an audience's or a registry's `namespaces` that is
-    empty, repeats a value, or names a namespace that is neither in the map nor a key of `pools`
-    (a typo that would serve nobody); `namespaces` together with `all_namespaces: true`; and the
-    missing marker of decision 7. The broker logs at start, at `info`, each namespace with its
-    pool names, and each scoped audience and registry with its namespaces: configuration values,
+    with no pool listed (it could never bind); a registry's `namespaces` that is empty, repeats a
+    value, or names a namespace that is neither in the map nor a key of `pools` (a typo that
+    would serve nobody). An audience's `namespaces` is checked as ADR-0053 decision 6 says
+    (*amended 2026-11-20*: there is no marker to require). The broker logs at start, at `info`,
+    each namespace with its pool names, and each scoped registry with its namespaces: configuration values,
     never a credential. `dev_mode` applies the same checks and the same enforcement: the dev
     binder (`free_node`) has no pools, so under a list a dev claim carries the pool the request
     named and `MemoryStore` records the namespace, and a fake that admitted what the real path
@@ -255,7 +257,7 @@ once the code exists (`.claude/rules/threat-modeling.md`).
 | A machine in a namespace the operator never listed is vouched for to SPIRE as a node | S/E | `Pools::admits` called by `Watcher::reconcile_machine`, `crates/mediatore-claims/src/watch.rs` (not yet built) |
 | A pool label written by hand on a machine in an unlisted namespace | S | The namespace is the key and is the API server's, `Pools::admits`, `crates/mediatore-claims/src/lib.rs` (not yet built). Inside a listed namespace the label is trusted by design (decision 2) |
 | A claim bound by banlieue to a member of an unlisted pool, through a selector | E | `Watcher::resolve` refuses on the claim's namespace and `status.poolRef`, `crates/mediatore-claims/src/watch.rs` (not yet built) |
-| A sandbox in one namespace is handed an operator-held credential meant for another | I | `audiences[].namespaces` checked in `still_configured` and `Watcher::refuse`, `crates/mediatore-api/src/lib.rs`, `crates/mediatore-claims/src/sandbox.rs` (not yet built) |
+| A sandbox in one namespace is handed an operator-held credential meant for another | I | ADR-0053's `audiences[].namespaces` (exists; amended 2026-11-20, this ADR adds nothing for audiences) |
 | A member in one namespace is handed another namespace's registry credential | I | `registries[].namespaces` checked in `me`, `crates/mediatore-api/src/lib.rs` (not yet built) |
 | A refusal tells a tenant which audiences or pools another tenant has | I | The refusal texts of decisions 6 and 7, pinned by test, `crates/mediatore-claims/src/sandbox.rs` (not yet built) |
 | The list is shrunk and the node entries already declared stay | E | `nodegc::entries_to_retract`, `crates/mediatore-claims/src/nodegc.rs`, run by `Watcher::collect_nodes` (not yet built) |
@@ -342,10 +344,10 @@ Unit, `crates/mediatore/src/config.rs`:
 `a_mapped_namespace_with_no_listed_pool_refuses_to_start`,
 `an_empty_pools_list_or_a_duplicate_pool_refuses_to_start`,
 `a_pool_entry_with_an_unknown_field_refuses_to_start`,
-`an_audience_scoped_to_an_unknown_namespace_refuses_to_start`,
-`under_a_map_a_proxy_placed_secret_audience_must_say_its_namespaces`,
-`under_a_map_a_credentialed_registry_must_say_its_namespaces`,
-`namespaces_and_all_namespaces_together_refuse_to_start`,
+`a_registry_scoped_to_an_unknown_namespace_refuses_to_start`,
+`under_a_map_an_unscoped_credentialed_registry_is_named_in_a_warning`,
+`under_a_map_a_shared_proxy_placed_secret_audience_is_named_in_a_warning`,
+`an_image_revisions_field_is_refused_until_it_is_built`,
 `every_config_in_the_shipped_examples_and_guides_still_parses`.
 
 Unit, `crates/mediatore-claims/src/lib.rs`: `pools_any_admits_everything`,
@@ -371,17 +373,17 @@ Unit, `crates/mediatore-claims/src/sandbox.rs`:
 `a_sandbox_naming_an_unlisted_pool_is_refused_without_a_claim`,
 `a_selector_in_a_namespace_with_no_listed_pool_is_refused_without_a_claim`,
 `the_pool_refusal_lists_no_served_pool`,
-`an_audience_not_served_to_the_namespace_reads_as_not_configured`.
+`an_image_on_a_registry_not_served_to_the_namespace_is_refused_without_a_claim`.
 
 Unit, `crates/mediatore-api/src/lib.rs`:
-`a_secret_audience_scoped_to_another_namespace_is_403_at_token_and_at_the_gateway_route`,
 `me_carries_no_registry_credential_for_a_registry_scoped_to_another_namespace`,
-`an_unscoped_audience_is_served_everywhere_as_before`,
+`an_unscoped_registry_is_served_everywhere_as_before`,
 `a_node_whose_machine_is_not_admitted_cannot_register_under_a_list`,
 `registration_is_unchecked_without_a_list`.
 
 End to end, `crates/mediatore/tests/e2e_dev.rs` (real HTTP listeners, the test kit's fake IdP):
-`two_namespaces_each_get_their_own_secret_audience_and_not_the_others`, and the negative cases
+`two_namespaces_each_get_their_own_registry_credential_and_not_the_others` and
+`a_claim_from_an_unlisted_pool_is_refused_over_real_listeners`, with the negative cases
 of `.claude/rules/testing.md` for the new refusals. `MemoryEntries` and `MemoryStore` gain what
 the retraction needs and refuse what the real ones refuse.
 
@@ -400,35 +402,41 @@ Kind tiers, on the build host:
 
 `make check`, `make calm-validate` and `make calm-diagrams` green before the commit.
 
-## Open questions
+## Open questions, answered 2026-11-20
 
-1. **Is `image_revisions` built with the key, or left for the operator who asks?** It needs the
+The maintainer took each recommendation but the fifth, whose premise ADR-0053 changed; the answer
+is the first line of each item.
+
+1. *Answered: the key now, `image_revisions` decided and unbuilt.* **Is `image_revisions` built with the key, or left for the operator who asks?** It needs the
    exact format of banlieue's `banlieue.io/pool-image-revision` label value confirmed against
    banlieue, and it turns every image rebuild into a configuration change. Recommendation: build
    the `(namespace, pool)` key now and keep `image_revisions` in this ADR as decided but
    unbuilt: until a deployment needs it the field is refused at start as unknown, never read
    and ignored.
-2. **Does shrinking the list release claims already bound on the excluded pool (decision 9)?**
+2. *Answered: release.* **Does shrinking the list release claims already bound on the excluded pool (decision 9)?**
    The alternative is to stop new binds and let running sandboxes reach their TTL, as a changed
    audience does not flap a bound sandbox. Recommendation: release. The list is a statement of
    trust in a pool's members, a credential may already be on that member, and waiting for a TTL
    is waiting on the party no longer trusted.
-3. **Does this ADR really take node-entry retraction for machines that are gone, or only for
+3. *Answered: both, as one rule.* **Does this ADR really take node-entry retraction for machines that are gone, or only for
    excluded ones?** Recommendation: both, as one rule (decision 9); the predicate is the same
    and a second ADR would re-open the same guards. If the maintainer wants the smaller change,
    decision 9 is cut to excluded machines and ADR-0039's successor takes the rest.
-4. **Should `pools` absent, without a map, narrow to `sandboxes.namespace`?** It would close
+4. *Answered: no, today's behaviour and the start line.* **Should `pools` absent, without a map, narrow to `sandboxes.namespace`?** It would close
    R-44 for the single-namespace operator too, and it would stop nodes for declarative
    sandboxes in other namespaces that work today. Recommendation: no, keep today's behaviour and
    the start log line; revisit when the default namespace form is next touched.
-5. **The marker `all_namespaces: true` (decision 7): required under a map, or is absence
-   enough?** Recommendation: required, for operator-held and registry credentials only, on the
-   precedent of `allow_any_authenticated` (ADR-0046 decision 19). It is not backward compatible
-   for a map-era deployment and the release notes say so.
-6. **Should a shared, proxy-placed `via: secret` audience under a map be refused, not warned
+5. *Answered: no marker; a warning (decision 7 as amended).* **The marker `all_namespaces: true`
+   (decision 7): required under a map, or is absence enough?** The recommendation was
+   "required", on the precedent of `allow_any_authenticated` (ADR-0046 decision 19). The
+   audience-scoping ADR-0053, merged after this was written, keeps an unscoped audience open
+   with a warning (its decision 7) and closes it under `policy.audiences: enforce` (its decision
+   14); requiring a marker here would reverse it. The maintainer chose to follow it, for
+   registries too.
+6. *Answered: warn.* **Should a shared, proxy-placed `via: secret` audience under a map be refused, not warned
    (decision 8)?** Recommendation: warn now, since gateways are optional; refuse once the
    gateway shape is the only supported one for multi-tenant deployments, in its own ADR.
-7. **The early answer at the front door.** `POST /v1/claims` could answer `400 invalid_pool` for
+7. *Answered: not in this ADR.* **The early answer at the front door.** `POST /v1/claims` could answer `400 invalid_pool` for
    an unlisted `pool_ref` instead of creating a sandbox that fails. Recommendation: not in this
    ADR; the sandbox's `status.reason` serves both paths, and a second answer is a second text to
    keep free of other tenants' names.

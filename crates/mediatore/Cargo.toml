@@ -37,6 +37,7 @@ mediatore-tls.workspace = true
 kube.workspace = true
 mediatore-store.workspace = true
 mediatore-policy.workspace = true
+mediatore-openbao.workspace = true
 mediatore-claims.workspace = true
 mediatore-guest.workspace = true
 mediatore-gateway.workspace = true

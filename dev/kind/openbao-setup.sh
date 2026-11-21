@@ -61,13 +61,19 @@ bao_root_stdin policy write mediatore-transit - >/dev/null <<'HCL'
 path "transit/encrypt/mediatore" { capabilities = ["update"] }
 path "transit/decrypt/mediatore" { capabilities = ["update"] }
 HCL
+# Platform audiences' credentials (ADR-0055 decision 5): a KV v2 mount the broker reads under
+# `platform/` and nowhere else, as an operator would grant it.
+bao_root secrets list -format=json | jq -e '."audiences/"' >/dev/null 2>&1 || bao_root secrets enable -path=audiences kv-v2 >/dev/null
+bao_root_stdin policy write mediatore-audiences - >/dev/null <<'HCL'
+path "audiences/data/platform/*" { capabilities = ["read"] }
+HCL
 bao_root write auth/kubernetes/role/mediatore \
   bound_service_account_names=mediatore \
   bound_service_account_namespaces="$NS" \
   audience=openbao \
-  token_policies=mediatore-transit \
+  token_policies=mediatore-transit,mediatore-audiences \
   token_ttl=1h >/dev/null
-echo "openbao: transit key mediatore (derived), Kubernetes auth role mediatore for $NS/mediatore (audience openbao)"
+echo "openbao: transit key mediatore (derived), KV v2 audiences (read on platform/* for the broker), Kubernetes auth role mediatore for $NS/mediatore (audience openbao)"
 
 # The SPIRE server's upstream authority (ADR-0031): the mount, the root once, the policy, the role.
 bao_root secrets list -format=json | jq -e '."spire/"' >/dev/null 2>&1 || bao_root secrets enable -path=spire pki >/dev/null

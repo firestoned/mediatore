@@ -7,6 +7,10 @@
 # bundle nor read any other kind here; what it reads it verifies against the keys in its
 # own configuration, never against anything in the cluster.
 #
+# The same Role lets the broker read notaio's audience bundles (ADR-0055 decision 1,
+# `<audience>-audience` ConfigMaps) under `policy.audience_definitions`: apply it also in the
+# platform audience namespace and in every sandbox namespace not already listed.
+#
 # One copy per listed namespace: `kubectl apply -k deploy/policy-bundles` applies it to
 # `sandboxes`, the default; for another namespace, an overlay of two lines
 # (`resources: [../policy-bundles]` and `namespace: <that namespace>`). The namespace must

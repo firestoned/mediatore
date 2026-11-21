@@ -366,6 +366,21 @@ async fn serve(listen: &str, tls: Option<(PathBuf, PathBuf)>) -> anyhow::Result<
     }
 }
 
+/// The first 16 hex digits of the SHA-256 of the request's `Authorization` value, or `none`.
+fn credential_fingerprint(head: &str) -> String {
+    use sha2::{Digest as _, Sha256};
+    head.lines()
+        .find_map(|l| {
+            l.split_once(':')
+                .filter(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+                .map(|(_, v)| v.trim())
+        })
+        .map_or_else(
+            || "none".to_owned(),
+            |v| hex::encode(Sha256::digest(v.as_bytes()))[..16].to_owned(),
+        )
+}
+
 /// One request: read the head, answer with the host it named.
 async fn answer<S: AsyncRead + AsyncWrite + Unpin>(mut stream: S, peer: std::net::SocketAddr) {
     let mut buf = vec![0u8; 8192];
@@ -391,8 +406,13 @@ async fn answer<S: AsyncRead + AsyncWrite + Unpin>(mut stream: S, peer: std::net
         })
         .map_or("", |(_, v)| v.trim());
     let target = text.lines().next().unwrap_or("").to_owned();
-    // Never the headers: a request through the proxy carries a real token.
-    println!("destination request from={peer} host={host} line={target:?}");
+    // Never the headers: a request through the proxy carries a real token. Which credential
+    // arrived is told by a fingerprint alone (ADR-0055: the kind tier proves a rotation reached
+    // the destination), the first 16 hex digits of the SHA-256 of the `Authorization` value.
+    let credential = credential_fingerprint(&text);
+    println!(
+        "destination request from={peer} host={host} line={target:?} credential_sha256={credential}"
+    );
     let body = format!("destination reached: host={host}\n");
     let resp = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",

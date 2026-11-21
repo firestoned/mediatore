@@ -58,6 +58,11 @@ struct TransitState {
     lease_secs: u64,
     tokens: HashMap<String, Instant>,
     keys: HashMap<String, Key>,
+    /// KV v2 secrets (ADR-0055 decision 5), by `(mount, path)`.
+    kv: HashMap<(String, String), serde_json::Map<String, serde_json::Value>>,
+    /// Paths the broker's policy does not grant: a read is 403.
+    kv_denied: std::collections::HashSet<String>,
+    kv_reads: usize,
     down: bool,
     logins: usize,
     encrypts: usize,
@@ -149,6 +154,33 @@ fn authorized(s: &TransitState, headers: &HeaderMap) -> bool {
         .and_then(|v| v.to_str().ok())
         .and_then(|t| s.tokens.get(t))
         .is_some_and(|expiry| *expiry > Instant::now())
+}
+
+/// `GET /v1/<mount>/data/<path>`: a KV v2 read, `{"data": {"data": {..}, "metadata": {..}}}`.
+async fn kv_read(
+    State(st): State<Shared>,
+    Path((mount, path)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    let mut s = st.lock().expect("transit state");
+    if s.down {
+        return errors(StatusCode::SERVICE_UNAVAILABLE, "down");
+    }
+    if !authorized(&s, &headers) || s.kv_denied.contains(&path) {
+        return errors(StatusCode::FORBIDDEN, "permission denied");
+    }
+    s.kv_reads += 1;
+    match s.kv.get(&(mount, path)) {
+        Some(data) => axum::Json(serde_json::json!({
+            "data": { "data": data, "metadata": { "version": 1 } }
+        }))
+        .into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({ "errors": [] })),
+        )
+            .into_response(),
+    }
 }
 
 /// `POST /v1/<mount>/encrypt/<key>`.
@@ -402,6 +434,9 @@ impl FakeTransit {
             lease_secs: 3600,
             tokens: HashMap::new(),
             keys: HashMap::new(),
+            kv: HashMap::new(),
+            kv_denied: std::collections::HashSet::new(),
+            kv_reads: 0,
             down: false,
             logins: 0,
             encrypts: 0,
@@ -419,6 +454,7 @@ impl FakeTransit {
             .route("/v1/{mount}/encrypt/{key}", axum::routing::post(encrypt))
             .route("/v1/{mount}/decrypt/{key}", axum::routing::post(decrypt))
             .route("/v1/{mount}/sign/{key}", axum::routing::post(sign))
+            .route("/v1/{mount}/data/{*path}", axum::routing::get(kv_read))
             .with_state(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -541,6 +577,28 @@ impl FakeTransit {
     /// How long a token issued from now lives.
     pub fn set_lease_secs(&self, secs: u64) {
         self.lock().lease_secs = secs;
+    }
+
+    /// Write `fields` at `mount`/`path` in KV v2, replacing what was there.
+    pub fn put_kv(&self, mount: &str, path: &str, fields: &[(&str, &str)]) {
+        let data = fields
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), serde_json::Value::from(*v)))
+            .collect();
+        self.lock()
+            .kv
+            .insert((mount.to_owned(), path.to_owned()), data);
+    }
+
+    /// Refuse reads of `path` (any mount) with 403, as a policy that does not grant it would.
+    pub fn deny_kv(&self, path: &str) {
+        self.lock().kv_denied.insert(path.to_owned());
+    }
+
+    /// Authorized KV reads so far.
+    #[must_use]
+    pub fn kv_reads(&self) -> usize {
+        self.lock().kv_reads
     }
 
     /// Answer every request with 503 while `down`.

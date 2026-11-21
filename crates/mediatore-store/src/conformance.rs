@@ -67,6 +67,7 @@ macro_rules! suite {
                 a_policy_floor_round_trips_to_the_nanosecond,
                 a_policy_floor_moves_only_from_what_is_held,
                 a_floor_written_under_another_policy_is_refused,
+                an_audience_floor_is_its_own_beside_a_policy_of_the_same_name,
                 ping_answers,
                 appended_output_reads_back_in_sequence,
                 a_partial_record_keeps_its_mark_through_a_write_and_a_read,
@@ -912,6 +913,41 @@ pub(crate) async fn a_floor_written_under_another_policy_is_refused(s: &dyn Clai
     assert_eq!(
         s.get_policy_floor("sandboxes", "agent").await.unwrap(),
         Some(held)
+    );
+}
+
+/// ADR-0055 decision 1: an audience's floor is kept under notaio's `audience/<name>`, a name no
+/// policy can have, beside the policy floors and never in their place.
+pub(crate) async fn an_audience_floor_is_its_own_beside_a_policy_of_the_same_name(
+    s: &dyn ClaimStore,
+) {
+    let policy = floor("artifactory", "policy-uid", 7, at(0));
+    let audience = floor("audience/artifactory", "audience-uid", 2, at(5));
+    s.advance_policy_floor(None, policy.clone()).await.unwrap();
+    s.advance_policy_floor(None, audience.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        s.get_policy_floor("sandboxes", "artifactory")
+            .await
+            .unwrap(),
+        Some(policy)
+    );
+    assert_eq!(
+        s.get_policy_floor("sandboxes", "audience/artifactory")
+            .await
+            .unwrap(),
+        Some(audience.clone())
+    );
+    let next = floor("audience/artifactory", "audience-uid", 3, at(10));
+    s.advance_policy_floor(Some(&audience), next.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        s.get_policy_floor("sandboxes", "audience/artifactory")
+            .await
+            .unwrap(),
+        Some(next)
     );
 }
 

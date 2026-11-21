@@ -13,6 +13,41 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+/// `OpenBao` reached for KV reads alone (ADR-0055 decision 5: a platform audience's credential):
+/// the connection and the login of a [`TransitConfig`], with no transit key. The KV mount and
+/// path come with each read.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KvConfig {
+    /// `https://openbao.example:8200`; `http` only under `dev_mode`.
+    pub url: String,
+    /// PEM file with the CA certificates `OpenBao`'s certificate chains to.
+    #[serde(default)]
+    pub ca_file: Option<PathBuf>,
+    /// The Kubernetes auth role the broker logs in as.
+    pub role: String,
+    /// Where the Kubernetes auth method is mounted (default `kubernetes`).
+    #[serde(default = "default_auth_mount")]
+    pub auth_mount: String,
+    /// The projected `ServiceAccount` token presented at login.
+    #[serde(default = "default_token_file")]
+    pub token_file: PathBuf,
+}
+
+impl From<&KvConfig> for TransitConfig {
+    fn from(kv: &KvConfig) -> Self {
+        Self {
+            url: kv.url.clone(),
+            ca_file: kv.ca_file.clone(),
+            mount: default_mount(),
+            key: String::new(),
+            role: kv.role.clone(),
+            auth_mount: kv.auth_mount.clone(),
+            token_file: kv.token_file.clone(),
+        }
+    }
+}
+
 /// `OpenBao` transit, as configuration (`store.sealing.transit` and
 /// `issuers[].entra.transit`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -237,14 +272,47 @@ impl Client {
         body: serde_json::Value,
     ) -> Result<serde_json::Value, Error> {
         let url = format!("{}/v1/{}/{op}/{key}", self.base, self.mount);
+        self.send(op, &url, Some(&body)).await
+    }
+
+    /// The fields of the KV v2 secret at `mount`/`path` (`GET /v1/<mount>/data/<path>`, ADR-0055
+    /// decision 5), the object under `data.data`. A path that holds nothing is `Rejected`, a
+    /// path the broker's policy does not grant is `Denied`. The answer is never logged.
+    pub async fn kv_get(
+        &self,
+        mount: &str,
+        path: &str,
+    ) -> Result<serde_json::Map<String, serde_json::Value>, Error> {
+        let url = format!(
+            "{}/v1/{}/data/{}",
+            self.base,
+            mount.trim_matches('/'),
+            path.trim_matches('/')
+        );
+        let mut v = self.send("kv read", &url, None).await?;
+        match v.pointer_mut("/data/data").map(serde_json::Value::take) {
+            Some(serde_json::Value::Object(fields)) => Ok(fields),
+            _ => Err(Error::Rejected("kv read: no data in the answer".into())),
+        }
+    }
+
+    /// One request with the leased token: `POST` with `body`, else `GET`; a 403 retried once
+    /// after a fresh login.
+    async fn send(
+        &self,
+        op: &str,
+        url: &str,
+        body: Option<&serde_json::Value>,
+    ) -> Result<serde_json::Value, Error> {
         let mut force = false;
         for _ in 0..2 {
             let token = self.token(force).await?;
-            let resp = self
-                .http
-                .post(&url)
+            let req = match body {
+                Some(b) => self.http.post(url).json(b),
+                None => self.http.get(url),
+            };
+            let resp = req
                 .header("X-Vault-Token", token)
-                .json(&body)
                 .send()
                 .await
                 .map_err(|e| Error::Unavailable(format!("{op}: {e}")))?;

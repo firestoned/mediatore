@@ -1,0 +1,9 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+#
+# The per-namespace Role for reading audience credentials (ADR-0055 decision 5). Apply one per
+# namespace that holds an audience's Secret, with `resourceNames` replaced (see rbac.yaml).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - rbac.yaml

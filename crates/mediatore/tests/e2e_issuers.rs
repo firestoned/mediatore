@@ -43,6 +43,7 @@ struct Harness {
 }
 
 impl Harness {
+    #[allow(clippy::too_many_lines)] // three IdPs and every AppState field, listed in full
     async fn start() -> Self {
         let google = FakeIdp::start_as(Profile::Google).await;
         google.set_client_secret(CLIENT_ID, GOOGLE_SECRET);
@@ -96,6 +97,7 @@ impl Harness {
         let state = Arc::new(AppState {
             inject: std::collections::BTreeMap::new(),
             inject_port: None,
+            audience_catalog: None,
             logs: None,
             log_limiter: Limiter::per_second(2),
             log_wakes: mediatore_api::LogWakes::default(),
@@ -398,6 +400,7 @@ async fn claim_through_gate(gate: IssuerGate, groups: &[&str]) -> (u16, String) 
     let state = Arc::new(AppState {
         inject: std::collections::BTreeMap::new(),
         inject_port: None,
+        audience_catalog: None,
         logs: None,
         log_limiter: Limiter::per_second(2),
         log_wakes: mediatore_api::LogWakes::default(),

@@ -100,9 +100,54 @@ pub struct WatcherConfig {
     /// `logs.retention` (ADR-0045 decision 4): how long a claim's stored output outlives the
     /// claim's end before the resync sweeps it. Only read when `logs_enabled`.
     pub logs_retention: Duration,
+    /// ADR-0055: under `policy.audience_definitions.mode: bundles`, the audience catalog, which
+    /// then answers every audience question here in place of `audiences`, `scopes` and
+    /// `delegated_audiences` (empty in that mode). `None`: the file answers.
+    pub catalog: Option<std::sync::Arc<crate::audience::LiveCatalog>>,
 }
 
 impl WatcherConfig {
+    /// The catalog's definition of `audience` as a sandbox in `namespace` resolves it now.
+    fn resolved(&self, audience: &str, namespace: &str) -> Option<crate::audience::Audience> {
+        let catalog = self.catalog.as_ref()?.snapshot();
+        catalog
+            .resolve(namespace, audience, jiff::Timestamp::now())
+            .ok()
+            .map(|a| (**a).clone())
+    }
+
+    /// Under the catalog, whether a sandbox in `namespace` must wait: the platform namespace or
+    /// its own has not completed its first list, so a missing audience may simply be unread. Its
+    /// spec is immutable, so a refusal now would be for good.
+    #[must_use]
+    pub fn audiences_unread(&self, namespace: &str) -> bool {
+        self.catalog
+            .as_ref()
+            .is_some_and(|c| !c.ready_for(namespace))
+    }
+
+    /// Whether a sandbox in `namespace` may name `audience` at all: configured and in scope
+    /// (the file), or resolvable from there (the catalog, ADR-0055 decision 3).
+    #[must_use]
+    pub fn usable(&self, audience: &str, namespace: &str) -> bool {
+        if self.catalog.is_some() {
+            return self.resolved(audience, namespace).is_some();
+        }
+        self.audiences.iter().any(|c| c.name == audience) && self.scope_allows(audience, namespace)
+    }
+
+    /// Whether `audience` is served from the requester's own credential for a sandbox in
+    /// `namespace` (ADR-0035).
+    #[must_use]
+    pub fn is_delegated(&self, audience: &str, namespace: &str) -> bool {
+        if self.catalog.is_some() {
+            return self.resolved(audience, namespace).is_some_and(|a| {
+                a.definition.credential.backend == mediatore_policy::types::Backend::Delegated
+            });
+        }
+        self.delegated_audiences.contains(audience)
+    }
+
     /// ADR-0053 decision 4: may a sandbox in `namespace` name `audience`? An unscoped audience is
     /// usable everywhere; a scoped one only where it lists the namespace.
     #[must_use]
@@ -121,10 +166,19 @@ impl WatcherConfig {
         audience: &str,
         bundle: &mediatore_policy::BundlePayload,
     ) -> bool {
-        let Some(configured) = self.audiences.iter().find(|a| a.name == audience) else {
+        let Some(grant) = bundle.content.audiences.iter().find(|g| g.name == audience) else {
             return false;
         };
-        let Some(grant) = bundle.content.audiences.iter().find(|g| g.name == audience) else {
+        if self.catalog.is_some() {
+            // ADR-0055 decision 6: the definition's rules are the ceiling, its endpoints the egress.
+            // Decision 3: a team audience only by a policy of its own namespace.
+            return self.resolved(audience, namespace).is_some_and(|a| {
+                (a.kind == crate::audience::AudienceKind::Platform
+                    || bundle.content.policy.namespace == a.namespace)
+                    && crate::policy::effective_grant(&a.rules, None, &a.endpoints, grant).is_some()
+            });
+        }
+        let Some(configured) = self.audiences.iter().find(|a| a.name == audience) else {
             return false;
         };
         let file = self
@@ -140,6 +194,24 @@ impl WatcherConfig {
     /// judges what the claim can actually do.
     #[must_use]
     pub fn audiences_in(&self, namespace: &str) -> Vec<Audience> {
+        if let Some(live) = &self.catalog {
+            let catalog = live.snapshot();
+            let now = jiff::Timestamp::now();
+            return catalog
+                .visible_from(namespace, now)
+                .filter(|a| {
+                    catalog
+                        .resolve(namespace, &a.name, now)
+                        .is_ok_and(|r| std::sync::Arc::ptr_eq(r, a))
+                })
+                .map(|a| Audience {
+                    name: a.name.clone(),
+                    max_ttl: i64::from(a.definition.max_ttl_seconds),
+                    egress: a.endpoints.clone(),
+                    rules: a.rules.clone(),
+                })
+                .collect();
+        }
         self.audiences
             .iter()
             .filter(|a| self.scope_allows(&a.name, namespace))
@@ -170,6 +242,7 @@ impl Default for WatcherConfig {
             audiences_mode: crate::policy::EgressMode::default(),
             policy_sources: crate::policy::PolicySources::default(),
             delegated_audiences: std::collections::BTreeSet::new(),
+            catalog: None,
             node_grace: Duration::from_mins(10),
             logs_enabled: false,
             logs_retention: Duration::from_hours(1),
@@ -1443,5 +1516,143 @@ mod tests {
         let r = rig(WatcherConfig::default());
         r.claims.fail_machine_listing(true);
         assert_eq!(r.watcher.collect_nodes().await.unwrap(), 0);
+    }
+
+    // ADR-0055: under `bundles` the watcher reads the audience catalog, not the file.
+
+    mod catalog {
+        use std::sync::Arc;
+
+        use jiff::Timestamp;
+        use mediatore_policy::types::{
+            AudienceCredential, AudienceDefinition, Backend, CredentialFormat, Placement,
+        };
+        use mediatore_testkit::policy::{audience_configmap, fresh_bundle, signed_audience};
+
+        use crate::audience::{AudienceReflector, LiveCatalog};
+        use crate::watch::WatcherConfig;
+
+        const PLATFORM: &str = "sandbox-platform";
+
+        fn def(backend: Backend, endpoint: &str) -> AudienceDefinition {
+            AudienceDefinition {
+                credential: AudienceCredential {
+                    backend,
+                    placement: Placement::Proxy,
+                    format: CredentialFormat::Bearer,
+                    source: None,
+                    header: None,
+                    extra_headers: Vec::new(),
+                    refresh: None,
+                },
+                endpoints: vec![endpoint.into()],
+                rules: Vec::new(),
+                max_ttl_seconds: 300,
+                ca_ref: None,
+            }
+        }
+
+        async fn live(entries: &[(&str, &str, AudienceDefinition)]) -> Arc<LiveCatalog> {
+            let keys = signed_audience(
+                Timestamp::now(),
+                1,
+                PLATFORM,
+                "x",
+                def(Backend::None, "x.example:443"),
+            )
+            .keys;
+            let r = AudienceReflector::new(
+                mediatore_store::MemoryStore::shared(),
+                keys,
+                PLATFORM.into(),
+                vec![
+                    PLATFORM.into(),
+                    "team-a".into(),
+                    "team-b".into(),
+                    "conformance".into(),
+                ],
+            );
+            for (ns, name, d) in entries {
+                let a = signed_audience(Timestamp::now(), 1, ns, name, d.clone());
+                r.applied(&audience_configmap(ns, name, &a.envelope)).await;
+            }
+            r.live()
+        }
+
+        #[tokio::test]
+        async fn a_team_audience_is_usable_in_its_namespace_and_a_platform_one_everywhere() {
+            let cfg = WatcherConfig {
+                catalog: Some(
+                    live(&[
+                        ("team-a", "registry", def(Backend::None, "r.example:443")),
+                        (PLATFORM, "shared", def(Backend::Delegated, "s.example:443")),
+                    ])
+                    .await,
+                ),
+                ..WatcherConfig::default()
+            };
+            assert!(cfg.usable("registry", "team-a"));
+            assert!(!cfg.usable("registry", "team-b"));
+            assert!(cfg.usable("shared", "team-b"));
+            assert!(!cfg.usable("nowhere", "team-a"));
+            assert!(cfg.is_delegated("shared", "team-a"));
+            assert!(!cfg.is_delegated("registry", "team-a"));
+            let mut seen: Vec<String> = cfg
+                .audiences_in("team-a")
+                .into_iter()
+                .map(|a| a.name)
+                .collect();
+            seen.sort();
+            assert_eq!(seen, ["registry", "shared"]);
+            let seen: Vec<String> = cfg
+                .audiences_in("team-b")
+                .into_iter()
+                .map(|a| a.name)
+                .collect();
+            assert_eq!(seen, ["shared"]);
+            // A file audience counts for nothing once the catalog serves.
+            let cfg = WatcherConfig {
+                audiences: vec![crate::shadow::Audience::named("registry")],
+                ..cfg
+            };
+            assert!(!cfg.usable("registry", "team-b"));
+        }
+
+        /// ADR-0055 decision 3: a team audience is granted only by a policy of its own namespace;
+        /// a platform audience by a policy of any namespace the sandbox draws from.
+        #[tokio::test]
+        async fn a_team_audience_is_granted_only_by_a_policy_of_its_own_namespace() {
+            let bundle = fresh_bundle(Timestamp::now(), 1).payload;
+            let policy_ns = bundle.content.policy.namespace.clone();
+            let granted = &bundle.content.audiences[0];
+            let endpoint = granted.endpoints[0].clone();
+            let team = |ns: &str| (ns.to_owned(), def(Backend::None, &endpoint));
+            let cfg_with = |entries: Vec<(String, AudienceDefinition)>| async move {
+                let entries: Vec<(&str, &str, AudienceDefinition)> = entries
+                    .iter()
+                    .map(|(ns, d)| (ns.as_str(), granted.name.as_str(), d.clone()))
+                    .collect();
+                WatcherConfig {
+                    catalog: Some(live(&entries).await),
+                    ..WatcherConfig::default()
+                }
+            };
+            let cfg = cfg_with(vec![team("team-a")]).await;
+            assert!(
+                !cfg.grants("team-a", &granted.name, &bundle),
+                "another namespace's policy"
+            );
+            assert!(!cfg.grants("team-b", &granted.name, &bundle));
+            let cfg = cfg_with(vec![team(&policy_ns)]).await;
+            assert!(
+                cfg.grants(&policy_ns, &granted.name, &bundle),
+                "its own namespace's policy"
+            );
+            let cfg = cfg_with(vec![team(PLATFORM)]).await;
+            assert!(
+                cfg.grants("team-a", &granted.name, &bundle),
+                "a platform audience"
+            );
+        }
     }
 }
