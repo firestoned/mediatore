@@ -71,6 +71,7 @@ macro_rules! shared_suite {
             an_update_never_puts_back_an_envelope_the_release_dropped,
             modify_claim_decides_again_on_the_fresh_record_and_stops_at_a_released_one,
             modify_claim_gives_up_after_its_attempts_with_a_conflict,
+            what_the_guest_rendered_and_the_follow_verdict_survive_a_write,
         );
     };
 }
@@ -91,6 +92,8 @@ fn subject() -> Subject {
 /// A record for claim `uid`, on a sandbox of its own, nothing bound.
 fn record(uid: Uuid) -> ClaimRecord {
     ClaimRecord {
+        rendered: None,
+        follow: None,
         uid,
         name: format!("sandbox-{}", &uid.to_string()[..8]),
         namespace: "team-a".into(),
@@ -149,6 +152,47 @@ async fn stored(f: &dyn Fixture, rec: ClaimRecord) -> (Uuid, Uuid) {
     let (uid, sandbox_uid) = (rec.uid, rec.sandbox_uid.expect("a sandbox uid"));
     f.store().put_claim(rec).await.unwrap();
     (uid, sandbox_uid)
+}
+
+/// ADR-0061 decision 2: what the guest was handed and the follow rule's verdict are kept on
+/// the record by every store, field for field.
+pub async fn what_the_guest_rendered_and_the_follow_verdict_survive_a_write(f: &dyn Fixture) {
+    let s = f.store();
+    let (uid, _) = stored(f, record(Uuid::new_v4())).await;
+    let mut rec = s.get_claim(uid).await.unwrap();
+    assert!(
+        rec.rendered.is_none() && rec.follow.is_none(),
+        "neither is set on a new record"
+    );
+    let rendered = mediatore_proto::Rendered {
+        bundle_version: 3,
+        bundle_digest: "sha256:0123".into(),
+        routes: vec![mediatore_proto::RenderedRoute {
+            audience: Some("e2e".into()),
+            endpoint: "git.example.com:443".parse().unwrap(),
+            rules: vec![mediatore_proto::EndpointRule {
+                method: "GET".into(),
+                path: "/repos/**".into(),
+            }],
+        }],
+        egress: vec!["git.example.com:443".parse().unwrap()],
+    };
+    let follow = mediatore_proto::FollowRefusal {
+        reason: mediatore_proto::FollowReason::LeaseExceeded,
+        rendered_version: Some(3),
+        current_version: 4,
+        enforced: false,
+        at: at(60),
+    };
+    rec.rendered = Some(rendered.clone());
+    rec.follow = Some(follow.clone());
+    s.update_claim(rec).await.unwrap();
+    let read = s.get_claim(uid).await.unwrap();
+    assert!(
+        read.rendered == Some(rendered),
+        "the rendered routes and egress are kept"
+    );
+    assert!(read.follow == Some(follow), "the follow verdict is kept");
 }
 
 /// Decision 1: every read sets the version, two reads with no write between them agree, and

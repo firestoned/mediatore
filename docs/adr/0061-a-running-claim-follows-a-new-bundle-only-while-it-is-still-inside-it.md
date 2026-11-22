@@ -3,7 +3,7 @@
 
 # ADR-0061: A running claim follows a new bundle version only while it is still inside it
 
-**Status:** Accepted 2026-11-21 (the four open questions decided by the maintainer at their recommendations); not yet implemented · **Date:** 2026-11-21
+**Status:** Accepted 2026-11-21 (the four open questions decided by the maintainer at their recommendations); implemented 2026-11-21 behind `policy.follow: shadow` by default (decisions 1 to 6; amended at implementation, see *Implementation notes*); not yet run on a cluster · **Date:** 2026-11-21
 
 Amends [ADR-0053](0053-an-audience-scoped-to-namespaces-each-with-its-own-rules.md) decision 12
 (every use reads the current bundle). Builds on [ADR-0026](0026-notaio-bundles-verified-in-shadow.md)
@@ -138,6 +138,55 @@ Decided 2026-11-21 by the maintainer: each at its recommendation.
    Nothing to build here.
 4. **Alerting.** *Recommendation:* routine. The audit line is `info`; `rendered_wider` and
    `bundle_changed_in_place` are `warn`. What alerts is the operator's choice.
+
+## Implementation notes
+
+What was built within decisions 1 to 6, so a reader of the code finds it here, with the
+amendments made at implementation:
+
+- **The function** is `serve_under` in `crates/mediatore-claims/src/follow.rs`, over a `Render`
+  (`Rendering` for the guest's first `200`, `Recorded`, or `Unknown` for a record from before this
+  ADR) and a `Current` (version, digest, lease, whether the name still resolves, the routes and
+  egress the claim would be handed now). The reasons are `mediatore_proto::FollowReason`.
+  *Amended:* a record from before the ADR at a changed version is refused as `rendered_unknown`,
+  a reason of its own, so the condition says why.
+- **The record** gains `rendered` (`mediatore_proto::Rendered`) and `follow`
+  (`mediatore_proto::FollowRefusal`, the last refusal and whether it was enforced), on
+  `ClaimRecord` and as `status.record.rendered` and `status.record.follow` on the `AgentSandbox`
+  (`crates/mediatore-claims/src/kubestore.rs`; the CRD regenerated). Both stores keep them field
+  for field (the shared case `what_the_guest_rendered_and_the_follow_verdict_survive_a_write`).
+- **The answers** (`crates/mediatore-api/src/follow.rs`): `gate` runs first in `GET /v1/me`,
+  `POST /v1/token`, `GET /v1/gateway/claims/{uid}` and the gateway's credential route.
+  `GET /v1/me`'s routes and egress are one function, `handed`, which the comparison reads too.
+  The first `200` writes `rendered` by compare-and-set and never replaces it. The mint answers
+  `403 policy_changed`; the gateway's two answers are the `404` of a released claim, so the
+  gateway drops what it cached.
+- **The verdict is written once, read by all.** *Amended (decision 3):* the reconciler does not
+  call `serve_under`; it would need the API's routes. The API writes the verdict on the record
+  when it changes (and clears a shadow one when the claim is inside again), with one line
+  (`info`, `warn` for `rendered_wider` and `bundle_changed_in_place`) naming the claim, the policy
+  `uid`, the admitted, rendered and current versions, the reason and whether it was enforced.
+  The reconciler mirrors it as `PolicyFollowed` (`followed` in
+  `crates/mediatore-claims/src/sandbox.rs`): `False` with `Refused` or `WouldRefuse`, `True` with
+  `Inside` once the guest rendered, absent before.
+- **The switch** is `policy.follow` (`PolicySection`, `crates/mediatore/src/config.rs`), named in
+  the start log with whether it is enforced. *Amended (decision 5):* the shadow line is the same
+  line as the enforced one, with `enforced=false`, rather than a separate `would_refuse` line.
+- **Under `policy.audiences: shadow`** the broker's file, not the bundle, decides the routes, so
+  a bundle that narrows rules or egress narrows nothing the guest was handed and the rendered leg
+  finds nothing; the admission leg (the lease, the name) still reports. The rendered leg starts
+  to report with `policy.audiences: enforce`, which is when it can bite.
+
+## What was proven, and what was not
+
+- `make check` on the build host: the function's cases (`follow::tests`), the stores, the
+  condition, and the answers over the real routers (`follow_rule` in `crates/mediatore-api`): what
+  the first answer records, a narrowing the guest rendered wider ending the claim under enforce
+  and staying ended, the shadow report and its clearing under both shadow combinations, a lease
+  shortened below the claim's lifetime, a record from before the ADR, a claim with no policy left
+  alone.
+- Not proven on a cluster: no kind tier runs a bound claim across a bundle version yet, and no
+  live broker runs `policy.audiences: enforce`, so `policy.follow: enforce` cannot bite anywhere.
 
 ## Consequences
 

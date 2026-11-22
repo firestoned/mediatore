@@ -56,6 +56,7 @@ use mediatore_tls::PeerSpiffeId;
 use uuid::Uuid;
 
 mod audiences;
+mod follow;
 pub use audiences::{AudienceCatalogSource, AudienceView, CatalogView};
 
 /// Hex characters of the claim UID used in the generated object name.
@@ -1188,6 +1189,8 @@ async fn dev_claim(
     }
     st.store
         .put_claim(ClaimRecord {
+            rendered: None,
+            follow: None,
             uid,
             name: name.clone(),
             subject: validated.subject.clone(),
@@ -2358,22 +2361,16 @@ async fn report(
     }
 }
 
-async fn me(
-    State(st): State<Shared>,
-    headers: HeaderMap,
-    peer: Option<Extension<PeerSpiffeId>>,
-) -> Result<Json<Me>, ApiError> {
-    let rec = claim_of_node_peer(&st, &headers, peer.as_ref().map(|e| &e.0)).await?;
-    audiences_ready(&st, &rec.namespace)?;
-    let expires_at = rec
-        .expires_at
-        .ok_or_else(|| ApiError::internal("bound claim has no deadline".to_owned()))?;
+/// What `GET /v1/me` hands the guest for `rec` now: the ruleset's destinations and the
+/// proxy's routes. One function, so ADR-0061's comparison reads exactly what a guest would be
+/// given.
+fn handed(st: &AppState, rec: &ClaimRecord) -> (Vec<Endpoint>, Vec<Route>) {
     // The destinations are the claim's audiences' (ADR-0020 decision 2): an audience that
     // declares none contributes none, and the jail reaches the broker only. Plus, in
     // `policy.egress: enforce`, the direct egress of its bundle the gateway serves
     // (ADR-0030), the same list the gateway is given.
-    let audience_endpoints = audience_egress(&st, &rec);
-    let direct = served_direct_egress(&st, &rec, &audience_endpoints);
+    let audience_endpoints = audience_egress(st, rec);
+    let direct = served_direct_egress(st, rec, &audience_endpoints);
     let mut egress = audience_endpoints;
     egress.extend(direct.iter().cloned());
     egress.sort();
@@ -2383,10 +2380,10 @@ async fn me(
     // A direct entry gets a route with no audience and no credential (decision 8): the
     // proxy forwards bare, and the gateway, not the proxy, is what admits it.
     let view = st.view(&rec.namespace);
-    let mut routes: Vec<Route> = claim_audiences(&st, &rec)
+    let mut routes: Vec<Route> = claim_audiences(st, rec)
         // `effective` reads the catalog again: a definition withdrawn in between is skipped,
         // never assumed present (ADR-0055 decision 2).
-        .filter_map(|a| effective(&st, &rec, a).map(|eff| (a, eff)))
+        .filter_map(|a| effective(st, rec, a).map(|eff| (a, eff)))
         .flat_map(|(a, eff)| {
             let rules = eff.rules;
             eff.egress.into_iter().map(move |e| (a, e, rules.clone()))
@@ -2436,6 +2433,25 @@ async fn me(
             .then(a.audience.cmp(&b.audience))
     });
     routes.dedup();
+    (egress, routes)
+}
+
+async fn me(
+    State(st): State<Shared>,
+    headers: HeaderMap,
+    peer: Option<Extension<PeerSpiffeId>>,
+) -> Result<Json<Me>, ApiError> {
+    let rec = claim_of_node_peer(&st, &headers, peer.as_ref().map(|e| &e.0)).await?;
+    audiences_ready(&st, &rec.namespace)?;
+    let expires_at = rec
+        .expires_at
+        .ok_or_else(|| ApiError::internal("bound claim has no deadline".to_owned()))?;
+    let rendering = rec.rendered.is_none();
+    follow::gate(&st, &rec, rendering).await?;
+    let (egress, routes) = handed(&st, &rec);
+    if rendering {
+        follow::record_rendered(&st, &rec, &egress, &routes).await;
+    }
     // The credential for the registry the image names, and no other (ADR-0022 decision 2).
     let registry_credential = rec
         .workload
@@ -2518,6 +2534,9 @@ pub struct PolicyEgress {
     /// `policy.audiences` (ADR-0053 decisions 9 to 16): under `Enforce` a claim is admitted, minted
     /// for and routed only under a verified bundle that grants what it uses.
     pub audiences: mediatore_claims::policy::EgressMode,
+    /// `policy.follow` (ADR-0061): under `Enforce`, with `audiences` `Enforce` too, a running
+    /// claim no longer inside its policy's current bundle is refused; otherwise recorded.
+    pub follow: mediatore_claims::policy::EgressMode,
     /// `policy.sources` (ADR-0054): which policy namespaces each sandbox namespace draws
     /// from. What a record is served is checked against it again at the time it is served.
     pub sources: mediatore_claims::policy::PolicySources,
@@ -2667,6 +2686,11 @@ async fn claim_egress(
         return Err(unknown());
     };
     audiences_ready(&st, &rec.namespace)?;
+    // ADR-0061 decision 4: refused, the claim is denied as a released one is, so the gateway
+    // drops what it cached.
+    if follow::gate(&st, &rec, false).await.is_err() {
+        return Err(unknown());
+    }
     let egress = egress_of(&st, &rec);
     tracing::debug!(claim_uid = %uid, endpoints = egress.len(), "claim egress answered to the gateway");
     Ok(Json(ClaimEgress {
@@ -3158,6 +3182,8 @@ async fn token_claim(
         return Err(ApiError::forbidden("claim revoked or expired"));
     }
     audiences_ready(st, &rec.namespace)?;
+    // ADR-0061: a running claim no longer inside its policy's current bundle mints nothing.
+    follow::gate(st, &rec, false).await?;
     if !claim_audiences(st, &rec).any(|a| a == audience) {
         return Err(ApiError::bad_request(
             "unknown_audience",
@@ -3345,6 +3371,9 @@ async fn gateway_credential(
         return Err(unknown());
     }
     audiences_ready(&st, &rec.namespace)?;
+    if follow::gate(&st, &rec, false).await.is_err() {
+        return Err(unknown());
+    }
     let audience = req.audience;
     if !claim_audiences(&st, &rec).any(|a| a == &audience) {
         return Err(ApiError::bad_request("unknown_audience", audience));
@@ -3688,6 +3717,8 @@ mod tests {
     fn claim(audiences: &[&str], node_id: Option<String>) -> ClaimRecord {
         let uid = Uuid::new_v4();
         ClaimRecord {
+            rendered: None,
+            follow: None,
             uid,
             name: format!("claim-{uid}"),
             subject: subject(),
@@ -4558,6 +4589,7 @@ mod tests {
         );
         (
             PolicyEgress {
+                follow: mediatore_claims::policy::EgressMode::Shadow,
                 bundles: reflector.cache(),
                 mode,
                 sources: sandboxes_draw_from(&namespace),
@@ -4986,6 +5018,7 @@ mod tests {
                 ceiling.iter().map(|(m, p)| rule(m, p)).collect(),
             );
             st.policy_egress = Some(PolicyEgress {
+                follow: mediatore_claims::policy::EgressMode::Shadow,
                 bundles: reflector.cache(),
                 mode: mediatore_claims::policy::EgressMode::Shadow,
                 audiences: mode,
@@ -6742,6 +6775,7 @@ mod tests {
             let mut restarted = base_state();
             restarted.store = with_entry.store.clone();
             restarted.policy_egress = Some(PolicyEgress {
+                follow: mediatore_claims::policy::EgressMode::Shadow,
                 sources: PolicySources::default(),
                 audiences: mediatore_claims::policy::EgressMode::Shadow,
                 ..pe
@@ -6880,6 +6914,7 @@ mod tests {
             let nowhere = with_policy(
                 broker(tenant_map(), false).await,
                 PolicyEgress {
+                    follow: mediatore_claims::policy::EgressMode::Shadow,
                     bundles: Arc::new(BundleCache::watching(vec![POLICY_NS.to_owned()])),
                     mode: EgressMode::Enforce,
                     sources: PolicySources::default(),
@@ -6910,6 +6945,7 @@ mod tests {
             let b = with_policy(
                 broker(tenant_map(), false).await,
                 PolicyEgress {
+                    follow: mediatore_claims::policy::EgressMode::Shadow,
                     bundles: Arc::new(BundleCache::watching(vec!["team-a".to_owned()])),
                     mode: EgressMode::Enforce,
                     sources: PolicySources::default(),
@@ -6945,6 +6981,7 @@ mod tests {
             let (pe, uid) = bundle_for(&["internal-git"], EgressMode::Shadow).await;
             let mut st = placed_internal_git(placed_state());
             st.policy_egress = Some(PolicyEgress {
+                follow: mediatore_claims::policy::EgressMode::Shadow,
                 sources: PolicySources::default(),
                 audiences: mediatore_claims::policy::EgressMode::Shadow,
                 ..pe
@@ -7830,6 +7867,7 @@ mod tests {
             let endpoint = bundle.content.audiences[0].endpoints[0].clone();
             let enforce = |st: &mut AppState| {
                 st.policy_egress = Some(PolicyEgress {
+                    follow: mediatore_claims::policy::EgressMode::Shadow,
                     audiences: mediatore_claims::policy::EgressMode::Enforce,
                     ..pe.clone()
                 });
@@ -7907,6 +7945,303 @@ mod tests {
             );
             assert!(rig.reflector.deleted(&cm));
             assert_eq!(gateway_answer(&rig.st, rec.uid).await.egress, vec![]);
+        }
+    }
+
+    /// ADR-0061: a running claim follows a newer bundle only while it is still inside it.
+    mod follow_rule {
+        use super::*;
+        use mediatore_claims::policy::{BundleReflector, EgressMode, Outcome};
+        use mediatore_policy::BundleContent;
+        use mediatore_proto::FollowReason;
+
+        const AUDIENCE: &str = "internal-git";
+
+        /// A change a test publishes as the policy's next version.
+        type Change<'a> = &'a dyn Fn(&Policy) -> BundleContent;
+
+        /// The conformance policy, admitted at version 2 on a reflector a test publishes
+        /// newer versions on.
+        struct Policy {
+            reflector: BundleReflector,
+            content: BundleContent,
+            namespace: String,
+            uid: String,
+        }
+
+        impl Policy {
+            async fn new() -> Self {
+                let now = Timestamp::now();
+                let mut content = mediatore_testkit::policy::fresh_bundle(now, 1)
+                    .payload
+                    .content;
+                content.audiences.retain(|a| a.name == AUDIENCE);
+                content.lease.max_duration_seconds = 3600;
+                let signed = mediatore_testkit::policy::signed_bundle(now, 2, content.clone());
+                let namespace = content.policy.namespace.clone();
+                let p = Self {
+                    reflector: BundleReflector::new(
+                        mediatore_store::MemoryStore::shared(),
+                        signed.keys,
+                        vec![namespace.clone()],
+                    ),
+                    uid: content.policy.uid.clone(),
+                    content,
+                    namespace,
+                };
+                p.publish(2, p.content.clone()).await;
+                p.reflector.resynced(
+                    &p.namespace,
+                    &std::collections::HashSet::from(["agent-bundle".to_owned()]),
+                );
+                p
+            }
+
+            async fn publish(&self, version: u64, content: BundleContent) {
+                let now = Timestamp::now();
+                let signed = mediatore_testkit::policy::signed_bundle(now, version, content);
+                let cm = mediatore_testkit::policy::bundle_configmap(
+                    &self.namespace,
+                    "agent-bundle",
+                    &signed.envelope,
+                );
+                let outcome = self.reflector.applied_at(&cm, now).await;
+                assert!(matches!(outcome, Outcome::Admitted { .. }), "{outcome:?}");
+            }
+
+            fn narrowed(&self) -> BundleContent {
+                let mut c = self.content.clone();
+                c.audiences[0].rules = vec![mediatore_policy::types::EndpointRule {
+                    method: "GET".into(),
+                    path: "/narrowed/only".into(),
+                }];
+                c
+            }
+
+            fn state(&self, follow: EgressMode, audiences: EgressMode) -> Shared {
+                let mut st = base_state();
+                let endpoint: Endpoint = self.content.audiences[0].endpoints[0].parse().unwrap();
+                st.audiences.push(AUDIENCE.into());
+                st.egress.insert(AUDIENCE.into(), vec![endpoint]);
+                st.no_credential.insert(AUDIENCE.into());
+                st.policy_egress = Some(PolicyEgress {
+                    bundles: self.reflector.cache(),
+                    mode: EgressMode::Shadow,
+                    audiences,
+                    follow,
+                    sources: sandboxes_draw_from(&self.namespace),
+                });
+                Arc::new(st)
+            }
+        }
+
+        /// A claim under the policy at version 2, bound to node `ek`.
+        async fn running(st: &Shared, p: &Policy, ek: &str) -> ClaimRecord {
+            let node = st.naming.node_id(ek);
+            st.store
+                .put_node(NodeRecord {
+                    ek_hash: ek.into(),
+                    node_id: node.clone(),
+                    dmi_uuid: Uuid::new_v4(),
+                    hostname: format!("pool-{ek}"),
+                    provider: None,
+                    banned: false,
+                    registered_at: Timestamp::now(),
+                })
+                .await
+                .unwrap();
+            let mut rec = claim(&[AUDIENCE], Some(node));
+            rec.policy_uid = Some(p.uid.clone());
+            rec.bundle_version = Some(2);
+            stored(st, rec).await
+        }
+
+        async fn me(st: &Shared, ek: &str) -> StatusCode {
+            call(
+                st,
+                "GET",
+                "/v1/me",
+                Some(&st.naming.node_id(ek)),
+                serde_json::Value::Null,
+            )
+            .await
+            .0
+        }
+
+        async fn gateway(st: &Shared, rec: &ClaimRecord) -> StatusCode {
+            call(
+                st,
+                "GET",
+                &format!("/v1/gateway/claims/{}", rec.uid),
+                Some(&gateway_peer()),
+                serde_json::Value::Null,
+            )
+            .await
+            .0
+        }
+
+        /// The mint's answer code: `no_credential` is a claim that is served (the audience
+        /// is reached without one), `policy_changed` one the rule refuses.
+        async fn mint(st: &Shared, rec: &ClaimRecord) -> String {
+            let (_, body, _) = token_for(st, rec, AUDIENCE).await;
+            code(&body).to_owned()
+        }
+
+        async fn record(st: &Shared, rec: &ClaimRecord) -> ClaimRecord {
+            st.store.get_claim(rec.uid).await.unwrap()
+        }
+
+        #[tokio::test]
+        async fn the_first_answer_records_what_the_guest_was_handed_once() {
+            let p = Policy::new().await;
+            let st = p.state(EgressMode::Enforce, EgressMode::Enforce);
+            let rec = running(&st, &p, "ek1").await;
+            assert_eq!(me(&st, "ek1").await, StatusCode::OK);
+            let rendered = record(&st, &rec).await.rendered.expect("recorded");
+            assert_eq!(rendered.bundle_version, 2);
+            assert!(
+                rendered.bundle_digest.starts_with("sha256:") || !rendered.bundle_digest.is_empty()
+            );
+            assert!(
+                rendered
+                    .routes
+                    .iter()
+                    .any(|r| r.audience.as_deref() == Some(AUDIENCE))
+            );
+            assert_eq!(rendered.egress.len(), 1);
+            // Written once: a later answer under a newer version does not replace it.
+            p.publish(3, p.content.clone()).await;
+            assert_eq!(me(&st, "ek1").await, StatusCode::OK);
+            assert_eq!(record(&st, &rec).await.rendered, Some(rendered));
+            assert_eq!(mint(&st, &rec).await, "no_credential", "inside v3: served");
+        }
+
+        #[tokio::test]
+        async fn under_enforce_a_narrowing_the_guest_rendered_wider_ends_the_claim() {
+            let p = Policy::new().await;
+            let st = p.state(EgressMode::Enforce, EgressMode::Enforce);
+            let rec = running(&st, &p, "ek1").await;
+            assert_eq!(me(&st, "ek1").await, StatusCode::OK);
+            assert_eq!(mint(&st, &rec).await, "no_credential");
+            p.publish(3, p.narrowed()).await;
+            assert_eq!(mint(&st, &rec).await, error_code::POLICY_CHANGED);
+            assert_eq!(gateway(&st, &rec).await, StatusCode::NOT_FOUND);
+            let follow = record(&st, &rec)
+                .await
+                .follow
+                .expect("the refusal is recorded");
+            assert_eq!(
+                (
+                    follow.reason,
+                    follow.rendered_version,
+                    follow.current_version,
+                    follow.enforced
+                ),
+                (FollowReason::RenderedWider, Some(2), 3, true)
+            );
+            // Final for the claim: a later version that would admit it again does not.
+            p.publish(4, p.content.clone()).await;
+            assert_eq!(mint(&st, &rec).await, error_code::POLICY_CHANGED);
+        }
+
+        #[tokio::test]
+        async fn under_shadow_the_refusal_is_recorded_and_nothing_is_refused() {
+            // `follow: enforce` with `audiences: shadow` is shadow too (decision 5). There the
+            // file, not the bundle, decides the routes, so a narrowed bundle narrows nothing the
+            // guest was handed; the lease leg still reports.
+            let narrowed = |p: &Policy| p.narrowed();
+            let shorter = |p: &Policy| {
+                let mut c = p.content.clone();
+                c.lease.max_duration_seconds = 60;
+                c
+            };
+            let cases: [(EgressMode, EgressMode, Change<'_>, FollowReason); 2] = [
+                (
+                    EgressMode::Shadow,
+                    EgressMode::Enforce,
+                    &narrowed,
+                    FollowReason::RenderedWider,
+                ),
+                (
+                    EgressMode::Enforce,
+                    EgressMode::Shadow,
+                    &shorter,
+                    FollowReason::LeaseExceeded,
+                ),
+            ];
+            for (follow, audiences, change, reason) in cases {
+                let p = Policy::new().await;
+                let st = p.state(follow, audiences);
+                let rec = running(&st, &p, "ek1").await;
+                assert_eq!(me(&st, "ek1").await, StatusCode::OK);
+                p.publish(3, change(&p)).await;
+                assert_ne!(
+                    mint(&st, &rec).await,
+                    error_code::POLICY_CHANGED,
+                    "{follow} {audiences}"
+                );
+                assert_eq!(gateway(&st, &rec).await, StatusCode::OK);
+                let seen = record(&st, &rec)
+                    .await
+                    .follow
+                    .expect("recorded under shadow");
+                assert_eq!(
+                    (seen.reason, seen.enforced),
+                    (reason, false),
+                    "{follow} {audiences}"
+                );
+                // Back inside: the report is cleared.
+                p.publish(4, p.content.clone()).await;
+                assert_ne!(mint(&st, &rec).await, error_code::POLICY_CHANGED);
+                assert_eq!(record(&st, &rec).await.follow, None, "{follow} {audiences}");
+            }
+        }
+
+        #[tokio::test]
+        async fn a_lease_shortened_below_the_claims_lifetime_ends_it() {
+            let p = Policy::new().await;
+            let st = p.state(EgressMode::Enforce, EgressMode::Enforce);
+            let rec = running(&st, &p, "ek1").await;
+            assert_eq!(me(&st, "ek1").await, StatusCode::OK);
+            let mut shorter = p.content.clone();
+            shorter.lease.max_duration_seconds = 60;
+            p.publish(3, shorter).await;
+            assert_eq!(mint(&st, &rec).await, error_code::POLICY_CHANGED);
+            assert_eq!(
+                record(&st, &rec).await.follow.map(|f| f.reason),
+                Some(FollowReason::LeaseExceeded)
+            );
+        }
+
+        #[tokio::test]
+        async fn a_claim_from_before_the_adr_is_served_until_its_version_changes() {
+            let p = Policy::new().await;
+            let st = p.state(EgressMode::Enforce, EgressMode::Enforce);
+            // Its guest rendered under a broker without ADR-0061: nothing is recorded.
+            let rec = running(&st, &p, "ek1").await;
+            assert_eq!(mint(&st, &rec).await, "no_credential");
+            p.publish(3, p.content.clone()).await;
+            assert_eq!(mint(&st, &rec).await, error_code::POLICY_CHANGED);
+            assert_eq!(
+                record(&st, &rec).await.follow.map(|f| f.reason),
+                Some(FollowReason::RenderedUnknown)
+            );
+        }
+
+        #[tokio::test]
+        async fn a_claim_with_no_policy_or_no_policy_section_is_not_touched() {
+            let p = Policy::new().await;
+            let st = p.state(EgressMode::Enforce, EgressMode::Shadow);
+            let mut rec = running(&st, &p, "ek1").await;
+            rec.policy_uid = None;
+            rec.bundle_version = None;
+            let mut fresh = record(&st, &rec).await;
+            fresh.policy_uid = None;
+            fresh.bundle_version = None;
+            st.store.update_claim(fresh).await.unwrap();
+            assert_eq!(me(&st, "ek1").await, StatusCode::OK);
+            let after = record(&st, &rec).await;
+            assert!(after.rendered.is_none() && after.follow.is_none());
         }
     }
 }

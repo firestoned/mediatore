@@ -274,6 +274,65 @@ pub struct AgentSandboxStatus {
 /// The condition type the shadow comparison writes.
 pub const POLICY_CONFORMANT: &str = "PolicyConformant";
 
+/// The condition type of the follow rule (ADR-0061 decision 4).
+pub const POLICY_FOLLOWED: &str = "PolicyFollowed";
+
+/// `conditions` with `PolicyFollowed` set from the record's follow verdict (ADR-0061 decision
+/// 4), which the API writes and this mirrors: `False` with the reason and both versions when
+/// the rule refuses (`Refused` under enforce, `WouldRefuse` under shadow), `True` once the guest
+/// rendered and the claim is inside, absent before. `lastTransitionTime` holds while the status
+/// does.
+#[must_use]
+pub fn followed(
+    conditions: Vec<Condition>,
+    record: &ClaimRecord,
+    generation: Option<i64>,
+) -> Vec<Condition> {
+    let held = conditions
+        .iter()
+        .find(|c| c.type_ == POLICY_FOLLOWED)
+        .cloned();
+    let mut out: Vec<Condition> = conditions
+        .into_iter()
+        .filter(|c| c.type_ != POLICY_FOLLOWED)
+        .collect();
+    let (status, reason, message) = match (&record.follow, &record.rendered) {
+        (Some(f), _) => (
+            "False",
+            if f.enforced { "Refused" } else { "WouldRefuse" },
+            format!(
+                "{}: rendered under bundle v{}, current v{}",
+                f.reason,
+                f.rendered_version
+                    .map_or_else(|| "unknown".to_owned(), |v| v.to_string()),
+                f.current_version
+            ),
+        ),
+        (None, Some(r)) => (
+            "True",
+            "Inside",
+            format!(
+                "inside its policy's current bundle (rendered under v{})",
+                r.bundle_version
+            ),
+        ),
+        (None, None) => return out,
+    };
+    let last_transition_time = held.filter(|c| c.status == status).map_or_else(
+        || Time(k8s_openapi::jiff::Timestamp::now()),
+        |c| c.last_transition_time,
+    );
+    out.push(Condition {
+        type_: POLICY_FOLLOWED.into(),
+        status: status.into(),
+        reason: reason.into(),
+        message,
+        observed_generation: generation,
+        last_transition_time,
+    });
+    out
+}
+
 /// The reason code of a sandbox failed because its `status.record` names another sandbox
 /// (ADR-0057 decision 7). The code leads `status.reason`, as `delegation_required` does.
 pub const RECORD_NOT_OWN: &str = "record_not_own";
@@ -567,6 +626,8 @@ pub fn record_for(
     bundle: Option<&BundlePayload>,
 ) -> ClaimRecord {
     ClaimRecord {
+        rendered: None,
+        follow: None,
         uid: claim_uid,
         name: sb.name_any(),
         namespace: crate::kubestore::namespace_of(sb),
@@ -882,7 +943,11 @@ impl Watcher {
             return Ok(refused);
         }
         let mut status = mirror_status(sb, &claim, &record);
-        status.conditions = self.conditions(sb, &current.conditions);
+        status.conditions = followed(
+            self.conditions(sb, &current.conditions),
+            &record,
+            sb.metadata.generation,
+        );
         // The entry is set (on Bound) or retracted (on Releasing / Failed) by the claim
         // watcher and recorded in the store, which raises no event here: poll until the
         // status agrees with the record, or until the watcher fails the claim.
@@ -3641,6 +3706,53 @@ mod tests {
     // ----- ADR-0054: which policies a namespace may name -----
 
     /// `policy.egress: enforce`, the broker otherwise as the conformance bundle allows.
+    /// ADR-0061 decision 4: the condition mirrors the record's follow verdict.
+    #[test]
+    fn policy_followed_mirrors_the_records_verdict() {
+        let mut rec = test_record_for_followed();
+        assert!(
+            followed(vec![], &rec, Some(1)).is_empty(),
+            "absent before the guest rendered"
+        );
+        rec.rendered = Some(mediatore_proto::Rendered {
+            bundle_version: 2,
+            bundle_digest: "sha256:2".into(),
+            routes: vec![],
+            egress: vec![],
+        });
+        let inside = followed(vec![], &rec, Some(1));
+        assert_eq!(
+            (inside[0].status.as_str(), inside[0].reason.as_str()),
+            ("True", "Inside")
+        );
+        rec.follow = Some(mediatore_proto::FollowRefusal {
+            reason: mediatore_proto::FollowReason::RenderedWider,
+            rendered_version: Some(2),
+            current_version: 3,
+            enforced: true,
+            at: jiff::Timestamp::now(),
+        });
+        let refused = followed(inside, &rec, Some(1));
+        assert_eq!(refused.len(), 1, "replaced, not added");
+        assert_eq!(
+            (refused[0].status.as_str(), refused[0].reason.as_str()),
+            ("False", "Refused")
+        );
+        assert_eq!(
+            refused[0].message,
+            "rendered_wider: rendered under bundle v2, current v3"
+        );
+        rec.follow.as_mut().unwrap().enforced = false;
+        let held = refused[0].last_transition_time.clone();
+        let shadow = followed(refused, &rec, Some(1));
+        assert_eq!(shadow[0].reason, "WouldRefuse");
+        assert_eq!(shadow[0].last_transition_time, held, "the status held");
+    }
+
+    fn test_record_for_followed() -> ClaimRecord {
+        record_for(&sandbox(true, false), Uuid::new_v4(), None)
+    }
+
     fn enforcing() -> WatcherConfig {
         WatcherConfig {
             egress_mode: EgressMode::Enforce,
