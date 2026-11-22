@@ -162,6 +162,91 @@ pub struct ClaimReport {
     pub report: GuestReport,
 }
 
+/// What the guest was handed when it rendered its jail (ADR-0061 decision 2): the bundle the
+/// first `200` from `GET /v1/me` was computed under and the routes and egress it carried. Kept
+/// on the claim's record, written once, never a credential or a header value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Rendered {
+    /// The bundle's version.
+    pub bundle_version: u64,
+    /// The bundle payload's content digest, as notaio signed it.
+    pub bundle_digest: String,
+    /// The proxy's routes as `/v1/me` answered them, without what places the credential.
+    #[serde(default)]
+    pub routes: Vec<RenderedRoute>,
+    /// The ruleset's destinations as `/v1/me` answered them.
+    #[serde(default)]
+    pub egress: Vec<Endpoint>,
+}
+
+/// One route of [`Rendered`]: the audience (none for a policy's direct egress), the endpoint
+/// and the rules the proxy enforces there (empty admits every method and path).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RenderedRoute {
+    /// The audience, `None` for a direct egress entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audience: Option<String>,
+    /// Where.
+    pub endpoint: Endpoint,
+    /// The rules; empty admits every method and path.
+    #[serde(default)]
+    pub rules: Vec<EndpointRule>,
+}
+
+/// Why a running claim is not served under its policy's current bundle (ADR-0061 decision 3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FollowReason {
+    /// The policy's name no longer resolves, in the namespace's sources, to the claim's policy.
+    PolicyUnresolved,
+    /// The claim's `ttl_seconds` is above the current bundle's lease.
+    LeaseExceeded,
+    /// A route or destination the guest rendered is wider than the current bundle allows.
+    RenderedWider,
+    /// The version changed and nothing records what the guest rendered.
+    RenderedUnknown,
+    /// The same version with another content digest: a signed bundle never changes in place.
+    BundleChangedInPlace,
+}
+
+impl FollowReason {
+    /// The reason as the answer and the condition spell it.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PolicyUnresolved => "policy_unresolved",
+            Self::LeaseExceeded => "lease_exceeded",
+            Self::RenderedWider => "rendered_wider",
+            Self::RenderedUnknown => "rendered_unknown",
+            Self::BundleChangedInPlace => "bundle_changed_in_place",
+        }
+    }
+}
+
+impl std::fmt::Display for FollowReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The follow rule's last refusal for a claim (ADR-0061 decisions 4 and 5), kept on its record
+/// so every replica and the reconciler read the same verdict.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FollowRefusal {
+    /// Why.
+    pub reason: FollowReason,
+    /// The version the guest rendered under, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rendered_version: Option<u64>,
+    /// The current version it was refused at.
+    pub current_version: u64,
+    /// Whether it was enforced (`policy.follow: enforce` under `policy.audiences: enforce`):
+    /// an enforced refusal is final for the claim; a shadow one is a report.
+    pub enforced: bool,
+    /// When.
+    pub at: Timestamp,
+}
+
 /// What the sandbox should run once identity is established.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Workload {
@@ -1175,6 +1260,9 @@ pub mod error_code {
     /// `POST /v1/gateway/claims/{uid}/credential` for an audience that is not declared
     /// `inject: gateway` (`403`): the route answers nothing for an audience placed in the proxy.
     pub const NOT_PLACED_AT_GATEWAY: &str = "not_placed_at_gateway";
+    /// A running claim no longer inside its policy's current bundle, under `policy.follow:
+    /// enforce` (`403`, ADR-0061 decision 4): final for the claim; the owner claims again.
+    pub const POLICY_CHANGED: &str = "policy_changed";
     /// A claim or `GET`/`DELETE` that names no namespace on a broker with a namespace map
     /// (`400`, ADR-0046 decision 4): there is no default to fall back to.
     pub const NAMESPACE_REQUIRED: &str = "namespace_required";

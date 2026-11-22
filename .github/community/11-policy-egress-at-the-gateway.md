@@ -69,3 +69,24 @@ in the namespaces the sandbox's own namespace draws from: itself alone by defaul
 - [ ] The migration walked on a live cluster that keeps policies apart from sandboxes
 - [ ] Eligibility by subject (ADR-0054 decision 7): not built. It waits on notaio's bundle
       carrying `subjects.groups`, and gets an ADR of its own
+
+## A running claim and a newer bundle (ADR-0061)
+
+[ADR-0061](../../docs/adr/0061-a-running-claim-follows-a-new-bundle-only-while-it-is-still-inside-it.md)
+amends ADR-0053 decision 12: a running claim follows its policy's newer bundle only while it is
+still inside it (the lease, the policy's name, nothing the guest rendered wider), behind
+`policy.follow: shadow | enforce`. notaio's roadmap 00, phase 2, "at every mint", is this rule.
+
+- [x] ADR-0061 accepted (2026-11-21), its four open questions at their recommendations
+- [x] CALM updated; `make calm-validate` passes
+- [x] `serve_under` and its reasons; the record's `rendered` and `follow`, kept by both stores;
+      the CRD regenerated
+- [x] The gate on `GET /v1/me`, `POST /v1/token` and the gateway's two answers; `403
+      policy_changed`; the `PolicyFollowed` condition; `policy.follow` validated at start
+- [x] Unit tests and tests over the real routers; `make check` (2026-11-21)
+- [x] Guide, README, ADR-0053 amended; threat-model full pass, stamp bumped
+- [ ] A kind tier that runs a bound claim across a newer bundle version, under both modes
+- [ ] Rollout, after `policy.audiences: enforce` is live: a week of `shadow` reading the
+      `WouldRefuse` conditions, then `enforce`
+- [ ] The knob and tool legs, with the guest rendering from the bundle (notaio phase 3, D4)
+

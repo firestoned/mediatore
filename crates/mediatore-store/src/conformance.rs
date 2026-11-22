@@ -99,6 +99,8 @@ fn at(secs: i64) -> Timestamp {
 
 pub(crate) fn claim(uid: Uuid) -> ClaimRecord {
     ClaimRecord {
+        rendered: None,
+        follow: None,
         uid,
         name: format!("sandbox-{}", &uid.to_string()[..8]),
         namespace: "team-a".into(),

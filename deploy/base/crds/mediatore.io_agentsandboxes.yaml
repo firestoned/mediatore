@@ -357,6 +357,12 @@ spec:
                     format: date-time
                     nullable: true
                     type: string
+                  follow:
+                    description: |-
+                      The follow rule's last refusal (ADR-0061 decisions 4 and 5), as `FollowRefusal`
+                      serialises.
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true
                   namespace:
                     description: The namespace of that sandbox, written and compared with `sandboxUid`.
                     nullable: true
@@ -373,6 +379,12 @@ spec:
                     default: false
                     description: Whether a sealed refresh envelope is held for the claim (in the sandbox's Secret).
                     type: boolean
+                  rendered:
+                    description: |-
+                      What the guest was handed when it rendered (ADR-0061 decision 2), as `Rendered`
+                      serialises.
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true
                   report:
                     description: The guest's report (ADR-0029 decision 5), as `ClaimReport` serialises.
                     type: object
@@ -749,6 +761,12 @@ spec:
                     format: date-time
                     nullable: true
                     type: string
+                  follow:
+                    description: |-
+                      The follow rule's last refusal (ADR-0061 decisions 4 and 5), as `FollowRefusal`
+                      serialises.
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true
                   namespace:
                     description: The namespace of that sandbox, written and compared with `sandboxUid`.
                     nullable: true
@@ -765,6 +783,12 @@ spec:
                     default: false
                     description: Whether a sealed refresh envelope is held for the claim (in the sandbox's Secret).
                     type: boolean
+                  rendered:
+                    description: |-
+                      What the guest was handed when it rendered (ADR-0061 decision 2), as `Rendered`
+                      serialises.
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true
                   report:
                     description: The guest's report (ADR-0029 decision 5), as `ClaimReport` serialises.
                     type: object

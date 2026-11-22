@@ -2262,6 +2262,7 @@ async fn bundle_policy(
     reflector.applied_at(&cm, now).await;
     (
         mediatore_api::PolicyEgress {
+            follow: mediatore_claims::policy::EgressMode::Shadow,
             bundles: reflector.cache(),
             mode: mediatore_claims::policy::EgressMode::Shadow,
             audiences,

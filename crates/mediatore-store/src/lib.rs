@@ -134,6 +134,14 @@ pub struct ClaimRecord {
     /// decision 2); `None` for a claim that ran to its deadline or was released by hand.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit: Option<WorkloadExit>,
+    /// What the guest was handed when it rendered (ADR-0061 decision 2), written once at the
+    /// first `200` from `GET /v1/me` for a claim under a policy; `None` before, and on a record
+    /// written before the ADR.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rendered: Option<mediatore_proto::Rendered>,
+    /// The follow rule's last refusal (ADR-0061 decisions 4 and 5); `None` while it serves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follow: Option<mediatore_proto::FollowRefusal>,
     /// The caller's delegated credentials, by audience (ADR-0035): sealed envelopes with the
     /// sandbox UID as associated data, like `refresh`. Emptied on release and revocation.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]

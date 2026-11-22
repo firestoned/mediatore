@@ -987,6 +987,8 @@ mod tests {
 
     fn record(uid: Uuid) -> ClaimRecord {
         ClaimRecord {
+            rendered: None,
+            follow: None,
             uid,
             name: "claim-x".into(),
             namespace: "sandboxes".into(),

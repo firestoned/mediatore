@@ -206,6 +206,9 @@ reflector, `policyRef`) and adds no component.
     being older than one already accepted. A bundle that is missing, expired or no longer verified at that moment grants
     **nothing**: the claim's audiences are dropped (fail closed), not served from the last bundle it saw. A claim recorded with no policy
     (created before `enforce`) loses its audiences the same way at its next ask, so the rollout of decision 15 drains them first.
+    *Amended by [ADR-0061](0061-a-running-claim-follows-a-new-bundle-only-while-it-is-still-inside-it.md) (2026-11-21):* a claim
+    follows a newer version only while it is still inside it: the lease and the policy's name are checked again, and what the guest
+    rendered must not be wider than the newer version allows; otherwise `403 policy_changed` under `policy.follow: enforce`.
 
 13. **The platform writes the policies; the tenant reads them.** A `SandboxPolicy` per tenant namespace is authored in the policy
     repository, linted by notaio against Security's ceiling and applied by GitOps. The tenant namespace gives its users `get`, `list`

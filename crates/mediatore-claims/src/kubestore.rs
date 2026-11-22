@@ -158,6 +158,16 @@ pub struct RecordStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(schema_with = "preserve_arbitrary")]
     pub exit: Option<serde_json::Value>,
+    /// What the guest was handed when it rendered (ADR-0061 decision 2), as `Rendered`
+    /// serialises.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "preserve_arbitrary")]
+    pub rendered: Option<serde_json::Value>,
+    /// The follow rule's last refusal (ADR-0061 decisions 4 and 5), as `FollowRefusal`
+    /// serialises.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "preserve_arbitrary")]
+    pub follow: Option<serde_json::Value>,
 }
 
 /// One delegated credential on the record (ADR-0035): which audience, until when.
@@ -1681,6 +1691,14 @@ fn record_status_from(rec: &ClaimRecord) -> RecordStatus {
             .as_ref()
             .and_then(|r| serde_json::to_value(r).ok()),
         exit: rec.exit.as_ref().and_then(|x| serde_json::to_value(x).ok()),
+        rendered: rec
+            .rendered
+            .as_ref()
+            .and_then(|r| serde_json::to_value(r).ok()),
+        follow: rec
+            .follow
+            .as_ref()
+            .and_then(|r| serde_json::to_value(r).ok()),
     }
 }
 
@@ -1698,6 +1716,14 @@ fn record_from(sb: &AgentSandbox, status: &RecordStatus) -> Result<ClaimRecord, 
         .map_err(|e| StoreError::Backend(format!("status.record.claimUid: {e}")))?;
     let created_at = status.created_at.0;
     Ok(ClaimRecord {
+        rendered: status
+            .rendered
+            .clone()
+            .and_then(|v| serde_json::from_value::<mediatore_proto::Rendered>(v).ok()),
+        follow: status
+            .follow
+            .clone()
+            .and_then(|v| serde_json::from_value::<mediatore_proto::FollowRefusal>(v).ok()),
         uid,
         name: sb.name_any(),
         namespace: namespace_of(sb),
@@ -4064,6 +4090,8 @@ mod tests {
             format: FORMAT_BARE_UID,
         };
         let rec = ClaimRecord {
+            rendered: None,
+            follow: None,
             uid,
             name: "sandbox-abc".into(),
             namespace: "sandboxes".into(),
@@ -4313,6 +4341,8 @@ mod tests {
     /// A record with the fields the ring reads: its UID, no sandbox yet.
     fn test_record(uid: Uuid) -> ClaimRecord {
         ClaimRecord {
+            rendered: None,
+            follow: None,
             uid,
             name: "sandbox-abc".into(),
             namespace: "sandboxes".into(),

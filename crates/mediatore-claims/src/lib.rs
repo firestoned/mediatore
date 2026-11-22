@@ -25,6 +25,7 @@ pub mod crd_formats;
 pub mod credential;
 #[cfg(test)]
 pub(crate) mod fakes;
+pub mod follow;
 pub mod kubestore;
 pub mod lease;
 pub mod nodegc;
@@ -210,6 +211,8 @@ mod tests {
 
     fn record(uid: Uuid) -> ClaimRecord {
         ClaimRecord {
+            rendered: None,
+            follow: None,
             uid,
             name: format!("claim-{uid}"),
             namespace: "sandboxes".into(),

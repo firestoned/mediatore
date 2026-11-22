@@ -23,7 +23,8 @@ use sandboxpolicy_bundle::{BundleError, VerifyOptions, verify_audience_bundle, v
 use serde::Deserialize;
 
 pub use sandboxpolicy_bundle::{
-    AUDIENCE_PAYLOAD_TYPE, AudienceBundlePayload, BundlePayload, Envelope, TrustedKeys,
+    AUDIENCE_PAYLOAD_TYPE, AudienceBundlePayload, BundleContent, BundlePayload, Envelope,
+    TrustedKeys,
 };
 /// The parts of a bundle's content (an audience grant, an egress rule, a lease), notaio's.
 pub use sandboxpolicy_types as types;

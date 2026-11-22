@@ -713,6 +713,7 @@ async fn enforcing_serves_a_policys_direct_egress_and_shadow_serves_none_of_it()
             // The claims live in `sandboxes` and the policy in its own namespace: the
             // operator's `policy.sources` entry says the one draws from the other (ADR-0054).
             Some(mediatore_api::PolicyEgress {
+                follow: mediatore_claims::policy::EgressMode::Shadow,
                 bundles,
                 mode,
                 sources: drawing("sandboxes", POLICY_NS),
@@ -812,6 +813,7 @@ async fn a_claim_with_no_policy_or_a_bundle_the_cache_does_not_hold_gets_the_aud
             CacheConfig::default(),
             None,
             Some(mediatore_api::PolicyEgress {
+                follow: mediatore_claims::policy::EgressMode::Shadow,
                 bundles,
                 mode: mediatore_claims::policy::EgressMode::Enforce,
                 sources: drawing("sandboxes", POLICY_NS),
@@ -857,6 +859,7 @@ async fn team_a_under_a_policy_of_team_b(
         CacheConfig::default(),
         None,
         Some(mediatore_api::PolicyEgress {
+            follow: mediatore_claims::policy::EgressMode::Shadow,
             bundles,
             mode: mediatore_claims::policy::EgressMode::Enforce,
             sources,
@@ -941,6 +944,7 @@ async fn under_enforce_a_claim_naming_a_policy_outside_its_sources_is_400_and_pa
         CacheConfig::default(),
         None,
         Some(mediatore_api::PolicyEgress {
+            follow: mediatore_claims::policy::EgressMode::Shadow,
             bundles,
             mode: mediatore_claims::policy::EgressMode::Enforce,
             sources: mediatore_claims::policy::PolicySources::default(),

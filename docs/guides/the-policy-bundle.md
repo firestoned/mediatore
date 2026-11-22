@@ -335,6 +335,25 @@ make sure no live claim lacks a policy, then `enforce` in dev and each tier in t
 next ask. The cost is a dependency: under `enforce` a notaio outage longer than the bundle lifetime (15 minutes by default), or a broker clock
 ahead of notaio's by more than the refresh margin, takes the audiences away from every claim under a policy.
 
+## A running claim and a newer bundle (`policy.follow`)
+
+Under `policy.audiences: enforce` every answer for a claim reads its policy's **current** bundle. The guest, though, renders its
+ruleset, its proxy's routes and rules and Landlock's ports once, from its first `GET /v1/me`, and the lease is checked only at the
+claim. [ADR-0061](../adr/0061-a-running-claim-follows-a-new-bundle-only-while-it-is-still-inside-it.md) has a running claim follow a
+newer version only while it is still inside it:
+
+- the policy's name still resolves, in the namespace's sources, to the claim's policy, and `ttl_seconds` fits the newer lease;
+- nothing the guest was handed (kept on the record as `status.record.rendered` at its first `GET /v1/me`) is wider than the newer
+  version allows: every route's rules covered, every destination still served.
+
+Otherwise, under `policy.follow: enforce` (which bites only with `policy.audiences: enforce`), the mint answers `403 policy_changed`
+with the reason, the gateway denies the claim as it does a released one, and the sandbox's `PolicyFollowed` condition is `False`
+with `Refused`, the reason and both versions. The refusal is final for the claim; its owner claims again, and tokens already minted
+run out. Under `shadow` (the default) nothing is refused: the same line is logged with `enforced=false` and the condition reads
+`WouldRefuse`, cleared once the claim is inside again. A claim whose guest rendered under a broker older than ADR-0061 has no
+`rendered` and is refused as `rendered_unknown` at the first changed version. Roll it out after `policy.audiences`: shadow for a week,
+read the `WouldRefuse` conditions, then `enforce`.
+
 ## Audience definitions from notaio (`policy.audience_definitions`)
 
 An audience's definition (its backend, where its credential is placed, its endpoints, the widest

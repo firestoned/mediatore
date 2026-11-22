@@ -556,6 +556,11 @@ pub struct PolicySection {
     /// `enforce` refuses. Per broker deployment, so per environment.
     #[serde(default)]
     pub audiences: mediatore_claims::policy::EgressMode,
+    /// Whether a running claim follows a newer bundle only while it is still inside it
+    /// (ADR-0061 decision 5): `shadow` (the default) logs and records each refusal, `enforce`
+    /// refuses, and only while `audiences` is `enforce` too.
+    #[serde(default)]
+    pub follow: mediatore_claims::policy::EgressMode,
     /// Sandbox namespace to the policy namespaces it draws from (ADR-0054 decision 2).
     /// Optional: a namespace with no entry finds a policy in itself and nowhere else, and an
     /// entry is the whole of that namespace's sources (its own included only if listed).
@@ -2660,6 +2665,27 @@ listen: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }
         );
         // Fail closed: a value the broker does not know is a refused start, not shadow.
         assert!(with_policy(&format!("policy:\n{keys}  audiences: enforced\n")).is_err());
+    }
+
+    #[test]
+    fn the_policy_follow_switch_defaults_to_shadow_and_refuses_an_unknown_value() {
+        use mediatore_claims::policy::EgressMode;
+        let k = conformance_key();
+        let keys = format!("  trusted_keys: [{{ id: \"notaio:v1\", public_key: \"{k}\" }}]\n");
+        let default = with_policy(&format!("policy:\n{keys}"))
+            .unwrap()
+            .policy
+            .unwrap();
+        assert_eq!(default.follow, EgressMode::Shadow);
+        let on = with_policy(&format!("policy:\n{keys}  follow: enforce\n"))
+            .unwrap()
+            .policy
+            .unwrap();
+        assert_eq!(
+            (on.follow, on.audiences),
+            (EgressMode::Enforce, EgressMode::Shadow)
+        );
+        assert!(with_policy(&format!("policy:\n{keys}  follow: enforced\n")).is_err());
     }
 
     #[test]
