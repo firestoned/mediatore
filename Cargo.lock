@@ -3134,8 +3134,8 @@ dependencies = [
 
 [[package]]
 name = "sandboxpolicy-bundle"
-version = "0.7.0"
-source = "git+https://github.com/firestoned/notaio?tag=v0.8.0-rc.1#35d50cde37cc6735fcd198c9aecae3565854726a"
+version = "0.8.0"
+source = "git+https://github.com/firestoned/notaio?tag=v0.8.0#93a863adc5beee551a847e9978a2861e521ae3b4"
 dependencies = [
  "base64 0.23.1",
  "ed25519-dalek",
@@ -3149,8 +3149,8 @@ dependencies = [
 
 [[package]]
 name = "sandboxpolicy-types"
-version = "0.7.0"
-source = "git+https://github.com/firestoned/notaio?tag=v0.8.0-rc.1#35d50cde37cc6735fcd198c9aecae3565854726a"
+version = "0.8.0"
+source = "git+https://github.com/firestoned/notaio?tag=v0.8.0#93a863adc5beee551a847e9978a2861e521ae3b4"
 dependencies = [
  "serde",
  "serde_json",

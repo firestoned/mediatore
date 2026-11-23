@@ -406,8 +406,8 @@ probe's tunnel then reaches the destination with the team Secret (the destinatio
 `credential_sha256=` and the first 16 hex digits, never the value); the Secret is rotated and the
 next tunnel carries the new one with the broker pod and its restart count unchanged; a sandbox in the
 second namespace naming the team audience is `Failed` with `audience e2e-egress is not configured` and
-no claim; and neither credential appears in the broker's log. The kind notaio is v0.8.0-rc.1 (both
-tiers green on it on 2026-11-23; on v0.7.0 and its rc.2 on 2026-11-21; rc.1, the first with
+no claim; and neither credential appears in the broker's log. The kind notaio is v0.8.0 (both
+tiers green on it and on its rc.1 on 2026-11-23; on v0.7.0 and its rc.2 on 2026-11-21; rc.1, the first with
 `SandboxAudience`, on 2026-11-20). Since v0.8.0-rc.1 `make kind-e2e-policy` also writes the older
 bundle back into the policy's own object for the floor to refuse (`Downgrade`), and puts a valid
 copy under another name for the subject check to refuse (`WrongSubject`), its deletion dropping
