@@ -17,7 +17,7 @@ use jiff::Timestamp;
 use mediatore_store::{ClaimStore, PolicyFloor, StoreError};
 use sandboxpolicy_bundle::conformance::error_name;
 use sandboxpolicy_bundle::floor::{
-    FloorEntry, audience_floor_name, next_audience_floor, next_floor,
+    FloorEntry, audience_floor_name, check_audience, check_policy, next_audience_floor, next_floor,
 };
 use sandboxpolicy_bundle::{BundleError, VerifyOptions, verify_audience_bundle, verify_bundle};
 use serde::Deserialize;
@@ -134,19 +134,42 @@ fn entry(f: &PolicyFloor) -> FloorEntry {
     }
 }
 
-/// Verify `envelope`, read from a `ConfigMap` in `namespace`, decide its policy's version floor
+/// The object notaio writes a policy's bundle to: `<policy>-bundle`. Its name is the policy a consumer asks for.
+pub const POLICY_OBJECT_SUFFIX: &str = "-bundle";
+
+/// The object notaio writes an audience's bundle to: `<audience>-audience`.
+pub const AUDIENCE_OBJECT_SUFFIX: &str = "-audience";
+
+/// The subject a `ConfigMap` named `configmap` in `namespace` is for, by notaio's naming: the name without `suffix`.
+/// An object notaio would not have written (no suffix, or nothing before it) is for no subject at all, and whatever
+/// bundle it holds is refused as `WrongSubject`.
+fn subject_of<'a>(namespace: &str, configmap: &'a str, suffix: &str) -> Result<&'a str, Refusal> {
+    configmap
+        .strip_suffix(suffix)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            Refusal::Bundle(BundleError::WrongSubject {
+                expected: format!("an object named <name>{suffix} in {namespace}"),
+                got: format!("{namespace}/{configmap}"),
+            })
+        })
+}
+
+/// Verify `envelope`, read from the `ConfigMap` `configmap` in `namespace`, decide its policy's version floor
 /// with notaio's rule, persist the new floor, and only then return the payload (ADR-0026
 /// decision 4). A bundle that comes back is one the broker may act on and will never forget
 /// having seen; anything else is a [`Refusal`] and left the floor where it was.
 ///
 /// # Errors
-/// A [`Refusal`]: forged, expired, a downgrade or a stale incarnation (`Bundle`); a copy in the
-/// wrong namespace (`Misplaced`); a store failure (`Store`); a floor that kept moving under
-/// other replicas (`Contended`).
+/// A [`Refusal`]: forged, expired, signed to live longer than a day, a downgrade or a stale incarnation
+/// (`Bundle`); a copy in the wrong namespace (`Misplaced`); a bundle of another policy than the one its object is
+/// named for (`Bundle(WrongSubject)`, notaio's subject check, v0.8.0-rc.1); a store failure (`Store`); a floor that
+/// kept moving under other replicas (`Contended`).
 pub async fn admit(
     store: &dyn ClaimStore,
     envelope: &Envelope,
     namespace: &str,
+    configmap: &str,
     keys: &TrustedKeys,
     now: Timestamp,
 ) -> Result<BundlePayload, Refusal> {
@@ -154,6 +177,12 @@ pub async fn admit(
         verify_bundle(envelope, keys, &VerifyOptions::at(now)).map_err(Refusal::Bundle)?;
     let policy = &payload.content.policy;
     placed(&policy.namespace, &policy.name, namespace)?;
+    check_policy(
+        &payload,
+        namespace,
+        subject_of(namespace, configmap, POLICY_OBJECT_SUFFIX)?,
+    )
+    .map_err(Refusal::Bundle)?;
     hold_floor(store, &policy.namespace, &policy.name, |held| {
         next_floor(held, &payload)
     })
@@ -171,6 +200,7 @@ pub async fn admit_audience(
     store: &dyn ClaimStore,
     envelope: &Envelope,
     namespace: &str,
+    configmap: &str,
     keys: &TrustedKeys,
     now: Timestamp,
 ) -> Result<AudienceBundlePayload, Refusal> {
@@ -178,6 +208,12 @@ pub async fn admit_audience(
         verify_audience_bundle(envelope, keys, &VerifyOptions::at(now)).map_err(Refusal::Bundle)?;
     let audience = &payload.content.audience;
     placed(&audience.namespace, &audience.name, namespace)?;
+    check_audience(
+        &payload,
+        namespace,
+        subject_of(namespace, configmap, AUDIENCE_OBJECT_SUFFIX)?,
+    )
+    .map_err(Refusal::Bundle)?;
     let floor_name = audience_floor_name(&audience.name);
     hold_floor(store, &audience.namespace, &floor_name, |held| {
         next_audience_floor(held, &payload)
@@ -274,7 +310,15 @@ mod tests {
                 .map_err(|e| e.to_string())?;
         }
         let (ns, name) = (&suite.policy.namespace, &suite.policy.name);
-        let outcome = admit(&store, &v.envelope, ns, keys, v.now).await;
+        let outcome = admit(
+            &store,
+            &v.envelope,
+            ns,
+            &format!("{name}-bundle"),
+            keys,
+            v.now,
+        )
+        .await;
         let after = store
             .get_policy_floor(ns, name)
             .await
@@ -315,8 +359,16 @@ mod tests {
     async fn the_broker_reaches_notaios_verdict_on_every_conformance_vector() {
         let suite = suite();
         let keys = trusted_keys(&configured(&suite)).expect("the suite's keys");
-        // v0.3.3 ships 14; a tag bump that ships fewer is worth a look before it passes.
-        assert!(suite.vectors.len() >= 14, "{} vectors", suite.vectors.len());
+        // v0.8.0-rc.1 ships 17; a tag bump that ships fewer is worth a look before it passes.
+        assert!(suite.vectors.len() >= 17, "{} vectors", suite.vectors.len());
+        // notaio's security review (v0.8.0-rc.1): a bundle signed to outlive a day is refused, whatever it says.
+        assert!(
+            suite
+                .vectors
+                .iter()
+                .any(|v| v.name == "refused-lifetime-too-long"),
+            "the lifetime bound has its vector"
+        );
         let mut failed = Vec::new();
         for v in &suite.vectors {
             if let Err(why) = check(&suite, &keys, v).await {
@@ -336,9 +388,16 @@ mod tests {
             .find(|v| v.floor.is_none() && matches!(v.expect, Expect::Accepted { .. }))
             .expect("a first-sight vector");
         let store = MemoryStore::default();
-        let r = admit(&store, &v.envelope, "elsewhere", &keys, v.now)
-            .await
-            .unwrap_err();
+        let r = admit(
+            &store,
+            &v.envelope,
+            "elsewhere",
+            "agent-bundle",
+            &keys,
+            v.now,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(r.code(), "Misplaced", "{r}");
         let (ns, name) = (&suite.policy.namespace, &suite.policy.name);
         assert_eq!(store.get_policy_floor(ns, name).await.unwrap(), None);
@@ -355,8 +414,12 @@ mod tests {
             .unwrap();
         let store = MemoryStore::default();
         let ns = &suite.policy.namespace;
-        let first = admit(&store, &v.envelope, ns, &keys, v.now).await.unwrap();
-        let again = admit(&store, &v.envelope, ns, &keys, v.now).await.unwrap();
+        let first = admit(&store, &v.envelope, ns, "agent-bundle", &keys, v.now)
+            .await
+            .unwrap();
+        let again = admit(&store, &v.envelope, ns, "agent-bundle", &keys, v.now)
+            .await
+            .unwrap();
         assert_eq!(first.meta.version, again.meta.version);
     }
 
@@ -409,7 +472,8 @@ mod tests {
         }
         let ns = &suite.audience.namespace;
         let floor_name = audience_floor_name(&suite.audience.name);
-        let outcome = admit_audience(&store, &v.envelope, ns, keys, v.now).await;
+        let cm = format!("{}-audience", suite.audience.name);
+        let outcome = admit_audience(&store, &v.envelope, ns, &cm, keys, v.now).await;
         let after = store
             .get_policy_floor(ns, &floor_name)
             .await
@@ -450,8 +514,15 @@ mod tests {
     async fn the_broker_reaches_notaios_verdict_on_every_audience_vector() {
         let suite = audience_suite();
         let keys = audience_keys(&suite);
-        // v0.7.0-rc.1, rc.2 and v0.7.0 ship 15; a tag bump that ships fewer is worth a look before it passes.
-        assert!(suite.vectors.len() >= 15, "{} vectors", suite.vectors.len());
+        // v0.8.0-rc.1 ships 17; a tag bump that ships fewer is worth a look before it passes.
+        assert!(suite.vectors.len() >= 17, "{} vectors", suite.vectors.len());
+        assert!(
+            suite
+                .vectors
+                .iter()
+                .any(|v| v.name == "refused-lifetime-too-long"),
+            "the lifetime bound has its vector for audiences too"
+        );
         let mut failed = Vec::new();
         for v in &suite.vectors {
             if let Err(why) = check_audience(&suite, &keys, v).await {
@@ -459,6 +530,11 @@ mod tests {
             }
         }
         assert!(failed.is_empty(), "{failed:#?}");
+    }
+
+    /// The object notaio writes the suite's audience to.
+    fn cm_of(suite: &AudienceSuite) -> String {
+        format!("{}-audience", suite.audience.name)
     }
 
     fn first_sight(vectors: &[Vector]) -> &Vector {
@@ -483,6 +559,7 @@ mod tests {
             &store,
             &p.envelope,
             &policies.policy.namespace,
+            &format!("{}-audience", policies.policy.name),
             &keys,
             p.now,
         )
@@ -495,6 +572,7 @@ mod tests {
             &store,
             &a.envelope,
             &audiences.audience.namespace,
+            &format!("{}-bundle", audiences.audience.name),
             &keys,
             a.now,
         )
@@ -509,9 +587,16 @@ mod tests {
         let keys = audience_keys(&suite);
         let v = first_sight(&suite.vectors);
         let store = MemoryStore::default();
-        let r = admit_audience(&store, &v.envelope, "elsewhere", &keys, v.now)
-            .await
-            .unwrap_err();
+        let r = admit_audience(
+            &store,
+            &v.envelope,
+            "elsewhere",
+            &cm_of(&suite),
+            &keys,
+            v.now,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(r.code(), "Misplaced", "{r}");
         let name = audience_floor_name(&suite.audience.name);
         for ns in [suite.audience.namespace.as_str(), "elsewhere"] {
@@ -537,7 +622,7 @@ mod tests {
             .advance_policy_floor(None, policy_floor.clone())
             .await
             .unwrap();
-        admit_audience(&store, &v.envelope, ns, &keys, v.now)
+        admit_audience(&store, &v.envelope, ns, &cm_of(&suite), &keys, v.now)
             .await
             .expect("admitted beside a policy of the same name");
         assert_eq!(

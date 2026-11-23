@@ -56,8 +56,8 @@ banlieue-api = { git = "https://github.com/firestoned/banlieue", tag = "v0.5.10"
 # notaio's bundle verifier, version floor and conformance vectors (ADR-0026 decision 1), pinned
 # to a signed release tag (notaio ADR-0014). No kube, no schemars: the `schema` feature stays off.
 # cargo deny allows this git source too. A bump is reviewed with that release's notes.
-sandboxpolicy-bundle = { git = "https://github.com/firestoned/notaio", tag = "v0.7.0", default-features = false }
-sandboxpolicy-types = { git = "https://github.com/firestoned/notaio", tag = "v0.7.0", default-features = false }
+sandboxpolicy-bundle = { git = "https://github.com/firestoned/notaio", tag = "v0.8.0-rc.1", default-features = false }
+sandboxpolicy-types = { git = "https://github.com/firestoned/notaio", tag = "v0.8.0-rc.1", default-features = false }
 
 # async + web
 tokio        = { version = "1", features = ["rt-multi-thread", "macros", "signal", "process", "fs", "time", "sync", "net", "io-util"] }

@@ -3135,7 +3135,7 @@ dependencies = [
 [[package]]
 name = "sandboxpolicy-bundle"
 version = "0.7.0"
-source = "git+https://github.com/firestoned/notaio?tag=v0.7.0#a5514bd2a8ebd5d732897246da8a9472fecba52e"
+source = "git+https://github.com/firestoned/notaio?tag=v0.8.0-rc.1#35d50cde37cc6735fcd198c9aecae3565854726a"
 dependencies = [
  "base64 0.23.1",
  "ed25519-dalek",
@@ -3150,7 +3150,7 @@ dependencies = [
 [[package]]
 name = "sandboxpolicy-types"
 version = "0.7.0"
-source = "git+https://github.com/firestoned/notaio?tag=v0.7.0#a5514bd2a8ebd5d732897246da8a9472fecba52e"
+source = "git+https://github.com/firestoned/notaio?tag=v0.8.0-rc.1#35d50cde37cc6735fcd198c9aecae3565854726a"
 dependencies = [
  "serde",
  "serde_json",
@@ -3298,7 +3298,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d43fb82d550b07e6f929a58d7d0935182602f48ddead875f5ee313c41c8f07fe"
 dependencies = [
  "annotate-snippets",
- "base64 0.23.1",
+ "base64 0.22.1",
  "encoding_rs_io",
  "granit-parser",
  "nohash-hasher",
@@ -3812,7 +3812,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

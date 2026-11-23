@@ -66,9 +66,9 @@ testkit             = $(if $(KIND_PREBUILT),./dist/$(1)$(if $(2), $(2)),cargo ru
 # the version, and the SHA-256 of each manifest from the release's checksums.sha256
 # (itself sigstore-signed; `cosign verify-blob` by hand after a bump, notaio's install
 # guide has the identity). A bump is these three lines.
-NOTAIO_VERSION         ?= 0.7.0
-NOTAIO_CRDS_SHA256     := 740fb6368f4e9d3618741f2ce90d9cc03652369c6bf0031f422022cbe2552f82
-NOTAIO_MANIFEST_SHA256 := d7aeedfa97a83be9850fc1be548b1e7a988f2c6906d9997c0f4089474a34ce99
+NOTAIO_VERSION         ?= 0.8.0-rc.1
+NOTAIO_CRDS_SHA256     := 14b47d0e30aeb3dae31e21d612268c5891575ad98009df881b461bed46bbf33d
+NOTAIO_MANIFEST_SHA256 := 8b9fd2f5b148392eca9c5e97533debb8092d8f9a3cfd13800c5c2174f94a1217
 
 # cargo-cyclonedx, what `make sbom` installs when the host has none: an exact version,
 # built with its own lockfile, in the job that uploads the release binary.

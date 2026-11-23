@@ -602,7 +602,18 @@ impl BundleReflector {
         let Ok(envelope) = serde_json::from_str::<Envelope>(text) else {
             return ignored(&namespace, &name, "the envelope does not parse");
         };
-        match admit(self.store.as_ref(), &envelope, &namespace, &self.keys, now).await {
+        // The bundle must be the one of the policy its object is named for (`<policy>-bundle`, notaio v0.8.0-rc.1):
+        // a valid bundle copied under another policy's name is refused, nothing cached and no floor moved.
+        match admit(
+            self.store.as_ref(),
+            &envelope,
+            &namespace,
+            &name,
+            &self.keys,
+            now,
+        )
+        .await
+        {
             Ok(payload) => {
                 let policy = payload.content.policy.name.clone();
                 let version = payload.meta.version;
@@ -1074,6 +1085,33 @@ mod tests {
             outcome_of(&cache.resolve(&mapped, "infra", &t.policy, later)),
             ("not found", None)
         );
+    }
+
+    #[tokio::test]
+    async fn a_bundle_in_another_policys_configmap_is_refused_and_moves_nothing() {
+        // notaio v0.8.0-rc.1 (its ADR-0008 decision 7): the consumer asks for one policy, by the object notaio writes
+        // for it (`<policy>-bundle`), and refuses a valid bundle of any other. Copied under another name, a policy's
+        // bundle is no bundle of the policy that name is for.
+        let r = rig();
+        let v = vector(&r.suite, "accepted-first-sight");
+        for name in ["other-agent-bundle", "agent", "agent-bundle-copy"] {
+            let cm = bundle_configmap(&r.suite, name, v);
+            assert_eq!(
+                r.reflector.applied_at(&cm, v.now).await,
+                Outcome::Refused {
+                    code: "WrongSubject"
+                },
+                "{name}"
+            );
+        }
+        assert!(r.cached(v.now).is_none(), "nothing reached the cache");
+        assert!(r.floor().await.is_none(), "no floor moved");
+        // Under its own name it is admitted.
+        let cm = bundle_configmap(&r.suite, "agent-bundle", v);
+        assert!(matches!(
+            r.reflector.applied_at(&cm, v.now).await,
+            Outcome::Admitted { .. }
+        ));
     }
 
     #[tokio::test]
