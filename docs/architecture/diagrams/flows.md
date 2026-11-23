@@ -21,6 +21,7 @@ transitions in sequence order. The flows modelled today, from the
 - **A policy bundle, verified and compared in shadow** (`flow-policy-shadow`)
 - **A private image pulled with the person&#x27;s own credential, which the VM never sees (ADR-0043)** (`flow-registry-pull-placed`)
 - **A one-shot workload&#x27;s output read back by its owner (ADR-0045)** (`flow-workload-output`)
+- **A claim&#x27;s image pulled through its own proxy and a gateway, under its namespace&#x27;s policy (ADR-0063)** (`flow-registry-pull-gateway`)
 
 
 ## Claim a sandbox and act as the user
@@ -133,4 +134,22 @@ flowchart TD
 ```
 
 <sub>Source: flow `flow-workload-output` in `architecture.json`.</sub>
+
+
+## A claim&#x27;s image pulled through its own proxy and a gateway, under its namespace&#x27;s policy (ADR-0063)
+
+The default pull in a gateway-era environment: the registry is a role: registry audience the claim's namespace was granted, the pull is decided by the authorizer like any other egress, and no path from the pool VM to a registry skips it.
+
+```mermaid
+flowchart TD
+    t1["1. The broker resolves the claim's audiences from its namespace's bundles and refuses the claim (400 registry_not_granted) unless a role: registry audience in that set covers the image's registry."]
+    t2["2. GET /v1/me hands the guest the registry route for the pull, apart from the workload's routes."]
+    t3["3. The guest starts the claim's egress proxy, then pulls through its pull listener; the route's rules are applied to each request."]
+    t4["4. The proxy opens a CONNECT tunnel to the registry through a gateway's data port under the claim's SVID."]
+    t5["5. The authorizer checks the registry's host:port against the claim's allowlist (broker or cache) and admits or refuses the tunnel."]
+    t6["6. Envoy connects to the registry and relays the bytes; the proxy's TLS with the registry carries the manifest and the layers, each verified against its digest by the guest (ADR-0021)."]
+    t1 --> t2 --> t3 --> t4 --> t5 --> t6
+```
+
+<sub>Source: flow `flow-registry-pull-gateway` in `architecture.json`.</sub>
 
