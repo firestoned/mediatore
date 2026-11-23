@@ -16,6 +16,19 @@ use mediatore_store::LogLimits;
 use mediatore_store::seal::TransitConfig;
 use serde::Deserialize;
 
+/// What an audience is for (ADR-0063 decision 2).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AudienceRole {
+    /// An API the workload calls: today's audience, and the default.
+    #[default]
+    Api,
+    /// An image registry the claim's image may be pulled from: its `egress` names the registries, its routes are
+    /// pull-only (the guest's puller reaches them through the claim's proxy, the workload never does), and its
+    /// `rules`, when any, admit only `GET` and `HEAD` under `/v2/`.
+    Registry,
+}
+
 /// Where an audience's credential is placed on the request (ADR-0040 decision 1).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -106,6 +119,10 @@ pub struct AudienceConfig {
     /// authorities of this audience's `egress`.
     #[serde(default)]
     pub inject: Inject,
+    /// What the audience is for (ADR-0063 decision 2): `api` (default) or `registry`, a registry the claim's image
+    /// may be pulled from and nothing the workload may call.
+    #[serde(default)]
+    pub role: AudienceRole,
     /// What the delegated credential is (ADR-0041): `bearer` (default) or `basic`.
     #[serde(default)]
     pub credential: Credential,
@@ -1204,9 +1221,9 @@ impl Config {
                 }
                 _ => {}
             }
-            if !self.gateways.is_empty() && r.reach.is_none() {
+            if !self.gateways.is_empty() {
                 anyhow::bail!(
-                    "registries[{host}].reach is required once gateways are set: a gateway-era pool reaches a registry only where the environment put it, `segment` for a mirror on the sandbox segment (ADR-0029 decision 2) or `relay` for one behind a gateway's registry leg (ADR-0038)"
+                    "registries[{host}]: with gateways set the pool pulls only through the claim's egress proxy and a gateway, so a registry is an audience with `role: registry`, granted per namespace; `registries[]` and its `reach` are refused (ADR-0063 decision 4)"
                 );
             }
             if !seen.insert(canonical_registry(host)) {
@@ -1218,23 +1235,76 @@ impl Config {
         Ok(())
     }
 
-    /// The registries a claim's image may name, canonical hosts, when the environment
-    /// has gateways (ADR-0029 decision 1); `None` without gateways, where nothing is
-    /// restricted.
+    /// Every registry some audience of `role: registry` serves, when the environment has gateways (ADR-0063); `None`
+    /// without. Tests only: what a claim may pull is [`Self::granted_registries`], per audience.
+    #[cfg(test)]
+    fn reachable_registries(&self) -> Option<std::collections::BTreeSet<String>> {
+        Some(self.granted_registries()?.into_values().flatten().collect())
+    }
+
+    /// [`Self::registry_audiences`] where it decides what a claim may pull: with gateways (ADR-0063 decision 4).
+    /// `None` in a direct environment, which pulls as it always did and refuses nothing by registry.
     #[must_use]
-    pub fn reachable_registries(&self) -> Option<std::collections::BTreeSet<String>> {
-        if self.gateways.is_empty() {
-            return None;
-        }
-        Some(
-            self.registries
+    pub fn granted_registries(
+        &self,
+    ) -> Option<std::collections::BTreeMap<String, std::collections::BTreeSet<String>>> {
+        (!self.gateways.is_empty()).then(|| self.registry_audiences())
+    }
+
+    /// Per audience of `role: registry` (ADR-0063 decision 2), the registries it serves, by the name a reference to
+    /// an image on them carries (the host, with the port only when it is not 443). In force only with gateways
+    /// ([`Self::granted_registries`]): a direct environment pulls as it always did (decision 4).
+    #[must_use]
+    fn registry_audiences(
+        &self,
+    ) -> std::collections::BTreeMap<String, std::collections::BTreeSet<String>> {
+        {
+            self.audiences
                 .iter()
-                .filter(|r| r.reach.is_some())
-                .map(|r| canonical_registry(&r.host))
-                // A registry the gateway places a credential for is reached through the gateway (ADR-0043).
-                .chain(self.placed_registries().into_keys())
-                .collect(),
-        )
+                .filter(|a| a.role == AudienceRole::Registry)
+                .map(|a| {
+                    (
+                        a.name.clone(),
+                        a.egress
+                            .iter()
+                            .map(mediatore_proto::image::registry_name)
+                            .collect(),
+                    )
+                })
+                .collect()
+        }
+    }
+
+    /// An audience of `role: registry` (ADR-0063 decision 2) names at least one registry, and its rules, when it has
+    /// any, admit only reading the registry API: `GET` and `HEAD` on a path under `/v2/`. A registry is pulled from,
+    /// never written to.
+    fn check_registry_audiences(&self) -> anyhow::Result<()> {
+        for a in self
+            .audiences
+            .iter()
+            .filter(|a| a.role == AudienceRole::Registry)
+        {
+            anyhow::ensure!(
+                !a.egress.is_empty(),
+                "audiences[{}]: role: registry names no registry in `egress` (ADR-0063 decision 2)",
+                a.name
+            );
+            let scoped = a
+                .namespaces
+                .iter()
+                .flat_map(|m| m.values().flat_map(|n| n.rules.iter()));
+            for r in a.rules.iter().chain(scoped) {
+                let method = r.method.to_ascii_uppercase();
+                anyhow::ensure!(
+                    (method == "GET" || method == "HEAD") && r.path.starts_with("/v2/"),
+                    "audiences[{}]: role: registry admits only GET and HEAD under /v2/, got {} {} (ADR-0063 decision 2)",
+                    a.name,
+                    r.method,
+                    r.path
+                );
+            }
+        }
+        Ok(())
     }
 
     /// The registries that are gateway-placed audiences (ADR-0043 decision 1), by the name a reference to an image
@@ -1244,16 +1314,11 @@ impl Config {
     pub fn placed_registries(&self) -> std::collections::BTreeMap<String, String> {
         self.audiences
             .iter()
-            .filter(|a| a.inject == Inject::Gateway)
+            .filter(|a| a.inject == Inject::Gateway && a.role == AudienceRole::Registry)
             .flat_map(|a| {
-                a.egress.iter().map(move |e| {
-                    let host = if e.port == 443 {
-                        e.host.clone()
-                    } else {
-                        format!("{}:{}", e.host, e.port)
-                    };
-                    (host, a.name.clone())
-                })
+                a.egress
+                    .iter()
+                    .map(move |e| (mediatore_proto::image::registry_name(e), a.name.clone()))
             })
             .collect()
     }
@@ -1271,6 +1336,7 @@ impl Config {
             anyhow::bail!("an audience uses the sts backend but no `sts` section is configured");
         }
         cfg.check_registries()?;
+        cfg.check_registry_audiences()?;
         cfg.check_routes()?;
         cfg.check_inject()?;
         cfg.check_entra()?;
@@ -2537,63 +2603,108 @@ listen: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }
     }
 
     #[test]
-    fn with_gateways_every_registry_needs_a_reach_and_the_reachable_set_is_those_with_one() {
+    fn with_gateways_the_registries_list_is_refused_at_start() {
+        // ADR-0063 decision 4: with gateways, no registry is reached but through the claim's proxy and a gateway, so
+        // neither reach (segment, relay) nor an operator's registry entry is accepted.
         let base = format!("{BASE}dev_mode: true\ngateways: [\"198.51.100.1:8443\"]\n");
+        for entry in [
+            "{ host: \"registry.internal:5000\", reach: segment }",
+            "{ host: artifactory.example, username: octocat, password_file: /x, reach: relay }",
+            "{ host: ghcr.io, username: octocat, password_file: /x }",
+        ] {
+            let err = Config::parse(&format!("{base}registries:\n  - {entry}\n"))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("role: registry") && err.contains("ADR-0063"),
+                "{entry}: {err}"
+            );
+        }
+        assert_eq!(
+            Config::parse(&base).unwrap().reachable_registries(),
+            Some(std::collections::BTreeSet::new()),
+            "gateways and no registry audience: every image is refused, said at the claim"
+        );
+        // Without gateways the list stands (a direct environment, decision 4).
+        let direct = format!(
+            "{BASE}dev_mode: true\nregistries:\n  - {{ host: \"registry.internal:5000\" }}\n"
+        );
+        let cfg = Config::parse(&direct).unwrap();
+        assert_eq!(cfg.registries.len(), 1);
+        assert_eq!(
+            cfg.granted_registries(),
+            None,
+            "nothing is granted by registry"
+        );
+        assert_eq!(cfg.reachable_registries(), None);
+    }
+
+    const REGISTRY_BASE: &str = "trust_domain: sandbox.test\nissuers: []\nlisten: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }\ndev_mode: true\ngateways: [\"198.51.100.1:8443\"]\n";
+
+    #[test]
+    fn an_audience_is_a_registry_by_its_role_and_names_the_registries_it_serves() {
+        // ADR-0063 decision 2.
+        let cfg = Config::parse(&format!(
+            "{REGISTRY_BASE}audiences:\n  - {{ name: mirror, via: none, role: registry, egress: [\"registry.home.example:443\", \"odd.home.example:5443\"], rules: [{{ method: GET, path: \"/v2/**\" }}, {{ method: head, path: \"/v2/**\" }}] }}\n  - {{ name: api, via: none, egress: [\"api.home.example:443\"] }}\n"
+        ))
+        .unwrap();
+        assert_eq!(cfg.audiences[0].role, AudienceRole::Registry);
+        assert_eq!(cfg.audiences[1].role, AudienceRole::Api, "the default");
+        let got = cfg.granted_registries().unwrap();
+        assert_eq!(got, cfg.registry_audiences());
+        assert_eq!(got.len(), 1, "an api audience serves no registry: {got:?}");
+        assert_eq!(
+            got["mirror"].iter().cloned().collect::<Vec<_>>(),
+            vec![
+                "odd.home.example:5443".to_string(),
+                "registry.home.example".to_string()
+            ],
+            "the name an image reference carries: the port only when it is not 443"
+        );
+        assert!(
+            cfg.reachable_registries()
+                .unwrap()
+                .contains("registry.home.example")
+        );
         let err = Config::parse(&format!(
-            "{base}registries:\n  - {{ host: ghcr.io, username: octocat, password_file: /x }}\n"
+            "{REGISTRY_BASE}audiences:\n  - {{ name: mirror, via: none, role: mirror, egress: [\"registry.home.example:443\"] }}\n"
         ))
         .unwrap_err()
         .to_string();
         assert!(
-            err.contains("reach is required") && err.contains("ADR-0029"),
-            "{err}"
+            err.contains("unknown variant"),
+            "a typo is not an api audience: {err}"
         );
-        let cfg = Config::parse(&format!(
-            "{base}registries:\n  - {{ host: \"registry.internal:5000\", reach: segment }}\n  - {{ host: docker.io, username: octocat, password_file: /x, reach: segment }}\n"
-        ))
-        .unwrap();
-        assert_eq!(cfg.registries[0].reach, Some(RegistryReach::Segment));
-        assert_eq!(
-            cfg.reachable_registries()
-                .unwrap()
-                .into_iter()
-                .collect::<Vec<_>>(),
-            vec![
-                "registry-1.docker.io".to_string(),
-                "registry.internal:5000".to_string()
-            ],
-            "canonical hosts, as a reference's registry is canonicalised"
-        );
-        // ADR-0038: `relay` is the second reach, a registry behind a gateway's registry leg; it is
-        // reachable like a segment one, may carry a credential (the TLS is the registry's, end to
-        // end) and is told apart from a typo.
-        let both = Config::parse(&format!(
-            "{base}registries:\n  - {{ host: \"registry.internal:5000\", reach: segment }}\n  - {{ host: artifactory.example, username: octocat, password_file: /x, reach: relay }}\n"
-        ))
-        .unwrap();
-        assert_eq!(both.registries[1].reach, Some(RegistryReach::Relay));
-        assert_eq!(
-            both.reachable_registries()
-                .unwrap()
-                .into_iter()
-                .collect::<Vec<_>>(),
-            vec![
-                "artifactory.example".to_string(),
-                "registry.internal:5000".to_string()
-            ],
-            "a relay registry is a reachable one"
-        );
-        let err = Config::parse(&format!(
-            "{base}registries:\n  - {{ host: ghcr.io, reach: tunnel }}\n"
-        ))
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("unknown variant"), "{err}");
-        assert_eq!(
-            Config::parse(&base).unwrap().reachable_registries(),
-            Some(std::collections::BTreeSet::new()),
-            "gateways and no registry: every image is unreachable, said at the claim"
-        );
+    }
+
+    #[test]
+    fn a_registry_audience_reads_the_registry_api_and_nothing_else() {
+        for (audience, why) in [
+            (
+                "{ name: mirror, via: none, role: registry }",
+                "names no registry",
+            ),
+            (
+                "{ name: mirror, via: none, role: registry, egress: [\"registry.home.example:443\"], rules: [{ method: PUT, path: \"/v2/**\" }] }",
+                "only GET and HEAD",
+            ),
+            (
+                "{ name: mirror, via: none, role: registry, egress: [\"registry.home.example:443\"], rules: [{ method: \"*\", path: \"/v2/**\" }] }",
+                "only GET and HEAD",
+            ),
+            (
+                "{ name: mirror, via: none, role: registry, egress: [\"registry.home.example:443\"], rules: [{ method: GET, path: \"/api/**\" }] }",
+                "under /v2/",
+            ),
+        ] {
+            let err = Config::parse(&format!("{REGISTRY_BASE}audiences:\n  - {audience}\n"))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(why) && err.contains("ADR-0063"),
+                "{audience}: {err}"
+            );
+        }
     }
 
     /// notaio's published conformance key: a real Ed25519 key, for tests only.
@@ -2736,25 +2847,11 @@ listen: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }
     }
 
     #[test]
-    fn a_placed_audiences_host_is_a_reachable_registry_and_names_its_audience() {
-        // ADR-0043 decision 1: a registry the gateway places a credential for is reached through the gateway, so a claim
-        // may name an image on it, and the broker knows which audience serves that registry.
-        let cfg = Config::parse(&inject_cfg(INJECT_OK)).unwrap();
-        assert!(
-            cfg.reachable_registries()
-                .unwrap()
-                .contains("api.anthropic.example"),
-            "the host of a gateway-placed audience is reachable"
-        );
-        assert_eq!(
-            cfg.placed_registries()
-                .get("api.anthropic.example")
-                .map(String::as_str),
-            Some("anthropic")
-        );
-        // A port other than 443 is part of the name, as an image reference carries it.
-        let odd = INJECT_OK.replace("api.anthropic.example:443", "registry.home.example:5443");
-        let cfg = Config::parse(&inject_cfg(&odd)).unwrap();
+    fn a_placed_registry_audience_names_its_registry_and_an_api_one_does_not() {
+        // ADR-0043 decision 1 under ADR-0063: a registry the gateway places a credential for is an audience of
+        // `role: registry`; a placed API audience is not a registry, whatever host it names.
+        let placed = "  - name: registry\n    via: delegated\n    credential: basic\n    inject: gateway\n    role: registry\n    max_ttl: 300\n    egress: [\"registry.home.example:5443\"]\n    rules:\n      - { method: GET, path: \"/v2/**\" }\n";
+        let cfg = Config::parse(&inject_cfg(placed)).unwrap();
         assert!(
             cfg.reachable_registries()
                 .unwrap()
@@ -2764,8 +2861,14 @@ listen: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }
             cfg.placed_registries()
                 .get("registry.home.example:5443")
                 .map(String::as_str),
-            Some("anthropic")
+            Some("registry")
         );
+        let cfg = Config::parse(&inject_cfg(INJECT_OK)).unwrap();
+        assert!(
+            cfg.placed_registries().is_empty(),
+            "an api audience is no registry"
+        );
+        assert!(cfg.reachable_registries().unwrap().is_empty());
     }
 
     // ----- ADR-0041: credential: basic ----------------------------------------------------------------------------------

@@ -184,7 +184,7 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
         limiter: Limiter::new(cfg.token.rate_per_minute),
         dev_mode: cfg.dev_mode,
         gateways: cfg.gateways.clone(),
-        reachable_registries: cfg.reachable_registries(),
+        registry_audiences: cfg.granted_registries(),
         policy_egress,
     });
 
@@ -430,7 +430,7 @@ async fn claim_watcher(
                 .collect(),
             scopes: audience_scopes(cfg),
             issuers: cfg.issuers.iter().map(|i| i.url.clone()).collect(),
-            reachable_registries: cfg.reachable_registries(),
+            registry_audiences: cfg.granted_registries(),
             placed_registries: cfg.placed_registries(),
             retention: std::time::Duration::from_secs(cfg.store.retention_secs),
             logs_enabled: cfg.logs.enabled,

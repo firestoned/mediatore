@@ -3,11 +3,12 @@
 #
 # Envoy's bootstrap for the egress gateway's control relay (ADR-0027 decisions 1, 2, 3 and
 # 9): a second Envoy, its own unit and user (envoy-relay.service), with no SPIRE socket, no
-# SVID and no credential of any kind. Four listeners on the sandbox address, each an L4
+# SVID and no credential of any kind. Three listeners on the sandbox address, each an L4
 # pass-through to one fixed upstream: the SPIRE server's attestation port, the broker's
 # sandbox listener and the SPIRE servers' bundle endpoint (ADR-0037, https_web profile, the
-# first-boot fetch of the bundle) and the operator's registry (ADR-0038, the pull, root's alone: the host
-# table says so), by address, as the deployment's env file names them. No CONNECT, no
+# first-boot fetch of the bundle), by address, as the deployment's env file names them. The
+# identity plane only: the registry leg ADR-0038 added is gone (ADR-0063 decision 4), and an
+# image is pulled through the claim's egress proxy and the data plane like any egress. No CONNECT, no
 # authority from the client, no name resolution on behalf of the sandbox; the TLS inside is
 # the agent's with the server and the node's with the broker, end to end, and the relay sees
 # ciphertext. A new upstream is a new listener here, a reviewed change, never a parameter.
@@ -70,23 +71,6 @@ static_resources:
                       log_format:
                         text_format_source:
                           inline_string: "relay upstream=bundle source=%DOWNSTREAM_REMOTE_ADDRESS% to=%UPSTREAM_HOST% rx=%BYTES_RECEIVED% tx=%BYTES_SENT% ms=%DURATION% flags=%RESPONSE_FLAGS%\n"
-    - name: registry
-      address:
-        socket_address: { address: @SANDBOX_ADDRESS@, port_value: @RELAY_REGISTRY_PORT@ }
-      filter_chains:
-        - filters:
-            - name: envoy.filters.network.tcp_proxy
-              typed_config:
-                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
-                stat_prefix: relay_registry
-                cluster: registry
-                access_log:
-                  - name: envoy.access_loggers.stdout
-                    typed_config:
-                      "@type": type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog
-                      log_format:
-                        text_format_source:
-                          inline_string: "relay upstream=registry source=%DOWNSTREAM_REMOTE_ADDRESS% to=%UPSTREAM_HOST% rx=%BYTES_RECEIVED% tx=%BYTES_SENT% ms=%DURATION% flags=%RESPONSE_FLAGS%\n"
   clusters:
     - name: spire_server
       connect_timeout: 5s
@@ -118,13 +102,3 @@ static_resources:
               - endpoint:
                   address:
                     socket_address: { address: @SPIRE_BUNDLE_ADDRESS@, port_value: @SPIRE_BUNDLE_PORT@ }
-    - name: registry
-      connect_timeout: 5s
-      type: STATIC
-      load_assignment:
-        cluster_name: registry
-        endpoints:
-          - lb_endpoints:
-              - endpoint:
-                  address:
-                    socket_address: { address: @REGISTRY_ADDRESS@, port_value: @REGISTRY_PORT@ }

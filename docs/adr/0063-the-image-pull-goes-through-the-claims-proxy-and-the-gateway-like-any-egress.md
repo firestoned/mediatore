@@ -254,14 +254,58 @@ what code runs in the sandbox.
 5. **The direct environment. Answered 2026-11-22: kept** as it is (decision 4), with the start-up
    warning it already logs.
 
+## Implementation notes (2026-11-22)
+
+Built, tests first:
+
+- **Decision 9.** `PullBounds` in `crates/mediatore-guest/src/image.rs`: the connect and idle bounds on every client
+  the puller builds (the direct one and the one to the claim's proxy), the deadline over the whole pull, cut to what is
+  left of the claim (`pull_bounds`, `crates/mediatore-guest/src/guest.rs`). `MEDIATORE_PULL_IDLE_SECS` and
+  `MEDIATORE_PULL_DEADLINE_SECS` refuse zero at start. The test registry gained `stall_blobs_after` and
+  `trickle_blobs`.
+- **Decision 2, in the broker's file configuration.** `audiences[].role: api | registry`
+  (`crates/mediatore/src/config.rs`), a registry audience's rules held to `GET` and `HEAD` under `/v2/`, and
+  `granted_registries` (per audience, the registries it serves, only with `gateways`). `POST /v1/claims` answers
+  `400 registry_not_granted` and the reconciler fails the sandbox with the same sentence
+  (`mediatore_proto::image::ungranted_registry`), which names no registry the broker serves.
+- **Decision 4, the broker, the gateway image and the pool's host table.** `registries[]` with `gateways` refuses the
+  start. The relay renders three legs (`image/gateway/envoy/relay.yaml.in`), the gateway's table no longer admits or
+  refuses a registry address, and the pool's host table refuses a registries file that names one and
+  `MEDIATORE_RELAY_REGISTRIES` (`image/host-table`). The guest refuses `MEDIATORE_RELAY_REGISTRIES` on any pool and
+  `MEDIATORE_PLAIN_HTTP_REGISTRIES` on a pool with gateways, at boot, before it registers.
+- **Decisions 1, 3 and 5.** `Route.pull_only` on a registry audience's routes; `GET /v1/me` leaves their endpoints
+  out of the jail's `egress`, the gateway's answer keeps them. The proxy's workload listener answers `404 pull_only`;
+  its pull listener serves a pull-only route over a tunnel (the route's own credential placed, the puller sending
+  none) or a placed one. With gateways the guest pulls every image through the proxy, and refuses a claim whose image
+  has no route (`through_the_proxy`). Proven over the real routers and a stand-in gateway in
+  `crates/mediatore/tests/e2e_forward.rs`.
+
+Not yet, and why:
+
+- **Bundles mode grants no registry yet.** `role` lives on notaio's `AudienceDefinition`, which has no such field
+  (`sandboxpolicy-types` v0.7.0). Until notaio carries it and the pin moves, a broker under
+  `policy.audience_definitions.mode: bundles` with `gateways` refuses every image (fail closed). An older broker would
+  ignore the field and serve a registry audience to the workload, so the broker moves first.
+- **The puller answers no challenge through the proxy.** It sends no credential and follows no redirect (ADR-0043
+  decision 2), so a registry whose anonymous pull needs a token from a realm is not served by a tunnelled route; a
+  pull-through mirror that answers anonymously, or a placed credential, is. The kind tier will show which the
+  operator's mirror is.
+- **The puller's relay internals** (`Relay`, `with_relay_registries` and their tests in `image.rs`) are unreachable
+  now that the guest refuses the variable; their removal is a mechanical follow-up.
+- **Decision 8 is not built.** Two things found while starting it change how: the pool image is shared by direct
+  pools, which need `systemd-resolved` for their DNS rule (ADR-0020), so the masks must apply only where the host table
+  loads; and `/etc/mediatore/gateways` and the guest's env are written by the deployment layer's cloud-config stage,
+  so a host table ordered before `network-pre.target` may run before its inputs exist and skip itself
+  (`ConditionPathExists`). Both need the stage the deployment layer writes in, checked on a pool member's boot.
+
 ## The ADD checklist
 
 - [x] ADR accepted (2026-11-22); every open question answered, 3 by the spike
 - [x] CALM updated (the relay's registry leg retired, `rel-gateway-registry`,
       `flow-registry-pull-gateway`, the pool image's exits); `make calm-validate` (no error; the one
       warning, `data-asset-sealing-key` unreferenced, is on `main` too) and `make calm-diagrams`
-- [ ] Tests first: the pull's connect, idle and whole-pull bounds (decision 9), each failing the
-      claim with the host named; the broker's refusal (`registry_not_granted`, by namespace), the start refusal
+- [x] Tests first (2026-11-22, `make check` green on the build host): the pull's connect, idle and whole-pull
+      bounds (decision 9), each failing the claim with the host named; the broker's refusal (`registry_not_granted`, by namespace), the start refusal
       for `registries[]` with `gateways`, the pull listener over a tunnelled route, the workload's
       listener refusing a pull-only route, `/v1/me` leaving it out, the guest's boot refusal of the
       old variables, the host table without `registry4`

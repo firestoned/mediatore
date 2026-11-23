@@ -846,9 +846,26 @@ impl Proxy {
                 return refuse(&r);
             }
         };
+        if forward.route.pull_only {
+            // A registry audience's route (ADR-0063 decision 5): the puller's, through the pull listener, never the
+            // workload's. The workload cannot fetch further images.
+            tracing::warn!(audience = forward.route.audience_label(), host = %forward.route.endpoint, %method, "a pull-only route asked from the jail; refused");
+            return refuse(&Refusal::new(StatusCode::NOT_FOUND, "pull_only"));
+        }
         if forward.route.placed_at_gateway() {
             return self.handle_at_gateway(req, &forward).await;
         }
+        self.handle_tunnelled(req, forward).await
+    }
+
+    /// A request on a route the proxy places itself (or sends bare), through a gateway's tunnel or, without gateways,
+    /// directly (ADR-0025, ADR-0028). It has been judged.
+    async fn handle_tunnelled(
+        &self,
+        req: Request<Incoming>,
+        forward: Forward<'_>,
+    ) -> Response<Body> {
+        let method = req.method().clone();
         let route = forward.route.clone();
         let path_log = forward.path_and_query.clone();
         let placed = match (forward.inject, route.audience.as_deref()) {
@@ -942,9 +959,10 @@ impl Proxy {
         }
     }
 
-    /// One request from the puller: for `host` only, judged by the route's rules as any request is, and sent to a
-    /// gateway when the route is gateway-placed. A route that is not placed is refused here, so this port never dials an
-    /// upstream and never asks for a token.
+    /// One request from the puller: for `host` only, judged by the route's rules as any request is, and sent through a
+    /// gateway (ADR-0063 decision 3): to its inject port for a gateway-placed route, in a tunnel for any other. Only a
+    /// registry audience's route (pull-only) or a gateway-placed one is served here; any other route is refused, so this
+    /// port never serves the workload's APIs.
     async fn handle_pull(&self, req: Request<Incoming>, host: &str) -> Response<Body> {
         let method = req.method().clone();
         let Some(path_and_query) = req.uri().path_and_query().map(ToString::to_string) else {
@@ -972,11 +990,20 @@ impl Proxy {
                 return refuse(&r);
             }
         };
-        if !forward.route.placed_at_gateway() {
-            tracing::warn!(host, "the pull host's route is not gateway-placed; refused");
-            return refuse(&Refusal::new(StatusCode::FORBIDDEN, "not_placed"));
+        if forward.route.placed_at_gateway() {
+            return self.handle_at_gateway(req, &forward).await;
         }
-        self.handle_at_gateway(req, &forward).await
+        if !forward.route.pull_only {
+            tracing::warn!(host, "the pull host's route is not a registry's; refused");
+            return refuse(&Refusal::new(StatusCode::FORBIDDEN, "not_a_pull_route"));
+        }
+        // The puller presents no phantom (it is root's, outside the jail): the route's own credential goes in when it
+        // has one, as the workload's would.
+        let forward = Forward {
+            inject: forward.route.injects(),
+            ..forward
+        };
+        self.handle_tunnelled(req, forward).await
     }
 }
 
@@ -1298,13 +1325,13 @@ pub fn command_args(
 pub const DEFAULT_PULL_PORT: u16 = 18129;
 
 /// The registry of an image, by the name its reference carries (the host, with the port only when it is not 443),
-/// when a gateway-placed route of the claim is for it (ADR-0043 decision 2): the pull then goes through the proxy.
-/// `None` for every other registry, which is pulled as it always was.
+/// when a route of the claim serves the pull: a registry audience's (pull-only, ADR-0063 decision 5) or a
+/// gateway-placed one (ADR-0043 decision 2). The pull then goes through the proxy. `None` for every other registry.
 #[must_use]
-pub fn placed_registry(routes: &[Route], registry: &str) -> Option<String> {
+pub fn pull_registry(routes: &[Route], registry: &str) -> Option<String> {
     routes
         .iter()
-        .filter(|r| r.placed_at_gateway())
+        .filter(|r| r.pull_only || r.placed_at_gateway())
         .map(|r| {
             if r.endpoint.port == 443 {
                 r.endpoint.host.clone()
@@ -1468,6 +1495,7 @@ mod tests {
             credential: Credential::Token,
             credential_header: None,
             inject_port: None,
+            pull_only: false,
         }
     }
 
@@ -2790,12 +2818,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_pull_listener_refuses_a_route_that_is_not_gateway_placed() {
-        // A registry route that is not placed (a misconfiguration) must not be served from here: the pull listener never
-        // dials an upstream itself and never asks for a token.
+    async fn the_pull_listener_refuses_a_route_that_is_neither_a_registrys_nor_placed() {
+        // An API route (a misconfiguration, or the image named on an API's host) must not be served from here: the pull
+        // listener serves a registry audience's route or a placed one (ADR-0063 decision 3), and asks for no token else.
         let ca = TestCa::new(TD);
         let fake = FakeGateway::start(&ca, Script::Echo).await;
-        let routes = vec![route("registry", "registry.home.example:443", &[])];
+        let routes = vec![route("api", "registry.home.example:443", &[])];
         let (h, pull) = harness_with_pull(
             &ca,
             routes,
@@ -2813,8 +2841,62 @@ mod tests {
         assert_eq!(h.tokens.0.load(Ordering::SeqCst), 0);
     }
 
+    #[tokio::test]
+    async fn the_workload_is_refused_a_pull_only_route_and_the_puller_is_served_it() {
+        // ADR-0063 decision 5: the registry audience's route is the puller's. The jail asking for it, with the phantom,
+        // is 404 pull_only and nothing leaves; the pull listener serves the same route.
+        let ca = TestCa::new(TD);
+        let fake = FakeGateway::start(&ca, Script::Echo).await;
+        let registry = Route {
+            pull_only: true,
+            ..placed(
+                "registry.home.example:443",
+                Some(fake.addr.port()),
+                &[("GET", "/v2/**")],
+            )
+        };
+        let (h, pull) = harness_with_pull(
+            &ca,
+            vec![registry],
+            vec![gw("127.0.0.1:1")],
+            "registry.home.example",
+        )
+        .await;
+        let jail = workload()
+            .get(format!(
+                "{}/registry.home.example/v2/team/tool/manifests/v1",
+                h.base
+            ))
+            .bearer_auth(h.phantom.expose())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(jail.status(), 404);
+        assert!(
+            jail.text().await.unwrap().contains("pull_only"),
+            "the refusal names why"
+        );
+        assert!(
+            fake.seen().is_empty(),
+            "nothing left for the jail's request"
+        );
+        let puller = workload()
+            .get(format!(
+                "{pull}/registry.home.example/v2/team/tool/manifests/v1"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(puller.status(), 200);
+        assert_eq!(
+            fake.seen().len(),
+            1,
+            "the puller's request went to the gateway"
+        );
+    }
+
     #[test]
-    fn a_registry_is_pulled_through_the_proxy_only_when_a_gateway_placed_route_names_it() {
+    fn a_registry_is_pulled_through_the_proxy_when_a_pull_only_or_placed_route_names_it() {
         // ADR-0043: the guest pulls through the proxy when the image's registry is a gateway-placed route of the claim, by
         // the name an image reference carries (the host, with the port only when it is not 443).
         let routes = vec![
@@ -2825,23 +2907,32 @@ mod tests {
             ),
             placed("odd.home.example:5443", Some(3133), &[]),
             route("direct", "plain.example:443", &[]),
+            Route {
+                pull_only: true,
+                ..route("mirror", "mirror.home.example:443", &[("GET", "/v2/**")])
+            },
         ];
         assert_eq!(
-            placed_registry(&routes, "registry.home.example").as_deref(),
+            pull_registry(&routes, "mirror.home.example").as_deref(),
+            Some("mirror.home.example"),
+            "a registry audience's tunnelled route (ADR-0063)"
+        );
+        assert_eq!(
+            pull_registry(&routes, "registry.home.example").as_deref(),
             Some("registry.home.example"),
             "443 is the bare host"
         );
         assert_eq!(
-            placed_registry(&routes, "odd.home.example:5443").as_deref(),
+            pull_registry(&routes, "odd.home.example:5443").as_deref(),
             Some("odd.home.example:5443"),
             "another port is part of the name"
         );
         assert_eq!(
-            placed_registry(&routes, "plain.example"),
+            pull_registry(&routes, "plain.example"),
             None,
-            "a route that is not gateway-placed is not a placed registry"
+            "an API route is no registry's"
         );
-        assert_eq!(placed_registry(&routes, "other.example"), None);
+        assert_eq!(pull_registry(&routes, "other.example"), None);
     }
 
     #[test]

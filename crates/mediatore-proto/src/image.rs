@@ -46,27 +46,42 @@ pub fn is_sha256_digest(s: &str) -> bool {
         .is_some_and(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
-/// Why `image` cannot be pulled by this environment's pool (ADR-0029 decision 1): its
-/// registry is not among the ones the operator declared reachable. `None` when nothing is
-/// restricted (no gateways) or the registry is declared.
+/// The registry an endpoint serves, by the name an image reference to it carries (ADR-0063 decision 2): the host,
+/// with the port only when it is not 443, Docker Hub's name made its API host.
 #[must_use]
-pub fn unreachable_registry(
-    reachable: Option<&std::collections::BTreeSet<String>>,
+pub fn registry_name(endpoint: &crate::Endpoint) -> String {
+    let host = canonical_registry(&endpoint.host);
+    if endpoint.port == 443 {
+        host
+    } else {
+        format!("{host}:{}", endpoint.port)
+    }
+}
+
+/// Why `image` may not be pulled by a claim that names `named` (ADR-0063 decision 2): none of the claim's audiences
+/// of `role: registry` serves its registry. `registry_audiences` maps each such audience to the registries it serves;
+/// `None` means nothing is granted by registry (no gateways), and nothing is refused. The answer is the same whether
+/// the registry is served to another namespace or to none, so a refusal says nothing about another tenant.
+#[must_use]
+pub fn ungranted_registry(
+    registry_audiences: Option<
+        &std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+    >,
+    named: &[String],
     image: &ImageReference,
 ) -> Option<String> {
-    let reachable = reachable?;
-    if reachable.contains(&image.registry) {
-        return None;
-    }
-    let listed = if reachable.is_empty() {
-        "none is declared".to_owned()
-    } else {
-        reachable.iter().cloned().collect::<Vec<_>>().join(", ")
-    };
-    Some(format!(
-        "registry {} is not reachable from this environment's pool; the pool reaches: {listed} (registries[].reach, ADR-0029)",
-        image.registry
-    ))
+    let registry_audiences = registry_audiences?;
+    let granted = named.iter().any(|a| {
+        registry_audiences
+            .get(a)
+            .is_some_and(|r| r.contains(&image.registry))
+    });
+    (!granted).then(|| {
+        format!(
+            "registry {} is not granted to this sandbox: name an audience with role: registry that serves it (ADR-0063)",
+            image.registry
+        )
+    })
 }
 
 /// A registry host as the API reaches it: Docker Hub's name becomes its API host,
@@ -175,6 +190,60 @@ impl fmt::Display for ImageReference {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_registry_is_named_as_an_image_reference_carries_it() {
+        let e = |h: &str, p| crate::Endpoint {
+            host: h.into(),
+            port: p,
+        };
+        assert_eq!(
+            registry_name(&e("registry.home.example", 443)),
+            "registry.home.example"
+        );
+        assert_eq!(
+            registry_name(&e("registry.home.example", 5443)),
+            "registry.home.example:5443"
+        );
+        assert_eq!(registry_name(&e("docker.io", 443)), DOCKER_REGISTRY);
+    }
+
+    #[test]
+    fn an_image_is_granted_only_by_a_registry_audience_the_claim_names() {
+        let map: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> = [
+            (
+                "mirror".to_string(),
+                ["registry.home.example".to_string()].into(),
+            ),
+            ("hub".to_string(), [DOCKER_REGISTRY.to_string()].into()),
+        ]
+        .into();
+        let image: ImageReference = "registry.home.example/team/tool:v1".parse().unwrap();
+        let named = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            ungranted_registry(Some(&map), &named(&["mirror"]), &image),
+            None
+        );
+        assert_eq!(
+            ungranted_registry(None, &[], &image),
+            None,
+            "no gateways: nothing refused"
+        );
+        let busybox: ImageReference = "busybox".parse().unwrap();
+        assert_eq!(
+            ungranted_registry(Some(&map), &named(&["hub"]), &busybox),
+            None
+        );
+        // Not named, named but serving another registry, or not a registry audience: one answer.
+        for n in [named(&[]), named(&["hub"]), named(&["api"])] {
+            let why = ungranted_registry(Some(&map), &n, &image).unwrap();
+            assert_eq!(
+                why,
+                "registry registry.home.example is not granted to this sandbox: name an audience with role: registry that serves it (ADR-0063)",
+                "{n:?}"
+            );
+        }
+    }
 
     fn r(s: &str) -> ImageReference {
         s.parse().unwrap()

@@ -64,6 +64,14 @@ a destination's. The puller in this mode sends no credential, answers no challen
 an error, never a call to the realm) and follows no redirect off the VM. Every other claim keeps the older order:
 pull as root, then the ruleset, then the proxy.
 
+### How long a pull may take
+
+Every pull is bounded (ADR-0063 decision 9): a connection opens within 10 seconds, a response brings something at
+least every `MEDIATORE_PULL_IDLE_SECS` (60 by default, the headers included), and the whole pull, manifests and every
+layer, finishes within `MEDIATORE_PULL_DEADLINE_SECS` (900 by default), cut to what is left of the claim when that is
+less. Past any of them the claim fails before the jail, and the error names the registry and the variable. Neither may
+be zero. A registry that stalls no longer holds a claim until its TTL.
+
 ## What the jail is
 
 The workload runs as the sandbox user in a PID namespace of its own, with `/proc` showing only its own processes

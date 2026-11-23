@@ -427,6 +427,17 @@ struct Inner {
     bearer_seen: AtomicUsize,
     /// When set, a blob request is answered with a redirect to `<this>/v2/<name>/blobs/<digest>`.
     redirect_blobs: Mutex<Option<String>>,
+    /// How a blob's body is sent: all at once (`None`), or paced (ADR-0063 decision 9's bounds).
+    blob_pace: Mutex<Option<Pace>>,
+}
+
+/// A blob body sent slowly, for the puller's bounds.
+#[derive(Debug, Clone, Copy)]
+enum Pace {
+    /// This many bytes, then nothing, with the connection held open.
+    StallAfter(usize),
+    /// One byte every interval: never idle for long, but slow.
+    Trickle(std::time::Duration),
 }
 
 /// The registry, serving on a loopback listener until dropped.
@@ -649,6 +660,22 @@ impl FakeRegistry {
         *self.inner.redirect_blobs.lock().unwrap() = Some(base.to_string());
     }
 
+    /// Send `bytes` of every blob's body, then nothing more, holding the connection open: a registry that stalls.
+    ///
+    /// # Panics
+    /// When the registry's state lock is poisoned.
+    pub fn stall_blobs_after(&self, bytes: usize) {
+        *self.inner.blob_pace.lock().unwrap() = Some(Pace::StallAfter(bytes));
+    }
+
+    /// Send every blob's body one byte per `interval`: a registry that never stalls for long but never finishes.
+    ///
+    /// # Panics
+    /// When the registry's state lock is poisoned.
+    pub fn trickle_blobs(&self, interval: std::time::Duration) {
+        *self.inner.blob_pace.lock().unwrap() = Some(Pace::Trickle(interval));
+    }
+
     /// Serve the blob at `digest` with its first byte flipped.
     ///
     /// # Panics
@@ -821,6 +848,18 @@ async fn v2(
                 if inner.tampered.lock().unwrap().iter().any(|d| d == digest) {
                     bytes[0] ^= 0xff;
                 }
+                let pace = *inner.blob_pace.lock().unwrap();
+                if let Some(pace) = pace {
+                    return (
+                        StatusCode::OK,
+                        [
+                            (header::CONTENT_TYPE, "application/octet-stream".to_string()),
+                            (header::CONTENT_LENGTH, bytes.len().to_string()),
+                        ],
+                        axum::body::Body::from_stream(paced(bytes, pace)),
+                    )
+                        .into_response();
+                }
                 (
                     StatusCode::OK,
                     [(header::CONTENT_TYPE, "application/octet-stream")],
@@ -836,4 +875,30 @@ async fn v2(
         };
     }
     StatusCode::NOT_FOUND.into_response()
+}
+
+/// `bytes` as a body stream sent at `pace`.
+fn paced(
+    bytes: Vec<u8>,
+    pace: Pace,
+) -> impl futures::Stream<Item = Result<Vec<u8>, std::convert::Infallible>> {
+    futures::stream::unfold((bytes, 0usize), move |(bytes, at)| async move {
+        match pace {
+            Pace::StallAfter(n) if at >= n.min(bytes.len()) => {
+                futures::future::pending::<()>().await;
+                None
+            }
+            Pace::StallAfter(n) => {
+                let end = n.min(bytes.len());
+                let chunk = bytes[at..end].to_vec();
+                Some((Ok(chunk), (bytes, end)))
+            }
+            Pace::Trickle(_) if at >= bytes.len() => None,
+            Pace::Trickle(every) => {
+                tokio::time::sleep(every).await;
+                let chunk = vec![bytes[at]];
+                Some((Ok(chunk), (bytes, at + 1)))
+            }
+        }
+    })
 }

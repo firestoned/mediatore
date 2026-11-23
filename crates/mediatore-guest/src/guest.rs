@@ -69,9 +69,8 @@ pub struct GuestArgs {
         value_delimiter = ','
     )]
     pub plain_http_registries: Vec<String>,
-    /// A registry reached through a gateway's registry leg (ADR-0038): `host=port`, the
-    /// registry's own name and the leg's port; the gateway is the one `MEDIATORE_URL` names.
-    /// Repeatable, or comma-separated in the environment
+    /// Refused when set (ADR-0063 decision 4): the gateway's registry leg of ADR-0038 is gone. Read only so that an
+    /// old env file fails the boot instead of being ignored
     #[arg(
         long = "relay-registry",
         env = "MEDIATORE_RELAY_REGISTRIES",
@@ -118,6 +117,13 @@ pub struct GuestArgs {
         default_value_t = egress::DEFAULT_PULL_PORT
     )]
     pub egress_pull_port: u16,
+    /// How long the pull may go with nothing read, in seconds (ADR-0063 decision 9): a registry, proxy or gateway that
+    /// stalls fails the claim before the jail, with the registry named
+    #[arg(long, env = "MEDIATORE_PULL_IDLE_SECS", default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..))]
+    pub pull_idle_secs: u64,
+    /// How long the whole pull may take, in seconds (ADR-0063 decision 9), and never past the claim's own deadline
+    #[arg(long, env = "MEDIATORE_PULL_DEADLINE_SECS", default_value_t = 900, value_parser = clap::value_parser!(u64).range(1..))]
+    pub pull_deadline_secs: u64,
     /// The pool's bootstrap list of egress gateways (ADR-0027 decision 4), one host:port
     /// per line, used when the broker lists none; absent on a pool with no gateway
     #[arg(long, env = "MEDIATORE_GATEWAYS_FILE", default_value = net::GATEWAYS_FILE)]
@@ -141,28 +147,11 @@ pub struct GuestArgs {
     pub dev_skip_setup: bool,
 }
 
-/// The gateway the registry legs are on (ADR-0038 decision 2): the one `MEDIATORE_URL` names,
-/// by IPv4 address, as the host table does (ADR-0029: the segment has no resolver).
-fn relay_gateway(mediatore_url: &str) -> anyhow::Result<std::net::IpAddr> {
-    let bad = || {
-        anyhow::anyhow!(
-            "MEDIATORE_RELAY_REGISTRIES needs MEDIATORE_URL to name a gateway by IPv4 address, got {mediatore_url:?} (the segment has no resolver)"
-        )
-    };
-    let url = reqwest::Url::parse(mediatore_url).map_err(|_| bad())?;
-    url.host_str()
-        .and_then(|h| h.parse::<std::net::Ipv4Addr>().ok())
-        .map(std::net::IpAddr::V4)
-        .ok_or_else(bad)
-}
-
-/// The pull client for this guest: plain-HTTP registries, the operator's CA, and the
-/// registries reached through a gateway's registry leg (ADR-0038).
+/// The pull client for this guest: plain-HTTP registries and the operator's CA (a direct pool, ADR-0029). A pool with
+/// gateways pulls through the claim's proxy (ADR-0063), which [`image::Puller::with_placed_registry`] adds per claim.
 fn puller(
     plain_http: &[String],
     registry_ca: Option<&std::path::Path>,
-    relay_registries: &[String],
-    mediatore_url: &str,
 ) -> anyhow::Result<image::Puller> {
     let mut client = image::Puller::new(plain_http)?;
     if let Some(ca) = registry_ca {
@@ -172,11 +161,59 @@ fn puller(
             .with_registry_ca(&pem)
             .map_err(|e| anyhow::anyhow!("registry CA {}: {e}", ca.display()))?;
     }
-    let entries = image::parse_relay_registries(&relay_registries.join(","))?;
-    if !entries.is_empty() {
-        client = client.with_relay_registries(relay_gateway(mediatore_url)?, &entries)?;
-    }
     Ok(client)
+}
+
+/// The pull's bounds for one claim (ADR-0063 decision 9): the configured idle and whole-pull values, the whole pull cut
+/// to what is left of the claim. A claim already past its deadline is not pulled at all.
+fn pull_bounds(
+    idle_secs: u64,
+    deadline_secs: u64,
+    claim_expires_at: jiff::Timestamp,
+    now: jiff::Timestamp,
+) -> anyhow::Result<image::PullBounds> {
+    let left = claim_expires_at.duration_since(now);
+    anyhow::ensure!(
+        left.is_positive(),
+        "the claim's deadline {claim_expires_at} has passed; nothing is pulled"
+    );
+    let left = std::time::Duration::try_from(left)?;
+    Ok(image::PullBounds {
+        idle: std::time::Duration::from_secs(idle_secs),
+        deadline: std::time::Duration::from_secs(deadline_secs).min(left),
+        ..image::PullBounds::default()
+    })
+}
+
+/// Which registry, if any, the claim's image is pulled from through its egress proxy (ADR-0063 decision 1): with
+/// gateways, always, by the claim's route for it, and a claim with no such route is refused (the broker refuses it
+/// first, `registry_not_granted`); without gateways, only a registry a route serves (ADR-0043), `None` otherwise.
+fn through_the_proxy(
+    routes: &[mediatore_proto::Route],
+    registry: &str,
+    with_gateways: bool,
+) -> anyhow::Result<Option<String>> {
+    let host = egress::pull_registry(routes, registry);
+    anyhow::ensure!(
+        host.is_some() || !with_gateways,
+        "the image's registry {registry} has no route on this claim: with gateways every pull goes through the claim's egress proxy and a gateway, never around them (ADR-0063 decision 1)"
+    );
+    Ok(host)
+}
+
+/// The pull settings that would reach a registry around the gateway, refused on a pool that names gateways (ADR-0063
+/// decision 4): the relay's registry leg and plain HTTP to a registry on the segment.
+fn refuse_bypasses(args: &GuestArgs, with_gateways: bool) -> anyhow::Result<()> {
+    // The relay's registry leg is gone from every gateway, so the variable names nothing anywhere.
+    anyhow::ensure!(
+        args.relay_registries.is_empty(),
+        "MEDIATORE_RELAY_REGISTRIES is set: the relay has no registry leg any more; the pull goes through the claim's egress proxy and a gateway; remove it (ADR-0063 decision 4)"
+    );
+    anyhow::ensure!(
+        !with_gateways || args.plain_http_registries.is_empty(),
+        "MEDIATORE_PLAIN_HTTP_REGISTRIES is set on a pool with gateways: the pull goes through the claim's egress proxy and a gateway, never around them; remove it (ADR-0063 decision 4)"
+    );
+    Ok(())
 }
 
 fn tmpfs_size(s: &str) -> Result<String, String> {
@@ -276,6 +313,12 @@ async fn wait_for_subject(client: &SandboxClient) -> anyhow::Result<Me> {
 /// Run the guest role: register, wait for a claim, set up the user and the jail, supervise
 /// until the deadline, tear down.
 pub async fn run(args: GuestArgs) -> anyhow::Result<()> {
+    // 0. A pool with gateways reaches a registry only through a claim's proxy (ADR-0063 decision 4): an env file that
+    //    still names another way fails the boot loudly, before anything registers.
+    refuse_bypasses(
+        &args,
+        !net::bootstrap_gateways(&args.gateways_file)?.is_empty(),
+    )?;
     // 1. Who am I, as a node.
     let ek_hash = if let Some(h) = &args.dev_ek_hash {
         h.clone()
@@ -397,30 +440,13 @@ async fn serve_claim(
     };
     tmpfs.mount().await?;
     let layout = sandboxfs::prepare(&args.sandbox_root, uid, gid)?;
-    let registry_client = puller(
-        &args.plain_http_registries,
-        args.registry_ca.as_deref(),
-        &args.relay_registries,
-        &args.mediatore_url,
-    )?;
-    // A registry the gateway places a credential for (ADR-0043) is pulled later, through the claim's own egress proxy,
-    // once the sandbox uid's ruleset is loaded and the proxy runs: the VM never holds the credential. Every other
-    // registry is pulled here, as it always was.
-    let placed_host = egress::placed_registry(&me.routes, &reference.registry);
-    let early = if placed_host.is_none() {
-        Some(
-            pull_image(
-                &registry_client,
-                me.registry_credential.as_ref(),
-                me,
-                reference,
-                &layout,
-            )
-            .await?,
-        )
-    } else {
-        None
-    };
+    let registry_client = puller(&args.plain_http_registries, args.registry_ca.as_deref())?
+        .with_bounds(pull_bounds(
+            args.pull_idle_secs,
+            args.pull_deadline_secs,
+            me.expires_at,
+            jiff::Timestamp::now(),
+        )?)?;
     // The gateways (ADR-0028 decision 6, ADR-0027 decision 4): the broker's list, or the
     // pool's bootstrap file when the broker has none, or neither and the proxy dials
     // directly. Which one decides the ruleset's shape and the proxy's dialer alike.
@@ -447,6 +473,28 @@ async fn serve_claim(
             "the environment lists no egress gateway: the proxy dials its upstreams directly and the ruleset admits the audiences' endpoints and DNS"
         ),
     }
+    // With gateways every pull goes through the claim's own egress proxy and a gateway, decided there like any egress
+    // (ADR-0063 decision 1): it waits for the proxy. Without gateways, a registry the gateway places a credential for
+    // (ADR-0043) is pulled the same way, and every other registry here, as it always was.
+    let pull_host = through_the_proxy(
+        &me.routes,
+        &reference.registry,
+        source != net::GatewaySource::None,
+    )?;
+    let early = if pull_host.is_none() {
+        Some(
+            pull_image(
+                &registry_client,
+                me.registry_credential.as_ref(),
+                me,
+                reference,
+                &layout,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
     let ruleset = net::Ruleset::resolve(
         uid,
         &args.mediatore_url,
@@ -491,7 +539,7 @@ async fn serve_claim(
     );
     let pull_addr = std::net::SocketAddr::from(([127, 0, 0, 1], args.egress_pull_port));
     let mut proxy_args = proxy_args;
-    if let Some(host) = &placed_host {
+    if let Some(host) = &pull_host {
         // The pull port must be one no jail rule lists: not the proxy's, and not a port of any destination the
         // sandbox uid's table names (Landlock admits a listed port at any address; the table is what pins the address).
         anyhow::ensure!(
@@ -508,7 +556,7 @@ async fn serve_claim(
             claim_uid = %me.claim_uid,
             registry = %host,
             %pull_addr,
-            "the image's registry is gateway-placed: pulled through the claim's egress proxy, no credential on this VM (ADR-0043)"
+            "the image is pulled through the claim's egress proxy and a gateway, no credential on this VM (ADR-0043, ADR-0063)"
         );
     }
     if args.egress_min_tls != mediatore_proto::tls::UpstreamTls::Tls13 {
@@ -554,7 +602,7 @@ async fn serve_claim(
     let pulled = if let Some(pulled) = early {
         pulled
     } else {
-        let host = placed_host.as_deref().unwrap_or_default();
+        let host = pull_host.as_deref().unwrap_or_default();
         let pulled = match registry_client
             .clone()
             .with_placed_registry(host, pull_addr)
@@ -656,63 +704,119 @@ async fn serve_claim(
 #[cfg(test)]
 mod tests {
     #[test]
-    fn the_registry_legs_gateway_is_the_one_mediatore_url_names_by_address() {
-        let g = |u: &str| super::relay_gateway(u);
-        assert_eq!(
-            g("https://192.0.2.1:3130").unwrap(),
-            "192.0.2.1".parse::<std::net::IpAddr>().unwrap()
+    fn a_pool_with_gateways_refuses_the_settings_that_reach_a_registry_around_them() {
+        use clap::Parser as _;
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[command(flatten)]
+            guest: super::GuestArgs,
+        }
+        let args = |extra: &[&str]| {
+            let mut v = vec!["guest", "--mediatore-url", "https://192.0.2.1:3130"];
+            v.extend_from_slice(extra);
+            Cli::try_parse_from(v).unwrap().guest
+        };
+        let plain = args(&["--plain-http-registry=registry.internal:5000"]);
+        let err = super::refuse_bypasses(&plain, true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("MEDIATORE_PLAIN_HTTP_REGISTRIES") && err.contains("ADR-0063"),
+            "{err}"
         );
-        assert_eq!(
-            g("https://192.0.2.1").unwrap(),
-            "192.0.2.1".parse::<std::net::IpAddr>().unwrap()
+        assert!(
+            super::refuse_bypasses(&plain, false).is_ok(),
+            "a direct pool keeps it"
         );
-        for bad in [
-            "https://broker.example:3130",
-            "https://localhost",
-            "not a url",
-            "https://[2001:db8::1]:3130",
-        ] {
-            let err = g(bad).unwrap_err().to_string();
+        // The relay leg is gone everywhere: refused with or without gateways.
+        let relay = args(&["--relay-registry=registry.example=3132"]);
+        for with_gateways in [true, false] {
+            let err = super::refuse_bypasses(&relay, with_gateways)
+                .unwrap_err()
+                .to_string();
             assert!(
-                err.contains("MEDIATORE_RELAY_REGISTRIES") && err.contains("MEDIATORE_URL"),
-                "{bad}: {err}"
+                err.contains("MEDIATORE_RELAY_REGISTRIES") && err.contains("ADR-0063"),
+                "{err}"
             );
         }
+        assert!(super::refuse_bypasses(&args(&[]), true).is_ok());
     }
 
     #[test]
-    fn the_puller_is_built_with_the_relay_registries_when_declared() {
-        let plain = Vec::new();
-        let none = super::puller(&plain, None, &[], "https://broker.example").unwrap();
-        drop(none);
-        let with = super::puller(
-            &plain,
-            None,
-            &[
-                "registry.example=3132".to_string(),
-                "mirror.example=3133".to_string(),
-            ],
-            "https://192.0.2.1:3130",
+    fn with_gateways_every_pull_goes_through_the_proxy_and_one_with_no_route_is_refused() {
+        // ADR-0063 decision 1: there is no path around the gateway, the pull included.
+        let mirror = mediatore_proto::Route {
+            audience: Some("mirror".into()),
+            endpoint: "mirror.home.example:443".parse().unwrap(),
+            rules: vec![],
+            ca_pem: None,
+            credential: mediatore_proto::Credential::None,
+            credential_header: None,
+            inject_port: None,
+            pull_only: true,
+        };
+        let routes = vec![mirror];
+        assert_eq!(
+            super::through_the_proxy(&routes, "mirror.home.example", true)
+                .unwrap()
+                .as_deref(),
+            Some("mirror.home.example")
         );
-        assert!(with.is_ok());
-        let err = super::puller(
-            &plain,
-            None,
-            &["registry.example=3132".to_string()],
-            "https://broker.example:3130",
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("MEDIATORE_URL"), "{err}");
-        let err = super::puller(
-            &plain,
-            None,
-            &["registry.example".to_string()],
-            "https://192.0.2.1",
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("host=port"), "{err}");
+        let err = super::through_the_proxy(&routes, "ghcr.io", true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ghcr.io") && err.contains("ADR-0063"), "{err}");
+        // Without gateways, a registry no route serves is pulled directly, as before.
+        assert_eq!(
+            super::through_the_proxy(&routes, "ghcr.io", false).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn the_pull_is_bounded_by_the_configuration_and_never_past_the_claim() {
+        let now: jiff::Timestamp = "2026-11-22T12:00:00Z".parse().unwrap();
+        let far = now + jiff::SignedDuration::from_hours(4);
+        let b = super::pull_bounds(60, 900, far, now).unwrap();
+        assert_eq!(b.idle, std::time::Duration::from_mins(1));
+        assert_eq!(b.deadline, std::time::Duration::from_mins(15));
+        assert_eq!(b.connect, crate::image::PullBounds::default().connect);
+        // A claim with five minutes left gets five minutes, not fifteen.
+        let near = now + jiff::SignedDuration::from_mins(5);
+        assert_eq!(
+            super::pull_bounds(60, 900, near, now).unwrap().deadline,
+            std::time::Duration::from_mins(5)
+        );
+        let err = super::pull_bounds(60, 900, now, now)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("has passed"), "{err}");
+    }
+
+    #[test]
+    fn a_pull_bound_of_zero_is_refused_at_start() {
+        use clap::Parser as _;
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[command(flatten)]
+            guest: super::GuestArgs,
+        }
+        for (flag, env) in [
+            ("--pull-idle-secs", "MEDIATORE_PULL_IDLE_SECS"),
+            ("--pull-deadline-secs", "MEDIATORE_PULL_DEADLINE_SECS"),
+        ] {
+            let err = Cli::try_parse_from([
+                "guest",
+                "--mediatore-url",
+                "https://192.0.2.1:3130",
+                flag,
+                "0",
+            ])
+            .map(|c| drop(c.guest))
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains(flag), "{env}: {err}");
+        }
     }
 
     #[test]

@@ -160,7 +160,9 @@ impl Harness {
         ca: TestCa,
         upstream: Upstream,
         gateways: Vec<Endpoint>,
-        reachable_registries: Option<std::collections::BTreeSet<String>>,
+        registry_audiences: Option<
+            std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+        >,
     ) -> Self {
         let idp = FakeIdp::start().await;
         let sts = Sts::new(
@@ -211,7 +213,7 @@ impl Harness {
             secrets: std::collections::BTreeMap::new(),
             delegated: std::collections::BTreeMap::new(),
             registries: std::collections::BTreeMap::new(),
-            reachable_registries,
+            registry_audiences,
             policy_egress: None,
             sandboxes: None,
             namespaces: Namespaces::Single("sandboxes".into()),
@@ -342,6 +344,51 @@ impl Harness {
         (url, phantom, tokens)
     }
 
+    /// The proxy with its pull listener for `host` as well (ADR-0043 decision 3, every pull under ADR-0063): the
+    /// workload's URL, the puller's URL and the phantom.
+    async fn start_proxy_with_pull(
+        &self,
+        me: &Me,
+        identity: &str,
+        host: &str,
+    ) -> (String, String, Phantom) {
+        let tokens = Arc::new(DevTokens {
+            sandbox_url: self.sandbox_url.clone(),
+            claim_svid: claim_svid(&me.claim_uid),
+            http: reqwest::Client::new(),
+            calls: AtomicUsize::new(0),
+        });
+        let phantom = Phantom::generate().expect("phantom");
+        let material = MemoryMaterial::new(self.ca.svid(identity));
+        let dialer = Dialer::Gateways(
+            Forwarder::new(me.gateways.clone(), material)
+                .expect("a forwarder")
+                .with_attempt_timeout(Duration::from_secs(5)),
+        );
+        let proxy = Arc::new(
+            Proxy::with_webpki_roots(
+                Routes::new(me.routes.clone()).expect("routes"),
+                phantom.clone(),
+                tokens,
+                dialer,
+            )
+            .expect("a proxy from the claim's routes"),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind proxy");
+        let pull = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the pull listener");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        let pull_url = format!("http://{}", pull.local_addr().expect("addr"));
+        let host = host.to_owned();
+        tokio::spawn(async move {
+            let _ = tokio::join!(proxy.clone().serve(listener), proxy.serve_pull(pull, host));
+        });
+        (url, pull_url, phantom)
+    }
+
     /// The workload's request: `GET /<host>/<path>` at the proxy with the phantom.
     async fn get(&self, proxy: &str, phantom: &Phantom, path: &str) -> reqwest::Response {
         self.http
@@ -430,6 +477,70 @@ async fn the_workload_reaches_its_upstream_through_a_gateway_as_the_claim() {
         authorizer_named.tunnels(),
         Vec::new(),
         "a server presenting the authorizer's identity is not a gateway to the forwarder"
+    );
+}
+
+/// ADR-0063 decisions 1, 3 and 5: a registry audience's route is pulled through the claim's proxy and a gateway's
+/// tunnel, as the claim, decided by the gateway like any egress; the jail asking for the same route is refused before
+/// anything leaves.
+#[tokio::test]
+async fn a_registry_route_is_pulled_through_a_gateway_tunnel_and_refused_to_the_workload() {
+    let ca = TestCa::new(TRUST_DOMAIN);
+    let upstream = Upstream::start().await;
+    let live = StandInGateway::start(&ca, &gateway_svid(), vec![upstream.tls.endpoint()]).await;
+    // The claim's one audience is the registry its image is on.
+    let granted = [(
+        AUDIENCE.to_owned(),
+        ["registry.internal:5000".to_owned()].into_iter().collect(),
+    )]
+    .into_iter()
+    .collect();
+    let h = Harness::start(ca, upstream, vec![live.endpoint()], Some(granted)).await;
+    let (_claim, me) = h.bound().await;
+    let route = me
+        .routes
+        .iter()
+        .find(|r| r.audience.as_deref() == Some(AUDIENCE))
+        .expect("the registry route");
+    assert!(
+        route.pull_only,
+        "a registry audience's route is the puller's"
+    );
+    assert_eq!(me.egress, vec![], "the jail reaches no registry");
+    let host = h.upstream.tls.endpoint().to_string();
+    let (proxy, pull, phantom) = h
+        .start_proxy_with_pull(&me, &claim_svid(&me.claim_uid), &host)
+        .await;
+
+    // The jail, with the phantom: refused at the proxy, nothing tunnelled.
+    let jail = h.get(&proxy, &phantom, "/v2/").await;
+    assert_eq!(jail.status(), 404);
+    assert!(
+        live.tunnels().is_empty(),
+        "no tunnel for the jail's request"
+    );
+    assert_eq!(h.upstream.seen().len(), 0, "nothing reached the registry");
+
+    // The puller, with nothing: through the tunnel, as the claim.
+    let pulled = h
+        .http
+        .get(format!("{pull}/{host}/v2/team/tool/manifests/v1"))
+        .send()
+        .await
+        .expect("through the pull listener");
+    assert_eq!(pulled.status(), 200);
+    assert_eq!(
+        pulled.text().await.unwrap(),
+        "upstream answered through the tunnel"
+    );
+    let tunnels = live.tunnels();
+    assert_eq!(tunnels.len(), 1, "{tunnels:?}");
+    assert_eq!(tunnels[0].peer, claim_svid(&me.claim_uid));
+    assert_eq!(tunnels[0].authority, host);
+    assert!(tunnels[0].allowed);
+    assert_eq!(
+        h.upstream.seen()[0].path_and_query,
+        "/v2/team/tool/manifests/v1"
     );
 }
 
@@ -571,16 +682,22 @@ async fn a_gateway_in_trouble_is_skipped_and_every_gateway_in_trouble_is_unreach
     );
 }
 
-/// ADR-0029 decision 1: in an environment with gateways the broker refuses a claim whose
-/// image names a registry the pool cannot reach, naming the ones it can, and admits the
-/// mirror; without gateways nothing is restricted (every other suite).
+/// ADR-0063 decision 2: in an environment with gateways the broker refuses a claim whose image is on a registry none
+/// of its audiences of `role: registry` serves, naming none of the registries that exist, and admits one its audience
+/// serves; without gateways nothing is refused by registry (every other suite).
 #[tokio::test]
-async fn a_claim_naming_a_registry_the_pool_cannot_reach_is_refused_and_the_mirror_is_not() {
+async fn a_claim_whose_registry_is_not_granted_is_refused_and_a_granted_one_is_not() {
     let ca = TestCa::new(TRUST_DOMAIN);
     let upstream = Upstream::start().await;
     let dead = mediatore_testkit::dead_endpoint().await;
-    let reachable = ["registry.internal:5000".to_owned()].into_iter().collect();
-    let h = Harness::start(ca, upstream, vec![dead], Some(reachable)).await;
+    // The claim's one audience serves the mirror; nothing serves ghcr.io.
+    let granted = [(
+        AUDIENCE.to_owned(),
+        ["registry.internal:5000".to_owned()].into_iter().collect(),
+    )]
+    .into_iter()
+    .collect();
+    let h = Harness::start(ca, upstream, vec![dead], Some(granted)).await;
     let claim = |image: &str| ClaimRequest {
         namespace: None,
         pool_ref: Some("pool-a".into()),
@@ -608,13 +725,15 @@ async fn a_claim_naming_a_registry_the_pool_cannot_reach_is_refused_and_the_mirr
         .expect("create claim");
     assert_eq!(resp.status(), 400);
     let body: serde_json::Value = resp.json().await.expect("body");
-    assert_eq!(body["error"], "unreachable_registry", "{body}");
+    assert_eq!(body["error"], "registry_not_granted", "{body}");
     let detail = body["detail"].as_str().unwrap_or_default().to_owned();
     assert!(
-        detail.contains("ghcr.io")
-            && detail.contains("registry.internal:5000")
-            && detail.contains("ADR-0029"),
+        detail.contains("ghcr.io") && detail.contains("ADR-0063"),
         "{body}"
+    );
+    assert!(
+        !detail.contains("registry.internal:5000"),
+        "a refusal names no registry the broker serves: {body}"
     );
     let resp = h
         .http
@@ -624,5 +743,5 @@ async fn a_claim_naming_a_registry_the_pool_cannot_reach_is_refused_and_the_mirr
         .send()
         .await
         .expect("create claim");
-    assert_eq!(resp.status(), 201, "the mirror is reachable");
+    assert_eq!(resp.status(), 201, "the mirror is granted");
 }

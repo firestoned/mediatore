@@ -13,6 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
 
 use mediatore_proto::image::{ImageReference, is_sha256_digest as is_digest};
 use mediatore_proto::{RegistryCredential, Secret};
@@ -194,10 +195,34 @@ struct Routed {
     via_relay: bool,
 }
 
+/// How long a pull may take (ADR-0063 decision 9): a connection that does not open, a read that brings nothing, or a
+/// whole pull that does not finish fails the claim before the jail, with the registry named. The defaults are the
+/// decision's; the guest takes the idle and whole-pull values from its environment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PullBounds {
+    /// To open each connection.
+    pub connect: Duration,
+    /// Between two reads of a response, its headers included (`MEDIATORE_PULL_IDLE_SECS`).
+    pub idle: Duration,
+    /// For the whole pull, manifests and every layer (`MEDIATORE_PULL_DEADLINE_SECS`).
+    pub deadline: Duration,
+}
+
+impl Default for PullBounds {
+    fn default() -> Self {
+        Self {
+            connect: Duration::from_secs(10),
+            idle: Duration::from_mins(1),
+            deadline: Duration::from_mins(15),
+        }
+    }
+}
+
 /// The pull client: one per guest, anonymous, HTTPS unless the registry is listed as plain.
 #[derive(Debug, Clone)]
 pub struct Puller {
     http: reqwest::Client,
+    bounds: PullBounds,
     /// The extra roots a registry on the operator's PKI chains to (`MEDIATORE_REGISTRY_CA`).
     registry_ca: Option<Vec<u8>>,
     /// The registries reached through a gateway's registry leg (ADR-0038), when any.
@@ -239,12 +264,11 @@ impl Puller {
     pub fn new(plain_http: &[String]) -> anyhow::Result<Self> {
         // TLS 1.3 over the Mozilla roots on aws-lc-rs (ADR-0007 decision 6): the registry
         // is a system we do not operate, so the far end keeps a classical fallback.
-        let http = reqwest::Client::builder()
-            .tls_backend_preconfigured(mediatore_proto::tls::https_client_config())
-            .user_agent(concat!("mediatore-guest/", env!("CARGO_PKG_VERSION")))
-            .build()?;
+        let bounds = PullBounds::default();
+        let http = build_client(None, None, bounds)?;
         Ok(Self {
             http,
+            bounds,
             registry_ca: None,
             relay: None,
             plain_http: plain_http.iter().cloned().collect(),
@@ -265,10 +289,7 @@ impl Puller {
         host: &str,
         proxy: std::net::SocketAddr,
     ) -> anyhow::Result<Self> {
-        let http = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .user_agent(concat!("mediatore-guest/", env!("CARGO_PKG_VERSION")))
-            .build()?;
+        let http = placed_client(self.bounds)?;
         self.placed = Some(Placed {
             host: host.to_owned(),
             base: format!("http://{proxy}/{host}"),
@@ -288,7 +309,11 @@ impl Puller {
         // Parsed once here so an unusable PEM is an error now, whatever order the builders run in.
         mediatore_proto::tls::https_client_config_with_extra_roots(pem)?;
         self.registry_ca = Some(pem.to_vec());
-        self.http = build_client(self.registry_ca.as_deref(), self.relay.as_ref())?;
+        self.http = build_client(
+            self.registry_ca.as_deref(),
+            self.relay.as_ref(),
+            self.bounds,
+        )?;
         Ok(self)
     }
 
@@ -312,7 +337,29 @@ impl Puller {
                 ports: entries.iter().map(|e| (e.host.clone(), e.port)).collect(),
             })
         };
-        self.http = build_client(self.registry_ca.as_deref(), self.relay.as_ref())?;
+        self.http = build_client(
+            self.registry_ca.as_deref(),
+            self.relay.as_ref(),
+            self.bounds,
+        )?;
+        Ok(self)
+    }
+
+    /// Bound the pull (ADR-0063 decision 9). The clients are rebuilt with the connect and idle bounds; the deadline is
+    /// held over the whole of [`Self::pull`].
+    ///
+    /// # Errors
+    /// A bound is zero, or a client cannot be built.
+    pub fn with_bounds(mut self, bounds: PullBounds) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            !bounds.connect.is_zero() && !bounds.idle.is_zero() && !bounds.deadline.is_zero(),
+            "a pull bound of zero would refuse every pull: {bounds:?} (MEDIATORE_PULL_IDLE_SECS, MEDIATORE_PULL_DEADLINE_SECS)"
+        );
+        self.bounds = bounds;
+        self.http = build_client(self.registry_ca.as_deref(), self.relay.as_ref(), bounds)?;
+        if let Some(p) = &mut self.placed {
+            p.http = placed_client(bounds)?;
+        }
         Ok(self)
     }
 
@@ -614,7 +661,47 @@ impl Puller {
     /// Pull `reference` into `rootfs`, staging each layer under `scratch` while it is
     /// hashed. `rootfs` and `scratch` exist and are empty. `credential`, when the claim
     /// carries one, is for this registry and goes over HTTPS only (ADR-0022 decision 3).
+    ///
+    /// The pull is bounded (ADR-0063 decision 9): past the idle bound with nothing read, or past the deadline, it fails
+    /// and says which bound and which registry.
     pub async fn pull(
+        &self,
+        reference: &ImageReference,
+        credential: Option<&RegistryCredential>,
+        rootfs: &Path,
+        scratch: &Path,
+    ) -> anyhow::Result<Pulled> {
+        let deadline = self.bounds.deadline;
+        let pulled = tokio::time::timeout(
+            deadline,
+            self.pull_unbounded(reference, credential, rootfs, scratch),
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "{reference}: the pull from {} did not finish within {} s (MEDIATORE_PULL_DEADLINE_SECS); refused (ADR-0063 decision 9)",
+                reference.registry,
+                deadline.as_secs_f64()
+            )
+        })?;
+        pulled.map_err(|e| {
+            if e.chain().any(|c| {
+                c.downcast_ref::<reqwest::Error>()
+                    .is_some_and(reqwest::Error::is_timeout)
+            }) {
+                anyhow::anyhow!(
+                    "{reference}: {} sent nothing for {} s (MEDIATORE_PULL_IDLE_SECS) or could not be reached within {} s; refused (ADR-0063 decision 9): {e}",
+                    reference.registry,
+                    self.bounds.idle.as_secs_f64(),
+                    self.bounds.connect.as_secs_f64()
+                )
+            } else {
+                e
+            }
+        })
+    }
+
+    async fn pull_unbounded(
         &self,
         reference: &ImageReference,
         credential: Option<&RegistryCredential>,
@@ -773,7 +860,10 @@ impl Puller {
         if let Err(e) = result {
             drop(file);
             let _ = tokio::fs::remove_file(dest).await;
-            return Err(anyhow::anyhow!("{reference}: {e}"));
+            // The cause is kept in the chain (a read timeout is told apart by it, ADR-0063 decision 9); the message reads
+            // as before.
+            let message = format!("{reference}: {e}");
+            return Err(e.context(message));
         }
         Ok(size)
     }
@@ -797,13 +887,19 @@ struct BearerChallenge {
 /// The one client the puller uses: TLS 1.3 over the Mozilla roots (and the operator's CA
 /// when given, ADR-0029), each declared relay registry pinned to its gateway, and redirects
 /// left to the puller when there are any (ADR-0038).
-fn build_client(pem: Option<&[u8]>, relay: Option<&Relay>) -> anyhow::Result<reqwest::Client> {
+fn build_client(
+    pem: Option<&[u8]>,
+    relay: Option<&Relay>,
+    bounds: PullBounds,
+) -> anyhow::Result<reqwest::Client> {
     let tls = match pem {
         Some(pem) => mediatore_proto::tls::https_client_config_with_extra_roots(pem)?,
         None => mediatore_proto::tls::https_client_config(),
     };
     let mut builder = reqwest::Client::builder()
         .tls_backend_preconfigured(tls)
+        .connect_timeout(bounds.connect)
+        .read_timeout(bounds.idle)
         .user_agent(concat!("mediatore-guest/", env!("CARGO_PKG_VERSION")));
     if let Some(relay) = relay {
         // Never an ambient proxy: a declared registry is dialled at its gateway by address, and a
@@ -816,6 +912,16 @@ fn build_client(pem: Option<&[u8]>, relay: Option<&Relay>) -> anyhow::Result<req
         }
     }
     Ok(builder.build()?)
+}
+
+/// The client for the claim's egress proxy on loopback (ADR-0043 decision 3): no TLS, no redirect, the pull's bounds.
+fn placed_client(bounds: PullBounds) -> anyhow::Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(bounds.connect)
+        .read_timeout(bounds.idle)
+        .user_agent(concat!("mediatore-guest/", env!("CARGO_PKG_VERSION")))
+        .build()?)
 }
 
 /// The whole body of `resp`, refused past [`MAX_BODY`]: by its declared length when it has
@@ -1129,6 +1235,142 @@ mod tests {
             .unwrap()
             .with_placed_registry("registry.home.example", proxy.host().parse().unwrap())
             .unwrap()
+    }
+
+    /// Bounds short enough for a test; the defaults are minutes.
+    fn short(idle_ms: u64, deadline_ms: u64) -> PullBounds {
+        PullBounds {
+            connect: std::time::Duration::from_secs(10),
+            idle: std::time::Duration::from_millis(idle_ms),
+            deadline: std::time::Duration::from_millis(deadline_ms),
+        }
+    }
+
+    #[test]
+    fn the_pull_bounds_default_to_decision_9s_values_and_refuse_zero() {
+        // ADR-0063 decision 9: a 10-second connect, a 60-second idle read, a 900-second whole pull.
+        let d = PullBounds::default();
+        assert_eq!(d.connect, std::time::Duration::from_secs(10));
+        assert_eq!(d.idle, std::time::Duration::from_mins(1));
+        assert_eq!(d.deadline, std::time::Duration::from_mins(15));
+        for zero in [
+            PullBounds {
+                connect: std::time::Duration::ZERO,
+                ..d
+            },
+            PullBounds {
+                idle: std::time::Duration::ZERO,
+                ..d
+            },
+            PullBounds {
+                deadline: std::time::Duration::ZERO,
+                ..d
+            },
+        ] {
+            assert!(
+                Puller::new(&[]).unwrap().with_bounds(zero).is_err(),
+                "{zero:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_registry_that_stalls_mid_blob_fails_the_pull_at_the_idle_bound() {
+        // Before decision 9 the puller had no timeout: a stalled registry held the claim until its TTL.
+        let reg = FakeRegistry::start().await;
+        reg.push("team/tool", "v1", &tiny());
+        reg.stall_blobs_after(8);
+        let s = scratch();
+        let started = std::time::Instant::now();
+        let err = puller(&reg)
+            .with_bounds(short(300, 30_000))
+            .unwrap()
+            .pull(
+                &reference(&reg, "team/tool:v1"),
+                None,
+                &s.rootfs,
+                &s.scratch,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "it waited {:?}",
+            started.elapsed()
+        );
+        assert!(err.contains("MEDIATORE_PULL_IDLE_SECS"), "{err}");
+        assert!(err.contains(&reg.host()), "the registry is named: {err}");
+    }
+
+    #[tokio::test]
+    async fn a_registry_that_never_stalls_but_never_finishes_fails_the_pull_at_the_deadline() {
+        // Each byte arrives inside the idle bound; the whole pull does not arrive inside the deadline.
+        let reg = FakeRegistry::start().await;
+        reg.push("team/tool", "v1", &tiny());
+        reg.trickle_blobs(std::time::Duration::from_millis(20));
+        let s = scratch();
+        let started = std::time::Instant::now();
+        let err = puller(&reg)
+            .with_bounds(short(2_000, 400))
+            .unwrap()
+            .pull(
+                &reference(&reg, "team/tool:v1"),
+                None,
+                &s.rootfs,
+                &s.scratch,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "it waited {:?}",
+            started.elapsed()
+        );
+        assert!(err.contains("MEDIATORE_PULL_DEADLINE_SECS"), "{err}");
+        assert!(err.contains(&reg.host()), "the registry is named: {err}");
+    }
+
+    #[tokio::test]
+    async fn a_placed_registry_that_stalls_fails_at_the_idle_bound_too() {
+        // The pull through the claim's proxy (ADR-0043, the only path under ADR-0063) has the same bounds.
+        let proxy = FakeRegistry::start_under("registry.home.example").await;
+        proxy.push("team/tool", "v1", &tiny());
+        proxy.stall_blobs_after(8);
+        let s = scratch();
+        let err = placed_puller(&proxy)
+            .with_bounds(short(300, 30_000))
+            .unwrap()
+            .pull(
+                &r("registry.home.example/team/tool:v1"),
+                None,
+                &s.rootfs,
+                &s.scratch,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("MEDIATORE_PULL_IDLE_SECS"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_pull_inside_its_bounds_is_unchanged() {
+        let reg = FakeRegistry::start().await;
+        let want = reg.push("team/tool", "v1", &tiny());
+        let s = scratch();
+        let got = puller(&reg)
+            .with_bounds(short(2_000, 10_000))
+            .unwrap()
+            .pull(
+                &reference(&reg, "team/tool:v1"),
+                None,
+                &s.rootfs,
+                &s.scratch,
+            )
+            .await
+            .unwrap();
+        assert_eq!(got.digest, want);
     }
 
     #[tokio::test]
