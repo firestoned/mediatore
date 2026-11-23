@@ -646,13 +646,7 @@ impl Watcher {
         }
         let live = ek_hashes_of(&self.claims.list_machines().await?);
         let now = jiff::Timestamp::now();
-        let busy: HashSet<String> = store
-            .list_claims()
-            .await?
-            .iter()
-            .filter(|c| c.ended_at().is_none_or(|ended| ended > now))
-            .filter_map(|c| c.node_id.clone())
-            .collect();
+        let busy = self.busy_node_ids(now).await?;
         let doomed = nodegc::nodes_to_delete(&nodegc::Inputs {
             nodes: &nodes,
             live_ek_hashes: &live,
@@ -679,6 +673,71 @@ impl Watcher {
             }
         }
         Ok(removed)
+    }
+
+    /// The SPIRE agent ID of every node a claim that has not ended is bound to.
+    async fn busy_node_ids(&self, now: jiff::Timestamp) -> Result<HashSet<String>, WatchError> {
+        Ok(self
+            .reconciler
+            .store
+            .list_claims()
+            .await?
+            .iter()
+            .filter(|c| c.ended_at().is_none_or(|ended| ended > now))
+            .filter_map(|c| c.node_id.clone())
+            .collect())
+    }
+
+    /// Retract the TPM node entries whose VM is gone (ADR-0039 decision 7), returning how
+    /// many. A node entry is declared from a VM's endorsement certificate and nothing else
+    /// removed it, so one was left per VM ever created. The decision is
+    /// [`nodegc::node_entries_to_delete`]; on the replica holding the Lease, like the node
+    /// collection. A failed listing retracts nothing; one failed retraction is logged and the
+    /// pass goes on.
+    ///
+    /// # Errors
+    /// The entries, the VMs, the nodes or the claims could not be listed.
+    pub async fn collect_node_entries(&self) -> Result<usize, WatchError> {
+        let entries = self.reconciler.spire.list_entries().await?;
+        if !entries
+            .iter()
+            .any(|e| nodegc::tpm_node_entry_ek(e).is_some())
+        {
+            return Ok(0);
+        }
+        let live = ek_hashes_of(&self.claims.list_machines().await?);
+        let nodes = self.reconciler.store.list_nodes().await?;
+        let now = jiff::Timestamp::now();
+        let busy = self.busy_node_ids(now).await?;
+        let doomed = nodegc::node_entries_to_delete(&nodegc::EntryInputs {
+            entries: &entries,
+            live_ek_hashes: &live,
+            busy_node_ids: &busy,
+            nodes: &nodes,
+            now,
+            grace: jiff::SignedDuration::try_from(self.config().node_grace)
+                .unwrap_or(jiff::SignedDuration::MAX),
+            cap: MAX_DELETIONS_PER_PASS,
+        });
+        let mut retracted = 0;
+        for name in doomed {
+            match self.reconciler.spire.delete_entry(&name).await {
+                Ok(()) => {
+                    let ek_hash = name.trim_start_matches("mediatore-node-");
+                    // Declared again should a VM publish this hash once more.
+                    self.declared
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .remove(ek_hash);
+                    tracing::info!(%ek_hash, entry = %name, "node entry retracted: its VM is gone");
+                    retracted += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(entry = %name, error = %e, "node entry not retracted; the next pass retries");
+                }
+            }
+        }
+        Ok(retracted)
     }
 
     /// Remove every sealed envelope that is past its expiry or whose session was parked and never taken for longer than
@@ -828,6 +887,23 @@ fn log_stream_error<R: std::error::Error + 'static>(
         tracing::debug!(error = %err, "{controller} controller: routine");
     }
 }
+/// After each resync: the nodes of VMs that are gone, then their node entries (ADR-0039,
+/// decisions 1 and 7), each logged and neither stopping the loop.
+async fn collect_gone(watcher: &Watcher) {
+    match watcher.collect_nodes().await {
+        Ok(0) => {}
+        Ok(removed) => tracing::info!(removed, "nodes of gone VMs collected"),
+        Err(e) => tracing::warn!(error = %e, "node collection failed; nothing removed"),
+    }
+    match watcher.collect_node_entries().await {
+        Ok(0) => {}
+        Ok(retracted) => tracing::info!(retracted, "node entries of gone VMs retracted"),
+        Err(e) => {
+            tracing::warn!(error = %e, "node entry collection failed; nothing retracted");
+        }
+    }
+}
+
 /// The three controllers (claims, pool members, sandboxes) and the resync ticker, until
 /// the first one ends (they do not end on their own). Run this on the Lease holder only.
 pub async fn run(client: Client, watcher: Arc<Watcher>) -> anyhow::Result<()> {
@@ -908,11 +984,7 @@ pub async fn run(client: Client, watcher: Arc<Watcher>) -> anyhow::Result<()> {
                 }
                 Err(e) => tracing::warn!(error = %e, "resync failed"),
             }
-            match watcher.collect_nodes().await {
-                Ok(0) => {}
-                Ok(removed) => tracing::info!(removed, "nodes of gone VMs collected"),
-                Err(e) => tracing::warn!(error = %e, "node collection failed; nothing removed"),
-            }
+            collect_gone(&watcher).await;
         }
     };
     let envelopes = async {
@@ -1512,6 +1584,62 @@ mod tests {
             0,
             "registered an hour ago, inside two hours of grace"
         );
+    }
+
+    // ----- retracting the node entries of VMs that are gone (ADR-0039 decision 7) --------------------------------------
+
+    #[tokio::test]
+    async fn a_node_entry_whose_vm_is_gone_is_retracted_and_one_whose_vm_exists_is_kept() {
+        let r = rig(WatcherConfig::default());
+        let gone: String = std::iter::repeat_n('a', 64).collect();
+        r.entries.ensure_node_entry(RSA_EK_HASH).await.unwrap();
+        r.entries.ensure_node_entry(&gone).await.unwrap();
+        r.claims.put_machine(machine(&[RSA_EK_PEM]));
+        assert_eq!(r.watcher.collect_node_entries().await.unwrap(), 1);
+        assert_eq!(r.entries.names(), vec![node_entry_name(RSA_EK_HASH)]);
+        for _ in 0..3 {
+            assert_eq!(r.watcher.collect_node_entries().await.unwrap(), 0);
+        }
+        assert_eq!(
+            r.entries.names(),
+            vec![node_entry_name(RSA_EK_HASH)],
+            "its VM still publishes the hash"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_retracted_node_entry_is_declared_again_when_its_vm_comes_back() {
+        let r = rig(WatcherConfig::default());
+        let vm = machine(&[RSA_EK_PEM]);
+        r.watcher.reconcile_machine(&vm).await.unwrap();
+        assert_eq!(r.entries.names(), vec![node_entry_name(RSA_EK_HASH)]);
+        // No VM lists it, no node and no claim: the empty list is believed and the entry goes.
+        assert_eq!(r.watcher.collect_node_entries().await.unwrap(), 1);
+        assert_eq!(r.entries.names(), Vec::<String>::new());
+        // The VM publishes its certificate again: the entry is declared again, not skipped as
+        // one already declared.
+        r.watcher.reconcile_machine(&vm).await.unwrap();
+        assert_eq!(r.entries.names(), vec![node_entry_name(RSA_EK_HASH)]);
+    }
+
+    #[tokio::test]
+    async fn a_failed_vm_listing_retracts_no_node_entry() {
+        let r = rig(WatcherConfig::default());
+        r.entries.ensure_node_entry(RSA_EK_HASH).await.unwrap();
+        r.claims.fail_machine_listing(true);
+        assert!(r.watcher.collect_node_entries().await.is_err());
+        assert_eq!(
+            r.entries.names(),
+            vec![node_entry_name(RSA_EK_HASH)],
+            "no list, no retraction"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_node_entries_means_no_listing_of_vms() {
+        let r = rig(WatcherConfig::default());
+        r.claims.fail_machine_listing(true);
+        assert_eq!(r.watcher.collect_node_entries().await.unwrap(), 0);
     }
 
     #[tokio::test]

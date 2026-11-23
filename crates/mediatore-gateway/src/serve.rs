@@ -39,6 +39,7 @@ use envoy_types::ext_authz::v3::{
     CheckResponseExt, DeniedHttpResponseBuilder, OkHttpResponseBuilder,
 };
 use envoy_types::pb::envoy::r#type::v3::StatusCode as HttpStatusCode;
+use mediatore_proto::{DecisionKind, DecisionVerdict, GatewayDecision};
 use tokio::net::{TcpListener, UnixListener};
 use tonic::{Request, Response, Status};
 
@@ -104,6 +105,10 @@ pub struct GatewayArgs {
     /// Claims the cache holds; past it, the least recently used goes
     #[arg(long, default_value_t = 4096)]
     pub max_claims: usize,
+    /// This gateway's name in the decisions it reports to the broker (ADR-0062); default: the
+    /// host name. Attribution, not authentication: every gateway has the one authorizer identity
+    #[arg(long, env = "MEDIATORE_GATEWAY_NAME")]
+    pub name: Option<String>,
     /// Dev only: send this SPIFFE ID, which must be `spiffe://<td>/gateway/authorizer`, as a
     /// header instead of mTLS (loopback `dev_mode` broker)
     #[cfg(feature = "dev")]
@@ -341,13 +346,25 @@ impl Checks {
     async fn answer_tunnel(&self, request: CheckRequest) -> CheckResponse {
         let (peer, method, authority) = Self::fields(request);
         let d = self.authorizer.authorize(&peer, &method, &authority).await;
-        let claim_uid = d.claim_uid.map(|u| u.to_string()).unwrap_or_default();
         let served = match d.served {
             Served::Cache => "cache",
             Served::Broker => "broker",
             Served::Stale => "stale",
             Served::None => "none",
         };
+        if let Some(uid) = d.claim_uid {
+            self.authorizer.report(GatewayDecision {
+                at: jiff::Timestamp::now(),
+                claim_uid: uid,
+                kind: DecisionKind::Tunnel,
+                authority: authority.clone(),
+                audience: None,
+                verdict: verdict_of(d.verdict.as_ref().err().copied()),
+                reason: d.verdict.as_ref().err().map(|w| w.code().to_owned()),
+                served: Some(served.to_owned()),
+            });
+        }
+        let claim_uid = d.claim_uid.map(|u| u.to_string()).unwrap_or_default();
         match d.verdict {
             Ok(()) => {
                 tracing::info!(
@@ -383,6 +400,18 @@ impl Checks {
             .authorizer
             .authorize_inject(&peer, &method, &host, &path)
             .await;
+        if let Some(uid) = d.claim_uid {
+            self.authorizer.report(GatewayDecision {
+                at: jiff::Timestamp::now(),
+                claim_uid: uid,
+                kind: DecisionKind::Inject,
+                authority: d.host.clone(),
+                audience: d.audience.clone(),
+                verdict: verdict_of(d.verdict.as_ref().err().copied()),
+                reason: d.verdict.as_ref().err().map(|w| w.code().to_owned()),
+                served: None,
+            });
+        }
         let claim_uid = d.claim_uid.map(|u| u.to_string()).unwrap_or_default();
         let audience = d.audience.unwrap_or_default();
         match d.verdict {
@@ -408,6 +437,14 @@ impl Checks {
                 denied(why)
             }
         }
+    }
+}
+
+/// A reported decision's verdict: allow, or deny for any refusal.
+const fn verdict_of(refusal: Option<Refusal>) -> DecisionVerdict {
+    match refusal {
+        None => DecisionVerdict::Allow,
+        Some(_) => DecisionVerdict::Deny,
     }
 }
 
@@ -546,8 +583,16 @@ pub async fn run(args: GatewayArgs) -> anyhow::Result<()> {
         max_claims: args.max_claims,
         ..CacheConfig::default()
     };
+    let name = crate::report::gateway_name(args.name.as_deref())?;
     let broker = Arc::new(broker);
-    let mut authorizer = Authorizer::new(&trust_domain, broker.clone(), cfg);
+    let (reporter, _reporting) =
+        crate::report::Reporter::spawn(name.clone(), broker.clone(), crate::report::EVERY);
+    let mut authorizer =
+        Authorizer::new(&trust_domain, broker.clone(), cfg).with_reporter(reporter);
+    tracing::info!(
+        gateway = name,
+        "reporting decisions to the broker under this name (ADR-0062)"
+    );
     if inject_socket.is_some() {
         authorizer = authorizer.with_credentials(broker);
     }
@@ -700,6 +745,54 @@ mod tests {
                 expires_at: jiff::Timestamp::now() + jiff::SignedDuration::from_secs(200),
             }))
         }
+    }
+
+    #[tokio::test]
+    async fn each_decision_about_a_claim_is_reported_and_one_about_no_claim_is_not() {
+        // ADR-0062 decisions 1 and 2: the tunnel check's claim, authority, verdict and reason
+        // reach the reporter; a peer that is no claim leaves only the gateway's own line.
+        let (reporter, mut rx) = crate::report::Reporter::queue(8);
+        let a = Authorizer::new(TD, Arc::new(FakeAllow), CacheConfig::default())
+            .with_reporter(reporter);
+        let checks = Checks::new(Arc::new(a));
+        let uid = Uuid::new_v4();
+        checks
+            .answer(check(
+                &claim_peer(uid),
+                "CONNECT",
+                "api.anthropic.example:443",
+                "",
+            ))
+            .await;
+        checks
+            .answer(check(
+                &claim_peer(uid),
+                "CONNECT",
+                "elsewhere.example:443",
+                "",
+            ))
+            .await;
+        checks
+            .answer(check(
+                "spiffe://x/y",
+                "CONNECT",
+                "api.anthropic.example:443",
+                "",
+            ))
+            .await;
+        let allowed = rx.try_recv().expect("the allow");
+        assert_eq!(
+            (allowed.claim_uid, allowed.kind, allowed.authority.as_str()),
+            (uid, DecisionKind::Tunnel, "api.anthropic.example:443")
+        );
+        assert_eq!(allowed.verdict, DecisionVerdict::Allow);
+        assert_eq!(allowed.reason, None);
+        assert_eq!(allowed.served.as_deref(), Some("broker"));
+        let denied = rx.try_recv().expect("the deny");
+        assert_eq!(denied.authority, "elsewhere.example:443");
+        assert_eq!(denied.verdict, DecisionVerdict::Deny);
+        assert_eq!(denied.reason.as_deref(), Some("not_allowed"));
+        assert!(rx.try_recv().is_err(), "no report without a claim");
     }
 
     fn authorizer() -> (Arc<Authorizer>, Arc<FakeCreds>) {

@@ -348,6 +348,7 @@ impl EntryManager for KubeEntryManager {
                     .and_then(|s| Uuid::parse_str(s).ok());
                 Some(EntryRef {
                     name,
+                    parent_id: Some(o.spec.parent_id),
                     kind,
                     claim_uid,
                 })
@@ -835,7 +836,8 @@ mod tests {
             EntryRef {
                 name: node_entry_name(EK),
                 kind: EntryKind::Node,
-                claim_uid: None
+                claim_uid: None,
+                parent_id: Some("y".into())
             }
         );
         assert_eq!(
@@ -843,7 +845,8 @@ mod tests {
             EntryRef {
                 name: claim_entry_name(uid),
                 kind: EntryKind::Claim,
-                claim_uid: Some(uid)
+                claim_uid: Some(uid),
+                parent_id: Some("y".into())
             }
         );
         finish(m, task).await;

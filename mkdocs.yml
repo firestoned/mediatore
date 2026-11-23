@@ -223,5 +223,6 @@ nav:
       - "ADR-0056: The broker in a namespace of its own, and admission policies that do not depend on its name": adr/0056-the-broker-in-a-namespace-of-its-own.md
       - "ADR-0057: A claim's record written by compare-and-set and bound to its sandbox": adr/0057-a-claims-record-written-by-compare-and-set-and-bound-to-its-sandbox.md
       - "ADR-0059: Which pools' members become nodes": adr/0059-which-pools-members-become-nodes.md
+      - "ADR-0062: The gateway reports its decisions to the broker": adr/0062-the-gateway-reports-its-decisions-to-the-broker.md
   - Security:
       - Threat model: security/threat-model.md

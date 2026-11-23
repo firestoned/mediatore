@@ -3,7 +3,7 @@
 
 # ADR-0039: A node leaves the register when its VM is gone
 
-**Status:** Accepted, implemented in the repository 2026-11-15 (the store's `delete_node`, the pure rule `nodegc::nodes_to_delete`, `Watcher::collect_nodes` on the resync ticker, `store.node_grace_secs`, their pinned tests; the live proof is a pool recycled under load and the register staying the size of the pool) · **Date:** 2026-11-15
+**Status:** Accepted, implemented in the repository 2026-11-15 (the store's `delete_node`, the pure rule `nodegc::nodes_to_delete`, `Watcher::collect_nodes` on the resync ticker, `store.node_grace_secs`, their pinned tests; the live proof is a pool recycled under load and the register staying the size of the pool); amended 2026-11-23 (decision 7: the node's SPIRE entry goes too) · **Date:** 2026-11-15
 
 Roadmap 05 (the store). Completes [ADR-0034](0034-the-kubernetes-api-as-the-brokers-store.md)
 decision 3, which made an attested node a `SandboxNode` and gave claims a retention window
@@ -85,6 +85,30 @@ built so that does not happen to a node whose VM exists.
    EK hash and the hostname (a hash and a name, no secret), and one per pass that removed
    any, with the count.
 
+7. *Amended 2026-11-23.* **A TPM node entry is retracted when no VM publishes its hash.**
+   Decisions 1 to 6 collected the `SandboxNode` and left its SPIRE node entry
+   (`mediatore-node-<ek hash>`, a `ClusterStaticEntry`) where it was: the claim entry sweep
+   (ADR-0006 decision 9) skips node entries, and nothing else removes one. Since the entry is
+   declared from the VM's published endorsement certificate (ADR-0011 decision 5), not from
+   the registration, it outlived both the VM and the node; a homelab cluster held 364 node
+   entries for 4 VMs on 2026-11-23, every one of a recycled pool member. Each gives an agent
+   that can no longer exist the bootstrap identity of a node.
+   - **The rule** (`nodegc::node_entries_to_delete`, a pure function): a node entry whose
+     hash no VM publishes is retracted, on the replica holding the Lease, once per resync,
+     after the node collection (`Watcher::collect_node_entries`).
+   - **Only TPM node entries.** An entry is this rule's when its name carries an EK hash and
+     its `parentID` is the TPM agent of that same hash (`nodegc::tpm_node_entry_ek`; the
+     entry list now carries `parent_id`). Claim entries stay with ADR-0006 decision 9, and an
+     x509pop node entry (ADR-0049), whose name is a hash of something else, is never touched.
+   - **The same guards as a node:** never an entry an unended claim's node is under, never
+     one whose node registered inside the grace, an empty VM list believed only as decision 2
+     believes it, at most `MAX_DELETIONS_PER_PASS` (20) per pass in name order, a failed
+     listing retracting nothing.
+   - **Declared again if its VM comes back:** the watcher forgets that it declared the hash,
+     so a VM publishing it again gets its entry on its next reconcile.
+   - One info line per retraction, `node entry retracted: its VM is gone`, with the hash and
+     the entry's name, and one per pass that retracted any, with the count.
+
 ## Consequences
 
 - The register is bounded by the pool plus the grace: it stops growing with churn.
@@ -101,6 +125,12 @@ built so that does not happen to a node whose VM exists.
   roadmap 05's.)
 - A ban on a node whose VM is gone stays until an operator deletes it: the safe side of a
   security record, noisier than the alternative, and visible as `BANNED true`.
+- *Decision 7:* the node entries are bounded by the VMs that publish a hash. A backlog left
+  by earlier releases drains at 20 per resync (364 entries in about 90 minutes at the default
+  five). Retracting the entry of a VM that still exists would cut its guest's node identity
+  at the next rotation; the VM list is the same one decision 1 trusts, under the same guards,
+  and the broker already retracts entries (claim entries) within the RBAC it holds. The
+  threat-model pass for the amendment is owed.
 
 ## Alternatives rejected
 

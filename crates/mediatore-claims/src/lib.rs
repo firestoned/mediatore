@@ -147,7 +147,8 @@ impl Reconciler {
     }
 
     /// Retract every claim entry whose claim is unknown or revoked (ADR-0006 decision 9).
-    /// Node entries are left alone: they live as long as the VM. Returns how many were
+    /// Node entries are not this sweep's: they live as long as a VM publishes their hash, and
+    /// the watcher retracts them once none does (ADR-0039 decision 7). Returns how many were
     /// retracted.
     pub async fn sweep_orphans(&self) -> anyhow::Result<usize> {
         let mut retracted = 0;

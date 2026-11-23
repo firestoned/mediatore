@@ -166,6 +166,10 @@ pub struct EntryRef {
     pub kind: EntryKind,
     /// The claim a claim entry belongs to.
     pub claim_uid: Option<Uuid>,
+    /// The SPIFFE ID the entry is parented to (`spec.parentID`): for a node entry of a TPM
+    /// guest, `spiffe://<td>/spire/agent/tpm/<ek hash>`, the same hash its name carries. What
+    /// tells a TPM node entry from an x509pop one (ADR-0049), whose name is also a hash.
+    pub parent_id: Option<String>,
 }
 
 /// Errors from declaring or retracting entries.
@@ -301,6 +305,12 @@ impl MemoryEntries {
     }
 }
 
+/// The TPM agent ID the memory fake parents its entries to: the shape the Kubernetes entries
+/// carry, under a trust domain that cannot be a real one.
+fn memory_agent_id(ek_hash: &str) -> String {
+    format!("spiffe://memory.invalid/spire/agent/tpm/{ek_hash}")
+}
+
 #[async_trait]
 impl EntryManager for MemoryEntries {
     async fn ensure_node_entry(&self, ek_hash: &str) -> Result<String, SpireError> {
@@ -312,6 +322,7 @@ impl EntryManager for MemoryEntries {
                 name: name.clone(),
                 kind: EntryKind::Node,
                 claim_uid: None,
+                parent_id: Some(memory_agent_id(ek_hash)),
             },
         );
         tracing::info!(name, "memory: node entry declared");
@@ -334,6 +345,7 @@ impl EntryManager for MemoryEntries {
                 name: name.clone(),
                 kind: EntryKind::Claim,
                 claim_uid: Some(claim_uid),
+                parent_id: Some(memory_agent_id(ek_hash)),
             },
         );
         tracing::info!(name, %claim_uid, unix_user, "memory: claim entry declared");

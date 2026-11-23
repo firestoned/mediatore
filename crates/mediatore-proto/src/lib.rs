@@ -1404,9 +1404,190 @@ pub struct ErrorBody {
     pub detail: Option<String>,
 }
 
+/// The most decisions one `POST /v1/gateway/decisions` batch may carry (ADR-0062 decision 5).
+pub const MAX_GATEWAY_DECISIONS: usize = 256;
+
+/// `POST /v1/gateway/decisions` body (ADR-0062): one gateway's decisions about claims, sent by the
+/// gateway authorizer's identity only. The fields of the gateway's own decision line and no
+/// others: never a path, a query, a header or a credential.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GatewayDecisions {
+    /// The gateway's name, as it names itself (decision 3): attribution, not authentication.
+    pub gateway: String,
+    /// At most [`MAX_GATEWAY_DECISIONS`].
+    pub decisions: Vec<GatewayDecision>,
+}
+
+/// What kind of check a reported decision answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionKind {
+    /// A `CONNECT host:port` from the tunnel Envoy (ADR-0028).
+    Tunnel,
+    /// A request at the inject port (ADR-0040).
+    Inject,
+}
+
+/// A reported decision's verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionVerdict {
+    /// The request went on.
+    Allow,
+    /// The request was refused, with `reason`.
+    Deny,
+}
+
+/// One decision of one gateway about one claim (ADR-0062 decision 2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GatewayDecision {
+    /// The gateway's clock when it decided.
+    pub at: Timestamp,
+    /// The claim the peer's SVID named.
+    pub claim_uid: Uuid,
+    /// Tunnel or inject.
+    pub kind: DecisionKind,
+    /// `host:port` as the `CONNECT` named it, or the inject request's authority as it came.
+    pub authority: String,
+    /// The audience of the matched inject route; absent where none matched and on a tunnel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audience: Option<String>,
+    /// Allow or deny.
+    pub verdict: DecisionVerdict,
+    /// The refusal code on a deny (`not_allowed`, `claim_gone`, ...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Where a tunnel's allowlist came from (`cache`, `broker`, `stale`, `none`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub served: Option<String>,
+}
+
+impl GatewayDecisions {
+    /// The shape check of ADR-0062 decision 5: what a batch must be before the broker writes any
+    /// of it into its log. The first fault, named; nothing of the offending value in it.
+    pub fn check(&self) -> Result<(), &'static str> {
+        if self.decisions.len() > MAX_GATEWAY_DECISIONS {
+            return Err("more than 256 decisions");
+        }
+        if !gateway_name_ok(&self.gateway) {
+            return Err("gateway name is not 1 to 63 of a-z, 0-9, '-' and '.'");
+        }
+        for d in &self.decisions {
+            if !authority_ok(&d.authority) {
+                return Err("authority is not a host[:port] of at most 261 bytes");
+            }
+            if !d.audience.as_deref().is_none_or(|a| word_ok(a, 63)) {
+                return Err("audience is not a name");
+            }
+            if !d.reason.as_deref().is_none_or(|r| word_ok(r, 32)) {
+                return Err("reason is not a refusal code");
+            }
+            if !d.served.as_deref().is_none_or(|s| word_ok(s, 16)) {
+                return Err("served is not a word");
+            }
+        }
+        Ok(())
+    }
+}
+
+/// 1 to 63 of `a-z`, `0-9`, `-` and `.`.
+#[must_use]
+pub fn gateway_name_ok(s: &str) -> bool {
+    (1..=63).contains(&s.len())
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.')
+}
+
+/// A `host[:port]` as a request can carry it: a DNS name, an IPv4 address or a bracketed IPv6
+/// one, at most 261 bytes (253, a colon, five digits, two brackets), nothing that could break a
+/// log line.
+fn authority_ok(s: &str) -> bool {
+    (1..=261).contains(&s.len())
+        && s.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b':' | b'[' | b']' | b'_')
+        })
+}
+
+/// A name or a code: `a-z`, `A-Z`, `0-9`, `-`, `_` and `.`, at most `max` bytes.
+fn word_ok(s: &str, max: usize) -> bool {
+    (1..=max).contains(&s.len())
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn decision() -> GatewayDecision {
+        GatewayDecision {
+            at: "2026-11-22T14:41:58Z".parse().unwrap(),
+            claim_uid: Uuid::nil(),
+            kind: DecisionKind::Tunnel,
+            authority: "pypi.org:443".into(),
+            audience: None,
+            verdict: DecisionVerdict::Allow,
+            reason: None,
+            served: Some("cache".into()),
+        }
+    }
+
+    #[test]
+    fn a_decision_batch_is_on_the_wire_as_adr_0062_writes_it() {
+        let batch = GatewayDecisions {
+            gateway: "gateway-02".into(),
+            decisions: vec![decision()],
+        };
+        let v = serde_json::to_value(&batch).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "gateway": "gateway-02",
+                "decisions": [{
+                    "at": "2026-11-22T14:41:58Z",
+                    "claim_uid": "00000000-0000-0000-0000-000000000000",
+                    "kind": "tunnel",
+                    "authority": "pypi.org:443",
+                    "verdict": "allow",
+                    "served": "cache"
+                }]
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<GatewayDecisions>(v).unwrap(),
+            batch
+        );
+        assert_eq!(batch.check(), Ok(()));
+    }
+
+    #[test]
+    fn a_batch_that_could_write_anything_else_into_the_brokers_log_is_refused() {
+        let with = |f: &dyn Fn(&mut GatewayDecisions)| {
+            let mut b = GatewayDecisions {
+                gateway: "gateway-02".into(),
+                decisions: vec![decision()],
+            };
+            f(&mut b);
+            b.check()
+        };
+        assert!(with(&|b| b.gateway = String::new()).is_err());
+        assert!(with(&|b| b.gateway = "Gateway 2".into()).is_err());
+        assert!(with(&|b| b.gateway = "g".repeat(64)).is_err());
+        assert!(with(&|b| b.decisions[0].authority = "a.example:443\nforged line".into()).is_err());
+        assert!(with(&|b| b.decisions[0].authority = "a.example/path".into()).is_err());
+        assert!(with(&|b| b.decisions[0].authority = "a".repeat(262)).is_err());
+        assert!(with(&|b| b.decisions[0].reason = Some("not allowed".into())).is_err());
+        assert!(with(&|b| b.decisions[0].audience = Some("x\u{1b}[31m".into())).is_err());
+        assert!(with(&|b| b.decisions = vec![decision(); MAX_GATEWAY_DECISIONS + 1]).is_err());
+        assert_eq!(
+            with(&|b| b.decisions[0].authority = "[2001:db8::1]:8443".into()),
+            Ok(())
+        );
+        assert_eq!(
+            with(&|b| b.decisions = vec![decision(); MAX_GATEWAY_DECISIONS]),
+            Ok(())
+        );
+    }
 
     #[test]
     fn a_workloads_logs_opt_in_is_off_by_default_and_left_off_the_wire() {

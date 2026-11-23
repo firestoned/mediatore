@@ -1,7 +1,8 @@
 // Copyright (c) 2026 Erick Bourgeois, mediatore
 // SPDX-License-Identifier: Apache-2.0
 
-//! Collecting the `SandboxNode`s of VMs that no longer exist (ADR-0039).
+//! Collecting the `SandboxNode`s of VMs that no longer exist (ADR-0039), and their SPIRE node
+//! entries (ADR-0039 decision 7, amended 2026-11-23).
 //!
 //! A node is registered once per VM, named by its EK hash, and nothing used to remove it:
 //! the register grew by one object per VM ever created. The rule here is the whole
@@ -14,7 +15,8 @@ use std::collections::HashSet;
 
 use banlieue_api::banlieue::VirtualMachine;
 use jiff::{SignedDuration, Timestamp};
-use mediatore_proto::ek::ek_hash_from_pems;
+use mediatore_proto::ek::{ek_hash_from_pems, is_ek_hash};
+use mediatore_spire::{EntryKind, EntryRef};
 use mediatore_store::NodeRecord;
 
 /// The most nodes one pass removes. A bug, a partial VM list or an operator error then
@@ -75,6 +77,76 @@ pub fn nodes_to_delete(i: &Inputs<'_>) -> Vec<String> {
         .collect()
 }
 
+/// The EK hash of a TPM guest's node entry: the hash its name carries, when the entry is
+/// parented to the TPM agent of that same hash. Any other entry is not this rule's: a claim
+/// entry, or an x509pop node entry (ADR-0049), whose name is a hash of something else.
+#[must_use]
+pub fn tpm_node_entry_ek(e: &EntryRef) -> Option<&str> {
+    if e.kind != EntryKind::Node {
+        return None;
+    }
+    let ek = e.name.strip_prefix("mediatore-node-")?;
+    let parent = e.parent_id.as_deref()?;
+    (is_ek_hash(ek) && parent.ends_with(&format!("/spire/agent/tpm/{ek}"))).then_some(ek)
+}
+
+/// What one pass over the node entries knows.
+pub struct EntryInputs<'a> {
+    /// Every entry mediatore has declared.
+    pub entries: &'a [EntryRef],
+    /// The EK hash every banlieue VM currently publishes.
+    pub live_ek_hashes: &'a HashSet<String>,
+    /// The SPIRE agent ID of every node a claim that has not ended is bound to.
+    pub busy_node_ids: &'a HashSet<String>,
+    /// Every registered node: a young one holds its entry, as it holds its record.
+    pub nodes: &'a [NodeRecord],
+    /// The time of the pass.
+    pub now: Timestamp,
+    /// The node grace, for the young nodes.
+    pub grace: SignedDuration,
+    /// The most to return.
+    pub cap: usize,
+}
+
+/// The names of the TPM node entries to retract, in name order, at most `cap` (ADR-0039
+/// decision 7). A node entry is declared from a VM's published endorsement certificate
+/// (ADR-0011), so it lives as long as some VM publishes its hash; past that it gives an agent
+/// that cannot exist an identity, and nothing else will ever remove it.
+///
+/// Kept: an entry whose hash a VM publishes, one an unended claim's node is under, one whose
+/// node registered inside the grace. An empty VM list is believed only as
+/// [`nodes_to_delete`] believes it.
+#[must_use]
+pub fn node_entries_to_delete(i: &EntryInputs<'_>) -> Vec<String> {
+    let young = |n: &NodeRecord| i.now.duration_since(n.registered_at) < i.grace;
+    if i.live_ek_hashes.is_empty() && (!i.busy_node_ids.is_empty() || i.nodes.iter().any(young)) {
+        return Vec::new();
+    }
+    let busy: HashSet<&str> = i
+        .busy_node_ids
+        .iter()
+        .filter_map(|id| id.rsplit_once("/spire/agent/tpm/").map(|(_, ek)| ek))
+        .collect();
+    let held: HashSet<&str> = i
+        .nodes
+        .iter()
+        .filter(|n| young(n))
+        .map(|n| n.ek_hash.as_str())
+        .collect();
+    let mut doomed: Vec<&str> = i
+        .entries
+        .iter()
+        .filter(|e| {
+            tpm_node_entry_ek(e).is_some_and(|ek| {
+                !i.live_ek_hashes.contains(ek) && !busy.contains(ek) && !held.contains(ek)
+            })
+        })
+        .map(|e| e.name.as_str())
+        .collect();
+    doomed.sort_unstable();
+    doomed.into_iter().take(i.cap).map(str::to_owned).collect()
+}
+
 /// The EK hash each VM publishes, computed exactly as the claim binding does
 /// ([`ek_hash_from_pems`] over the endorsement certificates banlieue mirrors onto the VM).
 /// A VM with no certificate yet, or an unusable one, protects no node.
@@ -113,7 +185,12 @@ mod tests {
     use mediatore_testkit::ek::{RSA_EK_HASH, RSA_EK_PEM};
     use serde_json::json;
 
-    use super::{Inputs, MAX_DELETIONS_PER_PASS, ek_hashes_of, nodes_to_delete};
+    use mediatore_spire::{EntryKind, EntryRef};
+
+    use super::{
+        EntryInputs, Inputs, MAX_DELETIONS_PER_PASS, ek_hashes_of, node_entries_to_delete,
+        nodes_to_delete, tpm_node_entry_ek,
+    };
 
     fn at(minutes: i64) -> Timestamp {
         "2026-11-15T00:00:00Z".parse::<Timestamp>().unwrap() + SignedDuration::from_mins(minutes)
@@ -267,5 +344,126 @@ mod tests {
             vec![RSA_EK_HASH.to_owned()],
             "no certificate, no protection; an empty list with only old nodes and no claim is believed"
         );
+    }
+
+    // ----- node entries (decision 7) -------------------------------------------------------
+
+    /// A 64-hex EK hash made of one repeated digit.
+    fn ek(d: char) -> String {
+        std::iter::repeat_n(d, 64).collect()
+    }
+
+    /// A TPM node entry, parented to the agent of its own hash.
+    fn tpm_entry(ek: &str) -> EntryRef {
+        EntryRef {
+            name: format!("mediatore-node-{ek}"),
+            kind: EntryKind::Node,
+            claim_uid: None,
+            parent_id: Some(format!("spiffe://sandbox.test/spire/agent/tpm/{ek}")),
+        }
+    }
+
+    fn entry_pass(
+        entries: &[EntryRef],
+        live: &HashSet<String>,
+        busy: &HashSet<String>,
+        nodes: &[NodeRecord],
+    ) -> Vec<String> {
+        node_entries_to_delete(&EntryInputs {
+            entries,
+            live_ek_hashes: live,
+            busy_node_ids: busy,
+            nodes,
+            now: at(100),
+            grace: SignedDuration::from_mins(10),
+            cap: MAX_DELETIONS_PER_PASS,
+        })
+    }
+
+    #[test]
+    fn a_node_entry_whose_vm_is_gone_is_retracted_and_one_whose_vm_publishes_is_kept() {
+        let (gone, alive) = (ek('a'), ek('b'));
+        let entries = [tpm_entry(&gone), tpm_entry(&alive)];
+        assert_eq!(
+            entry_pass(&entries, &set(&[&alive]), &set(&[]), &[]),
+            vec![format!("mediatore-node-{gone}")]
+        );
+    }
+
+    #[test]
+    fn a_node_entry_under_an_unended_claim_or_a_young_node_is_kept() {
+        let (busy, young) = (ek('c'), ek('d'));
+        let entries = [tpm_entry(&busy), tpm_entry(&young)];
+        let claim_node = format!("spiffe://sandbox.test/spire/agent/tpm/{busy}");
+        // Another VM is live, so the list is believed and only the guards decide.
+        let got = entry_pass(
+            &entries,
+            &set(&[&ek('e')]),
+            &set(&[&claim_node]),
+            &[node(&young, 95)],
+        );
+        assert_eq!(got, none());
+    }
+
+    #[test]
+    fn an_empty_vm_list_retracts_nothing_while_a_claim_is_active_or_a_node_is_young() {
+        let entries = [tpm_entry(&ek('a'))];
+        let busy = format!("spiffe://sandbox.test/spire/agent/tpm/{}", ek('f'));
+        assert_eq!(entry_pass(&entries, &set(&[]), &set(&[&busy]), &[]), none());
+        assert_eq!(
+            entry_pass(&entries, &set(&[]), &set(&[]), &[node(&ek('f'), 95)]),
+            none()
+        );
+        assert_eq!(
+            entry_pass(&entries, &set(&[]), &set(&[]), &[node(&ek('f'), 0)]),
+            vec![format!("mediatore-node-{}", ek('a'))],
+            "only old nodes and no claim: the empty list is believed"
+        );
+    }
+
+    #[test]
+    fn claim_entries_and_x509pop_node_entries_are_not_this_rules() {
+        let claim = EntryRef {
+            name: "mediatore-claim-6f1e0000-0000-4000-8000-0000000000c1".into(),
+            kind: EntryKind::Claim,
+            claim_uid: Some(Uuid::nil()),
+            parent_id: Some(format!("spiffe://sandbox.test/spire/agent/tpm/{}", ek('a'))),
+        };
+        let x509pop = EntryRef {
+            name: format!("mediatore-node-{}", ek('b')),
+            kind: EntryKind::Node,
+            claim_uid: None,
+            parent_id: Some("spiffe://sandbox.test/spire/agent/x509pop/host-ca/vm-uid".into()),
+        };
+        let unparented = EntryRef {
+            parent_id: None,
+            ..tpm_entry(&ek('c'))
+        };
+        for e in [&claim, &x509pop, &unparented] {
+            assert_eq!(tpm_node_entry_ek(e), None, "{}", e.name);
+        }
+        assert_eq!(
+            entry_pass(
+                &[claim, x509pop, unparented],
+                &set(&[&ek('z')]),
+                &set(&[]),
+                &[]
+            ),
+            none()
+        );
+    }
+
+    #[test]
+    fn at_most_the_cap_is_retracted_in_one_pass_in_name_order() {
+        let entries: Vec<EntryRef> = "0123456789abcdef0123456789"
+            .chars()
+            .enumerate()
+            .map(|(i, d)| tpm_entry(&format!("{d}{}", &ek(if i < 16 { '1' } else { '2' })[1..])))
+            .collect();
+        let got = entry_pass(&entries, &set(&[&ek('9')]), &set(&[]), &[]);
+        assert_eq!(got.len(), MAX_DELETIONS_PER_PASS);
+        let mut sorted = got.clone();
+        sorted.sort();
+        assert_eq!(got, sorted);
     }
 }

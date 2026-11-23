@@ -40,10 +40,11 @@ use mediatore_proto::image::ImageReference;
 use mediatore_proto::{
     ClaimEgress, ClaimPhase, ClaimReport, ClaimRequest, ClaimResponse, Credential, Delegation,
     DelegationPlain, Endpoint, EndpointRule, ErrorBody, GatewayCredential,
-    GatewayCredentialRequest, GuestExit, GuestReport, HeaderPair, HostTable, InjectRoute,
-    LOG_KEEPALIVE_SECS, LOG_RETRY_AFTER_SECS, LogBatch, LogEnd, LogEndLine, LogEntry, LogGap,
-    LogHeader, MAX_LOG_BATCH_BYTES, Me, NodeRegistered, NodeRegistration, RegistryCredential,
-    Route, Secret, Subject, TokenRequest, TokenResponse, WorkloadExit, error_code,
+    GatewayCredentialRequest, GatewayDecisions, GuestExit, GuestReport, HeaderPair, HostTable,
+    InjectRoute, LOG_KEEPALIVE_SECS, LOG_RETRY_AFTER_SECS, LogBatch, LogEnd, LogEndLine, LogEntry,
+    LogGap, LogHeader, MAX_LOG_BATCH_BYTES, Me, NodeRegistered, NodeRegistration,
+    RegistryCredential, Route, Secret, Subject, TokenRequest, TokenResponse, WorkloadExit,
+    error_code,
 };
 use mediatore_spire::{EntryManager, Naming};
 use mediatore_store::seal::{FORMAT_BARE_UID, SealError, Sealed, Sealer, Slot};
@@ -2728,6 +2729,46 @@ async fn claim_egress(
     }))
 }
 
+/// `POST /v1/gateway/decisions`: one gateway's tunnel and inject decisions, each written as one
+/// `info` line naming the gateway and the host (ADR-0062). The peer must be the gateway
+/// authorizer's identity, as on the other gateway routes. A batch whose shape is off is refused
+/// whole, before any of it is logged; nothing is stored and no claim is looked up.
+async fn gateway_decisions(
+    State(st): State<Shared>,
+    headers: HeaderMap,
+    peer: Option<Extension<PeerSpiffeId>>,
+    Json(batch): Json<GatewayDecisions>,
+) -> Result<StatusCode, ApiError> {
+    let peer = peer_spiffe_id(&st, peer.as_ref().map(|e| &e.0), &headers)?;
+    require_gateway_authorizer(&st, &peer, "POST /v1/gateway/decisions", "")?;
+    batch
+        .check()
+        .map_err(|why| ApiError::bad_request("invalid_decisions", why))?;
+    for d in &batch.decisions {
+        let kind = match d.kind {
+            mediatore_proto::DecisionKind::Tunnel => "tunnel",
+            mediatore_proto::DecisionKind::Inject => "inject",
+        };
+        let verdict = match d.verdict {
+            mediatore_proto::DecisionVerdict::Allow => "allow",
+            mediatore_proto::DecisionVerdict::Deny => "deny",
+        };
+        tracing::info!(
+            claim_uid = %d.claim_uid,
+            gateway = %batch.gateway,
+            kind,
+            authority = %d.authority,
+            audience = d.audience.as_deref().unwrap_or_default(),
+            verdict,
+            reason = d.reason.as_deref().unwrap_or_default(),
+            served = d.served.as_deref().unwrap_or_default(),
+            at = %d.at,
+            "gateway decision"
+        );
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// The claim's gateway-placed routes (ADR-0040 decision 2): one per exact upstream authority
 /// of each audience it names that is declared `inject: gateway`, sorted by audience then
 /// endpoint. Empty for a claim with no such audience. Carries no credential.
@@ -3440,6 +3481,7 @@ pub fn sandbox_router(state: Shared) -> Router {
         .route("/v1/me/logs", post(ingest_logs))
         .route("/v1/token", post(token))
         .route("/v1/gateway/claims/{uid}", get(claim_egress))
+        .route("/v1/gateway/decisions", post(gateway_decisions))
         .route(
             "/v1/gateway/claims/{uid}/credential",
             post(gateway_credential),
@@ -4132,6 +4174,88 @@ mod tests {
             let (status, _, _) = ask_egress(&st, uid, &authorizer).await;
             assert_eq!(status, *as_authorizer, "the authorizer's egress ask, {uid}");
         }
+    }
+
+    /// `POST /v1/gateway/decisions` as `peer` (ADR-0062).
+    async fn report(
+        st: &Shared,
+        peer: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value, String) {
+        call(st, "POST", "/v1/gateway/decisions", Some(peer), body).await
+    }
+
+    fn decisions(authority: &str) -> serde_json::Value {
+        serde_json::json!({
+            "gateway": "gateway-02",
+            "decisions": [
+                { "at": "2026-11-22T14:41:58Z", "claim_uid": "08799118-4721-4406-85ce-21fcfb09f75b",
+                  "kind": "tunnel", "authority": authority, "verdict": "allow", "served": "cache" },
+                { "at": "2026-11-22T14:41:59Z", "claim_uid": "08799118-4721-4406-85ce-21fcfb09f75b",
+                  "kind": "inject", "authority": "api.anthropic.com", "audience": "anthropic",
+                  "verdict": "deny", "reason": "not_allowed" }
+            ]
+        })
+    }
+
+    #[tokio::test]
+    async fn each_reported_decision_is_one_line_naming_the_gateway_and_the_host() {
+        // ADR-0062 decision 5: the authorizer's batch, logged one line per decision, stored
+        // nowhere, the claim not looked up (this one was never stored).
+        capture_logs();
+        let st: Shared = Arc::new(placed_state());
+        let (status, _, text) = report(&st, &gateway_peer(), decisions("pypi.org:443")).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{text}");
+        let logs = captured();
+        let lines: Vec<&str> = logs
+            .lines()
+            .filter(|l| l.contains("gateway decision"))
+            .collect();
+        assert_eq!(lines.len(), 2, "{logs}");
+        for want in [
+            "claim_uid=08799118-4721-4406-85ce-21fcfb09f75b",
+            "gateway=gateway-02",
+            "kind=\"tunnel\"",
+            "authority=pypi.org:443",
+            "verdict=\"allow\"",
+            "served=\"cache\"",
+        ] {
+            assert!(lines[0].contains(want), "{want} in {}", lines[0]);
+        }
+        for want in [
+            "kind=\"inject\"",
+            "authority=api.anthropic.com",
+            "audience=\"anthropic\"",
+            "verdict=\"deny\"",
+            "reason=\"not_allowed\"",
+        ] {
+            assert!(lines[1].contains(want), "{want} in {}", lines[1]);
+        }
+    }
+
+    #[tokio::test]
+    async fn decisions_from_anything_but_the_authorizer_or_of_a_bad_shape_write_nothing() {
+        capture_logs();
+        let st: Shared = Arc::new(placed_state());
+        let uid = Uuid::new_v4();
+        for peer in [
+            naming().gateway_id(),
+            naming().claim_id(uid),
+            naming().node_id("ekhash"),
+        ] {
+            let (status, body, text) = report(&st, &peer, decisions("pypi.org:443")).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{peer}: {text}");
+            assert_eq!(code(&body), "forbidden", "{peer}");
+        }
+        let (status, body, text) =
+            report(&st, &gateway_peer(), decisions("pypi.org:443\nforged")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+        assert_eq!(code(&body), "invalid_decisions");
+        assert!(
+            !captured().contains("gateway decision"),
+            "a refused batch is refused whole: {}",
+            captured()
+        );
     }
 
     #[test]
