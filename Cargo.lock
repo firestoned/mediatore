@@ -1976,7 +1976,7 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
 name = "mediatore"
-version = "0.1.0"
+version = "0.4.0-rc.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2019,7 +2019,7 @@ dependencies = [
 
 [[package]]
 name = "mediatore-api"
-version = "0.1.0"
+version = "0.4.0-rc.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2049,7 +2049,7 @@ dependencies = [
 
 [[package]]
 name = "mediatore-claims"
-version = "0.1.0"
+version = "0.4.0-rc.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2085,7 +2085,7 @@ dependencies = [
 
 [[package]]
 name = "mediatore-client"
-version = "0.1.0"
+version = "0.4.0-rc.6"
 dependencies = [
  "anyhow",
  "aws-lc-rs",
@@ -2105,7 +2105,7 @@ dependencies = [
 
 [[package]]
 name = "mediatore-entra"
-version = "0.1.0"
+version = "0.4.0-rc.6"
 dependencies = [
  "base64 0.23.1",
  "jiff",
@@ -2124,7 +2124,7 @@ dependencies = [
 
 [[package]]
 name = "mediatore-gateway"
-version = "0.1.0"
+version = "0.4.0-rc.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2151,7 +2151,7 @@ dependencies = [
 
 [[package]]
 name = "mediatore-guest"
-version = "0.1.0"
+version = "0.4.0-rc.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2188,7 +2188,7 @@ dependencies = [
 
 [[package]]
 name = "mediatore-openbao"
-version = "0.1.0"
+version = "0.4.0-rc.6"
 dependencies = [
  "mediatore-proto",
  "reqwest",
@@ -2202,7 +2202,7 @@ dependencies = [
 
 [[package]]
 name = "mediatore-policy"
-version = "0.1.0"
+version = "0.4.0-rc.6"
 dependencies = [
  "base64 0.23.1",
  "jiff",
@@ -2216,7 +2216,7 @@ dependencies = [
 
 [[package]]
 name = "mediatore-proto"
-version = "0.1.0"
+version = "0.4.0-rc.6"
 dependencies = [
  "base64 0.23.1",
  "hex",
@@ -2234,7 +2234,7 @@ dependencies = [
 
 [[package]]
 name = "mediatore-spire"
-version = "0.1.0"
+version = "0.4.0-rc.6"
 dependencies = [
  "async-trait",
  "futures",
@@ -2258,7 +2258,7 @@ dependencies = [
 
 [[package]]
 name = "mediatore-store"
-version = "0.1.0"
+version = "0.4.0-rc.6"
 dependencies = [
  "async-trait",
  "aws-lc-rs",
@@ -2278,7 +2278,7 @@ dependencies = [
 
 [[package]]
 name = "mediatore-sts"
-version = "0.1.0"
+version = "0.4.0-rc.6"
 dependencies = [
  "base64 0.23.1",
  "jiff",
@@ -2293,7 +2293,7 @@ dependencies = [
 
 [[package]]
 name = "mediatore-testkit"
-version = "0.1.0"
+version = "0.4.0-rc.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2331,7 +2331,7 @@ dependencies = [
 
 [[package]]
 name = "mediatore-tls"
-version = "0.1.0"
+version = "0.4.0-rc.6"
 dependencies = [
  "arc-swap",
  "axum",
