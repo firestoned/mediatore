@@ -128,7 +128,8 @@ stages:
     # AUTHORIZER_ENDPOINT, CHECK_TCP_ELEMENTS and INJECT_PORT_ELEMENT with the three lines of image/gateway/env.inject.example, set INJECT_HOST, INJECT_DOMAIN and
     # INJECT_UPSTREAM_PORT to the upstream, and keep INJECT_PORT equal to the broker's gateway_inject_port; (2) add the step below, which
     # moves the authorizer to its two unix sockets (the data plane's group reaches the check socket only, envoy-inject's group the inject
-    # socket only; the setgid directories give each socket its group) and enables the unit; (3) register `unix:user:envoy-inject` on the
+    # socket only; the setgid directories give each socket its group) and enables and starts the unit (enable alone never starts it here:
+    # /etc is rebuilt at every boot and this stage runs after systemd has planned the boot, so 3133 would stay closed); (3) register `unix:user:envoy-inject` on the
     # listeners' SPIFFE ID, spiffe://<td>/gateway (the third entry of each VM in deploy/gateway/clusterstaticentries.yaml; the authorizer's
     # user holds spiffe://<td>/gateway/authorizer and nothing else, ADR-0053); (4) open the gateways' path to the upstream. The authorizer's
     # listen flags are those of the release that serves the two sockets (ADR-0040 stage C): check them with `mediatore gateway --help`.
@@ -151,6 +152,8 @@ stages:
     #       commands:
     #         - systemctl daemon-reload
     #         - systemctl restart mediatore-gateway
+    #         # --no-block: the boot stage must not wait on a unit that waits on the agent.
+    #         - systemctl start --no-block envoy-inject
     #       systemctl:
     #         enable:
     #           - envoy-inject
