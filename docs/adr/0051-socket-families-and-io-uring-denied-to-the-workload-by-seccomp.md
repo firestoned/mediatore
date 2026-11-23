@@ -3,7 +3,7 @@
 
 # ADR-0051: Socket families and io_uring denied to the workload by a seccomp filter
 
-**Status:** Accepted, implemented 2026-11-19 · **Date:** 2026-11-18
+**Status:** Accepted, implemented 2026-11-19, released in v0.4.0 · **Date:** 2026-11-18
 
 Roadmap 06, the confinement item. Adds a third layer inside the jail of
 [ADR-0020](0020-jail-network-nftables-keyed-by-sandbox-uid.md) (nftables keyed by uid) and

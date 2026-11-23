@@ -3,7 +3,7 @@
 
 # ADR-0052: A sandbox workload's stored output is sealed per batch with the transit key
 
-**Status:** Accepted and implemented 2026-11-19 (amended at implementation: decision 3's trim and segment size count a fixed overhead per sealed batch as well as its text, found while mapping the controls; the first live run of the sealed path is still to come) · **Date:** 2026-11-19
+**Status:** Accepted and implemented 2026-11-19, released in v0.4.0 (amended at implementation: decision 3's trim and segment size count a fixed overhead per sealed batch as well as its text, found while mapping the controls; the first live run of the sealed path is still to come) · **Date:** 2026-11-19
 
 Amends [ADR-0045](0045-a-sandbox-workloads-output-streamed-to-its-owner.md) decision 6 (where the
 output is stored) and retires the reasoning of its R-39. Builds on

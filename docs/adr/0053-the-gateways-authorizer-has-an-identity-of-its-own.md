@@ -3,7 +3,7 @@
 
 # ADR-0053: The gateway's authorizer has an identity of its own
 
-**Status:** Accepted, implemented 2026-11-19 (amended at implementation, each amendment dated at
+**Status:** Accepted, implemented 2026-11-19, released in v0.4.0 (amended at implementation, each amendment dated at
 its decision; proven by the quality gate, the kind gateway tiers and the two image checks; nothing
 is proven on a booted gateway VM yet, so decisions 2, 5 and 6 are built and not verified there:
 *What was proven, and what was not*) · **Date:** 2026-11-19

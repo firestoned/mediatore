@@ -3,7 +3,7 @@
 
 # ADR-0054: Which policies a namespace may name
 
-**Status:** Accepted, implemented 2026-11-19 (decisions 1 to 6 and 8 to 10; decision 7 defers
+**Status:** Accepted, implemented 2026-11-19, released in v0.4.0 (decisions 1 to 6 and 8 to 10; decision 7 defers
 the check by subject, which is not built and waits on notaio's bundle carrying
 `subjects.groups`, its limit an accepted risk in the threat model; the seven open questions were
 each answered by taking the recommendation; amended at implementation, each amendment dated at

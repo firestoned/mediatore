@@ -3,7 +3,7 @@
 
 # ADR-0039: A node leaves the register when its VM is gone
 
-**Status:** Accepted, implemented in the repository 2026-11-15 (the store's `delete_node`, the pure rule `nodegc::nodes_to_delete`, `Watcher::collect_nodes` on the resync ticker, `store.node_grace_secs`, their pinned tests; the live proof is a pool recycled under load and the register staying the size of the pool); amended 2026-11-23 (decision 7: the node's SPIRE entry goes too) · **Date:** 2026-11-15
+**Status:** Accepted, implemented in the repository 2026-11-15 (the store's `delete_node`, the pure rule `nodegc::nodes_to_delete`, `Watcher::collect_nodes` on the resync ticker, `store.node_grace_secs`, their pinned tests; the live proof is a pool recycled under load and the register staying the size of the pool); amended 2026-11-23 (decision 7: the node's SPIRE entry goes too; released in v0.4.0) · **Date:** 2026-11-15
 
 Roadmap 05 (the store). Completes [ADR-0034](0034-the-kubernetes-api-as-the-brokers-store.md)
 decision 3, which made an attested node a `SandboxNode` and gave claims a retention window
