@@ -62,7 +62,7 @@ For another namespace, a two-line overlay of that directory setting `namespace:`
 Role is `get`, `list` and `watch` on ConfigMaps and nothing else: the broker never writes
 a bundle.
 
-The name is part of what the broker checks (notaio v0.8.0-rc.1): the ConfigMap
+The name is part of what the broker checks (notaio v0.8.0): the ConfigMap
 `<policy>-bundle` must hold the bundle of `<policy>`, and an audience's `<audience>-audience`
 the bundle of that audience. A valid bundle copied under another name, or into an object
 notaio would not have written, is refused with `WrongSubject` and the broker's log names the

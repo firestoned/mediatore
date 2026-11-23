@@ -14,7 +14,7 @@
 # admits; the earlier bundle written back into the policy's own object is refused by the
 # version floor, and still refused after a broker restart, because the floor lives in the
 # store with the claims; a valid bundle copied under another policy's name is refused as
-# `WrongSubject` and its deletion drops nothing (notaio v0.8.0-rc.1).
+# `WrongSubject` and its deletion drops nothing (notaio v0.8.0).
 # Then ADR-0053 phase 2: the broker is restarted with `policy.audiences: enforce`, and a
 # sandbox with no policyRef, one naming a policy with no bundle, one asking for an audience
 # the bundle lacks and one asking for more than the policy's lease are each Failed with
@@ -236,7 +236,7 @@ echo "v$V2 admitted; every sandbox compared again"
 [ -s "$DIR/bundle-v$V2.json" ] || fail "the bundle ConfigMap carries no envelope at v$V2"
 
 say "the floor: v$V1 written back into the policy's own object is refused, before and after a broker restart"
-# What a ConfigMap writer can still do (notaio v0.8.0-rc.1): put an older signed bundle into the object notaio
+# What a ConfigMap writer can still do (notaio v0.8.0): put an older signed bundle into the object notaio
 # writes for the policy. The floor refuses it; the copy is put back after, as notaio would on its next write.
 put_bundle() { # <envelope file>
   "${K[@]}" -n "$NS" patch configmap "$BUNDLE_CM" --type merge \
