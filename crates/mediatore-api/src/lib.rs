@@ -2379,7 +2379,7 @@ fn handed(st: &AppState, rec: &ClaimRecord) -> (Vec<Endpoint>, Vec<Route>) {
     egress.extend(direct.iter().cloned());
     // A registry audience's endpoints are the puller's, never the workload's (ADR-0063 decision 5): the jail's
     // destinations leave them out, and their routes are pull-only.
-    let pull = pull_endpoints(&st, &rec);
+    let pull = pull_endpoints(st, rec);
     egress.retain(|e| !pull.contains(e));
     egress.sort();
     egress.dedup();
@@ -2424,7 +2424,7 @@ fn handed(st: &AppState, rec: &ClaimRecord) -> (Vec<Endpoint>, Vec<Route>) {
             // ADR-0040: the gateways' inject port, on the routes of an audience placed
             // there; every other route is placed by the proxy.
             inject_port: view.inject(a).is_some().then_some(st.inject_port).flatten(),
-            pull_only: is_registry(&st, a),
+            pull_only: is_registry(st, a),
         })
         .chain(direct.into_iter().map(|e| Route {
             audience: None,
