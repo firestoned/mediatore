@@ -817,6 +817,7 @@ impl AudienceReflector {
             self.store.as_ref(),
             &envelope,
             &namespace,
+            &configmap,
             &self.keys,
             now,
         )
@@ -1458,6 +1459,39 @@ mod tests {
         ) -> k8s_openapi::api::core::v1::ConfigMap {
             let a = signed_audience(Timestamp::now(), version, ns, name, d);
             audience_configmap(ns, name, &a.envelope)
+        }
+
+        #[tokio::test]
+        async fn an_audience_bundle_in_another_audiences_configmap_is_refused_and_moves_nothing() {
+            // notaio v0.8.0-rc.1: the object notaio writes for audience `a` is `a-audience`, and a valid bundle of any
+            // other audience found there is refused, the floor of neither touched.
+            let (store, r) = rig();
+            for name in ["other-audience", "registry", "registry-audience-copy"] {
+                let mut c = cm(TEAM, "registry", 1, definition("r.example.com:443"));
+                c.metadata.name = Some(name.into());
+                assert_eq!(
+                    r.applied_at(&c, Timestamp::now()).await,
+                    AudienceOutcome::Refused {
+                        code: "WrongSubject"
+                    },
+                    "{name}"
+                );
+            }
+            assert!(
+                r.live()
+                    .snapshot()
+                    .resolve(TEAM, "registry", Timestamp::now())
+                    .is_err(),
+                "nothing reached the catalog"
+            );
+            assert!(
+                store
+                    .get_policy_floor(TEAM, "audience/registry")
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "no floor moved"
+            );
         }
 
         #[tokio::test]

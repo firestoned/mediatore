@@ -62,6 +62,12 @@ For another namespace, a two-line overlay of that directory setting `namespace:`
 Role is `get`, `list` and `watch` on ConfigMaps and nothing else: the broker never writes
 a bundle.
 
+The name is part of what the broker checks (notaio v0.8.0-rc.1): the ConfigMap
+`<policy>-bundle` must hold the bundle of `<policy>`, and an audience's `<audience>-audience`
+the bundle of that audience. A valid bundle copied under another name, or into an object
+notaio would not have written, is refused with `WrongSubject` and the broker's log names the
+object; nothing is cached and no floor moves. Copy nothing by hand: notaio writes these.
+
 ## The keys the broker trusts
 
 The broker trusts exactly the keys in its own configuration, never a key read from the
@@ -108,7 +114,8 @@ rule is notaio's (`next_floor`); the store's part is a compare-and-set, so two r
 cannot move a floor down between them. A floor is never deleted with its policy.
 
 notaio re-signs every bundle when half its lifetime is left (the default lifetime is 15
-minutes, a site value between 5 minutes and a day): the same version and content digest,
+minutes, a site value between 5 minutes and a day; the broker refuses a bundle signed to
+live longer than a day, `LifetimeTooLong`, whatever signed it): the same version and content digest,
 a later `issuedAt` and `notAfter`. The broker admits that refresh as it admits any bundle
 at or above the floor, replaces the held copy so the new `notAfter` takes, and compares no
 sandbox again, since nothing the comparison reads has changed. Expiry is strict: a bundle

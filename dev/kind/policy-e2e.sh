@@ -11,8 +11,10 @@
 # False with P001; one without a policyRef reports P010; one naming a policy with no
 # bundle reports P011; every one of them gets its claim, because nothing is refused on
 # the bundle's account. A change to the policy publishes a newer version the broker
-# admits; the earlier bundle delivered again is refused by the version floor, and still
-# refused after a broker restart, because the floor lives in the store with the claims.
+# admits; the earlier bundle written back into the policy's own object is refused by the
+# version floor, and still refused after a broker restart, because the floor lives in the
+# store with the claims; a valid bundle copied under another policy's name is refused as
+# `WrongSubject` and its deletion drops nothing (notaio v0.8.0-rc.1).
 # Then ADR-0053 phase 2: the broker is restarted with `policy.audiences: enforce`, and a
 # sandbox with no policyRef, one naming a policy with no bundle, one asking for an audience
 # the bundle lacks and one asking for more than the policy's lease are each Failed with
@@ -230,26 +232,44 @@ wait_for "$TIMEOUT" "sb-ok compared with v$V2" ok_on_v2
 expect sb-ok "True Conformant" "v$V2"
 expect sb-gap "False Gaps" "P001 audience e2e"
 echo "v$V2 admitted; every sandbox compared again"
+"${K[@]}" -n "$NS" get configmap "$BUNDLE_CM" -o jsonpath='{.data.bundle\.dsse\.json}' > "$DIR/bundle-v$V2.json"
+[ -s "$DIR/bundle-v$V2.json" ] || fail "the bundle ConfigMap carries no envelope at v$V2"
 
-say "the floor: v$V1 delivered again is refused, before and after a broker restart"
+say "the floor: v$V1 written back into the policy's own object is refused, before and after a broker restart"
+# What a ConfigMap writer can still do (notaio v0.8.0-rc.1): put an older signed bundle into the object notaio
+# writes for the policy. The floor refuses it; the copy is put back after, as notaio would on its next write.
+put_bundle() { # <envelope file>
+  "${K[@]}" -n "$NS" patch configmap "$BUNDLE_CM" --type merge \
+    -p "$(jq -n --rawfile b "$1" '{data: {"bundle.dsse.json": $b}}')" >/dev/null
+}
 replay() {
-  "${K[@]}" -n "$NS" delete configmap "$REPLAY_CM" --ignore-not-found --wait=true >/dev/null
-  "${K[@]}" -n "$NS" create configmap "$REPLAY_CM" --from-file=bundle.dsse.json="$DIR/bundle-v$V1.json" \
-    --dry-run=client -o yaml | "${K[@]}" label --local -f - app.kubernetes.io/managed-by=notaio -o yaml \
-    | "${K[@]}" apply -f - >/dev/null
+  put_bundle "$DIR/bundle-v$V1.json"
+}
+restore() {
+  put_bundle "$DIR/bundle-v$V2.json"
 }
 replay
 wait_for "$TIMEOUT" "'policy bundle refused' with Downgrade in the broker log" log_has "policy bundle refused" "Downgrade"
-"${K[@]}" -n "$NS" delete configmap "$REPLAY_CM" --wait=true >/dev/null
-sleep 2
-log_has "policy bundle gone" "configmap=$REPLAY_CM" && fail "deleting the replay dropped the policy from the cache"
+restore
 expect sb-ok "True Conformant" "v$V2"
 echo "replay refused (Downgrade); the cache kept v$V2"
+
+say "the subject: a valid bundle copied under another policy's name is refused, and its deletion drops nothing"
+"${K[@]}" -n "$NS" create configmap "$REPLAY_CM" --from-file=bundle.dsse.json="$DIR/bundle-v$V2.json" \
+  --dry-run=client -o yaml | "${K[@]}" label --local -f - app.kubernetes.io/managed-by=notaio -o yaml \
+  | "${K[@]}" apply -f - >/dev/null
+wait_for "$TIMEOUT" "'policy bundle refused' with WrongSubject for $REPLAY_CM" log_has "policy bundle refused" "configmap=$REPLAY_CM code=\"WrongSubject\""
+"${K[@]}" -n "$NS" delete configmap "$REPLAY_CM" --wait=true >/dev/null
+sleep 2
+log_has "policy bundle gone" "configmap=$REPLAY_CM" && fail "deleting the copy dropped the policy from the cache"
+expect sb-ok "True Conformant" "v$V2"
+echo "the copy refused (WrongSubject); deleting it left v$V2 where it was"
+
 restart_broker
 wait_for "$TIMEOUT" "'policy bundle admitted' version=$V2 in the new broker log" log_has "policy bundle admitted" "version=$V2"
 replay
 wait_for "$TIMEOUT" "'policy bundle refused' with Downgrade in the new broker log" log_has "policy bundle refused" "Downgrade"
-"${K[@]}" -n "$NS" delete configmap "$REPLAY_CM" --wait=true >/dev/null
+restore
 expect sb-ok "True Conformant" "v$V2"
 for sb in sb-ok sb-gap sb-none sb-orphan; do
   "${K[@]}" -n "$NS" get virtualmachineclaim "$sb" >/dev/null 2>&1 || fail "$sb lost its claim"
