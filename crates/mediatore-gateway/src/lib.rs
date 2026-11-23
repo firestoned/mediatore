@@ -39,6 +39,7 @@
 #![forbid(unsafe_code)]
 
 pub mod broker;
+pub mod report;
 pub mod serve;
 
 use std::collections::{BTreeSet, HashMap};
@@ -279,6 +280,8 @@ pub struct Authorizer {
     asking: std::sync::Mutex<HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>>,
     /// The same for a claim's credential, per audience.
     cred_asking: std::sync::Mutex<HashMap<CredentialKey, Arc<tokio::sync::Mutex<()>>>>,
+    /// Where decisions are reported (ADR-0062); none, nothing is reported.
+    reporter: Option<report::Reporter>,
 }
 
 impl Authorizer {
@@ -297,6 +300,21 @@ impl Authorizer {
             credentials: std::sync::Mutex::new(HashMap::new()),
             asking: std::sync::Mutex::new(HashMap::new()),
             cred_asking: std::sync::Mutex::new(HashMap::new()),
+            reporter: None,
+        }
+    }
+
+    /// Report every decision about a claim to `reporter` (ADR-0062).
+    #[must_use]
+    pub fn with_reporter(mut self, reporter: report::Reporter) -> Self {
+        self.reporter = Some(reporter);
+        self
+    }
+
+    /// Queue `decision` for the broker, if reporting is on; never waits.
+    pub fn report(&self, decision: mediatore_proto::GatewayDecision) {
+        if let Some(r) = &self.reporter {
+            r.note(decision);
         }
     }
 

@@ -66,6 +66,19 @@ audit line names the claim, audience, subject, backend and expiry, never the val
 An empty credential, one for another audience, and one already expired are refused and kept nowhere. Every refusal on
 this path carries `x-mediatore-refusal: <code>`, so the guest can tell the gateway's own refusal from the upstream's.
 
+## What the broker hears of each decision
+
+Each tunnel and inject decision about a claim is also reported to the broker (ADR-0062, Proposed):
+`POST /v1/gateway/decisions`, over the same mutual TLS as the ask, in batches every two seconds or of 256. A decision
+carries the claim, `tunnel` or `inject`, the authority, the audience of a matched inject route, the verdict, the refusal
+code and where the allowlist came from, and the batch carries the gateway's name (`--name`, `MEDIATORE_GATEWAY_NAME`, by
+default the host name). The broker writes one `gateway decision` line for each and stores nothing, so its log alone says
+which gateway carried a claim to which host.
+
+The name is attribution, not authentication: every gateway's authorizer has the one identity. Reporting is never on the
+decision's path: a decision is queued without waiting, a full queue (1024) drops and counts it, and a failed batch is
+dropped, logged once per run of failures. The gateway's own decision line stays the complete record.
+
 ## The two sockets
 
 The authorizer serves the data plane and the inject Envoy on **two unix sockets in two directories**, never one:

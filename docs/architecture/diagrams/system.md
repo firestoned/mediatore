@@ -125,6 +125,7 @@ flowchart LR
     service-sandbox-workload -->|HTTP| service-egress-proxy
     service-egress-proxy -->|mTLS| service-mediatore-sandbox-api
     service-egress-gateway -->|mTLS| service-mediatore-sandbox-api
+    service-egress-gateway -->|mTLS| service-mediatore-sandbox-api
     service-egress-proxy -->|mTLS| service-egress-gateway
     service-egress-gateway -->|TCP| ecosystem-downstream-api
     system-sandbox-vm -->|TCP| service-control-relay

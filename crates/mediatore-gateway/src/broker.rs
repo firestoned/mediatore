@@ -10,7 +10,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use mediatore_proto::{ClaimEgress, GatewayCredential, GatewayCredentialRequest};
+use mediatore_proto::{ClaimEgress, GatewayCredential, GatewayCredentialRequest, GatewayDecisions};
 use mediatore_spire::Naming;
 use mediatore_tls::{MaterialSource, SpiffeId, WorkloadApiSource};
 use uuid::Uuid;
@@ -238,6 +238,30 @@ impl Allowlists for Broker {
                 .map(Answer::Found)
                 .map_err(|e| AskError::Unreachable(format!("unreadable answer: {e}"))),
             404 => Ok(Answer::Gone),
+            s @ (401 | 403) => Err(AskError::Refused(s)),
+            s => Err(AskError::Unreachable(format!("status {s}"))),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::report::Reports for Broker {
+    async fn report(&self, batch: &GatewayDecisions) -> Result<(), AskError> {
+        let req = self
+            .client()?
+            .post(format!("{}/v1/gateway/decisions", self.base))
+            .json(batch);
+        #[cfg(feature = "dev")]
+        let req = match &self.transport {
+            Transport::DevHeader(id) => req.header(DEV_PEER_HEADER, id),
+            Transport::Mtls { .. } => req,
+        };
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| AskError::Unreachable(e.to_string()))?;
+        match resp.status().as_u16() {
+            200 | 204 => Ok(()),
             s @ (401 | 403) => Err(AskError::Refused(s)),
             s => Err(AskError::Unreachable(format!("status {s}"))),
         }

@@ -41,9 +41,10 @@ never sits behind a TLS-ending proxy: it is exposed as a TLS passthrough so the 
 | `POST /v1/token` | the egress proxy, as the claim | a token for one audience (below) |
 | `GET /v1/gateway/claims/{uid}` | a gateway only | what a claim may reach (the allowlist for tunnels) |
 | `POST /v1/gateway/claims/{uid}/credential` | a gateway only | the credential for a gateway-placed audience (ADR-0040) |
+| `POST /v1/gateway/decisions` | a gateway only | the gateway's tunnel and inject decisions, one `info` line each naming the gateway and the host: `204`, or `400 invalid_decisions` for a batch of the wrong shape, logged not at all (ADR-0062, Proposed) |
 
-The two gateway routes answer only the gateway identity, `spiffe://<td>/gateway`; any other peer, a node or a claim
-included, is refused.
+The gateway routes answer only the gateway authorizer's identity, `spiffe://<td>/gateway/authorizer` (ADR-0053); any
+other peer, the gateway's listeners, a node or a claim included, is refused.
 
 ## Who is the peer
 
