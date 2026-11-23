@@ -3,7 +3,7 @@
 
 # ADR-0038: The pull reaches the operator's registry through a fourth leg of the control relay, for root only
 
-**Status:** Accepted, implemented in the repository 2026-11-15 (the relay's fourth leg, the host table's root-only registry set, the guest's name mapping with manual redirects, `reach: relay`, their pinned tests; the live proof is a gateway and a pool member pulling an image) · **Date:** 2026-11-15
+**Status:** Superseded 2026-11-22 by [ADR-0063](0063-the-image-pull-goes-through-the-claims-proxy-and-the-gateway-like-any-egress.md) (the leg was a path from a pool VM to a registry that no authorizer saw; it, `reach: relay`, `MEDIATORE_RELAY_REGISTRIES` and the host table's `registry4` set are removed, never having run live; decision 7(f)'s "bounded at fifteen seconds" was not in the code, and the pull's bounds are ADR-0063 decision 9). Was: Accepted, implemented in the repository 2026-11-15 · **Date:** 2026-11-15
 
 Roadmap 10 (the gateway) and roadmap 06 (the guest). Builds what
 [ADR-0029](0029-the-pull-on-a-routeless-segment-and-the-pool-vms-root-rules.md) decision 1 recorded

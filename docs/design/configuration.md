@@ -49,13 +49,20 @@ issuers:
     ca_file: /etc/mediatore-ca/root.pem
     session: { client_id: mediatore }       # claims from this issuer delegate a refresh token
 
-# The pool and the gateways. With `gateways` set, every registry needs a `reach`.
+# The pool and the gateways. With `gateways` set, `registries[]` is refused: a registry is an
+# audience of `role: registry` the claim names, pulled through its proxy and a gateway (ADR-0063).
 gateways: ["192.0.2.10:8443", "192.0.2.11:8443", "192.0.2.12:8443"]
 gateway_inject_port: 3133
-registries:
-  - { host: mirror.example.com, reach: relay }
 
 audiences:
+  # The registry the pool pulls from: read-only rules, its routes the puller's alone.
+  - name: mirror
+    via: none
+    role: registry
+    egress: ["mirror.example.com:443"]
+    rules:
+      - { method: GET, path: "/v2/**" }
+      - { method: HEAD, path: "/v2/**" }
   # A person's own user name and token, placed by the gateway as Authorization: Basic.
   - name: gitserver
     via: delegated
@@ -152,8 +159,8 @@ A broker that starts logs what it understood: each issuer's gate form (`required
 `none (explicit)`) with its group values, `single open namespace <ns>` or `map of <n> namespaces` with each namespace's
 group values (configuration, never a token), the sealing mode, the egress mode, each issuer's CA, each audience served
 and how. Read it off the log instead of inferring it from the start succeeding, and run **one claim** after any change
-to the file, since a clean start does not show that a claim can be served (a `gateways` list without `registries[].reach`
-starts cleanly and then refuses every claim whose image is on a registry).
+to the file, since a clean start does not show that a claim can be served (a `gateways` list with no audience of
+`role: registry` starts cleanly and then refuses every claim, `registry_not_granted`).
 
 ## Rules this part keeps
 

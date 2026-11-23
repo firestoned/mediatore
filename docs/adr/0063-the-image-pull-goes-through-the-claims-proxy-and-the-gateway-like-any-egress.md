@@ -3,8 +3,9 @@
 
 # ADR-0063: The image pull goes through the claim's proxy and the gateway, like any egress
 
-**Status:** Accepted 2026-11-22, not yet implemented (CALM updated and every open question answered the
-same day, 3 by a spike on the build host) ·
+**Status:** Accepted and implemented 2026-11-22 (every open question answered, 3 by a spike on the build host;
+the threat-model pass the same day; not yet run live, and bundles mode grants no registry until notaio carries
+`role`: see the implementation notes) ·
 **Date:** 2026-11-22
 
 Roadmap 10 (the gateways) and roadmap 06 (the guest). Generalizes
@@ -290,13 +291,21 @@ Not yet, and why:
   decision 2), so a registry whose anonymous pull needs a token from a realm is not served by a tunnelled route; a
   pull-through mirror that answers anonymously, or a placed credential, is. The kind tier will show which the
   operator's mirror is.
-- **The puller's relay internals** (`Relay`, `with_relay_registries` and their tests in `image.rs`) are unreachable
-  now that the guest refuses the variable; their removal is a mechanical follow-up.
-- **Decision 8 is not built.** Two things found while starting it change how: the pool image is shared by direct
+- **Decision 8, two findings when it was started.** the pool image is shared by direct
   pools, which need `systemd-resolved` for their DNS rule (ADR-0020), so the masks must apply only where the host table
   loads; and `/etc/mediatore/gateways` and the guest's env are written by the deployment layer's cloud-config stage,
   so a host table ordered before `network-pre.target` may run before its inputs exist and skip itself
   (`ConditionPathExists`). Both need the stage the deployment layer writes in, checked on a pool member's boot.
+- **Decision 8, built 2026-11-22 after those were settled.** Nothing is masked in the image, which direct pools
+  share: `image/host-quiet`, run by `mediatore-host-nft.service` after the table loads (so only on a pool with
+  gateways), masks for that boot `systemd-timesyncd`, `systemd-resolved`, the apt timers, iSCSI and the VMware tools,
+  stops them, and removes the base's DHCP catch-all. The unit loads before `network-pre.target`
+  (`DefaultDependencies=no`), safe because the deployment layer writes its inputs in the `initramfs` stage
+  (`image/cloud-config-deployment.example.yaml`). The datasource stage is the base's with three local providers
+  (`image/oem/00_datasource.yaml`) for every pool. Not settled by code: Kairos may run `systemd-networkd` in the
+  initramfs with the DHCP file (its `05_network` comment says so), before any table; the pool member's boot shows
+  whether it does.
+- **The puller's relay internals** are removed (`image.rs`), with the tests that only exercised them.
 
 ## The ADD checklist
 
@@ -309,12 +318,15 @@ Not yet, and why:
       for `registries[]` with `gateways`, the pull listener over a tunnelled route, the workload's
       listener refusing a pull-only route, `/v1/me` leaving it out, the guest's boot refusal of the
       old variables, the host table without `registry4`
-- [ ] The image (decision 8): the host table before `network-pre.target`, the masks, the datasource
-      limit, the static network file; `image/check.sh` asserting each; a pool member's boot with no
-      flow but to a gateway
-- [ ] e2e over the real routers, negative cases included (another namespace's registry, an
-      ungranted registry, a redirect to an unlisted host)
+- [x] The image (decision 8, 2026-11-22): the host table before `network-pre.target`, `host-quiet`'s masks and
+      the DHCP catch-all removed, the datasource limit; `image/check.sh` and `make host-table-test` asserting each
+- [ ] A pool member's boot with no flow but to a gateway
+- [x] e2e over the real routers (`e2e_forward`: an ungranted registry refused with no other named, a pull through a
+      stand-in gateway's tunnel as the claim, the same route refused to the jail)
 - [ ] A kind tier: a claim pulls through a gateway, a claim in another namespace is refused the
       same registry, the relay has no registry leg
-- [ ] Guides, README, ADR-0029, ADR-0038 (decision 7(f) too) and ADR-0043 amended; threat model full pass (TB-15's
-      registry rows retired, the pull added to the data plane's boundary), stamp bumped
+- [x] Guides, README, roadmaps 06 and 10, ADR-0029, ADR-0038 (superseded, decision 7(f) too) and ADR-0043
+      amended (2026-11-22)
+- [x] Threat model full pass (2026-11-22): TB-15 narrowed, TB-11 rewritten, TB-13 one row, R-13 revised, R-25
+      withdrawn, R-63 to R-65 new, the stamp bumped
+- [ ] notaio: `role` on `SandboxAudience`, its read-only lint, the pin (R-63)

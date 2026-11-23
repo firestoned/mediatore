@@ -22,7 +22,7 @@ identity) and a hardened systemd unit.
 | --- | --- | --- | --- | --- |
 | **Data plane** (Envoy) | `envoy-gateway.service` | 8443 (`DATA_PORT`) | the gateway SVID | accepts a claim's `CONNECT` over mutual TLS, asks the authorizer, relays the tunnel untouched |
 | **Authorizer** (`mediatore gateway`) | `mediatore-gateway.service` | unix sockets (below) | the gateway SVID | answers each Envoy check; fetches per-claim answers and credentials from the broker |
-| **Control relay** (Envoy) | `envoy-relay.service` | 3129 SPIRE, 3130 broker, 3131 bundle, 3132 registry | none | four `tcp_proxy` legs to fixed upstreams: the only path from the segment to the identity plane; credential-less and sees ciphertext only |
+| **Control relay** (Envoy) | `envoy-relay.service` | 3129 SPIRE, 3130 broker, 3131 bundle | none | three `tcp_proxy` legs to fixed upstreams (the registry leg removed by ADR-0063): the only path from the segment to the identity plane; credential-less and sees ciphertext only |
 | **Inject** (Envoy) | `envoy-inject.service` | 3133 (`INJECT_PORT`) | the gateway SVID | terminates a claim's mutual TLS, originates TLS to a fixed host, and adds the credential the authorizer returned; shipped, and enabled only where an audience is `inject: gateway` |
 
 ## The tunnel path
@@ -119,5 +119,5 @@ Settings that must agree across the repository and the deployment: the broker's 
 
 ## Read next
 
-ADR-0027 (the control relay), ADR-0028 (the gateway), ADR-0030, ADR-0037 and ADR-0038 (the bundle and registry legs),
+ADR-0027 (the control relay), ADR-0028 (the gateway), ADR-0030, ADR-0037 (the bundle leg), ADR-0038 (the registry leg, removed by ADR-0063),
 ADR-0040 (placing a credential). Threat model TB-13 to TB-15 and TB-17, risks R-27 to R-29. Roadmaps 10 and 11.

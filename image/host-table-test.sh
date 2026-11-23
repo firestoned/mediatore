@@ -95,4 +95,27 @@ printf 'mirror.home.example:5000\n' > "$d/reg-name"; refuse "a registry given by
 for bad in 'x' '0' '70000' '33 33' '-1'; do
   printf 'MEDIATORE_URL=https://198.51.100.1:3130\nMEDIATORE_INJECT_PORT=%s\n' "$bad" > "$d/env-ip-bad"; refuse "an inject port '$bad'" "$d/gateways" "$d/registries" "$d/env-ip-bad" "$d/agent.conf"
 done
+# host-quiet (ADR-0063 decision 8): the units that dial out masked for the boot and stopped, the DHCP catch-all gone,
+# the deployment's static file kept
+want_units='systemd-timesyncd.service
+systemd-resolved.service
+apt-daily.timer
+apt-daily-upgrade.timer
+iscsid.socket
+iscsid.service
+open-iscsi.service
+open-vm-tools.service
+vgauth.service'
+[ "$("$here/host-quiet" --list)" = "$want_units" ] || { echo "✗ host-quiet's units drifted"; "$here/host-quiet" --list; exit 1; }
+mkdir "$d/net"; touch "$d/net/10-static.network" "$d/net/20-dhcp.network" "$d/net/20-dhcp-legacy.network"
+printf '#!/bin/sh\necho "$*" >> "%s"\n' "$d/calls" > "$d/systemctl"; chmod +x "$d/systemctl"
+SYSTEMCTL="$d/systemctl" NETWORK_DIR="$d/net" "$here/host-quiet" > "$d/quiet.out"
+[ -e "$d/net/10-static.network" ] || { echo "✗ host-quiet removed the static network file"; exit 1; }
+[ ! -e "$d/net/20-dhcp.network" ] && [ ! -e "$d/net/20-dhcp-legacy.network" ] || { echo "✗ the DHCP catch-all survived"; exit 1; }
+for u in $want_units; do
+  grep -qx "mask --runtime $u" "$d/calls" && grep -qx "stop --no-block $u" "$d/calls" || { echo "✗ $u was not masked for the boot and stopped"; cat "$d/calls"; exit 1; }
+done
+grep -q 'DHCP catch-all removed: 20-dhcp.network 20-dhcp-legacy.network' "$d/quiet.out" || { echo "✗ host-quiet does not say what it removed"; cat "$d/quiet.out"; exit 1; }
+echo "✓ host-quiet masks the units that dial out for the boot, stops them, and removes the DHCP catch-all but not the static file"
+
 echo "host-table-test: ok"

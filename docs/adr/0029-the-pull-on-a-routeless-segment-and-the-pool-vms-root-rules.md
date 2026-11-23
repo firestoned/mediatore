@@ -5,6 +5,10 @@
 
 **Status:** Accepted (implemented) · **Date:** 2026-11-04 (proposed and accepted the same day: the segment
 reach is what the homelab runs; the relay reach is recorded, not built) · **Amended:**
+2026-11-22 by [ADR-0063](0063-the-image-pull-goes-through-the-claims-proxy-and-the-gateway-like-any-egress.md) (decisions 1 and 2, for a gateway-era environment: the segment
+and relay reaches and `registries[]` are refused, a registry is an audience of `role: registry` and the
+pull goes through the claim's egress proxy and a gateway; decision 3's host table admits no registry
+and loads before the network);
 2026-11-15 by [ADR-0038](0038-the-pull-reaches-the-operators-registry-through-a-fourth-relay-leg.md)
 (decisions 1 and 2: `reach: relay` built, `RegistryReach::Relay` in
 `crates/mediatore/src/config.rs`);

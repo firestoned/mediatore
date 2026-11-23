@@ -3,7 +3,9 @@
 
 # ADR-0043: A person's registry credential is placed at the gateway for the image pull; the VM never sees it
 
-**Status:** Accepted 2026-11-15; implemented 2026-11-16, released in v0.2.10; not yet run live (the direction was set by the operator on 2026-11-15; see "Implementation notes" for what is built and what is left; the threat-model pass of 2026-11-16) · **Date:** 2026-11-15
+**Status:** Accepted 2026-11-15; implemented 2026-11-16, released in v0.2.10; not yet run live (the direction was set by the operator on 2026-11-15; see "Implementation notes" for what is built and what is left; the threat-model pass of 2026-11-16) · **Amended:** 2026-11-22 by [ADR-0063](0063-the-image-pull-goes-through-the-claims-proxy-and-the-gateway-like-any-egress.md) (decision 3's pull
+through the claim's proxy is every gateway-era pull, over a tunnel as well as the inject port; a placed registry is
+an audience of `role: registry`, and `reach: relay` is gone) · **Date:** 2026-11-15
 
 Roadmap 10 (the gateways) and roadmap 12 (the path to the upstreams). Extends
 [ADR-0040](0040-the-gateway-places-an-audiences-credential-the-pool-never-holds-it.md) (the gateway

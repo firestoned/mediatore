@@ -48,8 +48,8 @@ check "the four units enabled" \
   'for u in spire-agent mediatore-guest mediatore-host-nft spire-bundle-fetch; do test -L /etc/systemd/system/multi-user.target.wants/$u.service || exit 1; done'
 check "the bundle fetch (ADR-0037): curl and the system CAs, the script, its unit before the agent, which requires it" \
   'command -v curl && test -f /etc/ssl/certs/ca-certificates.crt && test -x /usr/libexec/mediatore/spire-bundle-fetch && grep -q "^Before=spire-agent.service" /etc/systemd/system/spire-bundle-fetch.service && grep -q "^Requires=.*spire-bundle-fetch.service" /etc/systemd/system/spire-agent.service && grep -q "^After=.*mediatore-host-nft.service" /etc/systemd/system/spire-bundle-fetch.service'
-check "the host table script, rendering from the pool's files and refusing a name (ADR-0029)" \
-  'test -x /usr/libexec/mediatore/host-table && d=$(mktemp -d) && printf "198.51.100.1:8443\n" > $d/g && printf "198.51.100.10:5000\n" > $d/r && printf "MEDIATORE_URL=https://198.51.100.1:3130\n" > $d/e && printf "agent {\n  server_address = \"198.51.100.1\"\n  server_port = \"3129\"\n}\n" > $d/a && /usr/libexec/mediatore/host-table --render $d/g $d/r $d/e $d/a | grep -q "policy drop" && printf "mirror.home.example:5000\n" > $d/r && ! /usr/libexec/mediatore/host-table --render $d/g $d/r $d/e $d/a >/dev/null 2>&1'
+check "the host table script, rendering from the pool's files, refusing a name and refusing a registry around the gateway (ADR-0029, ADR-0063)" \
+  'test -x /usr/libexec/mediatore/host-table && d=$(mktemp -d) && printf "198.51.100.1:8443\n" > $d/g && : > $d/r && printf "MEDIATORE_URL=https://198.51.100.1:3130\n" > $d/e && printf "agent {\n  server_address = \"198.51.100.1\"\n  server_port = \"3129\"\n}\n" > $d/a && /usr/libexec/mediatore/host-table --render $d/g $d/r $d/e $d/a | grep -q "policy drop" && printf "198.51.100.10:5000\n" > $d/r && ! /usr/libexec/mediatore/host-table --render $d/g $d/r $d/e $d/a >/dev/null 2>&1 && : > $d/r && printf "gateway.home.example:8443\n" > $d/g && ! /usr/libexec/mediatore/host-table --render $d/g $d/r $d/e $d/a >/dev/null 2>&1'
 check "the host table unit runs only with a gateway list, before the agent and the guest, which require it" \
   'grep -q "^ConditionPathExists=/etc/mediatore/gateways" /etc/systemd/system/mediatore-host-nft.service && grep -q "^ExecStart=/usr/libexec/mediatore/host-table" /etc/systemd/system/mediatore-host-nft.service && grep -q "^Requires=.*mediatore-host-nft.service" /etc/systemd/system/spire-agent.service && grep -q "^Requires=.*mediatore-host-nft.service" /etc/systemd/system/mediatore-guest.service'
 check "the units point at the paths the image has" \
@@ -64,6 +64,10 @@ check "Yama's ptrace scope raised in the image's sysctl (ADR-0025, roadmap 06)" 
   'grep -qx "kernel.yama.ptrace_scope = 1" /etc/sysctl.d/99-mediatore.conf'
 check "the kernel hardening in the image's sysctl: no MPTCP, no io_uring, kernel addresses and the kernel log restricted, no unprivileged bpf, the BPF JIT hardened" \
   'for k in "net.mptcp.enabled = 0" "kernel.io_uring_disabled = 2" "kernel.kptr_restrict = 2" "kernel.dmesg_restrict = 1" "kernel.unprivileged_bpf_disabled = 1" "net.core.bpf_jit_harden = 2"; do grep -qx "$k" /etc/sysctl.d/99-mediatore.conf || exit 1; done'
+check "the host table loads before the network, and host-quiet after it (ADR-0063 decision 8)" \
+  'u=/etc/systemd/system/mediatore-host-nft.service && grep -qx "DefaultDependencies=no" $u && grep -q "^Before=network-pre.target" $u && grep -qx "Wants=network-pre.target" $u && grep -qx "ExecStartPost=/usr/libexec/mediatore/host-quiet" $u && test -x /usr/libexec/mediatore/host-quiet && /usr/libexec/mediatore/host-quiet --list | grep -qx systemd-resolved.service'
+check "the datasource reads local devices only, no cloud metadata address (ADR-0063 decision 8)" \
+  'test "$(grep -c "providers:" /system/oem/00_datasource.yaml)" = 1 && grep -q "providers: \[\"cdrom\", \"config-drive\", \"vmware\"\]" /system/oem/00_datasource.yaml'
 check "no private key material (banlieue ADR-0108 decision 2)" \
   '! grep -rl "PRIVATE KEY" /etc /usr/share/mediatore /var/lib 2>/dev/null | grep -q .'
 

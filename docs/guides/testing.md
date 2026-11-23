@@ -255,13 +255,16 @@ a missing CA and a reply that is not a SPIFFE bundle refused. The live proof is 
 boot: `journalctl -u spire-bundle-fetch` shows the write, the relay's access log the
 `upstream=bundle` line.
 
-The registry leg ([ADR-0038](../adr/0038-the-pull-reaches-the-operators-registry-through-a-fourth-relay-leg.md))
-is pinned in three places: `make host-table-test` (the `registry4` set, the `meta skuid 0` rule, its order, no
-leak into the every-uid set, the refusals), `make gateway-render-check` (the fourth listener and port) and the
-guest's unit tests (the name mapping, the manual redirects, the refusal off the declared hosts, the token not
-following a redirect, the jail's ruleset never listing a leg: `crates/mediatore-guest/src/image.rs` and `net.rs`).
-The live proof is a pool member pulling an image through the leg: the relay's `upstream=registry` line, the
-guest's `workload image pulled` line with the digest, and a connection to the leg from the sandbox uid refused.
+The pull through the gateway ([ADR-0063](../adr/0063-the-image-pull-goes-through-the-claims-proxy-and-the-gateway-like-any-egress.md),
+which removed ADR-0038's registry leg) is pinned in four places: `make host-table-test` (no registry set, a
+registries file or `MEDIATORE_RELAY_REGISTRIES` refused, `host-quiet`'s units and its removal of the DHCP
+catch-all), `make gateway-render-check` (three relay legs and no registry), the unit tests (`role: registry` and
+its read-only rules, `registry_not_granted` at the front door and the reconciler, `pull_only` routes left out of
+the jail's egress, the workload listener's `404 pull_only`, the guest's refusal of a claim with no route for its
+registry and of the old variables, the pull's bounds) and `e2e_forward` (a pull through a stand-in gateway's
+tunnel as the claim, the same route refused to the jail). The cost was measured on kind (ADR-0063 open question
+3). The live proof is a pool member pulling through a gateway: the gateway's tunnel line keyed by the claim SVID,
+the guest's `workload image pulled` line with the digest, and the jail's request for the registry refused.
 
 The kind tiers run the guest with `--dev-skip-setup` and load no ruleset; the live proof is
 a libvirt member (roadmap 06).

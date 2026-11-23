@@ -108,7 +108,7 @@ ADR-0028, ADR-0031.
 | CA TTL | 24 h; the agent fetches its bundle at every boot through the relay's bundle leg (`3131`, ADR-0037), so nothing in the image goes stale. Only an image without a bundle endpoint bakes a bundle, and then it is the OpenBao root alone (ADR-0031), not the CA of the day |
 | Server reach for VMs | a LoadBalancer address on the LAN for port 8081, reached by pool members only through a gateway's relay (`3129`) |
 | Bundle endpoint | the SPIRE server's `bundle_endpoint` (https_web, a certificate from a CA the image trusts), reached by pool members only through the relay's bundle leg (`3131`, ADR-0037) |
-| Registry for the image pull | on a gateway-era pool without a registry on the segment, the operator's registry behind the relay's registry leg (`3132`, ADR-0038): `reach: relay` on the broker, `MEDIATORE_RELAY_REGISTRIES=<registry>=3132` in the pool's env; a dedicated read-only repository of digest-pinned images |
+| Registry for the image pull | an audience of `role: registry` (ADR-0063), granted to the namespaces that pull from it and named by the claim: the pull goes through the claim's egress proxy and a gateway like any egress, so the gateways' egress side must reach the registry; images named by digest. Before ADR-0063 this was a mirror on the segment (`reach: segment`) or the relay's registry leg (`3132`, ADR-0038), both removed |
 
 Agent configuration in the pool image's deployment layer (and the gateways', with their own
 addresses):
@@ -278,8 +278,10 @@ sandboxes: { namespace: banlieue-system }    # where POST /v1/claims creates the
 store: { sealing: { key_file: /etc/mediatore-sealing/key } }
 policy: { trusted_keys: [...], namespaces: [sandboxes], egress: enforce, sources: { banlieue-system: { namespaces: [sandboxes] } } }    # section C
 gateways: ["198.51.100.1:8443", "198.51.100.2:8443", "198.51.100.3:8443"]  # section F
-registries:
-  - { host: "198.51.100.10:5000", reach: segment }                         # the mirror
+# The mirror is an audience the claim names (ADR-0063), reached through the gateways; with
+# gateways set, registries[] is refused.
+#   - { name: mirror, via: none, role: registry, egress: ["198.51.100.10:5000"],
+#       rules: [{ method: GET, path: "/v2/**" }, { method: HEAD, path: "/v2/**" }] }
 ```
 
 The audience's `max_ttl`, `egress` and `rules` must agree with the policy audience's
@@ -313,9 +315,9 @@ pod to a node since ADR-0034.
 | Gateway attestation | each gateway's agent attests with its vTPM against the EK CAs of section B; `envoy-gateway.service` requires the agent, so an agent the server refuses (`Nodeattestor(tpm): could not verify cert`) takes the data plane down with it every few seconds: `8443` open for about 27 s, refused for about 16 s, the relay ports steady. The CA that issued the gateway's EK is missing from the ConfigMap, or the gateway was recreated and its entries name the old agent |
 | Admission | banlieue's `ValidatingAdmissionPolicy` on `VirtualMachineClaim` lets a claim name a subject other than its creator only for a listed broker: ConfigMap `banlieue-claim-subject-policy` in banlieue's namespace carries `brokers:` with `system:serviceaccount:banlieue-system:mediatore` and `issuers:` with the Dex issuer URL. Without both, every claim the broker creates is forbidden and the sandbox retries every five seconds, never binding |
 | Pool | `VirtualMachinePool` `sandbox-pool`: `readiness: GuestReady`, `recycleOnImageChange: true`, one warm member, `VMClass` with one NIC on the segment, addresses from the pool's `addressing` and a `userData` stage writing the static network file |
-| Pool image | `VMImage` `mediatore-guest` on the ISO built from `ghcr.io/firestoned/mediatore-guest` at the release's digest (`auroraboot`), three cloud-config layers: the image's base, banlieue's EK layer, the deployment layer (section B's `agent.conf`, `/etc/mediatore-guest/env` with `MEDIATORE_URL=https://<gateway sandbox address>:3130` and the `SPIRE_BUNDLE_*` lines, `/etc/mediatore/bundle-ca.pem` for the bundle endpoint's CA, `/etc/mediatore/gateways`, `/etc/mediatore/registries`, the mirror's CA or `MEDIATORE_PLAIN_HTTP_REGISTRIES`) |
-| Mirror | `registry:2` in proxy mode to `ghcr.io`, listening on the host's own segment address (a forwarded port is refused by the isolated network); declared on the broker with `reach: segment` and on the pool in `/etc/mediatore/registries` |
-| Host table | `inet mediatore_host` on every member: output to the gateways' data port, the relay ports and the mirror alone |
+| Pool image | `VMImage` `mediatore-guest` on the ISO built from `ghcr.io/firestoned/mediatore-guest` at the release's digest (`auroraboot`), three cloud-config layers: the image's base, banlieue's EK layer, the deployment layer (section B's `agent.conf`, `/etc/mediatore-guest/env` with `MEDIATORE_URL=https://<gateway sandbox address>:3130` and the `SPIRE_BUNDLE_*` lines, `/etc/mediatore/bundle-ca.pem` for the bundle endpoint's CA, `/etc/mediatore/gateways`; no registry setting since ADR-0063) |
+| Mirror | `registry:2` in proxy mode to `ghcr.io`, reachable from the gateways' egress side; on the broker an audience of `role: registry` the claim names (ADR-0063). Before ADR-0063 it listened on the segment and was declared with `reach: segment` and in `/etc/mediatore/registries`, both now refused |
+| Host table | `inet mediatore_host` on every member: output to the gateways' data port and the relay ports alone; `host-quiet` masks the base's units that would dial out (ADR-0063) |
 
 The example image, mirrored by digest: `198.51.100.10:5000/firestoned/research-agent@sha256:<digest>`
 (`examples/research-agent`, `make example-image`).
