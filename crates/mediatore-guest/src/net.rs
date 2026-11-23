@@ -601,6 +601,7 @@ table inet mediatore_sandbox {
             credential,
             credential_header: None,
             inject_port,
+            pull_only: false,
         };
         let dir = mediatore_testkit::tempdir();
         let resolv = dir.join("resolv.conf");

@@ -1,0 +1,39 @@
+#!/bin/sh
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+#
+# What a pool member with gateways must not run (ADR-0063 decision 8): the units the Kairos
+# base enables that would dial out on their own (time sync to the Debian pool, a resolver
+# for a segment that has none, the apt timers against the Debian mirrors) or that this image
+# never uses (iSCSI, VMware tools), and the base's DHCP catch-all, a broadcast on the segment
+# through a packet socket no nftables table sees. Run by mediatore-host-nft.service after the
+# host table is loaded, so only where the table is (a pool that names gateways); a direct pool
+# keeps its resolver (ADR-0020's DNS rule) and DHCP. The masks are runtime ones (/run): the
+# immutable image is unchanged and the next boot decides again. Before network-pre.target, so
+# systemd-networkd never reads the DHCP file.
+#
+#   host-quiet [--list]
+#
+# --list prints the units and exits. SYSTEMCTL and NETWORK_DIR override the tools for tests.
+set -eu
+
+UNITS="systemd-timesyncd.service systemd-resolved.service apt-daily.timer apt-daily-upgrade.timer iscsid.socket iscsid.service open-iscsi.service open-vm-tools.service vgauth.service"
+systemctl=${SYSTEMCTL:-systemctl}
+netdir=${NETWORK_DIR:-/etc/systemd/network}
+
+if [ "${1:-}" = --list ]; then
+  printf '%s\n' $UNITS
+  exit 0
+fi
+
+for u in $UNITS; do
+  # Masked first, so nothing starts it again; then stopped without waiting, which also
+  # cancels a start job the boot transaction already queued.
+  "$systemctl" mask --runtime "$u" >/dev/null 2>&1 || true
+  "$systemctl" stop --no-block "$u" >/dev/null 2>&1 || true
+done
+removed=''
+for f in "$netdir/20-dhcp.network" "$netdir/20-dhcp-legacy.network"; do
+  if [ -e "$f" ]; then rm -f "$f"; removed="$removed ${f##*/}"; fi
+done
+echo "host-quiet: masked $(printf '%s\n' $UNITS | wc -l | tr -d ' ') units for this boot; DHCP catch-all removed:${removed:- none}"

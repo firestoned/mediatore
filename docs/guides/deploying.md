@@ -643,13 +643,14 @@ Rolling an image back means rolling its entry back, or the switch.
 A gateway drops ICMP, so `ping` proves nothing about one; a TCP connect to its relay
 ports from the segment, or `nft list table inet mediatore_gateway` on its console, does.
 
-**The pool behind them.** The pool's deployment layer changes in four places
+**The pool behind them.** The pool's deployment layer changes in three places
 (`image/cloud-config-deployment.example.yaml` shows them): the agent's `server_address`
 is a gateway's sandbox address with port `3129`, `MEDIATORE_URL` is
 `https://<the same address>:3130`, `/etc/mediatore/gateways` lists the three sandbox
 addresses with the data port, the list the guest uses until the broker's `gateways` arrives
-(ADR-0027 decision 4), and `/etc/mediatore/registries` lists the mirror below. Where the
-SPIRE servers publish a bundle endpoint with a certificate from a CA the image trusts, a fifth
+(ADR-0027 decision 4). It names no registry: the image is pulled through the claim's egress
+proxy and a gateway (below). Where the
+SPIRE servers publish a bundle endpoint with a certificate from a CA the image trusts, a fourth
 place replaces the baked bundle ([ADR-0037](../adr/0037-the-pool-fetches-its-spire-bundle-at-boot-through-the-relay.md)):
 the gateways' env names the endpoint (`RELAY_BUNDLE_PORT=3131`, `SPIRE_BUNDLE_ADDRESS`,
 `SPIRE_BUNDLE_PORT=8443`), the pool's `/etc/mediatore-guest/env` names `SPIRE_BUNDLE_HOST` (the
@@ -666,57 +667,64 @@ stage on the pool's template writing `/etc/systemd/network/10-static.network` wi
 `Address=${IP}/${PREFIX}`, which banlieue renders per member; without that stage a member
 boots with no address at all, since the segment has no DHCP.
 
-**The mirror, and the host table.** A pool VM on the segment reaches the gateways and its
-neighbours and nothing else, so it cannot pull a workload image from `ghcr.io` or
-`docker.io`: a gateway-era pool pulls from the operator's registry on the segment, a
-registry or pull-through mirror with an address there
-([ADR-0029](../adr/0029-the-pull-on-a-routeless-segment-and-the-pool-vms-root-rules.md)
-decision 1), and the images your requesters name are the ones you mirrored, which is also
-where image review belongs. When the mirror runs on the host that owns the segment's
-bridge, it must listen on that host's segment address itself: libvirt's isolated network
-rejects anything forwarded off the bridge, a container's port mapping included, and a
-member sees `connection refused`. Declare it twice, once on each side. On the broker,
-`registries[]` gains `reach: segment` on every entry once `gateways` is set (the broker
-refuses to start otherwise), and an entry may carry no credential at all for an anonymous
-mirror (`- { host: "198.51.100.10:5000", reach: segment }`); a claim whose image names any
-other registry is refused at `POST /v1/claims` with `unreachable_registry`, and an
-`AgentSandbox` naming one fails before any claim exists, both naming the registries the
-pool reaches. On the pool, `/etc/mediatore/registries` lists the mirror's address and port
-(addresses, like everything on the segment), and either `MEDIATORE_PLAIN_HTTP_REGISTRIES`
-names it for a plain-HTTP mirror (pin by digest; no credential crosses plain HTTP,
-ADR-0022) or `MEDIATORE_REGISTRY_CA` points at the PEM of the CA your mirror's certificate
-chains to, trusted beside the Mozilla roots for the pull.
+**The image pull, through the gateway** ([ADR-0063](../adr/0063-the-image-pull-goes-through-the-claims-proxy-and-the-gateway-like-any-egress.md)).
+A pool VM on the segment reaches the gateways and nothing else, and no workload path goes
+around them, the pull included: the guest starts the claim's egress proxy first and pulls
+through its pull listener, and the proxy sends each request to a gateway, in a tunnel on the
+data port or, for a registry the gateway places a credential for (ADR-0043), to the inject
+port. The gateway decides the pull like any other request of the claim, against its
+allowlist. So a registry is an audience, marked `role: registry`, and a namespace pulls only
+from the registries it was granted:
 
-**The registry through the relay** ([ADR-0038](../adr/0038-the-pull-reaches-the-operators-registry-through-a-fourth-relay-leg.md)).
-Where a host cannot be placed on the segment, the pool pulls through a fourth leg of the
-gateway's control relay: `RELAY_REGISTRY_PORT` (3132) to `REGISTRY_ADDRESS:REGISTRY_PORT`
-(the registry, 443), a fixed upstream by address like the other three. Declare it twice. On
-the broker, `- { host: registry.example.com, reach: relay }` (a credential is allowed: the
-TLS is the registry's, end to end). On the pool, in `/etc/mediatore-guest/env`,
-`MEDIATORE_RELAY_REGISTRIES=registry.example.com=3132`, the registry's own name and the leg's
-port; the gateway is the one `MEDIATORE_URL` names, by address. The image reference carries
-no port: the guest dials the gateway at 3132 for that name and keeps the name for the TLS
-server name, the certificate check and the `Host` header, so the image reference is the one
-the registry knows. Three things to know. The pull is root's: the host table admits the leg
-to uid 0 alone (`meta skuid 0`) and the jail's ruleset never lists it, so the sandbox
-reaches the registry's content only through the egress proxy, under its claim's policy.
-The leg is L4 and cannot restrict paths, so the registry must: point the leg at a repository
-dedicated to the pool's images, read-only (anonymous, or the broker-supplied credential),
-and have claims name images by digest. And only a registry that serves its blobs itself
-fits: one that redirects layers to a cloud-storage host fails the claim before the jail
-(the log names the host), because the puller refuses a redirect off the declared names; set
-the registry to proxy the download, or declare the content host as a second leg. A gateway
-running the static allowlist (no authorizer yet) lets every claim reach the hosts on it
-through the egress proxy; this leg does not change that.
+```yaml
+audiences:
+  - name: mirror
+    via: none                      # an anonymous pull-through mirror; delegated + inject: gateway for a person's credential
+    role: registry
+    egress: ["registry.example.com:443"]
+    ca_file: /etc/mediatore-ca/registry-ca.pem   # when the registry is on your PKI
+    namespaces:                    # ADR-0053: the teams that may pull from it, each with its rules
+      team-a: { rules: [{ method: GET, path: "/v2/**" }, { method: HEAD, path: "/v2/**" }] }
+      team-b: { rules: [{ method: GET, path: "/v2/team-b/**" }, { method: HEAD, path: "/v2/team-b/**" }] }
+```
+
+A claim names the audience beside its others (`--audience mirror`, or `audiences` in the
+body); one whose image is on a registry none of its audiences serves is refused at
+`POST /v1/claims` with `registry_not_granted`, and an `AgentSandbox` naming one fails before
+any claim exists, with a sentence that names no other registry. A registry audience's
+routes are the puller's: the workload's proxy listener answers `404 pull_only` for them, and
+the jail's ruleset does not list them, so a workload cannot fetch further images. Its rules
+may only read (`GET` and `HEAD` under `/v2/`), or the broker refuses to start. With
+`gateways` set the broker also refuses `registries[]` and its `reach` (the mirror on the
+segment and the relay's registry leg of ADR-0029 and ADR-0038 are gone), and the guest
+refuses `MEDIATORE_PLAIN_HTTP_REGISTRIES` and `MEDIATORE_RELAY_REGISTRIES` at boot, so an
+environment that was not migrated fails loudly. The datacenter firewall must let the
+gateways' egress addresses reach the registry. Two limits: the puller answers no auth
+challenge through the proxy, so a registry whose anonymous pull needs a token from a realm
+is served only with a placed credential, and one that redirects its layers to another host
+needs that host in the audience's `egress`. Name images by digest: a tag is the registry's
+word. A pull is bounded (`MEDIATORE_PULL_IDLE_SECS`, 60, and `MEDIATORE_PULL_DEADLINE_SECS`,
+900, in the guest's env): a registry that stalls fails the claim before the jail, the
+registry named.
+
+Under `policy.audience_definitions.mode: bundles` no registry is granted yet: notaio's
+`SandboxAudience` carries no `role` (ADR-0063, implementation notes), so with gateways every
+image is refused there until it does.
 
 With `/etc/mediatore/gateways` present the image loads a second table at boot,
 `inet mediatore_host`, before the agent and the guest may start (ADR-0029 decision 3;
 `image/host-table`, `mediatore-host-nft.service`): input default drop but loopback and
 established traffic, output default drop but loopback, established traffic and TCP to the
 three gateways' data port, the relay's two ports (read from `MEDIATORE_URL` and the agent's
-`server_address`), the bundle leg and, for root alone, the registry legs
-(`MEDIATORE_RELAY_REGISTRIES`), and the registries file, forward dropped, every entry an IPv4 address
-and a port or the table refuses to load and the VM stays down. That is the bound on root
+`server_address`), the bundle leg and, for a pool with a placed audience, the inject port,
+forward dropped, every entry an IPv4 address and a port or the table refuses to load and the
+VM stays down. No registry address, for any uid: a registries file that names one, or
+`MEDIATORE_RELAY_REGISTRIES`, refuses the table (ADR-0063 decision 4). It loads before
+`network-pre.target`, and `host-quiet` then masks, for that boot, the units the Kairos base
+enables that would dial out on their own (`systemd-timesyncd`, `systemd-resolved`, the apt
+timers) or that the image never uses (iSCSI, VMware tools), and removes the base's DHCP
+catch-all before `systemd-networkd` reads it (ADR-0063 decision 8). A direct pool runs
+neither, and keeps its resolver and DHCP. That is the bound on root
 and every other uid; the sandbox uid's per-claim table sits beside it. Without the
 gateways file the unit is skipped and the pool runs as before. `nft list table inet
 mediatore_host` on a member shows it; `make host-table-test` pins the text.
@@ -783,7 +791,7 @@ audiences:
       - { method: POST, path: "/*/*/git-upload-pack" }
 ```
 
-**A registry as a placed audience.** To pull a person's image with their credential, make the registry's host an audience of this shape (rules `GET` and `HEAD` on `/v2/**`) and list the host under `registries` with `reach: relay`. With `gateways` set, every registry needs a `reach`, and a clean start does not show that: a missing one refuses every claim whose image is on a registry, so **run one claim after any change to the file**. Beyond the broker:
+**A registry as a placed audience.** To pull a person's image with their credential, make the registry's host an audience of this shape (rules `GET` and `HEAD` on `/v2/**`) and mark it `role: registry` (ADR-0063). With `gateways` set, every registry needs a `reach`, and a clean start does not show that: a missing one refuses every claim whose image is on a registry, so **run one claim after any change to the file**. Beyond the broker:
 
 - the registry's host is each gateway's inject upstream (`INJECT_HOST` and `INJECT_DOMAIN` in `/etc/mediatore-gateway/env`, or your own inject template when you place several audiences) and the datacenter firewall lets the gateways reach it (without the allowance the pull fails closed with a connect timeout);
 - the pool image carries a guest that has the pull listener (a second loopback port on the claim's egress proxy, `MEDIATORE_EGRESS_PULL_PORT`, default 18129; it must not equal the proxy's own port, and no jail rule lists it, so the workload cannot reach it);

@@ -107,8 +107,9 @@ Added 2026-11-15 ([ADR-0038](../../docs/adr/0038-the-pull-reaches-the-operators-
       admitted to uid 0 alone; the jail's ruleset pinned not to list a leg, pinned by
       `make host-table-test`, `make gateway-render-check` and the guest's unit tests (2026-11-15)
 
-Left to a live environment: a gateway and a pool member pulling an image through the leg, the
-relay's `upstream=registry` line and the sandbox uid's refused connection to the leg recorded.
+Superseded 2026-11-22 by [ADR-0063](../../docs/adr/0063-the-image-pull-goes-through-the-claims-proxy-and-the-gateway-like-any-egress.md):
+the leg was a path from a pool VM to a registry that no authorizer saw, and is removed; it was never
+proven live.
 
 Added 2026-11-15 ([ADR-0040](../../docs/adr/0040-the-gateway-places-an-audiences-credential-the-pool-never-holds-it.md)):
 
@@ -130,3 +131,27 @@ Added 2026-11-19 ([ADR-0053](../../docs/adr/0053-the-gateways-authorizer-has-an-
 - [ ] Per-gateway identities and binding a credential ask to the gateway serving the claim: an ADR of its own (decision 8)
 
 Left to a live environment: three gateway VMs booted from the image under the new entries, with the drops per user, the resolver under the chain, the agent's and the relay's upstreams and the migration in each direction observed (ADR-0053, *What was proven, and what was not*; threat model R-48). Until then the output chain is built and not verified.
+
+Added 2026-11-22 ([ADR-0063](../../docs/adr/0063-the-image-pull-goes-through-the-claims-proxy-and-the-gateway-like-any-egress.md)):
+no workload path goes around the gateway, the image pull included, and each namespace pulls only from the
+registries it was granted.
+
+- [x] ADR-0063 accepted, its open questions answered (the cost measured on kind: under 3% against a direct fetch,
+      the proxy streams a 4 GiB layer in 3.4 MiB); CALM updated
+- [x] The pull bounded: a 10 s connect, `MEDIATORE_PULL_IDLE_SECS` and `MEDIATORE_PULL_DEADLINE_SECS` (decision 9)
+- [x] `audiences[].role: registry` with read-only rules; `registry_not_granted` at the front door and the
+      reconciler; `registries[]` refused with `gateways` (decisions 2 and 4)
+- [x] Pull-only routes: left out of the jail's egress, `404 pull_only` to the workload, served by the pull listener
+      over a tunnel or the inject port; every gateway-era pull through the claim's proxy (decisions 1, 3 and 5)
+- [x] The relay's registry leg removed (three legs), the gateway's table without a registry address, the pool's host
+      table refusing a registries file and `MEDIATORE_RELAY_REGISTRIES`, the guest refusing the old variables at boot
+- [x] The pool image's own exits (decision 8): the host table before `network-pre.target`, `image/host-quiet` masking
+      the base's dialling units for the boot and removing the DHCP catch-all, the datasource limited to local devices
+- [x] Unit, e2e and image tests; `make check`, `make host-table-test`, `make gateway-render-check` (2026-11-22)
+- [ ] notaio: `role` on `SandboxAudience` and its read-only lint, then the pin; until then bundles mode grants no
+      registry
+- [ ] A kind tier: a claim pulls through a gateway, a claim in another namespace is refused the same registry, the
+      relay has no registry leg
+- [ ] Live: a pool member's boot with no flow but to a gateway (the journal's `mediatore-host drop:` lines, the
+      conntrack table), and a pull through a gateway keyed by the claim SVID; the cost on a real link and several
+      pulls at once

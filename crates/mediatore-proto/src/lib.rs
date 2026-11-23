@@ -799,6 +799,11 @@ pub struct Route {
     /// `Me.gateways`. Absent on every other route, and on a route from an older broker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inject_port: Option<u16>,
+    /// A route of an audience of `role: registry` (ADR-0063 decision 5): the guest's puller reaches it through the
+    /// proxy's pull listener and the workload never does (the proxy's own listener refuses it, `404 pull_only`).
+    /// Absent on every other route.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pull_only: bool,
 }
 
 impl Route {
@@ -1678,6 +1683,7 @@ mod tests {
             credential: Credential::Token,
             credential_header: None,
             inject_port: None,
+            pull_only: false,
         };
         assert!(open.admits("DELETE", "/anything/at/all"));
         let narrow = Route {
@@ -2053,6 +2059,7 @@ mod tests {
             credential: Credential::Gateway,
             credential_header: Some("x-api-key".into()),
             inject_port: Some(3133),
+            pull_only: false,
         };
         let json = serde_json::to_value(&route).unwrap();
         assert_eq!(json["credential"], "gateway");

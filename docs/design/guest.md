@@ -64,6 +64,14 @@ a destination's. The puller in this mode sends no credential, answers no challen
 an error, never a call to the realm) and follows no redirect off the VM. Every other claim keeps the older order:
 pull as root, then the ruleset, then the proxy.
 
+### How long a pull may take
+
+Every pull is bounded (ADR-0063 decision 9): a connection opens within 10 seconds, a response brings something at
+least every `MEDIATORE_PULL_IDLE_SECS` (60 by default, the headers included), and the whole pull, manifests and every
+layer, finishes within `MEDIATORE_PULL_DEADLINE_SECS` (900 by default), cut to what is left of the claim when that is
+less. Past any of them the claim fails before the jail, and the error names the registry and the variable. Neither may
+be zero. A registry that stalls no longer holds a claim until its TTL.
+
 ## What the jail is
 
 The workload runs as the sandbox user in a PID namespace of its own, with `/proc` showing only its own processes
@@ -74,8 +82,9 @@ gets carries `MEDIATORE_EGRESS_PROXY` (the proxy's base URL) and `MEDIATORE_TOKE
 that mean nothing anywhere but at this proxy during this claim). It holds no credential.
 
 Two firewalls bound the VM. The **claim's table** (above) binds the sandbox uid. The **host table**
-(`image/host-table`) binds the VM: output is default-drop, admitting only the broker, the relay legs and, to root alone,
-the registry leg; the loopback interface is admitted both ways, which is how root's puller reaches the proxy's pull port.
+(`image/host-table`) binds the VM: output is default-drop, admitting only the gateways and the relay legs, no registry for
+any uid (ADR-0063); the loopback interface is admitted both ways, which is how root's puller reaches the proxy's pull port.
+It loads before the network, and `image/host-quiet` then masks for the boot the base's units that would dial out.
 
 ## The other roles
 
@@ -98,4 +107,4 @@ the registry leg; the loopback interface is admitted both ways, which is how roo
 
 ADR-0014 (one binary), ADR-0019 (`GuestReady`), ADR-0020 (the jail's network), ADR-0021 (the filesystem and the
 pull), ADR-0023 (the VM image), ADR-0024 (Landlock), ADR-0029 (the pull on a routeless segment), ADR-0033 (the restart
-policy), ADR-0036 (`/proc`), ADR-0038 and ADR-0043 (the registry legs). Threat model TB-6, TB-11, TB-12, TB-15. Roadmap 06.
+policy), ADR-0036 (`/proc`), ADR-0038 (the registry leg, removed by ADR-0063), ADR-0043 and ADR-0063 (the pull through the proxy). Threat model TB-6, TB-11, TB-12, TB-15. Roadmap 06.

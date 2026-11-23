@@ -820,8 +820,9 @@ impl Watcher {
         {
             Err(e) => return Some(format!("workload image {:?}: {e}", spec.workload.image)),
             Ok(image) => {
-                if let Some(reason) = mediatore_proto::image::unreachable_registry(
-                    self.cfg.reachable_registries.as_ref(),
+                if let Some(reason) = mediatore_proto::image::ungranted_registry(
+                    self.cfg.registry_audiences.as_ref(),
+                    &spec.audiences,
                     &image,
                 ) {
                     return Some(reason);
@@ -3043,7 +3044,14 @@ mod tests {
         // before any claim exists, instead of failing the pull later as an anonymous one.
         let placed = WatcherConfig {
             audiences: vec![Audience::named("api.example"), Audience::named("registry")],
-            reachable_registries: Some(["registry.home.example".to_owned()].into_iter().collect()),
+            registry_audiences: Some(
+                [(
+                    "registry".to_owned(),
+                    ["registry.home.example".to_owned()].into_iter().collect(),
+                )]
+                .into_iter()
+                .collect(),
+            ),
             placed_registries: [("registry.home.example".to_owned(), "registry".to_owned())]
                 .into_iter()
                 .collect(),
@@ -3066,7 +3074,7 @@ mod tests {
         assert_eq!(st.phase, SandboxPhase::Failed);
         let reason = st.reason.unwrap_or_default();
         assert!(
-            reason.contains("registry.home.example") && reason.contains("name audience registry"),
+            reason.contains("registry.home.example") && reason.contains("not granted"),
             "{reason}"
         );
         assert!(
@@ -3097,16 +3105,23 @@ mod tests {
 
     #[tokio::test]
     async fn an_image_the_pool_cannot_reach_or_cannot_parse_fails_the_sandbox_without_a_claim() {
-        // A gateway-era environment whose only reachable registry is the mirror (ADR-0029).
+        // A gateway-era environment whose only registry audience serves the mirror (ADR-0063).
         let reachable = WatcherConfig {
-            reachable_registries: Some(["registry.internal:5000".to_owned()].into_iter().collect()),
+            registry_audiences: Some(
+                [(
+                    "mirror".to_owned(),
+                    ["registry.internal:5000".to_owned()].into_iter().collect(),
+                )]
+                .into_iter()
+                .collect(),
+            ),
             ..cfg()
         };
         for (cfg, image, want) in [
             (
                 reachable.clone(),
                 "ghcr.io/firestoned/agent:1",
-                "registry ghcr.io is not reachable from this environment's pool; the pool reaches: registry.internal:5000 (registries[].reach, ADR-0029)",
+                "registry ghcr.io is not granted to this sandbox: name an audience with role: registry that serves it (ADR-0063)",
             ),
             (cfg(), "not a reference!", "workload image"),
         ] {
@@ -3135,14 +3150,22 @@ mod tests {
                 "{image}: no claim"
             );
         }
-        // The mirror itself, and any registry without gateways, are fine.
-        for (cfg, image) in [
-            (reachable, "registry.internal:5000/team/agent:1"),
-            (cfg(), "ghcr.io/firestoned/agent:1"),
+        // The mirror, for a sandbox that names the registry audience serving it, and any registry without gateways,
+        // are fine.
+        let mut granted = reachable;
+        granted.audiences.push(Audience::named("mirror"));
+        for (cfg, image, audiences) in [
+            (
+                granted,
+                "registry.internal:5000/team/agent:1",
+                vec!["mirror".to_string()],
+            ),
+            (cfg(), "ghcr.io/firestoned/agent:1", vec![]),
         ] {
             let r = rig(cfg);
             let mut sb = sandbox(true, false);
             sb.spec.workload.image = image.into();
+            sb.spec.audiences.extend(audiences);
             assert_eq!(r.watcher.refuse(&sb.spec, "sandboxes"), None, "{image}");
         }
     }

@@ -266,7 +266,7 @@ impl Harness {
             )]
             .into_iter()
             .collect(),
-            reachable_registries: None,
+            registry_audiences: None,
             policy_egress: policy,
             sandboxes: None,
             namespaces,

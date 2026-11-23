@@ -106,7 +106,7 @@ rpcbind.socket`. The base image's own `sshd` stays masked.
 
 ## Check it
 
-On a VM, as root (the table has no exception for root except the registry legs on their own ports):
+On a VM, as root (the table has no exception for root: since ADR-0063 no registry is reached but through a claim's proxy):
 
 ```
 nft list table inet mediatore_host     # input, forward, output: policy drop

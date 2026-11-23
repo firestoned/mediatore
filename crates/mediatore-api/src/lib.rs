@@ -107,10 +107,11 @@ pub struct AppState {
     /// (`registries[]`); `GET /v1/me` hands the guest the one its claim's image names
     /// (ADR-0022).
     pub registries: BTreeMap<String, RegistryCredential>,
-    /// The registries a gateway-era pool can reach, canonical hosts (`registries[].reach`,
-    /// ADR-0029 decision 1): a claim whose image names another is refused. `None` in an
-    /// environment without gateways, where nothing is restricted.
-    pub reachable_registries: Option<std::collections::BTreeSet<String>>,
+    /// Per audience of `role: registry` (ADR-0063 decision 2), the registries it serves by the name an image
+    /// reference carries: its routes are pull-only (decision 5), and a claim's image must be on a registry one of the
+    /// claim's audiences in this map serves, or the claim is refused `registry_not_granted`. `None` in an environment
+    /// without gateways, which pulls as it always did (decision 4).
+    pub registry_audiences: Option<BTreeMap<String, std::collections::BTreeSet<String>>>,
     /// The verified bundles and the `policy.egress` switch (ADR-0030): a claim's direct
     /// egress joins its allowlist in `enforce`. `None` without a `policy` section, or under
     /// `dev_mode`, where no bundle is read: the audience endpoints alone.
@@ -978,11 +979,14 @@ async fn create_claim(
         .image
         .parse::<ImageReference>()
         .map_err(|e| ApiError::bad_request("invalid_workload_image", e))?;
-    // A gateway-era pool reaches its declared registries and no other (ADR-0029).
-    if let Some(reason) =
-        mediatore_proto::image::unreachable_registry(st.reachable_registries.as_ref(), &image)
-    {
-        return Err(ApiError::bad_request("unreachable_registry", reason));
+    // With gateways, a claim pulls only from a registry one of its own audiences of `role: registry` serves (ADR-0063
+    // decision 2): one answer whether the registry is another namespace's or nobody's.
+    if let Some(reason) = mediatore_proto::image::ungranted_registry(
+        st.registry_audiences.as_ref(),
+        &req.audiences,
+        &image,
+    ) {
+        return Err(ApiError::bad_request("registry_not_granted", reason));
     }
     // The requester asked for the workload's output and this broker stores none (ADR-0045
     // decision 11): refused before anything exists, never a claim whose output is silently
@@ -2373,6 +2377,10 @@ fn handed(st: &AppState, rec: &ClaimRecord) -> (Vec<Endpoint>, Vec<Route>) {
     let direct = served_direct_egress(st, rec, &audience_endpoints);
     let mut egress = audience_endpoints;
     egress.extend(direct.iter().cloned());
+    // A registry audience's endpoints are the puller's, never the workload's (ADR-0063 decision 5): the jail's
+    // destinations leave them out, and their routes are pull-only.
+    let pull = pull_endpoints(st, rec);
+    egress.retain(|e| !pull.contains(e));
     egress.sort();
     egress.dedup();
     // The proxy's routes (ADR-0025 decision 4): the same destinations, each with its
@@ -2416,6 +2424,7 @@ fn handed(st: &AppState, rec: &ClaimRecord) -> (Vec<Endpoint>, Vec<Route>) {
             // ADR-0040: the gateways' inject port, on the routes of an audience placed
             // there; every other route is placed by the proxy.
             inject_port: view.inject(a).is_some().then_some(st.inject_port).flatten(),
+            pull_only: is_registry(st, a),
         })
         .chain(direct.into_iter().map(|e| Route {
             audience: None,
@@ -2425,6 +2434,7 @@ fn handed(st: &AppState, rec: &ClaimRecord) -> (Vec<Endpoint>, Vec<Route>) {
             credential: Credential::None,
             credential_header: None,
             inject_port: None,
+            pull_only: false,
         }))
         .collect();
     routes.sort_by(|a, b| {
@@ -2624,6 +2634,23 @@ fn served_direct_egress(st: &AppState, rec: &ClaimRecord, audience: &[Endpoint])
             vec![]
         }
     }
+}
+
+/// The endpoints of the claim's audiences of `role: registry` (ADR-0063 decision 5): the guest's puller reaches them,
+/// through the proxy's pull listener and a gateway, and the workload does not.
+fn pull_endpoints(st: &AppState, rec: &ClaimRecord) -> Vec<Endpoint> {
+    claim_audiences(st, rec)
+        .filter(|a| is_registry(st, a))
+        .filter_map(|a| effective(st, rec, a))
+        .flat_map(|e| e.egress)
+        .collect()
+}
+
+/// Whether `audience` is of `role: registry` (ADR-0063 decision 2), where that role is in force.
+fn is_registry(st: &AppState, audience: &str) -> bool {
+    st.registry_audiences
+        .as_ref()
+        .is_some_and(|m| m.contains_key(audience))
 }
 
 /// The endpoints of the claim's gateway-placed audiences (ADR-0040): reachable through the
@@ -3585,7 +3612,7 @@ mod tests {
             secrets: BTreeMap::new(),
             delegated: BTreeMap::new(),
             registries: BTreeMap::new(),
-            reachable_registries: None,
+            registry_audiences: None,
             policy_egress: None,
             sandboxes: None,
             namespaces: Namespaces::Single("sandboxes".into()),
@@ -5271,6 +5298,76 @@ mod tests {
             "placed in the proxy, as before"
         );
         assert_eq!(grafana.inject_port, None);
+    }
+
+    #[tokio::test]
+    async fn a_registry_audiences_routes_are_pull_only_and_left_out_of_the_jails_egress() {
+        // ADR-0063 decision 5: the puller reaches a registry audience, the workload does not; the gateway still admits
+        // it, because the pull goes through it.
+        let mut st = placed_state();
+        st.registry_audiences = Some(
+            [(
+                "grafana".to_owned(),
+                ["grafana.example".to_owned()].into_iter().collect(),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let st = Arc::new(st);
+        let node = st.naming.node_id("ek1");
+        st.store
+            .put_node(NodeRecord {
+                ek_hash: "ek1".into(),
+                node_id: node.clone(),
+                dmi_uuid: Uuid::new_v4(),
+                hostname: "pool-1".into(),
+                provider: None,
+                banned: false,
+                registered_at: Timestamp::now(),
+            })
+            .await
+            .unwrap();
+        let st: Shared = st;
+        let rec = stored(&st, claim(&["grafana", "grafana-sts"], Some(node))).await;
+        let (status, body, _) = call(
+            &st,
+            "GET",
+            "/v1/me",
+            Some(&st.naming.node_id("ek1")),
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let me: Me = serde_json::from_value(body).unwrap();
+        let route = |a: &str| {
+            me.routes
+                .iter()
+                .find(|r| r.audience.as_deref() == Some(a))
+                .unwrap_or_else(|| panic!("the {a} route"))
+                .clone()
+        };
+        assert!(route("grafana").pull_only, "a registry audience's route");
+        assert!(!route("grafana-sts").pull_only, "an api audience's route");
+        let hosts: Vec<&str> = me.egress.iter().map(|e| e.host.as_str()).collect();
+        assert_eq!(
+            hosts,
+            ["grafana-sts.example"],
+            "the jail does not reach the registry"
+        );
+        let (status, body, _) = call(
+            &st,
+            "GET",
+            &format!("/v1/gateway/claims/{}", rec.uid),
+            Some(&gateway_peer()),
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let egress: mediatore_proto::ClaimEgress = serde_json::from_value(body).unwrap();
+        assert!(
+            egress.egress.iter().any(|e| e.host == "grafana.example"),
+            "the gateway admits the pull: {egress:?}"
+        );
     }
 
     #[tokio::test]

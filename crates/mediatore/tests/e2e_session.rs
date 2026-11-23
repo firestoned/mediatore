@@ -130,7 +130,7 @@ impl Harness {
             secrets: std::collections::BTreeMap::new(),
             delegated: std::collections::BTreeMap::new(),
             registries: std::collections::BTreeMap::new(),
-            reachable_registries: None,
+            registry_audiences: None,
             policy_egress: None,
             sandboxes: None,
             namespaces: Namespaces::Single("sandboxes".into()),

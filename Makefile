@@ -204,11 +204,11 @@ gateway-render-check: ## Fail when dev/kind/gateway/envoy.yaml drifted from the 
 	  ./image/gateway/render image/gateway/$$t - image/gateway/env.example image/gateway/vm.env.example > /dev/null || exit 1; \
 	done
 	@r=$$(./image/gateway/render image/gateway/envoy/relay.yaml.in - image/gateway/env.example image/gateway/vm.env.example); \
-	  test "$$(printf '%s\n' "$$r" | grep -c 'stat_prefix: relay_')" = 4 \
+	  test "$$(printf '%s\n' "$$r" | grep -c 'stat_prefix: relay_')" = 3 \
 	  && printf '%s\n' "$$r" | grep -q 'upstream=bundle' && printf '%s\n' "$$r" | grep -q 'name: spire_bundle' \
-	  && printf '%s\n' "$$r" | grep -q 'upstream=registry' && printf '%s\n' "$$r" | grep -q 'name: registry' \
-	  && ./image/gateway/render image/gateway/nftables.conf.in - image/gateway/env.example image/gateway/vm.env.example | grep -q 'elements = { 3129, 3130, 3131, 3132 }' \
-	  || { echo "the relay must render four listeners (SPIRE, broker, bundle: ADR-0037, registry: ADR-0038) and the host table admit 3129, 3130, 3131 and 3132"; exit 1; }
+	  && ! printf '%s\n' "$$r" | grep -v '^[[:space:]]*#' | grep -qi 'registry' \
+	  && ./image/gateway/render image/gateway/nftables.conf.in - image/gateway/env.example image/gateway/vm.env.example | grep -q 'elements = { 3129, 3130, 3131 }' \
+	  || { echo "the relay must render three listeners (SPIRE, broker, bundle: ADR-0037), no registry leg (ADR-0063 decision 4), and the host table admit 3129, 3130 and 3131"; exit 1; }
 	@# The inject Envoy (ADR-0040 decision 3): off by default (the example env renders no inject port and keeps the authorizer on loopback), and
 	@# its bootstrap has the shape the ADR says. The assertions ignore comment lines: the comments name what is forbidden.
 	@r=$$(./image/gateway/render image/gateway/envoy/inject.yaml.in - image/gateway/env.example image/gateway/vm.env.example | grep -v '^[[:space:]]*#'); \
@@ -225,14 +225,14 @@ gateway-render-check: ## Fail when dev/kind/gateway/envoy.yaml drifted from the 
 	  || { echo "the inject bootstrap must carry the claim mutual TLS, a bare-host route, TLS origination with SNI and a DNS SAN, ext_authz to the inject socket with mode inject, and no header mutation, CONNECT, strip_any_host_port or admin block (ADR-0040 decisions 3 and 4)"; exit 1; }
 	@d=$$(./image/gateway/render image/gateway/envoy/gateway.yaml.in - image/gateway/env.example image/gateway/vm.env.example); \
 	  printf '%s\n' "$$d" | grep -q 'socket_address: { address: 127.0.0.1, port_value: 9001 }' \
-	  && ./image/gateway/render image/gateway/nftables.conf.in - image/gateway/env.example image/gateway/vm.env.example | grep -q 'elements = { 3129, 3130, 3131, 3132 } }' \
-	  || { echo "with no inject settings the data plane asks the authorizer on loopback and the host table admits only the four relay ports"; exit 1; }
+	  && ./image/gateway/render image/gateway/nftables.conf.in - image/gateway/env.example image/gateway/vm.env.example | grep -q 'elements = { 3129, 3130, 3131 } }' \
+	  || { echo "with no inject settings the data plane asks the authorizer on loopback and the host table admits only the three relay ports"; exit 1; }
 	@d=$$(./image/gateway/render image/gateway/envoy/gateway.yaml.in - image/gateway/env.inject.example image/gateway/env.example image/gateway/vm.env.example); \
 	  n=$$(./image/gateway/render image/gateway/nftables.conf.in - image/gateway/env.inject.example image/gateway/env.example image/gateway/vm.env.example); \
 	  printf '%s\n' "$$d" | grep -q 'pipe: { path: /run/mediatore-gateway/check/check.sock }' && ! printf '%s\n' "$$d" | grep -q 'port_value: 9001' \
-	  && printf '%s\n' "$$n" | grep -q 'elements = { 3129, 3130, 3131, 3132, 3133 } }' \
+	  && printf '%s\n' "$$n" | grep -q 'elements = { 3129, 3130, 3131, 3133 } }' \
 	  || { echo "with inject on (env.inject.example in front of the example) the data plane asks the CHECK socket, no loopback TCP, and the host table admits the inject port under the relay's cap (ADR-0040 decisions 6 and 7)"; exit 1; }
-	@echo "✓ the kind bootstrap is the image's template, the example env files fill every template, the relay has its four legs, the inject Envoy is off by default and shaped by ADR-0040"
+	@echo "✓ the kind bootstrap is the image's template, the example env files fill every template, the relay has its three legs, the inject Envoy is off by default and shaped by ADR-0040"
 
 crds: ## Render mediatore's CRDs from their Rust types into deploy/base/crds/ (ADR-0008; never hand-edited, a unit test fails on a stale file)
 	cargo run -q -p mediatore-claims --bin crdgen -- --out-dir deploy/base/crds

@@ -7,7 +7,15 @@ Description=The pool VM's host table (ADR-0029 decision 3)
 # on every uid, loaded in one transaction before the agent and the guest may start. Without
 # the list the unit is skipped and the pool runs as before (ADR-0029 decision 4).
 ConditionPathExists=/etc/mediatore/gateways
-Before=spire-agent.service mediatore-guest.service
+# Before the network, not only before the agent and the guest (ADR-0063 decision 8): no unit that
+# waits for the network runs without the table, and host-quiet removes the DHCP catch-all before
+# systemd-networkd reads it. The inputs are there by then: the deployment layer writes them in
+# the initramfs stage.
+DefaultDependencies=no
+After=local-fs.target
+Wants=network-pre.target
+Before=network-pre.target spire-agent.service mediatore-guest.service shutdown.target
+Conflicts=shutdown.target
 ConditionPathExists=|/run/cos/active_mode
 ConditionPathExists=|/run/cos/passive_mode
 
@@ -15,6 +23,7 @@ ConditionPathExists=|/run/cos/passive_mode
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/libexec/mediatore/host-table
+ExecStartPost=/usr/libexec/mediatore/host-quiet
 ExecStop=/usr/sbin/nft delete table inet mediatore_host
 
 [Install]

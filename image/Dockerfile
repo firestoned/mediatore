@@ -77,8 +77,10 @@ RUN useradd --system --user-group --home-dir /var/lib/spire --no-create-home --s
 
 # The pool VM's host table (ADR-0029): the bound on every uid in an environment with
 # gateways, rendered from the pool's own files and loaded before the agent and the guest.
-COPY image/host-table image/spire-bundle-fetch /usr/libexec/mediatore/
-RUN chmod 0755 /usr/libexec/mediatore/host-table /usr/libexec/mediatore/spire-bundle-fetch
+COPY image/host-table image/host-quiet image/spire-bundle-fetch /usr/libexec/mediatore/
+RUN chmod 0755 /usr/libexec/mediatore/host-table /usr/libexec/mediatore/host-quiet /usr/libexec/mediatore/spire-bundle-fetch
+# The datasource stage with its providers cut to local devices (ADR-0063 decision 8).
+COPY image/oem/00_datasource.yaml /system/oem/00_datasource.yaml
 
 # Two directories the immutable root must already have, since nothing can create them at
 # boot: the sandbox root the guest mounts its per-claim tmpfs on (ADR-0021; the base has

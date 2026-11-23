@@ -130,7 +130,7 @@ fn state_in(
         secrets: std::collections::BTreeMap::new(),
         delegated: std::collections::BTreeMap::new(),
         registries: std::collections::BTreeMap::new(),
-        reachable_registries: None,
+        registry_audiences: None,
         policy_egress,
         sandboxes: None,
         namespaces: Namespaces::Single(namespace.into()),

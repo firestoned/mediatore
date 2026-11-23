@@ -68,10 +68,11 @@ pub struct WatcherConfig {
     >,
     /// Issuers mediatore trusts; a sandbox's subject must come from one.
     pub issuers: Vec<String>,
-    /// The registries a gateway-era pool can reach (`registries[].reach`, ADR-0029): a
-    /// sandbox whose image names another fails before any claim exists. `None` without
-    /// gateways.
-    pub reachable_registries: Option<std::collections::BTreeSet<String>>,
+    /// Per audience of `role: registry`, the registries it serves (ADR-0063 decision 2): with gateways, a sandbox
+    /// whose image is on a registry none of its audiences in this map serves fails before any claim exists. `None`
+    /// without gateways, where nothing is refused by registry.
+    pub registry_audiences:
+        Option<std::collections::BTreeMap<String, std::collections::BTreeSet<String>>>,
     /// The registries that are gateway-placed audiences (ADR-0043 decision 1), by the name an image reference carries,
     /// each with its audience: a sandbox whose image is on one must name that audience.
     pub placed_registries: std::collections::BTreeMap<String, String>,
@@ -235,7 +236,7 @@ impl Default for WatcherConfig {
             audiences: vec![],
             scopes: std::collections::BTreeMap::new(),
             issuers: vec![],
-            reachable_registries: None,
+            registry_audiences: None,
             placed_registries: std::collections::BTreeMap::new(),
             retention: Duration::from_hours(1),
             egress_mode: crate::policy::EgressMode::default(),

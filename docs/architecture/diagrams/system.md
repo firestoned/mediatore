@@ -130,7 +130,6 @@ flowchart LR
     system-sandbox-vm -->|TCP| service-control-relay
     service-control-relay -->|TCP| service-spire-server
     service-control-relay -->|TCP| service-spire-server
-    service-control-relay -->|TCP| ecosystem-oci-registry
     service-control-relay -->|TCP| service-mediatore-sandbox-api
     service-egress-proxy -->|HTTPS| ecosystem-downstream-api
     actor-sandbox-user --> data-asset-claim-store
@@ -149,6 +148,7 @@ flowchart LR
     service-spire-agent -->|TLS| service-spire-server
     service-spire-server --> data-asset-host-signing-ca-bundle
     service-mediatore-watcher -->|HTTPS| service-kubernetes-api
+    service-egress-gateway -->|TCP| ecosystem-oci-registry
 ```
 
 <sub>Source: nodes and relationships in `architecture.json`.</sub>

@@ -67,9 +67,9 @@ needs a claim identity checks the SPIFFE ID's shape (`/banlieue/claim/<uid>`), a
    `selection.strategy`, when present, is one of banlieue's `LongestReady`, `MostAvailable` and `Spread` or the body does
    not parse (`422`, ADR-0047); absent stays absent on the sandbox and the claim.
 4. **`unknown_audience`.** Every audience the body names must be one the broker is configured to serve.
-5. **`invalid_workload_image`**, then **`unreachable_registry`.** The image must parse, and in an environment with
-   gateways its registry must be one the pool reaches: a registry declared with a `reach`, or the host of a
-   gateway-placed audience.
+5. **`invalid_workload_image`**, then **`registry_not_granted`.** The image must parse, and in an environment with
+   gateways its registry must be served by one of the claim's own audiences of `role: registry` (ADR-0063); the
+   sentence names no other registry.
 6. **The session** (`session_for`). An issuer configured with a `session` requires the refresh token in the body
    (`session_required`); any other issuer refuses one (`session_unexpected`); an Entra issuer exchanges the caller's
    token On-Behalf-Of here (`session_refused` when Entra says no, `audience_needs_entra` for an audience Entra alone
