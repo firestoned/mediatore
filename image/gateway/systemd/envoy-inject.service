@@ -5,7 +5,8 @@
 Description=Envoy, the egress gateway's inject listener (ADR-0040)
 # The third process: the one that terminates a claim's mutual TLS and originates TLS to a
 # fixed upstream, so an audience's credential is placed here and never in the pool. Shipped,
-# not enabled: a deployment turns it on with env.inject.example and `systemctl enable`.
+# not enabled: a deployment turns it on with env.inject.example, `systemctl enable` and a start
+# (image/gateway/cloud-config-deployment.example.yaml: on Kairos, enable alone starts nothing).
 # It needs the table and the interface (fail closed), the agent's socket for the gateway SVID
 # (the claim's mutual TLS, like the data plane and unlike the relay), and the authorizer, whose
 # INJECT socket it asks on every request (the authorizer answers it, and only it, with a
