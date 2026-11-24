@@ -3,8 +3,16 @@
 
 # ADR-0065: A sandbox under several policies, the first named wins
 
-**Status:** Proposed (no implementation yet; CALM, the tests and the threat-model pass are owed
-before it is accepted) · **Date:** 2026-11-23
+**Status:** Rejected (2026-11-24; never implemented) · **Date:** 2026-11-23
+
+*Rejected 2026-11-24 in favour of composing at the policy:* a `SandboxPolicy` that includes
+others, resolved and signed by notaio as one bundle under one `ExposureCeiling` (notaio
+[roadmap 04](https://github.com/firestoned/notaio/blob/main/.github/community/04-composed-policies.md),
+this ADR's third alternative). Composing at the sandbox leaves the union of several policies
+bounded by no ceiling and seen by no review, needs an order rule for every sandbox-wide part,
+and turns the claim record, the follow check and the shadow verdict into lists. A sandbox keeps
+one `policyRef`; ADR-0026 decision 6, ADR-0054 and ADR-0061 stand unamended. Roadmap 16 is
+withdrawn. The text below is kept as proposed.
 
 Roadmap 16. Amends [ADR-0026](0026-notaio-bundles-verified-in-shadow.md) decision 6 (one
 `policyRef` per sandbox), [ADR-0054](0054-which-policies-a-namespace-may-name.md) decision 1 (the
