@@ -3,7 +3,7 @@
 
 # ADR-0047: A sandbox chooses its member by strategy
 
-**Status:** Accepted and implemented 2026-11-18 (proposed the same day; `Selection`, `SelectionStrategy`, `--strategy`, `spec.selection`, banlieue-api v0.5.10) · **Date:** 2026-11-18
+**Status:** Accepted and implemented 2026-11-18, released in v0.4.0 (proposed the same day; `Selection`, `SelectionStrategy`, `--strategy`, `spec.selection`, banlieue-api v0.5.10) · **Date:** 2026-11-18
 
 Roadmap 08 (the `AgentSandbox` CRD). Amends
 [ADR-0008](0008-agentsandbox-crd-owned-by-mediatore.md) decision 7 (the spec's fields) and

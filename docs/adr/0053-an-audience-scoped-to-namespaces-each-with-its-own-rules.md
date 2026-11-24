@@ -3,7 +3,7 @@
 
 # ADR-0053: An audience scoped to namespaces, each with its own rules
 
-**Status:** Phase 1 (decisions 1 to 8) accepted and implemented 2026-11-19; **phase 2 (decisions 9 to 16, the verified policy bundle as the source of the grants) accepted and implemented 2026-11-19, behind `policy.audiences: shadow` by default; not yet run live** (the two open questions of phase 2 were left at their defaults: eligibility is the policy's location only, and a claim names its own policy) (the three open questions were left at their defaults by the maintainer: namespace names, an unscoped audience stays open with a warning, the key is `namespaces`; amended at implementation: decision 3's top-level `rules` is a ceiling, not a refusal, and decisions 4 to 6 name what was built) · **Date:** 2026-11-19
+**Status:** Phase 1 (decisions 1 to 8) accepted and implemented 2026-11-19, released in v0.4.0; **phase 2 (decisions 9 to 16, the verified policy bundle as the source of the grants) accepted and implemented 2026-11-19, released in v0.4.0, behind `policy.audiences: shadow` by default; not yet run live** (the two open questions of phase 2 were left at their defaults: eligibility is the policy's location only, and a claim names its own policy) (the three open questions were left at their defaults by the maintainer: namespace names, an unscoped audience stays open with a warning, the key is `namespaces`; amended at implementation: decision 3's top-level `rules` is a ceiling, not a refusal, and decisions 4 to 6 name what was built) · **Date:** 2026-11-19
 
 Amends [ADR-0040](0040-the-gateway-places-an-audiences-credential-the-pool-never-holds-it.md)
 (the audience's `rules` and the routes the gateway holds),

@@ -3,7 +3,7 @@
 
 # ADR-0055: Audiences from signed SandboxAudience bundles, platform or team, read live
 
-**Status:** Accepted, implemented 2026-11-20 (amended at implementation, each amendment in its decision: decision 1 reads the policy namespaces too and names the floor objects, decision 2 refuses both sides of a collision from the namespaces that see both and reads a snapshot per decision, decision 4 lists the checks built, decision 5 polls with `get` and does not zeroize; a `caRef` and a `basic` operator-held credential are refused, `NotBuilt`; threat-model pass of 2026-11-20, R-56 to R-60) · **Date:** 2026-11-20
+**Status:** Accepted, implemented 2026-11-20, released in v0.4.0 (amended at implementation, each amendment in its decision: decision 1 reads the policy namespaces too and names the floor objects, decision 2 refuses both sides of a collision from the namespaces that see both and reads a snapshot per decision, decision 4 lists the checks built, decision 5 polls with `get` and does not zeroize; a `caRef` and a `basic` operator-held credential are refused, `NotBuilt`; threat-model pass of 2026-11-20, R-56 to R-60) · **Date:** 2026-11-20
 
 Roadmap 04 (audiences and backends) and roadmap 11 (policy at the gateway). The consumer side of
 notaio's [ADR-0020](https://github.com/firestoned/notaio/blob/main/docs/adr/0020-sandbox-audience.md)

@@ -3,7 +3,7 @@
 
 # ADR-0061: A running claim follows a new bundle version only while it is still inside it
 
-**Status:** Accepted 2026-11-21 (the four open questions decided by the maintainer at their recommendations); implemented 2026-11-21 behind `policy.follow: shadow` by default (decisions 1 to 6; amended at implementation, see *Implementation notes*); not yet run on a cluster · **Date:** 2026-11-21
+**Status:** Accepted 2026-11-21 (the four open questions decided by the maintainer at their recommendations); implemented 2026-11-21, released in v0.4.0, behind `policy.follow: shadow` by default (decisions 1 to 6; amended at implementation, see *Implementation notes*); not yet run on a cluster · **Date:** 2026-11-21
 
 Amends [ADR-0053](0053-an-audience-scoped-to-namespaces-each-with-its-own-rules.md) decision 12
 (every use reads the current bundle). Builds on [ADR-0026](0026-notaio-bundles-verified-in-shadow.md)

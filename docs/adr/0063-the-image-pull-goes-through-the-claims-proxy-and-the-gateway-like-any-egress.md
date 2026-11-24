@@ -3,7 +3,7 @@
 
 # ADR-0063: The image pull goes through the claim's proxy and the gateway, like any egress
 
-**Status:** Accepted and implemented 2026-11-22 (every open question answered, 3 by a spike on the build host;
+**Status:** Accepted and implemented 2026-11-22, released in v0.4.0 (every open question answered, 3 by a spike on the build host;
 the threat-model pass the same day; not yet run live, and bundles mode grants no registry until notaio carries
 `role`: see the implementation notes) ·
 **Date:** 2026-11-22

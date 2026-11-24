@@ -3,7 +3,7 @@
 
 # ADR-0049: AgentSandbox is served as v1alpha1 and v1beta1
 
-**Status:** Accepted and implemented 2026-11-18 (proposed the same day; `v1alpha1` served again beside `v1beta1`, deprecated, the same schema, `v1beta1` stored) · **Date:** 2026-11-18
+**Status:** Accepted and implemented 2026-11-18, released in v0.4.0 (proposed the same day; `v1alpha1` served again beside `v1beta1`, deprecated, the same schema, `v1beta1` stored) · **Date:** 2026-11-18
 
 Roadmap 08 (the `AgentSandbox` CRD). Amends [ADR-0048](0048-agentsandbox-served-as-v1beta1.md)
 decisions 1 and 3 and its cut-over consequence; ADR-0048 decisions 2, 4 and 5 stand.

@@ -3,7 +3,7 @@
 
 # ADR-0049: A guest without a vTPM attests with `x509pop`, using a certificate its host signs for the guest's own key
 
-**Status:** Accepted · **Date:** 2026-11-19 · **Proposed:** 2026-11-18
+**Status:** Accepted; the control-plane side implemented and released in v0.4.0 · **Date:** 2026-11-19 · **Proposed:** 2026-11-18
 
 Builds on [ADR-0004](0004-spiffe-identity-scheme.md) (the identity scheme),
 [ADR-0006](0006-registration-entries-as-clusterstaticentry.md) (no SPIRE admin identity,
