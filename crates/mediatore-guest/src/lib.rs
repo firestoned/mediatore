@@ -29,6 +29,7 @@ pub mod image;
 pub mod jail;
 pub mod logs;
 pub mod net;
+pub mod nodecert;
 pub mod ready;
 pub mod redact;
 pub mod report;

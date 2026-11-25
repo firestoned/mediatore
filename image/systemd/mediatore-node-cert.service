@@ -1,0 +1,33 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+
+[Unit]
+Description=mediatore node certificate (x509pop node attestation, ADR-0049)
+# A guest with no vTPM only. Nothing starts this unit unless the pool's cloud-config layer
+# installs the drop-in in image/systemd/spire-agent-x509pop.conf, which makes the agent
+# require it: no certificate, no agent (fail closed).
+Before=spire-agent.service
+# Only the system booted from the installed disk, as the agent (spire-agent.service). A
+# non-Kairos image drops these two lines or provides the sentinel.
+ConditionPathExists=|/run/cos/active_mode
+ConditionPathExists=|/run/cos/passive_mode
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# The agent's own user: it reads the key anyway, and a vsock connect needs no capability.
+User=spire
+ExecStart=/usr/bin/mediatore node-cert fetch
+# The key and the certificate (crates/mediatore-guest/src/nodecert.rs), owned by spire,
+# kept across this unit and the agent's restarts. tmpfs: the key is new at each boot.
+RuntimeDirectory=spire/x509pop
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+# vsock to the host's signer; unix for the journal. Nothing else.
+RestrictAddressFamilies=AF_VSOCK AF_UNIX

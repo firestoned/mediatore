@@ -21,6 +21,7 @@ the diagram shows the *target* architecture so contributors and users have
 one canonical picture, and labels such a node with its status. The nodes so
 marked today, if any:
 
+- `service-node-cert` (planned)
 - `data-asset-host-signing-ca-bundle` (planned)
 
 ```mermaid
@@ -52,6 +53,7 @@ flowchart LR
     system-sandbox-vm["Sandbox VM (pool member)"]
     service-spire-agent["SPIRE Agent (in guest)"]
     service-guest-agent["mediatore guest"]
+    service-node-cert["mediatore node-cert (in guest) (planned)"]
     service-sandbox-workload["Jailed Workload"]
     service-egress-proxy["mediatore egress-proxy"]
     service-egress-gateway["Egress gateway (Envoy + mediatore gateway, with the control relay beside them)"]
@@ -74,6 +76,7 @@ flowchart LR
     subgraph sg_system-sandbox-vm [System Sandbox Vm]
         service-spire-agent
         service-guest-agent
+        service-node-cert
         service-egress-proxy
         service-sandbox-workload
     end
@@ -149,6 +152,8 @@ flowchart LR
     service-spire-agent -->|TLS| service-spire-server
     service-spire-server --> data-asset-host-signing-ca-bundle
     service-mediatore-watcher -->|HTTPS| service-kubernetes-api
+    service-node-cert --> system-banlieue
+    service-spire-agent --> service-node-cert
     service-egress-gateway -->|TCP| ecosystem-oci-registry
 ```
 

@@ -97,6 +97,9 @@ RUN chmod 0755 /usr/bin/mediatore /usr/bin/spire-agent /usr/lib/spire/tpm_attest
     && echo "${TPM_PLUGIN_AGENT_SHA}  /usr/lib/spire/tpm_attestor_agent" | sha256sum -c -
 
 COPY image/systemd/spire-agent.service image/systemd/mediatore-guest.service image/systemd/mediatore-host-nft.service image/systemd/spire-bundle-fetch.service /etc/systemd/system/
+# The x509pop node certificate for a guest with no vTPM (ADR-0049): installed, never enabled.
+# Only the drop-in a no-vTPM pool's cloud-config writes (the example below) pulls them in.
+COPY image/systemd/mediatore-node-cert.service image/systemd/mediatore-node-cert-renew.service /etc/systemd/system/
 # Yama's ptrace scope raised to 1: the second line behind the jail's PID namespace between
 # the workload and the egress proxy, both the sandbox uid (ADR-0025, roadmap 06).
 COPY image/sysctl/99-mediatore.conf /etc/sysctl.d/99-mediatore.conf
@@ -104,6 +107,8 @@ COPY image/sysctl/99-mediatore.conf /etc/sysctl.d/99-mediatore.conf
 # file write (threat model R-43).
 COPY image/qemu-ga.conf /etc/qemu/qemu-ga.conf
 COPY image/spire/agent.conf /usr/share/mediatore/agent.conf.example
+COPY image/spire/agent-x509pop.conf /usr/share/mediatore/agent-x509pop.conf.example
+COPY image/systemd/spire-agent-x509pop.conf /usr/share/mediatore/spire-agent-x509pop.conf.example
 RUN grep -q "plugin_checksum = \"${TPM_PLUGIN_AGENT_SHA}\"" /usr/share/mediatore/agent.conf.example \
     && systemctl enable spire-agent.service mediatore-guest.service mediatore-host-nft.service spire-bundle-fetch.service qemu-guest-agent.service \
     && systemctl mask ssh.service ssh.socket sshd.service nftables.service
