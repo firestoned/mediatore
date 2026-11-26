@@ -1,0 +1,27 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+
+[Unit]
+Description=mediatore node certificate renewal (x509pop, ADR-0049)
+# Pulled in by the same drop-in as mediatore-node-cert.service. Renews at half the
+# remaining life with the same key, so the agent ID does not change; a renewal that keeps
+# failing leaves the current files, and the agent ends itself after they expire.
+After=mediatore-node-cert.service spire-agent.service
+Requires=mediatore-node-cert.service
+ConditionPathExists=|/run/cos/active_mode
+ConditionPathExists=|/run/cos/passive_mode
+
+[Service]
+Type=simple
+User=spire
+ExecStart=/usr/bin/mediatore node-cert renew
+Restart=on-failure
+RestartSec=30
+ReadWritePaths=/run/spire/x509pop
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+RestrictAddressFamilies=AF_VSOCK AF_UNIX

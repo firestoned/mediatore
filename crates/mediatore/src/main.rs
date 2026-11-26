@@ -52,6 +52,8 @@ enum Cmd {
     },
     /// The in-guest agent on a pool member: register the node, fetch the subject, jail the workload.
     Guest(mediatore_guest::guest::GuestArgs),
+    /// On a guest with no vTPM: the x509pop certificate from the host, `fetch` before the SPIRE agent, `renew` beside it (ADR-0049).
+    NodeCert(mediatore_guest::nodecert::NodeCertArgs),
     /// Inside the jail: trade the claim SVID for one audience-scoped token.
     Token(mediatore_guest::token::TokenArgs),
     /// Inside the jail, before the workload: apply Landlock to this process, then exec the argv (ADR-0024).
@@ -91,6 +93,7 @@ async fn main() -> anyhow::Result<()> {
     match Cli::parse().cmd {
         Cmd::Serve { config } => serve(&config).await,
         Cmd::Guest(args) => mediatore_guest::guest::run(args).await,
+        Cmd::NodeCert(args) => Ok(mediatore_guest::nodecert::run(args).await?),
         Cmd::Token(args) => mediatore_guest::token::run(args).await,
         Cmd::EgressProxy(args) => mediatore_guest::egress::run(args).await,
         Cmd::Gateway(args) => mediatore_gateway::serve::run(args).await,

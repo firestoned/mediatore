@@ -170,6 +170,15 @@
       "description": "Root daemon, the guest role of the one mediatore binary (ADR-0014): registers the node (EK hash + DMI UUID), then announces GuestReady to the hypervisor over the channel banlieue reads (the /run marker, guestinfo or vsock; ADR-0019), so the pool counts the member only once it is attested and registered; polls GET /v1/me for a bound claim, creates the per-subject user (sb- + 12 hex, ADR-0004), mounts a size-bounded tmpfs at /mnt/sandbox (nosuid, nodev, mode 0711 so the egress proxy reaches its files; ADR-0021 amended) and pulls the claim's workload image from its registry into it as the rootfs (with the operator's credential for that registry when the broker handed one over, used for the pull and kept nowhere; ADR-0022), manifest and layers verified against their digests, the manifest digest logged (ADR-0021), loads the per-claim nftables ruleset keyed by that uid (the broker, the audiences' egress endpoints, DNS; no ruleset, no jail; ADR-0020), bind-mounts the binary at the pinned path read-only into the jail and supervises the nsjail until the deadline, restarting the workload as its restart policy says (ADR-0033: always, on-failure, never) and, when the policy ends the claim, telling the broker how the workload exited (POST /v1/me/exit) so the claim is released, then tears down; what nsjail execs is the binary's jail-exec role, which applies Landlock to itself (the rootfs readable, /work, /tmp and the home writable, TCP connect to the egress proxy's port only, no bind) before the workload's argv runs, and a refusal (exit 125) ends the claim instead of restarting (ADR-0024). Since ADR-0025 it also generates the claim's phantom token, writes the routes GET /v1/me returned to a file of the sandbox user's, starts mediatore egress-proxy as that user outside the jail before the jail, and ends the claim if the proxy exits. crates/mediatore-guest. The ruleset has two shapes since ADR-0028 decision 6 (net::Shape): with gateways, from GET /v1/me or the pool's /etc/mediatore/gateways, the relay, the gateways and the proxy by address and no DNS rule at all, a broker or gateway given by name refusing the claim; without, ADR-0020's list, the broker, the audiences' endpoints resolved at load, the proxy and DNS. The pull trusts the mirror's CA beside the Mozilla roots when told (MEDIATORE_REGISTRY_CA, ADR-0029). Since ADR-0045, for a claim whose requester opted in (workload.logs), it spawns the jail with piped stdout and stderr, redacts every line before it leaves the VM (crates/mediatore-guest/src/redact.rs, logs.rs: the phantom and every secret-bearing environment value, and JWTs, Authorization values and private keys by shape; best effort, not a guarantee), writes the redacted copy to the console, and ships batches to the broker over the node SVID without ever blocking the workload; the last batch is flushed before the exit is reported."
     },
     {
+      "unique-id": "service-node-cert",
+      "node-type": "service",
+      "name": "mediatore node-cert (in guest)",
+      "description": "Decided, not built (ADR-0049 Decision 5, amended 2026-11-24): the node-cert role of the one mediatore binary (ADR-0014), on a guest with no vTPM only, in Rust with no subprocess (no openssl, no Python). Runs as the SPIRE agent's own user with no capability. `mediatore node-cert fetch` is a oneshot the agent's unit requires and is ordered after: it generates an EC P-256 key in process (0600 under /run/spire/x509pop/, tmpfs, new each boot, never sent), sends only a PEM CSR to its own host over vsock port 1025, and writes the reply's leaf followed by its chain as one file beside the key, by rename, so the agent never reads a half-written file or a leaf without its chain; no certificate, no agent (fail closed). `mediatore node-cert renew` runs beside the agent and fetches again with the same key at half the remaining life of the certificate on disk; a failed renewal keeps the current files and retries. The reply is size-capped, must parse as PEM certificates, and the leaf's public key must be the guest's own and the leaf valid now; the subject is the host's choice (the VM's UID) and is not checked here. The lifetime is the host's (bounded 5 min to 7 days by banlieue's installer); backoff stays under the host signer's per-guest rate limit. Never logs the key, the CSR or a certificate body: serial, issuer CN and notAfter only. crates/mediatore-guest.",
+      "metadata": {
+        "status": "planned"
+      }
+    },
+    {
       "unique-id": "service-sandbox-workload",
       "node-type": "service",
       "name": "Jailed Workload",
@@ -245,7 +254,7 @@
       "unique-id": "data-asset-host-signing-ca-bundle",
       "node-type": "data-asset",
       "name": "Per-host signing CA bundle (x509pop trust anchors, ADR-0049)",
-      "description": "Decided, not built (ADR-0049, Proposed). The x509pop NodeAttestor's ca_bundle_path on the SPIRE server: one CA certificate per host whose guests have no vTPM, each created at the host's install and held (key included) only by that host's provider; the certificate is public and an operator adds it to the bundle when onboarding the host, never discovered from the host. Controls: (1) every CA in the bundle has a UNIQUE, operator-chosen common name and the bundle's rendering refuses a duplicate (mediatore-spire refuse_duplicate_common_names), because the agent ID is issuer-qualified and a duplicate removes the confinement; (2) the server's agent_path_template is /x509pop/{{ .Issuer.CommonName }}/{{ .Subject.CommonName }}, giving the agent ID spiffe://<td>/spire/agent/x509pop/<issuer CN>/<subject CN>, stable across certificate renewal and declarable before the guest boots, with both common names restricted to the path-segment alphabet (mediatore-spire x509pop_agent_id); (3) the host's signer ignores the CSR subject and sets the subject CN to the VM's UID, basicConstraints CA:FALSE (the server does not enforce it) and keyUsage digitalSignature (the server requires it), with a bounded validity; (4) a compromised host can speak only for its own guests, under its own CA's name; (5) retiring a CA revokes every identity it signed at the agents' next re-attestation. No SPIRE admin identity and no join token: mediatore still only declares ClusterStaticEntry (ADR-0006). The TPM attestor and its EK CA bundle (ADR-0018) are unchanged and stay the attestor of every guest with a vTPM.",
+      "description": "Decided, not built on this side (ADR-0049, Accepted; the hosts' CAs and signer are built in banlieue, ADR-0146). The x509pop NodeAttestor's ca_bundle_path on the SPIRE server: one CA certificate per host whose guests have no vTPM, each created at the host's install and held (key included) only by that host's provider; the certificate is public and an operator adds it to the bundle when onboarding the host, never discovered from the host. Controls: (1) every CA in the bundle has a UNIQUE, operator-chosen common name and the bundle's rendering refuses a duplicate (mediatore-spire refuse_duplicate_common_names), because the agent ID is issuer-qualified and a duplicate removes the confinement; (2) the server's agent_path_template is /x509pop/{{ .Issuer.CommonName }}/{{ .Subject.CommonName }}, giving the agent ID spiffe://<td>/spire/agent/x509pop/<issuer CN>/<subject CN>, stable across certificate renewal and declarable before the guest boots, with both common names restricted to the path-segment alphabet (mediatore-spire x509pop_agent_id); (3) the host's signer ignores the CSR subject and sets the subject CN to the VM's UID, basicConstraints CA:FALSE (the server does not enforce it) and keyUsage digitalSignature (the server requires it), with a bounded validity; (4) a compromised host can speak only for its own guests, under its own CA's name; (5) retiring a CA revokes every identity it signed at the agents' next re-attestation. No SPIRE admin identity and no join token: mediatore still only declares ClusterStaticEntry (ADR-0006). The TPM attestor and its EK CA bundle (ADR-0018) are unchanged and stay the attestor of every guest with a vTPM.",
       "metadata": {
         "status": "planned"
       }
@@ -280,6 +289,7 @@
           "nodes": [
             "service-spire-agent",
             "service-guest-agent",
+            "service-node-cert",
             "service-egress-proxy",
             "service-sandbox-workload"
           ]
@@ -1045,7 +1055,7 @@
     },
     {
       "unique-id": "rel-spire-agent-server-x509pop",
-      "description": "Decided, not built (ADR-0049): node attestation of a guest with no vTPM (the banlieue firecracker provider class) by the x509pop attestor instead of the TPM one. The in-guest agent proves possession of the private key of a certificate its host signed for the guest's own key (EC P-256, the key never leaves the guest) and that chains to a CA in the per-host bundle; the agent ID is spiffe://<td>/spire/agent/x509pop/<issuer CN>/<subject CN>. The agent re-attests at about half its SVID lifetime and does not outlive its certificate (fail closed). Same transport as rel-spire-agent-server; keeps rel-spire-agent-server for every guest with a vTPM.",
+      "description": "Decided, not built (ADR-0049): node attestation of a guest with no vTPM (the banlieue firecracker provider class) by the x509pop attestor instead of the TPM one. The in-guest agent proves possession of the private key of a certificate its host signed for the guest's own key (EC P-256, the key never leaves the guest; obtained and renewed by mediatore node-cert over rel-node-cert-host-signer, the chain it returned presented as intermediates) and that chains to a CA in the per-host bundle; the agent ID is spiffe://<td>/spire/agent/x509pop/<issuer CN>/<subject CN>. The agent re-attests at about half its SVID lifetime and does not outlive its certificate (fail closed). Same transport as rel-spire-agent-server; keeps rel-spire-agent-server for every guest with a vTPM.",
       "relationship-type": {
         "connects": {
           "source": {
@@ -1090,6 +1100,38 @@
         }
       },
       "protocol": "HTTPS",
+      "metadata": {
+        "status": "planned"
+      }
+    },
+    {
+      "unique-id": "rel-node-cert-host-signer",
+      "description": "Decided, not built (ADR-0049 Decisions 5 and 6, amended 2026-11-24; banlieue ADR-0146): one request per connection on the guest's own vsock, port 1025, to the per-guest signer the host's banlieue provider runs (banlieue-attestation-ca): a PEM CSR and a half-close out; the PEM leaf followed by the host CA's chain (none for a self-signed host CA) back. The signer takes only the public key, sets the subject CN to the machine's UID, CA:FALSE, digitalSignature, a bounded validity, and rate-limits per guest. The peer is the guest by construction (the socket is that guest's alone), so no identity is exchanged on this leg. Built and tested on the host side for Cloud Hypervisor; Firecracker reuses the same contract.",
+      "relationship-type": {
+        "connects": {
+          "source": {
+            "node": "service-node-cert"
+          },
+          "destination": {
+            "node": "system-banlieue"
+          }
+        }
+      },
+      "metadata": {
+        "status": "planned"
+      }
+    },
+    {
+      "unique-id": "rel-node-cert-spire-agent",
+      "description": "Decided, not built (ADR-0049 Decision 5, amended 2026-11-24): the x509pop agent reads the key and the certificate node-cert wrote (private_key_path; certificate_path, the leaf followed by the host CA's chain, with no intermediates_path, which SPIRE refuses when it holds no certificate) at start and at every re-attestation; the agent's unit requires the fetch oneshot, so it never starts without a certificate.",
+      "relationship-type": {
+        "interacts": {
+          "actor": "service-spire-agent",
+          "nodes": [
+            "service-node-cert"
+          ]
+        }
+      },
       "metadata": {
         "status": "planned"
       }

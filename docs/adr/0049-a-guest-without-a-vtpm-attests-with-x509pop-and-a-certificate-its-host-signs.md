@@ -3,7 +3,7 @@
 
 # ADR-0049: A guest without a vTPM attests with `x509pop`, using a certificate its host signs for the guest's own key
 
-**Status:** Accepted; the control-plane side implemented and released in v0.4.0 · **Date:** 2026-11-19 · **Proposed:** 2026-11-18
+**Status:** Accepted; the control-plane side implemented and released in v0.4.0 · **Date:** 2026-11-19 · **Proposed:** 2026-11-18 · **Amended:** 2026-11-24 (Decision 5: the guest helper is a Rust subcommand, `mediatore node-cert`, with no `openssl` or Python, and the certificate's lifetime is the host's; Decision 6: the reply is the leaf followed by the host CA's chain, as banlieue ADR-0146 Decision 7 has the signer send it)
 
 Builds on [ADR-0004](0004-spiffe-identity-scheme.md) (the identity scheme),
 [ADR-0006](0006-registration-entries-as-clusterstaticentry.md) (no SPIRE admin identity,
@@ -115,14 +115,56 @@ have had.
 
 ### 5. Certificates are renewed in the guest, over vsock, before they expire
 
-A guest unit, before the agent starts, makes the key (if absent) and the CSR with `openssl`
-and requests a certificate on vsock port 1025 (banlieue ADR-0137 Decision 6); it fails
+A guest unit, before the agent starts, makes the key (if absent) and the CSR and requests a
+certificate on vsock port 1025 (banlieue ADR-0137 Decision 6, ADR-0146 Decision 2); it fails
 closed: no certificate, no agent, with retry and backoff as the prototype showed. A second
 loop renews at half the remaining life, with the same key, so the node ID is unchanged. A
 renewal that keeps failing ends the agent one SVID lifetime after the certificate's expiry:
-fail closed, as for any lost root of trust. The certificate lifetime and the renewal
-fraction are configuration, set at implementation from the sandbox's own life, and are not
-decided here.
+fail closed, as for any lost root of trust.
+
+*Amended 2026-11-24.* The helper is the `mediatore` binary the guest already runs
+(ADR-0014), as a role of its own, `mediatore node-cert`, in `mediatore-guest`, written in
+Rust with no subprocess: no `openssl`, no Python, nothing in the image that the other roles
+do not already need. The prototype's shell helper is not carried forward. A minimal or
+read-only guest root (banlieue ADR-0142's shared microvm root) has no interpreter to add,
+and the host's half is pure Rust for the same reason (banlieue ADR-0143 Decision 6).
+
+- **Two modes, two units.** `mediatore node-cert fetch` is the oneshot the agent's unit
+  `Requires=` and is ordered after: it obtains a certificate or exits non-zero, so the agent
+  never starts without one. `mediatore node-cert renew` is long-running beside the agent: it
+  sleeps to half the remaining life of the certificate on disk, fetches again with the same
+  key, and repeats. A failed renewal keeps the current files (still valid) and retries; it
+  never deletes them.
+- **Unprivileged.** Both run as the agent's own user (`spire`), which must read the key
+  anyway. Connecting a vsock stream needs no capability, so the helper has none, and the
+  agent's unit no longer needs the vTPM devices or the `tss` group.
+- **The key** is EC P-256 (Decision 3), generated in process, written `0600` under the
+  agent's runtime directory (`/run/spire/x509pop/`), and never sent: only the CSR leaves.
+  It lives on `tmpfs` and is new at each boot. Nothing depends on it surviving one, because
+  the agent ID is the issuer and subject CNs (Decision 2), not the key or the fingerprint.
+- **The files** are two: the key, and the certificate as one file, the leaf followed by
+  the chain (Decision 6). Each is written to a temporary name and renamed, so the agent,
+  which re-reads them at every re-attestation, never sees a half-written one or a leaf
+  without its chain. The agent configuration names them as `private_key_path` and
+  `certificate_path`, which takes "the identity certificate followed by any intermediate
+  certificates". There is no `intermediates_path`: SPIRE refuses one that holds no
+  certificate ("no certificates found in file"), and that is every self-signed host CA's
+  case.
+- **What the guest checks in the reply.** The reply is size-capped; it must parse as PEM
+  certificates; the leaf's public key must be the guest's own (a host answering with another
+  key's certificate is refused before the agent ever sees it); the leaf must be valid now.
+  The guest does not check the subject: it does not name itself (Decision 3), and the
+  server's chain verification and the declared node entry are the checks that count.
+- **Lifetime is the host's.** The signer chooses the validity, bounded by the host install
+  to between five minutes and seven days (`--attestation-certificate-ttl`, banlieue
+  ADR-0146 Decision 5). The guest reads `notAfter` from what it received and renews at half
+  of what remains; it asks for no lifetime and has no setting for one. The fraction, one
+  half, matches the agent's own re-attestation cadence (*What the prototype showed*).
+- **Backoff respects the host's rate limit.** The signer accepts a bounded number of
+  requests per guest per window and drops the rest; the helper's first retries are spaced so
+  that the first minute stays under it, and later ones are capped, never tight.
+- **Never logged:** the key, the CSR and the certificate bodies. The log carries the
+  certificate's serial, issuer CN and `notAfter`.
 
 ### 6. The wire protocol is one request per connection, bounded
 
@@ -130,6 +172,14 @@ The guest sends a PEM CSR and half-closes; the host answers with a PEM certifica
 closes. The request is capped (the prototype's was 363 bytes); a non-EC-P-256 key, an
 oversized request or a malformed CSR is refused without a reply. The provider never logs a
 certificate request body.
+
+*Amended 2026-11-24.* The answer is the PEM leaf **followed by the host CA's chain**, up to
+but not including the root, when the host CA was signed by an upstream PKI (banlieue
+ADR-0146 Decision 7, the signer's `ca-chain.pem`); for a self-signed host CA it is the leaf
+alone, which is the original case. The guest writes the reply's certificates, leaf first,
+as its agent's certificate bundle, and the agent presents the rest as intermediates, so the server's bundle
+can hold the root and not one entry per host (ADR-0050). The guest caps the reply, as the
+host caps the request.
 
 ### 7. The node key is the SHA-256 of the agent ID
 
@@ -166,15 +216,20 @@ Decision 6 (Proposed) designs that, so it is not built here.
 - A compromised host can still mint certificates for its own guests. Nothing here
   attests the software on the host or in the guest (the TPM design does not either: it
   proves a key, not a measurement). A guest is trusted as far as the host that signed it.
-- The guest image needs `openssl` and Python (or an equivalent) for the helper, and the unix
-  workload attestor needs `discover_workload_path = true`. The earlier join-token layer in the
-  sandbox's image build is replaced by a certificate layer.
+- The guest image needs nothing new for the helper (*amended 2026-11-24*: it is the
+  `mediatore node-cert` role of the binary already there, not `openssl` and Python): two
+  units and an agent configuration with the `x509pop` attestor block, and the unix
+  workload attestor keeps `discover_workload_path = true`. The earlier join-token layer in
+  the sandbox's image build is replaced by a certificate layer.
 - Threat model: a new trust anchor class (per-host signing CAs), a new vsock request path
   (bounded), and the removal of a server-side minting path that was never built. Pass due when
   implemented.
 - Accepted, partly implemented: the control-plane side is in `crates/mediatore-spire/src/x509pop.rs`
   (the agent ID, the CA common-name checks, node entry rendering beside the TPM one); the claim
-  watcher, the guest helper, the host signer and the image are not. Open: the lifetime and renewal fraction; whether
+  watcher, the guest helper and the image are not; the host signer is built on the banlieue
+  side for Cloud Hypervisor (banlieue ADR-0146, `banlieue-attestation-ca`), so the helper is
+  proven there first and Firecracker reuses it unchanged. Settled 2026-11-24: the lifetime
+  is the host's and the renewal fraction one half (Decision 5). Open: whether
   to reuse the SKI as the subject for a key-bound ID (untested); RSA and ed25519 keys; the
   bundle-rendering check for unique CNs (the check exists as `refuse_duplicate_common_names`;
   mediatore has no bundle-rendering code, the bundle is a deploy file, and ADR-0050 moves

@@ -38,6 +38,10 @@ hex.workspace = true
 base64.workspace = true
 tar.workspace = true
 flate2.workspace = true
+# The node-cert role (ADR-0049 Decision 5, amended 2026-11-24): the guest's EC P-256 key and
+# CSR on the aws-lc-rs provider, and the host's reply parsed as X.509, all in process.
+rcgen = { workspace = true, features = ["pem"] }
+x509-cert.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
@@ -55,6 +59,9 @@ libc.workspace = true
 
 [dev-dependencies]
 mediatore-testkit.workspace = true
+# node-cert: a private directory per test, and the fake signer's validity times.
+tempfile.workspace = true
+time.workspace = true
 
 [features]
 # `--dev-spiffe-id`: a peer-identity header instead of mTLS, for the loopback dev loop only.
