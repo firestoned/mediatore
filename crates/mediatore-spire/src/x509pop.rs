@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 use x509_cert::Certificate;
 use x509_cert::der::asn1::{PrintableStringRef, Utf8StringRef};
 use x509_cert::der::oid::ObjectIdentifier;
+use x509_cert::ext::pkix::BasicConstraints;
 
 use crate::kube::ClusterStaticEntrySpec;
 use crate::{GUEST_AGENT_PATH, Naming, SpireError, node_entry_name, validate_ek_hash};
@@ -117,6 +118,28 @@ fn common_name_of(cert: &Certificate) -> Result<String, SpireError> {
     }
 }
 
+/// Refuse a certificate that is not a host CA in the sense ADR-0049 decision 2 needs:
+/// `basicConstraints` with `cA` true and a path length of zero. The server names an agent
+/// after its leaf's *immediate* issuer (ADR-0050's prototype table), so a CA free to sign
+/// another CA could sign one that carries a different host's common name, and its leaves
+/// would attest under that host's name. With a path length of zero the server's own chain
+/// validation refuses such a chain, and the name a leaf attests under is the bundle CA's.
+/// `cn` is only for the message.
+fn refuse_unconfined_ca(cert: &Certificate, cn: &str) -> Result<(), SpireError> {
+    match cert.tbs_certificate().get_extension::<BasicConstraints>() {
+        Ok(Some((_, bc))) if bc.ca && bc.path_len_constraint == Some(0) => Ok(()),
+        Ok(Some((_, bc))) if bc.ca => Err(SpireError::Invalid(format!(
+            "CA {cn:?} may sign further CAs; its path length constraint must be 0"
+        ))),
+        Ok(_) => Err(SpireError::Invalid(format!(
+            "certificate {cn:?} is not a CA (basicConstraints with cA true is required)"
+        ))),
+        Err(e) => Err(SpireError::Invalid(format!(
+            "certificate {cn:?}: basicConstraints does not parse: {e}"
+        ))),
+    }
+}
+
 fn parse_certs(pem: &str) -> Result<Vec<Certificate>, SpireError> {
     let certs = Certificate::load_pem_chain(pem.as_bytes())
         .map_err(|e| SpireError::Invalid(format!("CA bundle: {e}")))?;
@@ -131,13 +154,17 @@ pub fn ca_bundle_common_names(pem: &str) -> Result<Vec<String>, SpireError> {
     parse_certs(pem)?.iter().map(common_name_of).collect()
 }
 
-/// Refuse a bundle in which two CAs share a common name, or any name that cannot be an
-/// agent-ID segment. The agent ID is issuer-qualified, so a duplicate removes the
-/// confinement (ADR-0049 decision 2). The error names the duplicate.
+/// Refuse a bundle in which two CAs share a common name, any name that cannot be an
+/// agent-ID segment, or any member that is not a CA with a path length of zero
+/// ([`refuse_unconfined_ca`]). The agent ID is issuer-qualified, so a duplicate, or a CA
+/// that can make another CA under any name, removes the confinement (ADR-0049 decision 2).
+/// The error names the certificate.
 pub fn refuse_duplicate_common_names(pem: &str) -> Result<(), SpireError> {
     let mut seen = BTreeSet::new();
-    for cn in ca_bundle_common_names(pem)? {
+    for cert in parse_certs(pem)? {
+        let cn = common_name_of(&cert)?;
         validate_common_name(&cn)?;
+        refuse_unconfined_ca(&cert, &cn)?;
         if !seen.insert(cn.clone()) {
             return Err(SpireError::Invalid(format!(
                 "two CAs in the bundle share the common name {cn:?}; every CA needs a unique one"
@@ -148,11 +175,17 @@ pub fn refuse_duplicate_common_names(pem: &str) -> Result<(), SpireError> {
 }
 
 /// Common name of a host's signing CA: the PEM must hold exactly one certificate
-/// (`Provider.spec.attestation.hostCa` is a single certificate).
+/// (`Provider.spec.attestation.hostCa` is a single certificate), and it must be a CA with
+/// a path length of zero ([`refuse_unconfined_ca`]): no node entry is rendered under the
+/// name of a CA that could hand that name's standing to another.
 pub fn host_ca_common_name(pem: &str) -> Result<String, SpireError> {
     let certs = parse_certs(pem)?;
     match <[Certificate; 1]>::try_from(certs) {
-        Ok([cert]) => common_name_of(&cert),
+        Ok([cert]) => {
+            let cn = common_name_of(&cert)?;
+            refuse_unconfined_ca(&cert, &cn)?;
+            Ok(cn)
+        }
         Err(all) => Err(SpireError::Invalid(format!(
             "host CA must be exactly one certificate, found {}",
             all.len()
@@ -232,14 +265,61 @@ mod tests {
 
     const TD: &str = "sandbox.test";
 
+    /// A host CA as ADR-0049 decision 2 needs it: a CA that may sign no further CA.
     fn ca_pem(cn: &str) -> String {
+        cert_pem(cn, IsCa::Ca(BasicConstraints::Constrained(0)))
+    }
+
+    /// A self-signed certificate named `cn` with the given `basicConstraints`.
+    fn cert_pem(cn: &str, is_ca: IsCa) -> String {
         let mut p = CertificateParams::new(Vec::<String>::new()).unwrap();
         let mut dn = DistinguishedName::new();
         dn.push(DnType::CommonName, cn);
         p.distinguished_name = dn;
-        p.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        p.is_ca = is_ca;
         let key = KeyPair::generate().unwrap();
         p.self_signed(&key).unwrap().pem()
+    }
+
+    /// The shapes that are not a host CA: one that may sign further CAs (no path length,
+    /// or one above zero), and a certificate that is no CA at all (the extension saying so,
+    /// or absent).
+    fn not_host_cas(cn: &str) -> [String; 4] {
+        [
+            cert_pem(cn, IsCa::Ca(BasicConstraints::Unconstrained)),
+            cert_pem(cn, IsCa::Ca(BasicConstraints::Constrained(1))),
+            cert_pem(cn, IsCa::ExplicitNoCa),
+            cert_pem(cn, IsCa::NoCa),
+        ]
+    }
+
+    #[test]
+    fn a_bundle_ca_that_may_sign_further_cas_or_is_no_ca_is_refused() {
+        // ADR-0049 decision 2 rests on a CA minting IDs under its own name alone. The
+        // server names an agent after its leaf's immediate issuer, so a CA free to sign a
+        // CA could sign one carrying another host's name.
+        for refused in not_host_cas("host-b") {
+            let pem = format!("{}{refused}", ca_pem("host-a"));
+            let err = refuse_duplicate_common_names(&pem).unwrap_err().to_string();
+            assert!(err.contains("host-b"), "the refusal names the CA: {err}");
+        }
+        refuse_duplicate_common_names(&bundle(&["host-a", "host-b"])).unwrap();
+    }
+
+    #[test]
+    fn a_host_ca_that_may_sign_further_cas_or_is_no_ca_gives_no_attestation() {
+        for refused in not_host_cas("host-a") {
+            assert!(host_ca_common_name(&refused).is_err());
+            let input = X509popInput {
+                host_ca_pem: refused,
+                attestation_subject: "vm-1".into(),
+            };
+            assert!(
+                input.attestation().is_err(),
+                "no node entry for such a host"
+            );
+        }
+        assert_eq!(host_ca_common_name(&ca_pem("host-a")).unwrap(), "host-a");
     }
 
     fn bundle(cns: &[&str]) -> String {
