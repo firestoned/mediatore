@@ -56,6 +56,8 @@ the component that finishes the story.
   boundaries, token shapes and SPIFFE ID scheme.
 - [Threat model](security/threat-model.md): the living STRIDE pass over every trust boundary,
   re-verified after each implemented ADR.
+- [NIST AI 800-1 crosswalk](security/nist-ai-800-1.md): which of NIST's practices for managing
+  misuse risk mediatore covers, with the control for each, and the gaps.
 
 ## Project
 
