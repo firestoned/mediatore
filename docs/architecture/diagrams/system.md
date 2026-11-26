@@ -23,6 +23,7 @@ marked today, if any:
 
 - `service-node-cert` (planned)
 - `data-asset-host-signing-ca-bundle` (planned)
+- `data-asset-trap-draw` (planned)
 
 ```mermaid
 flowchart LR
@@ -63,6 +64,7 @@ flowchart LR
     data-asset-os-credential-store["The requester's saved credential (OS credential store)"]
     data-asset-workload-output["Workload output (the Secret ring)"]
     data-asset-host-signing-ca-bundle["Per-host signing CA bundle (x509pop trust anchors, ADR-0049) (planned)"]
+    data-asset-trap-draw["The claim's tripwire draw (ADR-0069) (planned)"]
     subgraph sg_system-mediatore [System Mediatore]
         service-mediatore-user-api
         service-mediatore-sandbox-api
@@ -79,6 +81,7 @@ flowchart LR
         service-node-cert
         service-egress-proxy
         service-sandbox-workload
+        data-asset-trap-draw
     end
     subgraph sg_network-sandbox-segment [Network Sandbox Segment]
         system-sandbox-vm
@@ -155,6 +158,11 @@ flowchart LR
     service-node-cert --> system-banlieue
     service-spire-agent --> service-node-cert
     service-egress-gateway -->|TCP| ecosystem-oci-registry
+    service-guest-agent --> data-asset-trap-draw
+    service-egress-proxy --> service-guest-agent
+    service-sandbox-workload -->|TCP| service-guest-agent
+    service-guest-agent -->|mTLS| service-mediatore-sandbox-api
+    service-mediatore-sandbox-api -->|HTTPS| data-asset-claim-store
 ```
 
 <sub>Source: nodes and relationships in `architecture.json`.</sub>

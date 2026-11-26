@@ -10,15 +10,18 @@ decided there, before anything leaves it: the gateway never sees a decoy, a bait
 draw, and its part is unchanged. The first use of one is taken as proof that the workload is no longer
 doing what it was asked (a prompt injection, a hijacked agent, a malicious dependency), and the
 sandbox is ended: the jail's network is cut and its processes killed on the VM at once, the claim
-is released at the broker, and the VM goes back to banlieue. Needs an ADR (provisionally
-ADR-0067, not yet written; take the next free number when it is drafted): it adds a route to the
-node surface, a field to the claim's record and a condition to the
-`AgentSandbox` status, and a section to the policy bundle.
+is released at the broker, and the VM goes back to banlieue. Decided in
+[ADR-0069](../../docs/adr/0069-tripwires-on-the-vm-a-decoy-the-workload-takes-ends-its-sandbox.md)
+(Proposed): it adds a route to the node surface, a field to the claim's record, a field and a
+condition to the `AgentSandbox` status, a section to the policy bundle, and the broker's first
+OpenTelemetry signals. Every trip event, and the host or port it reached for, is recorded in the
+audit line and on the sandbox's status, and exported as spans and metrics.
 
 Builds on roadmap 06 (the jail and its nftables table, ADR-0020), roadmap 07 (the egress proxy,
 ADR-0025), roadmap 08 (the `AgentSandbox` status), and roadmaps 09 and 11 (the signed bundle).
 Roadmap 10's gateway is not changed. Uses ADR-0033's ending of a claim from the
-guest and ADR-0045's log stream. Roadmap 16, when it lands, lets a trip name the binary that took
+guest, ADR-0045's log stream and ADR-0064's status summary. The OpenTelemetry part waits on
+roadmap 15's export ADR and phase 1 foundations. Roadmap 16, when it lands, lets a trip name the binary that took
 the bait.
 
 ## Why
@@ -79,7 +82,8 @@ signal strong enough to justify ending the sandbox without a person in the loop.
    is revoked.
 10. **Shadow first.** `policy.traps: off | shadow | enforce`, refused at start when it is anything
    else. In `shadow` a trap logs and reports `would_trip` and ends nothing, as ADR-0030 and
-   ADR-0061 rolled out.
+   ADR-0061 rolled out. `off` is the default (ADR-0069 decision 5): arming traps changes every
+   workload's environment, which an operator turns on deliberately.
 
 ## Assume the attacker has read this
 
@@ -187,7 +191,7 @@ sees a service, not a closed port.
 | 10250 | the kubelet |
 | 11211 | memcached |
 | 27017 | MongoDB |
-| `169.254.169.254:80` | a cloud metadata service (an address the guest adds to `lo`) |
+| `169.254.169.254:80` | a cloud metadata service (the sandbox uid's packets redirected to a drawn loopback listener; ADR-0068's drop holds for every other uid) |
 | any other port in 1024 to 65535 | a forgotten dev server; at least one per draw, answering as an HTTP server |
 
 The seed ports above are only more likely than the rest. Under `enforce`, a connection to a
@@ -296,6 +300,11 @@ that greps its home directory. The files above are bait; only sending what is in
 
 ## The design questions for the ADR
 
+ADR-0069 answers these. Where it differs from a proposal below, the ADR stands: the body is
+streamed through a matcher that holds back the longest pattern rather than buffered with a `413`
+(decision 6); `off` is the default mode (decision 5); `denied` targets trip per class, `report`
+by default (decision 10); the canaries are not kept or hashed after the claim.
+
 1. **Kill or quarantine.** Ending the VM destroys what a responder would want to look at. The
    alternative keeps it frozen and cut off for a bounded time before the release. Proposed: kill
    by default, since a compromised VM kept running is a risk of its own and the log stream holds
@@ -357,9 +366,10 @@ that greps its home directory. The files above are bait; only sending what is in
 
 ### Phase 0: design
 
-- [ ] The ADR written and accepted, the questions above decided.
-- [ ] CALM: the guest's `trip` flow, `POST /v1/me/trip`, the record's
-      `tripped`; `make calm-validate` and `make calm-diagrams`.
+- [ ] ADR-0069 accepted (drafted 2026-11-26, Proposed).
+- [x] CALM (2026-11-26): `data-asset-trap-draw`, the guest's, the proxy's and the workload's decoy
+      relationships, `POST /v1/me/trip`, the record and status writes, `flow-tripwire`;
+      `make calm-validate` and `make calm-diagrams` pass.
 - [ ] notaio: the bundle's `traps` section agreed with its schema, if question 2 puts it there.
 
 ### Phase 1: containment on the guest
@@ -376,7 +386,15 @@ that greps its home directory. The files above are bait; only sending what is in
 - [ ] `POST /v1/me/trip` on the node surface: the node's SVID only, the claim bound to it, the
       body validated; `tripped` written by compare-and-set, then the release.
 - [ ] A tripped claim is not restarted (ADR-0033) and its token is refused at `POST /v1/token`.
-- [ ] The `Tripped` condition on `AgentSandbox`, the reconciler's no-reclaim rule, the CLI's view.
+- [ ] The `Tripped` condition on `AgentSandbox`, the reconciler's no-reclaim rule, the
+      acknowledgement annotation, the CLI's view.
+- [ ] Every event recorded (ADR-0069 decision 9): the audit line; `status.tripwires`, bounded to
+      16 entries, written by compare-and-set apart from the record and ignored by the
+      controller's watch filter; its CRD schema in both served versions.
+- [ ] OpenTelemetry in the broker (ADR-0069 decision 11), once roadmap 15's foundations exist: the
+      `mediatore.trip.report` span and its events, the five instruments, the schema additions;
+      `drawn` targets exported, `workload` targets as their class only. The cardinality test and
+      the bait canary scan over every exported signal.
 - [ ] e2e in `crates/mediatore/tests/e2e_dev.rs`: a trip ends the claim; a trip from a
       non-node peer, from another claim's node and for a revoked claim are refused or no-ops; a
       second trip is idempotent.

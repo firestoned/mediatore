@@ -47,13 +47,13 @@
       "unique-id": "data-asset-agentsandbox-cr",
       "node-type": "data-asset",
       "name": "AgentSandbox resources",
-      "description": "Namespaced CRD mediatore.io/v1beta1 (v1alpha1 until ADR-0048, 2026-11-18; v1alpha1 served beside it as the same object, deprecated, conversion None, ADR-0049), served and reconciled by mediatore (ADR-0008, built: roadmap 08; created through the broker only in a namespace of sandboxes.namespaces that the caller's groups admit, ADR-0046; schema generated from the Rust type into deploy/base/crds). The request for one sandbox: subject, poolRef or poolSelector (exactly one, by CEL; poolSelector: {} is every pool in the namespace, an omitted field never is; the pool bound from is mirrored into status.poolRef, ADR-0044), selection (optional; strategy LongestReady, MostAvailable or Spread, how banlieue ranks the Ready members of the matched pools; absent is LongestReady and mediatore writes no default; copied to the claim verbatim, ADR-0047), ttlSeconds, audiences, workload. Created by the user API on POST /v1/claims or declaratively by anything with RBAC on agentsandboxes; spec.subject is pinned to the caller by the mediatore-agentsandbox-subject admission policy unless the caller is mediatore's ServiceAccount or a listed broker, and the whole spec is immutable afterwards. Never carries a credential. Owns exactly one VirtualMachineClaim; a finalizer holds it until the claim and its ClusterStaticEntry are gone. Status mirrors the claim plus whether the entry is set. ADR-0026 (implemented) adds spec.policyRef, the name of a SandboxPolicy in the sandbox's namespace, optional and immutable with the rest of the spec; naming a policy grants nothing in shadow, and under policy.egress: enforce it is what admits the bundle's direct egress (ADR-0030). ADR-0045 adds spec.workload.logs, the requester's opt-in to output capture (boolean, default false, immutable with the rest of the spec)."
+      "description": "Namespaced CRD mediatore.io/v1beta1 (v1alpha1 until ADR-0048, 2026-11-18; v1alpha1 served beside it as the same object, deprecated, conversion None, ADR-0049), served and reconciled by mediatore (ADR-0008, built: roadmap 08; created through the broker only in a namespace of sandboxes.namespaces that the caller's groups admit, ADR-0046; schema generated from the Rust type into deploy/base/crds). The request for one sandbox: subject, poolRef or poolSelector (exactly one, by CEL; poolSelector: {} is every pool in the namespace, an omitted field never is; the pool bound from is mirrored into status.poolRef, ADR-0044), selection (optional; strategy LongestReady, MostAvailable or Spread, how banlieue ranks the Ready members of the matched pools; absent is LongestReady and mediatore writes no default; copied to the claim verbatim, ADR-0047), ttlSeconds, audiences, workload. Created by the user API on POST /v1/claims or declaratively by anything with RBAC on agentsandboxes; spec.subject is pinned to the caller by the mediatore-agentsandbox-subject admission policy unless the caller is mediatore's ServiceAccount or a listed broker, and the whole spec is immutable afterwards. Never carries a credential. Owns exactly one VirtualMachineClaim; a finalizer holds it until the claim and its ClusterStaticEntry are gone. Status mirrors the claim plus whether the entry is set. ADR-0026 (implemented) adds spec.policyRef, the name of a SandboxPolicy in the sandbox's namespace, optional and immutable with the rest of the spec; naming a policy grants nothing in shadow, and under policy.egress: enforce it is what admits the bundle's direct egress (ADR-0030). ADR-0045 adds spec.workload.logs, the requester's opt-in to output capture (boolean, default false, immutable with the rest of the spec). ADR-0069 (Proposed, planned) adds status.tripwires, every trip event the broker accepted for the claim folded per kind, trap and target (at most 16 entries and an overflow count, an enforce entry never evicted, written by compare-and-set apart from the record and ignored by the controller's watch filter), the Tripped condition, and the mediatore.io/trip-acknowledged annotation without which, or a spec change, a tripped sandbox is not claimed again. Never a bait value, a path or a body; a target the workload chose is within the host grammar."
     },
     {
       "unique-id": "data-asset-claim-store",
       "node-type": "data-asset",
       "name": "Claim Store (the Kubernetes API)",
-      "description": "What the broker remembers, in the Kubernetes API (ADR-0034, superseding the database of ADR-0012): the claim record on the AgentSandbox status (status.record, the store's alone: the SPIRE entry id, the node, the bind deadline, the revocation, the policy incarnation and bundle version, the guest's report, the workload's exit, and since ADR-0061 what the guest was handed at its first GET /v1/me (bundle version and digest, routes and rules, egress) and the follow rule's last refusal; the claim UID and the node as labels), the sealed refresh envelope in a Secret owned by the sandbox (key id, nonce, AES-256-GCM ciphertext bound to the sandbox UID; parked by the API, claimed by the reconciler, rotated at every mint, emptied on revocation), attested nodes as SandboxNode resources (EK hash, agent SPIFFE ID, DMI UUID, banned), removed by the watcher once no VM publishes their EK hash (ADR-0039), notaio's version floors as PolicyFloor resources moved by compare-and-set on resourceVersion. Since ADR-0057 an update of a claim's record is conditional on the resourceVersion it was read at, a release carries no precondition, the status is written before the Secrets, and the record names its sandbox (sandboxUid, namespace). An ended claim is held by its finalizer for store.retention_secs and then swept, the audit line in the log. In memory under dev_mode only. ADR-0043 decision 4: the sealed envelope in a claim's Secret is deleted, not blanked, when the claim is released, and an envelope for a claim that never binds is deleted when the claim's ttl_seconds has passed counted from creation; the released-claim marker moves to the AgentSandbox status record. ADR-0045 adds the workload output ring beside the session Secrets (data-asset-workload-output)."
+      "description": "What the broker remembers, in the Kubernetes API (ADR-0034, superseding the database of ADR-0012): the claim record on the AgentSandbox status (status.record, the store's alone: the SPIRE entry id, the node, the bind deadline, the revocation, the policy incarnation and bundle version, the guest's report, the workload's exit, and since ADR-0061 what the guest was handed at its first GET /v1/me (bundle version and digest, routes and rules, egress) and the follow rule's last refusal; the claim UID and the node as labels), the sealed refresh envelope in a Secret owned by the sandbox (key id, nonce, AES-256-GCM ciphertext bound to the sandbox UID; parked by the API, claimed by the reconciler, rotated at every mint, emptied on revocation), attested nodes as SandboxNode resources (EK hash, agent SPIFFE ID, DMI UUID, banned), removed by the watcher once no VM publishes their EK hash (ADR-0039), notaio's version floors as PolicyFloor resources moved by compare-and-set on resourceVersion. Since ADR-0057 an update of a claim's record is conditional on the resourceVersion it was read at, a release carries no precondition, the status is written before the Secrets, and the record names its sandbox (sandboxUid, namespace). An ended claim is held by its finalizer for store.retention_secs and then swept, the audit line in the log. In memory under dev_mode only. ADR-0043 decision 4: the sealed envelope in a claim's Secret is deleted, not blanked, when the claim is released, and an envelope for a claim that never binds is deleted when the claim's ttl_seconds has passed counted from creation; the released-claim marker moves to the AgentSandbox status record. ADR-0045 adds the workload output ring beside the session Secrets (data-asset-workload-output). ADR-0069 (Proposed, planned) adds tripped to the record under policy.traps enforce: the first trip event (id, time, kind, trap, target, source), written by compare-and-set before the release; a record with tripped set is never restarted and its token is refused."
     },
     {
       "unique-id": "service-openbao",
@@ -95,13 +95,13 @@
       "unique-id": "data-asset-policy-bundles",
       "node-type": "data-asset",
       "name": "SandboxPolicy bundles (ConfigMaps)",
-      "description": "notaio's signed bundles, one ConfigMap per policy in each namespace listed in policy.namespaces. State notaio owns and the broker only reads: the broker's RBAC there is a Role granting get, list and watch on ConfigMaps and nothing else. A bundle is used only once it verifies against the configured keys at the current time and passes notaio's floor rule; one that fails is logged with its reason and changes nothing, an expired one leaves the cache. Under policy.egress: shadow (the default) a bundle is compared with the broker's configuration and reported, never enforced (ADR-0026, roadmap 09, done); under policy.egress: enforce its servable direct egress is served at the gateway (ADR-0030), and a gateway-placed audience must be one the claim's policy admits (ADR-0040). Which namespaces' bundles a sandbox may name is the broker's configuration, policy.sources (ADR-0054), never cluster state: a namespace's own bundles by default, an explicit list otherwise; being read (policy.namespaces) does not make a bundle nameable."
+      "description": "notaio's signed bundles, one ConfigMap per policy in each namespace listed in policy.namespaces. State notaio owns and the broker only reads: the broker's RBAC there is a Role granting get, list and watch on ConfigMaps and nothing else. A bundle is used only once it verifies against the configured keys at the current time and passes notaio's floor rule; one that fails is logged with its reason and changes nothing, an expired one leaves the cache. Under policy.egress: shadow (the default) a bundle is compared with the broker's configuration and reported, never enforced (ADR-0026, roadmap 09, done); under policy.egress: enforce its servable direct egress is served at the gateway (ADR-0030), and a gateway-placed audience must be one the claim's policy admits (ADR-0040). Which namespaces' bundles a sandbox may name is the broker's configuration, policy.sources (ADR-0054), never cluster state: a namespace's own bundles by default, an explicit list otherwise; being read (policy.namespaces) does not make a bundle nameable. ADR-0069 (Proposed, planned) adds a traps section: the deployment's own catalogue of possible tripwires (seed ports, host stems and suffixes, variable names each with a generator, the counts within built-in bounds), widening the public seeds and never narrowing them or carrying a literal value; admission refuses an entry that overlaps a grant of the same policy (the next free P code). Served to the guest on GET /v1/me, never to the proxy."
     },
     {
       "unique-id": "data-asset-audience-bundles",
       "node-type": "data-asset",
       "name": "SandboxAudience bundles (ConfigMaps)",
-      "description": "notaio's signed audience bundles (notaio ADR-0020, mediatore ADR-0055): one <audience>-audience ConfigMap per SandboxAudience, the envelope under audience.dsse.json, in the platform audience namespace (platform audiences, visible from every namespace) or a sandbox namespace (team audiences, usable only from that namespace). The kind is the namespace's, never a field of the bundle. Read with the same Role and keys as the policy bundles; verified under the audience payload type, so a policy bundle never verifies as one nor the reverse; a version floor per audience in the store beside the policy floors. Checked again on admission (a team audience's backend is secret or none and never OpenBao, no reserved header, exact DNS endpoints), and a name or endpoint two audiences share is refused for both from every namespace that sees both. Under policy.audience_definitions.mode: shadow they are compared with audiences[] and logged; the file still serves. The credentials they name are read under shadow too (rel-mediatore-audience-secrets, rel-mediatore-openbao-audience-kv) and only the outcome logged; under policy.audience_definitions.mode: bundles the catalog and those credentials serve the API and the watcher in place of audiences[] (ADR-0055, built): a team audience only to claims of its namespace, with 503 audiences_not_synced until the namespaces are listed."
+      "description": "notaio's signed audience bundles (notaio ADR-0020, mediatore ADR-0055): one <audience>-audience ConfigMap per SandboxAudience, the envelope under audience.dsse.json, in the platform audience namespace (platform audiences, visible from every namespace) or a sandbox namespace (team audiences, usable only from that namespace). The kind is the namespace's, never a field of the bundle. Read with the same Role and keys as the policy bundles; verified under the audience payload type, so a policy bundle never verifies as one nor the reverse; a version floor per audience in the store beside the policy floors. Checked again on admission (a team audience's backend is secret or none and never OpenBao, no reserved header, exact DNS endpoints), and a name or endpoint two audiences share is refused for both from every namespace that sees both. Under policy.audience_definitions.mode: shadow they are compared with audiences[] and logged; the file still serves. The credentials they name are read under shadow too (rel-mediatore-audience-secrets, rel-mediatore-openbao-audience-kv) and only the outcome logged; under policy.audience_definitions.mode: bundles the catalog and those credentials serve the API and the watcher in place of audiences[] (ADR-0055, built): a team audience only to claims of its namespace, with 503 audiences_not_synced until the namespaces are listed. ADR-0069 (Proposed, planned) adds traps.body: skip, which marks an audience that carries the agent's own conversation (a model API) so the egress proxy matches bait in its headers, path and query and not its body."
     },
     {
       "unique-id": "data-asset-policy-trusted-keys",
@@ -167,7 +167,7 @@
       "unique-id": "service-guest-agent",
       "node-type": "service",
       "name": "mediatore guest",
-      "description": "Root daemon, the guest role of the one mediatore binary (ADR-0014): registers the node (EK hash + DMI UUID), then announces GuestReady to the hypervisor over the channel banlieue reads (the /run marker, guestinfo or vsock; ADR-0019), so the pool counts the member only once it is attested and registered; polls GET /v1/me for a bound claim, creates the per-subject user (sb- + 12 hex, ADR-0004), mounts a size-bounded tmpfs at /mnt/sandbox (nosuid, nodev, mode 0711 so the egress proxy reaches its files; ADR-0021 amended) and pulls the claim's workload image from its registry into it as the rootfs (with the operator's credential for that registry when the broker handed one over, used for the pull and kept nowhere; ADR-0022), manifest and layers verified against their digests, the manifest digest logged (ADR-0021), loads the per-claim nftables ruleset keyed by that uid (the broker, the audiences' egress endpoints, DNS; no ruleset, no jail; ADR-0020), bind-mounts the binary at the pinned path read-only into the jail and supervises the nsjail until the deadline, restarting the workload as its restart policy says (ADR-0033: always, on-failure, never) and, when the policy ends the claim, telling the broker how the workload exited (POST /v1/me/exit) so the claim is released, then tears down; what nsjail execs is the binary's jail-exec role, which applies Landlock to itself (the rootfs readable, /work, /tmp and the home writable, TCP connect to the egress proxy's port only, no bind) before the workload's argv runs, and a refusal (exit 125) ends the claim instead of restarting (ADR-0024). Since ADR-0025 it also generates the claim's phantom token, writes the routes GET /v1/me returned to a file of the sandbox user's, starts mediatore egress-proxy as that user outside the jail before the jail, and ends the claim if the proxy exits. crates/mediatore-guest. The ruleset has two shapes since ADR-0028 decision 6 (net::Shape): with gateways, from GET /v1/me or the pool's /etc/mediatore/gateways, the relay, the gateways and the proxy by address and no DNS rule at all, a broker or gateway given by name refusing the claim; without, ADR-0020's list, the broker, the audiences' endpoints resolved at load, the proxy and DNS. The pull trusts the mirror's CA beside the Mozilla roots when told (MEDIATORE_REGISTRY_CA, ADR-0029). Since ADR-0045, for a claim whose requester opted in (workload.logs), it spawns the jail with piped stdout and stderr, redacts every line before it leaves the VM (crates/mediatore-guest/src/redact.rs, logs.rs: the phantom and every secret-bearing environment value, and JWTs, Authorization values and private keys by shape; best effort, not a guarantee), writes the redacted copy to the console, and ships batches to the broker over the node SVID without ever blocking the workload; the last batch is flushed before the exit is reported."
+      "description": "Root daemon, the guest role of the one mediatore binary (ADR-0014): registers the node (EK hash + DMI UUID), then announces GuestReady to the hypervisor over the channel banlieue reads (the /run marker, guestinfo or vsock; ADR-0019), so the pool counts the member only once it is attested and registered; polls GET /v1/me for a bound claim, creates the per-subject user (sb- + 12 hex, ADR-0004), mounts a size-bounded tmpfs at /mnt/sandbox (nosuid, nodev, mode 0711 so the egress proxy reaches its files; ADR-0021 amended) and pulls the claim's workload image from its registry into it as the rootfs (with the operator's credential for that registry when the broker handed one over, used for the pull and kept nowhere; ADR-0022), manifest and layers verified against their digests, the manifest digest logged (ADR-0021), loads the per-claim nftables ruleset keyed by that uid (the broker, the audiences' egress endpoints, DNS; no ruleset, no jail; ADR-0020), bind-mounts the binary at the pinned path read-only into the jail and supervises the nsjail until the deadline, restarting the workload as its restart policy says (ADR-0033: always, on-failure, never) and, when the policy ends the claim, telling the broker how the workload exited (POST /v1/me/exit) so the claim is released, then tears down; what nsjail execs is the binary's jail-exec role, which applies Landlock to itself (the rootfs readable, /work, /tmp and the home writable, TCP connect to the egress proxy's port only, no bind) before the workload's argv runs, and a refusal (exit 125) ends the claim instead of restarting (ADR-0024). Since ADR-0025 it also generates the claim's phantom token, writes the routes GET /v1/me returned to a file of the sandbox user's, starts mediatore egress-proxy as that user outside the jail before the jail, and ends the claim if the proxy exits. crates/mediatore-guest. The ruleset has two shapes since ADR-0028 decision 6 (net::Shape): with gateways, from GET /v1/me or the pool's /etc/mediatore/gateways, the relay, the gateways and the proxy by address and no DNS rule at all, a broker or gateway given by name refusing the claim; without, ADR-0020's list, the broker, the audiences' endpoints resolved at load, the proxy and DNS. The pull trusts the mirror's CA beside the Mozilla roots when told (MEDIATORE_REGISTRY_CA, ADR-0029). Since ADR-0045, for a claim whose requester opted in (workload.logs), it spawns the jail with piped stdout and stderr, redacts every line before it leaves the VM (crates/mediatore-guest/src/redact.rs, logs.rs: the phantom and every secret-bearing environment value, and JWTs, Authorization values and private keys by shape; best effort, not a guarantee), writes the redacted copy to the console, and ships batches to the broker over the node SVID without ever blocking the workload; the last batch is flushed before the exit is reported. ADR-0069 (Proposed, planned): under policy.traps shadow or enforce (served on GET /v1/me, off by default) the guest draws the claim's tripwires at boot from the OS CSPRNG (data-asset-trap-draw): decoy loopback listeners it owns and answers with a plausible first line, the sandbox uid's redirect of 169.254.169.254:80 to one of them (a nat output rule keyed on that uid in the claim's table, so ADR-0068's drop holds for every other uid), decoy routes and bait credentials it hands to the egress proxy and plants in the jail's environment and the sandbox user's home. On a trip, from a listener or from the proxy, it replaces the sandbox uid's chain with a drop of everything in one nft transaction (cutting the jail and the proxy, never its own path), kills the jail's process tree, flushes the ADR-0045 output and reports POST /v1/me/trip, retried until acknowledged; containment never waits on the broker. Under enforce a guest that cannot arm its traps does not report ready."
     },
     {
       "unique-id": "service-node-cert",
@@ -182,13 +182,13 @@
       "unique-id": "service-sandbox-workload",
       "node-type": "service",
       "name": "Jailed Workload",
-      "description": "Runs under nsjail as the per-subject user in a read-only rootfs unpacked from the claim's image onto a per-claim tmpfs (ADR-0021), with only the binary mounted in and /work writable, in the VM's network namespace behind an nftables chain keyed by its uid (ADR-0020); and under Landlock, applied by its own process before the first instruction of the workload (mediatore jail-exec, ADR-0024): writes only to /work, /tmp and the home whatever the image's file modes say, TCP connect to the egress proxy's loopback port and no other, no TCP bind, signals and abstract sockets scoped to the jail, inherited by every child. And a third layer in the same process (ADR-0051, crates/mediatore-guest/src/seccomp.rs): a seccomp filter applied after Landlock that refuses every socket family but AF_UNIX, AF_INET and AF_INET6, any inet socket that is not a stream, and io_uring, so a vsock, a UDP socket or an io_uring socket operation no longer depends on the nftables chain or on a dropped capability. Holds no credential: since ADR-0025 the Workload API socket is not mounted, the broker is unreachable, and the jail's environment carries MEDIATORE_EGRESS_PROXY (http://127.0.0.1:3128) and MEDIATORE_TOKEN, a phantom the proxy swaps for the real token on the way out. The binary stays mounted read-only for jail-exec (ADR-0014, ADR-0024)."
+      "description": "Runs under nsjail as the per-subject user in a read-only rootfs unpacked from the claim's image onto a per-claim tmpfs (ADR-0021), with only the binary mounted in and /work writable, in the VM's network namespace behind an nftables chain keyed by its uid (ADR-0020); and under Landlock, applied by its own process before the first instruction of the workload (mediatore jail-exec, ADR-0024): writes only to /work, /tmp and the home whatever the image's file modes say, TCP connect to the egress proxy's loopback port and no other, no TCP bind, signals and abstract sockets scoped to the jail, inherited by every child. And a third layer in the same process (ADR-0051, crates/mediatore-guest/src/seccomp.rs): a seccomp filter applied after Landlock that refuses every socket family but AF_UNIX, AF_INET and AF_INET6, any inet socket that is not a stream, and io_uring, so a vsock, a UDP socket or an io_uring socket operation no longer depends on the nftables chain or on a dropped capability. Holds no credential: since ADR-0025 the Workload API socket is not mounted, the broker is unreachable, and the jail's environment carries MEDIATORE_EGRESS_PROXY (http://127.0.0.1:3128) and MEDIATORE_TOKEN, a phantom the proxy swaps for the real token on the way out. The binary stays mounted read-only for jail-exec (ADR-0014, ADR-0024). ADR-0069 (Proposed, planned): under policy.traps shadow or enforce the jail's environment and the sandbox user's home (never /work) also carry bait the workload cannot tell from real: credentials in their providers' shapes, variables pointing at decoy routes on the proxy, and decoy services on loopback. Reading them trips nothing; connecting to a decoy, naming a decoy route or sending a bait value does."
     },
     {
       "unique-id": "service-egress-proxy",
       "node-type": "service",
       "name": "mediatore egress-proxy",
-      "description": "The egress-proxy role of the one binary (ADR-0025), one process per claim started by the guest as the sandbox user outside the jail, in the VM's namespace and filesystem. A reverse proxy on 127.0.0.1:3128: the workload calls /<host>[:<port>]/<path> with the phantom token, the proxy checks the host against the claim's routes (one per audience and egress endpoint, and under policy.egress enforce one per direct egress entry of the claim's bundle the gateway serves, from GET /v1/me) and the method and path against the route's rules (nono's endpoint_rules shape: method or *, a path glob with * one segment and ** any), swaps the phantom for a token for the route's audience fetched over the claim SVID at POST /v1/token and cached until shortly before its expiry, or on a route with credential none (a bundle's direct entry, an audience via: none; ADR-0025 decision 8) drops the phantom and forwards bare; for an audience via: secret (ADR-0032) the credential is the operator's, placed in the header the broker named (Authorization as a bearer, or x-api-key and the like) with the extra headers beside it, the phantom recognised in that header too and every owned header stripped on every route; and forwards over TLS 1.3 to the Mozilla roots, or to the CA the route carries for an audience on a private PKI (audiences[].ca_file, ADR-0025 decision 7). No TLS interception. A request with no Authorization header is forwarded bare, one with a foreign bearer is 401 on every route, one outside the rules 403, one to a host not in the routes 404. In an environment with egress gateways (the gateways list on GET /v1/me, ADR-0028 decision 6) the upstream is not dialled directly: the proxy's dialer is the forwarder of ADR-0028 decision 3, placed in this process by ADR-0027 decision 8 (crates/mediatore-guest/src/forward.rs): TLS 1.3 to a gateway on the sandbox leg's configuration presenting the claim SVID and verifying spiffe://<td>/gateway, CONNECT host:port, the upstream's TLS inside the tunnel; the list walked from a random start per connection, a connect or handshake failure moving to the next (decision 7), a gateway's refusal final (502 gateway_refused at the workload, the authorizer's code in the log; 502 gateway_unreachable when none carried it). The only process that ever holds a downstream token or the claim SVID; the uid-keyed table drops packets to its port from any other uid, and a proxy that exits ends the claim. crates/mediatore-guest/src/egress.rs. ADR-0040: on a route with credential: gateway the proxy never fetches a token; it sends the request in origin form to the gateway's inject port over the claim-SVID mutual TLS and the gateway places the credential."
+      "description": "The egress-proxy role of the one binary (ADR-0025), one process per claim started by the guest as the sandbox user outside the jail, in the VM's namespace and filesystem. A reverse proxy on 127.0.0.1:3128: the workload calls /<host>[:<port>]/<path> with the phantom token, the proxy checks the host against the claim's routes (one per audience and egress endpoint, and under policy.egress enforce one per direct egress entry of the claim's bundle the gateway serves, from GET /v1/me) and the method and path against the route's rules (nono's endpoint_rules shape: method or *, a path glob with * one segment and ** any), swaps the phantom for a token for the route's audience fetched over the claim SVID at POST /v1/token and cached until shortly before its expiry, or on a route with credential none (a bundle's direct entry, an audience via: none; ADR-0025 decision 8) drops the phantom and forwards bare; for an audience via: secret (ADR-0032) the credential is the operator's, placed in the header the broker named (Authorization as a bearer, or x-api-key and the like) with the extra headers beside it, the phantom recognised in that header too and every owned header stripped on every route; and forwards over TLS 1.3 to the Mozilla roots, or to the CA the route carries for an audience on a private PKI (audiences[].ca_file, ADR-0025 decision 7). No TLS interception. A request with no Authorization header is forwarded bare, one with a foreign bearer is 401 on every route, one outside the rules 403, one to a host not in the routes 404. In an environment with egress gateways (the gateways list on GET /v1/me, ADR-0028 decision 6) the upstream is not dialled directly: the proxy's dialer is the forwarder of ADR-0028 decision 3, placed in this process by ADR-0027 decision 8 (crates/mediatore-guest/src/forward.rs): TLS 1.3 to a gateway on the sandbox leg's configuration presenting the claim SVID and verifying spiffe://<td>/gateway, CONNECT host:port, the upstream's TLS inside the tunnel; the list walked from a random start per connection, a connect or handshake failure moving to the next (decision 7), a gateway's refusal final (502 gateway_refused at the workload, the authorizer's code in the log; 502 gateway_unreachable when none carried it). The only process that ever holds a downstream token or the claim SVID; the uid-keyed table drops packets to its port from any other uid, and a proxy that exits ends the claim. crates/mediatore-guest/src/egress.rs. ADR-0040: on a route with credential: gateway the proxy never fetches a token; it sends the request in origin form to the gateway's inject port over the claim-SVID mutual TLS and the gateway places the credential. ADR-0069 (Proposed, planned): carries the drawn decoy routes (hosts that are no audience) and the bait values, handed by the guest over a root-owned unix socket the jail cannot reach. Every request is checked before anything is forwarded: headers, path and query whole before the tunnel opens; the body streamed through a multi-pattern matcher (each bait raw, percent-encoded and base64 at three alignments) that holds back the longest pattern, so a complete bait value never leaves the VM; an encoded body decoded for the matcher. A request naming a decoy route or carrying bait is 403 trap, the upstream stream is reset, nothing more is forwarded for the claim, and the guest is told. An audience marked traps.body: skip (a model API, the agent's own conversation) is matched on headers, path and query only. The proxy never sees the bundle's trap catalogue, only the draw."
     },
     {
       "unique-id": "service-egress-gateway",
@@ -258,6 +258,15 @@
       "metadata": {
         "status": "planned"
       }
+    },
+    {
+      "unique-id": "data-asset-trap-draw",
+      "node-type": "data-asset",
+      "name": "The claim's tripwire draw (ADR-0069)",
+      "description": "ADR-0069 decision 3 (Proposed, planned): which decoy ports, decoy routes and bait credentials a claim's sandbox carries, how many of each, and every bait value, drawn by the guest at boot from the OS CSPRNG out of public seeds, generated entries, entries derived from the claim's real routes and the deployment's catalogue in the policy bundle; a drawn entry that collides with anything real is redrawn. Held in the guest's memory and handed to the egress proxy; never in the image, the bundle, the record, GET /v1/me or a log at info, and gone with the VM. Nothing of it leaves the VM except the one trap a trip report names. The secret is the draw, never the method: the catalogues and the code are public.",
+      "metadata": {
+        "status": "planned"
+      }
     }
   ],
   "relationships": [
@@ -282,7 +291,7 @@
     },
     {
       "unique-id": "rel-sandbox-vm-composition",
-      "description": "Everything identity-bearing on a pool member: the SPIRE agent (node identity), the in-guest agent (subject plumbing), the egress proxy (claim identity, the tokens) and the jailed workload (a phantom token and one loopback route).",
+      "description": "Everything identity-bearing on a pool member: the SPIRE agent (node identity), the in-guest agent (subject plumbing), the egress proxy (claim identity, the tokens) and the jailed workload (a phantom token and one loopback route). Since ADR-0069 (planned) also the claim's tripwire draw, held by the guest and the proxy.",
       "relationship-type": {
         "composed-of": {
           "container": "system-sandbox-vm",
@@ -291,7 +300,8 @@
             "service-guest-agent",
             "service-node-cert",
             "service-egress-proxy",
-            "service-sandbox-workload"
+            "service-sandbox-workload",
+            "data-asset-trap-draw"
           ]
         }
       }
@@ -651,7 +661,7 @@
     },
     {
       "unique-id": "rel-guest-agent-mediatore",
-      "description": "POST /v1/nodes (EK hash + DMI UUID + hostname) over the node SVID at boot; then polls GET /v1/me until a claim is bound and the subject comes back. Since ADR-0022 the answer to GET /v1/me includes the pull credential for the claim's image registry when the operator configured one. Since ADR-0025 it carries the proxy's routes, and since ADR-0025 decision 8 (2026-11-08) a route may carry credential none: one per served direct egress entry of the claim's bundle under policy.egress enforce, with no audience, and the routes of an audience via: none. Since ADR-0028 decision 6 the answer also carries gateways, the environment's egress gateways in the broker's order, for the forwarder and the ruleset; empty until the gateways exist. With egress gateways the connection itself runs through a gateway's control relay (ADR-0027 decision 3), the node SVID's mutual TLS end to end inside it, and the guest falls back to the pool's bootstrap list /etc/mediatore/gateways when the answer lists none (decision 4). Once the image is pulled and the tables are loaded, before the jail, the guest POSTs /v1/me/report over the same identity: the manifest digest, the sandbox ruleset's hash and the host table as nft lists it, hashed, or its absence (ADR-0029 decision 5); the broker keeps it on the claim's record (logged when the claim is swept), and GET /v1/claims/{name} shows it. Since ADR-0045, when GET /v1/me says workload.logs the guest also POSTs /v1/me/logs over the node SVID: batches of the jailed workload's stdout and stderr lines, redacted in the VM (the phantom and every secret-bearing environment value literally and in their base64 and percent-encoded forms; JWTs, Authorization values and private-key PEM blocks by shape), on the leading edge (at once after a quiet half second, otherwise every half second, or at 32 KiB; a line that has not ended after 150 ms of silence as a partial record, less the end the redactor holds back), with a per-claim sequence number the broker uses to accept a retried batch idempotently and per-stream dropped byte counts when the guest's 1 MiB queue overflowed; the workload never waits for the broker, a 429 is honoured, a 501 or 404 stops shipping for the claim and keeps the console copy, and the last batch is flushed, bounded to five seconds, before POST /v1/me/exit. The broker accepts a batch from the claim's node alone, re-validates its shape and size (400, 413), rate-limits it to two per second (429), refuses one for a claim that did not opt in (400 logs_not_requested), and answers 501 with logs.enabled off.",
+      "description": "POST /v1/nodes (EK hash + DMI UUID + hostname) over the node SVID at boot; then polls GET /v1/me until a claim is bound and the subject comes back. Since ADR-0022 the answer to GET /v1/me includes the pull credential for the claim's image registry when the operator configured one. Since ADR-0025 it carries the proxy's routes, and since ADR-0025 decision 8 (2026-11-08) a route may carry credential none: one per served direct egress entry of the claim's bundle under policy.egress enforce, with no audience, and the routes of an audience via: none. Since ADR-0028 decision 6 the answer also carries gateways, the environment's egress gateways in the broker's order, for the forwarder and the ruleset; empty until the gateways exist. With egress gateways the connection itself runs through a gateway's control relay (ADR-0027 decision 3), the node SVID's mutual TLS end to end inside it, and the guest falls back to the pool's bootstrap list /etc/mediatore/gateways when the answer lists none (decision 4). Once the image is pulled and the tables are loaded, before the jail, the guest POSTs /v1/me/report over the same identity: the manifest digest, the sandbox ruleset's hash and the host table as nft lists it, hashed, or its absence (ADR-0029 decision 5); the broker keeps it on the claim's record (logged when the claim is swept), and GET /v1/claims/{name} shows it. Since ADR-0045, when GET /v1/me says workload.logs the guest also POSTs /v1/me/logs over the node SVID: batches of the jailed workload's stdout and stderr lines, redacted in the VM (the phantom and every secret-bearing environment value literally and in their base64 and percent-encoded forms; JWTs, Authorization values and private-key PEM blocks by shape), on the leading edge (at once after a quiet half second, otherwise every half second, or at 32 KiB; a line that has not ended after 150 ms of silence as a partial record, less the end the redactor holds back), with a per-claim sequence number the broker uses to accept a retried batch idempotently and per-stream dropped byte counts when the guest's 1 MiB queue overflowed; the workload never waits for the broker, a 429 is honoured, a 501 or 404 stops shipping for the claim and keeps the console copy, and the last batch is flushed, bounded to five seconds, before POST /v1/me/exit. The broker accepts a batch from the claim's node alone, re-validates its shape and size (400, 413), rate-limits it to two per second (429), refuses one for a claim that did not opt in (400 logs_not_requested), and answers 501 with logs.enabled off. Since ADR-0069 (Proposed, planned) GET /v1/me also serves policy.traps (off, shadow, enforce) and the claim's bundle's traps catalogue, read by the guest outside the jail; a trip is reported on its own route (rel-guest-agent-trip).",
       "relationship-type": {
         "connects": {
           "source": {
@@ -1153,6 +1163,94 @@
       "metadata": {
         "status": "implemented"
       }
+    },
+    {
+      "unique-id": "rel-guest-agent-trap-draw",
+      "description": "ADR-0069 decision 3: the guest draws the claim's tripwires at boot, before the jail starts, and holds them; a redraw replaces any entry that collides with a port, host, variable or file the claim really uses.",
+      "relationship-type": {
+        "connects": {
+          "source": {
+            "node": "service-guest-agent"
+          },
+          "destination": {
+            "node": "data-asset-trap-draw"
+          }
+        }
+      },
+      "metadata": {
+        "status": "planned"
+      }
+    },
+    {
+      "unique-id": "rel-egress-proxy-guest-traps",
+      "description": "ADR-0069 decisions 6 and 7: a unix socket in a root-owned directory the jail cannot reach, the proxy's uid admitted by its peer credential. The guest hands the proxy the drawn decoy routes and bait values at start; the proxy tells the guest of each trip (kind, trap, target, never the value) the moment it refuses the request.",
+      "relationship-type": {
+        "connects": {
+          "source": {
+            "node": "service-egress-proxy"
+          },
+          "destination": {
+            "node": "service-guest-agent"
+          }
+        }
+      },
+      "metadata": {
+        "status": "planned"
+      }
+    },
+    {
+      "unique-id": "rel-workload-decoy-listeners",
+      "description": "ADR-0069 decision 2: TCP on loopback from the jail to the guest's drawn decoy listeners, admitted by the claim's table for the sandbox uid alone, and to 169.254.169.254:80, which that table redirects for the sandbox uid to one of them (decision 13). A completed handshake from the sandbox uid is a trip; another uid's connection is logged and never trips. Under the denied classes of decision 10, a connection to a loopback port that is neither the proxy nor drawn is reported, and trips once its class is switched to trip.",
+      "relationship-type": {
+        "connects": {
+          "source": {
+            "node": "service-sandbox-workload"
+          },
+          "destination": {
+            "node": "service-guest-agent"
+          }
+        }
+      },
+      "protocol": "TCP",
+      "metadata": {
+        "status": "planned"
+      }
+    },
+    {
+      "unique-id": "rel-guest-agent-trip",
+      "description": "POST /v1/me/trip over the node SVID through the control relay, as exit and report (ADR-0069 decision 8, Proposed): mode and up to 32 distinct events a minute, each a random id (idempotent on retry), the time, the kind (port, route, credential, denied), the trap's name, the target (a host, a port or an address; never a path, a query, a header, a body or the bait value), whether the target was drawn or the workload's, the containment time and a repeat count. The broker checks the node is the claim's, the shape and the rate; 501 under policy.traps off. Retried with capped backoff until 204. The broker's OpenTelemetry signals for each report (a mediatore.trip.report root span with one event per trip, five instruments with enum labels only, a drawn target exported and a workload target as its class) go through roadmap 15's exporter, not modelled until its ADR.",
+      "relationship-type": {
+        "connects": {
+          "source": {
+            "node": "service-guest-agent"
+          },
+          "destination": {
+            "node": "service-mediatore-sandbox-api"
+          }
+        }
+      },
+      "protocol": "mTLS",
+      "metadata": {
+        "status": "planned"
+      }
+    },
+    {
+      "unique-id": "rel-mediatore-tripwire-record",
+      "description": "ADR-0069 decision 9: for each accepted trip event the sandbox API writes one audit line (the record of every event and host), folds it into status.tripwires on the claim's AgentSandbox by compare-and-set and re-merge on resourceVersion (a patch that names status.tripwires alone, as ADR-0064's), and under enforce writes tripped on status.record by compare-and-set, sets the Tripped condition, then releases the claim as POST /v1/me/exit does.",
+      "relationship-type": {
+        "connects": {
+          "source": {
+            "node": "service-mediatore-sandbox-api"
+          },
+          "destination": {
+            "node": "data-asset-claim-store"
+          }
+        }
+      },
+      "protocol": "HTTPS",
+      "metadata": {
+        "status": "planned"
+      }
     }
   ],
   "flows": [
@@ -1432,6 +1530,58 @@
           "sequence-number": 6,
           "relationship-unique-id": "rel-gateway-registry",
           "description": "Envoy connects to the registry and relays the bytes; the proxy's TLS with the registry carries the manifest and the layers, each verified against its digest by the guest (ADR-0021)."
+        }
+      ]
+    },
+    {
+      "unique-id": "flow-tripwire",
+      "name": "A bait credential sent by a hijacked workload ends its sandbox (ADR-0069, planned)",
+      "description": "Under policy.traps enforce: the draw at boot, a request carrying bait refused on the VM before any byte of the bait leaves, containment on the VM, the report, the record and the release. A decoy port is the same from step 4 on, the guest's listener in place of the proxy (rel-workload-decoy-listeners). The gateway takes no part.",
+      "transitions": [
+        {
+          "sequence-number": 1,
+          "relationship-unique-id": "rel-guest-agent-mediatore",
+          "description": "GET /v1/me answers with the claim, policy.traps: enforce and the bundle's traps catalogue."
+        },
+        {
+          "sequence-number": 2,
+          "relationship-unique-id": "rel-guest-agent-trap-draw",
+          "description": "The guest draws the claim's traps from the OS CSPRNG, redraws every collision, arms its decoy listeners and the sandbox uid's metadata redirect, plants the bait in the jail's environment and the sandbox user's home, and only then reports ready."
+        },
+        {
+          "sequence-number": 3,
+          "relationship-unique-id": "rel-egress-proxy-guest-traps",
+          "description": "The guest hands the proxy the drawn decoy routes and bait values; the jail starts."
+        },
+        {
+          "sequence-number": 4,
+          "relationship-unique-id": "rel-workload-egress-proxy",
+          "description": "The hijacked workload sends a bait value in a request to one of its routes; the proxy's matcher finds it before the complete value is forwarded, resets the upstream stream and answers 403 trap."
+        },
+        {
+          "sequence-number": 5,
+          "relationship-unique-id": "rel-egress-proxy-guest-traps",
+          "description": "The proxy forwards nothing more for the claim and tells the guest; the guest drops every packet of the sandbox uid in one nft transaction, kills the jail's process tree and flushes the workload output."
+        },
+        {
+          "sequence-number": 6,
+          "relationship-unique-id": "rel-guest-agent-trip",
+          "description": "POST /v1/me/trip with the event, retried until the broker answers 204."
+        },
+        {
+          "sequence-number": 7,
+          "relationship-unique-id": "rel-mediatore-tripwire-record",
+          "description": "The audit line; tripped on the record by compare-and-set; the event folded into status.tripwires; the Tripped condition; the trip span and counters exported when telemetry is on."
+        },
+        {
+          "sequence-number": 8,
+          "relationship-unique-id": "rel-watcher-entries",
+          "description": "The release: the ClusterStaticEntry is deleted and the claim SVID stops renewing."
+        },
+        {
+          "sequence-number": 9,
+          "relationship-unique-id": "rel-banlieue-kube-api",
+          "description": "The VirtualMachineClaim is deleted and banlieue destroys the member; the AgentSandbox is not claimed again until its spec changes or the trip is acknowledged."
         }
       ]
     }

@@ -22,6 +22,7 @@ transitions in sequence order. The flows modelled today, from the
 - **A private image pulled with the person&#x27;s own credential, which the VM never sees (ADR-0043)** (`flow-registry-pull-placed`)
 - **A one-shot workload&#x27;s output read back by its owner (ADR-0045)** (`flow-workload-output`)
 - **A claim&#x27;s image pulled through its own proxy and a gateway, under its namespace&#x27;s policy (ADR-0063)** (`flow-registry-pull-gateway`)
+- **A bait credential sent by a hijacked workload ends its sandbox (ADR-0069, planned)** (`flow-tripwire`)
 
 
 ## Claim a sandbox and act as the user
@@ -152,4 +153,25 @@ flowchart TD
 ```
 
 <sub>Source: flow `flow-registry-pull-gateway` in `architecture.json`.</sub>
+
+
+## A bait credential sent by a hijacked workload ends its sandbox (ADR-0069, planned)
+
+Under policy.traps enforce: the draw at boot, a request carrying bait refused on the VM before any byte of the bait leaves, containment on the VM, the report, the record and the release. A decoy port is the same from step 4 on, the guest's listener in place of the proxy (rel-workload-decoy-listeners). The gateway takes no part.
+
+```mermaid
+flowchart TD
+    t1["1. GET /v1/me answers with the claim, policy.traps: enforce and the bundle's traps catalogue."]
+    t2["2. The guest draws the claim's traps from the OS CSPRNG, redraws every collision, arms its decoy listeners and the sandbox uid's metadata redirect, plants the bait in the jail's environment and the sandbox user's home, and only then reports ready."]
+    t3["3. The guest hands the proxy the drawn decoy routes and bait values; the jail starts."]
+    t4["4. The hijacked workload sends a bait value in a request to one of its routes; the proxy's matcher finds it before the complete value is forwarded, resets the upstream stream and answers 403 trap."]
+    t5["5. The proxy forwards nothing more for the claim and tells the guest; the guest drops every packet of the sandbox uid in one nft transaction, kills the jail's process tree and flushes the workload output."]
+    t6["6. POST /v1/me/trip with the event, retried until the broker answers 204."]
+    t7["7. The audit line; tripped on the record by compare-and-set; the event folded into status.tripwires; the Tripped condition; the trip span and counters exported when telemetry is on."]
+    t8["8. The release: the ClusterStaticEntry is deleted and the claim SVID stops renewing."]
+    t9["9. The VirtualMachineClaim is deleted and banlieue destroys the member; the AgentSandbox is not claimed again until its spec changes or the trip is acknowledged."]
+    t1 --> t2 --> t3 --> t4 --> t5 --> t6 --> t7 --> t8 --> t9
+```
+
+<sub>Source: flow `flow-tripwire` in `architecture.json`.</sub>
 
