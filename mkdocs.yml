@@ -139,6 +139,7 @@ nav:
   - Guides:
       - Running workloads on a claimed VM: guides/running-workloads.md
       - Deploying on a homelab cluster: guides/deploying.md
+      - The VM images, base and overlays: guides/vm-images.md
       - Homelab walkthrough: guides/homelab-walkthrough.md
       - The research agent, front to back: guides/research-agent-walkthrough.md
       - Claude from the sandbox, end to end: guides/claude-end-to-end.md
@@ -226,5 +227,6 @@ nav:
       - "ADR-0057: A claim's record written by compare-and-set and bound to its sandbox": adr/0057-a-claims-record-written-by-compare-and-set-and-bound-to-its-sandbox.md
       - "ADR-0059: Which pools' members become nodes": adr/0059-which-pools-members-become-nodes.md
       - "ADR-0062: The gateway reports its decisions to the broker": adr/0062-the-gateway-reports-its-decisions-to-the-broker.md
+      - "ADR-0068: The cloud platform's host addresses: WireServer root's alone on Azure, the metadata service nobody's": adr/0068-the-cloud-platforms-host-addresses-root-alone-on-azure-the-metadata-service-for-nobody.md
   - Security:
       - Threat model: security/threat-model.md

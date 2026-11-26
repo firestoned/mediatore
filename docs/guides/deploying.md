@@ -228,6 +228,12 @@ is the `VMImage` (a libvirt `Url` source pinned by digest, three cloud-config la
 `image/cloud-config-deployment.example.yaml`) and the `VMClass` with a vTPM; it runs
 `installMode: deferred` until a Kairos 4.4 Debian base exists for first-boot sealing.
 
+Since [ADR-0067](../adr/0067-the-vm-images-are-overlays-on-a-replaceable-base.md) the image
+is an overlay on a VM base (`image/base/Dockerfile`, `make base-image`): the base is Kairos,
+Debian 13 and the OS layer, the overlay only mediatore's pieces, so a site can build it on
+its own base with `VM_BASE=<image>`. [The VM images](vm-images.md) has the layering, the
+`BINARY_FROM` choices, a multi-provider `VMImage` and what Azure still needs.
+
 A `Url` source needs banlieue-imagebuilder and the kairos-operator on the cluster; without
 them the `VMImage` stays `BuildPending` on every provider. The other route, the one the
 live proof took: merge the three layers yourself (maps deep-merged, lists concatenated, in
@@ -494,8 +500,8 @@ VM reaches the SPIRE server and the broker at all (the segment has no route and 
 resolver). Everything is image content and ordinary banlieue objects; banlieue gains no
 kind.
 
-**The image.** `image/gateway/Dockerfile` is the same Kairos derivative as the sandbox
-image with Envoy copied from its official image at the digest the kind tier runs
+**The image.** `image/gateway/Dockerfile` is an overlay on the same VM base as the sandbox
+image ([ADR-0067](../adr/0067-the-vm-images-are-overlays-on-a-replaceable-base.md)) with Envoy copied from its official image at the digest the kind tier runs
 (`dev/kind/gateway/kustomization.yaml`), the authorizer (`mediatore gateway`, the one
 binary), the agent and the plugin, `nftables`, and four service users. The Build workflow
 publishes it as `ghcr.io/firestoned/mediatore-gateway`, signed and attested; `make

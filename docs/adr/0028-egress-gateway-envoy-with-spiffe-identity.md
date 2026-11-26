@@ -15,7 +15,9 @@ gateway is the verified bundle's `egress[]` too, behind the `policy.egress` swit
 decision 8's hardening) · 2026-11-19 by
 [ADR-0053](0053-the-gateways-authorizer-has-an-identity-of-its-own.md) (decisions 2, 4
 and 8: the authorizer has an identity of its own, the gateway routes answer it alone, and the
-host table gains an output chain keyed on the socket's owner)
+host table gains an output chain keyed on the socket's owner) · 2026-11-26 by
+[ADR-0067](0067-the-vm-images-are-overlays-on-a-replaceable-base.md) (decision 10: the gateway
+image is an overlay on the shared VM base image, `image/base/Dockerfile`)
 
 Roadmap 10. Gives the egress gateway of [ADR-0010](0010-no-inbound-to-sandboxes.md)
 decision 4 its software, its identity and its authorization. Amends banlieue
@@ -190,6 +192,12 @@ that identity.
     default route; `sandbox` second, written by the image, ADR-0109 decisions 4 and 6),
     placed one per failure domain (banlieue ADR-0098), on a `tpmEnabled` class like every
     VM from now on. banlieue gains no kind, no field and no controller.
+
+    *Amended 2026-11-26 by [ADR-0067](0067-the-vm-images-are-overlays-on-a-replaceable-base.md):*
+    `image/gateway/Dockerfile` is an overlay `FROM ${VM_BASE}`, the VM base image that carries
+    Kairos, Debian 13, `tpm2-tools`, `qemu-guest-agent`, `nftables` and the purges for both
+    VM images; the overlay adds Envoy, the agent, the plugin, the binary (from the mediatore
+    container image with `BINARY_FROM=image`), the users, units and templates.
 
 ## Implementation notes
 

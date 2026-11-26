@@ -13,7 +13,11 @@ unit, `mediatore-host-nft.service`, and the host table); 2026-11-07 by
 deployment layer writes is the PKI root the server's CA chains to); 2026-11-14 by
 [ADR-0037](0037-the-pool-fetches-its-spire-bundle-at-boot-through-the-relay.md) (decision
 3: the bundle is fetched at every boot through the relay to `/run/spire/bundle.json` by a
-fourth unit, `spire-bundle-fetch.service`; the PEM file is the fallback)
+fourth unit, `spire-bundle-fetch.service`; the PEM file is the fallback); 2026-11-26 by
+[ADR-0067](0067-the-vm-images-are-overlays-on-a-replaceable-base.md) (decisions 1 and 4: the
+image is an overlay `FROM` a VM base image, `image/base/Dockerfile`, that carries the Kairos
+pin, the shared packages and the purges; the binary may also come from the mediatore
+container image, `BINARY_FROM=image`; the base is published beside it)
 
 Roadmap 06, the image item. Implements mediatore's share of banlieue
 [ADR-0108](https://github.com/firestoned/banlieue/blob/main/docs/adr/0108-sandbox-guest-software-is-consumer-image-content.md)
@@ -75,6 +79,13 @@ runs `Deferred` installs, which banlieue's libvirt guide calls the simpler path 
    `spiffe/spire-agent` image and the attestor plugin from the `spire-tpm-plugin` image,
    both pinned by digest, the plugin's checksum verified in the build against the one
    `image/spire/agent.conf` pins. No `banlieue-imagebuilder` layer installs software.
+
+   *Amended 2026-11-26 by [ADR-0067](0067-the-vm-images-are-overlays-on-a-replaceable-base.md):*
+   the `FROM`, the Kairos pin, `tpm2-tools`, `qemu-guest-agent`, `nftables` and the purges
+   moved to the VM base image (`image/base/Dockerfile`); `image/Dockerfile` is an overlay
+   `FROM ${VM_BASE}` that installs only its own packages (`curl`, `ca-certificates`, the
+   two nsjail libraries) and adds everything else as before. `BINARY_FROM=image` copies the
+   binary from the mediatore container image (`MEDIATORE_IMG`, pinned by digest).
 
 2. **Binaries in the immutable rootfs; the pinned path is `/usr/bin/mediatore`.**
    `mediatore` at `/usr/bin/mediatore`, `spire-agent` at `/usr/bin/spire-agent`, the
