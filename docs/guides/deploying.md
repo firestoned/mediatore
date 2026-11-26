@@ -766,6 +766,39 @@ audiences:
 
 The broker refuses at start an audience with `inject: gateway` that has no `gateways`, no `gateway_inject_port`, no `egress`, no `rules`, an IP-literal host, a `max_ttl` above 300 or no credential to place. A placed audience's host is removed from the claim's tunnel lists, so the only path to it is the injecting one. `POST /v1/token` for it answers `403 placed_at_gateway`.
 
+#### How the gateway knows which credential goes into which connection
+
+Identity decides it, not an address or a header the sandbox sends. The pool VM's workload has no credential for a placed audience and no way to name one; what it has is a claim SVID, and everything below keys on that.
+
+1. **One identity per claim.** SPIRE gives each sandbox claim its own SPIFFE identity, through the registration entries the `spire.entries` class reconciles (ADR-0028). The gateway's three processes have identities too: `envoy-inject` takes the gateway SVID from its own SPIRE entry (`unix:user:envoy-inject`, ADR-0040 decision 3), and the authorizer has its own, `spiffe://<trust_domain>/gateway/authorizer` (ADR-0053).
+2. **Mutual TLS carries the claim to the gateway.** The proxy on the pool VM sends the request, with no credential, to the gateway's inject port over mutual TLS 1.3 using the claim SVID. `envoy-inject` accepts only a peer whose SAN has the claim prefix (ADR-0028 decision 4). No SVID, no connection. Retracting a claim's SVID makes the listener refuse that claim at once.
+3. **The identity is read from the connection.** Envoy hands the authorizer `source.principal` (the verified peer), the method, the host and the path of the request. The authorizer never reads the claim from anything the client sent. It looks up the claim's gateway-placed routes (`GET /v1/gateway/claims/{uid}`, answered only to the gateway), requires the request's authority to equal an entry of that audience's own `egress` and a rule to match the method and the path without its query, and refuses `CONNECT`.
+4. **The broker issues the credential to the authorizer only.** The authorizer calls `POST /v1/gateway/claims/{uid}/credential` with the audience. The broker accepts that call only from the peer `spiffe://<trust_domain>/gateway/authorizer` (any other peer is `403`), and checks in order that the claim is live, that the claim names the audience, that the audience is gateway-placed, that the claim's policy bundle admits it (under `policy.egress: enforce`, no verified bundle is `403`) and that the per-claim rate limit allows it. It opens the credential sealed for that claim (the delegated envelope, which only that claim's uid can open) and answers with a credential that expires within 300 seconds. Nothing is stored, and every issue is one log line (`gateway credential issued`) with the claim, audience and subject, never the credential.
+5. **The authorizer alone writes the header.** The response sets the credential header and removes any other credential-bearing header the client sent, so a sandbox cannot smuggle its own. `envoy-inject` then originates TLS to the audience's fixed host. The pool VM's own SVID cannot fetch the credential: `POST /v1/token` for a placed audience is `403 placed_at_gateway`.
+
+An example, with placeholders. A person creates a sandbox with `--delegate gitserver=prompt` for the `gitserver` audience above, and the claim has the UID `<claim-uid>`:
+
+```text
+workload on the pool VM              gateway                                   broker
+  GET /org/repo/info/refs
+  (no credential)
+  -- mutual TLS, claim SVID -->
+                                     envoy-inject: peer SAN has the claim prefix
+                                     ext_authz (mode: inject): principal = claim,
+                                       host git.example.com:443, path matches a rule
+                                     authorizer -- POST /v1/gateway/claims/<claim-uid>/credential -->
+                                                                               peer is .../gateway/authorizer
+                                                                               claim live, names gitserver,
+                                                                               policy admits it, rate ok
+                                                                               opens the sealed envelope
+                                     <-- Basic credential, expires_at <= 300 s ahead --
+                                     header set, other credential headers removed
+                                     originates TLS to git.example.com:443
+  <-- response ------------------------
+```
+
+A second claim on the same pool VM gets its own SVID, so it can neither obtain nor use the first claim's credential, and a sandbox whose policy does not list `gitserver` is refused at step 4 even though its mutual TLS is valid.
+
 **On each gateway**, nothing changes until a deployment turns the third process on: write the two lines of `image/gateway/env.inject.example` into `/etc/mediatore-gateway/env` above the rest (the authorizer endpoint moves to the check socket, and the host table admits the inject port), start the authorizer with `--check-socket`, `--inject-socket` and `--socket-dir-mode 2750` (two setgid directories, one Envoy's group each, named with `--check-socket-group` and `--inject-socket-group`; `--socket-owner` defaults to the authorizer's own user and `--socket-mode` to `0660`), register the third SPIRE entry for `unix:user:envoy-inject` under the gateway's SPIFFE ID, then `systemctl enable --now envoy-inject.service`. The unit validates its bootstrap before every start. This repository's template renders one upstream; a deployment that places several audiences renders its own from the same shape.
 
 **On each pool VM**, `MEDIATORE_INJECT_PORT` in the guest's env admits the inject port in the host table; the sandbox uid's per-claim table lists it only for a claim with a placed route.
