@@ -4,7 +4,7 @@
 # All CI logic lives here (rules/github-workflows.md): workflows install tools
 # and call these targets, and every target runs identically locally.
 
-.PHONY: all help fmt fmt-check lint test deny audit check ci-preempt sbom dist dist-e2e dist-chmod image guest-image guest-image-check crds e2e live-admission-test release-assets release-assets-test dist-darwin set-version set-version-test \
+.PHONY: all help fmt fmt-check lint test deny audit check ci-preempt sbom dist dist-e2e dist-chmod image base-image guest-image guest-image-check crds e2e live-admission-test release-assets release-assets-test dist-darwin set-version set-version-test \
         kind-install kind-create kind-delete kind-down kind-spire kind-deploy kind-up \
         kind-images kind-dex kind-openbao kind-broker kind-banlieue-crds kind-e2e-entries kind-e2e-mtls kind-e2e-watcher kind-e2e-sandbox \
         kind-e2e-dex kind-e2e kind-e2e-ci kind-e2e-logs \
@@ -165,13 +165,29 @@ claude-code-image: ## Build the example Claude Code workload image (examples/cla
 	$(CONTAINER_CLI) run --rm $(CLAUDE_CODE_IMAGE) claude --version
 	$(CONTAINER_CLI) run --rm $(CLAUDE_CODE_IMAGE) sh -c 'test ! -e /usr/bin/mediatore && ! find / -xdev -perm -4000 -type f 2>/dev/null | grep -q . && echo "no mediatore binary, no setuid file"'
 
+# The VM base image (ADR-0067): Kairos, Debian 13 and the OS layer the two VM images share,
+# nothing of mediatore's; image/base/Dockerfile. The guest and gateway images are overlays
+# FROM it (VM_BASE, which defaults to BASE_IMAGE here); a site builds them on its own base
+# with VM_BASE=<its image>.
+BASE_IMAGE ?= ghcr.io/firestoned/mediatore-vm-base:dev
+VM_BASE    ?= $(BASE_IMAGE)
+# The overlays build the base first when they overlay this repository's own (a local tag
+# nothing has pushed); a site's VM_BASE is pulled as it is.
+VM_BASE_DEP = $(if $(filter $(BASE_IMAGE),$(VM_BASE)),base-image)
+base-image: ## Build the VM base image (ADR-0067): Kairos + Debian 13 + the shared OS layer, what the guest and gateway overlays build FROM
+	$(CONTAINER_CLI) build -f image/base/Dockerfile -t $(BASE_IMAGE) .
+
 # The sandbox VM image (ADR-0023): a Kairos derivative with the guest software in the
-# immutable rootfs. The base, the SPIRE agent and the plugin are pinned by digest in
-# image/Dockerfile; BINARY_FROM=host reuses dist/mediatore (make dist) as the kind tier does.
+# immutable rootfs, an overlay on VM_BASE (ADR-0067). The SPIRE agent, the plugin and the
+# mediatore image are pinned by digest in image/Dockerfile. BINARY_FROM: `container`
+# compiles the tree, `host` reuses dist/mediatore (make dist) as the kind tier does, `image`
+# copies the binary out of MEDIATORE_IMG (the Dockerfile's pinned default when empty).
 GUEST_IMAGE ?= ghcr.io/firestoned/mediatore-guest:dev
 BINARY_FROM ?= container
-guest-image: ## Build the sandbox VM image, a Kairos derivative (ADR-0023); BINARY_FROM=host copies dist/mediatore
-	$(CONTAINER_CLI) build -f image/Dockerfile --build-arg BINARY_FROM=$(BINARY_FROM) -t $(GUEST_IMAGE) .
+MEDIATORE_IMG ?=
+VM_IMAGE_ARGS = --build-arg BINARY_FROM=$(BINARY_FROM) --build-arg VM_BASE=$(VM_BASE) $(if $(MEDIATORE_IMG),--build-arg MEDIATORE_IMG=$(MEDIATORE_IMG))
+guest-image: $(VM_BASE_DEP) ## Build the sandbox VM image, an overlay on VM_BASE (ADR-0023, ADR-0067); BINARY_FROM=host copies dist/mediatore, BINARY_FROM=image takes it from MEDIATORE_IMG
+	$(CONTAINER_CLI) build -f image/Dockerfile $(VM_IMAGE_ARGS) -t $(GUEST_IMAGE) .
 
 guest-image-check: host-table-test bundle-fetch-test ## Check the built VM image carries what ADR-0023 says, and no listener
 	CONTAINER_CLI=$(CONTAINER_CLI) ./image/check.sh $(GUEST_IMAGE)
@@ -182,12 +198,12 @@ bundle-fetch-test: ## Pin the pool VM's boot-time bundle fetch (ADR-0037): the e
 host-table-test: ## Pin the pool VM's host table (ADR-0029): the exact render from a pool's files, names and missing inputs refused
 	@./image/host-table-test.sh
 
-# The egress gateway VM image (ADR-0028 decision 10): the same Kairos base with Envoy
+# The egress gateway VM image (ADR-0028 decision 10): an overlay on the same VM base with Envoy
 # (pinned by digest, the digest the kind tier runs), the authorizer, the agent, the two
 # bootstrap templates and the host table; image/gateway/Dockerfile.
 GATEWAY_IMAGE ?= ghcr.io/firestoned/mediatore-gateway:dev
-gateway-image: ## Build the egress gateway VM image, a Kairos derivative with Envoy (ADR-0028 decision 10); BINARY_FROM=host copies dist/mediatore
-	$(CONTAINER_CLI) build -f image/gateway/Dockerfile --build-arg BINARY_FROM=$(BINARY_FROM) -t $(GATEWAY_IMAGE) .
+gateway-image: $(VM_BASE_DEP) ## Build the egress gateway VM image, an overlay on VM_BASE with Envoy (ADR-0028 decision 10, ADR-0067); BINARY_FROM as for guest-image
+	$(CONTAINER_CLI) build -f image/gateway/Dockerfile $(VM_IMAGE_ARGS) -t $(GATEWAY_IMAGE) .
 
 gateway-image-check: gateway-render-check ## Check the built gateway image carries what ADR-0028 decision 8 and ADR-0027 say: both Envoys unprivileged, the relay without the agent's socket, the table, no sshd, no forwarding
 	CONTAINER_CLI=$(CONTAINER_CLI) ./image/gateway/check.sh $(GATEWAY_IMAGE)
@@ -232,7 +248,19 @@ gateway-render-check: ## Fail when dev/kind/gateway/envoy.yaml drifted from the 
 	  printf '%s\n' "$$d" | grep -q 'pipe: { path: /run/mediatore-gateway/check/check.sock }' && ! printf '%s\n' "$$d" | grep -q 'port_value: 9001' \
 	  && printf '%s\n' "$$n" | grep -q 'elements = { 3129, 3130, 3131, 3133 } }' \
 	  || { echo "with inject on (env.inject.example in front of the example) the data plane asks the CHECK socket, no loopback TCP, and the host table admits the inject port under the relay's cap (ADR-0040 decisions 6 and 7)"; exit 1; }
-	@echo "✓ the kind bootstrap is the image's template, the example env files fill every template, the relay has its three legs, the inject Envoy is off by default and shaped by ADR-0040"
+	@# ADR-0068: the cloud platform's addresses, for every user and ahead of every user's row: IMDS dropped, root included;
+	@# WireServer root's at TCP 80 and 32526 and systemd-networkd's DHCP renewal, its port 53 back to the rows, anything else dropped.
+	@n=$$(./image/gateway/render image/gateway/nftables.conf.in - image/gateway/env.example image/gateway/vm.env.example | grep -v '^[[:space:]]*#'); \
+	  o=$$(printf '%s\n' "$$n" | sed -n '/chain output {/,/^  }/p'); \
+	  i=$$(printf '%s\n' "$$o" | grep -nx '    ip daddr 169.254.169.254 log prefix "mediatore-gateway out imds: " counter drop' | cut -d: -f1); \
+	  j=$$(printf '%s\n' "$$o" | grep -nx '    ip daddr 168.63.129.16 jump output_wireserver' | cut -d: -f1); \
+	  k=$$(printf '%s\n' "$$o" | grep -n 'meta skuid' | head -1 | cut -d: -f1); \
+	  w=$$(printf '%s\n' "$$n" | sed -n '/chain output_wireserver {/,/^  }/p' | sed '1d;$$d'); \
+	  test -n "$$i" && test -n "$$j" && test -n "$$k" && test "$$i" -lt "$$k" && test "$$j" -lt "$$k" \
+	  && test "$$w" = "$$(printf '%s\n' '    meta l4proto { tcp, udp } th dport 53 return' '    meta skuid 0 tcp dport { 80, 32526 } accept' '    meta skuid "systemd-network" udp sport 68 udp dport 67 accept' '    log prefix "mediatore-gateway out wireserver: " counter drop')" \
+	  && test "$$(printf '%s\n' "$$n" | grep -c '168\.63\.129\.16')" = 1 && test "$$(printf '%s\n' "$$n" | grep -c '169\.254\.169\.254')" = 1 \
+	  || { echo "the gateway's output chain must drop IMDS for every user and send WireServer to output_wireserver before any user's row, which admits root at TCP 80 and 32526 and systemd-networkd's DHCP renewal alone (ADR-0068)"; exit 1; }
+	@echo "✓ the kind bootstrap is the image's template, the example env files fill every template, the relay has its three legs, the inject Envoy is off by default and shaped by ADR-0040, the platform addresses kept to root (ADR-0068)"
 
 crds: ## Render mediatore's CRDs from their Rust types into deploy/base/crds/ (ADR-0008; never hand-edited, a unit test fails on a stale file)
 	cargo run -q -p mediatore-claims --bin crdgen -- --out-dir deploy/base/crds

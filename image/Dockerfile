@@ -3,18 +3,31 @@
 
 # The sandbox VM image: a Kairos derivative (ADR-0023). What every pool member boots.
 #
-# Everything the guest needs is in the immutable rootfs: the one mediatore binary at the
-# pinned path, the SPIRE agent and its TPM attestor plugin, the packages, the units, the
-# spire user. Nothing deployment-specific (trust bundle, trust domain, server address) and
-# nothing per VM (keys) is here; those are the cloud-config layers (image/cloud-config.yaml
-# and image/cloud-config-deployment.example.yaml) and the member's sealed partition.
+# An overlay (ADR-0067): `FROM` the VM base (image/base/Dockerfile, or a site's own base
+# by VM_BASE), adding only mediatore's pieces. The OS layer (Kairos, Debian 13, the shared
+# packages, the listeners removed) is the base's; what this file adds is the one mediatore
+# binary at the pinned path, the SPIRE agent and its TPM attestor plugin, nsjail and the
+# two libraries it links, curl for the bundle fetch, the spire user, the units, the sysctl
+# and the datasource stage. Nothing deployment-specific (trust bundle, trust domain, server
+# address) and nothing per VM (keys) is here; those are the cloud-config layers
+# (image/cloud-config.yaml and image/cloud-config-deployment.example.yaml) and the
+# member's sealed partition.
 #
-# BINARY_FROM, as for the server image: `container` compiles mediatore in the build,
-# `host` copies dist/mediatore (`make dist`). The other three ARGs are pins, by digest;
-# the plugin's checksum is verified against the one image/spire/agent.conf carries;
+# BINARY_FROM: `image` (the default) copies /usr/bin/mediatore out of the mediatore
+# container image MEDIATORE_IMG, the published server image, so a site's build needs no
+# toolchain; `container` compiles mediatore in the build; `host` copies dist/mediatore
+# (`make dist`), as CI and the kind tier do. The other ARGs are pins, by digest; the
+# plugin's checksum is verified against the one image/spire/agent.conf carries;
 # NSJAIL_COMMIT pins the source nsjail (the jail, ADR-0020) is built from.
-ARG BINARY_FROM=container
-ARG KAIROS_BASE=quay.io/kairos/debian:13-core-amd64-generic-v3.7.2@sha256:9ec2c93da51dfdcd7a65ffb578089e2d278abb1ff210cbb7587f7cd3d6e7e523
+ARG BINARY_FROM=image
+# The VM base this overlays (image/base/Dockerfile, `make base-image`). A moving tag until
+# the Build workflow has published it: pin it here as <tag>@sha256:<digest> then, from
+# `crane digest ghcr.io/firestoned/mediatore-vm-base:latest`. CI builds against the base
+# it publishes in the same run, by digest.
+ARG VM_BASE=ghcr.io/firestoned/mediatore-vm-base:latest
+# The mediatore container image BINARY_FROM=image takes the binary from (the static musl
+# build at /usr/bin/mediatore, the root Dockerfile). Bump it with the release the pool runs.
+ARG MEDIATORE_IMG=ghcr.io/firestoned/mediatore:sha-4c653fb@sha256:3e1ff6061d83047f163261b6b30b58b17508bde33caff9a0a2c5df931e92ea6e
 ARG SPIRE_AGENT_IMG=ghcr.io/spiffe/spire-agent:1.15.3@sha256:41b0dcd8b258a69db9e2768292a060766fb76fd866e4bc925849981ea1b825ff
 ARG TPM_PLUGIN_AGENT_IMG=ghcr.io/spiffe/spire-tpm-plugin-tpm-attestor-agent:v1.11.3@sha256:4dba6dc77fcec06b66962b632b6453636d49d51a38946efb0bc6fed29e4b75b1
 ARG TPM_PLUGIN_AGENT_SHA=ffb7e266c7a10a7b1bdb349409d6c2ded8090715770287813055431cb692575c
@@ -39,6 +52,10 @@ RUN cargo build --release --target x86_64-unknown-linux-musl -p mediatore \
 FROM scratch AS build-host
 COPY dist/mediatore /mediatore
 
+FROM ${MEDIATORE_IMG} AS mediatore-image
+FROM scratch AS build-image
+COPY --from=mediatore-image /usr/bin/mediatore /mediatore
+
 FROM build-${BINARY_FROM} AS build
 
 FROM ${NSJAIL_BUILD_IMG} AS nsjail
@@ -55,21 +72,22 @@ RUN git clone https://github.com/google/nsjail /nsjail \
 FROM ${SPIRE_AGENT_IMG} AS spire-agent
 FROM ${TPM_PLUGIN_AGENT_IMG} AS tpm-plugin
 
-FROM ${KAIROS_BASE}
+FROM ${VM_BASE}
 ARG TPM_PLUGIN_AGENT_SHA
 
-# tpm2-tools: the EK certificate export banlieue's layer runs (its examples/21).
-# qemu-guest-agent: the libvirt provider reads /run/banlieue through it (ADR-0019); its
-# command set is cut to what that takes by image/qemu-ga.conf, below.
-# nftables: the jail's ruleset (ADR-0020); the base has it, named so a base without it fails.
+# What this overlay needs of its base, checked so a site's own base fails here, at build
+# time, rather than on a member: the tools the units and the build call, the packages the
+# base layer installs, the TPM device group, and no sshd (ADR-0010 decision 2).
+RUN command -v apt-get && command -v systemctl && command -v useradd && command -v nft \
+    && command -v tpm2_nvread && command -v qemu-ga && getent group tss \
+    && ! command -v sshd
+
+# The guest's own packages, beside the base's:
 # curl, ca-certificates: the boot-time fetch of the SPIRE bundle through the gateway (ADR-0037).
 # libprotobuf32t64, libnl-route-3-200: what the nsjail binary built above links against.
-# Removed: every listener the base ships. Nothing inbound (ADR-0010 decision 2).
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends tpm2-tools qemu-guest-agent nftables curl ca-certificates libprotobuf32t64 libnl-route-3-200 \
-    && apt-get purge -y --auto-remove openssh-server openssh-sftp-server snmpd lldpd fail2ban rpcbind nfs-common \
-    && rm -rf /var/lib/apt/lists/* \
-    && ! command -v sshd
+    && apt-get install -y --no-install-recommends curl ca-certificates libprotobuf32t64 libnl-route-3-200 \
+    && rm -rf /var/lib/apt/lists/*
 
 # The agent runs unprivileged, in the TPM device group (image/systemd/spire-agent.service).
 RUN useradd --system --user-group --home-dir /var/lib/spire --no-create-home --shell /usr/sbin/nologin spire \

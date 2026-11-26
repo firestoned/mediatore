@@ -20,13 +20,26 @@
 # userData (vm.env) and the member's sealed partition. No sshd, no forwarding, no admin
 # interface (decision 8).
 #
-# BINARY_FROM as for the sandbox image: `container` compiles mediatore in the build, `host`
-# copies dist/mediatore (`make dist`). The pins: the Kairos base, Envoy (the same digest
-# dev/kind/gateway/kustomization.yaml runs the tier against; a bump is both files and the
-# tier again), the SPIRE agent and the plugin, whose checksum is verified against
-# image/spire/agent.conf.
-ARG BINARY_FROM=container
-ARG KAIROS_BASE=quay.io/kairos/debian:13-core-amd64-generic-v3.7.2@sha256:9ec2c93da51dfdcd7a65ffb578089e2d278abb1ff210cbb7587f7cd3d6e7e523
+# An overlay (ADR-0067), like the sandbox image: `FROM` the VM base (image/base/Dockerfile,
+# or a site's own base by VM_BASE), which carries the OS layer (Kairos, Debian 13,
+# tpm2-tools, qemu-guest-agent, nftables, no listener); this file adds mediatore's pieces
+# only, pulled from their images.
+#
+# BINARY_FROM as for the sandbox image: `image` (the default) copies /usr/bin/mediatore
+# out of the mediatore container image MEDIATORE_IMG, `container` compiles mediatore in the
+# build, `host` copies dist/mediatore (`make dist`). The pins: the mediatore image, Envoy
+# (the same digest dev/kind/gateway/kustomization.yaml runs the tier against; a bump is
+# both files and the tier again), the SPIRE agent and the plugin, whose checksum is
+# verified against image/spire/agent.conf.
+ARG BINARY_FROM=image
+# The VM base this overlays (image/base/Dockerfile, `make base-image`). A moving tag until
+# the Build workflow has published it: pin it here as <tag>@sha256:<digest> then, from
+# `crane digest ghcr.io/firestoned/mediatore-vm-base:latest`. CI builds against the base
+# it publishes in the same run, by digest.
+ARG VM_BASE=ghcr.io/firestoned/mediatore-vm-base:latest
+# The mediatore container image BINARY_FROM=image takes the binary from (the static musl
+# build at /usr/bin/mediatore, the root Dockerfile). Bump it with the release the gateways run.
+ARG MEDIATORE_IMG=ghcr.io/firestoned/mediatore:sha-4c653fb@sha256:3e1ff6061d83047f163261b6b30b58b17508bde33caff9a0a2c5df931e92ea6e
 ARG ENVOY_IMG=docker.io/envoyproxy/envoy:v1.40.2@sha256:49d3e8b6246d1a804acffaebe42f2799edc77b77a37a97709ef742af90b6d223
 ARG SPIRE_AGENT_IMG=ghcr.io/spiffe/spire-agent:1.15.3@sha256:41b0dcd8b258a69db9e2768292a060766fb76fd866e4bc925849981ea1b825ff
 ARG TPM_PLUGIN_AGENT_IMG=ghcr.io/spiffe/spire-tpm-plugin-tpm-attestor-agent:v1.11.3@sha256:4dba6dc77fcec06b66962b632b6453636d49d51a38946efb0bc6fed29e4b75b1
@@ -46,27 +59,27 @@ RUN cargo build --release --target x86_64-unknown-linux-musl -p mediatore \
 FROM scratch AS build-host
 COPY dist/mediatore /mediatore
 
+FROM ${MEDIATORE_IMG} AS mediatore-image
+FROM scratch AS build-image
+COPY --from=mediatore-image /usr/bin/mediatore /mediatore
+
 FROM build-${BINARY_FROM} AS build
 
 FROM ${ENVOY_IMG} AS envoy
 FROM ${SPIRE_AGENT_IMG} AS spire-agent
 FROM ${TPM_PLUGIN_AGENT_IMG} AS tpm-plugin
 
-FROM ${KAIROS_BASE}
+FROM ${VM_BASE}
 ARG TPM_PLUGIN_AGENT_SHA
 
-# tpm2-tools: the EK certificate export banlieue's layer runs (its examples/21).
-# qemu-guest-agent: the libvirt provider reads the VM's addresses and, the VM being
-# tpmEnabled, its EK certificate through it; its command set is cut to what that takes by
-# image/gateway/qemu-ga.conf, below.
-# nftables: the host table (ADR-0027 decision 5); the base has it, named so a base
-# without it fails.
-# Removed: every listener the base ships. Nothing inbound but the two planes (ADR-0028
-# decision 8, banlieue ADR-0109 decision 8).
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends tpm2-tools qemu-guest-agent nftables \
-    && apt-get purge -y --auto-remove openssh-server openssh-sftp-server snmpd lldpd fail2ban rpcbind nfs-common \
-    && rm -rf /var/lib/apt/lists/* \
+# What this overlay needs of its base, checked so a site's own base fails here, at build
+# time, rather than on a gateway: the tools the units and the build call, the packages the
+# base layer installs (tpm2-tools for the EK export, qemu-guest-agent for the libvirt
+# channel, cut to what that takes by image/gateway/qemu-ga.conf below, nftables for the
+# host table, ADR-0027 decision 5), the TPM device group, and no sshd (ADR-0028 decision 8,
+# banlieue ADR-0109 decision 8).
+RUN command -v systemctl && command -v useradd && command -v nft \
+    && command -v tpm2_nvread && command -v qemu-ga && getent group tss \
     && ! command -v sshd
 
 # The agent in the TPM device group (image/systemd/spire-agent.service); the four service

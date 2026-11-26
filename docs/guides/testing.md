@@ -248,6 +248,13 @@ make host-table-test
 ./image/host-table --render gateways registries env agent.conf | sudo /usr/sbin/nft -c -f -
 ```
 
+The test pins two renders ([ADR-0068](../adr/0068-the-cloud-platforms-host-addresses-root-alone-on-azure-the-metadata-service-for-nobody.md)): the table off Azure, byte for byte, and on
+Azure, chosen by the DMI chassis asset tag, with IMDS dropped first and WireServer admitted to root and
+`systemd-networkd`'s DHCP renewal alone. It points `CHASSIS_ASSET_TAG_FILE` at a file of its own for every
+render, because a CI runner may itself be an Azure VM. To check the Azure render with `nft -c`, give it a tag
+file holding `7783-7084-3265-9085-8269-3286-77`; the check resolves the user `systemd-network`, so run it where
+that user exists (the built image: `podman run --rm --cap-add NET_ADMIN --entrypoint sh <image> -c '...'`).
+
 The boot-time bundle fetch ([ADR-0037](../adr/0037-the-pool-fetches-its-spire-bundle-at-boot-through-the-relay.md),
 `image/spire-bundle-fetch`) is pinned the same way by `make bundle-fetch-test`, with a stub for
 curl: the exact request to the gateway's bundle leg, the atomic write, a gateway given by name,

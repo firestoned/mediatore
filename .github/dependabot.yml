@@ -33,12 +33,13 @@ updates:
       cargo:
         patterns: ["*"]
 
-  # Container base images (Dockerfile FROM lines): the server image, the sandbox VM
-  # image and the gateway VM image.
+  # Container base images (Dockerfile FROM lines): the server image, the VM base image
+  # (the Kairos pin, ADR-0067) and its two overlays, the sandbox and gateway VM images.
   - package-ecosystem: "docker"
     directories:
       - "/"
       - "/image"
+      - "/image/base"
       - "/image/gateway"
     schedule:
       interval: "weekly"
