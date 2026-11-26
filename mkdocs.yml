@@ -161,6 +161,8 @@ nav:
       - Identity and mTLS: design/identity-and-mtls.md
       - Issuers and audiences: design/issuers-and-audiences.md
       - Policy: design/policy.md
+      - "Who may use a policy: overview": design/policy-subjects-overview.md
+      - "Who may use a policy: design": design/policy-subjects.md
       - The guest: design/guest.md
       - The egress proxy: design/egress-proxy.md
       - The gateway: design/gateway.md

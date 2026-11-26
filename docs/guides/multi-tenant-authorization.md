@@ -29,18 +29,25 @@ weakest of them, so know which one you are configuring.
 | --- | --- | --- | --- |
 | Issuer gate | the broker, `issuers[].required_group` or `required_groups` ([`crates/mediatore-entra/src/lib.rs`](https://github.com/firestoned/mediatore/blob/main/crates/mediatore-entra/src/lib.rs)) | whether this login may use the broker at all | `mediatore.yaml` |
 | Namespace groups (v0.3.0) | the broker, `sandboxes.namespaces` ([`crates/mediatore/src/config.rs`](https://github.com/firestoned/mediatore/blob/main/crates/mediatore/src/config.rs)) | in which namespace this login may create, read and delete sandboxes through the API | `mediatore.yaml` ([section 5](#5-groups-per-namespace-v030)) |
-| Policy subjects | the signed bundle for the `policyRef`, read from the policy namespaces ([ADR-0026](../adr/0026-notaio-bundles-verified-in-shadow.md)) | which groups a policy is written for, and the audiences and egress it grants | the policy repository, by pull request |
+| Policy | the broker: `policy.sources` picks the namespaces a sandbox's namespace may take its policy from ([ADR-0054](../adr/0054-which-policies-a-namespace-may-name.md)), and the signed bundle of the `policyRef` sets what the claim gets ([ADR-0026](../adr/0026-notaio-bundles-verified-in-shadow.md), [ADR-0053](../adr/0053-an-audience-scoped-to-namespaces-each-with-its-own-rules.md)) | which policies a sandbox may name, and the audiences, egress and lease they grant. **Not** which groups may use a policy: see below | `mediatore.yaml` for the sources, the policy repository (by pull request) for the bundle |
 | Claim subject | banlieue's admission policy `banlieue-virtualmachineclaim-subject-authorization` | that a `VirtualMachineClaim` names its own creator, except for listed brokers | ConfigMap `banlieue-claim-subject-policy` (`brokers`, `issuers`, `usernamePrefix`) |
 | Kubernetes RBAC | the API server | who may create an `AgentSandbox` directly, in which namespace (the declarative path) | a RoleBinding per namespace, for example to a role that grants `create` and `delete` on `agentsandboxes` |
 
 The first, the second (once `sandboxes.namespaces` is set) and the fourth are checked for every
-API claim. The fifth is the only check on the
-declarative path (a team applying an `AgentSandbox` with `kubectl`), together with the
+API claim. The third is checked once the broker reads bundles: in `shadow` (the default) a named
+policy is compared and reported and grants nothing, and under `policy.audiences: enforce` it
+decides what the claim gets ([the policy bundle](the-policy-bundle.md)). The fifth is the only
+check on the declarative path (a team applying an `AgentSandbox` with `kubectl`), together with the
 `mediatore-agentsandbox-subject` admission policy, which limits a requester to the subject it is.
 
-The policy's group list is compared in shadow today: a named policy reports conformance and
-grants nothing the broker's own configuration does not ([the policy bundle](the-policy-bundle.md)).
-The issuer gate is the enforcement point for who may claim.
+**A policy's own group list is not checked anywhere.** `SandboxPolicy` has `spec.subjects.groups`,
+the groups the policy is written for, but notaio does not put it in the signed bundle, so the
+broker never sees it, in `shadow` or under `enforce`
+([ADR-0054](../adr/0054-which-policies-a-namespace-may-name.md) decision 7, accepted risk R-54 in
+the [threat model](../security/threat-model.md)). Who may claim is decided by the issuer gate and
+the namespace groups. Anyone who passes both for a namespace may name every policy that namespace
+draws from. Carrying the list in the bundle and checking it is a proposal, not built:
+[Who may use a policy](../design/policy-subjects-overview.md).
 
 ## 2. The issuer gate
 
@@ -166,9 +173,11 @@ path of [section 5](#5-groups-per-namespace-v030) comes on top of this):
    [ADR-0054](../adr/0054-which-policies-a-namespace-may-name.md)). To keep `SandboxPolicy`,
    `ExposureCeiling` and the published bundles in one platform namespace, list that namespace under
    `policy.namespaces` and give each tenant namespace a `policy.sources` entry naming it. Under
-   `policy.egress: enforce` every tenant that draws from a namespace may name every policy in it, so
-   a tenant whose policies must not be used by another gets a policy namespace of its own. Teams
-   change policy by pull request, never in the cluster.
+   `policy.egress: enforce` or `policy.audiences: enforce`, every tenant that draws from a namespace
+   may name every policy in it, whatever groups the policy's `subjects` lists (the broker does not
+   check them, [section 1](#1-who-may-do-what-five-separate-checks)). So a tenant whose policies
+   must not be used by another gets a policy namespace of its own. Teams change policy by pull
+   request, never in the cluster.
 5. **Create the sandbox in the team's namespace** with `kubectl apply`. With one claim namespace,
    `POST /v1/claims` and the CLI create sandboxes in `sandboxes.namespace` only.
 
