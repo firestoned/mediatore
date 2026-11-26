@@ -2388,12 +2388,23 @@ mod tests {
             validations[0]["expression"],
             "request.userInfo.username == 'system:serviceaccount:banlieue-system:mediatore'"
         );
-        // The same spelling as the policy on the broker's entries: one name to change.
+        // The same spelling as the policy on the broker's entries, which carries it as
+        // the first way an entry is claimed and in its sender validation (ADR-0056
+        // decision 4): one name to change, in every place.
+        let spelling = validations[0]["expression"].as_str().unwrap();
         let entries = admission_docs("clusterstaticentry-mediatore.yaml");
-        assert_eq!(
-            entries[0]["spec"]["matchConditions"][0]["expression"],
-            validations[0]["expression"]
-        );
+        for carried in [
+            &entries[0]["spec"]["matchConditions"][0]["expression"],
+            &entries[0]["spec"]["validations"][0]["expression"],
+        ] {
+            assert!(
+                carried
+                    .as_str()
+                    .unwrap()
+                    .starts_with(&format!("{spelling} || ")),
+                "{carried}"
+            );
+        }
         let binding = docs
             .iter()
             .find(|d| d["kind"] == "ValidatingAdmissionPolicyBinding")
@@ -2403,6 +2414,168 @@ mod tests {
         assert!(
             binding["spec"]["matchResources"].is_null(),
             "bound everywhere: a namespace left out would be ungoverned"
+        );
+    }
+
+    /// The messages of the validations the entries policy carried before it claimed an entry
+    /// by what it is: every one must still be there.
+    const KEPT_ENTRY_VALIDATIONS: [&str; 15] = [
+        "mediatore may only declare entries named mediatore-*",
+        "spiffeID must be spiffe://<td>/banlieue/node/<ek-hash> or spiffe://<td>/banlieue/claim/<uuid>",
+        "parentID must be a tpm agent ID: spiffe://<td>/spire/agent/tpm/<ek-hash>",
+        "spiffeID and parentID must be in the same trust domain",
+        "a node entry's EK hash must equal its parent agent's EK hash",
+        "selectors must be unix workload selectors",
+        "a node entry must select unix:uid:0",
+        "a claim entry must select exactly one unix:user:sb-<12 hex> (ADR-0004)",
+        "mediatore entries are never admin",
+        "mediatore entries are never downstream",
+        "mediatore entries never use an SVIDStore",
+        "mediatore entries never federate",
+        "mediatore entries carry no DNS names",
+        "className is required (the controller manager ignores classless resources)",
+        "x509SVIDTTL must be at most 4h",
+    ];
+
+    /// ADR-0056 decision 4: the entries policy claims an entry by what it is, whoever
+    /// sends it, and says who may send one. The CEL itself is proven by an API server
+    /// (the kind gateway tier's dry runs); what is held here is that the file still says
+    /// it: one match condition of four ways, none of the three object tests tied to a
+    /// sender, the sender validation first with the message the broker's self-check
+    /// reads, every earlier validation still present, and bound with `Deny`.
+    #[test]
+    fn the_entries_policy_claims_an_entry_by_what_it_is_and_names_its_one_sender() {
+        const BROKER: &str =
+            "request.userInfo.username == 'system:serviceaccount:banlieue-system:mediatore'";
+        let docs = admission_docs("clusterstaticentry-mediatore.yaml");
+        let policy = docs
+            .iter()
+            .find(|d| d["kind"] == "ValidatingAdmissionPolicy")
+            .expect("the policy");
+        assert_eq!(policy["metadata"]["name"], mediatore_spire::ENTRIES_POLICY);
+        assert_eq!(policy["spec"]["failurePolicy"], "Fail");
+        let rule = &policy["spec"]["matchConstraints"]["resourceRules"][0];
+        assert_eq!(rule["resources"], json!(["clusterstaticentries"]));
+        assert_eq!(rule["operations"], json!(["CREATE", "UPDATE"]));
+
+        let conditions = policy["spec"]["matchConditions"].as_array().unwrap();
+        assert_eq!(
+            conditions.len(),
+            1,
+            "conditions are ANDed: a second one would narrow what is claimed"
+        );
+        let claimed = conditions[0]["expression"].as_str().unwrap();
+        let ways: Vec<&str> = claimed.split(" || ").collect();
+        assert_eq!(ways.len(), 4, "{claimed}");
+        assert_eq!(ways[0], BROKER, "whatever the broker sends is judged");
+        assert!(
+            ways[1].contains("object.metadata.name.startsWith('mediatore-')"),
+            "by its name: {}",
+            ways[1]
+        );
+        let label = mediatore_spire::MANAGED_BY_LABEL;
+        let managed_by = mediatore_spire::MANAGED_BY;
+        assert!(
+            ways[2].contains(&format!(
+                "object.metadata.labels['{label}'] == '{managed_by}'"
+            )),
+            "by the label the broker sets: {}",
+            ways[2]
+        );
+        assert!(
+            ways[3].contains("object.spec.spiffeID.matches('^spiffe://[^/]+/banlieue/')"),
+            "by its path, in any trust domain: {}",
+            ways[3]
+        );
+        for way in &ways[1..] {
+            assert!(
+                !way.contains("request."),
+                "an object test tied to the request is the fail-open this replaced: {way}"
+            );
+        }
+
+        let validations = policy["spec"]["validations"].as_array().unwrap();
+        let sender = &validations[0];
+        assert_eq!(
+            sender["expression"],
+            format!("{BROKER} || (request.operation == 'UPDATE' && oldObject.spec == object.spec)"),
+            "the broker's ServiceAccount, or an update that declares nothing"
+        );
+        assert_eq!(
+            sender["message"],
+            mediatore_spire::ENTRIES_POLICY_SENDER_MESSAGE,
+            "the broker's self-check reads this message: change both or neither"
+        );
+        assert_eq!(sender["reason"], "Forbidden");
+        // What the policy refused before, it still refuses: every earlier validation.
+        for kept in KEPT_ENTRY_VALIDATIONS {
+            assert!(
+                validations[1..].iter().any(|v| v["message"] == kept),
+                "the validation is gone: {kept}"
+            );
+        }
+        assert_eq!(validations.len(), 16);
+
+        // The literal is the one string the two AgentSandbox policies carry.
+        for file in ["agentsandbox-subject.yaml", "agentsandbox-status.yaml"] {
+            let text = std::fs::read_to_string(format!(
+                "{}/../../deploy/base/admission/{file}",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .unwrap();
+            assert!(text.contains(BROKER), "{file} spells the broker otherwise");
+        }
+
+        let binding = docs
+            .iter()
+            .find(|d| d["kind"] == "ValidatingAdmissionPolicyBinding")
+            .expect("the binding");
+        assert_eq!(binding["spec"]["policyName"], policy["metadata"]["name"]);
+        assert_eq!(binding["spec"]["validationActions"], json!(["Deny"]));
+        assert!(
+            binding["spec"]["matchResources"].is_null() && binding["spec"]["paramRef"].is_null(),
+            "bound everywhere, with no parameter that could be missing"
+        );
+    }
+
+    /// The gateway's entries are the platform team's and stay the gateway policy's alone:
+    /// none of the shipped ones carries a sign by which the broker's policy claims an
+    /// entry, and the gateway policy claims by a path the broker's shapes never have.
+    #[test]
+    fn the_shipped_gateway_entries_carry_none_of_the_signs_of_a_brokers_entry() {
+        let path = format!(
+            "{}/../../deploy/gateway/clusterstaticentries.yaml",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let docs: Vec<serde_json::Value> =
+            serde_saphyr::from_multiple(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let entries: Vec<&serde_json::Value> = docs
+            .iter()
+            .filter(|d| d["kind"] == "ClusterStaticEntry")
+            .collect();
+        assert!(!entries.is_empty(), "no gateway entry was read from {path}");
+        for entry in entries {
+            let name = entry["metadata"]["name"].as_str().unwrap();
+            assert!(!name.starts_with("mediatore-"), "{name}");
+            assert!(
+                entry["metadata"]["labels"][mediatore_spire::MANAGED_BY_LABEL].is_null(),
+                "{name} carries the broker's label"
+            );
+            let id = entry["spec"]["spiffeID"].as_str().unwrap();
+            let after_td = id.strip_prefix("spiffe://").and_then(|r| r.split_once('/'));
+            let Some((_, id_path)) = after_td else {
+                panic!("{name}: {id} is not a SPIFFE ID with a path");
+            };
+            assert!(
+                id_path == "gateway" || id_path.starts_with("gateway/"),
+                "{name}: {id}"
+            );
+            assert!(!id_path.starts_with("banlieue/"), "{name}: {id}");
+        }
+        let gateway = admission_docs("clusterstaticentry-gateway.yaml");
+        assert_eq!(
+            gateway[0]["spec"]["matchConditions"][0]["expression"],
+            "has(object.spec.spiffeID) && object.spec.spiffeID.matches('^spiffe://[^/]+/gateway(/.*)?$')"
         );
     }
 

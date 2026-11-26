@@ -10,7 +10,8 @@ is proven on a booted gateway VM yet, so decisions 2, 5 and 6 are built and not 
 [ADR-0068](0068-the-cloud-platforms-host-addresses-root-alone-on-azure-the-metadata-service-for-nobody.md)
 (decisions 5 and 6: ahead of every user's row the output chain drops IMDS for every user, root included,
 and keeps Azure's WireServer to root at TCP 80 and 32526 and to `systemd-networkd`'s DHCP renewal, its
-port 53 left to the rows)
+port 53 left to the rows), and 2026-11-26 at decisions 5 and 6 (open question 7 built: the tunnel check is the
+authorizer's unix socket by default and the default table has no loopback exception)
 
 Roadmap 10 (the gateway). Carries the separation of
 [ADR-0040](0040-the-gateway-places-an-audiences-credential-the-pool-never-holds-it.md) decision 6
@@ -231,6 +232,42 @@ Constraints that shape the decision:
    *Optional keys are written in the template as `@NAME:-default@`, which `image/gateway/render`
    fills with the default when the env files do not carry the key.*
 
+   *Amended 2026-11-26 (open question 7, built): the loopback exception is no longer in the
+   default table. `image/gateway/env.example` sets
+   `AUTHORIZER_ENDPOINT=pipe: { path: /run/mediatore-gateway/check/check.sock }` and
+   `CHECK_TCP_ELEMENTS=` (empty), with or without the inject Envoy, and the two templates'
+   defaults for an absent key are the same (`AUTHORIZER_ENDPOINT` became optional, and the
+   default of `CHECK_TCP_ELEMENTS` went from `elements = { 9001 }` to empty). The tunnel
+   Envoy's row therefore reads: loopback refused, no exception. The socket is the CHECK socket
+   of ADR-0040 decision 6, as inject deployments already had it: its directory `2750`, setgid,
+   owned by `mediatore-gateway` and the group `envoy`, made by an `ExecStartPre=+` that is now
+   in the image's unit, the socket `0660`. No other local user can ask the check, which closes
+   what the first bullet above left open ("root and the users the table does not name reach it
+   as they did"): root still can, as root can do anything on the gateway.*
+
+   *Loopback TCP stays as an explicit setting, for a pod (the kind tier, whose two containers
+   share no socket directory: `dev/kind/gateway/envoy.env` says so) and for an operator who
+   sets it on purpose: both keys, `AUTHORIZER_ENDPOINT=socket_address: { address: 127.0.0.1,
+   port_value: <port> }` and `CHECK_TCP_ELEMENTS=elements = { <port> }`. The exception is then
+   the one described above, with what it leaves open. The authorizer's listen argument is no
+   longer fixed in the unit: `image/gateway/authorizer-start` reads the two keys through
+   `image/gateway/render` (a small template, `image/gateway/authorizer.in`, so an absent key
+   or a key written twice means to the authorizer what it means to Envoy's bootstrap and to
+   the table) and starts `mediatore gateway` with `--check-socket` and `--socket-dir-mode 2750`
+   or with `--listen 127.0.0.1:<port>`. The same script, as an `ExecStartPre`, refuses the
+   start with the reason when the two keys disagree (the socket in one and a loopback port in
+   the other, either way round, or two different ports) or when the endpoint is neither that
+   socket nor `127.0.0.1`: an env file updated by half would otherwise give an Envoy that
+   dials where nobody listens, or a table that drops every check, and look like a broker
+   outage. One consequence for a gateway deployed before this ADR's chain existed: an env file
+   that names the TCP endpoint and has no `CHECK_TCP_ELEMENTS` line used to render the
+   exception by default and is now refused until the line is added or the endpoint line is
+   removed. `env.inject.example` is down to the one line inject itself adds
+   (`INJECT_PORT_ELEMENT`); the binary's own default (`--listen 127.0.0.1:9001`) is unchanged,
+   for dev runs. Asserted by `make gateway-render-check` and `image/gateway/check.sh`; not run
+   on a booted gateway VM, where the socket's owner and group, the Envoy's connect over the
+   pipe and the refusal are still to be observed.*
+
 6. **The same chain bounds the address a resolved name may lead to, and says what it does not
    bound.** The refused column for `envoy` and `envoy-inject` is applied by the kernel at
    connect time, after resolution, so it holds whatever a name resolved to and however often
@@ -252,6 +289,14 @@ Constraints that shape the decision:
    - unix sockets, which nftables does not see. The agent's socket stays reachable to both
      Envoys, as it must (their SVID), and after decision 3 that SVID opens no route at the
      broker.
+
+   *Amended 2026-11-26 (open question 7, built): the authorizer's check socket is now one of
+   those unix sockets by default, so the table is not what keeps a local user away from the
+   check: the socket's directory is (`2750`, the group `envoy`, ADR-0040 decision 6). In the
+   default table the refusal of loopback for the tunnel Envoy has no exception, so a name that
+   resolves to `127.0.0.1` leads nowhere on any port, the former check port included. A
+   deployment that sets loopback TCP on purpose (decision 5's amendment of the same date) has
+   the one port back, and with it what this decision said of it.*
 
 7. **Migration: the broker is strict by default, with one explicit switch that exists for one
    release.** The three parts cannot change at one instant, and the order matters, so it is
@@ -591,9 +636,11 @@ either (the templates name none); it is recorded in the threat model.
    rule that only that user may reach the port. With the unix socket as the default
    (ADR-0040 decision 6 already ships it for inject) there is no loopback rule to get wrong.
    *Recommendation:* yes, in the same image release, as its own small change, so that the
-   exception in decision 5 is temporary. (Open, not built: the loopback TCP check is still the
-   default, the unix socket is used only where `env.inject.example` is the env in front, and the
-   exception of decision 5 stays until this is done.)
+   exception in decision 5 is temporary. (Answered 2026-11-26 by a change of its own, built: the unix
+   socket is the default on the gateway image, with or without inject, the default table has no
+   loopback exception, and loopback TCP is an explicit setting of two keys that the authorizer's
+   unit checks against each other. The amendments of that date at decisions 5 and 6 say what the
+   code does. Not yet observed on a booted gateway VM.)
 8. **Is `EGRESS_DENY_ELEMENTS` in scope here or a follow-up?** *Recommendation:* in scope, as
    an empty-by-default key, because the chain it extends is new in this ADR and the Kubernetes
    API and the secrets store are the addresses an operator will most want in it; what goes in

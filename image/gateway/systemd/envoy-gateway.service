@@ -6,6 +6,8 @@ Description=Envoy, the egress gateway's data plane (ADR-0028)
 # No table, no listener; no interface, no listener; the SVID comes from the agent over SDS;
 # the authorizer is asked on every tunnel, so it is started first (Envoy retries the
 # cluster meanwhile and refuses every CONNECT until it answers).
+# It is asked on its CHECK socket by default, which this unit's group (envoy) reaches and no
+# other user does (ADR-0040 decision 6); a connect needs no write access to the mount below.
 Requires=mediatore-gateway-nft.service mediatore-gateway-network.service spire-agent.service
 After=mediatore-gateway-nft.service mediatore-gateway-network.service spire-agent.service network-online.target mediatore-gateway.service
 Wants=network-online.target mediatore-gateway.service

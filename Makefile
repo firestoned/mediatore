@@ -123,13 +123,13 @@ sbom: ## Generate CycloneDX SBOM(s) for the workspace (*.cdx.json per crate)
 # ----- Artifacts ---------------------------------------------------------------
 
 dist: ## The one static musl binary into dist/ (ADR-0014): what the server image copies with BINARY_FROM=host and what the VM image bakes in
-	cargo build --profile $(DIST_PROFILE) --target $(MUSL_TARGET) -p mediatore
+	cargo build --locked --profile $(DIST_PROFILE) --target $(MUSL_TARGET) -p mediatore
 	@mkdir -p dist
 	cp target/$(MUSL_TARGET)/$(DIST_PROFILE)/mediatore dist/
 
 dist-darwin: ## The CLI for a Mac (the same binary, every role) into dist/mediatore-darwin-arm64; runs on a macOS arm64 host, native, no cross-compile
 	@test "$$(uname -s)-$$(uname -m)" = "Darwin-arm64" || { echo "dist-darwin runs on a macOS arm64 host, this is $$(uname -s)-$$(uname -m)"; exit 1; }
-	cargo build --release -p mediatore
+	cargo build --locked --release -p mediatore
 	@mkdir -p dist
 	cp target/release/mediatore dist/mediatore-darwin-arm64
 
@@ -216,7 +216,7 @@ kind-gateway-envoy: ## Render dev/kind/gateway/envoy.yaml from image/gateway/env
 gateway-render-check: ## Fail when dev/kind/gateway/envoy.yaml drifted from the image's template, or an example env leaves a placeholder unfilled
 	@./image/gateway/render image/gateway/envoy/gateway.yaml.in - dev/kind/gateway/envoy.env | diff -u dev/kind/gateway/envoy.yaml - \
 	  || { echo "dev/kind/gateway/envoy.yaml drifted from image/gateway/envoy/gateway.yaml.in: run make kind-gateway-envoy"; exit 1; }
-	@for t in envoy/gateway.yaml.in envoy/relay.yaml.in envoy/inject.yaml.in nftables.conf.in network.in; do \
+	@for t in envoy/gateway.yaml.in envoy/relay.yaml.in envoy/inject.yaml.in nftables.conf.in network.in authorizer.in; do \
 	  ./image/gateway/render image/gateway/$$t - image/gateway/env.example image/gateway/vm.env.example > /dev/null || exit 1; \
 	done
 	@r=$$(./image/gateway/render image/gateway/envoy/relay.yaml.in - image/gateway/env.example image/gateway/vm.env.example); \
@@ -225,7 +225,7 @@ gateway-render-check: ## Fail when dev/kind/gateway/envoy.yaml drifted from the 
 	  && ! printf '%s\n' "$$r" | grep -v '^[[:space:]]*#' | grep -qi 'registry' \
 	  && ./image/gateway/render image/gateway/nftables.conf.in - image/gateway/env.example image/gateway/vm.env.example | grep -q 'elements = { 3129, 3130, 3131 }' \
 	  || { echo "the relay must render three listeners (SPIRE, broker, bundle: ADR-0037), no registry leg (ADR-0063 decision 4), and the host table admit 3129, 3130 and 3131"; exit 1; }
-	@# The inject Envoy (ADR-0040 decision 3): off by default (the example env renders no inject port and keeps the authorizer on loopback), and
+	@# The inject Envoy (ADR-0040 decision 3): off by default (the example env renders no inject port), and
 	@# its bootstrap has the shape the ADR says. The assertions ignore comment lines: the comments name what is forbidden.
 	@r=$$(./image/gateway/render image/gateway/envoy/inject.yaml.in - image/gateway/env.example image/gateway/vm.env.example | grep -v '^[[:space:]]*#'); \
 	  test "$$(printf '%s\n' "$$r" | grep -c '^    - name: inject$$')" = 1 \
@@ -239,15 +239,58 @@ gateway-render-check: ## Fail when dev/kind/gateway/envoy.yaml drifted from the 
 	  && ! printf '%s\n' "$$r" | grep -Eq 'request_headers_to_(add|remove)|response_headers_to_add|strip_any_host_port|connect_matcher|upgrade_configs|dynamic_forward_proxy|^admin:' \
 	  && ! printf '%s\n' "$$r" | grep -Eqi 'authorization|x-api-key' \
 	  || { echo "the inject bootstrap must carry the claim mutual TLS, a bare-host route, TLS origination with SNI and a DNS SAN, ext_authz to the inject socket with mode inject, and no header mutation, CONNECT, strip_any_host_port or admin block (ADR-0040 decisions 3 and 4)"; exit 1; }
-	@d=$$(./image/gateway/render image/gateway/envoy/gateway.yaml.in - image/gateway/env.example image/gateway/vm.env.example); \
-	  printf '%s\n' "$$d" | grep -q 'socket_address: { address: 127.0.0.1, port_value: 9001 }' \
-	  && ./image/gateway/render image/gateway/nftables.conf.in - image/gateway/env.example image/gateway/vm.env.example | grep -q 'elements = { 3129, 3130, 3131 } }' \
-	  || { echo "with no inject settings the data plane asks the authorizer on loopback and the host table admits only the three relay ports"; exit 1; }
+	@# The tunnel check (ADR-0053 open question 7): the CHECK socket by default, with or without inject, and no loopback exception in the default
+	@# table; loopback TCP only for an env file that names it in both keys. The assertions ignore comment lines.
+	@d=$$(./image/gateway/render image/gateway/envoy/gateway.yaml.in - image/gateway/env.example image/gateway/vm.env.example | grep -v '^[[:space:]]*#'); \
+	  n=$$(./image/gateway/render image/gateway/nftables.conf.in - image/gateway/env.example image/gateway/vm.env.example | grep -v '^[[:space:]]*#'); \
+	  printf '%s\n' "$$d" | sed -n '/^    - name: authorizer$$/,/^    - name: destinations$$/p' | grep -qx '                    pipe: { path: /run/mediatore-gateway/check/check.sock }' \
+	  && ! printf '%s\n' "$$d" | grep -Eq '127\.0\.0\.1|port_value: 9001' \
+	  && printf '%s\n' "$$n" | grep -qx '  set check_tcp { type inet_service;  }' && ! printf '%s\n' "$$n" | grep -q '9001' \
+	  && test "$$(printf '%s\n' "$$n" | grep -c '@check_tcp')" = 1 \
+	  && printf '%s\n' "$$n" | grep -q 'elements = { 3129, 3130, 3131 } }' \
+	  || { echo "by default (the example env) the data plane asks the authorizer's CHECK socket over a pipe, the host table has no loopback exception for the tunnel Envoy (check_tcp empty, port 9001 nowhere) and admits only the three relay ports (ADR-0053 open question 7)"; exit 1; }
 	@d=$$(./image/gateway/render image/gateway/envoy/gateway.yaml.in - image/gateway/env.inject.example image/gateway/env.example image/gateway/vm.env.example); \
 	  n=$$(./image/gateway/render image/gateway/nftables.conf.in - image/gateway/env.inject.example image/gateway/env.example image/gateway/vm.env.example); \
-	  printf '%s\n' "$$d" | grep -q 'pipe: { path: /run/mediatore-gateway/check/check.sock }' && ! printf '%s\n' "$$d" | grep -q 'port_value: 9001' \
-	  && printf '%s\n' "$$n" | grep -q 'elements = { 3129, 3130, 3131, 3133 } }' \
-	  || { echo "with inject on (env.inject.example in front of the example) the data plane asks the CHECK socket, no loopback TCP, and the host table admits the inject port under the relay's cap (ADR-0040 decisions 6 and 7)"; exit 1; }
+	  test "$$d" = "$$(./image/gateway/render image/gateway/envoy/gateway.yaml.in - image/gateway/env.example image/gateway/vm.env.example)" \
+	  && test "$$(grep -c '^[A-Z]' image/gateway/env.inject.example)" = 1 && grep -qx 'INJECT_PORT_ELEMENT=, 3133' image/gateway/env.inject.example \
+	  && printf '%s\n' "$$n" | grep -q 'elements = { 3129, 3130, 3131, 3133 } }' && ! printf '%s\n' "$$n" | grep -v '^[[:space:]]*#' | grep -q '9001' \
+	  && c=$$(printf '%s\n' "$$d" | sed -n 's/^ *pipe: { path: \(.*check\.sock\) }$$/\1/p') \
+	  && i=$$(./image/gateway/render image/gateway/envoy/inject.yaml.in - image/gateway/env.inject.example image/gateway/env.example image/gateway/vm.env.example | sed -n 's/^ *pipe: { path: \(.*inject\.sock\) }$$/\1/p') \
+	  && test -n "$$c" && test -n "$$i" && test "$$(dirname "$$c")" != "$$(dirname "$$i")" \
+	  || { echo "with inject on (env.inject.example in front of the example) the one thing that changes is the inject port in the host table, under the relay's cap: the data plane is on the CHECK socket already, no loopback TCP, and the CHECK and INJECT sockets are in two directories (ADR-0040 decisions 6 and 7)"; exit 1; }
+	@# The authorizer listens where the data plane dials (image/gateway/authorizer-start, the unit's ExecStartPre and ExecStart): the same keys, read
+	@# by the same renderer, with the same defaults as the bootstrap and the table; an env file updated by half is refused with the reason. The three
+	@# scratch env files are removed by name and their directory with rmdir.
+	@tmp=$$(mktemp -d); trap 'rm -f "$$tmp/neither.env" "$$tmp/tcp.env" "$$tmp/half.env"; rmdir "$$tmp"' EXIT; a=./image/gateway/authorizer-start; g=image/gateway; \
+	  s='--check-socket /run/mediatore-gateway/check/check.sock --socket-dir-mode 2750'; \
+	  t='socket_address: { address: 127.0.0.1, port_value: 9001 }'; p='pipe: { path: /run/mediatore-gateway/check/check.sock }'; \
+	  grep -vE '^(AUTHORIZER_ENDPOINT|CHECK_TCP_ELEMENTS)=' $$g/env.example > "$$tmp/neither.env"; \
+	  no() { printf '%s\n' "$$@" > "$$tmp/half.env"; ! $$a check "$$tmp/half.env" "$$tmp/neither.env" $$g/vm.env.example 2>/dev/null; }; \
+	  test "$$($$a print $$g/env.example $$g/vm.env.example)" = "$$s" \
+	  && test "$$($$a print $$g/env.inject.example $$g/env.example $$g/vm.env.example)" = "$$s" \
+	  && test "$$($$a print "$$tmp/neither.env" $$g/vm.env.example)" = "$$s" \
+	  && for f in envoy/gateway.yaml.in nftables.conf.in authorizer.in; do \
+	       test "$$($$g/render $$g/$$f - "$$tmp/neither.env" $$g/vm.env.example)" = "$$($$g/render $$g/$$f - $$g/env.example $$g/vm.env.example)" || exit 1; \
+	     done \
+	  && printf '%s\n' "AUTHORIZER_ENDPOINT=$$t" 'CHECK_TCP_ELEMENTS=elements = { 9001 }' > "$$tmp/tcp.env" \
+	  && test "$$($$a print "$$tmp/tcp.env" "$$tmp/neither.env" $$g/vm.env.example)" = '--listen 127.0.0.1:9001' \
+	  && $$g/render $$g/envoy/gateway.yaml.in - "$$tmp/tcp.env" "$$tmp/neither.env" $$g/vm.env.example | grep -qx "                    $$t" \
+	  && $$g/render $$g/nftables.conf.in - "$$tmp/tcp.env" "$$tmp/neither.env" $$g/vm.env.example | grep -q 'set check_tcp { type inet_service; elements = { 9001 } }' \
+	  && no "AUTHORIZER_ENDPOINT=$$t" \
+	  && no "AUTHORIZER_ENDPOINT=$$t" 'CHECK_TCP_ELEMENTS=' \
+	  && no 'CHECK_TCP_ELEMENTS=elements = { 9001 }' \
+	  && no "AUTHORIZER_ENDPOINT=$$p" 'CHECK_TCP_ELEMENTS=elements = { 9001 }' \
+	  && no 'AUTHORIZER_ENDPOINT=socket_address: { address: 127.0.0.1, port_value: 9002 }' 'CHECK_TCP_ELEMENTS=elements = { 9001 }' \
+	  && no 'AUTHORIZER_ENDPOINT=socket_address: { address: 0.0.0.0, port_value: 9001 }' 'CHECK_TCP_ELEMENTS=elements = { 9001 }' \
+	  && no 'AUTHORIZER_ENDPOINT=pipe: { path: /run/mediatore-gateway/inject/inject.sock }' \
+	  && no "AUTHORIZER_ENDPOINT=$$p" "AUTHORIZER_ENDPOINT=$$t" 'CHECK_TCP_ELEMENTS=elements = { 9001 }' \
+	  && grep -qx 'ExecStartPre=/usr/libexec/mediatore-gateway/authorizer-start check /etc/mediatore-gateway/env /etc/mediatore-gateway/vm.env' $$g/systemd/mediatore-gateway.service \
+	  && grep -qx 'ExecStart=/usr/libexec/mediatore-gateway/authorizer-start exec /etc/mediatore-gateway/env /etc/mediatore-gateway/vm.env' $$g/systemd/mediatore-gateway.service \
+	  && grep -qx 'ExecStartPre=+/usr/bin/install -d -m 2750 -o mediatore-gateway -g envoy /run/mediatore-gateway/check' $$g/systemd/mediatore-gateway.service \
+	  && sed -n 's/^ *AUTHORIZER_ENDPOINT=//p' $$g/cloud-config-deployment.example.yaml | grep -qx "$$p" \
+	  && grep -qx ' *CHECK_TCP_ELEMENTS=' $$g/cloud-config-deployment.example.yaml \
+	  && grep -qx "AUTHORIZER_ENDPOINT=$$t" dev/kind/gateway/envoy.env \
+	  || { echo "the authorizer's unit must listen where the data plane dials: the check socket for the example env, for an env file with neither key and with inject in front, loopback TCP only for an env file that names it in AUTHORIZER_ENDPOINT and CHECK_TCP_ELEMENTS both, and a refusal for one updated by half (image/gateway/authorizer-start); the deployment example carries the socket, the kind tier loopback TCP on purpose"; exit 1; }
 	@# ADR-0068: the cloud platform's addresses, for every user and ahead of every user's row: IMDS dropped, root included;
 	@# WireServer root's at TCP 80 and 32526 and systemd-networkd's DHCP renewal, its port 53 back to the rows, anything else dropped.
 	@n=$$(./image/gateway/render image/gateway/nftables.conf.in - image/gateway/env.example image/gateway/vm.env.example | grep -v '^[[:space:]]*#'); \
@@ -260,7 +303,7 @@ gateway-render-check: ## Fail when dev/kind/gateway/envoy.yaml drifted from the 
 	  && test "$$w" = "$$(printf '%s\n' '    meta l4proto { tcp, udp } th dport 53 return' '    meta skuid 0 tcp dport { 80, 32526 } accept' '    meta skuid "systemd-network" udp sport 68 udp dport 67 accept' '    log prefix "mediatore-gateway out wireserver: " counter drop')" \
 	  && test "$$(printf '%s\n' "$$n" | grep -c '168\.63\.129\.16')" = 1 && test "$$(printf '%s\n' "$$n" | grep -c '169\.254\.169\.254')" = 1 \
 	  || { echo "the gateway's output chain must drop IMDS for every user and send WireServer to output_wireserver before any user's row, which admits root at TCP 80 and 32526 and systemd-networkd's DHCP renewal alone (ADR-0068)"; exit 1; }
-	@echo "✓ the kind bootstrap is the image's template, the example env files fill every template, the relay has its three legs, the inject Envoy is off by default and shaped by ADR-0040, the platform addresses kept to root (ADR-0068)"
+	@echo "✓ the kind bootstrap is the image's template, the example env files fill every template, the relay has its three legs, the inject Envoy is off by default and shaped by ADR-0040, the tunnel check is the CHECK socket by default with no loopback exception and the authorizer listens where the data plane dials (ADR-0053), the platform addresses kept to root (ADR-0068)"
 
 crds: ## Render mediatore's CRDs from their Rust types into deploy/base/crds/ (ADR-0008; never hand-edited, a unit test fails on a stale file)
 	cargo run -q -p mediatore-claims --bin crdgen -- --out-dir deploy/base/crds
@@ -364,6 +407,10 @@ set-version: ## Set [workspace.package] version in VERSION_FILE to VERSION; fail
 	@got=$$(awk -F'"' '/^\[workspace\.package\]/ { p = 1; next } /^\[/ { p = 0 } p && /^version *=/ { print $$2; exit }' $(VERSION_FILE)); \
 	  if [ "$$got" != "$(VERSION)" ]; then echo "$(VERSION_FILE): workspace version is '$$got', expected '$(VERSION)'"; exit 1; fi; \
 	  echo "$(VERSION_FILE): workspace version $(VERSION)"
+	@# The lock names every workspace crate at its version, and the builds are --locked: bring
+	@# those entries, and only those, to the new version. A copy elsewhere (VERSION_FILE) has
+	@# no lock beside it to move.
+	@if [ "$(VERSION_FILE)" = "Cargo.toml" ]; then cargo update --workspace --quiet && echo "Cargo.lock: workspace crates at $(VERSION)"; fi
 
 set-version-test: ## Prove set-version changes the workspace version, and only it, and the workspace still resolves
 	@tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \

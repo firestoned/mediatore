@@ -125,7 +125,7 @@ Added 2026-11-19 ([ADR-0053](../../docs/adr/0053-the-gateways-authorizer-has-an-
 - [x] A connection on the sandbox listener ends at its peer certificate's `notAfter` (2026-11-19)
 - [x] Tests: unit and end to end in `make check`; the kind gateway tiers with two identities on the pod, the listeners' identity refused by the broker and the admission dry runs (2026-11-19)
 - [x] Threat model: full pass; A-28 new, R-20 and R-27 narrowed, R-48 to R-51 new (2026-11-19)
-- [ ] The tunnel check on the unix socket by default, which removes the loopback exception (ADR-0053 open question 7)
+- [x] The tunnel check on the unix socket by default, which removes the loopback exception (ADR-0053 open question 7; built 2026-11-26, the image check green, a booted gateway still owed)
 - [ ] The output chain's default policy moved to `drop`, once a booted gateway has given the list of users that open a connection (open question 4)
 - [ ] The transition switch removed, the release after the one that ships it
 - [ ] Per-gateway identities and binding a credential ask to the gateway serving the claim: an ADR of its own (decision 8)

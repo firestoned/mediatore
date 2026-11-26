@@ -1,0 +1,11 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+#
+# The two keys that say where the tunnel check is asked, as image/gateway/render reads them
+# from the env files (the first definition wins, an absent key takes the default written
+# here): rendered by image/gateway/authorizer-start, so the authorizer listens where the
+# data plane's bootstrap (envoy/gateway.yaml.in) dials and the host table (nftables.conf.in)
+# agrees. The defaults here are those two templates' defaults, word for word: `make
+# gateway-render-check` and image/gateway/check.sh fail when one of the three differs.
+endpoint=@AUTHORIZER_ENDPOINT:-pipe: { path: /run/mediatore-gateway/check/check.sock }@
+check_tcp=@CHECK_TCP_ELEMENTS:-@

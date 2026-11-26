@@ -21,8 +21,9 @@
 # tier's fixture). RBAC on clusterstaticentries and on this policy is the platform team's.
 # A policy does not judge objects that already exist but does refuse an update to one, so
 # apply it once the last entry of the old shape has been replaced (ADR-0053 decision 7).
-# The broker's own policy (clusterstaticentry-mediatore.yaml) is unchanged and already
-# refuses its ServiceAccount both IDs. Requires Kubernetes 1.30+.
+# The broker's own policy (clusterstaticentry-mediatore.yaml) refuses its ServiceAccount both
+# IDs, and since 2026-11-26 also claims an entry by its name, label or path: a gateway entry
+# carries none of those signs, so it stays this policy's alone. Requires Kubernetes 1.30+.
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:

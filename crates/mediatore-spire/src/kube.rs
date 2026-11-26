@@ -27,8 +27,9 @@ use uuid::Uuid;
 
 use crate::x509pop::{NodeAttestation, node_entry_spec};
 use crate::{
-    CLAIM_UID_LABEL, EntryKind, EntryManager, EntryRef, KIND_LABEL, MANAGED_BY, MANAGED_BY_LABEL,
-    Naming, SpireError, claim_entry_name, validate_ek_hash, validate_unix_user,
+    CLAIM_UID_LABEL, ENTRIES_POLICY, ENTRIES_POLICY_SENDER_MESSAGE, EntryKind, EntryManager,
+    EntryRef, KIND_LABEL, MANAGED_BY, MANAGED_BY_LABEL, Naming, SelfCheckError, SpireError,
+    claim_entry_name, validate_ek_hash, validate_unix_user,
 };
 
 /// `spec` of `spire.spiffe.io/v1alpha1` `ClusterStaticEntry`, the fields mediatore uses.
@@ -102,6 +103,86 @@ impl Default for EntriesConfig {
             claim_svid_ttl: MAX_CLAIM_SVID_TTL,
         }
     }
+}
+
+/// Name prefix of the entry the self-check sends: the broker's own prefix, so the policy
+/// claims it by its name whoever the sender is.
+const SELF_CHECK_NAME_PREFIX: &str = "mediatore-selfcheck-";
+/// `spec.className` of that entry: the class of no controller manager, so the entry could
+/// not be rendered into a server entry even on an API server that ignored the dry run.
+const SELF_CHECK_CLASS: &str = "mediatore-selfcheck-never-rendered";
+
+/// The entry [`KubeEntryManager`]'s self-check asks the API server to judge, as a dry run
+/// (ADR-0056 decision 5). The policy claims it three times over (the name, the label, a
+/// path under `/banlieue/`) and its validations refuse it twice: the SPIFFE ID is neither
+/// a node's nor a claim's, and the parent is the SPIRE server, never a TPM agent. It is
+/// well formed for the CRD's schema, so the schema is not what answers. It is never a
+/// shape the policy admits; a test holds it to that.
+fn self_check_probe(naming: &Naming) -> ClusterStaticEntry {
+    let mut labels = BTreeMap::new();
+    labels.insert(MANAGED_BY_LABEL.to_owned(), MANAGED_BY.to_owned());
+    ClusterStaticEntry {
+        metadata: ObjectMeta {
+            name: Some(format!("{SELF_CHECK_NAME_PREFIX}{}", Uuid::new_v4())),
+            labels: Some(labels),
+            ..ObjectMeta::default()
+        },
+        spec: ClusterStaticEntrySpec {
+            spiffe_id: format!(
+                "spiffe://{}/banlieue/selfcheck/refused",
+                naming.trust_domain
+            ),
+            parent_id: format!("spiffe://{}/spire/server", naming.trust_domain),
+            selectors: vec!["unix:user:mediatore-selfcheck".to_owned()],
+            class_name: Some(SELF_CHECK_CLASS.to_owned()),
+            x509_svid_ttl: None,
+            hint: Some("selfcheck".to_owned()),
+        },
+        status: None,
+    }
+}
+
+/// Read the API server's answer to the self-check's dry run. Only a refusal that names
+/// the entries policy is proof, and only when it is not the policy's sender validation.
+///
+/// A denial by a `ValidatingAdmissionPolicy` is a `Status` whose code and reason are the
+/// failed validation's (`Forbidden`, 403, for all but one of this policy's; `Invalid`,
+/// 422, when a validation names none) and whose message names the policy. An RBAC
+/// refusal is also a 403 `Forbidden`, and names no policy:
+///
+/// ```text
+/// clusterstaticentries.spire.spiffe.io "NAME" is forbidden: ValidatingAdmissionPolicy 'POLICY' with binding 'BINDING' denied request: MESSAGE
+/// clusterstaticentries.spire.spiffe.io is forbidden: User "USER" cannot create resource "clusterstaticentries" in API group "spire.spiffe.io" at the cluster scope
+/// ```
+///
+/// The closing quote in the needle keeps `mediatore-clusterstaticentry-gateway`, the
+/// gateway entries' policy, from standing in for this one.
+fn judge_self_check(
+    name: &str,
+    answer: Result<ClusterStaticEntry, kube::Error>,
+) -> Result<(), SelfCheckError> {
+    let status = match answer {
+        Ok(_) => return Err(SelfCheckError::Admitted(name.to_owned())),
+        Err(kube::Error::Api(status)) => status,
+        Err(e) => return Err(SelfCheckError::Unreachable(e.to_string())),
+    };
+    let by_the_policy = matches!(status.code, 403 | 422)
+        && status
+            .message
+            .contains(&format!("ValidatingAdmissionPolicy '{ENTRIES_POLICY}'"));
+    if by_the_policy {
+        if status.message.contains(ENTRIES_POLICY_SENDER_MESSAGE) {
+            return Err(SelfCheckError::NotTheBroker(status.message.clone()));
+        }
+        return Ok(());
+    }
+    if status.code == 403 && status.message.contains("cannot create resource") {
+        return Err(SelfCheckError::Rbac(status.message.clone()));
+    }
+    Err(SelfCheckError::Refused {
+        code: status.code,
+        message: status.message.clone(),
+    })
 }
 
 /// Declares and retracts `ClusterStaticEntry` resources.
@@ -354,6 +435,25 @@ impl EntryManager for KubeEntryManager {
                 })
             })
             .collect())
+    }
+
+    /// A server-side dry-run create (`dryRun=All`: admission runs, nothing is stored) of
+    /// the entry `self_check_probe` builds, which the policy must refuse. Needs no verb
+    /// beyond the `create` a declaration already uses (`deploy/base/rbac.yaml`).
+    async fn self_check(&self) -> Result<(), SelfCheckError> {
+        let probe = self_check_probe(&self.naming);
+        let name = probe.metadata.name.clone().unwrap_or_default();
+        let dry_run = PostParams {
+            dry_run: true,
+            field_manager: None,
+        };
+        judge_self_check(&name, self.api.create(&dry_run, &probe).await)?;
+        tracing::info!(
+            name,
+            policy = ENTRIES_POLICY,
+            "entries: the admission policy refused a forbidden dry-run entry (self-check passed)"
+        );
+        Ok(())
     }
 }
 
@@ -759,6 +859,210 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, SpireError::Denied(msg) if msg.contains("never admin")));
         finish(m, task).await;
+    }
+
+    /// What the API server answers when the entries policy denies: the validation's
+    /// reason and code, the policy and its binding named in the message.
+    fn policy_denial(code: u16, reason: &str, policy: &str, why: &str) -> Value {
+        status_json(
+            code,
+            reason,
+            &format!(
+                "clusterstaticentries.spire.spiffe.io \"mediatore-selfcheck-0\" is forbidden: ValidatingAdmissionPolicy '{policy}' with binding '{policy}' denied request: {why}"
+            ),
+        )
+    }
+
+    /// The self-check's one request: a POST that must be a dry run, of the refused shape.
+    fn dry_run_post(status: u16, body: &Value) -> Step {
+        let mut s = post(status, body);
+        s.query_contains = "dryRun=All";
+        s.check = Some(|v: &Value| {
+            let name = v["metadata"]["name"].as_str().unwrap();
+            assert!(name.starts_with("mediatore-selfcheck-"), "{name}");
+            assert_eq!(
+                v["metadata"]["labels"]["app.kubernetes.io/managed-by"],
+                "mediatore"
+            );
+            assert_eq!(
+                v["spec"]["spiffeID"],
+                "spiffe://sandbox.test/banlieue/selfcheck/refused"
+            );
+            assert_eq!(v["spec"]["parentID"], "spiffe://sandbox.test/spire/server");
+            assert_eq!(
+                v["spec"]["className"], "mediatore-selfcheck-never-rendered",
+                "never the configured class: no controller manager would render it"
+            );
+            assert!(v["spec"].get("admin").is_none());
+        });
+        s
+    }
+
+    const SPIFFE_ID_RULE: &str = "spiffeID must be spiffe://<td>/banlieue/node/<ek-hash> or spiffe://<td>/banlieue/claim/<uuid>";
+
+    #[tokio::test]
+    async fn the_self_check_passes_on_the_policys_denial_of_a_dry_run() {
+        // 403 Forbidden is what this policy's validations answer; 422 Invalid is what a
+        // validation without a reason answers. Both name the policy.
+        for (code, reason) in [(403, "Forbidden"), (422, "Invalid")] {
+            let (m, task) = manager(vec![dry_run_post(
+                code,
+                &policy_denial(code, reason, ENTRIES_POLICY, SPIFFE_ID_RULE),
+            )]);
+            assert_eq!(m.self_check().await, Ok(()), "{code} {reason}");
+            finish(m, task).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn the_self_check_fails_when_the_forbidden_entry_is_admitted() {
+        // The finding: a policy that matches nothing this identity sends admits it, and
+        // nothing else would ever say so.
+        let (m, task) = manager(vec![dry_run_post(
+            201,
+            &entry_json("mediatore-selfcheck-0", None, &json!({})),
+        )]);
+        let err = m.self_check().await.unwrap_err();
+        assert!(
+            matches!(&err, SelfCheckError::Admitted(n) if n.starts_with("mediatore-selfcheck-")),
+            "{err:?}"
+        );
+        assert!(
+            err.to_string().contains("not in force for this identity"),
+            "{err}"
+        );
+        finish(m, task).await;
+    }
+
+    #[tokio::test]
+    async fn an_rbac_403_is_not_proof_and_is_reported_as_rbac() {
+        let (m, task) = manager(vec![dry_run_post(
+            403,
+            &status_json(
+                403,
+                "Forbidden",
+                "clusterstaticentries.spire.spiffe.io is forbidden: User \"system:serviceaccount:elsewhere:broker\" cannot create resource \"clusterstaticentries\" in API group \"spire.spiffe.io\" at the cluster scope",
+            ),
+        )]);
+        let err = m.self_check().await.unwrap_err();
+        assert!(matches!(err, SelfCheckError::Rbac(_)), "{err:?}");
+        finish(m, task).await;
+    }
+
+    #[tokio::test]
+    async fn the_policys_sender_refusal_is_a_broker_the_policy_does_not_name() {
+        // A renamed ServiceAccount with the policy left as shipped: in force, and it would
+        // refuse every real entry. Said at start, not at the first bind.
+        let (m, task) = manager(vec![dry_run_post(
+            403,
+            &policy_denial(
+                403,
+                "Forbidden",
+                ENTRIES_POLICY,
+                ENTRIES_POLICY_SENDER_MESSAGE,
+            ),
+        )]);
+        let err = m.self_check().await.unwrap_err();
+        assert!(matches!(err, SelfCheckError::NotTheBroker(_)), "{err:?}");
+        finish(m, task).await;
+    }
+
+    #[tokio::test]
+    async fn a_refusal_that_is_not_the_entries_policys_is_not_proof() {
+        // Another policy (the gateway entries', whose name only begins like this one's),
+        // the CRD's schema, a missing CRD, a policy message under a code no denial has.
+        let other = format!("{ENTRIES_POLICY}-gateway");
+        for (code, body) in [
+            (
+                403,
+                policy_denial(
+                    403,
+                    "Forbidden",
+                    &other,
+                    "nothing else lives under /gateway",
+                ),
+            ),
+            (
+                422,
+                status_json(422, "Invalid", "spec.selectors: Required value"),
+            ),
+            (
+                404,
+                status_json(
+                    404,
+                    "NotFound",
+                    "the server could not find the requested resource",
+                ),
+            ),
+            (
+                500,
+                policy_denial(500, "InternalError", ENTRIES_POLICY, SPIFFE_ID_RULE),
+            ),
+        ] {
+            let (m, task) = manager(vec![dry_run_post(code, &body)]);
+            let err = m.self_check().await.unwrap_err();
+            assert!(
+                matches!(&err, SelfCheckError::Refused { code: c, .. } if *c == code),
+                "{code}: {err:?}"
+            );
+            finish(m, task).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn an_api_server_that_does_not_answer_fails_the_self_check_as_unreachable() {
+        let (svc, handle) = tower_test::mock::pair::<Request<Body>, Response<Body>>();
+        drop(handle); // nothing listens: every request fails before any answer
+        let m = KubeEntryManager::new(
+            Client::new(svc, "default"),
+            Naming {
+                trust_domain: TD.into(),
+            },
+            EntriesConfig::default(),
+        );
+        let err = m.self_check().await.unwrap_err();
+        assert!(matches!(err, SelfCheckError::Unreachable(_)), "{err:?}");
+    }
+
+    #[test]
+    fn the_self_check_probe_is_never_a_shape_the_policy_admits() {
+        // The policy's two anchors, as its second and third validations spell them.
+        let probe = self_check_probe(&Naming {
+            trust_domain: TD.into(),
+        });
+        let name = probe.metadata.name.as_deref().unwrap();
+        assert!(
+            name.starts_with("mediatore-"),
+            "claimed by its name: {name}"
+        );
+        assert!(name.len() <= 253, "a valid object name: {name}");
+        let labels = probe.metadata.labels.as_ref().unwrap();
+        assert_eq!(
+            labels.get(MANAGED_BY_LABEL).map(String::as_str),
+            Some(MANAGED_BY)
+        );
+        let id = &probe.spec.spiffe_id;
+        assert!(
+            id.starts_with("spiffe://sandbox.test/banlieue/"),
+            "claimed by its path: {id}"
+        );
+        assert!(!id.contains("/banlieue/node/"), "not a node ID: {id}");
+        assert!(!id.contains("/banlieue/claim/"), "not a claim ID: {id}");
+        assert!(
+            !id.contains("/gateway"),
+            "never the gateway policy's to judge: {id}"
+        );
+        let parent = &probe.spec.parent_id;
+        assert!(!parent.contains("/spire/agent/"), "not an agent: {parent}");
+        assert_ne!(
+            probe.spec.class_name.as_deref(),
+            Some(EntriesConfig::default().class_name.as_str())
+        );
+        // Two probes never collide on a name, so a 409 is never the answer.
+        let again = self_check_probe(&Naming {
+            trust_domain: TD.into(),
+        });
+        assert_ne!(probe.metadata.name, again.metadata.name);
     }
 
     #[tokio::test]

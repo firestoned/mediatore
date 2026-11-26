@@ -1,0 +1,77 @@
+#!/bin/sh
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+#
+# Start mediatore gateway, the authorizer, listening for the tunnel check exactly where the
+# data plane's Envoy was told to ask (ADR-0053 decision 5, open question 7). Envoy's
+# bootstrap takes the place from AUTHORIZER_ENDPOINT and the host table its loopback
+# exception from CHECK_TCP_ELEMENTS, both through image/gateway/render; this script reads
+# the same two keys through the same renderer (authorizer.in), so a key that is absent, or
+# written twice, means here what it means there. Two places are served and no other:
+#
+#   pipe: { path: /run/mediatore-gateway/check/check.sock }           the default: the CHECK
+#       socket, in the setgid directory the unit made for the data plane's group; then
+#       CHECK_TCP_ELEMENTS must be empty (no loopback exception in the table)
+#   socket_address: { address: 127.0.0.1, port_value: <port> }        loopback TCP, set on
+#       purpose; then CHECK_TCP_ELEMENTS must be "elements = { <port> }", the same port
+#
+# Anything else, or the two keys disagreeing (an env file updated by half), is refused with
+# the reason: an Envoy that dials a socket while the authorizer listens on TCP, or a table
+# that drops Envoy's every check, would otherwise look like a broker outage.
+#
+#   authorizer-start check <env-file>...   exit 0 when the two keys agree, 1 with the reason
+#   authorizer-start print <env-file>...   the same, and print the listen arguments
+#   authorizer-start exec  <env-file>...   the same, and become mediatore gateway
+#
+# An env file that does not exist is skipped (vm.env is optional to the authorizer); the
+# inject socket is the deployment's drop-in, not this script's (ADR-0040).
+set -eu
+here=$(dirname "$0")
+tmpl=/usr/share/mediatore-gateway/authorizer.in
+[ -f "$here/authorizer.in" ] && tmpl=$here/authorizer.in
+sock=/run/mediatore-gateway/check/check.sock
+
+refuse() { echo "authorizer-start: $1" >&2; exit 1; }
+
+[ $# -ge 2 ] || { echo "usage: authorizer-start check|print|exec <env-file>..." >&2; exit 2; }
+verb=$1; shift
+n=$#
+for f in "$@"; do
+  if [ -f "$f" ]; then set -- "$@" "$f"; fi
+done
+shift "$n"
+[ $# -ge 1 ] || refuse "no env file to read"
+
+rendered=$("$here/render" "$tmpl" - "$@")
+endpoint=$(printf '%s\n' "$rendered" | sed -n 's/^endpoint=//p')
+check_tcp=$(printf '%s\n' "$rendered" | sed -n 's/^check_tcp=//p')
+# Spacing is YAML's and nft's to forgive, so it is not compared.
+e=$(printf '%s' "$endpoint" | tr -d ' \t')
+c=$(printf '%s' "$check_tcp" | tr -d ' \t')
+
+case $e in
+  "pipe:{path:$sock}")
+    [ -z "$c" ] || refuse "AUTHORIZER_ENDPOINT is the check socket and CHECK_TCP_ELEMENTS ($check_tcp) still opens a loopback port to the data plane's user: empty CHECK_TCP_ELEMENTS or remove its line"
+    args="--check-socket $sock --socket-dir-mode 2750"
+    ;;
+  'socket_address:{address:127.0.0.1,port_value:'*'}')
+    port=${e#*port_value:}
+    port=${port%\}}
+    case $port in
+      ''|*[!0-9]*) refuse "AUTHORIZER_ENDPOINT ($endpoint) names no port" ;;
+    esac
+    [ "$c" = "elements={$port}" ] || refuse "AUTHORIZER_ENDPOINT is loopback TCP at port $port and CHECK_TCP_ELEMENTS ($check_tcp) is not \"elements = { $port }\": the host table would drop the data plane's every check. Set both keys for loopback TCP, or remove both for the check socket"
+    args="--listen 127.0.0.1:$port"
+    ;;
+  *)
+    refuse "AUTHORIZER_ENDPOINT ($endpoint) is neither the check socket, pipe: { path: $sock }, nor loopback TCP, socket_address: { address: 127.0.0.1, port_value: <port> }: the authorizer serves the tunnel check nowhere else"
+    ;;
+esac
+
+case $verb in
+  check) ;;
+  print) printf '%s\n' "$args" ;;
+  # Unquoted on purpose: the arguments are the fixed words above and a port of digits.
+  exec) exec /usr/bin/mediatore gateway $args ;;
+  *) echo "usage: authorizer-start check|print|exec <env-file>..." >&2; exit 2 ;;
+esac

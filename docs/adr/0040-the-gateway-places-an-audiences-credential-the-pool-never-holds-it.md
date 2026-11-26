@@ -194,6 +194,14 @@ Anthropic flow, under any placement, needs an egress allowance first (open quest
    cannot obtain a credential through the authorizer. Without a gateway-placed audience the loopback
    TCP of ADR-0028 stays (`--listen`) and `envoy-inject` is not started.
 
+   *Amended 2026-11-26 by
+   [ADR-0053](0053-the-gateways-authorizer-has-an-identity-of-its-own.md) open question 7: the
+   last sentence no longer describes the gateway image. The check socket, with the directory,
+   owner, group and modes above, is the image's default without a gateway-placed audience too:
+   the image's unit makes `check/` and starts the authorizer on `check/check.sock`, and an
+   inject deployment adds only `inject/` and `--inject-socket`. Loopback TCP is an explicit
+   setting (the kind tier's pod keeps it); `envoy-inject` is still not started by default.*
+
 7. **The guest proxy sends the request to the gateway instead of tunnelling; the direct path stays
    rejected.** A route gains `credential: gateway` beside `token` and `none` (ADR-0025 decision 8) and
    carries the gateway's inject port. For such a route the proxy never calls `POST /v1/token`, still

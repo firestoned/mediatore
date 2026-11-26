@@ -18,12 +18,30 @@ ExecStartPre=/usr/bin/spire-agent healthcheck -socketPath /run/spire/sockets/age
 # dropped by the table and look like a broker outage. Refused here instead, with the reason
 # (ADR-0053 decision 5). The URL is https://BROKER_ADDRESS, with :BROKER_PORT unless 443.
 ExecStartPre=/bin/sh -c 'u=$${MEDIATORE_URL%%/}; a="https://$$BROKER_ADDRESS"; [ -n "$$BROKER_ADDRESS" ] && { [ "$$u" = "$$a:$$BROKER_PORT" ] || { [ "$$BROKER_PORT" = 443 ] && [ "$$u" = "$$a" ]; }; } && exit 0; echo "MEDIATORE_URL ($$MEDIATORE_URL) does not name BROKER_ADDRESS at BROKER_PORT ($$BROKER_ADDRESS:$$BROKER_PORT), the one place the host table lets the authorizer dial" >&2; exit 1'
-# On loopback, where only Envoy reaches it; the broker's address and the agent's socket
-# from the env file (MEDIATORE_URL, SPIFFE_ENDPOINT_SOCKET), the cache bounds the role's
-# defaults (fresh 30 s, stale 300 s, 4096 claims). Its identity is its own,
+# The tunnel check is served on the CHECK socket, /run/mediatore-gateway/check/check.sock, by
+# default (ADR-0040 decision 6, ADR-0053 open question 7): a unix socket in a directory of its
+# own, 2750 and setgid, owned by this user and by the group of the data plane's Envoy (envoy),
+# so that Envoy alone reaches it and no other local user can ask the authorizer a question. The
+# directory is made here by root at that mode (this unit cannot set the setgid bit itself,
+# RestrictSUIDSGID=yes) and the socket in it takes the directory's group; the authorizer is in
+# neither Envoy's group. An inject deployment's drop-in adds the INJECT socket's directory
+# beside it, never inside it (image/gateway/cloud-config-deployment.example.yaml).
+ExecStartPre=+/usr/bin/install -d -m 2750 -o mediatore-gateway -g envoy /run/mediatore-gateway/check
+# Envoy dials what AUTHORIZER_ENDPOINT says and the host table opens what CHECK_TCP_ELEMENTS
+# says; the authorizer listens where the same two keys say, read as image/gateway/render reads
+# them (an absent key is the check socket and no loopback port). An env file updated by half,
+# the socket in one key and loopback TCP in the other, is refused here with the reason, as is
+# an endpoint that is neither the check socket nor 127.0.0.1: it would otherwise look like a
+# broker outage (image/gateway/authorizer-start).
+ExecStartPre=/usr/libexec/mediatore-gateway/authorizer-start check /etc/mediatore-gateway/env /etc/mediatore-gateway/vm.env
+# The listen argument is explicit and follows the env file: --check-socket and
+# --socket-dir-mode 2750 by default, --listen 127.0.0.1:<port> only where the env file sets
+# loopback TCP on purpose. The broker's address and the agent's socket are the env file's
+# (MEDIATORE_URL, SPIFFE_ENDPOINT_SOCKET), the cache bounds the role's defaults (fresh 30 s,
+# stale 300 s, 4096 claims). Its identity is its own,
 # spiffe://<td>/gateway/authorizer, asked of the agent by ID: without that SVID it does not
 # start, and Envoy then refuses every tunnel (ADR-0053 decisions 1 and 2).
-ExecStart=/usr/bin/mediatore gateway --listen 127.0.0.1:9001
+ExecStart=/usr/libexec/mediatore-gateway/authorizer-start exec /etc/mediatore-gateway/env /etc/mediatore-gateway/vm.env
 EnvironmentFile=/etc/mediatore-gateway/env
 EnvironmentFile=-/etc/mediatore-gateway/vm.env
 Restart=on-failure
@@ -49,6 +67,8 @@ MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 ReadOnlyPaths=/run/spire/sockets
+# The runtime directory holds the check socket's directory; the table's unit made it, root's and 0755, so this user writes only below.
+ReadWritePaths=/run/mediatore-gateway
 
 [Install]
 WantedBy=multi-user.target

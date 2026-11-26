@@ -3,7 +3,7 @@
 
 # ADR-0056: The broker in a namespace of its own, and admission policies that do not depend on its name
 
-**Status:** Proposed · **Date:** 2026-11-19
+**Status:** Proposed · **Date:** 2026-11-19 · decisions 4 and 5 implemented 2026-11-26, ahead of the move (the notes under each); the rest not built
 
 Roadmap 02 (SPIRE on the cluster: the deployment and its overlay) and roadmap 05 (the store,
 whose Secrets are what moves). This is the *Revisit when* of accepted risk R-45
@@ -167,6 +167,26 @@ the cluster's administrators are trusted. Its revisit condition is this move.
    Control: the three files under `deploy/base/admission/`, and unit tests beside the existing
    ones in `crates/mediatore-claims/src/sandbox.rs` that parse them.
 
+   *Built 2026-11-26, ahead of the namespace move, for the entries policy alone.* The match
+   condition is the disjunction above and the sender validation is the policy's first, so a
+   broker the policy does not name is refused its own entries and told why. What differs from
+   the text: **the username is still a literal**, the same string as before, in three files.
+   Open question 3 (one parameter or three literals) is not answered, so nothing reads
+   `broker` from a ConfigMap, and an overlay that renames the `ServiceAccount` or its namespace still
+   patches the literal (twice in `clusterstaticentry-mediatore.yaml`, once in each
+   `AgentSandbox` policy). One exemption the text did not have: the sender validation admits an
+   UPDATE that leaves `spec` as it was, from anyone, since the garbage collector removing a
+   finalizer and an administrator's annotation declare nothing; the shape validations still
+   judge it. Open question 4 is answered yes by this build, with its consequence: an administrator can no longer apply or
+   edit the `spec` of an entry that looks like the broker's, by hand; deleting one is not
+   matched and stays RBAC's. A gateway entry given a `mediatore-` name or the managed-by label
+   is claimed by both policies and admitted by neither. Controls:
+   `deploy/base/admission/clusterstaticentry-mediatore.yaml`,
+   `the_entries_policy_claims_an_entry_by_what_it_is_and_names_its_one_sender` and
+   `the_shipped_gateway_entries_carry_none_of_the_signs_of_a_brokers_entry`
+   (`crates/mediatore-claims/src/sandbox.rs`), and the dry runs of the kind gateway tier
+   (`dev/kind/gateway-e2e.sh`), which are what prove the CEL.
+
 5. **A startup self-check: the broker proves the entries policy binds it, or does not start.**
    Outside `dev_mode`, before either listener serves and before the watcher asks for the Lease,
    the broker sends a server-side dry-run create (`dryRun=All`, nothing is persisted) of a
@@ -183,6 +203,23 @@ the cluster's administrators are trusted. Its revisit condition is this move.
    `KubeEntryManager::self_check` in `crates/mediatore-spire/src/kube.rs`, called from
    `crates/mediatore/src/main.rs` and from `Watcher::resync` in
    `crates/mediatore-claims/src/watch.rs`; `MemoryEntries` answers it as the policy would.
+
+   *Built 2026-11-26, ahead of the namespace move, in part.* `EntryManager::self_check`
+   (`crates/mediatore-spire/src/lib.rs`, with `KubeEntryManager`'s in `kube.rs`) is called from
+   `proven_entries` in `crates/mediatore/src/main.rs` as the first thing `serve` does with the
+   cluster. What differs from the text: the forbidden entry is not a node ID under a wrong
+   parent but `spiffe://<td>/banlieue/selfcheck/refused` parented to `spiffe://<td>/spire/server`,
+   of a class no controller manager renders, so two validations refuse it and it is the shape
+   of nothing real. **There is no second dry run of a permitted shape.** Its purpose is served
+   by reading the denial: when the policy's answer is its sender validation, the broker is not
+   the identity the policy names, and the start fails saying so (`SelfCheckError::NotTheBroker`).
+   That rests on the API server reporting the first failed validation, which the kind tier
+   shows and a unit test cannot. An RBAC refusal, a refusal that does not name this policy and
+   an unanswered request are three more start errors, each under its own name; the trait's
+   default refuses, so a manager that cannot ask does not start a broker. **The check is not
+   repeated at resync** (open question 7 is not answered): a policy removed under a running
+   broker is not noticed until the next start. It runs in `dev_mode` too, where
+   `MemoryEntries` answers as a server that enforces the policy does.
 
 6. **The home namespace is always the pod's own; it is not configuration.** The store, the
    Lease and the session Secrets stay on `client.default_namespace()`. No `store.namespace` key

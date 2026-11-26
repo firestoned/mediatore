@@ -185,6 +185,15 @@ the kind tier waits on (it needs a kubeconfig for the broker's ServiceAccount, w
 skips when a variable is missing. [Testing tiers](testing.md) has the rest of the
 suites.
 
+The broker makes the same proof for itself at every start
+([ADR-0056](../adr/0056-the-broker-in-a-namespace-of-its-own.md) decision 5): a dry-run create
+of an entry the policy must refuse, and it does not serve unless the refusal is the policy's.
+An overlay that renames the broker's ServiceAccount or moves it to another namespace must
+patch the username `system:serviceaccount:banlieue-system:mediatore` in the three files under
+`deploy/base/admission/` (twice in `clusterstaticentry-mediatore.yaml`); with the entries
+policy left unpatched the broker's entries are refused, not left unjudged, and the broker
+stops at start with an error that says which of the two it found.
+
 ## 5. Log in and request a sandbox
 
 ```sh
@@ -582,7 +591,7 @@ first, so each rule is about a new connection.
 | `mediatore-gateway` (the authorizer) | `BROKER_ADDRESS` at `BROKER_PORT`, nothing else |
 | `envoy-relay` | its four upstreams (`SPIRE_SERVER_*`, `BROKER_*`, `SPIRE_BUNDLE_*`, `REGISTRY_*`), each by address and port, nothing else |
 | `spire` (the agent) | `SPIRE_SERVER_ADDRESS` at `SPIRE_SERVER_PORT`, nothing else |
-| `envoy`, `envoy-inject` | any IPv4 destination that is not loopback or one of the VM's own addresses, link-local (`169.254.0.0/16`), one of the four control-plane addresses of the env file, or an entry of `EGRESS_DENY_ELEMENTS`; no IPv6. The tunnel Envoy keeps one loopback exception, the authorizer's check port, while that is loopback TCP |
+| `envoy`, `envoy-inject` | any IPv4 destination that is not loopback or one of the VM's own addresses, link-local (`169.254.0.0/16`), one of the four control-plane addresses of the env file, or an entry of `EGRESS_DENY_ELEMENTS`; no IPv6. No loopback exception by default: the tunnel Envoy asks the authorizer on a unix socket. It has one, the authorizer's check port, only where you keep the check on loopback TCP on purpose (below) |
 | every other user, root included | as before, except `BROKER_ADDRESS`, on any port |
 
 No user opens a new connection by the sandbox interface. Three consequences for your env
@@ -601,12 +610,38 @@ env file predates them:
   provider here at least; a blanket refusal of private space is yours to choose, since an
   audience may be an on-premises host. Until you fill it those addresses are your datacenter
   firewall's to refuse on the three egress addresses.
-- `CHECK_TCP_ELEMENTS` (default `elements = { 9001 }`): the tunnel Envoy's one loopback
-  port. Empty once the data plane asks the check socket (`env.inject.example` empties it).
+- `CHECK_TCP_ELEMENTS` (default empty): the tunnel Envoy's one loopback port, only for a
+  gateway that keeps the authorizer's check on loopback TCP (next paragraph). Empty, there
+  is no loopback exception at all.
 - `RESOLVER_ELEMENTS` (default empty): the Envoys' resolver, only where the rules would
   refuse it, as `elements = { 127.0.0.53 }` for a stub on loopback or an address inside a
   range you denied. Read `/etc/resolv.conf` on a booted gateway before you rely on the
   default: with a loopback stub and this key empty, no tunnel resolves a name.
+
+**Where the tunnel Envoy asks the authorizer.** On a unix socket, by default and with or
+without the inject Envoy (ADR-0053 open question 7, built 2026-11-26):
+`AUTHORIZER_ENDPOINT=pipe: { path: /run/mediatore-gateway/check/check.sock }` and
+`CHECK_TCP_ELEMENTS=` in `image/gateway/env.example`, and the same when your env file names
+neither key. The authorizer's unit makes the socket's directory (`2750`, setgid, owner
+`mediatore-gateway`, group `envoy`), so the tunnel Envoy's group reaches the check and no
+other local user does, and it listens where `AUTHORIZER_ENDPOINT` says: you do not set a
+listen flag. To keep loopback TCP (any local user can then ask the check, a yes or no on a
+claim's allowlist and a way to make the authorizer ask the broker; this is what the kind
+tier's pod does, and it is not recommended on a gateway VM), set both keys, with one port:
+
+```sh
+AUTHORIZER_ENDPOINT=socket_address: { address: 127.0.0.1, port_value: 9001 }
+CHECK_TCP_ELEMENTS=elements = { 9001 }
+```
+
+A gateway whose env file already carries those two lines keeps running as it did, on a new
+image too. One whose env file carries the TCP endpoint and no `CHECK_TCP_ELEMENTS` line (a
+file from before the output chain) must gain the line or lose the endpoint line: the
+authorizer's unit refuses to start, with the reason in its journal, when one key says
+loopback TCP and the other does not, since Envoy would dial where nobody listens or the
+table would drop every check. To move a gateway to the socket, remove both lines (or set
+them as the example does) and restart `mediatore-gateway`, `mediatore-gateway-nft` and
+`envoy-gateway`, or reboot it.
 
 What the chain does not bound: root on the gateway, which can rewrite the table; an
 internal address you did not list; a name that resolves to a public address you did not
@@ -805,7 +840,7 @@ workload on the pool VM              gateway                                   b
 
 A second claim on the same pool VM gets its own SVID, so it can neither obtain nor use the first claim's credential, and a sandbox whose policy does not list `gitserver` is refused at step 4 even though its mutual TLS is valid.
 
-**On each gateway**, nothing changes until a deployment turns the third process on: write the two lines of `image/gateway/env.inject.example` into `/etc/mediatore-gateway/env` above the rest (the authorizer endpoint moves to the check socket, and the host table admits the inject port), start the authorizer with `--check-socket`, `--inject-socket` and `--socket-dir-mode 2750` (two setgid directories, one Envoy's group each, named with `--check-socket-group` and `--inject-socket-group`; `--socket-owner` defaults to the authorizer's own user and `--socket-mode` to `0660`), register the third SPIRE entry for `unix:user:envoy-inject` under the gateway's SPIFFE ID, then `systemctl enable --now envoy-inject.service`. The unit validates its bootstrap before every start. This repository's template renders one upstream; a deployment that places several audiences renders its own from the same shape.
+**On each gateway**, nothing changes until a deployment turns the third process on: write the line of `image/gateway/env.inject.example` into `/etc/mediatore-gateway/env` above the rest (the host table admits the inject port; the data plane is on the check socket already, the image's default, and inject is not for a gateway that keeps the check on loopback TCP), start the authorizer with `--check-socket`, `--inject-socket` and `--socket-dir-mode 2750` (two setgid directories, one Envoy's group each, named with `--check-socket-group` and `--inject-socket-group`; `--socket-owner` defaults to the authorizer's own user and `--socket-mode` to `0660`), register the third SPIRE entry for `unix:user:envoy-inject` under the gateway's SPIFFE ID, then `systemctl enable --now envoy-inject.service`. The unit validates its bootstrap before every start. This repository's template renders one upstream; a deployment that places several audiences renders its own from the same shape.
 
 **On each pool VM**, `MEDIATORE_INJECT_PORT` in the guest's env admits the inject port in the host table; the sandbox uid's per-claim table lists it only for a claim with a placed route.
 
