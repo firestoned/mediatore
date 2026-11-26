@@ -84,7 +84,8 @@ RUN command -v systemctl && command -v useradd && command -v nft \
 
 # The agent in the TPM device group (image/systemd/spire-agent.service); the four service
 # users with no group in common and no login (a socket group is what lets an Envoy reach the
-# authorizer: ADR-0040 decision 6). Only the agent touches the TPM.
+# authorizer, the data plane's on the check socket by default: ADR-0040 decision 6, ADR-0053
+# open question 7). Only the agent touches the TPM.
 RUN useradd --system --user-group --home-dir /var/lib/spire --no-create-home --shell /usr/sbin/nologin spire \
     && usermod -aG tss spire \
     && for u in envoy envoy-relay envoy-inject mediatore-gateway; do \
@@ -101,9 +102,9 @@ RUN chmod 0755 /usr/bin/mediatore /usr/bin/envoy /usr/bin/spire-agent /usr/lib/s
     && echo "${TPM_PLUGIN_AGENT_SHA}  /usr/lib/spire/tpm_attestor_agent" | sha256sum -c - \
     && /usr/bin/envoy --version | grep -q "1.40.2"
 
-COPY image/gateway/render /usr/libexec/mediatore-gateway/render
+COPY image/gateway/render image/gateway/authorizer-start /usr/libexec/mediatore-gateway/
 COPY image/gateway/envoy/gateway.yaml.in image/gateway/envoy/relay.yaml.in image/gateway/envoy/inject.yaml.in /usr/share/mediatore-gateway/envoy/
-COPY image/gateway/nftables.conf.in image/gateway/network.in image/gateway/env.example image/gateway/env.inject.example image/gateway/vm.env.example /usr/share/mediatore-gateway/
+COPY image/gateway/nftables.conf.in image/gateway/network.in image/gateway/authorizer.in image/gateway/env.example image/gateway/env.inject.example image/gateway/vm.env.example /usr/share/mediatore-gateway/
 COPY image/gateway/systemd/spire-agent.service \
      image/gateway/systemd/mediatore-gateway-network.service \
      image/gateway/systemd/mediatore-gateway-nft.service \
@@ -118,10 +119,13 @@ COPY image/gateway/sysctl/99-mediatore-gateway.conf /etc/sysctl.d/99-mediatore-g
 COPY image/gateway/qemu-ga.conf /etc/qemu/qemu-ga.conf
 COPY image/spire/agent.conf /usr/share/mediatore/agent.conf.example
 # The examples render every template completely: a placeholder nobody documents fails the build.
-RUN chmod 0755 /usr/libexec/mediatore-gateway/render \
-    && for t in envoy/gateway.yaml.in envoy/relay.yaml.in envoy/inject.yaml.in nftables.conf.in network.in; do \
+# And the example env starts the authorizer on its check socket: the unit's listen argument is
+# read from the same keys Envoy's bootstrap and the host table are rendered from (authorizer-start).
+RUN chmod 0755 /usr/libexec/mediatore-gateway/render /usr/libexec/mediatore-gateway/authorizer-start \
+    && for t in envoy/gateway.yaml.in envoy/relay.yaml.in envoy/inject.yaml.in nftables.conf.in network.in authorizer.in; do \
          /usr/libexec/mediatore-gateway/render "/usr/share/mediatore-gateway/$t" - /usr/share/mediatore-gateway/env.example /usr/share/mediatore-gateway/vm.env.example > /dev/null; \
        done \
+    && /usr/libexec/mediatore-gateway/authorizer-start print /usr/share/mediatore-gateway/env.example /usr/share/mediatore-gateway/vm.env.example | grep -qx -- "--check-socket /run/mediatore-gateway/check/check.sock --socket-dir-mode 2750" \
     && grep -q "plugin_checksum = \"${TPM_PLUGIN_AGENT_SHA}\"" /usr/share/mediatore/agent.conf.example \
     && systemctl enable spire-agent.service mediatore-gateway-network.service mediatore-gateway-nft.service \
          envoy-gateway.service envoy-relay.service mediatore-gateway.service qemu-guest-agent.service \

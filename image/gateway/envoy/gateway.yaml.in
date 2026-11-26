@@ -17,7 +17,9 @@
 # peer's identity, so "one URI SAN per certificate" is the issuing CA's property (SPIRE puts
 # one in an SVID) unless the SPIFFE validator is the one in force. Each
 # CONNECT is checked with the authorizer beside Envoy, mediatore gateway, with Envoy's own
-# Check call over gRPC on loopback (ext_authz with grpc_service): the check carries the
+# Check call over gRPC (ext_authz with grpc_service), on the address the env file names: the
+# authorizer's check socket on a gateway VM, the default here, or loopback TCP where that is
+# set on purpose (a pod, as in the kind tier). The check carries the
 # peer's identity from its verified certificate, the method and the authority, nothing the
 # client sent. A refusal or an unreachable authorizer is 403. (Envoy's HTTP mode cannot
 # carry a CONNECT check: it copies the tunnel's own request line into the check and resets
@@ -140,6 +142,8 @@ static_resources:
                   address:
                     pipe: { path: @SPIRE_SOCKET@ }
     # The authorizer, mediatore gateway, beside Envoy: Envoy's Check call over gRPC.
+    # The address is the authorizer's CHECK socket unless the env file names another: the
+    # authorizer's unit reads the same key with the same default (image/gateway/authorizer-start).
     - name: authorizer
       connect_timeout: 1s
       type: STATIC
@@ -154,7 +158,7 @@ static_resources:
           - lb_endpoints:
               - endpoint:
                   address:
-                    @AUTHORIZER_ENDPOINT@
+                    @AUTHORIZER_ENDPOINT:-pipe: { path: /run/mediatore-gateway/check/check.sock }@
     # The destinations: whatever authority an admitted CONNECT names, resolved by Envoy.
     - name: destinations
       connect_timeout: 5s

@@ -86,7 +86,10 @@ stages:
           # NIC's name and prefix, the SPIRE server's and the broker's addresses on the
           # egress side, the broker's URL for the authorizer (https://BROKER_ADDRESS, with
           # :BROKER_PORT unless 443: the host table's output chain admits the authorizer
-          # nowhere else, ADR-0053 decision 5). EGRESS_DENY_ELEMENTS takes the addresses and
+          # nowhere else, ADR-0053 decision 5). AUTHORIZER_ENDPOINT is the authorizer's check
+          # socket and CHECK_TCP_ELEMENTS empty: leave both as they are (the authorizer's unit
+          # listens where the first says and refuses to start when the two disagree; loopback
+          # TCP is an explicit choice, env.example says how). EGRESS_DENY_ELEMENTS takes the addresses and
           # ranges no sandbox should reach through a gateway, as ", 10.0.0.0/8, ...": your
           # Kubernetes API, secrets store and identity provider at least. The agent.conf
           # above must name SPIRE_SERVER_ADDRESS and SPIRE_SERVER_PORT: the same chain
@@ -107,9 +110,9 @@ stages:
             BROKER_ADDRESS=192.0.2.21
             BROKER_PORT=443
             EGRESS_DENY_ELEMENTS=
-            CHECK_TCP_ELEMENTS=elements = { 9001 }
+            CHECK_TCP_ELEMENTS=
             RESOLVER_ELEMENTS=
-            AUTHORIZER_ENDPOINT=socket_address: { address: 127.0.0.1, port_value: 9001 }
+            AUTHORIZER_ENDPOINT=pipe: { path: /run/mediatore-gateway/check/check.sock }
             SPIRE_SOCKET=/run/spire/sockets/agent.sock
             TUNNEL_MAX_SECS=86400
             INJECT_PORT=3133
@@ -125,14 +128,18 @@ stages:
             SPIFFE_ENDPOINT_SOCKET=unix:///run/spire/sockets/agent.sock
             RUST_LOG=info
     # TURN THE INJECT ENVOY ON (ADR-0040): off by default. The unit is in the image and not enabled. To enable it, (1) in the env above, replace
-    # AUTHORIZER_ENDPOINT, CHECK_TCP_ELEMENTS and INJECT_PORT_ELEMENT with the three lines of image/gateway/env.inject.example, set INJECT_HOST, INJECT_DOMAIN and
-    # INJECT_UPSTREAM_PORT to the upstream, and keep INJECT_PORT equal to the broker's gateway_inject_port; (2) add the step below, which
-    # moves the authorizer to its two unix sockets (the data plane's group reaches the check socket only, envoy-inject's group the inject
-    # socket only; the setgid directories give each socket its group) and enables and starts the unit (enable alone never starts it here:
+    # INJECT_PORT_ELEMENT with the line of image/gateway/env.inject.example, set INJECT_HOST, INJECT_DOMAIN and INJECT_UPSTREAM_PORT to the upstream, keep
+    # INJECT_PORT equal to the broker's gateway_inject_port, and leave AUTHORIZER_ENDPOINT and CHECK_TCP_ELEMENTS as above: the data plane is on the CHECK
+    # socket already, the image's default, and inject is not for a gateway that keeps the check on loopback TCP; (2) add the step below, which gives the
+    # authorizer its second socket, the INJECT socket, in a directory of its own beside the check socket's (the data plane's group reaches the check socket
+    # only, envoy-inject's group the inject socket only; the setgid directories give each socket its group, and the image's unit already makes the check
+    # socket's) and enables and starts the unit (enable alone never starts it here:
     # /etc is rebuilt at every boot and this stage runs after systemd has planned the boot, so 3133 would stay closed); (3) register `unix:user:envoy-inject` on the
     # listeners' SPIFFE ID, spiffe://<td>/gateway (the third entry of each VM in deploy/gateway/clusterstaticentries.yaml; the authorizer's
     # user holds spiffe://<td>/gateway/authorizer and nothing else, ADR-0053); (4) open the gateways' path to the upstream. The authorizer's
-    # listen flags are those of the release that serves the two sockets (ADR-0040 stage C): check them with `mediatore gateway --help`.
+    # listen flags are those of the release that serves the two sockets (ADR-0040 stage C): check them with `mediatore gateway --help`. The drop-in
+    # replaces the unit's ExecStart, so it names both sockets; its check directory line and its ReadWritePaths repeat what the image's unit now
+    # does itself, so the same drop-in serves an image from before the check socket was the default.
     #
     # stages:
     #   boot:

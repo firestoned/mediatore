@@ -8,7 +8,7 @@
 # admitted, a new connection to a relay port counted per source and dropped over the cap
 # (the control plane has no identity to rate-limit by). On the egress interface nothing
 # new arrives: replies to the gateway's own connections only. Forwarding is off in sysctl
-# and dropped here as well. Loopback carries the authorizer and nothing else listens. The inject Envoy's port (ADR-0040 decision 7) is a fifth
+# and dropped here as well. Nothing listens on loopback: the authorizer is asked on a unix socket (on loopback TCP only where a deployment set that on purpose). The inject Envoy's port (ADR-0040 decision 7) is a fifth
 # element of the relay's set, under the same per-source cap, only when the deployment sets INJECT_PORT_ELEMENT (env.inject.example).
 #
 # Output (ADR-0053 decisions 5 and 6) is keyed on the socket's owner. The policy stays accept
@@ -28,10 +28,12 @@
 #   envoy-relay        its four fixed upstreams, each by address and port, and nothing else
 #   spire              the SPIRE server, and nothing else
 #   envoy              any IPv4 destination that is not loopback or one of the VM's own
-#                      addresses (the authorizer's check port excepted while that is loopback
-#                      TCP, CHECK_TCP_ELEMENTS), link-local, a control-plane address of the
-#                      env file or one of the operator's EGRESS_DENY_ELEMENTS; no IPv6
-#   envoy-inject       the same, with no loopback exception (its check is a unix socket)
+#                      addresses, link-local, a control-plane address of the env file or one
+#                      of the operator's EGRESS_DENY_ELEMENTS; no IPv6. No loopback exception
+#                      by default (its check is a unix socket); one port, the authorizer's,
+#                      only where a deployment keeps the check on loopback TCP on purpose
+#                      (CHECK_TCP_ELEMENTS)
+#   envoy-inject       the same, with no loopback exception ever (its check is a unix socket)
 # A name a claim is allowed is resolved by Envoy; the rules above apply at connect time, to
 # whatever address it resolved to. The three keys this chain added are optional, each with
 # its default written at its placeholder below, so an env file from before the chain existed
@@ -42,9 +44,10 @@ table inet mediatore_gateway {
   # control plane's addresses, and the ranges the operator lists (", 10.0.0.0/8, ..." in
   # EGRESS_DENY_ELEMENTS; empty by default, those ranges are then the datacenter firewall's).
   set egress_refused { type ipv4_addr; flags interval; auto-merge; elements = { 169.254.0.0/16, @SPIRE_SERVER_ADDRESS@, @SPIRE_BUNDLE_ADDRESS@, @BROKER_ADDRESS@@EGRESS_DENY_ELEMENTS:-@ } }
-  # The authorizer's tunnel check while it is loopback TCP: "elements = { 9001 }", the
-  # default. Empty once the data plane asks the check socket (env.inject.example).
-  set check_tcp { type inet_service; @CHECK_TCP_ELEMENTS:-elements = { 9001 }@ }
+  # The authorizer's tunnel check, only for a deployment that keeps it on loopback TCP on
+  # purpose: "elements = { 9001 }". Empty by default, the key absent included: the data plane
+  # asks the check socket, and the rule in output_envoy below then matches nothing.
+  set check_tcp { type inet_service; @CHECK_TCP_ELEMENTS:-@ }
   # The Envoys' resolver, only where the rules below would refuse it: a stub on loopback, or
   # an address inside a denied range ("elements = { 127.0.0.53 }"). Empty by default: a
   # resolver on the egress side outside the refused set needs no entry.
@@ -108,7 +111,8 @@ table inet mediatore_gateway {
     log prefix "mediatore-gateway out agent: " counter drop
   }
   chain output_envoy {
-    # The one loopback exception, the tunnel Envoy's alone: the authorizer's check.
+    # The one loopback exception there can be, the tunnel Envoy's alone: the authorizer's
+    # check while a deployment keeps it on loopback TCP. The set is empty by default.
     oif "lo" ip daddr 127.0.0.1 tcp dport @check_tcp accept
     jump output_listener
   }
