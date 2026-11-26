@@ -27,6 +27,8 @@ yet proven on a live cluster, the page says so.
 | [Identity and mTLS](identity-and-mtls.md) | SPIFFE IDs, registration entries, the mutual TLS between parts | `crates/mediatore-spire`, `crates/mediatore-tls` |
 | [Issuers and audiences](issuers-and-audiences.md) | Validating a login, the token backends, how a credential is placed | `crates/mediatore-entra`, `crates/mediatore-sts`, `crates/mediatore/src/config.rs` |
 | [Policy](policy.md) | notaio's signed bundles, the version floor, shadow and enforce | `crates/mediatore-policy`, `crates/mediatore-claims/src/{policy,shadow}.rs` |
+| [Who may use a policy: overview](policy-subjects-overview.md) | Proposal, plain language: why a policy's groups should be checked | not built |
+| [Who may use a policy: design](policy-subjects.md) | Proposal: carrying `subjects.groups` in the signed bundle and checking it | not built; notaio `crates/sandboxpolicy-bundle`, `crates/mediatore-api` |
 | [The guest](guest.md) | What runs on a pool VM: the lifecycle of a claim from the inside | `crates/mediatore-guest` |
 | [The egress proxy](egress-proxy.md) | The jail's only way out, and how it places a credential | `crates/mediatore-guest/src/{egress,forward}.rs` |
 | [The gateway](gateway.md) | The authorizer and the three Envoys on each gateway VM | `crates/mediatore-gateway`, `image/gateway/` |
