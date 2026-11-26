@@ -3,16 +3,17 @@
 
 # ADR-0066: Eligibility by group, from the signed policy bundle
 
-**Status:** Proposed (no implementation yet; it needs notaio ADR-0022, the bundle that carries the
+**Status:** Proposed (no implementation yet; it needs notaio ADR-0024, the bundle that carries the
 groups; CALM, the tests and the threat-model pass are owed before it is accepted) · **Date:** 2026-11-25
 
 Completes [ADR-0054](0054-which-policies-a-namespace-may-name.md) decision 7, which left eligibility
 by subject "to an ADR of its own", and the group-spelling question of
 [ADR-0046](0046-who-may-claim-a-list-of-groups-and-a-namespace-to-groups-mapping.md) decision 2.
-Builds on [ADR-0026](0026-notaio-bundles-verified-in-shadow.md) (the verified bundle) and uses the
-policy list of [ADR-0065](0065-a-sandbox-under-several-policies-the-first-named-wins.md) decision 9.
-Depends on notaio ADR-0022 (the bundle's `subjects`, schema v4). Changes no token shape, no SPIFFE ID
-and no storage contract. It does change a trust boundary: who may name a policy becomes a rule the
+Builds on [ADR-0026](0026-notaio-bundles-verified-in-shadow.md) (the verified bundle). A sandbox
+keeps one `policyRef`: ADR-0065 (several policies, composed by the broker) is rejected in favour of
+notaio composing at the policy (notaio ADR-0023), so the broker checks one bundle's one list.
+Depends on notaio ADR-0024 (the bundle's `subjects`, in schema v4). Changes no token shape, no SPIFFE
+ID and no storage contract. It does change a trust boundary: who may name a policy becomes a rule the
 broker applies, so the threat-model pass is part of done.
 
 ## Context
@@ -29,8 +30,12 @@ That is coarse. An operator that wants one namespace's members to hold a read-on
 subset to hold a read-write one has no way to say so.
 
 ADR-0054 gave the reasons the check must not read the `SandboxPolicy` object: it is unsigned cluster
-state. The groups have to arrive in the signed bundle. notaio ADR-0022 puts them there, in bundle
+state. The groups have to arrive in the signed bundle. notaio ADR-0024 puts them there, in bundle
 schema v4.
+
+A policy composed of others (notaio ADR-0023) is one policy to the broker: its `subjects` are its
+own, signed as the effective content, and notaio refuses a composite whose groups are wider than any
+include's (`L033`) before it signs. So the broker never combines lists and never reads an include.
 
 What stays as it is, and why:
 
@@ -53,10 +58,11 @@ What stays as it is, and why:
    issuer gate and the namespace gate, never instead of them: all three must pass.
    - **An empty list is nobody**, not anyone. notaio warns on it (`L010`); the broker reads it as no
      eligible requester.
-   - **With a list of policies** (ADR-0065), the requester must be eligible for every policy.
+   - **One policy per sandbox.** A composite is one policy and one list (see Context); the broker
+     does no composition and checks no include.
 
 3. **Only a v4 bundle can carry the answer, and a bundle without it is never open.** The verifier
-   accepts schema v3 and v4 (notaio ADR-0022 decision 6: consumers first). Under `enforce`, a policy
+   accepts schema v3 and v4 (notaio ADR-0024 decision 6: consumers first). Under `enforce`, a policy
    whose verified bundle is v3, so with no `subjects`, refuses the claim with `P016`
    (`policy_without_subjects`); under `shadow` it reports `P016`. A missing list is never read as
    permission. The floor (ADR-0008, ADR-0026 decision 4) already refuses a replayed older version,
@@ -82,7 +88,7 @@ What stays as it is, and why:
    admission policy, unchanged and not weaker. The documentation and the threat model record it: an
    operator must not read this ADR as protecting that path.
 
-8. **New findings,** following P010 to P012 and the P013 and P014 that ADR-0065 reserves:
+8. **New findings,** following P010 to P014:
 
    | Code | Meaning |
    | ---- | ------- |
@@ -96,11 +102,11 @@ What stays as it is, and why:
 | Threat | STRIDE | Control |
 | --- | --- | --- |
 | A requester names a policy they are not eligible for | E | Decision 2, in addition to the issuer and namespace gates |
-| The list is read from unsigned cluster state | T/E | Decision 3 and notaio ADR-0022: only from the verified bundle |
+| The list is read from unsigned cluster state | T/E | Decision 3 and notaio ADR-0024: only from the verified bundle |
 | A bundle with no subjects is read as open | E | Decision 3: `P016`, refused under `enforce`, never permissive |
 | An empty list admits everyone | E | Decision 2: empty means nobody |
 | A group of another organisation matches by prefix | S/E | Decision 4: exact, no normalising, both spellings listed |
-| An older bundle with wider groups is replayed | T | The version floor, monotonic across the schema change (notaio ADR-0022 decision 4) |
+| An older bundle with wider groups is replayed | T | The version floor, monotonic across the schema change (notaio ADR-0024 decision 4) |
 | The refusal body reveals who may use a policy | I | Decision 5: no group in any body or line |
 | An unset or mistyped mode weakens a deployment on upgrade | T | Decision 1: default `off` is today's behaviour; an unknown value does not start |
 | The declarative path is mistaken for covered | E | Decision 7: stated in the ADR, the guide and the threat model; behaviour unchanged |
@@ -114,7 +120,7 @@ What stays as it is, and why:
 - The rollout order is fixed: the broker is upgraded first (it accepts v3 and v4), then notaio
   publishes v4, then the mode moves to `shadow`, then `enforce` after the log has been read.
 - Two refusal codes, one mode key and a section in `docs/guides/the-policy-bundle.md`.
-- No change to notaio beyond ADR-0022, and none to the token, the SPIFFE ID or the store.
+- No change to notaio beyond its ADR-0024, and none to the token, the SPIFFE ID or the store.
 
 ## Alternatives considered
 
