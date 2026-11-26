@@ -9,6 +9,21 @@
     against mediatore `main` and notaio `v0.8.0` (the tag `Cargo.toml` pins) on 2026-11-25. The
     plain-language version is [Who may use a policy: the overview](policy-subjects-overview.md).
 
+!!! note "Superseded in part by ADR-0066 (2026-11-26)"
+    [ADR-0066](../adr/0066-eligibility-by-group-from-the-signed-bundle.md) decides what this page
+    proposed, and differs from it. Where they disagree, ADR-0066 holds:
+
+    - the switch is `policy.eligibility: off | shadow | enforce`, default `off`, not
+      `policy.subjects` (sections 4.1, 4.2 and 7);
+    - the findings are `P015` (`policy_not_eligible`) and `P016` (`policy_without_subjects`), not
+      `P013` and `P014`, which the rejected ADR-0065 still defines (section 4.6);
+    - a refused claim is a `403`, the groups are not kept on the claim record, and a running claim
+      is not checked again when it follows a new bundle (sections 4.3 to 4.5).
+
+    The producer side is notaio's ADR-0024 (the groups in the bundle) and ADR-0026 (bundle schema
+    v4 and its rollout: a verifier that reads v3 and v4 in one release, then
+    `NOTAIO_BUNDLE_SCHEMA` switches the producer), planned in notaio's roadmap 05.
+
 This page closes [ADR-0054](../adr/0054-which-policies-a-namespace-may-name.md) decision 7
 ("eligibility by subject ... belongs with notaio's signed bundle, in an ADR of its own") and the
 accepted risk **R-54** in the [threat model](../security/threat-model.md). In notaio it is K7.2 and
