@@ -9,6 +9,10 @@
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 d=$(mktemp -d); trap 'rm -rf "$d"' EXIT
+# The platform the table is rendered for is read from the DMI chassis asset tag (ADR-0068). A CI runner may
+# itself be an Azure VM, so every render below names its tag file: absent here, so the pinned table is the
+# non-Azure one wherever the test runs.
+export CHASSIS_ASSET_TAG_FILE="$d/no-asset-tag"
 printf '# the pool bootstrap list\n198.51.100.1:8443\n198.51.100.2:8443\n\n  198.51.100.3:8443  \n' > "$d/gateways"
 printf '# no registry on the segment (ADR-0063)\n\n' > "$d/registries"
 printf 'MEDIATORE_URL=https://198.51.100.1:3130\nSPIFFE_ENDPOINT_SOCKET=/run/spire/sockets/agent.sock\nRUST_LOG=info\nSPIRE_BUNDLE_HOST=spire.home.example\nSPIRE_BUNDLE_PORT=3131\nSPIRE_BUNDLE_GATEWAY=198.51.100.1\n' > "$d/env"
@@ -117,5 +121,66 @@ for u in $want_units; do
 done
 grep -q 'DHCP catch-all removed: 20-dhcp.network 20-dhcp-legacy.network' "$d/quiet.out" || { echo "✗ host-quiet does not say what it removed"; cat "$d/quiet.out"; exit 1; }
 echo "✓ host-quiet masks the units that dial out for the boot, stops them, and removes the DHCP catch-all but not the static file"
+
+# ADR-0068: on Azure (the DMI chassis asset tag Azure sets) the output chain also drops IMDS explicitly, admits
+# root alone to WireServer at its two ports, and the network daemon's DHCP renewal to it; anywhere else the table is
+# byte for byte the pinned one, and no render admits a link-local or platform address through the pool's files.
+azure_tag='7783-7084-3265-9085-8269-3286-77'
+for other in 'No Asset Tag' '' '7783-7084-3265-9085-8269-3286-78'; do
+  printf '%s\n' "$other" > "$d/tag-other"
+  [ "$(CHASSIS_ASSET_TAG_FILE="$d/tag-other" "$here/host-table" --render "$d/gateways" "$d/registries" "$d/env" "$d/agent.conf")" = "$got" ] \
+    || { echo "✗ a chassis asset tag of '$other' changed the table"; exit 1; }
+done
+echo "✓ off Azure (no tag file, another tag, an empty one) the table is the pinned one, unchanged"
+
+want_azure=$(printf '%s\n' "$want" | sed '/^    oif "lo" accept$/a\
+    ip daddr 169.254.169.254 log prefix "mediatore-host imds: " counter drop
+/^    ip daddr \. tcp dport @allow4 accept$/a\
+    ip daddr 168.63.129.16 tcp dport { 80, 32526 } meta skuid 0 accept\
+    ip daddr 168.63.129.16 udp sport 68 udp dport 67 meta skuid "systemd-network" accept
+/^# mediatore host table/a\
+# on Azure (ADR-0068): IMDS dropped for every uid; WireServer for root alone, at 80 and 32526, and the DHCP renewal of systemd-networkd')
+printf '%s\n' "$azure_tag" > "$d/tag-azure"
+az=$(CHASSIS_ASSET_TAG_FILE="$d/tag-azure" "$here/host-table" --render "$d/gateways" "$d/registries" "$d/env" "$d/agent.conf")
+if [ "$az" != "$want_azure" ]; then
+  echo "host-table: the Azure table drifted:"; diff <(printf '%s\n' "$want_azure") <(printf '%s\n' "$az") || true; exit 1
+fi
+echo "✓ on Azure the table renders as pinned: the pinned table plus the IMDS drop, root's WireServer and the DHCP renewal"
+printf '  %s  \n\n' "$azure_tag" > "$d/tag-azure-ws"
+[ "$(CHASSIS_ASSET_TAG_FILE="$d/tag-azure-ws" "$here/host-table" --render "$d/gateways" "$d/registries" "$d/env" "$d/agent.conf")" = "$az" ] \
+  || { echo "✗ the Azure tag with the whitespace sysfs adds was not recognised"; exit 1; }
+echo "✓ the tag is read as sysfs writes it (trailing newline, blanks)"
+
+# What the Azure rules admit, and to whom: every line naming WireServer is root's at 80 or 32526, or the network
+# daemon's DHCP; IMDS appears once, as a drop, before any accept but loopback; nothing names link-local otherwise.
+out=$(printf '%s\n' "$az" | sed -n '/chain output {/,/^  }/p')
+printf '%s\n' "$out" | grep -F '168.63.129.16' | while IFS= read -r l; do
+  case $l in
+    *'tcp dport { 80, 32526 } meta skuid 0 accept') ;;
+    *'udp sport 68 udp dport 67 meta skuid "systemd-network" accept') ;;
+    *) echo "✗ a WireServer rule that is not root's (or the DHCP renewal's): $l"; exit 1 ;;
+  esac
+done
+[ "$(printf '%s\n' "$out" | grep -c '168.63.129.16')" = 2 ] || { echo "✗ WireServer named other than twice"; exit 1; }
+printf '%s\n' "$az" | grep -F 'set allow4' | grep -Eq '168\.63\.129\.16|169\.254\.' && { echo "✗ a platform address in the every-uid set"; exit 1; } || true
+first_accept=$(printf '%s\n' "$out" | grep -n 'accept$' | grep -v 'oif "lo" accept' | head -1 | cut -d: -f1)
+imds=$(printf '%s\n' "$out" | grep -n '169.254.169.254' | cut -d: -f1)
+[ -n "$imds" ] && [ "$(printf '%s\n' "$imds" | wc -l | tr -d ' ')" = 1 ] && [ "$imds" -lt "$first_accept" ] \
+  && printf '%s\n' "$out" | grep -F '169.254.169.254' | grep -q 'drop$' \
+  || { echo "✗ IMDS is not dropped explicitly, for every uid, before the first accept"; exit 1; }
+printf '%s\n' "$out" | grep -F '169.254.169.254' | grep -q skuid && { echo "✗ the IMDS drop is keyed on a uid"; exit 1; } || true
+echo "✓ on Azure WireServer is root's alone (TCP 80 and 32526) and the DHCP renewal's, and IMDS is dropped for every uid first"
+printf '%s\n' "$got" | grep -Eq '168\.63\.129\.16|169\.254\.169\.254|skuid' && { echo "✗ the non-Azure table names a platform address or a uid"; exit 1; } || true
+echo "✓ the non-Azure table names no platform address and no uid"
+
+# No pool file may put a link-local address (IMDS among them) or WireServer in the every-uid set, on any platform.
+for bad in 169.254.169.254:80 169.254.1.1:8443 168.63.129.16:80; do
+  printf '%s\n' "$bad" > "$d/gw-platform"; refuse "a gateway at $bad" "$d/gw-platform" "$d/registries" "$d/env" "$d/agent.conf"
+  printf 'MEDIATORE_URL=https://%s\n' "$bad" > "$d/env-platform"; refuse "a broker at $bad" "$d/gateways" "$d/registries" "$d/env-platform" "$d/agent.conf"
+done
+printf 'agent {\n  server_address = "169.254.169.254"\n  server_port = "3129"\n}\n' > "$d/agent-imds"; refuse "a SPIRE server at IMDS" "$d/gateways" "$d/registries" "$d/env" "$d/agent-imds"
+CHASSIS_ASSET_TAG_FILE="$d/tag-azure" "$here/host-table" --render "$d/gw-platform" "$d/registries" "$d/env" "$d/agent.conf" >/dev/null 2>&1 \
+  && { echo "✗ WireServer in the gateway list was accepted on Azure"; exit 1; } || true
+echo "✓ a link-local address or WireServer in a pool's files is refused, on Azure too"
 
 echo "host-table-test: ok"

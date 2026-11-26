@@ -5,6 +5,10 @@
 
 **Status:** Accepted (implemented) · **Date:** 2026-11-04 (proposed and accepted the same day: the segment
 reach is what the homelab runs; the relay reach is recorded, not built) · **Amended:**
+2026-11-26 by [ADR-0068](0068-the-cloud-platforms-host-addresses-root-alone-on-azure-the-metadata-service-for-nobody.md)
+(decision 3: on Azure, read from the DMI chassis asset tag, the table drops IMDS for every uid and admits
+WireServer to root at TCP 80 and 32526 and to `systemd-networkd`'s DHCP renewal; a link-local or platform
+address in a pool's files is refused everywhere; off Azure the table is unchanged);
 2026-11-22 by [ADR-0063](0063-the-image-pull-goes-through-the-claims-proxy-and-the-gateway-like-any-egress.md) (decisions 1 and 2, for a gateway-era environment: the segment
 and relay reaches and `registries[]` are refused, a registry is an audience of `role: registry` and the
 pull goes through the claim's egress proxy and a gateway; decision 3's host table admits no registry

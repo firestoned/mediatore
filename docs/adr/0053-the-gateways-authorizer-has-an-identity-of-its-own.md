@@ -6,7 +6,11 @@
 **Status:** Accepted, implemented 2026-11-19, released in v0.4.0 (amended at implementation, each amendment dated at
 its decision; proven by the quality gate, the kind gateway tiers and the two image checks; nothing
 is proven on a booted gateway VM yet, so decisions 2, 5 and 6 are built and not verified there:
-*What was proven, and what was not*) · **Date:** 2026-11-19
+*What was proven, and what was not*) · **Date:** 2026-11-19 · **Amended:** 2026-11-26 by
+[ADR-0068](0068-the-cloud-platforms-host-addresses-root-alone-on-azure-the-metadata-service-for-nobody.md)
+(decisions 5 and 6: ahead of every user's row the output chain drops IMDS for every user, root included,
+and keeps Azure's WireServer to root at TCP 80 and 32526 and to `systemd-networkd`'s DHCP renewal, its
+port 53 left to the rows)
 
 Roadmap 10 (the gateway). Carries the separation of
 [ADR-0040](0040-the-gateway-places-an-audiences-credential-the-pool-never-holds-it.md) decision 6

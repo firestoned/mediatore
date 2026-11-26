@@ -13,9 +13,15 @@
 #
 # Output (ADR-0053 decisions 5 and 6) is keyed on the socket's owner. The policy stays accept
 # for the users the table does not name (root, the resolver's, the clock's); the five it names
-# may open a new connection only where their row says, and two rules hold for every user:
-# nothing new leaves by the sandbox interface, and the broker's address is reached by the
-# authorizer's and the relay's users and by nobody else. User names are resolved when the
+# may open a new connection only where their row says, and three rules hold for every user:
+# nothing new leaves by the sandbox interface, the broker's address is reached by the
+# authorizer's and the relay's users and by nobody else, and the cloud platform's addresses
+# (ADR-0068) are kept to the one user that needs each: the instance metadata service
+# (169.254.169.254) to nobody, root included, and Azure's WireServer (168.63.129.16) to root at
+# TCP 80 and 32526 and to systemd-networkd's user for the DHCP renewal, its port 53 (the
+# resolver Azure hands out) left to each user's row as any resolver is. These lines only narrow
+# what the policy already admitted, so they are the same on every platform: off Azure neither
+# address answers. User names are resolved when the
 # table loads: one that does not exist fails the load, and with it every unit that requires
 # the table. Unix sockets are not seen here: the agent's stays reachable to both Envoys.
 #   mediatore-gateway  the broker, BROKER_ADDRESS at BROKER_PORT, and nothing else
@@ -67,6 +73,9 @@ table inet mediatore_gateway {
     ct state established,related accept
     # Every user: nothing on a gateway initiates toward the sandbox segment (ADR-0010).
     oifname "@SANDBOX_IF@" ct state new log prefix "mediatore-gateway out sandbox: " counter drop
+    # Every user, root included: no instance metadata service (ADR-0068); WireServer by its own chain.
+    ip daddr 169.254.169.254 log prefix "mediatore-gateway out imds: " counter drop
+    ip daddr 168.63.129.16 jump output_wireserver
     meta skuid "mediatore-gateway" jump output_authorizer
     meta skuid "envoy-relay" jump output_relay
     meta skuid "spire" jump output_agent
@@ -74,6 +83,15 @@ table inet mediatore_gateway {
     meta skuid "envoy-inject" jump output_listener
     # Every other user, root included: as before, but for the broker's address, on any port.
     ip daddr @BROKER_ADDRESS@ ct state new log prefix "mediatore-gateway out broker: " counter drop
+  }
+  chain output_wireserver {
+    # Azure's DNS at the same address: back to the user rows, which treat it as any resolver.
+    meta l4proto { tcp, udp } th dport 53 return
+    # The provisioning ready report and the host plugin: root's alone.
+    meta skuid 0 tcp dport { 80, 32526 } accept
+    # The lease renewal of systemd-networkd, which runs as its own user.
+    meta skuid "systemd-network" udp sport 68 udp dport 67 accept
+    log prefix "mediatore-gateway out wireserver: " counter drop
   }
   chain output_authorizer {
     ip daddr @BROKER_ADDRESS@ tcp dport @BROKER_PORT@ accept

@@ -23,6 +23,15 @@
 #
 # --render prints the table instead of loading it. The files default to the paths above;
 # the registries file must be absent or empty (ADR-0063), the other three must exist.
+#
+# On Azure (ADR-0068), read from the DMI chassis asset tag Azure sets on every VM, the output
+# chain also drops the instance metadata service (169.254.169.254) for every uid, by an
+# explicit rule ahead of any accept, and admits the platform's WireServer (168.63.129.16) to
+# root alone at TCP 80 and 32526 (the provisioning ready report and the host plugin), and to
+# systemd-networkd's own user for the DHCP renewal (UDP 68 to 67). No sandbox uid and no other
+# daemon reaches either address; anywhere else the table is unchanged. On every platform a
+# link-local address or WireServer in the pool's files is refused: the every-uid set never
+# names them. CHASSIS_ASSET_TAG_FILE overrides the sysfs path for tests.
 set -eu
 
 render=0
@@ -34,6 +43,14 @@ agent_conf=${4:-/etc/spire/agent.conf}
 
 die() { echo "host-table: $*" >&2; exit 1; }
 
+# Azure's platform addresses (ADR-0068) and the asset tag that says the VM is on Azure.
+AZURE_ASSET_TAG='7783-7084-3265-9085-8269-3286-77'
+WIRESERVER='168.63.129.16'
+IMDS='169.254.169.254'
+tag_file=${CHASSIS_ASSET_TAG_FILE:-/sys/class/dmi/id/chassis_asset_tag}
+azure=0
+if [ -r "$tag_file" ] && [ "$(tr -d '[:space:]' < "$tag_file")" = "$AZURE_ASSET_TAG" ]; then azure=1; fi
+
 # An IPv4 address and a port, as `nft` elements want them.
 is_addr_port() {
   printf '%s' "$1" | grep -Eq '^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9]):([1-9][0-9]{0,4})$'
@@ -42,6 +59,9 @@ is_addr_port() {
 elements=''
 add() { # <what> <address:port>
   is_addr_port "$2" || die "$1: $2 is not an IPv4 address and a port (the segment has no resolver; names are refused, ADR-0029)"
+  case ${2%:*} in
+    169.254.*|"$WIRESERVER") die "$1: ${2%:*} is a link-local or platform address (IMDS, WireServer): never in the every-uid set (ADR-0068)" ;;
+  esac
   el="${2%:*} . ${2##*:}"
   case " $elements " in *" $el,"*|*" $el "*) return ;; esac
   elements="${elements:+$elements, }$el"
@@ -103,8 +123,20 @@ if grep -q '^MEDIATORE_RELAY_REGISTRIES=.' "$guest_env"; then
   die "$guest_env sets MEDIATORE_RELAY_REGISTRIES: the relay has no registry leg; the pull goes through the claim's egress proxy and a gateway (ADR-0063 decision 4)"
 fi
 
+# ADR-0068: the lines only an Azure render carries; empty anywhere else, so that table is unchanged.
+az_comment='' az_imds='' az_wireserver=''
+if [ "$azure" = 1 ]; then
+  az_comment="
+# on Azure (ADR-0068): IMDS dropped for every uid; WireServer for root alone, at 80 and 32526, and the DHCP renewal of systemd-networkd"
+  az_imds="
+    ip daddr $IMDS log prefix \"mediatore-host imds: \" counter drop"
+  az_wireserver="
+    ip daddr $WIRESERVER tcp dport { 80, 32526 } meta skuid 0 accept
+    ip daddr $WIRESERVER udp sport 68 udp dport 67 meta skuid \"systemd-network\" accept"
+fi
+
 table=$(cat <<NFT
-# mediatore host table (ADR-0029, ADR-0063): every uid reaches the gateways' two planes and nothing else; nothing comes in
+# mediatore host table (ADR-0029, ADR-0063): every uid reaches the gateways' two planes and nothing else; nothing comes in$az_comment
 table inet mediatore_host
 delete table inet mediatore_host
 table inet mediatore_host {
@@ -122,9 +154,9 @@ table inet mediatore_host {
   }
   chain output {
     type filter hook output priority filter; policy drop;
-    oif "lo" accept
+    oif "lo" accept$az_imds
     ct state established,related accept
-    ip daddr . tcp dport @allow4 accept
+    ip daddr . tcp dport @allow4 accept$az_wireserver
     log prefix "mediatore-host drop: " counter drop
   }
 }
@@ -134,5 +166,5 @@ if [ "$render" = 1 ]; then
   printf '%s\n' "$table"
 else
   printf '%s\n' "$table" | nft -f -
-  echo "host-table: loaded inet mediatore_host with $(printf '%s' "$elements" | tr ',' '\n' | wc -l | tr -d ' ') destinations"
+  echo "host-table: loaded inet mediatore_host with $(printf '%s' "$elements" | tr ',' '\n' | wc -l | tr -d ' ') destinations$([ "$azure" = 1 ] && echo '; on Azure: IMDS dropped, WireServer for root and the DHCP renewal (ADR-0068)')"
 fi

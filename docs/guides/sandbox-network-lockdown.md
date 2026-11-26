@@ -104,6 +104,29 @@ net.ipv6.conf.all.disable_ipv6 = 1
 (the same for `default`), `LLMNR=no` and `MulticastDNS=no` in a `resolved.conf.d` drop-in, and `systemctl mask rpcbind.service
 rpcbind.socket`. The base image's own `sshd` stays masked.
 
+### On a cloud platform: the host's own addresses
+
+[ADR-0068](../adr/0068-the-cloud-platforms-host-addresses-root-alone-on-azure-the-metadata-service-for-nobody.md). Two host-local addresses sit beside every cloud VM, and the image keeps them to the one user that
+needs each:
+
+- **The instance metadata service, `169.254.169.254`, is nobody's**, root included, on every platform. On the pool VM the policy drops
+  it and, on Azure, an explicit `ip daddr 169.254.169.254 ... drop` comes first in the output chain; on the gateway the same rule holds
+  for every user ahead of the per-user rows. `image/host-table` refuses any pool file that names a link-local address.
+- **Azure's WireServer, `168.63.129.16`, is root's**, at TCP 80 and 32526: the provisioning ready report (banlieue's root-run
+  `banlieue-azure-guest ready`) and the host plugin. `systemd-networkd`, which runs as the user `systemd-network`, may send it the DHCP
+  renewal (UDP 68 to 67); the first lease and a rebind are broadcasts on a packet socket no table sees. Nothing else reaches it: not the
+  sandbox uid, not the SPIRE agent, not the gateway's Envoys (which may still resolve through it at port 53, as through any resolver).
+
+The pool VM's table adds its Azure lines only when the DMI chassis asset tag is Azure's
+(`cat /sys/class/dmi/id/chassis_asset_tag`: `7783-7084-3265-9085-8269-3286-77`); anywhere else it is unchanged. On a pool with gateways
+`host-quiet` still removes the base's DHCP catch-all, so on Azure the deployment's own network file runs DHCP on the synthetic NIC and
+leaves the accelerated-networking VF unmanaged. To see the rules on an Azure member:
+
+```
+nft list chain inet mediatore_host output   # the imds drop first, then root's WireServer and the DHCP renewal
+journalctl -u mediatore-host-nft            # "... on Azure: IMDS dropped, WireServer for root and the DHCP renewal (ADR-0068)"
+```
+
 ## Check it
 
 On a VM, as root (the table has no exception for root: since ADR-0063 no registry is reached but through a claim's proxy):
