@@ -3,7 +3,7 @@
 
 # ADR-0049: A guest without a vTPM attests with `x509pop`, using a certificate its host signs for the guest's own key
 
-**Status:** Accepted; the control-plane side implemented and released in v0.4.0 · **Date:** 2026-11-19 · **Proposed:** 2026-11-18 · **Amended:** 2026-11-24 (Decision 5: the guest helper is a Rust subcommand, `mediatore node-cert`, with no `openssl` or Python, and the certificate's lifetime is the host's; Decision 6: the reply is the leaf followed by the host CA's chain, as banlieue ADR-0146 Decision 7 has the signer send it)
+**Status:** Accepted; the control-plane side implemented and released in v0.4.0 · **Date:** 2026-11-19 · **Proposed:** 2026-11-18 · **Amended:** 2026-11-26 (Decision 2: a bundle CA and a host CA must be a CA with a path length of zero, refused otherwise) and 2026-11-24 (Decision 5: the guest helper is a Rust subcommand, `mediatore node-cert`, with no `openssl` or Python, and the certificate's lifetime is the host's; Decision 6: the reply is the leaf followed by the host CA's chain, as banlieue ADR-0146 Decision 7 has the signer send it)
 
 Builds on [ADR-0004](0004-spiffe-identity-scheme.md) (the identity scheme),
 [ADR-0006](0006-registration-entries-as-clusterstaticentry.md) (no SPIRE admin identity,
@@ -95,6 +95,23 @@ The server's `agent_path_template` is `/x509pop/{{ .Issuer.CommonName }}/{{ .Sub
 The confinement is **load-bearing on one rule: every CA in the bundle has a unique,
 operator-chosen common name**, and the bundle's rendering refuses a duplicate. Both CN
 fields are restricted to the path-segment alphabet.
+
+*Amended 2026-11-26: a second rule carries the confinement, and it was not written here. The
+server's template renders the common name of the leaf's immediate issuer
+([ADR-0050](0050-host-trust-anchors-roots-in-the-bundle-and-a-short-lived-intermediate-per-host.md)'s
+prototype table), so "a CA can mint only IDs under its own name" holds only for a CA that
+cannot make another CA: one free to sign a CA could sign one carrying another host's name.
+**Every CA in the bundle, and the host CA a node entry is rendered from, must therefore carry
+`basicConstraints` with `cA` true and a path length of zero**; the server's own chain
+validation then refuses anything a host signs below it. `refuse_duplicate_common_names` and
+`host_ca_common_name` (`crates/mediatore-spire/src/x509pop.rs`) refuse a certificate that is
+not a CA, or a CA with no path length or one above zero, naming it
+(`refuse_unconfined_ca`; units `a_bundle_ca_that_may_sign_further_cas_or_is_no_ca_is_refused`,
+`a_host_ca_that_may_sign_further_cas_or_is_no_ca_gives_no_attestation`). So no node entry is
+declared under the name of a host whose CA is not so constrained: whoever creates a host's
+signing CA must set the path length, or that host's guests do not attest. ADR-0050, if it is
+accepted, replaces the rule with its own (roots in the bundle, the path length of zero on each
+host's intermediate) and this check moves with it.*
 
 ### 3. The signer sets the subject; the guest does not name itself
 
