@@ -123,13 +123,13 @@ sbom: ## Generate CycloneDX SBOM(s) for the workspace (*.cdx.json per crate)
 # ----- Artifacts ---------------------------------------------------------------
 
 dist: ## The one static musl binary into dist/ (ADR-0014): what the server image copies with BINARY_FROM=host and what the VM image bakes in
-	cargo build --profile $(DIST_PROFILE) --target $(MUSL_TARGET) -p mediatore
+	cargo build --locked --profile $(DIST_PROFILE) --target $(MUSL_TARGET) -p mediatore
 	@mkdir -p dist
 	cp target/$(MUSL_TARGET)/$(DIST_PROFILE)/mediatore dist/
 
 dist-darwin: ## The CLI for a Mac (the same binary, every role) into dist/mediatore-darwin-arm64; runs on a macOS arm64 host, native, no cross-compile
 	@test "$$(uname -s)-$$(uname -m)" = "Darwin-arm64" || { echo "dist-darwin runs on a macOS arm64 host, this is $$(uname -s)-$$(uname -m)"; exit 1; }
-	cargo build --release -p mediatore
+	cargo build --locked --release -p mediatore
 	@mkdir -p dist
 	cp target/release/mediatore dist/mediatore-darwin-arm64
 
@@ -407,6 +407,10 @@ kind-create: kind-install ## Create the kind cluster (no-op if it exists) and wr
 	@cp dev/kind/cluster.yaml $(KIND_DIR)/cluster.yaml
 	@# With a vTPM up (make kind-vtpm), its device goes into the node as /dev/tpmrm0.
 	@if [ -r $(KIND_VTPM_DIR)/device ]; then \
+	@# The lock names every workspace crate at its version, and the builds are --locked: bring
+	@# those entries, and only those, to the new version. A copy elsewhere (VERSION_FILE) has
+	@# no lock beside it to move.
+	@if [ "$(VERSION_FILE)" = "Cargo.toml" ]; then cargo update --workspace --quiet && echo "Cargo.lock: workspace crates at $(VERSION)"; fi
 		printf '    extraMounts:\n      - hostPath: %s\n        containerPath: /dev/tpmrm0\n' "$$(cat $(KIND_VTPM_DIR)/device)" >> $(KIND_DIR)/cluster.yaml; \
 	fi
 	@if kind get clusters 2>/dev/null | grep -qx $(KIND_CLUSTER_NAME); then \
