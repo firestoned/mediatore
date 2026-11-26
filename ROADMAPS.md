@@ -26,7 +26,7 @@ the same commit that changes a roadmap item's state.
 | 14 | A stored secret expires right on its TTL (a spike: the envelope stays in Kubernetes, how its deletion is driven) | ⛔ not started | [14-secret-expiry-at-the-ttl.md](.github/community/14-secret-expiry-at-the-ttl.md) |
 | 15 | Observability (OpenTelemetry) that never weakens security or speed | ⛔ not started | [15-observability.md](.github/community/15-observability.md) |
 | 16 | Per-binary policy inside a sandbox (a route narrowed to the binaries that may use it, enforced at the guest's egress proxy; ADR-0066, not yet written) | ⛔ not started | [16-per-binary-egress-policy.md](.github/community/16-per-binary-egress-policy.md) |
-| 17 | Tripwires (decoy ports, routes, credentials and hosts; the first use of one ends the sandbox; shadow first; ADR not yet written) | ⛔ not started | [17-tripwires.md](.github/community/17-tripwires.md) |
+| 17 | Tripwires (decoy ports, proxy routes and credentials, all decided on the VM before anything leaves it, drawn at random per sandbox from catalogues of possible traps; the first use of one ends the sandbox; shadow first; ADR not yet written) | ⛔ not started | [17-tripwires.md](.github/community/17-tripwires.md) |
 
 Statuses: ✅ done · 🔶 in progress · ⛔ not started · 📄 reference doc.
 ADRs are separate and live in [`docs/adr/`](docs/adr/).
