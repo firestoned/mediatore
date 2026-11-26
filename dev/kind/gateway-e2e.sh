@@ -517,6 +517,90 @@ entry_refused "spiffeID must be spiffe://<td>/banlieue/node/" broker mediatore-g
 entry_refused "spiffeID must be spiffe://<td>/banlieue/node/" broker mediatore-gw-probe-m /gateway/authorizer '["unix:user:mediatore-gateway"]'
 echo "admitted: the listeners' two entries and the authorizer's; refused: swapped selectors, two selectors, other paths, admin, a long TTL, DNS names; the broker's ServiceAccount: neither ID"
 
+say "the broker's entries (ADR-0056 decision 4): the entries policy claims an entry by its name, its label or its path whoever sends it, and admits one only from the broker's ServiceAccount"
+# Server-side dry runs again. The administrator stands for any principal that is not the
+# broker: before ADR-0056 decision 4 the policy did not match what it sent at all.
+ENTRIES_POLICY_DENIAL="ValidatingAdmissionPolicy 'mediatore-clusterstaticentry' with binding 'mediatore-clusterstaticentry' denied request"
+NOT_THE_BROKER="is the broker's alone to declare"
+dry_own() { # <admin|broker> <name> <labels, a YAML flow map> <path after the trust domain> <parent path after the trust domain> <selectors, a YAML flow list> [<className>]
+  local who=$1 name=$2 labels=$3 path=$4 parent=$5 selectors=$6 class=${7:-spire-server-spire}
+  local -a kc=("${K[@]}")
+  [ "$who" = broker ] && kc=("${KSA[@]}")
+  "${kc[@]}" create --dry-run=server -o name -f - 2>&1 <<YAML || true
+apiVersion: spire.spiffe.io/v1alpha1
+kind: ClusterStaticEntry
+metadata:
+  name: $name
+  labels: $labels
+spec:
+  className: $class
+  spiffeID: spiffe://$TD$path
+  parentID: spiffe://$TD$parent
+  selectors: $selectors
+YAML
+}
+own_admitted() { # <dry_own arguments>
+  local out; out=$(dry_own "$@")
+  grep -qF "clusterstaticentry.spire.spiffe.io/$2" <<<"$out" || fail "the entry $2 ($4, sent by the $1) was not admitted: $out"
+}
+own_refused() { # <the refusal must carry this> <dry_own arguments>
+  local why=$1 out; shift; out=$(dry_own "$@")
+  grep -qF "clusterstaticentry.spire.spiffe.io/$2" <<<"$out" && fail "the entry $2 ($4, sent by the $1) was admitted"
+  grep -qF -- "$ENTRIES_POLICY_DENIAL" <<<"$out" || fail "the entry $2 ($4, sent by the $1) was refused, but not by the entries policy: $out"
+  grep -qF -- "$why" <<<"$out" || fail "the entry $2 ($4, sent by the $1) was refused by the entries policy, but not for '$why': $out"
+}
+OWN='{ app.kubernetes.io/managed-by: mediatore }'
+AGENT=/spire/agent/tpm/$ZEROS
+CLAIM_ID=/banlieue/claim/00000000-0000-4000-8000-000000000000
+CLAIM_SELECTORS='["unix:user:sb-000000000000"]'
+NODE_SELECTORS='["unix:uid:0", "unix:path:/usr/bin/mediatore"]'
+# The policy has been stored since the cluster was made; the wait covers an API server
+# that was restarted into it a moment ago.
+entries_policy_settled() { dry_own admin mediatore-own-probe-settle '{}' "$CLAIM_ID" "$AGENT" "$CLAIM_SELECTORS" | grep -qF "$NOT_THE_BROKER"; }
+wait_for 60 "the entries admission policy claiming an entry by its name" entries_policy_settled
+# Not the broker, each sign alone: the name, the label, the path. A permitted shape every
+# time, so the sender is the one thing wrong and the one thing said.
+own_refused "$NOT_THE_BROKER" admin mediatore-own-probe-a '{}' "$CLAIM_ID" "$AGENT" "$CLAIM_SELECTORS"
+own_refused "$NOT_THE_BROKER" admin mediatore-own-probe-b '{}' /elsewhere/thing "$AGENT" '["unix:uid:0"]'
+own_refused "$NOT_THE_BROKER" admin own-probe-c "$OWN" /elsewhere/thing "$AGENT" '["unix:uid:0"]'
+own_refused "$NOT_THE_BROKER" admin own-probe-d '{}' "$CLAIM_ID" "$AGENT" "$CLAIM_SELECTORS"
+own_refused "$NOT_THE_BROKER" admin own-probe-e '{}' "/banlieue/node/$ZEROS" "$AGENT" "$NODE_SELECTORS"
+own_refused "$NOT_THE_BROKER" admin own-probe-f '{}' /banlieue/other "$AGENT" '["unix:uid:0"]'
+# A gateway ID under one of the broker's signs is claimed by both policies and admitted by neither.
+own_refused "$NOT_THE_BROKER" admin mediatore-own-probe-g '{}' /gateway "$AGENT" '["unix:user:envoy"]'
+own_refused "$NOT_THE_BROKER" admin own-probe-h "$OWN" /gateway/authorizer "$AGENT" '["unix:user:mediatore-gateway"]'
+# The broker's ServiceAccount: its two shapes are admitted as before, and what it must not
+# declare is refused by the validation that always refused it.
+own_admitted broker mediatore-own-probe-claim "$OWN" "$CLAIM_ID" "$AGENT" "$CLAIM_SELECTORS"
+own_admitted broker mediatore-own-probe-node "$OWN" "/banlieue/node/$ZEROS" "$AGENT" "$NODE_SELECTORS"
+own_refused "named mediatore-*" broker own-probe-i "$OWN" "$CLAIM_ID" "$AGENT" "$CLAIM_SELECTORS"
+own_refused "parentID must be a tpm agent ID" broker mediatore-own-probe-j "$OWN" "$CLAIM_ID" /spire/server "$CLAIM_SELECTORS"
+# The broker's start self-check, word for word (crates/mediatore-spire/src/kube.rs,
+# self_check_probe): the answer it requires is this denial, Forbidden, naming the policy.
+selfcheck=$(dry_own broker mediatore-selfcheck-e2e "$OWN" /banlieue/selfcheck/refused /spire/server '["unix:user:mediatore-selfcheck"]' mediatore-selfcheck-never-rendered)
+grep -qF "(Forbidden)" <<<"$selfcheck" || fail "the self-check's entry was not refused as Forbidden: $selfcheck"
+grep -qF -- "$ENTRIES_POLICY_DENIAL: spiffeID must be spiffe://<td>/banlieue/node/" <<<"$selfcheck" || fail "the self-check's entry was not refused by the entries policy's spiffeID rule: $selfcheck"
+# An update that leaves spec as it was is not a declaration: a principal that is not the
+# broker gets past the sender validation and is judged on the shape alone. A real object
+# for once (an update needs one), of a class no controller manager renders, labelled into
+# the policy's reach in a dry run and refused for its name, not for its sender.
+"${K[@]}" delete clusterstaticentry own-probe-update --ignore-not-found --wait=true >/dev/null
+"${K[@]}" create -f - >/dev/null <<YAML
+apiVersion: spire.spiffe.io/v1alpha1
+kind: ClusterStaticEntry
+metadata:
+  name: own-probe-update
+spec:
+  className: mediatore-e2e-never-rendered
+  spiffeID: spiffe://$TD/elsewhere/thing
+  parentID: spiffe://$TD$AGENT
+  selectors: ["unix:uid:0"]
+YAML
+relabel=$("${K[@]}" label clusterstaticentry own-probe-update app.kubernetes.io/managed-by=mediatore --dry-run=server 2>&1 || true)
+"${K[@]}" delete clusterstaticentry own-probe-update --ignore-not-found --wait=false >/dev/null 2>&1 || true
+grep -qF -- "$ENTRIES_POLICY_DENIAL: mediatore may only declare entries named mediatore-*" <<<"$relabel" || fail "a relabel that leaves spec as it was should pass the sender validation and be refused for the name: $relabel"
+echo "refused from an administrator: an entry that is the broker's by its name, its label or its path, in a permitted shape or not, a gateway ID among them; admitted from the broker's ServiceAccount: its claim and node shapes; refused from it: another name, a parent that is no TPM agent, the self-check's entry (Forbidden, the policy named); an update that leaves spec alone is judged on the shape, not the sender"
+
 say "fixtures: a clean slate, then the node pod registering the fixture EK, a sandbox bound to it"
 cleanup
 FILES=$(mktemp -d)

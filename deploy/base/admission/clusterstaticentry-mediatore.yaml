@@ -1,8 +1,9 @@
 # Copyright (c) 2026 Erick Bourgeois, mediatore
 # SPDX-License-Identifier: Apache-2.0
 #
-# What the broker's ServiceAccount may declare as a SPIRE registration entry
-# (ADR-0006 decision 6). mediatore creates exactly two shapes (ADR-0004):
+# What may be declared as one of the broker's SPIRE registration entries, and by
+# whom (ADR-0006 decision 6, ADR-0056 decision 4). mediatore creates exactly two
+# shapes (ADR-0004):
 #
 #   node   spiffe://<td>/banlieue/node/<ek>   parent spiffe://<td>/spire/agent/tpm/<ek>
 #   claim  spiffe://<td>/banlieue/claim/<uid> parent spiffe://<td>/spire/agent/tpm/<ek>
@@ -14,6 +15,37 @@
 #
 # <ek> is the hex SHA-256 of the EK's DER SubjectPublicKeyInfo (64 hex chars),
 # the same value the tpm node attestor puts in the agent ID.
+#
+# The policy judges an entry by what it is, not only by who sends it. It claims
+# every CREATE and UPDATE that the broker's ServiceAccount sends, and from any
+# other principal every entry that is the broker's by one of three signs: a name
+# beginning with mediatore-, the label app.kubernetes.io/managed-by: mediatore
+# (the one the broker sets, crates/mediatore-spire/src/lib.rs), or a spiffeID
+# whose path is under /banlieue/ in any trust domain. Whatever it claims is held
+# to the two shapes, and its first validation says such an entry is the broker's
+# alone to declare. An UPDATE that leaves spec as it was is not a declaration
+# (the garbage collector removing a finalizer, an annotation) and is admitted
+# from anyone, if the object is still of a permitted shape. DELETE is not
+# matched: retracting an entry by hand stays RBAC's.
+#
+# The ServiceAccount is a literal, `system:serviceaccount:banlieue-system:mediatore`,
+# twice below, the same string agentsandbox-subject.yaml and
+# agentsandbox-status.yaml carry. A kustomize `namespace:` does not rewrite a
+# string inside a CEL expression: AN OVERLAY THAT RENAMES THE ServiceAccount OR
+# MOVES IT TO ANOTHER NAMESPACE MUST PATCH BOTH OCCURRENCES. Forgetting to used
+# to leave the broker's entries unjudged, with no error anywhere (the policy
+# matched nothing the broker sent). It now refuses them: the entries are still
+# claimed by their names, the sender validation fails, no sandbox binds, and the
+# broker says so when it starts (its self-check, ADR-0056 decision 5,
+# crates/mediatore-spire/src/kube.rs) instead of serving.
+#
+# The gateway's entries (clusterstaticentry-gateway.yaml: gateway-*, a path of
+# /gateway or under it, labelled mediatore.io/role: gateway) carry none of the
+# three signs and are not claimed here from the platform team. An entry that
+# carries one of them AND a /gateway path is claimed by both policies and can
+# satisfy neither's spiffeID rule: refused, as the broker's ServiceAccount
+# asking for a gateway ID always was. So a gateway entry must not be named
+# mediatore-* nor carry the managed-by label.
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -29,11 +61,20 @@ spec:
         apiVersions: ["v1alpha1"]
         operations: ["CREATE", "UPDATE"]
         resources: ["clusterstaticentries"]
-  # Only the broker's ServiceAccount is constrained here. Other principals are
-  # governed by RBAC (and should have no create on this resource at all).
+  # One condition, a disjunction (conditions are ANDed, so the four tests cannot be
+  # four conditions): the sender is the broker's ServiceAccount, or the object is
+  # the broker's by its name, its label or its path. Each object test is guarded
+  # with has(), so an object without labels or a spiffeID is a non-match on that
+  # test and never an evaluation error. Anything else is governed by RBAC and, for
+  # /gateway, by clusterstaticentry-gateway.yaml.
   matchConditions:
-    - name: is-mediatore-serviceaccount
-      expression: "request.userInfo.username == 'system:serviceaccount:banlieue-system:mediatore'"
+    - name: is-from-the-broker-or-is-one-of-its-entries
+      expression: >-
+        request.userInfo.username == 'system:serviceaccount:banlieue-system:mediatore' ||
+        (has(object.metadata.name) && object.metadata.name.startsWith('mediatore-')) ||
+        (has(object.metadata.labels) && 'app.kubernetes.io/managed-by' in object.metadata.labels &&
+        object.metadata.labels['app.kubernetes.io/managed-by'] == 'mediatore') ||
+        (has(object.spec) && has(object.spec.spiffeID) && object.spec.spiffeID.matches('^spiffe://[^/]+/banlieue/'))
   variables:
     - name: td
       expression: "'^spiffe://[a-z0-9.-]+'"
@@ -46,6 +87,15 @@ spec:
     - name: isClaim
       expression: "object.spec.spiffeID.contains('/banlieue/claim/')"
   validations:
+    # Who: first, so that a broker this policy does not name is told exactly that,
+    # whatever else is wrong with what was sent. The message is read by the broker's
+    # self-check (ENTRIES_POLICY_SENDER_MESSAGE, crates/mediatore-spire/src/lib.rs)
+    # and held to it by a unit test: change both or neither.
+    - expression: >-
+        request.userInfo.username == 'system:serviceaccount:banlieue-system:mediatore' ||
+        (request.operation == 'UPDATE' && oldObject.spec == object.spec)
+      message: "an entry named mediatore-*, labelled app.kubernetes.io/managed-by=mediatore or under /banlieue/ is the broker's alone to declare, and this request is not from the broker's ServiceAccount as this policy spells it"
+      reason: Forbidden
     - expression: "object.metadata.name.startsWith('mediatore-')"
       message: "mediatore may only declare entries named mediatore-*"
       reason: Forbidden

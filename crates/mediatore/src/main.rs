@@ -130,7 +130,7 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
         trust_domain: cfg.trust_domain.clone(),
     };
     let client = kube_client(&cfg).await?;
-    let spire = entry_manager(&cfg, naming.clone(), client.as_ref());
+    let spire = proven_entries(&cfg, naming.clone(), client.as_ref()).await?;
     if cfg.dev_mode {
         tracing::warn!("dev_mode: peer identity from header, in-memory entries, no mTLS");
     }
@@ -805,6 +805,31 @@ fn entry_manager(
     ))
 }
 
+/// The entry manager, once it has proven that the entries admission policy binds the
+/// identity it declares under (ADR-0056 decision 5). Called before anything is served and
+/// before the watcher asks for the Lease, so a broker the policy does not bind never binds
+/// a claim.
+async fn proven_entries(
+    cfg: &Config,
+    naming: Naming,
+    client: Option<&kube::Client>,
+) -> anyhow::Result<Arc<dyn EntryManager>> {
+    let spire = entry_manager(cfg, naming, client);
+    prove_entries_admission(spire.as_ref()).await?;
+    Ok(spire)
+}
+
+/// Fail closed on the manager's self-check: an admitted forbidden entry, a refusal that is
+/// not the policy's and an API server that does not answer are each a start error. The
+/// in-memory manager of `dev_mode` answers as a server that enforces the policy does.
+async fn prove_entries_admission(spire: &dyn EntryManager) -> anyhow::Result<()> {
+    spire.self_check().await.map_err(|e| {
+        anyhow::Error::new(e).context(
+            "the broker does not start: the entries admission self-check failed (ADR-0056 decision 5)",
+        )
+    })
+}
+
 /// SIGINT or SIGTERM: the latter is what a rollout sends, and without it every restart
 /// waited for the kill.
 async fn shutdown() {
@@ -1187,6 +1212,135 @@ mod tests {
             .is_err(),
             "ADR-0028: the gateways file is not optional, an empty list is explicit"
         );
+    }
+
+    /// Entries whose self-check answers what a test tells it to, and counts the asking.
+    /// Test-only: the shipped fake, `MemoryEntries`, cannot be told to admit.
+    struct ToldEntries {
+        answer: Result<(), mediatore_spire::SelfCheckError>,
+        asked: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ToldEntries {
+        fn answering(answer: Result<(), mediatore_spire::SelfCheckError>) -> Self {
+            Self {
+                answer,
+                asked: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl EntryManager for ToldEntries {
+        async fn ensure_node_entry(
+            &self,
+            _ek_hash: &str,
+        ) -> Result<String, mediatore_spire::SpireError> {
+            Err(mediatore_spire::SpireError::NotImplemented(
+                "ensure_node_entry",
+            ))
+        }
+
+        async fn create_claim_entry(
+            &self,
+            _ek_hash: &str,
+            _claim_uid: uuid::Uuid,
+            _unix_user: &str,
+            _claim_ttl: std::time::Duration,
+        ) -> Result<String, mediatore_spire::SpireError> {
+            Err(mediatore_spire::SpireError::NotImplemented(
+                "create_claim_entry",
+            ))
+        }
+
+        async fn delete_entry(&self, _name: &str) -> Result<(), mediatore_spire::SpireError> {
+            Err(mediatore_spire::SpireError::NotImplemented("delete_entry"))
+        }
+
+        async fn list_entries(
+            &self,
+        ) -> Result<Vec<mediatore_spire::EntryRef>, mediatore_spire::SpireError> {
+            Err(mediatore_spire::SpireError::NotImplemented("list_entries"))
+        }
+
+        async fn self_check(&self) -> Result<(), mediatore_spire::SelfCheckError> {
+            self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.answer.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn the_start_goes_on_when_admission_refuses_the_forbidden_entry() {
+        let entries = ToldEntries::answering(Ok(()));
+        prove_entries_admission(&entries).await.unwrap();
+        assert_eq!(
+            entries.asked.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "asked once, before anything is served"
+        );
+        // dev_mode: the in-memory manager answers as a server that enforces the policy.
+        prove_entries_admission(&MemoryEntries::default())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_broker_refuses_to_start_when_the_forbidden_entry_is_admitted() {
+        use mediatore_spire::SelfCheckError;
+        let entries = ToldEntries::answering(Err(SelfCheckError::Admitted(
+            "mediatore-selfcheck-0".into(),
+        )));
+        let err = prove_entries_admission(&entries).await.unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<SelfCheckError>(),
+                Some(SelfCheckError::Admitted(_))
+            ),
+            "{err:#}"
+        );
+        let said = format!("{err:#}");
+        assert!(said.contains("the broker does not start"), "{said}");
+        assert!(
+            said.contains("the entries admission policy is not in force for this identity"),
+            "{said}"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_other_self_check_fault_stops_the_start_under_its_own_name() {
+        use mediatore_spire::SelfCheckError;
+        for (fault, names) in [
+            (
+                SelfCheckError::Rbac("cannot create resource".into()),
+                "RBAC",
+            ),
+            (
+                SelfCheckError::Unreachable("connection refused".into()),
+                "did not answer",
+            ),
+            (
+                SelfCheckError::NotTheBroker("denied".into()),
+                "does not name this identity",
+            ),
+            (
+                SelfCheckError::Refused {
+                    code: 422,
+                    message: "schema".into(),
+                },
+                "not by the entries admission policy",
+            ),
+            (SelfCheckError::Unsupported, "cannot prove"),
+        ] {
+            let entries = ToldEntries::answering(Err(fault.clone()));
+            let err = prove_entries_admission(&entries).await.unwrap_err();
+            assert_eq!(err.downcast_ref::<SelfCheckError>(), Some(&fault));
+            let said = format!("{err:#}");
+            assert!(said.contains(names), "{said}");
+            assert!(
+                !said.contains("not in force for this identity"),
+                "only an admitted entry says the policy is not in force: {said}"
+            );
+        }
     }
 
     #[test]

@@ -38,6 +38,17 @@ pub const MANAGED_BY: &str = "mediatore";
 pub const KIND_LABEL: &str = "mediatore.io/kind";
 /// Label carrying the claim UID on a claim entry.
 pub const CLAIM_UID_LABEL: &str = "mediatore.io/claim-uid";
+/// Name of the `ValidatingAdmissionPolicy` that bounds what may be declared as one of the
+/// broker's entries (`deploy/base/admission/clusterstaticentry-mediatore.yaml`). The API
+/// server names it in every denial it issues, which is how [`EntryManager::self_check`]
+/// tells this policy's refusal from any other.
+pub const ENTRIES_POLICY: &str = "mediatore-clusterstaticentry";
+/// The message of that policy's sender validation, word for word (a test in
+/// `mediatore-claims` holds the file to it): an entry that is the broker's by its name, its
+/// label or its path was sent by a principal the policy does not take for the broker.
+/// Read by [`EntryManager::self_check`], so a broker whose `ServiceAccount` the policy
+/// does not name learns it at start and not at its first bind.
+pub const ENTRIES_POLICY_SENDER_MESSAGE: &str = "an entry named mediatore-*, labelled app.kubernetes.io/managed-by=mediatore or under /banlieue/ is the broker's alone to declare, and this request is not from the broker's ServiceAccount as this policy spells it";
 /// Path of the one mediatore binary on a pool member, pinned by the node entry's `unix:path`
 /// selector (ADR-0014). The jail mounts the same file, so `unix:uid:0` is the selector that
 /// tells the guest role from a jailed workload.
@@ -195,6 +206,48 @@ pub enum SpireError {
     NotImplemented(&'static str),
 }
 
+/// Why [`EntryManager::self_check`] did not prove that the entries admission policy binds
+/// the identity the manager declares under (ADR-0056 decision 5). Every variant is a
+/// reason not to start: none is a degraded mode.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SelfCheckError {
+    /// The API server admitted a dry-run create of an entry the policy must refuse: the
+    /// policy is absent, unbound, or does not match what this identity sends.
+    #[error(
+        "the entries admission policy is not in force for this identity: the API server admitted a dry-run create of the forbidden ClusterStaticEntry {0}. Apply deploy/base/admission/clusterstaticentry-mediatore.yaml (policy and binding) before the broker starts"
+    )]
+    Admitted(String),
+    /// The policy refused the probe by its sender validation: it is in force, and it does
+    /// not take this identity for the broker, so it would refuse every real entry too.
+    #[error(
+        "the entries admission policy is in force but does not name this identity as the broker: every entry the broker declares would be refused. Patch the ServiceAccount username in deploy/base/admission/clusterstaticentry-mediatore.yaml to the one the broker runs as. The API server said: {0}"
+    )]
+    NotTheBroker(String),
+    /// Authorization refused the create before admission judged it. That proves nothing
+    /// about the policy, and a broker without the verb is a different fault.
+    #[error(
+        "this identity may not create clusterstaticentries (RBAC, deploy/base/rbac.yaml), so the entries admission policy was never asked: {0}"
+    )]
+    Rbac(String),
+    /// The API server refused the probe, and not through the entries policy (the CRD's
+    /// schema, a missing CRD, an expired credential, another admission plugin).
+    #[error(
+        "the dry-run create of a forbidden ClusterStaticEntry was refused, but not by the entries admission policy (HTTP {code}), which proves nothing about it: {message}"
+    )]
+    Refused {
+        /// The HTTP status code of the answer.
+        code: u16,
+        /// The API server's message.
+        message: String,
+    },
+    /// No answer from the API server.
+    #[error("the API server did not answer the entries admission self-check: {0}")]
+    Unreachable(String),
+    /// The manager has no way to ask. The trait's default, so a new manager fails closed.
+    #[error("this entry manager cannot prove that the entries admission policy is in force")]
+    Unsupported,
+}
+
 /// Refuse anything that is not the attestor's hash shape; the admission policy would too.
 pub fn validate_ek_hash(ek_hash: &str) -> Result<(), SpireError> {
     if is_ek_hash(ek_hash) {
@@ -284,6 +337,17 @@ pub trait EntryManager: Send + Sync + 'static {
     async fn delete_entry(&self, name: &str) -> Result<(), SpireError>;
     /// Every entry mediatore has declared, for the orphan sweep.
     async fn list_entries(&self) -> Result<Vec<EntryRef>, SpireError>;
+    /// Prove, before the broker serves, that the entries admission policy binds the
+    /// identity this manager declares under (ADR-0056 decision 5): ask for something the
+    /// policy must refuse, persisting nothing, and succeed only on its refusal.
+    ///
+    /// # Errors
+    /// [`SelfCheckError`]: the forbidden entry was admitted, the refusal was not the
+    /// policy's, or there was no answer. The default refuses ([`SelfCheckError::Unsupported`]):
+    /// a manager that cannot ask has proven nothing.
+    async fn self_check(&self) -> Result<(), SelfCheckError> {
+        Err(SelfCheckError::Unsupported)
+    }
 }
 
 /// In-memory entries for `dev_mode` and tests. Validates like [`KubeEntryManager`] and
@@ -360,6 +424,14 @@ impl EntryManager for MemoryEntries {
 
     async fn list_entries(&self) -> Result<Vec<EntryRef>, SpireError> {
         Ok(self.entries.lock().unwrap().values().cloned().collect())
+    }
+
+    /// As a compliant API server answers: the forbidden entry is refused by the policy, so
+    /// the check passes. This fake only ever declares the two shapes, through validation
+    /// that refuses what admission would, and it cannot be told to admit anything else.
+    async fn self_check(&self) -> Result<(), SelfCheckError> {
+        tracing::debug!("memory: entries admission self-check answered as the policy would");
+        Ok(())
     }
 }
 
@@ -490,6 +562,81 @@ mod tests {
             Err(SpireError::Invalid(_))
         ));
         assert_eq!(m.names(), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn memory_fake_answers_the_self_check_as_a_compliant_server_would() {
+        // ADR-0056 decision 5: under dev_mode there is no API server, and the fake stands
+        // for one that enforces the policy. It declares nothing while answering.
+        let m = MemoryEntries::default();
+        assert_eq!(m.self_check().await, Ok(()));
+        assert_eq!(m.names(), Vec::<String>::new());
+    }
+
+    /// A manager that implements only what the trait requires.
+    struct NoSelfCheck;
+
+    #[async_trait]
+    impl EntryManager for NoSelfCheck {
+        async fn ensure_node_entry(&self, _ek_hash: &str) -> Result<String, SpireError> {
+            Err(SpireError::NotImplemented("ensure_node_entry"))
+        }
+
+        async fn create_claim_entry(
+            &self,
+            _ek_hash: &str,
+            _claim_uid: Uuid,
+            _unix_user: &str,
+            _claim_ttl: Duration,
+        ) -> Result<String, SpireError> {
+            Err(SpireError::NotImplemented("create_claim_entry"))
+        }
+
+        async fn delete_entry(&self, _name: &str) -> Result<(), SpireError> {
+            Err(SpireError::NotImplemented("delete_entry"))
+        }
+
+        async fn list_entries(&self) -> Result<Vec<EntryRef>, SpireError> {
+            Err(SpireError::NotImplemented("list_entries"))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_manager_that_cannot_ask_fails_the_self_check_closed() {
+        assert_eq!(
+            NoSelfCheck.self_check().await,
+            Err(SelfCheckError::Unsupported),
+            "the default must refuse: a manager that proves nothing does not start a broker"
+        );
+    }
+
+    #[test]
+    fn every_self_check_error_says_which_fault_it_is() {
+        // The operator reads one line at start; each fault names its own remedy and none
+        // reads like another.
+        let admitted = SelfCheckError::Admitted("mediatore-selfcheck-x".into()).to_string();
+        assert!(
+            admitted.contains("not in force for this identity"),
+            "{admitted}"
+        );
+        assert!(
+            admitted.contains("clusterstaticentry-mediatore.yaml"),
+            "{admitted}"
+        );
+        let renamed = SelfCheckError::NotTheBroker("denied".into()).to_string();
+        assert!(renamed.contains("does not name this identity"), "{renamed}");
+        let rbac = SelfCheckError::Rbac("cannot create".into()).to_string();
+        assert!(rbac.contains("RBAC"), "{rbac}");
+        assert!(!rbac.contains("not in force"), "{rbac}");
+        let refused = SelfCheckError::Refused {
+            code: 422,
+            message: "schema".into(),
+        }
+        .to_string();
+        assert!(refused.contains("HTTP 422"), "{refused}");
+        let silent = SelfCheckError::Unreachable("connect".into()).to_string();
+        assert!(silent.contains("did not answer"), "{silent}");
+        assert!(!silent.contains("not in force"), "{silent}");
     }
 
     #[test]
