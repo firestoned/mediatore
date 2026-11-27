@@ -24,13 +24,15 @@ issuers:
     backend: sts
     client_id: mediatore
     allow_any_authenticated: true   # a placeholder issuer for the kind tier, no groups to gate on (ADR-0046 decision 19)
-  - url: https://mediatore-dex.banlieue-system.svc:5556
+    subject_prefix: "example:"      # two issuers under one sts: each qualifies `sub` (ADR-0071 decision 3)
+  - url: https://mediatore-dex.mediatore-system.svc:5556
     backend: sts
     client_id: mediatore
     subject_claim: preferred_username
     required_group: sandbox-users
     session: { client_id: mediatore }
     ca_file: /etc/mediatore-dex/ca.pem
+    subject_prefix: "dex:"
 audiences:
   - { name: e2e, via: sts }
   - { name: e2e-sts, via: sts, max_ttl: 900 }
@@ -57,7 +59,7 @@ store:
   retention_secs: 0
   sealing:
     transit:
-      url: https://mediatore-openbao.banlieue-system.svc:8200
+      url: https://mediatore-openbao.mediatore-system.svc:8200
       ca_file: /etc/mediatore-openbao/ca.pem
       key: mediatore
       role: mediatore

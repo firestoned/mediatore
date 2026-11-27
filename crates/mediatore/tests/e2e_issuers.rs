@@ -7,6 +7,10 @@
 //! as the subject, no groups, `access_type=offline` for the refresh token, a client
 //! secret the token endpoint wants from the installed-app client. Auth0: `email` as the
 //! subject, groups under a namespaced claim, `offline_access` for the refresh token.
+//!
+//! Both identify a person by `email`, so the two subject spaces overlap: the same address
+//! at each is two people. ADR-0071: each issuer has a `subject_prefix`, the minted `sub`
+//! carries it, and a broker with two issuers and no prefixes does not start.
 
 use std::future::IntoFuture;
 use std::sync::Arc;
@@ -21,7 +25,7 @@ use mediatore_proto::{
 use mediatore_spire::{MemoryEntries, Naming};
 use mediatore_store::seal::LocalKeySealer;
 use mediatore_store::{ClaimStore, MemoryStore};
-use mediatore_sts::Sts;
+use mediatore_sts::{Sts, SubjectPrefixes};
 use mediatore_testkit::{AUTH0_GROUPS_CLAIM, FakeIdp, Profile};
 
 const TRUST_DOMAIN: &str = "sandbox.test";
@@ -31,6 +35,9 @@ const CLIENT_ID: &str = "mediatore";
 const GOOGLE_SECRET: &str = "GOCSPX-not-a-secret";
 const REQUIRED_GROUP: &str = "firestoned:sandbox-users";
 const PEER_HEADER: &str = "x-mediatore-peer-spiffe-id";
+/// The `subject_prefix` of each issuer (ADR-0071 decision 1).
+const GOOGLE_PREFIX: &str = "google:";
+const AUTH0_PREFIX: &str = "auth0:";
 const EK_HASH: &str = "72c566555391e835a15c522680b51ec3b840561ed70af5605a5ae4835f040ee8";
 
 struct Harness {
@@ -43,8 +50,13 @@ struct Harness {
 }
 
 impl Harness {
-    #[allow(clippy::too_many_lines)] // three IdPs and every AppState field, listed in full
+    /// Both issuers, each with its `subject_prefix`.
     async fn start() -> Self {
+        Self::start_with(Issuers::Both).await
+    }
+
+    #[allow(clippy::too_many_lines)] // three IdPs and every AppState field, listed in full
+    async fn start_with(which: Issuers) -> Self {
         let google = FakeIdp::start_as(Profile::Google).await;
         google.set_client_secret(CLIENT_ID, GOOGLE_SECRET);
         let auth0 = FakeIdp::start_as(Profile::Auth0).await;
@@ -66,6 +78,7 @@ impl Harness {
             ca_file: None,
             entra: None,
             groups_claim: None,
+            subject_prefix: which.prefix(GOOGLE_PREFIX),
         };
         let auth0_issuer = IssuerConfig {
             url: auth0.issuer.clone(),
@@ -82,9 +95,22 @@ impl Harness {
             ca_file: None,
             entra: None,
             groups_claim: Some(AUTH0_GROUPS_CLAIM.into()),
+            subject_prefix: which.prefix(AUTH0_PREFIX),
         };
+        let issuers = match which {
+            Issuers::Both => vec![google_issuer, auth0_issuer],
+            Issuers::GoogleAloneWithoutAPrefix => vec![google_issuer],
+        };
+        // What `sts` in main.rs does with the issuers' `subject_prefix` (ADR-0071): the set is
+        // the one `Config::parse` accepted.
+        let prefixes = SubjectPrefixes::new(
+            issuers
+                .iter()
+                .map(|i| (i.url.as_str(), i.subject_prefix.as_deref())),
+        )
+        .expect("subject prefixes");
         // What `validator` in main.rs does with `client_secret_file`.
-        let validator = Validator::new(vec![google_issuer, auth0_issuer])
+        let validator = Validator::new(issuers)
             .with_session_secret(&google.issuer, Secret(GOOGLE_SECRET.into()));
         let sts = Sts::new(
             "https://mediatore.test",
@@ -92,7 +118,8 @@ impl Harness {
             mediatore_testkit::entra::fresh_p256_key_pem().as_bytes(),
             SignedDuration::from_mins(15),
         )
-        .expect("sts");
+        .expect("sts")
+        .with_subject_prefixes(prefixes);
         let store = MemoryStore::shared();
         let state = Arc::new(AppState {
             inject: std::collections::BTreeMap::new(),
@@ -266,6 +293,21 @@ impl Harness {
     }
 }
 
+/// Which issuers the broker under test trusts.
+#[derive(Clone, Copy)]
+enum Issuers {
+    /// Google and Auth0, each with its `subject_prefix`.
+    Both,
+    /// Google alone and no `subject_prefix`: a deployment from before ADR-0071.
+    GoogleAloneWithoutAPrefix,
+}
+
+impl Issuers {
+    fn prefix(self, prefix: &str) -> Option<String> {
+        matches!(self, Self::Both).then(|| prefix.to_owned())
+    }
+}
+
 async fn error_code(resp: reqwest::Response) -> (u16, String) {
     let status = resp.status().as_u16();
     let body: ErrorBody = resp.json().await.unwrap();
@@ -304,7 +346,12 @@ async fn a_google_login_is_by_email_with_the_installed_app_secret_and_access_typ
     assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
     let minted: TokenResponse = resp.json().await.unwrap();
     let claims = payload(&minted.access_token);
-    assert_eq!(claims["sub"], "octocat@example.com");
+    assert_eq!(
+        claims["sub"],
+        format!("{GOOGLE_PREFIX}octocat@example.com"),
+        "two issuers: the issuer's prefix, then the id (ADR-0071)"
+    );
+    assert_eq!(claims["upstream_iss"], h.google.issuer);
     assert!(
         claims
             .get("groups")
@@ -350,7 +397,7 @@ async fn an_auth0_login_is_by_email_with_groups_under_the_namespaced_claim() {
     let (claim, _) = h.claim(&session).await.unwrap();
     let minted: TokenResponse = h.token(&claim).await.json().await.unwrap();
     let claims = payload(&minted.access_token);
-    assert_eq!(claims["sub"], "hexley@example.com");
+    assert_eq!(claims["sub"], format!("{AUTH0_PREFIX}hexley@example.com"));
     assert_eq!(
         claims["groups"],
         serde_json::json!([REQUIRED_GROUP]),
@@ -397,6 +444,7 @@ async fn claim_through_gate(gate: IssuerGate, groups: &[&str]) -> (u16, String) 
         ca_file: None,
         entra: None,
         groups_claim: None,
+        subject_prefix: None,
     }]);
     let state = Arc::new(AppState {
         inject: std::collections::BTreeMap::new(),
@@ -496,4 +544,136 @@ async fn a_prefixed_group_is_refused_under_a_gate_that_lists_only_the_bare_name(
     let (status, body) = claim_through_gate(IssuerGate::List(&[GATE_BARE]), &[GATE_PREFIXED]).await;
     assert_eq!(status, 403, "{body}");
     assert!(!body.contains(GATE_BARE), "the 403 names a group: {body}");
+}
+
+// ----- ADR-0071: `sub` qualified by upstream issuer ------------------------------------------------------------------
+
+#[tokio::test]
+async fn the_same_subject_id_at_two_issuers_gets_two_different_subs() {
+    let h = Harness::start().await;
+    // One address, two accounts: `octocat@example.com` at Google and at Auth0.
+    h.auth0.set_groups("octocat", &[REQUIRED_GROUP]);
+    let at_google = Harness::login(&h.google, "octocat", h.google_opts())
+        .await
+        .unwrap();
+    let at_auth0 = Harness::login(&h.auth0, "octocat", h.auth0_opts())
+        .await
+        .unwrap();
+    let (google_claim, _) = h.claim(&at_google).await.unwrap();
+    let google_rec = h.store.get_claim(google_claim.uid.unwrap()).await.unwrap();
+    let minted: TokenResponse = h.token(&google_claim).await.json().await.unwrap();
+    let google = payload(&minted.access_token);
+    let (auth0_claim, _) = h.claim(&at_auth0).await.unwrap();
+    let auth0_rec = h.store.get_claim(auth0_claim.uid.unwrap()).await.unwrap();
+    let minted: TokenResponse = h.token(&auth0_claim).await.json().await.unwrap();
+    let auth0 = payload(&minted.access_token);
+
+    // The broker's own records hold the same id under two issuers ...
+    assert_eq!(google_rec.subject.id, "octocat@example.com");
+    assert_eq!(auth0_rec.subject.id, google_rec.subject.id);
+    assert_ne!(auth0_rec.subject.issuer, google_rec.subject.issuer);
+    // ... and a resource server that reads `sub` alone still sees two people.
+    assert_eq!(google["sub"], format!("{GOOGLE_PREFIX}octocat@example.com"));
+    assert_eq!(auth0["sub"], format!("{AUTH0_PREFIX}octocat@example.com"));
+    assert_ne!(google["sub"], auth0["sub"]);
+    assert_eq!(google["upstream_iss"], h.google.issuer);
+    assert_eq!(auth0["upstream_iss"], h.auth0.issuer);
+}
+
+#[tokio::test]
+async fn one_issuer_without_a_prefix_mints_the_bare_sub() {
+    let h = Harness::start_with(Issuers::GoogleAloneWithoutAPrefix).await;
+    let session = Harness::login(&h.google, "octocat", h.google_opts())
+        .await
+        .unwrap();
+    let (claim, _) = h.claim(&session).await.unwrap();
+    let minted: TokenResponse = h.token(&claim).await.json().await.unwrap();
+    let claims = payload(&minted.access_token);
+    assert_eq!(
+        claims["sub"], "octocat@example.com",
+        "one issuer, no prefix: the token of before ADR-0071"
+    );
+    assert_eq!(claims["upstream_iss"], h.google.issuer);
+}
+
+/// `mediatore serve` on `config`: its exit status and what it wrote to stderr. The run is
+/// expected to end at the configuration load; one that is still up after a minute is killed.
+fn serve_until_exit(config: &std::path::Path) -> (Option<i32>, String) {
+    use std::io::Read as _;
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_mediatore"))
+        .arg("serve")
+        .arg("--config")
+        .arg(config)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("the broker binary runs");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if std::time::Instant::now() > deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    (status.and_then(|s| s.code()), stderr)
+}
+
+/// A whole broker configuration under `dev_mode` on loopback with an `sts`, trusting
+/// `issuers` (the YAML list items).
+fn broker_config(dir: &std::path::Path, issuers: &str) -> std::path::PathBuf {
+    let key = dir.join("sts.pem");
+    std::fs::write(&key, mediatore_testkit::entra::fresh_p256_key_pem()).unwrap();
+    let path = dir.join("mediatore.yaml");
+    std::fs::write(
+        &path,
+        format!(
+            "trust_domain: {TRUST_DOMAIN}\nlisten: {{ user: 127.0.0.1:0, sandbox: 127.0.0.1:0 }}\ndev_mode: true\nsts: {{ issuer: https://mediatore.test, kid: k, signing_key_file: {} }}\naudiences:\n  - {{ name: {AUDIENCE}, via: sts }}\nissuers:\n{issuers}",
+            key.display()
+        ),
+    )
+    .unwrap();
+    path
+}
+
+#[test]
+fn two_issuers_without_subject_prefixes_refuse_to_start() {
+    let dir = mediatore_testkit::tempdir();
+    let two = "  - { url: \"https://accounts.example.com\", backend: sts, client_id: m, subject_claim: email, allow_any_authenticated: true }\n  - { url: \"https://login.example.com\", backend: sts, client_id: m, subject_claim: email, allow_any_authenticated: true }\n";
+    let (code, stderr) = serve_until_exit(&broker_config(&dir, two));
+    assert_eq!(code, Some(1), "the broker must not start: {stderr}");
+    assert!(
+        stderr.contains("issuers[https://accounts.example.com].subject_prefix"),
+        "the start error names the key and the issuer: {stderr}"
+    );
+    assert!(stderr.contains("ADR-0071"), "{stderr}");
+
+    // One prefix is not enough, and the same prefix twice is the same refusal.
+    for (issuers, named) in [
+        (
+            two.replacen("client_id: m,", "client_id: m, subject_prefix: \"a:\",", 1),
+            "issuers[https://login.example.com].subject_prefix",
+        ),
+        (
+            two.replace("client_id: m,", "client_id: m, subject_prefix: \"a:\","),
+            "overlap",
+        ),
+    ] {
+        let dir = mediatore_testkit::tempdir();
+        let (code, stderr) = serve_until_exit(&broker_config(&dir, &issuers));
+        assert_eq!(code, Some(1), "the broker must not start: {stderr}");
+        assert!(stderr.contains(named), "{stderr}");
+    }
 }

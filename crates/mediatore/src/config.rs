@@ -14,6 +14,7 @@ use mediatore_proto::{
 };
 use mediatore_store::LogLimits;
 use mediatore_store::seal::TransitConfig;
+use mediatore_sts::{SubjectPrefixError, SubjectPrefixes};
 use serde::Deserialize;
 
 /// What an audience is for (ADR-0063 decision 2).
@@ -1373,6 +1374,7 @@ impl Config {
         cfg.check_entra()?;
         cfg.check_gates()?;
         cfg.check_issuer_urls()?;
+        cfg.check_subject_prefixes()?;
         if !cfg.dev_mode && cfg.spire.is_none() {
             anyhow::bail!("`spire` (workload_api_socket, entries) is required outside dev_mode");
         }
@@ -1469,6 +1471,38 @@ impl Config {
         Ok(())
     }
 
+    /// ADR-0071 decisions 1 and 3: a `subject_prefix` has the one form, and under an `sts` two
+    /// or more issuers each have one, no two overlapping, so the broker never signs the same
+    /// `sub` for two people who share a subject id at two issuers. Without an `sts` the
+    /// broker signs no token and only the form is checked. Refused at start with the key
+    /// and the issuer's `url`, never minted bare.
+    fn check_subject_prefixes(&self) -> anyhow::Result<()> {
+        if self.sts.is_some() {
+            self.subject_prefixes()?;
+            return Ok(());
+        }
+        for issuer in &self.issuers {
+            // One issuer at a time: the form alone, not the set.
+            SubjectPrefixes::new([(issuer.url.as_str(), issuer.subject_prefix.as_deref())])?;
+        }
+        Ok(())
+    }
+
+    /// The `sub` prefix of each issuer, checked as a set (ADR-0071): a malformed prefix is
+    /// refused whatever the number of issuers, and two or more issuers need one each, no two
+    /// overlapping. The STS is built with the result (`sts` in main.rs), so what was
+    /// checked is what mints.
+    ///
+    /// # Errors
+    /// The `mediatore_sts::SubjectPrefixError`, which names `issuers[<url>].subject_prefix`.
+    pub fn subject_prefixes(&self) -> Result<SubjectPrefixes, SubjectPrefixError> {
+        SubjectPrefixes::new(
+            self.issuers
+                .iter()
+                .map(|i| (i.url.as_str(), i.subject_prefix.as_deref())),
+        )
+    }
+
     /// What the user API serves: the map, or the single open namespace (ADR-0046 decision 3).
     #[must_use]
     pub fn namespaces(&self) -> Namespaces {
@@ -1504,6 +1538,17 @@ impl Config {
                 .gate_form()
                 .unwrap_or_else(|e| format!("invalid ({e})"));
             tracing::info!(issuer = %issuer.url, gate = %form, "issuer gate in force");
+            // ADR-0071: what a resource server will read as `sub` for this issuer's people.
+            if self.sts.is_some() {
+                match issuer.subject_prefix.as_deref() {
+                    Some(prefix) => {
+                        tracing::info!(issuer = %issuer.url, subject_prefix = %prefix, "sts: sub is the subject_prefix followed by the subject id (ADR-0071)");
+                    }
+                    None => {
+                        tracing::info!(issuer = %issuer.url, "sts: sub is the bare subject id, this issuer has no subject_prefix (ADR-0071)");
+                    }
+                }
+            }
         }
         if self.logs.enabled {
             tracing::info!(
@@ -4407,5 +4452,139 @@ listen: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }
             "        rules: []\n",
         );
         assert!(scoped_err(&empty).contains("namespaces.team-a.rules"));
+    }
+
+    // ----- ADR-0071: `sub` qualified by upstream issuer ---------------------------------------------------------------
+
+    const STS: &str = "sts: { issuer: https://mediatore.test, kid: k, signing_key_file: /k }\n";
+
+    /// A dev configuration trusting `issuers` (each the keys after `url`, `backend` and
+    /// `client_id`), with `extra` top-level sections.
+    fn issuers_cfg(issuers: &[(&str, &str)], extra: &str) -> anyhow::Result<Config> {
+        use std::fmt::Write as _;
+        let mut text = format!("{}{extra}issuers:\n", DEV.replace("issuers: []\n", ""));
+        for (url, keys) in issuers {
+            writeln!(
+                text,
+                "  - {{ url: \"{url}\", backend: sts, client_id: m, allow_any_authenticated: true{keys} }}"
+            )
+            .unwrap();
+        }
+        Config::parse(&text)
+    }
+
+    const ISSUER_A: &str = "https://dex.example.com";
+    const ISSUER_B: &str = "https://accounts.example.com";
+
+    #[test]
+    fn two_issuers_without_subject_prefixes_refuse_to_start_under_an_sts() {
+        let err = issuers_cfg(&[(ISSUER_A, ""), (ISSUER_B, "")], STS)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(&format!("issuers[{ISSUER_A}].subject_prefix")),
+            "the start error names the key: {err}"
+        );
+        assert!(err.contains("ADR-0071"), "{err}");
+    }
+
+    #[test]
+    fn two_issuers_with_one_subject_prefix_missing_refuse_to_start() {
+        let err = issuers_cfg(
+            &[(ISSUER_A, ", subject_prefix: \"dex:\""), (ISSUER_B, "")],
+            STS,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains(&format!("issuers[{ISSUER_B}].subject_prefix is not set")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn two_issuers_with_the_same_subject_prefix_refuse_to_start() {
+        let same = ", subject_prefix: \"idp:\"";
+        let err = issuers_cfg(&[(ISSUER_A, same), (ISSUER_B, same)], STS)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("overlap"), "{err}");
+        assert!(err.contains(ISSUER_A) && err.contains(ISSUER_B), "{err}");
+    }
+
+    #[test]
+    fn two_issuers_with_distinct_subject_prefixes_start() {
+        let cfg = issuers_cfg(
+            &[
+                (ISSUER_A, ", subject_prefix: \"dex:\""),
+                (ISSUER_B, ", subject_prefix: \"google:\""),
+            ],
+            STS,
+        )
+        .unwrap();
+        let prefixes = cfg.subject_prefixes().unwrap();
+        assert_eq!(prefixes.get(ISSUER_A), Some("dex:"));
+        assert_eq!(prefixes.get(ISSUER_B), Some("google:"));
+    }
+
+    #[test]
+    fn one_issuer_needs_no_subject_prefix_and_may_have_one() {
+        let cfg = issuers_cfg(&[(ISSUER_A, "")], STS).unwrap();
+        assert!(cfg.issuers[0].subject_prefix.is_none());
+        assert!(cfg.subject_prefixes().unwrap().is_empty());
+        let cfg = issuers_cfg(&[(ISSUER_A, ", subject_prefix: \"dex:\"")], STS).unwrap();
+        assert_eq!(cfg.subject_prefixes().unwrap().get(ISSUER_A), Some("dex:"));
+    }
+
+    #[test]
+    fn a_malformed_subject_prefix_refuses_to_start_whatever_the_number_of_issuers() {
+        for bad in ["dex", "Dex:", "dex/", "a:b:", "", ":"] {
+            let keys = format!(", subject_prefix: \"{bad}\"");
+            for extra in [STS, ""] {
+                let err = issuers_cfg(&[(ISSUER_A, &keys)], extra)
+                    .unwrap_err()
+                    .to_string();
+                assert!(
+                    err.contains(&format!("issuers[{ISSUER_A}].subject_prefix")),
+                    "{bad:?}: {err}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn without_an_sts_no_sub_is_minted_and_two_issuers_need_no_subject_prefix() {
+        // No `sts`: the broker signs no token, so there is no `sub` to keep apart. The day an
+        // `sts` section is added, the same file is refused until the prefixes are there.
+        let cfg = issuers_cfg(&[(ISSUER_A, ""), (ISSUER_B, "")], "").unwrap();
+        assert!(cfg.sts.is_none());
+        assert!(issuers_cfg(&[(ISSUER_A, ""), (ISSUER_B, "")], STS).is_err());
+    }
+
+    #[test]
+    fn startup_logs_each_issuers_subject_prefix_or_that_sub_is_the_bare_id() {
+        let cfg = issuers_cfg(
+            &[
+                (ISSUER_A, ", subject_prefix: \"dex:\""),
+                (ISSUER_B, ", subject_prefix: \"google:\""),
+            ],
+            STS,
+        )
+        .unwrap();
+        let logs = startup_log(&cfg);
+        for (issuer, prefix) in [(ISSUER_A, "dex:"), (ISSUER_B, "google:")] {
+            assert!(
+                logs.lines().any(|l| l.contains(issuer)
+                    && l.contains(&format!("subject_prefix={prefix}"))
+                    && l.contains("ADR-0071")),
+                "{logs}"
+            );
+        }
+        let logs = startup_log(&issuers_cfg(&[(ISSUER_A, "")], STS).unwrap());
+        assert!(
+            logs.lines()
+                .any(|l| l.contains(ISSUER_A) && l.contains("sub is the bare subject id")),
+            "{logs}"
+        );
     }
 }

@@ -23,12 +23,27 @@ TD=${2:?trust domain}
 EK_PEM=${3:?ek pem}
 EK_HASH=$(tr -d '\n' < "${4:?ek hash file}")
 K=(kubectl --kubeconfig "$KUBECONFIG_PATH")
-BROKER_NS=banlieue-system
+# The broker's namespace, and the fixtures' (Dex, glauth): one and the same in the tier.
+# The migration rehearsal (dev/kind/migration-rehearsal.sh, ADR-0056 decision 7) runs the
+# tier in two halves around the move, with the broker first in its old namespace:
+# MEDIATORE_BROKER_NS names where the broker is, MEDIATORE_DEX_PHASE which half
+# (`until-first-token` stops after the first issue and leaves everything standing,
+# `from-second-token` takes up the claim recorded in MEDIATORE_DEX_STATE), and a claim
+# bound in the first half must issue again in the second.
+BROKER_NS=${MEDIATORE_BROKER_NS:-mediatore-system}
+FIXTURE_NS=mediatore-system
+PHASE=${MEDIATORE_DEX_PHASE:-all}
+STATE_FILE=${MEDIATORE_DEX_STATE:-}
+case "$PHASE" in
+  all) ;;
+  until-first-token|from-second-token) [ -n "$STATE_FILE" ] || { echo "MEDIATORE_DEX_STATE is required with MEDIATORE_DEX_PHASE=$PHASE" >&2; exit 1; } ;;
+  *) echo "MEDIATORE_DEX_PHASE must be until-first-token or from-second-token, not $PHASE" >&2; exit 1 ;;
+esac
 # The broker's sandboxes.namespace: where the user API creates the resource.
 NS=mediatore-e2e-sandbox
-ISSUER=https://mediatore-dex.banlieue-system.svc:5556
-USER_API=http://mediatore.banlieue-system.svc:8080
-SANDBOX_API=https://mediatore-sandbox.banlieue-system.svc
+ISSUER=https://mediatore-dex.$FIXTURE_NS.svc:5556
+USER_API=http://mediatore.$BROKER_NS.svc:8080
+SANDBOX_API=https://mediatore-sandbox.$BROKER_NS.svc
 AUDIENCE=e2e-sts
 LOGIN=octocat
 PASSWORD=octocat-e2e
@@ -51,11 +66,11 @@ pod_phase()   { "${K[@]}" -n "$NS" get pod "$1" -o jsonpath='{.status.phase}' 2>
 entries()     { "${K[@]}" get clusterstaticentries -l "$ENTRY_SELECTOR" -o jsonpath='{range .items[*]}{.metadata.name} {.spec.spiffeID}{"\n"}{end}' 2>/dev/null || true; }
 sandbox()     { "${K[@]}" -n "$NS" get agentsandbox "$1" -o json 2>/dev/null || true; }
 field()       { sandbox "$1" | jq -r "$2 // empty"; }
-dex_tokens()  { "${K[@]}" -n "$BROKER_NS" get refreshtokens.dex.coreos.com -o json 2>/dev/null | jq -c '[.items[] | {id: .metadata.name, lastUsed: .LastUsed, generation: .metadata.generation}]' || echo '[]'; }
+dex_tokens()  { "${K[@]}" -n "$FIXTURE_NS" get refreshtokens.dex.coreos.com -o json 2>/dev/null | jq -c '[.items[] | {id: .metadata.name, lastUsed: .LastUsed, generation: .metadata.generation}]' || echo '[]'; }
 
 dump() {
   printf '\n--- broker (last 60 lines)\n'; broker_logs | tail -60
-  printf '\n--- dex (last 30 lines)\n'; "${K[@]}" -n "$BROKER_NS" logs deploy/mediatore-dex --tail=30 2>/dev/null | plain || true
+  printf '\n--- dex (last 30 lines)\n'; "${K[@]}" -n "$FIXTURE_NS" logs deploy/mediatore-dex --tail=30 2>/dev/null | plain || true
   printf '\n--- dex refresh tokens\n'; dex_tokens
   printf '\n--- %s\n' "$NS"; "${K[@]}" -n "$NS" get agentsandboxes,virtualmachineclaims,pods 2>/dev/null || true
   for p in cli-1 cli-2 token-1 token-2 token-3 token-4 token-5; do
@@ -71,17 +86,20 @@ glauth_config() { # <otherGroups value>: the directory with octocat in that grou
 # over and the old pod is out of the endpoint list, so Dex's next LDAP dial is not
 # routed to a pod that is gone.
 glauth_settled() {
-  "${K[@]}" -n "$BROKER_NS" get endpointslices -l kubernetes.io/service-name=mediatore-glauth -o json 2>/dev/null \
+  "${K[@]}" -n "$FIXTURE_NS" get endpointslices -l kubernetes.io/service-name=mediatore-glauth -o json 2>/dev/null \
     | jq -e '[.items[].endpoints[]?] | length == 1 and all(.conditions.ready == true and (.conditions.terminating // false) == false)' >/dev/null
 }
 set_directory() { # <otherGroups value>
-  glauth_config "$1" | "${K[@]}" -n "$BROKER_NS" create configmap mediatore-glauth-config --from-file=glauth.cfg=/dev/stdin --dry-run=client -o yaml | "${K[@]}" apply -f - >/dev/null
-  "${K[@]}" -n "$BROKER_NS" rollout restart deploy/mediatore-glauth >/dev/null
-  "${K[@]}" -n "$BROKER_NS" rollout status deploy/mediatore-glauth --timeout=120s >/dev/null
+  glauth_config "$1" | "${K[@]}" -n "$FIXTURE_NS" create configmap mediatore-glauth-config --from-file=glauth.cfg=/dev/stdin --dry-run=client -o yaml | "${K[@]}" apply -f - >/dev/null
+  "${K[@]}" -n "$FIXTURE_NS" rollout restart deploy/mediatore-glauth >/dev/null
+  "${K[@]}" -n "$FIXTURE_NS" rollout status deploy/mediatore-glauth --timeout=120s >/dev/null
   wait_for "$TIMEOUT" "glauth's endpoint settled after the restart" glauth_settled
 }
 
+KEEP=""
 cleanup() {
+  # The first half of the rehearsal hands its claim, pods and identities to the second.
+  [ -z "$KEEP" ] || return 0
   set_directory 5502 || true
   "${K[@]}" delete namespace "$NS" --ignore-not-found --wait=false >/dev/null 2>&1 || true
   "${K[@]}" delete clusterspiffeid mediatore-e2e-dex-node mediatore-e2e-dex-claim --ignore-not-found --wait=false >/dev/null 2>&1 || true
@@ -226,18 +244,19 @@ BROKER_POD=$(broker_pod)
 [ -n "$BROKER_POD" ] || fail "no Running broker pod in $BROKER_NS"
 wait_for "$TIMEOUT" "'issuer pinned to a private CA' in the broker log" log_has "issuer pinned to a private CA" "$ISSUER"
 wait_for "$TIMEOUT" "'claim watcher running' in the broker log" log_has "claim watcher running"
-"${K[@]}" -n "$BROKER_NS" rollout status deploy/mediatore-dex --timeout=60s >/dev/null
-"${K[@]}" -n "$BROKER_NS" rollout status deploy/mediatore-glauth --timeout=60s >/dev/null
+"${K[@]}" -n "$FIXTURE_NS" rollout status deploy/mediatore-dex --timeout=60s >/dev/null
+"${K[@]}" -n "$FIXTURE_NS" rollout status deploy/mediatore-glauth --timeout=60s >/dev/null
 echo "broker ${BROKER_POD#pod/}, Dex and glauth up"
 
+if [ "$PHASE" != from-second-token ]; then
 say "fixtures: a namespace, the directory as shipped, and a node registering the fixture EK over mTLS"
 "${K[@]}" delete namespace "$NS" --ignore-not-found --wait=true >/dev/null
 "${K[@]}" delete clusterstaticentries -l "$ENTRY_SELECTOR" --ignore-not-found --wait=true >/dev/null
-"${K[@]}" -n "$BROKER_NS" delete refreshtokens.dex.coreos.com --all --ignore-not-found >/dev/null 2>&1 || true
+"${K[@]}" -n "$FIXTURE_NS" delete refreshtokens.dex.coreos.com --all --ignore-not-found >/dev/null 2>&1 || true
 set_directory 5502
 "${K[@]}" create namespace "$NS" >/dev/null
 # The Dex CA for the user-side pod: ConfigMaps are namespaced, so copy the broker's.
-"${K[@]}" -n "$BROKER_NS" get configmap mediatore-dex-ca -o jsonpath='{.data.ca\.pem}' \
+"${K[@]}" -n "$FIXTURE_NS" get configmap mediatore-dex-ca -o jsonpath='{.data.ca\.pem}' \
   | "${K[@]}" -n "$NS" create configmap mediatore-dex-ca --from-file=ca.pem=/dev/stdin >/dev/null
 "${K[@]}" apply -f - >/dev/null <<YAML
 apiVersion: spire.spiffe.io/v1alpha1
@@ -314,12 +333,34 @@ BEFORE=$(dex_tokens | jq -r '.[0].lastUsed')
 token_pod token-1
 wait_for "$TIMEOUT" "a token in the token-1 pod log" has_token token-1
 CLAIMS=$(payload "$(token_line token-1)")
-echo "$CLAIMS" | jq -e --arg uid "$CLAIM_UID" --arg aud "$AUDIENCE" '.sub == "octocat" and .aud == $aud and .claim_uid == $uid and .iss == "https://mediatore.sandbox.test"' >/dev/null \
+echo "$CLAIMS" | jq -e --arg uid "$CLAIM_UID" --arg aud "$AUDIENCE" '.sub == "dex:octocat" and .aud == $aud and .claim_uid == $uid and .iss == "https://mediatore.sandbox.test"' >/dev/null \
   || fail "unexpected token claims: $CLAIMS"
 AFTER=$(dex_tokens | jq -r '.[0].lastUsed')
 [ "$AFTER" != "$BEFORE" ] || fail "Dex's refresh token was not used before the issue (lastUsed $BEFORE)"
 log_has "upstream session refused" && fail "a refusal was logged on a good session"
 echo "token for octocat, aud $AUDIENCE, claim $CLAIM_UID; Dex refresh token used at $AFTER (was $BEFORE)"
+
+if [ "$PHASE" = until-first-token ]; then
+  printf '%s %s\n' "$NAME" "$CLAIM_UID" > "$STATE_FILE"
+  KEEP=1
+  say "PASS (first half): $NAME bound as claim $CLAIM_UID and issuing, with the broker in $BROKER_NS; left standing for the second half"
+  exit 0
+fi
+else
+  read -r NAME CLAIM_UID < "$STATE_FILE"
+  [ -n "$NAME" ] && [ -n "$CLAIM_UID" ] || fail "no claim recorded in $STATE_FILE"
+  say "after the move: the claim bound before it ($CLAIM_UID, sandbox $NAME) issues again, the broker now in $BROKER_NS"
+  [ "$(field "$NAME" '.status.ready')" = "true" ] || fail "$NAME is no longer Ready: $(sandbox "$NAME" | jq -c .status)"
+  BEFORE=$(dex_tokens | jq -r '.[0].lastUsed')
+  token_pod token-5
+  wait_for "$TIMEOUT" "a token in the token-5 pod log" has_token token-5
+  CLAIMS=$(payload "$(token_line token-5)")
+  echo "$CLAIMS" | jq -e --arg uid "$CLAIM_UID" --arg aud "$AUDIENCE" '.sub == "dex:octocat" and .aud == $aud and .claim_uid == $uid' >/dev/null \
+    || fail "unexpected token claims after the move: $CLAIMS"
+  AFTER=$(dex_tokens | jq -r '.[0].lastUsed')
+  [ "$AFTER" != "$BEFORE" ] || fail "Dex's refresh token was not used before the issue after the move: the copied session did not open (lastUsed $BEFORE)"
+  echo "token for octocat, claim $CLAIM_UID, issued by the broker in $BROKER_NS from the session copied there; Dex refresh token used at $AFTER (was $BEFORE)"
+fi
 
 say "revoked upstream, one way: octocat leaves the gated group in the directory"
 set_directory ""
@@ -343,7 +384,7 @@ echo "$(payload "$(token_line token-3)")" | jq -e --arg uid "$CLAIM_UID" '.claim
 echo "sandbox $NAME2 created, bound, issuing"
 
 say "revoked upstream, the other way: the refresh token is deleted at Dex"
-"${K[@]}" -n "$BROKER_NS" delete refreshtokens.dex.coreos.com --all >/dev/null
+"${K[@]}" -n "$FIXTURE_NS" delete refreshtokens.dex.coreos.com --all >/dev/null
 token_pod token-4
 wait_for "$TIMEOUT" "'session_revoked' in the token-4 pod log" refused token-4
 wait_for "$TIMEOUT" "'upstream session refused; claim released' for $CLAIM_UID in the broker log" log_has "upstream session refused; claim released" "$CLAIM_UID"

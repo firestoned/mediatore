@@ -150,11 +150,72 @@ Entra is covered on its own page: [the Entra path](the-entra-path.md). The login
 same PKCE flow (or `az account get-access-token` for a token the CLI did not obtain),
 but the session is not delegated: mediatore exchanges the caller's token On-Behalf-Of.
 
+## More than one issuer
+
+A subject id is unique only inside the issuer that gave it. `octocat@example.com` at
+Google and `octocat@example.com` at Auth0 are two accounts, and nothing makes them the
+same person. The broker keeps them apart itself (a claim belongs to an issuer and an id,
+and both are compared), but a resource server that receives a token minted by the
+broker's STS usually authorizes on `sub` alone. So with two or more issuers under an
+`sts`, every issuer carries a `subject_prefix`, and `sub` is the prefix followed by the id:
+
+```yaml
+issuers:
+  - url: https://accounts.google.com
+    backend: sts
+    client_id: 1234.apps.googleusercontent.com
+    subject_claim: email
+    allow_any_authenticated: true   # Google carries no groups; the Workspace domain is the gate
+    subject_prefix: "google:"       # sub: google:octocat@example.com
+    session: { client_id: 1234.apps.googleusercontent.com, client_secret_file: /etc/mediatore-google/secret }
+  - url: https://tenant.us.auth0.com/
+    backend: sts
+    client_id: abc
+    subject_claim: email
+    required_group: sandbox-users
+    groups_claim: https://example.com/groups
+    subject_prefix: "auth0:"        # sub: auth0:octocat@example.com
+    session: { client_id: abc }
+```
+
+The rules, each a start error that names `issuers[<url>].subject_prefix`
+([ADR-0071](../adr/0071-sub-qualified-by-issuer-when-the-broker-trusts-several.md)):
+
+- A prefix is 1 to 31 characters of `a-z`, `0-9`, `.`, `_` and `-`, the first a letter or
+  a digit, followed by one `:`. Lower case only, so a resource server that folds case
+  cannot merge two.
+- With two or more issuers and an `sts` section, every issuer has one. There is no
+  default and nothing is derived from the URL: a missing prefix stops the broker.
+- No two issuers have the same prefix.
+- With one issuer the key is optional. Without it `sub` is the bare id, exactly as
+  before; nothing changes for a deployment that has one issuer and adds nothing.
+
+What to know before adding a second issuer to a running deployment:
+
+- **The first issuer's `sub` changes** on the restart that adds the prefixes, from
+  `octocat` to `dex:octocat`. A resource server that maps `sub` to an account (a Grafana
+  user, a git host's login) needs the new value before that restart. Setting a prefix
+  while there is still one issuer makes this a change you schedule, and a new deployment
+  that may ever trust a second issuer should set one from the first day.
+- **Replacing the one issuer with another is the same case.** With one issuer and no
+  prefix, the old issuer's `octocat` and the new issuer's `octocat` are the same `sub` to
+  a resource server that remembers it. Give the new issuer a prefix when you switch.
+- The prefix is in tokens only. The sandbox's `spec.subject`, `mediatore sandbox list`,
+  the user in the guest and the broker's log lines keep the raw id and the issuer URL,
+  and `upstream_iss` in the token still names the issuer.
+- A resource server that wants the two halves reads `sub` up to the first `:` as the
+  prefix and the rest as the id, or reads `upstream_iss`.
+
+The broker logs one line per issuer at start saying which form `sub` takes.
+
 ## What stays the same everywhere
 
 - The subject written on the sandbox is the issuer URL plus the `subject_claim` value.
   banlieue's policy prefixes usernames per issuer (`github:`, `google:`) when it compares
-  a declarative requester with `spec.subject`; the token side never carries a prefix.
+  a declarative requester with `spec.subject`; the sandbox and the claim's record always
+  hold the raw id. A token the broker's STS mints carries the raw id as `sub` with one
+  issuer, and `<subject_prefix><id>` once the issuer has a `subject_prefix`
+  ([more than one issuer](#more-than-one-issuer)).
 - Every issuer writes exactly one gate: `required_group` (one group), `required_groups`
   (a list, any one of them admits) or `allow_any_authenticated: true` (no gate, with a
   comment saying why). Both group keys on one issuer, an empty list, a duplicate or a

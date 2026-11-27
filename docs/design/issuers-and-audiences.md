@@ -25,6 +25,15 @@ configuration and its cross-field rules). The guides [Issuers](../guides/issuers
 | `session` | present when a claim from this issuer must delegate a refresh token (ADR-0013); `client_secret_file` for a token endpoint that wants one |
 | `entra` | present for `entra-obo`: the broker's own credential for the exchange (a key file, an OpenBao transit key, or a federated service-account token) |
 | `ca_file` | the CA that signs this issuer's certificate, for an issuer on a private PKI; discovery, the JWKS and token requests then trust exactly it |
+| `subject_prefix` | what the STS puts in front of this issuer's subject id in `sub`, such as `dex:` (1 to 31 of `a-z`, `0-9`, `.`, `_`, `-`, the first a letter or digit, then one `:`). Optional with one issuer: `sub` is then the bare id. With two or more issuers under an `sts`, every issuer needs one and no two may be equal, or the broker does not start (ADR-0071) |
+
+**One person, one `sub`.** A subject id is unique only inside the issuer that gave it: `octocat` at one issuer and
+`octocat` at another are two people. Inside the broker a person is always the pair of issuer and id (the claim's
+owner check compares both). In a token the STS mints, a resource server usually reads `sub` alone, so with several
+issuers `sub` is `<subject_prefix><id>` (`dex:octocat`, `google:octocat@example.com`) and `upstream_iss` still carries
+the issuer's URL. The prefix of a `sub` is everything up to and including the first `:`. `SubjectPrefixes`
+(`mediatore-sts/src/lib.rs`) checks the set at start and again when the STS is built, and the STS refuses to mint for
+an issuer without a prefix once any issuer has one.
 
 **Validating a bearer** (`POST /v1/claims`): the issuer is known, the audience is mediatore's client, the signature
 verifies through the issuer's JWKS (cached for five minutes), the token is not expired, the subject claim is present,
@@ -49,7 +58,7 @@ from, and `inject` says where it is placed:
 
 | `via` | The credential is | Defined in |
 | --- | --- | --- |
-| `sts` | a token mediatore mints, an RFC 8693 token with the person as `sub` and the claim identity in `act` | ADR-0003, `mediatore-sts` |
+| `sts` | a token mediatore mints, an RFC 8693 token with the person as `sub` (qualified by the issuer's `subject_prefix` when one is set, ADR-0071) and the claim identity in `act` | ADR-0003, `mediatore-sts` |
 | `entra-obo` | an Entra token for the audience's resource, from the claim's Entra session | ADR-0016 |
 | `secret` | an operator-held credential read from a mounted file at start (ADR-0032); not a person's | ADR-0032 |
 | `delegated` | the **person's own** credential, delegated with the claim and sealed per audience | ADR-0035, ADR-0041 |

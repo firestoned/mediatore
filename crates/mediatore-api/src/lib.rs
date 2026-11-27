@@ -1114,14 +1114,14 @@ fn refuse_unresolved_policy(
     let ambiguous = matches!(resolution, Resolution::Ambiguous);
     match pe.mode {
         EgressMode::Enforce => {
-            tracing::warn!(subject = %validated.subject.id, %namespace, %policy, %sources, %held_outside, ambiguous, "claim refused: the policy named does not resolve in the namespace's policy sources (ADR-0054)");
+            tracing::warn!(subject = %validated.subject.id, issuer = %validated.subject.issuer, %namespace, %policy, %sources, %held_outside, ambiguous, "claim refused: the policy named does not resolve in the namespace's policy sources (ADR-0054)");
             Err(ApiError::bad_request(
                 POLICY_NOT_RESOLVED,
                 not_resolved(policy, namespace),
             ))
         }
         EgressMode::Shadow => {
-            tracing::info!(subject = %validated.subject.id, %namespace, %policy, %sources, %held_outside, ambiguous, "policy.egress is shadow: enforce would refuse this claim, the policy named does not resolve in the namespace's policy sources (ADR-0054)");
+            tracing::info!(subject = %validated.subject.id, issuer = %validated.subject.issuer, %namespace, %policy, %sources, %held_outside, ambiguous, "policy.egress is shadow: enforce would refuse this claim, the policy named does not resolve in the namespace's policy sources (ADR-0054)");
             Ok(())
         }
     }
@@ -1337,7 +1337,7 @@ async fn session_for(
         .exchange(&validated.issuer, bearer_token, &resource)
         .await
         .map_err(|e| exchange_error(validated, &resource, &e))?;
-    tracing::info!(subject = %validated.subject.id, %resource, "session obtained on behalf of the caller");
+    tracing::info!(subject = %validated.subject.id, issuer = %validated.subject.issuer, %resource, "session obtained on behalf of the caller");
     Ok(Some(refresh))
 }
 
@@ -2979,7 +2979,7 @@ async fn store_refreshed(
 fn exchange_error(validated: &Validated, resource: &str, e: &IdpError) -> ApiError {
     match e {
         IdpError::SessionRevoked(code) => {
-            tracing::warn!(subject = %validated.subject.id, %resource, %code, "on-behalf-of exchange refused");
+            tracing::warn!(subject = %validated.subject.id, issuer = %validated.subject.issuer, %resource, %code, "on-behalf-of exchange refused");
             ApiError::new(
                 StatusCode::FORBIDDEN,
                 "session_refused",
@@ -2989,7 +2989,7 @@ fn exchange_error(validated: &Validated, resource: &str, e: &IdpError) -> ApiErr
             )
         }
         other => {
-            tracing::warn!(subject = %validated.subject.id, %resource, error = %other, "on-behalf-of exchange unavailable");
+            tracing::warn!(subject = %validated.subject.id, issuer = %validated.subject.issuer, %resource, error = %other, "on-behalf-of exchange unavailable");
             ApiError::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "upstream_unavailable",
@@ -3814,6 +3814,7 @@ mod tests {
             ca_file: None,
             entra: None,
             groups_claim: None,
+            subject_prefix: None,
         }
     }
 
@@ -5798,6 +5799,7 @@ mod tests {
             ca_file: None,
             entra: None,
             groups_claim: None,
+            subject_prefix: None,
         }]);
         st.namespaces = namespaces;
         st.dev_mode = dev_mode;
@@ -6143,6 +6145,7 @@ mod tests {
                 ca_file: None,
                 entra: None,
                 groups_claim: None,
+                subject_prefix: None,
             }]);
         }
         let mut body = request(Some("team-a"));
@@ -6246,6 +6249,7 @@ mod tests {
                 ca_file: None,
                 entra: None,
                 groups_claim: None,
+                subject_prefix: None,
             }]);
         }
         let mut body = request(None);

@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
-use mediatore_api::{AppState, Limiter};
+use mediatore_api::{AppState, Limiter, Namespaces};
 use mediatore_claims::Reconciler;
 use mediatore_claims::audience::AudienceReflector;
 use mediatore_claims::credential::{CredentialCache, CredentialReader, Readers};
@@ -131,9 +131,6 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
     };
     let client = kube_client(&cfg).await?;
     let spire = proven_entries(&cfg, naming.clone(), client.as_ref()).await?;
-    if cfg.dev_mode {
-        tracing::warn!("dev_mode: peer identity from header, in-memory entries, no mTLS");
-    }
     let sealer = sealer(&cfg).await?;
     let store = store(&cfg, client.as_ref(), sealer.clone())?;
     let sandboxes = sandbox_front(&cfg, client.as_ref())?;
@@ -719,8 +716,8 @@ async fn validator(cfg: &Config) -> anyhow::Result<Validator> {
 /// The refresh-material sealer (ADR-0012 decision 3): the local key file, or `OpenBao`
 /// transit (ADR-0015). Either is read and probed now, so a bad Secret, role, policy or
 /// key fails the start, not the first claim. `Config::parse` guarantees exactly one is set.
-/// The STS when one is configured (ADR-0003): no token outlives the longest `max_ttl`, and
-/// each audience is held to its own.
+/// The STS when one is configured (ADR-0003): no token outlives the longest `max_ttl`,
+/// each audience is held to its own, and `sub` is qualified by issuer (ADR-0071).
 fn sts(cfg: &Config) -> anyhow::Result<Option<Sts>> {
     let Some(s) = &cfg.sts else {
         return Ok(None);
@@ -733,6 +730,9 @@ fn sts(cfg: &Config) -> anyhow::Result<Option<Sts>> {
         &pem,
         jiff::SignedDuration::from_secs(max),
     )?;
+    // ADR-0071: `sub` carries each issuer's `subject_prefix`. The set `Config::parse` accepted
+    // is checked again here, so an STS is never built over issuers that could share a `sub`.
+    let sts = sts.with_subject_prefixes(cfg.subject_prefixes()?);
     Ok(Some(cfg.audiences.iter().fold(sts, |sts, a| {
         sts.with_audience_max_ttl(&a.name, jiff::SignedDuration::from_secs(a.max_ttl))
     })))
@@ -762,7 +762,8 @@ async fn sealer(cfg: &Config) -> anyhow::Result<Option<Arc<dyn Sealer>>> {
 }
 
 /// The Kubernetes client outside `dev_mode`: the cluster `spire.entries.kubeconfig` names,
-/// in-cluster when unset. `None` under `dev_mode`, which needs no cluster.
+/// in-cluster when unset. `None` under `dev_mode`, which needs no cluster. Its default
+/// namespace is the broker's home, checked here ([`check_home_namespace`]).
 async fn kube_client(cfg: &Config) -> anyhow::Result<Option<kube::Client>> {
     let Some(spire) = (!cfg.dev_mode).then_some(cfg.spire.as_ref()).flatten() else {
         return Ok(None);
@@ -775,6 +776,8 @@ async fn kube_client(cfg: &Config) -> anyhow::Result<Option<kube::Client>> {
         }
         None => kube::Client::try_default().await?,
     };
+    // Before anything is read or served: the home is the pod's own namespace (ADR-0056).
+    check_home_namespace(client.default_namespace(), &cfg.namespaces())?;
     Ok(Some(client))
 }
 
@@ -814,9 +817,53 @@ async fn proven_entries(
     naming: Naming,
     client: Option<&kube::Client>,
 ) -> anyhow::Result<Arc<dyn EntryManager>> {
-    let spire = entry_manager(cfg, naming, client);
+    // Behind the gate: a later self-check that fails (the watcher repeats it at each resync)
+    // stops this manager declaring, for the watcher and the API alike, until one passes.
+    let spire: Arc<dyn EntryManager> = Arc::new(mediatore_spire::Gated::new(entry_manager(
+        cfg, naming, client,
+    )));
     prove_entries_admission(spire.as_ref()).await?;
+    if cfg.dev_mode {
+        tracing::warn!("dev_mode: peer identity from header, in-memory entries, no mTLS");
+    }
     Ok(spire)
+}
+
+/// The broker's home namespace is the pod's own, never configuration (ADR-0056 decision 6):
+/// the store's Secrets, `SandboxNode`s and `PolicyFloor`s and the watcher's Lease are read
+/// and written there. Outside `dev_mode`, two things are checked before anything is served.
+/// `default` is refused: it is what a client outside a pod falls back to when its
+/// kubeconfig names no namespace, and a broker that kept its keys' neighbours there would
+/// be reading Secrets its `Role` was never meant for. A claimable namespace equal to the
+/// home is warned about, one line each, and not refused (open question 6): sandboxes there
+/// put tenants' objects back beside the broker's keys.
+///
+/// # Errors
+/// When the home namespace is `default`.
+fn check_home_namespace(home: &str, claimable: &Namespaces) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        home != "default",
+        "the broker does not start: its home namespace is `default` (ADR-0056 decision 6). The home is the namespace of the broker's own ServiceAccount, where the session Secrets, the store's resources and the watcher's Lease live; `default` is what a client outside a pod falls back to. Run the broker in its own namespace (deploy/base: mediatore-system), or, outside a cluster, name that namespace in the context of the kubeconfig `spire.entries.kubeconfig` points at"
+    );
+    for namespace in claimable_at_home(home, claimable) {
+        tracing::warn!(
+            %namespace,
+            "a claimable namespace is the broker's home: sandboxes there put tenants' objects beside the broker's keys and session Secrets; move the pool and its sandboxes to a namespace of their own (ADR-0056 decision 6)"
+        );
+    }
+    Ok(())
+}
+
+/// The namespaces sandboxes may be claimed in (`sandboxes.namespace`, or the keys of
+/// `sandboxes.namespaces`) that are the broker's home.
+fn claimable_at_home(home: &str, claimable: &Namespaces) -> Vec<String> {
+    match claimable {
+        Namespaces::Single(namespace) => vec![namespace.clone()],
+        Namespaces::Map(map) => map.keys().cloned().collect(),
+    }
+    .into_iter()
+    .filter(|namespace| namespace == home)
+    .collect()
 }
 
 /// Fail closed on the manager's self-check: an admitted forbidden entry, a refusal that is
@@ -916,7 +963,7 @@ mod tests {
             "mediatore",
             "guest",
             "--mediatore-url",
-            "https://mediatore-sandbox.banlieue-system.svc",
+            "https://mediatore-sandbox.mediatore-system.svc",
             "--dev-ek-hash",
             "ec00000000000000000000000000000000000000000000000000000000000007",
             "--dev-dmi-uuid",
@@ -935,7 +982,7 @@ mod tests {
             "--audience",
             "e2e",
             "--mediatore-url",
-            "https://mediatore-sandbox.banlieue-system.svc",
+            "https://mediatore-sandbox.mediatore-system.svc",
         ]);
         assert!(
             matches!(token, Ok(Cmd::Token(ref a)) if a.audience == "e2e"),
@@ -1269,6 +1316,48 @@ mod tests {
         }
     }
 
+    /// ADR-0056 decision 6: `default` is where a client with no namespace of its own lands,
+    /// never a home; the broker's own namespace, and any other, starts.
+    #[test]
+    fn a_home_namespace_of_default_refuses_to_start() {
+        let elsewhere = Namespaces::Single("sandboxes".into());
+        let err = check_home_namespace("default", &elsewhere).unwrap_err();
+        let said = format!("{err:#}");
+        assert!(said.contains("the broker does not start"), "{said}");
+        assert!(said.contains("home namespace is `default`"), "{said}");
+        assert!(said.contains("mediatore-system"), "{said}");
+        check_home_namespace("mediatore-system", &elsewhere).unwrap();
+        check_home_namespace("banlieue-system", &elsewhere).unwrap();
+    }
+
+    /// ADR-0056 decision 6 and open question 6: sandboxes claimed in the broker's home are
+    /// warned about, in both configuration forms, and do not stop the start.
+    #[test]
+    fn a_claimable_namespace_equal_to_home_is_warned() {
+        let home = "mediatore-system";
+        let single = Namespaces::Single(home.into());
+        assert_eq!(claimable_at_home(home, &single), vec![home.to_owned()]);
+        check_home_namespace(home, &single).expect("warned, not refused");
+
+        let map = Namespaces::Map(
+            [
+                ("team-a".to_owned(), vec!["a".to_owned()]),
+                (home.to_owned(), vec!["platform".to_owned()]),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        assert_eq!(claimable_at_home(home, &map), vec![home.to_owned()]);
+        check_home_namespace(home, &map).expect("warned, not refused");
+
+        for apart in [
+            Namespaces::Single("sandboxes".into()),
+            Namespaces::Map([("team-a".to_owned(), vec![])].into_iter().collect()),
+        ] {
+            assert_eq!(claimable_at_home(home, &apart), Vec::<String>::new());
+        }
+    }
+
     #[tokio::test]
     async fn the_start_goes_on_when_admission_refuses_the_forbidden_entry() {
         let entries = ToldEntries::answering(Ok(()));
@@ -1328,6 +1417,10 @@ mod tests {
                     message: "schema".into(),
                 },
                 "not by the entries admission policy",
+            ),
+            (
+                SelfCheckError::Parameter("no params found".into()),
+                "cannot be evaluated",
             ),
             (SelfCheckError::Unsupported, "cannot prove"),
         ] {

@@ -174,6 +174,7 @@ fn state(idp: &FakeIdp, upstream: &TlsUpstream, keyed_upstream: &TlsUpstream) ->
             ca_file: None,
             entra: None,
             groups_claim: None,
+            subject_prefix: None,
         }]),
         sts: Some(sts),
         audiences: vec![AUDIENCE.into(), PUBLIC.into(), KEYED.into()],

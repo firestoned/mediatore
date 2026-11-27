@@ -17,7 +17,7 @@ Every value in the example is a placeholder.
 | `trust_domain` | the SPIFFE trust domain of the deployment | the identity scheme, the mTLS verifiers ([Identity and mTLS](identity-and-mtls.md)) |
 | `listen` | `user`, `sandbox`: the two listener addresses | [Broker API](broker-api.md) |
 | `spire` | `workload_api_socket`; `entries.class_name` (the SPIRE Controller Manager's class) | [Identity and mTLS](identity-and-mtls.md) |
-| `issuers[]` | `url`, `backend`, `client_id`, `subject_claim`, `required_group`, `required_groups`, `allow_any_authenticated`, `groups_claim`, `session`, `entra`, `ca_file` | [Issuers and audiences](issuers-and-audiences.md) |
+| `issuers[]` | `url`, `backend`, `client_id`, `subject_claim`, `required_group`, `required_groups`, `allow_any_authenticated`, `groups_claim`, `session`, `entra`, `ca_file`, `subject_prefix` | [Issuers and audiences](issuers-and-audiences.md) |
 | `audiences[]` | `name`, `via`, `max_ttl`, `egress`, `rules`, `ca_file`, `secret_file`, `secret_header`, `secret_extra_headers`, `header`, `extra_headers`, `refresh`, `inject`, `credential` | [Issuers and audiences](issuers-and-audiences.md) |
 | `sts` | `issuer`, `kid`, `signing_key_file` | the token service |
 | `registries[]` | `host`, `username`, `password_file`, `reach` (`segment` or `relay`) | the pull ([The guest](guest.md)) |
