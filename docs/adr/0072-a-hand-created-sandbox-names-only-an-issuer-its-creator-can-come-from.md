@@ -3,7 +3,7 @@
 
 # ADR-0072: A hand-created sandbox names only an issuer its creator can come from
 
-**Status:** Proposed · **Date:** 2026-11-27
+**Status:** Accepted and implemented 2026-11-27 (built on each open question's recommendation; what was built differently from the text is under *As built*) · **Date:** 2026-11-27
 
 Amends [ADR-0008](0008-agentsandbox-crd-owned-by-mediatore.md) decision 5 (what admission pins of
 `spec.subject`, and what the reconciler refuses of it) and
@@ -316,6 +316,42 @@ Tests are written before the code they hold.
   listed broker naming the second configured issuer is admitted by the policy and `Failed` by the
   reconciler with the reason of decision 4. The existing cases stay green.
 - This is not the TPM attestation path: no file `rules/testing.md` lists is touched.
+
+## As built (2026-11-27)
+
+Every decision is built, with the tests named above, and the threat model's pass of the same day
+cites each control. Where the build differs from the text, or says more than it:
+
+- **The policy has two more variables than decision 1 names.** `issuerListed` (no line, or a pair
+  naming the sandbox's issuer) and `frontDoor` (the annotation, as a CEL optional) beside
+  `issuerLines`, `issuerPrefixes`, `issuerPrefixesAreSound` and `expectedPrefix`. `issuerPrefixes`
+  now keeps every non-blank line as its words, so a line that is not a pair is seen by the
+  soundness check instead of being dropped. Validation 1's message is chosen by a conditional: the
+  unsound list first, then the unlisted issuer (the sentence of decision 1), then the id sentence
+  as before.
+- **The reconciler's rule is its own function,** `refuse_declarative_issuer`, called in
+  `refuse_before_the_claim` right after `Watcher::refuse` and under the same "only before a claim"
+  guard, since `refuse` reads the spec alone and the rule needs the annotation. The reason is the
+  sentence of decision 4 (`issuer_not_declarative`).
+- **The self-check takes the home namespace** (`KubeSandboxes::self_check(namespace)`, called from
+  `prove_front_door` in `main.rs` with the client's default namespace), and its errors are
+  `FrontDoorCheckError`: `Admitted`, `Parameter` (the policy bound but unable to evaluate),
+  `Refused` (anything that is not validation 3's message, an older policy included) and
+  `Unreachable`. The probe is named `mediatore-selfcheck-` and twelve hex digits and names the
+  issuer `https://selfcheck.invalid`; it is schema-valid so the CRD's own validation cannot be what
+  refuses it. It runs at start only; the entries self-check's repetition at resync is not copied.
+- **The start line has a case decision 6 does not list:** with no issuer configured it says, at
+  `info`, that a hand-created sandbox is refused whatever issuer it names.
+- **The resolved set lives on `Config`** (`Config::declarative_issuers`, and
+  `Config::front_door_rule_in_force` for decision 5's "in force"); the check of written values is in
+  `SandboxesSection::validate`, which `Config::parse` calls with the configured issuer URLs.
+- **The fake needed no change.** `MemorySandboxes` already kept the annotations it was given and
+  added none.
+- **Open question 3 is not built:** the broker does not read the ConfigMap; the `warn` stands.
+  **Open question 5 is not built** and is recorded as the *Revisit when* of R-70.
+- **Live:** `make kind-e2e-sandbox` sets `issuerPrefixes` on the running parameter and proves each
+  case of *What must be proven* through the API server; the kind broker declares
+  `https://issuer.example.com`, the issuer every tier's `kubectl` fixtures name.
 
 ## Open questions
 

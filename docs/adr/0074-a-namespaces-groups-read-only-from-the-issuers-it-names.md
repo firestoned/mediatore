@@ -3,7 +3,7 @@
 
 # ADR-0074: A namespace's groups are read only from the issuers it names
 
-**Status:** Proposed · **Date:** 2026-11-27
+**Status:** Accepted and implemented 2026-11-27 (built with ADR-0072 and ADR-0073; what was built differently from the text is under *As built*) · **Date:** 2026-11-27
 
 Amends [ADR-0046](0046-who-may-claim-a-list-of-groups-and-a-namespace-to-groups-mapping.md)
 decisions 3 (an entry of `sandboxes.namespaces` gains `issuers`), 14 (what is refused at start)
@@ -217,6 +217,32 @@ Tests are written before the code they hold.
   is admitted in the first and refused in the second. The other tiers keep the single form and
   prove that it is untouched.
 - This is not the TPM attestation path.
+
+## As built (2026-11-27)
+
+Built as written, with the tests named above. Where the build says more than the text:
+
+- **The map's value is `NamespaceGrant`** (`groups`, `issuers`) in `crates/mediatore-api`, always
+  resolved: `SandboxesSection::resolve(issuers)` fills an entry written without `issuers` with the
+  configured issuers, which the validation allows only when there is one. A broker with no issuer
+  at all resolves an empty list and qualifies nobody.
+- **The start checks are one function,** `validate_namespace_issuers`, called from
+  `SandboxesSection::validate(issuers)`, which `Config::parse` now calls with the configured issuer
+  URLs. The namespace line logs `issuers=<urls>`, with ` (the only issuer)` when the entry wrote
+  none.
+- **The fixtures.** The unit and e2e maps name a placeholder issuer that the harness replaces with
+  the fake issuer's URL once it listens (`FIXTURE_ISSUER` in `crates/mediatore-api/src/lib.rs` and
+  `crates/mediatore/tests/e2e_dev.rs`); two configuration tests whose maps sit under three issuers
+  (`startup_logs_the_namespace_names_and_no_token`,
+  `startup_names_each_unscoped_audience_when_the_namespace_map_is_set`) gained an `issuers` list,
+  as decision 2 requires.
+- **Live.** `make kind-e2e-dex`, on a full run, restarts the broker on a map of two entries,
+  `mediatore-e2e-sandbox` reading `sandbox-users` from the Dex issuer and `mediatore-e2e-other`
+  reading it from the placeholder issuer; the real CLI (`dex-driver --namespace`) is admitted in
+  the first and refused in the second (the proof of the refusal is the broker's `namespace decision`
+  line with `decision="denied"`; the CLI reports only that the create failed), and the configuration
+  is put back. The migration
+  rehearsal's halves skip it.
 
 ## Open questions
 

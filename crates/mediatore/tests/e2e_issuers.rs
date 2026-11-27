@@ -10,13 +10,15 @@
 //!
 //! Both identify a person by `email`, so the two subject spaces overlap: the same address
 //! at each is two people. ADR-0071: each issuer has a `subject_prefix`, the minted `sub`
-//! carries it, and a broker with two issuers and no prefixes does not start.
+//! carries it, and a broker with two issuers and no prefixes does not start. ADR-0073: the
+//! same prefix qualifies each of the token's `groups`. ADR-0074: a namespace's groups are
+//! read only from the issuers its entry lists.
 
 use std::future::IntoFuture;
 use std::sync::Arc;
 
 use jiff::SignedDuration;
-use mediatore_api::{AppState, Limiter, Namespaces};
+use mediatore_api::{AppState, Limiter, NamespaceGrant, Namespaces};
 use mediatore_client::{Api, LoginOptions, Session};
 use mediatore_entra::{Backend, IssuerConfig, SessionConfig, Validator};
 use mediatore_proto::{
@@ -400,8 +402,8 @@ async fn an_auth0_login_is_by_email_with_groups_under_the_namespaced_claim() {
     assert_eq!(claims["sub"], format!("{AUTH0_PREFIX}hexley@example.com"));
     assert_eq!(
         claims["groups"],
-        serde_json::json!([REQUIRED_GROUP]),
-        "read from the namespaced claim"
+        serde_json::json!([format!("{AUTH0_PREFIX}{REQUIRED_GROUP}")]),
+        "read from the namespaced claim, behind the issuer's prefix (ADR-0073)"
     );
     // Taken out of the group at Auth0: the gate on the fresh token releases the claim.
     h.auth0.set_groups("hexley", &["firestoned:other"]);
@@ -594,6 +596,262 @@ async fn one_issuer_without_a_prefix_mints_the_bare_sub() {
         "one issuer, no prefix: the token of before ADR-0071"
     );
     assert_eq!(claims["upstream_iss"], h.google.issuer);
+}
+
+// ----- ADR-0073 and ADR-0074: one group name at two issuers ---------------------------------------------------------
+
+/// The group name both directories use, for two different sets of people.
+const SHARED_GROUP: &str = "platform-admins";
+const DEX_PREFIX: &str = "dex:";
+const CORP_PREFIX: &str = "corp:";
+
+/// A broker trusting two Dex-shaped session issuers, `dex:` and `corp:`, both of which put
+/// groups in their tokens, serving `namespaces` (with [`FIRST`] and [`SECOND`] standing for
+/// the two issuers' URLs).
+struct TwoDirectories {
+    first: FakeIdp,
+    second: FakeIdp,
+    user_url: String,
+    sandbox_url: String,
+    http: reqwest::Client,
+}
+
+const FIRST: &str = "https://first.placeholder.test";
+const SECOND: &str = "https://second.placeholder.test";
+
+impl TwoDirectories {
+    #[allow(clippy::too_many_lines)] // every AppState field, listed in full
+    async fn start(namespaces: Namespaces) -> Self {
+        let first = FakeIdp::start().await;
+        let second = FakeIdp::start().await;
+        let issuer = |url: &str, prefix: &str| IssuerConfig {
+            url: url.to_owned(),
+            backend: Backend::Sts,
+            client_id: CLIENT_ID.into(),
+            subject_claim: "preferred_username".into(),
+            required_group: None,
+            required_groups: None,
+            allow_any_authenticated: true,
+            session: Some(SessionConfig {
+                client_id: CLIENT_ID.into(),
+                client_secret_file: None,
+            }),
+            ca_file: None,
+            entra: None,
+            groups_claim: None,
+            subject_prefix: Some(prefix.to_owned()),
+        };
+        let issuers = vec![
+            issuer(&first.issuer, DEX_PREFIX),
+            issuer(&second.issuer, CORP_PREFIX),
+        ];
+        let prefixes = SubjectPrefixes::new(
+            issuers
+                .iter()
+                .map(|i| (i.url.as_str(), i.subject_prefix.as_deref())),
+        )
+        .expect("subject prefixes");
+        let namespaces = match namespaces {
+            Namespaces::Map(map) => Namespaces::Map(
+                map.into_iter()
+                    .map(|(ns, mut grant)| {
+                        for i in &mut grant.issuers {
+                            if i == FIRST {
+                                first.issuer.clone_into(i);
+                            } else if i == SECOND {
+                                second.issuer.clone_into(i);
+                            }
+                        }
+                        (ns, grant)
+                    })
+                    .collect(),
+            ),
+            single @ Namespaces::Single(_) => single,
+        };
+        let sts = Sts::new(
+            "https://mediatore.test",
+            "e2e-1",
+            mediatore_testkit::entra::fresh_p256_key_pem().as_bytes(),
+            SignedDuration::from_mins(15),
+        )
+        .expect("sts")
+        .with_subject_prefixes(prefixes);
+        let state = Arc::new(AppState {
+            inject: std::collections::BTreeMap::new(),
+            inject_port: None,
+            audience_catalog: None,
+            logs: None,
+            log_limiter: Limiter::per_second(2),
+            log_wakes: mediatore_api::LogWakes::default(),
+            accept_plain_gateway_identity: false,
+            scopes: std::collections::BTreeMap::new(),
+            store: MemoryStore::shared(),
+            spire: Arc::new(MemoryEntries::default()),
+            naming: Naming {
+                trust_domain: TRUST_DOMAIN.into(),
+            },
+            validator: Validator::new(issuers),
+            sts: Some(sts),
+            audiences: vec![AUDIENCE.into()],
+            obo_audiences: vec![],
+            egress: std::collections::BTreeMap::new(),
+            rules: std::collections::BTreeMap::new(),
+            cas: std::collections::BTreeMap::new(),
+            no_credential: std::collections::BTreeSet::new(),
+            secrets: std::collections::BTreeMap::new(),
+            delegated: std::collections::BTreeMap::new(),
+            registries: std::collections::BTreeMap::new(),
+            registry_audiences: None,
+            policy_egress: None,
+            sandboxes: None,
+            namespaces,
+            max_ttl_seconds: mediatore_proto::DEFAULT_MAX_TTL_SECONDS,
+            sealer: Some(Arc::new(LocalKeySealer::new([6u8; 32]))),
+            limiter: Limiter::new(60),
+            dev_mode: true,
+            gateways: vec![],
+        });
+        let user = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let sandbox = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let user_url = format!("http://{}", user.local_addr().unwrap());
+        let sandbox_url = format!("http://{}", sandbox.local_addr().unwrap());
+        tokio::spawn(axum::serve(user, mediatore_api::user_router(state.clone())).into_future());
+        tokio::spawn(axum::serve(sandbox, mediatore_api::sandbox_router(state)).into_future());
+        mediatore_proto::tls::ensure_provider();
+        let h = Self {
+            first,
+            second,
+            user_url,
+            sandbox_url,
+            http: reqwest::Client::new(),
+        };
+        let resp = h
+            .http
+            .post(format!("{}/v1/nodes", h.sandbox_url))
+            .header(
+                PEER_HEADER,
+                format!("spiffe://{TRUST_DOMAIN}/banlieue/node/{EK_HASH}"),
+            )
+            .json(&NodeRegistration {
+                ek_hash: EK_HASH.into(),
+                dmi_uuid: uuid::Uuid::new_v4(),
+                hostname: "pool-a-7".into(),
+                provider: None,
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        h
+    }
+
+    /// A login at `idp` holding [`SHARED_GROUP`], delegated with a claim in `namespace`.
+    async fn claim(
+        &self,
+        idp: &FakeIdp,
+        login: &str,
+        namespace: Option<&str>,
+    ) -> reqwest::Response {
+        idp.set_groups(login, &[SHARED_GROUP]);
+        let (id_token, refresh_token) = idp.session(login, CLIENT_ID);
+        self.http
+            .post(format!("{}/v1/claims", self.user_url))
+            .bearer_auth(id_token)
+            .json(&ClaimRequest {
+                namespace: namespace.map(ToOwned::to_owned),
+                pool_ref: Some("pool-a".into()),
+                pool_selector: None,
+                selection: None,
+                ttl_seconds: 3600,
+                audiences: vec![AUDIENCE.into()],
+                workload: Workload {
+                    image: "registry.internal:5000/sandbox:latest".into(),
+                    args: vec![],
+                    restart: mediatore_proto::RestartPolicy::Always,
+                    logs: false,
+                },
+                refresh_token: Some(Secret(refresh_token)),
+                policy_ref: None,
+                delegations: vec![],
+            })
+            .send()
+            .await
+            .unwrap()
+    }
+
+    /// The claims of a token the broker mints for `claim`.
+    async fn minted(&self, claim: &ClaimResponse) -> serde_json::Value {
+        let resp = self
+            .http
+            .post(format!("{}/v1/token", self.sandbox_url))
+            .header(
+                PEER_HEADER,
+                format!(
+                    "spiffe://{TRUST_DOMAIN}/banlieue/claim/{}",
+                    claim.uid.unwrap()
+                ),
+            )
+            .json(&mediatore_proto::TokenRequest {
+                audience: AUDIENCE.into(),
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let minted: TokenResponse = resp.json().await.unwrap();
+        payload(&minted.access_token)
+    }
+}
+
+#[tokio::test]
+async fn the_same_group_at_two_issuers_reaches_the_resource_server_as_two() {
+    let h = TwoDirectories::start(Namespaces::Single("sandboxes".into())).await;
+    let mut tokens = vec![];
+    for idp in [&h.first, &h.second] {
+        let resp = h.claim(idp, "octocat", None).await;
+        assert_eq!(resp.status(), 201);
+        let claim: ClaimResponse = resp.json().await.unwrap();
+        tokens.push(h.minted(&claim).await);
+    }
+    let (at_first, at_second) = (&tokens[0], &tokens[1]);
+    assert_eq!(at_first["sub"], format!("{DEX_PREFIX}octocat"));
+    assert_eq!(at_second["sub"], format!("{CORP_PREFIX}octocat"));
+    assert_eq!(
+        at_first["groups"],
+        serde_json::json!([format!("{DEX_PREFIX}{SHARED_GROUP}")])
+    );
+    assert_eq!(
+        at_second["groups"],
+        serde_json::json!([format!("{CORP_PREFIX}{SHARED_GROUP}")])
+    );
+    assert_ne!(
+        at_first["groups"], at_second["groups"],
+        "a resource server that maps groups sees two groups"
+    );
+}
+
+#[tokio::test]
+async fn the_same_group_name_at_two_issuers_reaches_only_the_listed_issuers_namespace() {
+    let entry = |issuer: &str| NamespaceGrant {
+        groups: vec![SHARED_GROUP.to_owned()],
+        issuers: vec![issuer.to_owned()],
+    };
+    let h = TwoDirectories::start(Namespaces::Map(std::collections::BTreeMap::from([
+        ("team-dex".to_owned(), entry(FIRST)),
+        ("team-corp".to_owned(), entry(SECOND)),
+    ])))
+    .await;
+    for (idp, own, other) in [
+        (&h.first, "team-dex", "team-corp"),
+        (&h.second, "team-corp", "team-dex"),
+    ] {
+        let resp = h.claim(idp, "octocat", Some(own)).await;
+        assert_eq!(resp.status(), 201, "{own}: {}", resp.text().await.unwrap());
+        let resp = h.claim(idp, "octocat", Some(other)).await;
+        assert_eq!(resp.status(), 403, "{other} lists the other issuer");
+        let body: ErrorBody = resp.json().await.unwrap();
+        assert_eq!(body.error, "forbidden");
+    }
 }
 
 /// `mediatore serve` on `config`: its exit status and what it wrote to stderr. The run is

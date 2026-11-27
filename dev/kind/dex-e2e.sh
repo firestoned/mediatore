@@ -12,7 +12,11 @@
 # session ends upstream: the user is taken out of the gated group in the directory, and
 # the refresh token is deleted at Dex; each one makes the next issue a 403 session_revoked
 # and releases the claim at once. No banlieue controller runs: the claim's status is
-# patched by hand, as in the sandbox tier.
+# patched by hand, as in the sandbox tier. ADR-0073: the minted token's groups carry the
+# Dex issuer's `subject_prefix`. ADR-0074 (a full run only): the broker restarted on a
+# namespace map of two entries, one reading the group from Dex and one from the other
+# issuer; the real CLI's create is admitted in the first and refused in the second, and
+# the configuration is put back.
 #
 #   dex-e2e.sh <admin kubeconfig> <trust domain> <ek pem> <ek hash file>
 set -euo pipefail
@@ -115,9 +119,18 @@ wait_for() { # <seconds> <description> <command...>
 log_has() { broker_logs | grep -F "$1" | grep -qF "${2:-}"; }
 pod_done() { [ "$(pod_phase "$1")" = "Succeeded" ] || [ "$(pod_phase "$1")" = "Failed" ]; }
 
-# The user's side, in a pod: the real CLI driven by dex-driver. Prints the created
-# sandbox's JSON.
-claim_via_cli() { # <pod name>
+# The user's side, in a pod: the real CLI driven by dex-driver, claiming in [namespace]
+# when given. cli_pod starts it; claim_via_cli waits for it to succeed and prints the
+# created sandbox's JSON.
+claim_via_cli() { # <pod name> [namespace]
+  cli_pod "$@"
+  wait_for "$TIMEOUT" "pod $1 finished" pod_done "$1"
+  [ "$(pod_phase "$1")" = "Succeeded" ] || fail "pod $1 failed: $(pod_logs "$1" | tail -15)"
+  pod_logs "$1" | sed -n 's/^sandbox: //p' | tail -1
+}
+cli_pod() { # <pod name> [namespace]
+  local namespace_arg=""
+  [ -z "${2:-}" ] || namespace_arg="        - --namespace=$2"
   "${K[@]}" apply -f - >/dev/null <<YAML
 apiVersion: v1
 kind: Pod
@@ -145,6 +158,7 @@ spec:
         - --audience=$AUDIENCE
         - --image=registry.internal:5000/sandbox:e2e
         - --arg=sh
+$namespace_arg
       env:
         # The tier's user API has no TLS in front of it: the CLI sends a login there only when told to.
         - { name: MEDIATORE_ALLOW_PLAIN_HTTP, value: "true" }
@@ -161,9 +175,6 @@ spec:
     - name: dex-ca
       configMap: { name: mediatore-dex-ca }
 YAML
-  wait_for "$TIMEOUT" "pod $1 finished" pod_done "$1"
-  [ "$(pod_phase "$1")" = "Succeeded" ] || fail "pod $1 failed: $(pod_logs "$1" | tail -15)"
-  pod_logs "$1" | sed -n 's/^sandbox: //p' | tail -1
 }
 
 # A workload pod with the claim SVID asking for a token, once: the Workload API blocks
@@ -335,6 +346,10 @@ wait_for "$TIMEOUT" "a token in the token-1 pod log" has_token token-1
 CLAIMS=$(payload "$(token_line token-1)")
 echo "$CLAIMS" | jq -e --arg uid "$CLAIM_UID" --arg aud "$AUDIENCE" '.sub == "dex:octocat" and .aud == $aud and .claim_uid == $uid and .iss == "https://mediatore.sandbox.test"' >/dev/null \
   || fail "unexpected token claims: $CLAIMS"
+# ADR-0073: each group behind the issuer's subject_prefix, as sub is.
+echo "$CLAIMS" | jq -e '(.groups | length) > 0 and all(.groups[]; startswith("dex:")) and any(.groups[]; . == "dex:sandbox-users")' >/dev/null \
+  || fail "the token's groups are not qualified by the Dex issuer's prefix: $(echo "$CLAIMS" | jq -c .groups)"
+echo "groups $(echo "$CLAIMS" | jq -c .groups), each behind dex: (ADR-0073)"
 AFTER=$(dex_tokens | jq -r '.[0].lastUsed')
 [ "$AFTER" != "$BEFORE" ] || fail "Dex's refresh token was not used before the issue (lastUsed $BEFORE)"
 log_has "upstream session refused" && fail "a refusal was logged on a good session"
@@ -392,3 +407,59 @@ wait_for "$TIMEOUT" "claim entry for $CLAIM_UID gone" entry_gone
 echo "403 session_revoked; the claim released: entry retracted"
 
 say "PASS: ADR-0013 holds against a real Dex (the CLI's PKCE login, the delegated session, a refresh before every issue, revocation by group and by token)"
+
+if [ "$PHASE" = all ]; then
+say "ADR-0074: a namespace map whose entries name their issuers; the group Dex gives octocat admits it to the namespace listing Dex and not to the one listing the other issuer"
+OTHER_NS=mediatore-e2e-other
+PLACEHOLDER=https://issuer.example.com
+ORIGINAL_CONFIG=$(mktemp)
+"${K[@]}" -n "$BROKER_NS" get configmap mediatore-config -o jsonpath='{.data.mediatore\.yaml}' > "$ORIGINAL_CONFIG"
+broker_config() { # <file>: the broker's configuration, applied and the broker restarted on it
+  "${K[@]}" -n "$BROKER_NS" create configmap mediatore-config --from-file=mediatore.yaml="$1" \
+    --dry-run=client -o yaml | "${K[@]}" apply -f - >/dev/null
+  "${K[@]}" -n "$BROKER_NS" rollout restart deploy/mediatore >/dev/null
+  "${K[@]}" -n "$BROKER_NS" rollout status deploy/mediatore --timeout=120s >/dev/null
+  BROKER_POD=$(broker_pod)
+  [ -n "$BROKER_POD" ] || fail "no Running broker pod in $BROKER_NS"
+  wait_for "$TIMEOUT" "'claim watcher running' in the broker log" log_has "claim watcher running"
+}
+restore_config() { broker_config "$ORIGINAL_CONFIG"; rm -f "$ORIGINAL_CONFIG"; }
+trap 'restore_config >/dev/null 2>&1 || true; cleanup' EXIT
+MAP_CONFIG=$(mktemp)
+{
+  # The configuration as deployed, its `sandboxes` section replaced by a map.
+  awk '/^sandboxes:/ { skip = 1; next } skip && /^[^ #]/ { skip = 0 } !skip' "$ORIGINAL_CONFIG"
+  cat <<YAML
+sandboxes:
+  declarative_issuers: [$PLACEHOLDER]
+  namespaces:
+    $NS: { groups: [sandbox-users], issuers: ["$ISSUER"] }
+    $OTHER_NS: { groups: [sandbox-users], issuers: ["$PLACEHOLDER"] }
+YAML
+} > "$MAP_CONFIG"
+broker_config "$MAP_CONFIG"
+rm -f "$MAP_CONFIG"
+for ns in "$NS" "$OTHER_NS"; do
+  wait_for "$TIMEOUT" "the namespace groups line for $ns" log_has "namespace groups" "namespace=$ns"
+done
+log_has "namespace groups" "issuers=$ISSUER" || fail "the start did not name $NS's issuer"
+echo "broker ${BROKER_POD#pod/} on a map: $NS reads sandbox-users from Dex, $OTHER_NS from $PLACEHOLDER"
+CREATED=$(claim_via_cli cli-3 "$NS")
+NAME3=$(echo "$CREATED" | jq -r .name)
+[ -n "$NAME3" ] && [ "$NAME3" != null ] || fail "no sandbox name in: $CREATED"
+[ "$(echo "$CREATED" | jq -r .namespace)" = "$NS" ] || fail "cli-3's sandbox is not in $NS: $CREATED"
+echo "admitted in $NS: $NAME3"
+cli_pod cli-4 "$OTHER_NS"
+wait_for "$TIMEOUT" "pod cli-4 finished" pod_done cli-4
+[ "$(pod_phase cli-4)" = "Failed" ] || fail "cli-4 was admitted in $OTHER_NS, whose entry lists another issuer"
+# The broker's own audit line is the proof of the refusal (ADR-0046 decision 13): the CLI
+# reports only that the create failed.
+denied_there() { broker_logs | grep -F "namespace decision" | grep -F "requested=$OTHER_NS" | grep -qF 'decision="denied"'; }
+wait_for "$TIMEOUT" "a denied namespace decision for $OTHER_NS in the broker log" denied_there
+"${K[@]}" -n "$OTHER_NS" get agentsandboxes -o name 2>/dev/null | grep -q . && fail "a sandbox was created in $OTHER_NS"
+echo "refused in $OTHER_NS: $(broker_logs | grep -F "namespace decision" | grep -F "requested=$OTHER_NS" | tail -1 | sed 's/.*INFO //' | cut -c1-200)"
+restore_config
+trap cleanup EXIT
+echo "the broker's configuration restored on ${BROKER_POD#pod/}"
+say "PASS: ADR-0073 and ADR-0074 hold against a real Dex (the minted groups behind dex:, and a namespace's groups read only from the issuer its entry names)"
+fi

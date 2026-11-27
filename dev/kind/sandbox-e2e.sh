@@ -17,7 +17,11 @@
 # strategy as written, while one with a strategy banlieue does not have is refused by the
 # schema. ADR-0049: a sandbox written as `v1alpha1` is governed by the same subject policy,
 # answered with the deprecation warning, read back as `v1beta1`, owns its claim through
-# `v1beta1`, and its spec is frozen through either name. No banlieue controller runs: the claim's status is patched by hand, as in the
+# `v1beta1`, and its spec is frozen through either name. ADR-0072: once the policy's
+# `issuerPrefixes` lists anything, an unlisted issuer is refused and a list that cannot tell
+# its issuers apart admits nothing; `mediatore.io/front-door` is the broker's alone and
+# immutable; a sandbox created by hand naming an issuer outside
+# `sandboxes.declarative_issuers` is Failed by the reconciler. No banlieue controller runs: the claim's status is patched by hand, as in the
 # watcher tier.
 #
 #   sandbox-e2e.sh <admin kubeconfig> <broker SA kubeconfig> <trust domain> <ek pem> <ek hash file>
@@ -129,6 +133,8 @@ roleRef:
 subjects:
   - { kind: User, name: stranger }
   - { kind: User, name: e2e-broker }
+  # A user whose API-server username carries a per-issuer prefix (ADR-0072).
+  - { kind: User, name: "e2e:octocat" }
 ---
 apiVersion: spire.spiffe.io/v1alpha1
 kind: ClusterSPIFFEID
@@ -211,6 +217,98 @@ fi
 echo "$out" | grep -q 'spec is immutable' || fail "the patch was refused, but not by the policy: $out"
 echo "denied: changing the spec afterwards"
 "${K[@]}" -n "$NS" delete agentsandbox sb-self sb-broker --wait=false >/dev/null
+
+say "ADR-0072: the issuer a hand-created sandbox names, and the broker's mark"
+# The broker trusts two issuers and declares one for this path, so the rule is in force and
+# the broker proved the policy guards its mark before it served.
+log_has "self-check passed, ADR-0072" || fail "the broker did not log the front-door self-check"
+echo "the broker's log: $(broker_logs | grep -F 'self-check passed, ADR-0072' | tail -1 | sed 's/.*INFO //' | cut -c1-160)"
+DEX=https://mediatore-dex.mediatore-system.svc:5556
+OTHER=https://other.example.com
+as_issuer() { sed "s#issuer: \"$ISSUER\"#issuer: \"$1\"#"; } # <issuer>: the manifest on stdin names it
+marked() { sed "/^metadata:\$/a\\  annotations: { mediatore.io/front-door: \"${1:-api}\" }"; } # [value]
+subject_param() { # <issuerPrefixes>: the parameter's per-issuer list, as given
+  "${K[@]}" -n "$BROKER_NS" patch configmap mediatore-agentsandbox-subject-policy --type=merge \
+    -p "$(jq -n --arg v "$1" '{data: {issuerPrefixes: $v}}')" >/dev/null
+}
+# The API server reads the parameter from a cache: a decision is retried until the edit is
+# seen. An object admitted on the way there is deleted before the next try.
+until_denied() { # <description> <message fragment> <kubectl args...>; the manifest on stdin
+  local what=$1 frag=$2 m out i; shift 2; m=$(cat)
+  for ((i = 0; i < TIMEOUT; i++)); do
+    if out=$(printf '%s\n' "$m" | "$@" 2>&1); then
+      printf '%s\n' "$m" | "${K[@]}" delete -f - --wait=false >/dev/null 2>&1 || true
+    elif echo "$out" | grep -qF "$frag"; then
+      echo "denied: $what"; return 0
+    fi
+    sleep 1
+  done
+  fail "$what: not denied with '$frag' within ${TIMEOUT}s: $out"
+}
+until_admitted() { # <description> <kubectl args...>; the manifest on stdin
+  local what=$1 m out i; shift; m=$(cat)
+  for ((i = 0; i < TIMEOUT; i++)); do
+    if out=$(printf '%s\n' "$m" | "$@" 2>&1); then echo "admitted: $what"; return 0; fi
+    sleep 1
+  done
+  fail "$what: not admitted within ${TIMEOUT}s: $out"
+}
+trap 'subject_param ""; cleanup' EXIT
+
+# Decision 1: once issuerPrefixes lists anything, an issuer it does not list is refused,
+# with no fallback to usernamePrefix; a listed one is checked under its own prefix.
+subject_param "$ISSUER e2e:"
+manifest sb-unlisted octocat '[]' | as_issuer "$OTHER" \
+  | until_denied "e2e:octocat naming an issuer issuerPrefixes does not list" "is not listed in issuerPrefixes" "${K[@]}" --as=e2e:octocat create -f -
+manifest sb-listed octocat '[]' \
+  | until_admitted "e2e:octocat naming the listed issuer, under its prefix" "${K[@]}" --as=e2e:octocat create -f -
+# Decision 2: a list that cannot tell its issuers apart admits nothing.
+subject_param "$ISSUER e2e:
+$OTHER e2e:x"
+manifest sb-overlap octocat '[]' \
+  | until_denied "e2e:octocat under a list with one prefix the start of another" "cannot tell its issuers apart" "${K[@]}" --as=e2e:octocat create -f -
+subject_param "$ISSUER e2e:
+not-a-pair"
+manifest sb-malformed octocat '[]' \
+  | until_denied "e2e:octocat under a list with a line that is not a pair" "cannot tell its issuers apart" "${K[@]}" --as=e2e:octocat create -f -
+subject_param ""
+manifest sb-back "$ME" '[]' | as_issuer "$OTHER" \
+  | until_admitted "$ME naming any issuer once the list is empty again (the single-issuer cluster of ADR-0008)" "${K[@]}" create -f -
+"${K[@]}" -n "$NS" delete agentsandbox sb-listed sb-back --ignore-not-found --wait=false >/dev/null
+
+# Decision 3: the mark is the broker's own, on create, and nobody's to change.
+mark_denied() { # <description> <kubectl args...>; the manifest on stdin
+  local what=$1 out; shift
+  if out=$("$@" 2>&1); then fail "$what: admitted, expected a denial"; fi
+  echo "$out" | grep -qF "mediatore.io/front-door is the broker's own" || fail "$what: refused, but not for the mark: $out"
+  echo "denied: $what"
+}
+manifest sb-forged stranger '[]' | marked | mark_denied "an impersonated stranger setting the mark on its own sandbox" "${K[@]}" --as=stranger create -f -
+manifest sb-forged octocat '[]' | marked | mark_denied "the listed broker (e2e-broker) setting the mark" "${K[@]}" --as=e2e-broker create -f -
+manifest sb-forged octocat '[]' | marked selfcheck | mark_denied "the broker ServiceAccount setting the mark to another value" "${KSA[@]}" create -f -
+manifest sb-marked octocat '[]' | marked | admitted "the broker ServiceAccount setting the mark to api" "${KSA[@]}" create -f -
+manifest sb-unmarked "$ME" '[]' | admitted "$ME naming itself, unmarked" "${K[@]}" create -f -
+immutable() { # <description> <kubectl args...>
+  local what=$1 out; shift
+  if out=$("$@" 2>&1); then fail "$what: admitted, expected a denial"; fi
+  echo "$out" | grep -qF "mediatore.io/front-door is immutable" || fail "$what: refused, but not for the mark: $out"
+  echo "denied: $what"
+}
+immutable "changing the mark on sb-marked" "${K[@]}" -n "$NS" annotate agentsandbox sb-marked --overwrite mediatore.io/front-door=x
+immutable "removing the mark from sb-marked" "${K[@]}" -n "$NS" annotate agentsandbox sb-marked mediatore.io/front-door-
+immutable "adding the mark to sb-unmarked" "${KSA[@]}" -n "$NS" annotate agentsandbox sb-unmarked mediatore.io/front-door=api
+"${K[@]}" -n "$NS" delete agentsandbox sb-marked sb-unmarked --wait=false >/dev/null
+
+# Decision 4: the listed broker may name any id, and is still held to the declared issuers.
+manifest sb-dex octocat '[]' | as_issuer "$DEX" \
+  | admitted "the listed broker naming octocat at the second configured issuer" "${K[@]}" --as=e2e-broker create -f -
+failed_dex() { [ "$(field sb-dex '.status.phase')" = "Failed" ]; }
+wait_for "$TIMEOUT" "sb-dex Failed" failed_dex
+field sb-dex '.status.reason' | grep -qF "issuer $DEX may not be named by a sandbox created through the Kubernetes API: it is not in sandboxes.declarative_issuers (ADR-0072)" \
+  || fail "unexpected reason: $(field sb-dex '.status.reason')"
+"${K[@]}" -n "$NS" get virtualmachineclaim sb-dex >/dev/null 2>&1 && fail "a claim was created for sb-dex"
+"${K[@]}" -n "$NS" delete agentsandbox sb-dex --wait=false >/dev/null
+echo "sb-dex admitted by the policy and Failed by the reconciler ($(field sb-dex '.status.reason' | cut -c1-60)...), no claim"
 
 say "reconcile: sb-e2e gets a finalizer, an owned claim and a record"
 has_claim() { "${K[@]}" -n "$NS" get virtualmachineclaim sb-e2e >/dev/null 2>&1; }
@@ -359,4 +457,4 @@ archived() { broker_logs | grep -F "resync" | grep -qE 'archived=[1-9]'; }
 wait_for "$TIMEOUT" "a resync archiving at least one row" archived
 echo "archived at resync"
 
-say "PASS: ADR-0008, ADR-0034, ADR-0044, ADR-0047 and ADR-0049 hold against a real cluster (subject policy, owned claim and record on the resource, bind to Ready, a restart on the Kubernetes store, fail-closed audience, the pool selector and its exactly-one rule, the selection strategy carried as written, v1alpha1 served as the same object, finalizer, the retention sweep)"
+say "PASS: ADR-0008, ADR-0034, ADR-0044, ADR-0047, ADR-0049 and ADR-0072 hold against a real cluster (subject policy, the issuer list with no fallback and the broker's mark, owned claim and record on the resource, bind to Ready, a restart on the Kubernetes store, fail-closed audience, the pool selector and its exactly-one rule, the selection strategy carried as written, v1alpha1 served as the same object, finalizer, the retention sweep)"

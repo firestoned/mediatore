@@ -3,7 +3,7 @@
 
 # ADR-0071: `sub` qualified by issuer when the broker trusts several
 
-**Status:** Accepted and implemented 2026-11-27 · **Date:** 2026-11-27
+**Status:** Accepted and implemented 2026-11-27 · **Date:** 2026-11-27 · **Amended:** 2026-11-27 by [ADR-0073](0073-groups-qualified-by-issuer-when-the-broker-trusts-several.md) (`subject_prefix` qualifies each element of `groups` as well as `sub`, from the same lookup)
 
 Amends [ADR-0003](0003-token-backends.md) (the shape of the token the STS mints: `sub` may carry a
 prefix) and [ADR-0017](0017-issuer-profiles.md) (the issuer's keys: one more, `subject_prefix`).

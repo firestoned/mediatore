@@ -121,7 +121,8 @@ pub fn subject_prefix_is_well_formed(prefix: &str) -> bool {
         })
 }
 
-/// The `sub` prefix of each trusted issuer, checked as a set (ADR-0071).
+/// The `sub` prefix of each trusted issuer, checked as a set (ADR-0071), which qualifies each
+/// of a token's `groups` too (ADR-0073).
 ///
 /// Built only by [`SubjectPrefixes::new`], so a value of this type is always one under which
 /// two different issuers cannot be minted the same `sub`: either there is one issuer at
@@ -197,6 +198,21 @@ impl SubjectPrefixes {
         self.by_issuer.get(issuer).map(String::as_str)
     }
 
+    /// The prefix this set gives `subject`'s issuer: `None` when no issuer has one.
+    ///
+    /// # Errors
+    /// [`StsError::NoSubjectPrefix`] when some issuer has a prefix and this subject's does
+    /// not (an issuer this set was not built with).
+    fn prefix_for(&self, subject: &Subject) -> Result<Option<&str>, StsError> {
+        match self.by_issuer.get(&subject.issuer) {
+            Some(prefix) => Ok(Some(prefix.as_str())),
+            None if self.by_issuer.is_empty() => Ok(None),
+            None => Err(StsError::NoSubjectPrefix {
+                issuer: subject.issuer.clone(),
+            }),
+        }
+    }
+
     /// The `sub` for `subject`: its issuer's prefix and then its id, or the bare id when no
     /// issuer has a prefix.
     ///
@@ -205,13 +221,30 @@ impl SubjectPrefixes {
     /// not (an issuer this set was not built with): fail closed, its bare id is not minted
     /// beside qualified ones.
     pub fn sub<'a>(&self, subject: &'a Subject) -> Result<Cow<'a, str>, StsError> {
-        match self.by_issuer.get(&subject.issuer) {
-            Some(prefix) => Ok(Cow::Owned(format!("{prefix}{}", subject.id))),
-            None if self.by_issuer.is_empty() => Ok(Cow::Borrowed(&subject.id)),
-            None => Err(StsError::NoSubjectPrefix {
-                issuer: subject.issuer.clone(),
-            }),
-        }
+        Ok(qualified(self.prefix_for(subject)?, &subject.id))
+    }
+
+    /// The `groups` for a token of `subject` (ADR-0073): its issuer's prefix in front of each
+    /// of the upstream's groups, in the upstream's order and spelling, or the groups as they
+    /// are when no issuer has a prefix. The same lookup as [`Self::sub`], so a token never
+    /// carries one qualified and the other bare.
+    ///
+    /// # Errors
+    /// [`StsError::NoSubjectPrefix`], exactly when [`Self::sub`] fails for `subject`.
+    pub fn groups(&self, subject: &Subject, groups: &[String]) -> Result<Vec<String>, StsError> {
+        let prefix = self.prefix_for(subject)?;
+        Ok(groups
+            .iter()
+            .map(|group| qualified(prefix, group).into_owned())
+            .collect())
+    }
+}
+
+/// `value` behind `prefix`, or `value` itself when there is none.
+fn qualified<'a>(prefix: Option<&str>, value: &'a str) -> Cow<'a, str> {
+    match prefix {
+        Some(prefix) => Cow::Owned(format!("{prefix}{value}")),
+        None => Cow::Borrowed(value),
     }
 }
 
@@ -248,7 +281,8 @@ pub struct MintRequest<'a> {
     pub claim_uid: Uuid,
     /// Exactly one downstream audience.
     pub audience: &'a str,
-    /// Group memberships carried through from the upstream token.
+    /// Group memberships carried through from the upstream token, as the upstream spells
+    /// them: the STS qualifies them by issuer itself ([`SubjectPrefixes::groups`], ADR-0073).
     pub groups: Vec<String>,
     /// Requested lifetime; capped by [`Sts::max_ttl_for`] the audience.
     pub ttl: SignedDuration,
@@ -404,7 +438,15 @@ impl Sts {
             });
         }
         let expires_at = now + req.ttl;
-        let sub = self.subject_prefixes.sub(req.subject)?;
+        // One lookup for both claims (ADR-0073 decision 3): both qualified, or both bare, or
+        // nothing signed.
+        let prefix = self.subject_prefixes.prefix_for(req.subject)?;
+        let sub = qualified(prefix, &req.subject.id);
+        let groups = req
+            .groups
+            .iter()
+            .map(|group| qualified(prefix, group).into_owned())
+            .collect();
         let claims = Claims {
             iss: &self.issuer,
             sub: &sub,
@@ -418,7 +460,7 @@ impl Sts {
             },
             claim_uid: req.claim_uid,
             upstream_iss: &req.subject.issuer,
-            groups: req.groups.clone(),
+            groups,
         };
         let header = Header {
             alg: Algorithm::ES256,
@@ -808,5 +850,149 @@ MUX5AKaxsGDNBXbbUOvRmJfjaSyiqtitNnd5Zd7UoxcUu0EiVY9OuHW2
             matches!(&err, StsError::NoSubjectPrefix { issuer } if issuer == OTHER),
             "{err}"
         );
+    }
+
+    // ----- ADR-0073: `groups` qualified by the same prefix -------------------------------------------
+
+    /// The `sub` and `groups` of a token minted for `subject` with `groups`, read after
+    /// verification. `None` for `groups` when the claim is absent.
+    fn minted_sub_and_groups(
+        sts: &Sts,
+        subject: &Subject,
+        groups: &[&str],
+    ) -> Result<(String, Option<Vec<String>>), StsError> {
+        let m = sts.mint(&MintRequest {
+            subject,
+            actor_spiffe_id: "spiffe://td/banlieue/claim/x",
+            claim_uid: Uuid::new_v4(),
+            audience: "grafana",
+            groups: groups.iter().map(|g| (*g).to_owned()).collect(),
+            ttl: SignedDuration::from_mins(5),
+        })?;
+        let jwk = &sts.jwks()["keys"][0];
+        let key = jsonwebtoken::DecodingKey::from_ec_components(
+            jwk["x"].as_str().unwrap(),
+            jwk["y"].as_str().unwrap(),
+        )
+        .unwrap();
+        let mut validation = jsonwebtoken::Validation::new(Algorithm::ES256);
+        validation.set_audience(&["grafana"]);
+        let claims = jsonwebtoken::decode::<serde_json::Value>(&m.token, &key, &validation)
+            .unwrap()
+            .claims;
+        let groups = claims.get("groups").map(|g| {
+            g.as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_owned())
+                .collect()
+        });
+        Ok((claims["sub"].as_str().unwrap().to_owned(), groups))
+    }
+
+    fn owned(groups: &[&str]) -> Vec<String> {
+        groups.iter().map(|g| (*g).to_owned()).collect()
+    }
+
+    #[test]
+    fn a_prefixed_issuers_groups_are_the_prefix_then_each_group() {
+        let sts =
+            test_sts().with_subject_prefixes(SubjectPrefixes::new([(DEX, Some("dex:"))]).unwrap());
+        let (sub, groups) =
+            minted_sub_and_groups(&sts, &subject_at(DEX), &["platform-admins", "readers"]).unwrap();
+        assert_eq!(sub, "dex:octocat");
+        assert_eq!(
+            groups,
+            Some(owned(&["dex:platform-admins", "dex:readers"])),
+            "every element qualified, in the upstream's order"
+        );
+    }
+
+    #[test]
+    fn the_upstreams_order_and_spelling_are_kept() {
+        let sts =
+            test_sts().with_subject_prefixes(SubjectPrefixes::new([(DEX, Some("dex:"))]).unwrap());
+        let upstream = ["zeta", "Alpha", " padded ", "mid"];
+        let (_, groups) = minted_sub_and_groups(&sts, &subject_at(DEX), &upstream).unwrap();
+        assert_eq!(
+            groups,
+            Some(owned(&["dex:zeta", "dex:Alpha", "dex: padded ", "dex:mid"])),
+            "nothing folded, trimmed, sorted or split"
+        );
+    }
+
+    #[test]
+    fn one_issuer_without_a_prefix_keeps_the_bare_groups() {
+        let sts = test_sts().with_subject_prefixes(SubjectPrefixes::new([(DEX, None)]).unwrap());
+        let (sub, groups) =
+            minted_sub_and_groups(&sts, &subject_at(DEX), &["platform-admins"]).unwrap();
+        assert_eq!(sub, "octocat");
+        assert_eq!(groups, Some(owned(&["platform-admins"])));
+    }
+
+    #[test]
+    fn the_same_group_at_two_issuers_mints_two_different_groups() {
+        let sts = test_sts().with_subject_prefixes(
+            SubjectPrefixes::new([(DEX, Some("dex:")), (OTHER, Some("corp:"))]).unwrap(),
+        );
+        let (_, at_dex) =
+            minted_sub_and_groups(&sts, &subject_at(DEX), &["platform-admins"]).unwrap();
+        let (_, at_other) =
+            minted_sub_and_groups(&sts, &subject_at(OTHER), &["platform-admins"]).unwrap();
+        assert_eq!(at_dex, Some(owned(&["dex:platform-admins"])));
+        assert_eq!(at_other, Some(owned(&["corp:platform-admins"])));
+        assert_ne!(at_dex, at_other);
+    }
+
+    #[test]
+    fn a_group_holding_the_delimiter_is_still_its_own_issuers() {
+        let sts = test_sts().with_subject_prefixes(
+            SubjectPrefixes::new([(DEX, Some("dex:")), (OTHER, Some("corp:"))]).unwrap(),
+        );
+        // A group at Dex spelled like the other issuer's prefix stays Dex's: the prefix of a
+        // qualified value is everything up to its first `:`.
+        let (_, groups) = minted_sub_and_groups(
+            &sts,
+            &subject_at(DEX),
+            &["corp:admins", "example-org:admins"],
+        )
+        .unwrap();
+        let groups = groups.unwrap();
+        assert_eq!(
+            groups,
+            owned(&["dex:corp:admins", "dex:example-org:admins"])
+        );
+        for group in &groups {
+            assert_eq!(group.split_once(':').map(|(p, _)| p), Some("dex"));
+        }
+    }
+
+    #[test]
+    fn a_token_never_carries_a_qualified_sub_beside_bare_groups() {
+        let prefixes = SubjectPrefixes::new([(DEX, Some("dex:"))]).unwrap();
+        // The helper is refused for an issuer outside the set, as `sub` is.
+        assert!(matches!(
+            prefixes.groups(&subject_at(OTHER), &owned(&["admins"])),
+            Err(StsError::NoSubjectPrefix { issuer }) if issuer == OTHER
+        ));
+        // And at mint nothing is signed: the refusal comes before the token.
+        let sts = test_sts().with_subject_prefixes(prefixes);
+        let err = minted_sub_and_groups(&sts, &subject_at(OTHER), &["admins"]).unwrap_err();
+        assert!(
+            matches!(&err, StsError::NoSubjectPrefix { issuer } if issuer == OTHER),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn no_groups_mints_no_groups_claim_with_or_without_a_prefix() {
+        for prefixes in [
+            SubjectPrefixes::default(),
+            SubjectPrefixes::new([(DEX, Some("dex:"))]).unwrap(),
+        ] {
+            let sts = test_sts().with_subject_prefixes(prefixes);
+            let (_, groups) = minted_sub_and_groups(&sts, &subject_at(DEX), &[]).unwrap();
+            assert_eq!(groups, None, "no groups claim at all");
+        }
     }
 }

@@ -240,11 +240,40 @@ The whole `spec` is immutable after creation. The subject because the attributio
 authorized then; the rest because mediatore reads it once, when it creates the claim.
 Change of mind means a new resource.
 
-`spec.subject.issuer` is not checked at admission (the API server cannot tell which
-issuer minted the caller's token). mediatore refuses a sandbox whose issuer is not one of
-its configured `issuers`, or whose `audiences` are not all among its configured
-`audiences`, before any claim exists: the status is `Failed` with the reason, and nothing
-was created on the banlieue side.
+`spec.subject.issuer` is a statement of the creator's: the API server cannot tell which
+issuer minted the caller's token. Two things bound it
+([ADR-0072](../adr/0072-a-hand-created-sandbox-names-only-an-issuer-its-creator-can-come-from.md)):
+
+- **At admission, once `issuerPrefixes` lists anything.** With the key empty the policy
+  checks the id against `usernamePrefix` whatever issuer the sandbox names, the one-issuer
+  cluster. Once it holds one `<issuer> <prefix>` line, a sandbox naming an issuer it does not
+  list is refused (there is no fallback to `usernamePrefix`), and a listed one is checked under
+  its own prefix. A list that cannot tell its issuers apart (a line that is not exactly two
+  words, an issuer twice, two prefixes equal or one the start of the other) admits no sandbox
+  from anybody the id check applies to, until it is fixed. The refusal names the key.
+- **At reconcile, for a sandbox the broker did not create.** What `POST /v1/claims` creates
+  carries the annotation `mediatore.io/front-door: api`, which the policy admits from the
+  broker's username alone, with that value alone, and which nobody can add, change or remove
+  afterwards. A sandbox without it may name only an issuer of `sandboxes.declarative_issuers`
+  in `mediatore.yaml`: the one issuer when the broker trusts one, none when it trusts two or
+  more and the key is not written. A sandbox outside the list is `Failed` with the reason
+  `issuer <url> may not be named by a sandbox created through the Kubernetes API: it is not
+  in sandboxes.declarative_issuers (ADR-0072)`. A listed broker is held to the list too.
+
+| The cluster | In `mediatore.yaml` | In the ConfigMap |
+| --- | --- | --- |
+| One issuer | nothing | `usernamePrefix`, as before |
+| Several issuers, people use `POST /v1/claims` only | nothing (the start `warn`s that the path is closed) | nothing |
+| Several issuers, the API server authenticates against one of them | `sandboxes.declarative_issuers: [<that url>]` | `usernamePrefix`, or one `issuerPrefixes` pair |
+| Several issuers, the API server authenticates against several | every one of them in `sandboxes.declarative_issuers` | one `issuerPrefixes` pair each, prefixes distinct |
+
+Apply the policy from the same release before the broker: where the list leaves an issuer
+out, the broker proves at start that the policy refuses a forged annotation and does not
+start if it does not.
+
+mediatore also refuses a sandbox whose issuer is not one of its configured `issuers`, or
+whose `audiences` are not all among its configured `audiences`, before any claim exists:
+the status is `Failed` with the reason, and nothing was created on the banlieue side.
 
 ### banlieue's side of the same rule
 

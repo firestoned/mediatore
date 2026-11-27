@@ -3,7 +3,7 @@
 
 # ADR-0017: Issuer profiles: any OIDC issuer on the session path, Entra on its own
 
-**Status:** Implemented · **Date:** 2026-10-21 · **Implemented:** 2026-10-21 (roadmap 04: `extra_params` and `--auth-param`, `groups_claim`, the Google and Auth0 profiles of the fake issuer, `crates/mediatore/tests/e2e_issuers.rs`) · **Amended:** 2026-11-17 (decision 4, the issuer's gate, [ADR-0046](0046-who-may-claim-a-list-of-groups-and-a-namespace-to-groups-mapping.md)) · **Amended:** 2026-11-27 by [ADR-0071](0071-sub-qualified-by-issuer-when-the-broker-trusts-several.md) (one more key per issuer, `subject_prefix`, required of every issuer once an `sts` trusts two or more)
+**Status:** Implemented · **Date:** 2026-10-21 · **Implemented:** 2026-10-21 (roadmap 04: `extra_params` and `--auth-param`, `groups_claim`, the Google and Auth0 profiles of the fake issuer, `crates/mediatore/tests/e2e_issuers.rs`) · **Amended:** 2026-11-17 (decision 4, the issuer's gate, [ADR-0046](0046-who-may-claim-a-list-of-groups-and-a-namespace-to-groups-mapping.md)) · **Amended:** 2026-11-27 by [ADR-0071](0071-sub-qualified-by-issuer-when-the-broker-trusts-several.md) (one more key per issuer, `subject_prefix`, required of every issuer once an `sts` trusts two or more) · **Amended:** 2026-11-27 by [ADR-0073](0073-groups-qualified-by-issuer-when-the-broker-trusts-several.md) (the groups read through decision 4's claim are minted behind that `subject_prefix`; the issuer's gate still reads them as the issuer spells them)
 
 Corrects the framing of [ADR-0013](0013-dex-session-delegation.md) and
 [ADR-0016](0016-entra-on-behalf-of.md), and closes the gaps that kept Google and Auth0

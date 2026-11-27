@@ -3,7 +3,7 @@
 
 # ADR-0073: `groups` qualified by issuer when the broker trusts several
 
-**Status:** Proposed · **Date:** 2026-11-27
+**Status:** Accepted and implemented 2026-11-27 (built with ADR-0071 and ADR-0074; what was built differently from the text is under *As built*) · **Date:** 2026-11-27
 
 Amends [ADR-0003](0003-token-backends.md) (the shape of the token the STS mints: each element of
 `groups` may carry a prefix) and
@@ -186,6 +186,20 @@ Tests are written before the code they hold.
 - Live: `make kind-e2e-dex`, whose broker has `dex:` on the Dex issuer, checks the minted token's
   `groups` beside its `sub`.
 - This is not the TPM attestation path.
+
+## As built (2026-11-27)
+
+Built as written, with the tests named above. Where the build says more than the text:
+
+- `SubjectPrefixes::groups(subject, groups)` is the public form of the rule; `mint_at` takes the
+  issuer's prefix once through the private `prefix_for` and builds `sub` and every element of
+  `groups` from it, so the one lookup of decision 3 is literal. `the_upstreams_order_and_spelling_are_kept`
+  is the order test the text asks for.
+- Three existing assertions on a minted `groups` changed, each for an issuer that already had a
+  prefix: the Auth0 login of `e2e_issuers.rs` (`auth0:`) and the two Entra assertions of
+  `e2e_entra.rs` (`entra:`). The gate tests of ADR-0046 pass unedited.
+- Live, `make kind-e2e-dex` checks that the token's groups are non-empty, all begin with `dex:` and
+  include `dex:sandbox-users`.
 
 ## Open questions
 

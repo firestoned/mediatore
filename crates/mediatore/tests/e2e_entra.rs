@@ -364,7 +364,11 @@ async fn the_bearer_is_exchanged_once_and_every_issue_refreshes_for_the_audience
     let claims = payload(&sts.access_token);
     assert_eq!(claims["iss"], "https://mediatore.test");
     assert_eq!(claims["aud"], STS_AUDIENCE);
-    assert_eq!(claims["groups"], serde_json::json!([REQUIRED_GROUP]));
+    // Behind the issuer's `subject_prefix`, as `sub` is (ADR-0073).
+    assert_eq!(
+        claims["groups"],
+        serde_json::json!([format!("entra:{REQUIRED_GROUP}")])
+    );
     assert_eq!(
         h.idp.refresh_scopes().last().unwrap(),
         &format!("offline_access {CLIENT_ID}/.default")
@@ -382,7 +386,10 @@ async fn the_bearer_is_exchanged_once_and_every_issue_refreshes_for_the_audience
     let sts: TokenResponse = h.token(&claim, STS_AUDIENCE).await.json().await.unwrap();
     assert_eq!(
         payload(&sts.access_token)["groups"],
-        serde_json::json!([REQUIRED_GROUP, "firestoned:traders"])
+        serde_json::json!([
+            format!("entra:{REQUIRED_GROUP}"),
+            "entra:firestoned:traders"
+        ])
     );
 }
 

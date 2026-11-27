@@ -68,6 +68,11 @@ pub struct WatcherConfig {
     >,
     /// Issuers mediatore trusts; a sandbox's subject must come from one.
     pub issuers: Vec<String>,
+    /// `sandboxes.declarative_issuers`, resolved (ADR-0072 decision 4): the issuers a sandbox
+    /// the broker did not create through its API may name. With one issuer and the key not
+    /// written, that issuer; with two or more and the key not written, none; written, exactly
+    /// the list. A sandbox created by hand naming any other is refused before its claim.
+    pub declarative_issuers: Vec<String>,
     /// `sandboxes.max_ttl_seconds` (ADR-0008 decision 9, amended 2026-11-26): the longest
     /// lifetime a sandbox may ask for, with or without a policy. A `ttlSeconds` above it fails
     /// the sandbox before any claim exists; a policy's lease only narrows it.
@@ -240,6 +245,7 @@ impl Default for WatcherConfig {
             audiences: vec![],
             scopes: std::collections::BTreeMap::new(),
             issuers: vec![],
+            declarative_issuers: vec![],
             max_ttl_seconds: mediatore_proto::DEFAULT_MAX_TTL_SECONDS,
             registry_audiences: None,
             placed_registries: std::collections::BTreeMap::new(),

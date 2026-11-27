@@ -3,7 +3,7 @@
 
 # ADR-0008: AgentSandbox is a mediatore CRD, reconciled by mediatore
 
-**Status:** Implemented · **Date:** 2026-10-12 · **Accepted:** 2026-10-14 · **Implemented:** 2026-10-14 (roadmap 08; the implementation notes below) · **Amended:** 2026-11-01 (a new optional, immutable `spec.policyRef`, [ADR-0026](0026-notaio-bundles-verified-in-shadow.md) decision 6); 2026-11-09 (decision 8, `spec.workload.restart`, [ADR-0033](0033-a-one-shot-workload-the-restart-policy-and-the-claim-released-when-it-is-done.md)); 2026-11-09 (decision 12, the store: the claim record is `status.record` on the `AgentSandbox`, sessions are Secrets and nodes are `SandboxNode` resources, no tables, [ADR-0034](0034-the-kubernetes-api-as-the-brokers-store.md)); 2026-11-10 (a delegation per audience on the request and the `DelegationsPending` condition, [ADR-0035](0035-a-requesters-own-session-delegated-at-claim-time.md)); 2026-11-16 (decision 7, `spec.poolRef` optional beside `spec.poolSelector`, exactly one, and `status.poolRef` the pool bound from, [ADR-0044](0044-a-sandbox-selects-its-pool-by-label.md)); 2026-11-17 (the Namespace paragraph, the claim's namespace chosen from the caller's groups, [ADR-0046](0046-who-may-claim-a-list-of-groups-and-a-namespace-to-groups-mapping.md)); 2026-11-18 (decision 7, an optional, immutable `spec.selection`, the strategy banlieue picks the member by, [ADR-0047](0047-a-sandbox-chooses-its-member-by-strategy.md)); 2026-11-18 (decision 1, served as `mediatore.io/v1beta1`, [ADR-0048](0048-agentsandbox-served-as-v1beta1.md)); 2026-11-18 (decision 1, `v1alpha1` served beside `v1beta1`, deprecated, [ADR-0049](0049-agentsandbox-served-as-v1alpha1-and-v1beta1.md)); 2026-11-26 (decision 9, a broker-wide ceiling on `ttlSeconds`, `sandboxes.max_ttl_seconds`, one day by default)
+**Status:** Implemented · **Date:** 2026-10-12 · **Accepted:** 2026-10-14 · **Implemented:** 2026-10-14 (roadmap 08; the implementation notes below) · **Amended:** 2026-11-01 (a new optional, immutable `spec.policyRef`, [ADR-0026](0026-notaio-bundles-verified-in-shadow.md) decision 6); 2026-11-09 (decision 8, `spec.workload.restart`, [ADR-0033](0033-a-one-shot-workload-the-restart-policy-and-the-claim-released-when-it-is-done.md)); 2026-11-09 (decision 12, the store: the claim record is `status.record` on the `AgentSandbox`, sessions are Secrets and nodes are `SandboxNode` resources, no tables, [ADR-0034](0034-the-kubernetes-api-as-the-brokers-store.md)); 2026-11-10 (a delegation per audience on the request and the `DelegationsPending` condition, [ADR-0035](0035-a-requesters-own-session-delegated-at-claim-time.md)); 2026-11-16 (decision 7, `spec.poolRef` optional beside `spec.poolSelector`, exactly one, and `status.poolRef` the pool bound from, [ADR-0044](0044-a-sandbox-selects-its-pool-by-label.md)); 2026-11-17 (the Namespace paragraph, the claim's namespace chosen from the caller's groups, [ADR-0046](0046-who-may-claim-a-list-of-groups-and-a-namespace-to-groups-mapping.md)); 2026-11-18 (decision 7, an optional, immutable `spec.selection`, the strategy banlieue picks the member by, [ADR-0047](0047-a-sandbox-chooses-its-member-by-strategy.md)); 2026-11-18 (decision 1, served as `mediatore.io/v1beta1`, [ADR-0048](0048-agentsandbox-served-as-v1beta1.md)); 2026-11-18 (decision 1, `v1alpha1` served beside `v1beta1`, deprecated, [ADR-0049](0049-agentsandbox-served-as-v1alpha1-and-v1beta1.md)); 2026-11-26 (decision 9, a broker-wide ceiling on `ttlSeconds`, `sandboxes.max_ttl_seconds`, one day by default); 2026-11-27 (decision 5 corrected: what admission pins of `spec.subject.issuer`, the broker's mark on what it creates and `sandboxes.declarative_issuers`, [ADR-0072](0072-a-hand-created-sandbox-names-only-an-issuer-its-creator-can-come-from.md))
 
 Supersedes banlieue
 [ADR-0055](https://github.com/firestoned/banlieue/blob/main/docs/adr/0055-agentsandbox.md)
@@ -86,6 +86,18 @@ an explicit, empty-by-default list of broker principals. Without this policy, an
 `create` on `agentsandboxes` could attribute a sandbox, and the tokens it mints, to anyone.
 mediatore's ServiceAccount is then the only principal that creates the
 `VirtualMachineClaim`, and banlieue's policy already has to allow it as a broker.
+
+*Corrected by [ADR-0072](0072-a-hand-created-sandbox-names-only-an-issuer-its-creator-can-come-from.md)
+(2026-11-27):* the policy never matched `spec.subject.issuer` to the requesting user; the API
+server cannot tell which issuer minted a caller's token, and the sentence above described an
+intent. What holds now: admission pins the id to the username, and pins the issuer to the
+username's prefix when the operator has listed the issuers in `issuerPrefixes` (an unlisted
+issuer is then refused, with no fallback to `usernamePrefix`, and a list that cannot tell its
+issuers apart admits nothing); the broker refuses, for a sandbox it did not create through
+`POST /v1/claims` (the annotation `mediatore.io/front-door: api`, which the policy admits from
+the broker's username alone and makes immutable), an issuer outside
+`sandboxes.declarative_issuers`, which is none by default once the broker trusts two or more
+issuers; and with one issuer and nothing listed, the issuer is the only one there is.
 
 **6. `AgentSandbox` never carries a credential.** Carried over from ADR-0055 decision 3.
 Policy by value, credentials by reference. A custom resource is readable by anyone with

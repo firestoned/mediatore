@@ -22,7 +22,7 @@ use mediatore_proto::{
 use mediatore_spire::{MemoryEntries, Naming};
 use mediatore_store::seal::{LocalKeySealer, Sealer, TransitConfig, TransitSealer};
 use mediatore_store::{ClaimStore, MemoryStore};
-use mediatore_sts::Sts;
+use mediatore_sts::{Sts, SubjectPrefixes};
 use mediatore_testkit::FakeIdp;
 use mediatore_testkit::FakeTransit;
 
@@ -51,7 +51,22 @@ struct Harness {
 
 impl Harness {
     async fn start(rate_per_minute: u32) -> Self {
-        Self::start_with(rate_per_minute, Arc::new(LocalKeySealer::new([3u8; 32]))).await
+        Self::start_with(
+            rate_per_minute,
+            Arc::new(LocalKeySealer::new([3u8; 32])),
+            None,
+        )
+        .await
+    }
+
+    /// The same broker with a `subject_prefix` on its one issuer (ADR-0071, ADR-0073).
+    async fn start_prefixed(rate_per_minute: u32, prefix: &str) -> Self {
+        Self::start_with(
+            rate_per_minute,
+            Arc::new(LocalKeySealer::new([3u8; 32])),
+            Some(prefix),
+        )
+        .await
     }
 
     /// The broker over the transit sealer (ADR-0015), against a fake `OpenBao`.
@@ -74,12 +89,16 @@ impl Harness {
         .await
         .expect("the probe round-trips");
         (
-            Self::start_with(rate_per_minute, Arc::new(sealer)).await,
+            Self::start_with(rate_per_minute, Arc::new(sealer), None).await,
             fake,
         )
     }
 
-    async fn start_with(rate_per_minute: u32, sealer: Arc<dyn Sealer>) -> Self {
+    async fn start_with(
+        rate_per_minute: u32,
+        sealer: Arc<dyn Sealer>,
+        subject_prefix: Option<&str>,
+    ) -> Self {
         let idp = FakeIdp::start().await;
         let sts = Sts::new(
             "https://mediatore.test",
@@ -87,7 +106,10 @@ impl Harness {
             STS_TEST_KEY.as_bytes(),
             SignedDuration::from_mins(15),
         )
-        .expect("sts");
+        .expect("sts")
+        .with_subject_prefixes(
+            SubjectPrefixes::new([(idp.issuer.as_str(), subject_prefix)]).expect("one prefix"),
+        );
         let store = MemoryStore::shared();
         let entries = Arc::new(MemoryEntries::default());
         let state = Arc::new(AppState {
@@ -119,7 +141,7 @@ impl Harness {
                 ca_file: None,
                 entra: None,
                 groups_claim: None,
-                subject_prefix: None,
+                subject_prefix: subject_prefix.map(ToOwned::to_owned),
             }]),
             sts: Some(sts),
             audiences: vec![AUDIENCE.into()],
@@ -290,6 +312,28 @@ async fn the_envelope_lands_in_the_record_and_every_issue_refreshes_first() {
         "fresh groups"
     );
     assert_eq!(h.idp.refreshes(), 2);
+}
+
+#[tokio::test]
+async fn fresh_groups_are_minted_under_the_issuers_prefix() {
+    // ADR-0073: the issuer's `subject_prefix` qualifies each fresh group as it does `sub`.
+    let h = Harness::start_prefixed(10, "dex:").await;
+    let (claim, _) = h.bound_claim("octocat").await;
+    h.idp
+        .set_groups("octocat", &[REQUIRED_GROUP, "firestoned:dev"]);
+    let resp = h.token(&claim).await;
+    assert_eq!(resp.status(), 200);
+    let tok: TokenResponse = resp.json().await.unwrap();
+    let claims = payload(&tok.access_token);
+    assert_eq!(claims["sub"], "dex:octocat");
+    assert_eq!(
+        claims["groups"],
+        serde_json::json!([format!("dex:{REQUIRED_GROUP}"), "dex:firestoned:dev"]),
+        "fresh groups, each behind the prefix, in the issuer's order"
+    );
+    // The record and the response keep the upstream's spelling: the prefix is in the token
+    // alone (ADR-0073 decision 4).
+    assert_eq!(tok.subject.id, "octocat");
 }
 
 #[tokio::test]

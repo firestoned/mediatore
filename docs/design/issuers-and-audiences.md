@@ -33,11 +33,13 @@ owner check compares both). In a token the STS mints, a resource server usually 
 issuers `sub` is `<subject_prefix><id>` (`dex:octocat`, `google:octocat@example.com`) and `upstream_iss` still carries
 the issuer's URL. The prefix of a `sub` is everything up to and including the first `:`. `SubjectPrefixes`
 (`mediatore-sts/src/lib.rs`) checks the set at start and again when the STS is built, and the STS refuses to mint for
-an issuer without a prefix once any issuer has one.
+an issuer without a prefix once any issuer has one. The same prefix qualifies each element of the token's `groups`
+(ADR-0073), from the same lookup, so a token never carries a qualified `sub` beside bare groups; the broker's own gates
+and the namespace map compare the groups as the issuer spells them.
 
 **Validating a bearer** (`POST /v1/claims`): the issuer is known, the audience is mediatore's client, the signature
 verifies through the issuer's JWKS (cached for five minutes), the token is not expired, the subject claim is present,
-and the **group gate** passes (a token carrying one of `required_groups`, or `allow_any_authenticated: true`). Where a person may then create a sandbox is the namespace map, `sandboxes.namespaces`, checked on the same groups ([Configuration](configuration.md)). Failures are `IdpError` variants (`UnknownIssuer`, `Invalid`, `Forbidden`, and for a session `SessionRevoked`,
+and the **group gate** passes (a token carrying one of `required_groups`, or `allow_any_authenticated: true`). Where a person may then create a sandbox is the namespace map, `sandboxes.namespaces`, checked on the same groups and read only from a token of an issuer the entry lists (ADR-0074; [Configuration](configuration.md)). Failures are `IdpError` variants (`UnknownIssuer`, `Invalid`, `Forbidden`, and for a session `SessionRevoked`,
 `Upstream` and `Credential`).
 
 **A session.** For an issuer with a `session`, the caller delegates its refresh token with the claim. The broker seals

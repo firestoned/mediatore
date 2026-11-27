@@ -50,6 +50,36 @@ pub const FINALIZER: &str = "mediatore.io/sandbox";
 /// watcher selects on.
 pub const SANDBOX_UID_LABEL: &str = "mediatore.io/sandbox-uid";
 
+/// The annotation a sandbox created through `POST /v1/claims` carries (ADR-0072 decision 3).
+/// The subject admission policy admits it only from the broker's username and only with
+/// [`FRONT_DOOR_API`], and makes it immutable (`deploy/base/admission/agentsandbox-subject.yaml`,
+/// validations 3 and 4).
+pub const FRONT_DOOR_ANNOTATION: &str = "mediatore.io/front-door";
+
+/// The one value of [`FRONT_DOOR_ANNOTATION`]: created through the broker's API.
+pub const FRONT_DOOR_API: &str = "api";
+
+/// Whether the broker created this sandbox through `POST /v1/claims` (ADR-0072 decision 3):
+/// the annotation, with exactly [`FRONT_DOOR_API`]. Anything else, a second value included,
+/// is a sandbox created by hand. The mark is only as strong as the admission policy that
+/// guards it, which the broker proves at start where it relies on it
+/// ([`KubeSandboxes::self_check`]).
+#[must_use]
+pub fn created_through_the_api(sb: &AgentSandbox) -> bool {
+    sb.annotations()
+        .get(FRONT_DOOR_ANNOTATION)
+        .map(String::as_str)
+        == Some(FRONT_DOOR_API)
+}
+
+/// Why a sandbox created by hand is refused for its issuer (ADR-0072 decision 4).
+#[must_use]
+pub fn issuer_not_declarative(issuer: &str) -> String {
+    format!(
+        "issuer {issuer} may not be named by a sandbox created through the Kubernetes API: it is not in sandboxes.declarative_issuers (ADR-0072)"
+    )
+}
+
 /// Why a sandbox asking for more than `sandboxes.max_ttl_seconds` is refused: the sentence in
 /// `status.reason` (ADR-0008 decision 9, amended 2026-11-26). It names the ceiling, which is
 /// configuration, so the requester knows what would fit.
@@ -860,6 +890,18 @@ impl Watcher {
         None
     }
 
+    /// ADR-0072 decision 4: a sandbox the broker did not create through its API may name only
+    /// an issuer of `sandboxes.declarative_issuers` (the resolved set). A sandbox the broker
+    /// created is not asked: its issuer is the one that validated the bearer token.
+    fn refuse_declarative_issuer(&self, sb: &AgentSandbox) -> Option<String> {
+        if created_through_the_api(sb) {
+            return None;
+        }
+        let issuer = &sb.spec.subject.issuer;
+        (!self.cfg.declarative_issuers.iter().any(|i| i == issuer))
+            .then(|| issuer_not_declarative(issuer))
+    }
+
     /// Patch the status when it differs from what the object carries.
     async fn mirror(
         &self,
@@ -1009,7 +1051,10 @@ impl Watcher {
             tracing::info!(sandbox = %sb.name_any(), %namespace, "audience definitions not all read yet; holding the sandbox (ADR-0055)");
             return Ok(Some(Action::requeue(self.cfg.requeue)));
         }
-        let Some(reason) = self.refuse(&sb.spec, &namespace) else {
+        let Some(reason) = self
+            .refuse(&sb.spec, &namespace)
+            .or_else(|| self.refuse_declarative_issuer(sb))
+        else {
             return self.refuse_unresolved_policy(sb, current).await;
         };
         tracing::warn!(sandbox = %sb.name_any(), %namespace, %reason, "sandbox refused; no claim created");
@@ -1589,6 +1634,148 @@ impl KubeSandboxes {
     fn api(&self, namespace: &str) -> Api<AgentSandbox> {
         Api::namespaced(self.client.clone(), namespace)
     }
+
+    /// ADR-0072 decision 5: prove that the subject admission policy reserves
+    /// [`FRONT_DOOR_ANNOTATION`] before the broker relies on it. One server-side dry run of a
+    /// sandbox in `namespace` (the broker's home) carrying the annotation with a value that is
+    /// not [`FRONT_DOOR_API`], which the policy must refuse by its validation 3. Nothing is
+    /// persisted.
+    ///
+    /// # Errors
+    /// [`FrontDoorCheckError`]: admitted, refused by something else, or not answered.
+    pub async fn self_check(&self, namespace: &str) -> Result<(), FrontDoorCheckError> {
+        let probe = front_door_probe(namespace);
+        let name = probe.name_any();
+        let dry_run = PostParams {
+            dry_run: true,
+            field_manager: None,
+        };
+        judge_front_door_check(&name, self.api(namespace).create(&dry_run, &probe).await)?;
+        tracing::info!(
+            name,
+            %namespace,
+            policy = SUBJECT_POLICY,
+            "sandboxes: the admission policy refused a dry-run sandbox carrying a forged mediatore.io/front-door (self-check passed, ADR-0072)"
+        );
+        Ok(())
+    }
+}
+
+/// The subject admission policy (`deploy/base/admission/agentsandbox-subject.yaml`).
+pub const SUBJECT_POLICY: &str = "mediatore-agentsandbox-subject";
+
+/// A fragment of validation 3's message in that policy: the refusal that proves the mark is
+/// guarded. Kept equal to the policy's text by a unit test.
+pub const FRONT_DOOR_POLICY_MESSAGE: &str =
+    "the annotation mediatore.io/front-door is the broker's own";
+
+/// Names of the self-check's dry-run sandboxes, never a name `POST /v1/claims` gives.
+const FRONT_DOOR_PROBE_PREFIX: &str = "mediatore-selfcheck-";
+
+/// The value the probe carries: anything but [`FRONT_DOOR_API`].
+const FRONT_DOOR_PROBE_VALUE: &str = "selfcheck";
+
+/// A sandbox the subject policy must refuse for its mark alone: schema-valid (the CRD's own
+/// validation runs before admission), carrying [`FRONT_DOOR_ANNOTATION`] with a value that is
+/// not [`FRONT_DOOR_API`].
+fn front_door_probe(namespace: &str) -> AgentSandbox {
+    let mut sb = AgentSandbox::new(
+        &format!(
+            "{FRONT_DOOR_PROBE_PREFIX}{}",
+            &Uuid::new_v4().simple().to_string()[..12]
+        ),
+        AgentSandboxSpec {
+            subject: SandboxSubject {
+                issuer: "https://selfcheck.invalid".into(),
+                id: "mediatore-selfcheck".into(),
+                display: None,
+            },
+            pool_ref: Some(LocalObjectReference {
+                name: "mediatore-selfcheck".into(),
+            }),
+            pool_selector: None,
+            selection: None,
+            ttl_seconds: 60,
+            audiences: vec![],
+            workload: SandboxWorkload {
+                image: "registry.invalid/selfcheck:0".into(),
+                args: vec![],
+                restart: None,
+                logs: false,
+            },
+            policy_ref: None,
+        },
+    );
+    sb.metadata.namespace = Some(namespace.to_owned());
+    sb.metadata.annotations = Some(BTreeMap::from([(
+        FRONT_DOOR_ANNOTATION.to_owned(),
+        FRONT_DOOR_PROBE_VALUE.to_owned(),
+    )]));
+    sb
+}
+
+/// Why the front-door self-check failed: the broker does not serve (ADR-0072 decision 5).
+#[derive(Debug, thiserror::Error)]
+pub enum FrontDoorCheckError {
+    /// The dry run was admitted: the policy is absent, unbound or older than ADR-0072.
+    #[error(
+        "the subject admission policy does not reserve the annotation mediatore.io/front-door: the API server admitted a dry-run AgentSandbox {0} carrying a forged one. Apply deploy/base/admission/agentsandbox-subject.yaml from this release before the broker starts"
+    )]
+    Admitted(String),
+    /// The policy refused, but could not evaluate (its parameter is missing or incomplete).
+    #[error(
+        "the subject admission policy is bound but cannot be evaluated, so it proves nothing about mediatore.io/front-door: restore the ConfigMap mediatore-agentsandbox-subject-policy with its key `broker`. The API server said: {0}"
+    )]
+    Parameter(String),
+    /// Refused, and not by validation 3 of the policy (RBAC, the schema, another plugin, an
+    /// older policy that refuses for another reason).
+    #[error(
+        "the dry-run AgentSandbox carrying a forged mediatore.io/front-door was refused, but not by the subject admission policy's rule for it (HTTP {code}), which proves nothing about it: {message}"
+    )]
+    Refused {
+        /// The HTTP status code of the answer.
+        code: u16,
+        /// The API server's message.
+        message: String,
+    },
+    /// No answer from the API server.
+    #[error("the API server did not answer the front-door self-check: {0}")]
+    Unreachable(String),
+}
+
+/// Read the API server's answer to the front-door self-check (ADR-0072 decision 5). Only a
+/// refusal by the subject policy whose message is validation 3's is proof; a refusal by the
+/// same policy that could not evaluate is not, nor is anything else.
+///
+/// # Errors
+/// The [`FrontDoorCheckError`] that says which.
+pub fn judge_front_door_check(
+    name: &str,
+    answer: Result<AgentSandbox, kube::Error>,
+) -> Result<(), FrontDoorCheckError> {
+    let status = match answer {
+        Ok(_) => return Err(FrontDoorCheckError::Admitted(name.to_owned())),
+        Err(kube::Error::Api(status)) => status,
+        Err(e) => return Err(FrontDoorCheckError::Unreachable(e.to_string())),
+    };
+    let by_the_policy = matches!(status.code, 403 | 422)
+        && status
+            .message
+            .contains(&format!("ValidatingAdmissionPolicy '{SUBJECT_POLICY}'"));
+    if by_the_policy
+        && ["failed to configure binding", "resulted in error"]
+            .iter()
+            .any(|n| status.message.contains(n))
+    {
+        return Err(FrontDoorCheckError::Parameter(status.message.clone()));
+    }
+    if by_the_policy && status.message.contains(FRONT_DOOR_POLICY_MESSAGE) {
+        return Ok(());
+    }
+    Err(FrontDoorCheckError::Refused {
+        code: status.code,
+        message: status.message.clone(),
+    })
 }
 
 fn front_door_error(e: kube::Error) -> FrontDoorError {
@@ -1660,6 +1847,8 @@ mod tests {
             requeue: Duration::from_millis(5),
             audiences: vec![Audience::named("api.example")],
             issuers: vec![ISSUER.into()],
+            // One issuer and the key not written: that issuer (ADR-0072 decision 4).
+            declarative_issuers: vec![ISSUER.into()],
             ..WatcherConfig::default()
         }
     }
@@ -2595,6 +2784,266 @@ mod tests {
         }
     }
 
+    /// The subject policy's variables and validations, by name and by position.
+    fn subject_policy() -> (serde_json::Value, Vec<serde_json::Value>) {
+        let docs = admission_docs("agentsandbox-subject.yaml");
+        let policy = docs
+            .iter()
+            .find(|d| d["kind"] == "ValidatingAdmissionPolicy")
+            .expect("the policy")
+            .clone();
+        let validations = policy["spec"]["validations"].as_array().unwrap().clone();
+        (policy, validations)
+    }
+
+    fn variable(policy: &serde_json::Value, name: &str) -> String {
+        policy["spec"]["variables"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["name"] == name)
+            .unwrap_or_else(|| panic!("variable {name}"))["expression"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    /// Whitespace collapsed, so a test reads an expression and not its line breaks.
+    fn squeezed(text: &str) -> String {
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// ADR-0072 decision 1. These pin the text; that an API server evaluates it so is
+    /// `make kind-e2e-sandbox`'s.
+    #[test]
+    fn the_subject_policy_has_no_fallback_once_issuer_prefixes_is_set() {
+        let (policy, validations) = subject_policy();
+        // Every non-blank line counts, parsed or not.
+        let lines = squeezed(&variable(&policy, "issuerLines"));
+        assert!(lines.contains("filter(l, l.trim() != '')"), "{lines}");
+        let pairs = squeezed(&variable(&policy, "issuerPrefixes"));
+        assert!(
+            !pairs.contains("size(e) == 2"),
+            "a malformed line is kept for the soundness check, never dropped: {pairs}"
+        );
+        // Listed: any issuer while nothing is listed, otherwise only a listed one.
+        let listed = squeezed(&variable(&policy, "issuerListed"));
+        assert!(
+            listed.starts_with("size(variables.issuerLines) == 0 ||"),
+            "{listed}"
+        );
+        assert!(
+            listed.contains("e[0] == object.spec.subject.issuer"),
+            "{listed}"
+        );
+        // The single prefix is read only while nothing is listed: no fallback.
+        let expected = squeezed(&variable(&policy, "expectedPrefix"));
+        assert!(
+            expected.starts_with("size(variables.issuerLines) == 0 ? variables.usernamePrefix :"),
+            "{expected}"
+        );
+        assert_eq!(expected.matches("variables.usernamePrefix").count(), 1);
+        let first = squeezed(validations[0]["expression"].as_str().unwrap());
+        for term in [
+            "variables.isMediatore",
+            "variables.isBroker",
+            "variables.issuerPrefixesAreSound && variables.issuerListed && variables.expectedPrefix + object.spec.subject.id == request.userInfo.username",
+        ] {
+            assert!(first.contains(term), "{term} in {first}");
+        }
+        let message = squeezed(validations[0]["messageExpression"].as_str().unwrap());
+        assert!(
+            message.contains("' is not listed in issuerPrefixes of ConfigMap'"),
+            "{message}"
+        );
+        assert_eq!(validations[0]["reason"], "Forbidden");
+    }
+
+    /// ADR-0072 decision 2.
+    #[test]
+    fn the_subject_policy_refuses_a_list_that_cannot_tell_its_issuers_apart() {
+        let (policy, validations) = subject_policy();
+        let sound = squeezed(&variable(&policy, "issuerPrefixesAreSound"));
+        for term in [
+            // every line a pair
+            "variables.issuerPrefixes.all(e, size(e) == 2)",
+            // no issuer twice
+            "size(variables.issuerPrefixes.filter(b, b[0] == a[0])) == 1",
+            // no prefix equal to another or the start of another
+            "size(variables.issuerPrefixes.filter(b, b[1].startsWith(a[1]))) == 1",
+        ] {
+            assert!(sound.contains(term), "{term} in {sound}");
+        }
+        let message = squeezed(validations[0]["messageExpression"].as_str().unwrap());
+        assert!(
+            message.starts_with("!variables.issuerPrefixesAreSound ? 'issuerPrefixes of ConfigMap"),
+            "{message}"
+        );
+    }
+
+    /// ADR-0072 decision 3: validations 3 and 4.
+    #[test]
+    fn the_subject_policy_reserves_the_front_door_annotation_to_the_broker() {
+        let (_, validations) = subject_policy();
+        assert_eq!(
+            validations.len(),
+            4,
+            "1 id, 2 immutable spec, 3 and 4 the mark"
+        );
+        let create = squeezed(validations[2]["expression"].as_str().unwrap());
+        assert_eq!(
+            create,
+            "request.operation != 'CREATE' || !variables.frontDoor.hasValue() || (variables.isMediatore && variables.frontDoor.value() == 'api')"
+        );
+        assert!(
+            !create.contains("isBroker"),
+            "the brokers list does not lift it"
+        );
+        let update = squeezed(validations[3]["expression"].as_str().unwrap());
+        assert!(
+            update.starts_with("request.operation != 'UPDATE' ||"),
+            "{update}"
+        );
+        assert!(
+            update.contains("variables.frontDoor.hasValue() == oldObject.metadata.?annotations[?'mediatore.io/front-door'].hasValue()")
+                && update.contains("variables.frontDoor.orValue('') == oldObject.metadata.?annotations[?'mediatore.io/front-door'].orValue('')"),
+            "neither added, changed nor removed: {update}"
+        );
+        assert!(!update.contains("isMediatore"), "binds the broker too");
+        for v in &validations[2..] {
+            assert_eq!(v["reason"], "Forbidden");
+        }
+        // The self-check reads validation 3's refusal by this fragment of its message.
+        let message = squeezed(validations[2]["messageExpression"].as_str().unwrap());
+        assert!(
+            message.contains(&format!(
+                "'{}",
+                FRONT_DOOR_POLICY_MESSAGE.replace('\'', "\\'")
+            )),
+            "{message}"
+        );
+    }
+
+    /// ADR-0072 decision 3: the key and the value in the CEL are the ones the broker writes
+    /// and reads.
+    #[test]
+    fn the_annotation_the_policy_guards_is_the_one_the_broker_writes() {
+        let (policy, validations) = subject_policy();
+        assert_eq!(
+            variable(&policy, "frontDoor"),
+            format!("object.metadata.?annotations[?'{FRONT_DOOR_ANNOTATION}']")
+        );
+        let create = validations[2]["expression"].as_str().unwrap();
+        assert!(
+            create.contains(&format!("== '{FRONT_DOOR_API}'")),
+            "{create}"
+        );
+        let update = validations[3]["expression"].as_str().unwrap();
+        assert!(
+            update.contains(&format!("[?'{FRONT_DOOR_ANNOTATION}']")),
+            "{update}"
+        );
+        assert_eq!(
+            policy["metadata"]["name"], SUBJECT_POLICY,
+            "the self-check looks for this name in a refusal"
+        );
+    }
+
+    // ----- ADR-0072 decision 5: the front-door self-check ------------------------------------------------
+
+    fn api_error(code: u16, message: &str) -> kube::Error {
+        kube::Error::Api(
+            kube::core::Status::failure(message, "Forbidden")
+                .with_code(code)
+                .boxed(),
+        )
+    }
+
+    fn refusal_by(validation_message: &str) -> String {
+        format!(
+            "agentsandboxes.mediatore.io \"mediatore-selfcheck-x\" is forbidden: ValidatingAdmissionPolicy '{SUBJECT_POLICY}' with binding '{SUBJECT_POLICY}' denied request: {validation_message}"
+        )
+    }
+
+    #[test]
+    fn the_front_door_check_passes_on_the_policys_refusal() {
+        let answer = Err(api_error(
+            403,
+            &refusal_by(&format!(
+                "{FRONT_DOOR_POLICY_MESSAGE}: it marks a sandbox the broker created through POST /v1/claims"
+            )),
+        ));
+        judge_front_door_check("mediatore-selfcheck-x", answer).unwrap();
+        // The probe is what the rule is about: the mark with a value that is not `api`.
+        let probe = front_door_probe("mediatore-system");
+        assert!(probe.name_any().starts_with(FRONT_DOOR_PROBE_PREFIX));
+        assert_eq!(probe.namespace().as_deref(), Some("mediatore-system"));
+        assert_eq!(
+            probe
+                .annotations()
+                .get(FRONT_DOOR_ANNOTATION)
+                .map(String::as_str),
+            Some(FRONT_DOOR_PROBE_VALUE)
+        );
+        assert!(!created_through_the_api(&probe));
+    }
+
+    #[test]
+    fn a_probe_that_is_admitted_or_refused_by_something_else_stops_the_broker() {
+        let probe = front_door_probe("mediatore-system");
+        assert!(matches!(
+            judge_front_door_check("p", Ok(probe)),
+            Err(FrontDoorCheckError::Admitted(name)) if name == "p"
+        ));
+        // The same policy, but a validation other than the mark's (an older policy).
+        assert!(matches!(
+            judge_front_door_check(
+                "p",
+                Err(api_error(403, &refusal_by("spec.subject.id is x")))
+            ),
+            Err(FrontDoorCheckError::Refused { code: 403, .. })
+        ));
+        // The same policy, unable to evaluate.
+        for text in [
+            "failed to configure binding: no params found for policy binding with `Deny` parameterNotFoundAction",
+            "expression 'params.data.broker.trim()' resulted in error: no such key: broker",
+        ] {
+            assert!(matches!(
+                judge_front_door_check("p", Err(api_error(403, &refusal_by(text)))),
+                Err(FrontDoorCheckError::Parameter(_))
+            ));
+        }
+        // RBAC, the schema, another policy whose name merely contains this one's.
+        for (code, text) in [
+            (
+                403,
+                "agentsandboxes.mediatore.io is forbidden: User \"x\" cannot create resource \"agentsandboxes\"",
+            ),
+            (
+                422,
+                "AgentSandbox.mediatore.io \"p\" is invalid: spec.ttlSeconds: Invalid value",
+            ),
+            (
+                403,
+                &format!(
+                    "ValidatingAdmissionPolicy '{SUBJECT_POLICY}-copy' with binding 'b' denied request: {FRONT_DOOR_POLICY_MESSAGE}"
+                ),
+            ),
+        ] {
+            assert!(
+                matches!(
+                    judge_front_door_check("p", Err(api_error(code, text))),
+                    Err(FrontDoorCheckError::Refused { .. })
+                ),
+                "{text}"
+            );
+        }
+        assert!(matches!(
+            judge_front_door_check("p", Err(kube::Error::LinesCodecMaxLineLengthExceeded)),
+            Err(FrontDoorCheckError::Unreachable(_))
+        ));
+    }
+
     /// How the three policies that name the broker spell "the request is from the broker":
     /// the key `broker` of their one parameter, never a literal (ADR-0056 decision 4).
     const FROM_THE_BROKER: &str = "request.userInfo.username == params.data.broker.trim()";
@@ -3461,6 +3910,197 @@ mod tests {
                 "{want}: no record"
             );
         }
+    }
+
+    // ----- ADR-0072: a hand-created sandbox names only an issuer its creator can come from ---------------
+
+    const OTHER_ISSUER: &str = "https://other.example.com";
+
+    /// The broker trusting [`ISSUER`] and [`OTHER_ISSUER`], with `declarative` as the resolved
+    /// `sandboxes.declarative_issuers`.
+    fn two_issuers(declarative: &[&str]) -> WatcherConfig {
+        WatcherConfig {
+            issuers: vec![ISSUER.into(), OTHER_ISSUER.into()],
+            declarative_issuers: declarative.iter().map(|i| (*i).to_owned()).collect(),
+            ..cfg()
+        }
+    }
+
+    /// The sandbox of [`sandbox`], naming `issuer`, marked as the broker's when `api`.
+    fn sandbox_at(issuer: &str, api: bool) -> AgentSandbox {
+        let mut sb = sandbox(true, false);
+        sb.spec.subject.issuer = issuer.into();
+        if api {
+            sb.metadata.annotations = Some(BTreeMap::from([(
+                FRONT_DOOR_ANNOTATION.to_owned(),
+                FRONT_DOOR_API.to_owned(),
+            )]));
+        }
+        sb
+    }
+
+    /// One pass: the status the fake holds after it, and whether a claim exists.
+    async fn one_pass(r: &Rig, sb: &AgentSandbox) -> (AgentSandboxStatus, bool) {
+        r.claims.put_sandbox(sb.clone());
+        r.watcher.reconcile_sandbox(sb).await.unwrap();
+        let status = r
+            .claims
+            .sandbox("sandboxes", "sb-1")
+            .unwrap()
+            .status
+            .unwrap_or_default();
+        (status, r.claims.claim("sandboxes", "sb-1").is_some())
+    }
+
+    async fn assert_refused_for_its_issuer(r: &Rig, sb: &AgentSandbox) {
+        let (status, claimed) = one_pass(r, sb).await;
+        assert_eq!(status.phase, SandboxPhase::Failed);
+        assert_eq!(
+            status.reason.as_deref(),
+            Some(issuer_not_declarative(&sb.spec.subject.issuer).as_str())
+        );
+        assert!(!claimed, "no claim");
+        assert!(r.store.list_claims().await.unwrap().is_empty(), "no record");
+    }
+
+    #[tokio::test]
+    async fn with_one_issuer_a_hand_created_sandbox_naming_it_is_admitted_as_before() {
+        let r = rig(cfg());
+        let (status, claimed) = one_pass(&r, &sandbox_at(ISSUER, false)).await;
+        assert_ne!(status.phase, SandboxPhase::Failed, "{:?}", status.reason);
+        assert!(claimed, "the claim is created as before ADR-0072");
+    }
+
+    #[tokio::test]
+    async fn with_two_issuers_a_hand_created_sandbox_is_refused_unless_its_issuer_is_declared() {
+        // The key not written under two issuers: nothing is declared, the path is closed.
+        for issuer in [ISSUER, OTHER_ISSUER] {
+            assert_refused_for_its_issuer(&rig(two_issuers(&[])), &sandbox_at(issuer, false)).await;
+        }
+        // Declared: that issuer, and no other.
+        let r = rig(two_issuers(&[ISSUER]));
+        let (status, claimed) = one_pass(&r, &sandbox_at(ISSUER, false)).await;
+        assert_ne!(status.phase, SandboxPhase::Failed, "{:?}", status.reason);
+        assert!(claimed);
+        assert_refused_for_its_issuer(
+            &rig(two_issuers(&[ISSUER])),
+            &sandbox_at(OTHER_ISSUER, false),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn with_two_issuers_a_sandbox_created_through_the_api_names_any_configured_issuer() {
+        for issuer in [ISSUER, OTHER_ISSUER] {
+            let r = rig(two_issuers(&[]));
+            let (status, claimed) = one_pass(&r, &sandbox_at(issuer, true)).await;
+            assert_ne!(
+                status.phase,
+                SandboxPhase::Failed,
+                "{issuer}: {:?}",
+                status.reason
+            );
+            assert!(claimed, "{issuer}");
+        }
+        // The mark does not excuse an issuer that is not configured at all.
+        let r = rig(two_issuers(&[]));
+        let (status, claimed) = one_pass(&r, &sandbox_at("https://third.example.com", true)).await;
+        assert_eq!(
+            status.reason.as_deref(),
+            Some("issuer https://third.example.com is not configured")
+        );
+        assert!(!claimed);
+    }
+
+    #[tokio::test]
+    async fn an_empty_declarative_issuers_closes_the_declarative_path_with_one_issuer_too() {
+        let r = rig(WatcherConfig {
+            declarative_issuers: vec![],
+            ..cfg()
+        });
+        assert_refused_for_its_issuer(&r, &sandbox_at(ISSUER, false)).await;
+        // The broker's own sandbox is not asked.
+        let r = rig(WatcherConfig {
+            declarative_issuers: vec![],
+            ..cfg()
+        });
+        assert!(one_pass(&r, &sandbox_at(ISSUER, true)).await.1);
+    }
+
+    #[tokio::test]
+    async fn a_front_door_annotation_with_another_value_is_a_hand_created_sandbox() {
+        assert!(created_through_the_api(&sandbox_at(ISSUER, true)));
+        assert!(!created_through_the_api(&sandbox_at(ISSUER, false)));
+        for value in ["API", "api ", " api", "", "yes", "true", "api,api"] {
+            let mut sb = sandbox_at(OTHER_ISSUER, false);
+            sb.metadata.annotations = Some(BTreeMap::from([(
+                FRONT_DOOR_ANNOTATION.to_owned(),
+                value.to_owned(),
+            )]));
+            assert!(!created_through_the_api(&sb), "{value:?}");
+            assert_refused_for_its_issuer(&rig(two_issuers(&[ISSUER])), &sb).await;
+        }
+        // Another key carrying `api` is not the mark either.
+        let mut sb = sandbox_at(OTHER_ISSUER, false);
+        sb.metadata.annotations = Some(BTreeMap::from([(
+            "mediatore.io/front-door-x".to_owned(),
+            FRONT_DOOR_API.to_owned(),
+        )]));
+        assert!(!created_through_the_api(&sb));
+    }
+
+    #[tokio::test]
+    async fn a_refused_issuer_creates_no_claim_no_record_and_drops_nothing_it_did_not_park() {
+        let r = rig(two_issuers(&[ISSUER]));
+        // Another sandbox's parked session, which the refusal must not touch.
+        let other_uid = Uuid::new_v4();
+        r.store
+            .put_session(mediatore_store::SessionRecord {
+                sandbox_uid: other_uid,
+                ..parked_session()
+            })
+            .await
+            .unwrap();
+        assert_refused_for_its_issuer(&r, &sandbox_at(OTHER_ISSUER, false)).await;
+        assert!(
+            r.store.take_session(other_uid).await.unwrap().is_some(),
+            "another sandbox's parked session is left where it was"
+        );
+        assert!(r.entries.names().is_empty(), "no entry declared");
+    }
+
+    #[tokio::test]
+    async fn a_sandbox_already_claimed_is_not_failed_when_declarative_issuers_changes() {
+        let r = rig(cfg());
+        let sb = sandbox_at(ISSUER, false);
+        let bound = settle(&r, &sb).await;
+        assert!(r.claims.claim("sandboxes", "sb-1").is_some());
+        let before = bound.status.clone().unwrap();
+        assert_ne!(before.phase, SandboxPhase::Failed);
+        // The operator closes the declarative path; the same objects, a new broker.
+        let later = Watcher::new(
+            Reconciler {
+                store: r.store.clone(),
+                spire: r.entries.clone(),
+                naming: mediatore_spire::Naming {
+                    trust_domain: "sandbox.test".into(),
+                },
+            },
+            r.claims.clone(),
+            two_issuers(&[]),
+        );
+        later.reconcile_sandbox(&bound).await.unwrap();
+        let after = r
+            .claims
+            .sandbox("sandboxes", "sb-1")
+            .unwrap()
+            .status
+            .unwrap();
+        assert_ne!(after.phase, SandboxPhase::Failed, "{:?}", after.reason);
+        assert!(
+            r.claims.claim("sandboxes", "sb-1").is_some(),
+            "the claim stays"
+        );
     }
 
     /// ADR-0045 decision 11: a sandbox that asks for its workload's output on a broker that

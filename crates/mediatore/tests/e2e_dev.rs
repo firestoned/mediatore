@@ -270,7 +270,7 @@ impl Harness {
             registry_audiences: None,
             policy_egress: policy,
             sandboxes: None,
-            namespaces,
+            namespaces: with_fixture_issuer(namespaces, &idp.issuer),
             max_ttl_seconds: mediatore_proto::DEFAULT_MAX_TTL_SECONDS,
             sealer: Some(Arc::new(LocalKeySealer::new([9u8; 32]))),
             limiter: Limiter::new(10),
@@ -1932,11 +1932,38 @@ async fn a_delegation_is_required_where_the_audience_wants_one_and_refused_anywh
 const ADMIN_GROUP: &str = "example-org:APP_EXAMPLE_ADMIN";
 const TEAM_A_GROUP: &str = "APP_EXAMPLE_TEAM_A_USER";
 
+/// Stands for the fake issuer's URL in a map written before it listens; the harness puts in
+/// the URL it took (ADR-0074: every entry names the issuers its groups are read from).
+const FIXTURE_ISSUER: &str = "https://fixture-issuer.test";
+
 fn tenant_map() -> Namespaces {
+    let grant = |group: &str| mediatore_api::NamespaceGrant {
+        groups: vec![group.to_owned()],
+        issuers: vec![FIXTURE_ISSUER.to_owned()],
+    };
     Namespaces::Map(std::collections::BTreeMap::from([
-        ("infra".to_owned(), vec![ADMIN_GROUP.to_owned()]),
-        ("team-a".to_owned(), vec![TEAM_A_GROUP.to_owned()]),
+        ("infra".to_owned(), grant(ADMIN_GROUP)),
+        ("team-a".to_owned(), grant(TEAM_A_GROUP)),
     ]))
+}
+
+/// `namespaces` with [`FIXTURE_ISSUER`] replaced by `issuer`.
+fn with_fixture_issuer(namespaces: Namespaces, issuer: &str) -> Namespaces {
+    match namespaces {
+        Namespaces::Map(map) => Namespaces::Map(
+            map.into_iter()
+                .map(|(ns, mut grant)| {
+                    for i in &mut grant.issuers {
+                        if i == FIXTURE_ISSUER {
+                            issuer.clone_into(i);
+                        }
+                    }
+                    (ns, grant)
+                })
+                .collect(),
+        ),
+        single @ Namespaces::Single(_) => single,
+    }
 }
 
 impl Harness {

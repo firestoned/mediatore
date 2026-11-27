@@ -134,6 +134,7 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
     let sealer = sealer(&cfg).await?;
     let store = store(&cfg, client.as_ref(), sealer.clone())?;
     let sandboxes = sandbox_front(&cfg, client.as_ref())?;
+    prove_front_door(&cfg, client.as_ref()).await?;
 
     let sts = sts(&cfg)?;
 
@@ -428,7 +429,9 @@ async fn claim_watcher(
                 })
                 .collect(),
             scopes: audience_scopes(cfg),
-            issuers: cfg.issuers.iter().map(|i| i.url.clone()).collect(),
+            issuers: cfg.issuer_urls(),
+            // ADR-0072 decision 4: what a sandbox created by hand may name, resolved.
+            declarative_issuers: cfg.declarative_issuers(),
             max_ttl_seconds: cfg.sandboxes.max_ttl_seconds,
             registry_audiences: cfg.granted_registries(),
             placed_registries: cfg.placed_registries(),
@@ -864,6 +867,28 @@ fn claimable_at_home(home: &str, claimable: &Namespaces) -> Vec<String> {
     .into_iter()
     .filter(|namespace| namespace == home)
     .collect()
+}
+
+/// ADR-0072 decision 5: where the rule of decision 4 is in force (some configured issuer may
+/// not be named on the declarative path), the broker relies on its mark and first proves the
+/// subject admission policy guards it, by a dry run in its home namespace the policy must
+/// refuse. Admitted, refused by anything else or unanswered, the broker does not serve. Where
+/// the rule decides nothing no probe is sent, and `dev_mode` has no API server to ask.
+async fn prove_front_door(cfg: &Config, client: Option<&kube::Client>) -> anyhow::Result<()> {
+    let Some(client) = client else {
+        return Ok(());
+    };
+    if !cfg.front_door_rule_in_force() {
+        return Ok(());
+    }
+    KubeSandboxes::new(client.clone())
+        .self_check(client.default_namespace())
+        .await
+        .map_err(|e| {
+            anyhow::Error::new(e).context(
+                "the broker does not start: the front-door self-check failed (ADR-0072 decision 5)",
+            )
+        })
 }
 
 /// Fail closed on the manager's self-check: an admitted forbidden entry, a refusal that is
@@ -1339,10 +1364,14 @@ mod tests {
         assert_eq!(claimable_at_home(home, &single), vec![home.to_owned()]);
         check_home_namespace(home, &single).expect("warned, not refused");
 
+        let grant = |group: &str| mediatore_api::NamespaceGrant {
+            groups: vec![group.to_owned()],
+            issuers: vec!["https://dex.example.com".to_owned()],
+        };
         let map = Namespaces::Map(
             [
-                ("team-a".to_owned(), vec!["a".to_owned()]),
-                (home.to_owned(), vec!["platform".to_owned()]),
+                ("team-a".to_owned(), grant("a")),
+                (home.to_owned(), grant("platform")),
             ]
             .into_iter()
             .collect(),
@@ -1352,7 +1381,7 @@ mod tests {
 
         for apart in [
             Namespaces::Single("sandboxes".into()),
-            Namespaces::Map([("team-a".to_owned(), vec![])].into_iter().collect()),
+            Namespaces::Map([("team-a".to_owned(), grant("a"))].into_iter().collect()),
         ] {
             assert_eq!(claimable_at_home(home, &apart), Vec::<String>::new());
         }

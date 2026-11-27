@@ -236,7 +236,19 @@ twice: the gate cannot say "this group may claim here". The decision:
   error** telling you to list the policy namespaces: it no longer defaults to the claims' namespace,
   because there is none. Without the map the old default stands.
 - **The declarative path is not governed by the map.** A person with `create agentsandboxes` in a
-  namespace holds a Kubernetes grant; the map is a control on the broker's front door only.
+  namespace holds a Kubernetes grant; the map is a control on the broker's front door only. What
+  such a sandbox may say about its subject's issuer is
+  [ADR-0072](../adr/0072-a-hand-created-sandbox-names-only-an-issuer-its-creator-can-come-from.md)'s:
+  with two or more issuers, only the ones `sandboxes.declarative_issuers` lists, none by default.
+- **An entry's groups are read from the issuers it names**
+  ([ADR-0074](../adr/0074-a-namespaces-groups-read-only-from-the-issuers-it-names.md)). A group
+  name is unique only inside the issuer that gave it: `platform-admins` at one directory and at
+  another are two sets of people. Each entry takes `issuers`, a list of `issuers[].url` values, and
+  a token qualifies only when its issuer is listed and its groups intersect. With two or more
+  issuers every entry must list its issuers or the broker does not start; with one, the key is
+  optional and read as that issuer. A token of an issuer the entry does not list gets exactly the
+  answer of a caller without the group. An entry that lists several issuers reads its groups from
+  each: list several only where the name means the same people at each.
 - **Unknown keys are refused across the whole config file.** A misspelled key (`group:` for
   `groups:`, a misspelled `sandboxes`) is a start error naming the key, in the issuer, `session`,
   `entra`, `sandboxes` and namespace-entry blocks and at the top level.
@@ -259,6 +271,33 @@ sandboxes:
   namespaces:
     infra:  { groups: [example-org:APP_EXAMPLE_ADMIN, APP_EXAMPLE_ADMIN] }
     team-a: { groups: [APP_EXAMPLE_TEAM_A_USER] }
+```
+
+With a second issuer, each entry names the issuers its groups are read from (ADR-0074); the
+start refuses an entry that does not:
+
+```yaml
+issuers:
+  - url: https://login.example.com
+    backend: sts
+    client_id: mediatore
+    subject_claim: preferred_username
+    required_groups: [example-org:APP_EXAMPLE_ADMIN, APP_EXAMPLE_ADMIN, APP_EXAMPLE_TEAM_A_USER]
+    subject_prefix: "login:"              # two issuers: each qualifies `sub` and `groups` (ADR-0071, ADR-0073)
+  - url: https://dex.example.com
+    backend: sts
+    client_id: mediatore
+    subject_claim: preferred_username
+    required_groups: [example-org:APP_EXAMPLE_ADMIN]
+    subject_prefix: "dex:"
+sandboxes:
+  namespaces:
+    infra:
+      issuers: [https://login.example.com, https://dex.example.com]
+      groups: [example-org:APP_EXAMPLE_ADMIN, APP_EXAMPLE_ADMIN]
+    team-a:
+      issuers: [https://login.example.com]
+      groups: [APP_EXAMPLE_TEAM_A_USER]
 ```
 
 A request then names its namespace, for example `mediatore sandbox create --namespace team-a`.

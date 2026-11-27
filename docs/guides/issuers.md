@@ -206,7 +206,34 @@ What to know before adding a second issuer to a running deployment:
 - A resource server that wants the two halves reads `sub` up to the first `:` as the
   prefix and the rest as the id, or reads `upstream_iss`.
 
-The broker logs one line per issuer at start saying which form `sub` takes.
+The same prefix qualifies the token's `groups`
+([ADR-0073](../adr/0073-groups-qualified-by-issuer-when-the-broker-trusts-several.md)): a group
+name is unique only inside the issuer that gave it, so with `subject_prefix: "dex:"` the
+upstream's `platform-admins` is minted `dex:platform-admins`, beside `sub: dex:octocat`.
+Every element is qualified, in the upstream's order and spelling; a group that holds a `:`
+itself keeps it after the prefix. A resource server that maps groups to roles needs the
+qualified names on the same restart that changes `sub`. The broker's own decisions (each
+issuer's `required_groups`, the namespace map) keep the upstream's spelling: the prefix is in
+the token and nowhere else. An issuer with no `session` that is not Entra mints no groups, as
+before.
+
+The broker logs one line per issuer at start saying which form `sub` and `groups` take.
+
+Two more settings follow from a second issuer:
+
+- **The namespace map names its issuers.** With `sandboxes.namespaces` set, each entry lists
+  the issuers its groups are read from, or the broker does not start
+  ([ADR-0074](../adr/0074-a-namespaces-groups-read-only-from-the-issuers-it-names.md);
+  [multi-tenant authorization](multi-tenant-authorization.md#5-groups-per-namespace-v030)).
+- **A sandbox created with `kubectl` names only a declared issuer.** The API server cannot
+  tell which issuer authenticated its caller, so with two or more issuers an `AgentSandbox`
+  created through the Kubernetes API (not `POST /v1/claims`) is refused by the broker unless
+  its issuer is in `sandboxes.declarative_issuers`, which is empty until you write it
+  ([ADR-0072](../adr/0072-a-hand-created-sandbox-names-only-an-issuer-its-creator-can-come-from.md)).
+  List the issuers your API server's users come from, and give each of them its own prefix in
+  the admission policy's `issuerPrefixes`
+  ([requesting a sandbox](requesting-a-sandbox.md#who-may-name-which-subject)). The start
+  `warn`s while the key is not written.
 
 ## What stays the same everywhere
 
@@ -214,8 +241,8 @@ The broker logs one line per issuer at start saying which form `sub` takes.
   banlieue's policy prefixes usernames per issuer (`github:`, `google:`) when it compares
   a declarative requester with `spec.subject`; the sandbox and the claim's record always
   hold the raw id. A token the broker's STS mints carries the raw id as `sub` with one
-  issuer, and `<subject_prefix><id>` once the issuer has a `subject_prefix`
-  ([more than one issuer](#more-than-one-issuer)).
+  issuer, and `<subject_prefix><id>` once the issuer has a `subject_prefix`, with each of its
+  `groups` qualified the same way ([more than one issuer](#more-than-one-issuer)).
 - Every issuer writes exactly one gate: `required_group` (one group), `required_groups`
   (a list, any one of them admits) or `allow_any_authenticated: true` (no gate, with a
   comment saying why). Both group keys on one issuer, an empty list, a duplicate or a
