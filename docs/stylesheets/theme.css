@@ -1,0 +1,200 @@
+/* Copyright (c) 2026 Erick Bourgeois, mediatore */
+/* SPDX-License-Identifier: Apache-2.0 */
+
+/* mediatore's docs theme: dark first, a violet-to-cyan gradient, soft glow on what you can act on. */
+
+:root {
+  --mt-violet: #a78bfa;
+  --mt-indigo: #6366f1;
+  --mt-cyan: #22d3ee;
+  --mt-gradient: linear-gradient(120deg, var(--mt-violet) 0%, var(--mt-indigo) 45%, var(--mt-cyan) 100%);
+  --mt-glow: 0 0 0 1px rgba(167, 139, 250, 0.25), 0 8px 30px -12px rgba(99, 102, 241, 0.55);
+  --mt-radius: 12px;
+}
+
+/* ---------- Dark (default) ---------- */
+[data-md-color-scheme="slate"] {
+  --md-hue: 245;
+  --md-default-bg-color: #0a0a17;
+  --md-default-fg-color: rgba(233, 233, 255, 0.92);
+  --md-default-fg-color--light: rgba(214, 214, 245, 0.68);
+  --md-default-fg-color--lighter: rgba(214, 214, 245, 0.38);
+  --md-default-fg-color--lightest: rgba(214, 214, 245, 0.1);
+  --md-primary-fg-color: #12122a;
+  --md-primary-fg-color--light: #1b1b3a;
+  --md-primary-fg-color--dark: #08081a;
+  --md-primary-bg-color: #ececff;
+  --md-accent-fg-color: var(--mt-cyan);
+  --md-accent-fg-color--transparent: rgba(34, 211, 238, 0.12);
+  --md-typeset-a-color: #b9a6ff;
+  --md-code-bg-color: #11112a;
+  --md-code-fg-color: #dcdcff;
+  --md-footer-bg-color: #08081a;
+  --md-footer-bg-color--dark: #050512;
+  --md-typeset-table-color: rgba(167, 139, 250, 0.16);
+}
+
+/* ---------- Light ---------- */
+[data-md-color-scheme="default"] {
+  --md-primary-fg-color: #4338ca;
+  --md-primary-fg-color--light: #6366f1;
+  --md-primary-fg-color--dark: #312e81;
+  --md-accent-fg-color: #0891b2;
+  --md-accent-fg-color--transparent: rgba(8, 145, 178, 0.1);
+  --md-typeset-a-color: #5b21b6;
+  --md-default-bg-color: #fbfbff;
+  --md-code-bg-color: #f3f2ff;
+}
+
+/* A faint grid behind the page, as on a plotting surface. Dark only. */
+[data-md-color-scheme="slate"] body {
+  background-image:
+    radial-gradient(ellipse 80% 50% at 50% -10%, rgba(99, 102, 241, 0.18), transparent 70%),
+    linear-gradient(rgba(167, 139, 250, 0.045) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(167, 139, 250, 0.045) 1px, transparent 1px);
+  background-size: 100% 100%, 32px 32px, 32px 32px;
+  background-attachment: fixed;
+}
+
+/* Header and tabs: glass over the grid, a gradient hairline underneath. */
+.md-header,
+.md-tabs {
+  background-color: color-mix(in srgb, var(--md-primary-fg-color) 78%, transparent);
+  backdrop-filter: saturate(160%) blur(12px);
+  -webkit-backdrop-filter: saturate(160%) blur(12px);
+}
+.md-header {
+  box-shadow: none;
+  border-bottom: 1px solid transparent;
+  border-image: var(--mt-gradient) 1;
+}
+.md-header__topic:first-child .md-ellipsis {
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+.md-tabs__link--active,
+.md-tabs__link:hover {
+  color: #fff;
+  text-shadow: 0 0 12px rgba(34, 211, 238, 0.55);
+}
+
+/* Type: tighter headings, the title in the gradient. */
+.md-typeset h1,
+.md-typeset h2,
+.md-typeset h3 {
+  letter-spacing: -0.02em;
+  font-weight: 700;
+}
+.md-typeset h1 {
+  background: var(--mt-gradient);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+.md-typeset h2 {
+  padding-bottom: 0.3em;
+  border-bottom: 1px solid var(--md-default-fg-color--lightest);
+}
+.md-typeset a {
+  text-decoration: none;
+  background-image: var(--mt-gradient);
+  background-size: 0% 1px;
+  background-position: 0 100%;
+  background-repeat: no-repeat;
+  transition: background-size 0.25s ease;
+}
+.md-typeset a:hover {
+  background-size: 100% 1px;
+}
+
+/* Code: rounded, a quiet border, a glow on hover. */
+.md-typeset pre > code,
+.md-typeset .highlight {
+  border-radius: var(--mt-radius);
+}
+.md-typeset .highlight {
+  border: 1px solid var(--md-default-fg-color--lightest);
+  transition: box-shadow 0.2s ease, border-color 0.2s ease;
+}
+.md-typeset .highlight:hover {
+  border-color: rgba(167, 139, 250, 0.4);
+  box-shadow: var(--mt-glow);
+}
+.md-typeset :not(pre) > code {
+  border-radius: 6px;
+  padding: 0.1em 0.35em;
+  border: 1px solid var(--md-default-fg-color--lightest);
+}
+
+/* Admonitions and tables as cards. */
+.md-typeset .admonition,
+.md-typeset details {
+  border-radius: var(--mt-radius);
+  border-width: 1px;
+  border-left-width: 1px;
+  box-shadow: var(--mt-glow);
+  background: color-mix(in srgb, var(--md-default-bg-color) 85%, var(--mt-indigo));
+}
+.md-typeset table:not([class]) {
+  border-radius: var(--mt-radius);
+  overflow: hidden;
+  border: 1px solid var(--md-default-fg-color--lightest);
+}
+.md-typeset table:not([class]) th {
+  background: color-mix(in srgb, var(--md-default-bg-color) 80%, var(--mt-indigo));
+}
+
+/* Navigation: the current page marked by a gradient bar, not just colour. */
+.md-nav__link--active {
+  position: relative;
+  font-weight: 600;
+}
+.md-nav--secondary .md-nav__link--active::before,
+.md-nav--primary .md-nav__item--active > .md-nav__link--active::before {
+  content: "";
+  position: absolute;
+  left: -0.6rem;
+  top: 0.15em;
+  bottom: 0.15em;
+  width: 2px;
+  border-radius: 2px;
+  background: var(--mt-gradient);
+}
+
+/* Search box with a glow on focus. */
+.md-search__form {
+  border-radius: 999px;
+  transition: box-shadow 0.2s ease;
+}
+.md-search__form:focus-within {
+  box-shadow: var(--mt-glow);
+}
+
+/* Buttons: the gradient. */
+.md-typeset .md-button--primary {
+  background: var(--mt-gradient);
+  border: none;
+  color: #fff;
+  box-shadow: var(--mt-glow);
+}
+
+/* Footer hairline. */
+.md-footer {
+  border-top: 1px solid transparent;
+  border-image: var(--mt-gradient) 1;
+}
+
+/* Mermaid diagrams on a card. */
+.md-typeset .mermaid {
+  padding: 1rem;
+  border-radius: var(--mt-radius);
+  border: 1px solid var(--md-default-fg-color--lightest);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .md-typeset a,
+  .md-typeset .highlight,
+  .md-search__form {
+    transition: none;
+  }
+}

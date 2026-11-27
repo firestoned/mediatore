@@ -31,23 +31,24 @@ theme:
   name: material
   language: en
   palette:
-    # Light mode
-    - scheme: default
-      primary: teal
-      accent: teal
-      toggle:
-        icon: material/brightness-7
-        name: Switch to dark mode
-    # Dark mode
+    # Dark first: the "slate" scheme is the default, light is the toggle.
     - scheme: slate
-      primary: teal
-      accent: teal
+      primary: custom
+      accent: custom
       toggle:
-        icon: material/brightness-4
+        icon: material/weather-sunny
         name: Switch to light mode
+    - scheme: default
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
   font:
-    text: Roboto
-    code: Roboto Mono
+    text: Inter
+    code: JetBrains Mono
+  logo: assets/mark.svg
+  favicon: assets/mark.svg
   features:
     - navigation.instant
     - navigation.instant.progress
@@ -71,6 +72,9 @@ theme:
     repo: fontawesome/brands/github
     edit: material/pencil
     view: material/eye
+
+extra_css:
+  - stylesheets/theme.css
 
 plugins:
   - search:
