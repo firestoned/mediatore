@@ -118,8 +118,10 @@ credential it produces. No layer is relied on alone.
    chain, keyed on the owner of the socket, so that the broker's address is reached by the
    authorizer's and the relay's users and by nobody else, and nothing on a gateway opens a
    new connection toward the sandbox interface. The input chain of this decision is
-   unchanged. The output chain is asserted in the built image and has not been loaded by a
-   booted gateway VM.*
+   unchanged. The output chain is asserted in the built image. Since 2026-11-27 it has been
+   loaded by one booted gateway VM, which served a claim under it with nothing legitimate
+   dropped; a refused connection being dropped has not been observed on a VM (ADR-0053, *What
+   was proven, and what was not*).*
 
 6. **The sandbox's own ruleset narrows by every uid, not only the sandbox uid.** ADR-0020
    decision 3 filters the `sb-` uid and leaves root-level rules to the image. For the

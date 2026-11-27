@@ -4,8 +4,11 @@
 # ADR-0053: The gateway's authorizer has an identity of its own
 
 **Status:** Accepted, implemented 2026-11-19, released in v0.4.0 (amended at implementation, each amendment dated at
-its decision; proven by the quality gate, the kind gateway tiers and the two image checks; nothing
-is proven on a booted gateway VM yet, so decisions 2, 5 and 6 are built and not verified there:
+its decision; proven by the quality gate, the kind gateway tiers and the two image checks; on 2026-11-27
+one gateway VM booted from the image carried a claim through a tunnel with the authorizer under its own
+ID and the output chain loaded; still not shown on a booted gateway: the chain dropping a refused
+destination, a refused name's `503`, the transition switch walked, the inject listener placing a
+credential, more than one gateway:
 *What was proven, and what was not*) · **Date:** 2026-11-19 · **Amended:** 2026-11-26 by
 [ADR-0068](0068-the-cloud-platforms-host-addresses-root-alone-on-azure-the-metadata-service-for-nobody.md)
 (decisions 5 and 6: ahead of every user's row the output chain drops IMDS for every user, root included,
@@ -264,9 +267,10 @@ Constraints that shape the decision:
    exception by default and is now refused until the line is added or the endpoint line is
    removed. `env.inject.example` is down to the one line inject itself adds
    (`INJECT_PORT_ELEMENT`); the binary's own default (`--listen 127.0.0.1:9001`) is unchanged,
-   for dev runs. Asserted by `make gateway-render-check` and `image/gateway/check.sh`; not run
-   on a booted gateway VM, where the socket's owner and group, the Envoy's connect over the
-   pipe and the refusal are still to be observed.*
+   for dev runs. Asserted by `make gateway-render-check` and `image/gateway/check.sh`. Observed
+   on one booted gateway VM on 2026-11-27: the socket's owner, group and mode, and a claim's
+   tunnels decided by the authorizer that listened on it. Not observed there: the refusal of an
+   env file updated by half, and another local user turned away at the socket.*
 
 6. **The same chain bounds the address a resolved name may lead to, and says what it does not
    bound.** The refused column for `envoy` and `envoy-inject` is applied by the kernel at
@@ -375,7 +379,8 @@ TB-3, TB-6, TB-13, TB-14 and TB-17 carry them with their tests since the pass of
 *(not built)* marks are left as the proposal read. Two rows are not as written. "A refused
 authorizer keeps serving what it had cached" is true for up to the stale bound (decision 7's
 amendment), and is an accepted risk there, not a control. "The chain cuts something the VM needs"
-is still *not proven*: no gateway VM has booted this table. The entries case of the TB-3 table
+is still *not proven*: no gateway VM has booted this table. (Since 2026-11-27 one has, and it
+served a claim: *What was proven, and what was not*.) The entries case of the TB-3 table
 runs in the kind gateway tier, not the entries tier.
 
 **TB-6, gateway to the broker's sandbox API (the two gateway routes)**
@@ -550,6 +555,19 @@ resolver; and the migration of decision 7 is walked once in each direction (swit
 off). Until that run has passed, decisions 2 and 5 are not to be called verified, whatever
 `make check` and CI say.
 
+*Amended 2026-11-27:* a live run has met part of that condition and not all of it (*Shown on a
+booted gateway, 2026-11-27*, below). Met: a gateway VM from the built image under the new
+entries, a pool member behind it, one claim through a tunnel, the authorizer holding the new ID,
+the agent reaching its server, the relay carrying the pool members' broker sessions and the
+resolver read from the VM. Not met: one gateway, not three; a tunnel, not the inject listener; no
+deliberate attempt at a refused destination, so no drop for an Envoy's user was observed, and no
+name made to resolve to one; the switch not walked in either direction. So decision 2 is shown
+on one booted gateway: the authorizer started on its own SVID and a broker with the switch off
+served the claim through it. Decision 5 is shown that far and no further: the chain loads, every
+user in it resolves, and nothing the gateway needs was dropped under it. That the chain refuses
+what it says it refuses is still not to be called verified on a VM, for decision 5 or for
+decision 6.
+
 ## What was proven, and what was not
 
 Proven on 2026-11-19, on the build host:
@@ -574,13 +592,64 @@ Proven on 2026-11-19, on the build host:
   gateway image carries the output chain and its five sub-chains, the users the table names, the
   optional sets in their default and filled forms, and the `MEDIATORE_URL` guard.
 
-Not proven: anything on a booted gateway VM. The tier's gateway is a pod, so no `unix:user`
+Not proven on 2026-11-19: anything on a booted gateway VM. The tier's gateway is a pod, so no `unix:user`
 selector, no host table and no systemd unit has run. The kernel's drops per user, the resolver
 (open question 6), the agent and the relay still reaching their upstreams under the chain, and
 the migration of decision 7 walked in each direction are all still to be observed, and the core
 cluster has not run this change. Until then decisions 2, 5 and 6 are built and not verified.
 Which certificate validator Envoy runs under the SDS secret is not established by this change
 either (the templates name none); it is recorded in the threat model.
+
+### Shown on a booted gateway, 2026-11-27
+
+One gateway VM in a homelab cluster was booted from the image built from `main` at `ee1cfe4`
+(the gateway image carrying this ADR and the unix check socket by default), under its three SPIRE
+entries, behind a broker with `accept_plain_gateway_identity: false`, and one claim was run
+through it. This is the first run of this change on a VM. It is one gateway on one hypervisor, not
+the three of *What must be proven*.
+
+Shown on the VM:
+
+- **The units and the identities.** All six units active. The SPIRE agent attested in one attempt
+  and issued the three SVIDs. The authorizer logged `the authorizer's SVID from the Workload API`
+  with `/gateway/authorizer` and listened on both sockets.
+- **The sockets.** The check directory at mode `2750`, owned by the authorizer's user with the
+  group `envoy`, and `check.sock` at `0660` with the group `envoy`; the inject directory the same
+  with the group `envoy-inject`.
+- **The table.** The host table's output chain loaded, with every `meta skuid` resolved to a uid,
+  and the authorizer's chain admitting the broker's address at its port. The relay carried the
+  pool members' broker sessions. The resolver was a non-loopback uplink nameserver.
+- **The claim.** A workload on a pool member got `200` with the bearer swapped in through a
+  tunnel, `200` bare, `403` for a path outside the rules, `404` for a host not granted and `404`
+  for the registry mirror used as an ordinary destination, three times over. Its image was pulled
+  through the claim's proxy and the gateway. The authorizer logged a `tunnel` decision for the
+  claim's SVID for each tunnel.
+- **The counters, afterwards.** The chain's drop counters were zero for the authorizer's rule and
+  for the all-user broker rule. The only drops were two multicast packets, LLMNR and IGMP,
+  leaving by the sandbox interface.
+
+Not shown by this run:
+
+- A connection from an Envoy's user to the broker, to loopback, to a link-local address or to a
+  control-plane address being dropped. No such attempt was made: the counters show that nothing
+  legitimate was dropped, not that something refused was.
+- A name that resolves into the refused set giving `503` for its tunnel.
+- The transition switch of decision 7 walked in either direction.
+- Which certificate validator Envoy runs.
+- The inject listener placing a credential on this image: the authorizer listened on the inject
+  socket, and that is all this run shows of it.
+- More than one gateway, and anything on another hypervisor.
+
+The boot journal showed two faults, neither fatal: `mediatore-gateway.service` failed its first
+two starts, once with `226/NAMESPACE` because its `ReadOnlyPaths=` named the agent's socket
+directory before that directory existed and once at its health check while the agent was not yet
+healthy, and came up on the third, so the path is now optional (`-`) in the authorizer's and the
+tunnel Envoy's units and the authorizer's unit has no start limit, which lets it retry for as
+long as the agent takes. The authorizer was also started once on the check socket alone and then
+restarted with both, because the example cloud-config wrote the inject drop-in in the `boot`
+stage, after systemd had started the unit, so the example now writes it in the `initramfs` stage
+and keeps only the start of `envoy-inject` in `boot`; neither fix has been booted yet (the
+first is asserted in the built image by `image/gateway/check.sh`).
 
 ## Open questions
 
@@ -629,8 +698,11 @@ either (the templates name none); it is recorded in the threat model.
    local stub resolver, the loopback refusal needs one more exception (the stub's address, port
    53) or Envoy's bootstrap names the egress resolver directly. *Recommendation:* name the
    resolver in the bootstrap from a new env key and keep loopback closed; to be settled by
-   reading the booted image, not assumed. (Open. Not settled: no image has booted under the
-   chain. `RESOLVER_ELEMENTS` exists, empty, for the case where the answer is a loopback stub.)
+   reading the booted image, not assumed. (Read on one booted gateway, 2026-11-27: the resolver
+   was a non-loopback uplink nameserver, not a stub on loopback, and the claim's tunnels were
+   served under the chain. That is one image on one network, so the question stays open for
+   any other. `RESOLVER_ELEMENTS` exists, empty by default, for the case where the answer is a
+   loopback stub.)
 7. **Should the tunnel check move to the unix socket by default in the same change?** With the
    check on loopback TCP the table needs a loopback exception for the tunnel Envoy's user and a
    rule that only that user may reach the port. With the unix socket as the default
@@ -640,7 +712,9 @@ either (the templates name none); it is recorded in the threat model.
    socket is the default on the gateway image, with or without inject, the default table has no
    loopback exception, and loopback TCP is an explicit setting of two keys that the authorizer's
    unit checks against each other. The amendments of that date at decisions 5 and 6 say what the
-   code does. Not yet observed on a booted gateway VM.)
+   code does. Observed on one booted gateway VM on 2026-11-27: the check directory `2750` with the
+   group `envoy`, the socket `0660`, and a claim's tunnels decided by the authorizer listening on
+   it. Another local user being refused at the socket was not tried.)
 8. **Is `EGRESS_DENY_ELEMENTS` in scope here or a follow-up?** *Recommendation:* in scope, as
    an empty-by-default key, because the chain it extends is new in this ADR and the Kubernetes
    API and the secrets store are the addresses an operator will most want in it; what goes in

@@ -167,8 +167,9 @@ that identity.
    (`image/gateway/nftables.conf.in`). Its default policy is `accept`; the authorizer, the relay
    and the agent are each held to their upstreams, both Envoys are refused loopback, the VM's own
    addresses, link-local, the control-plane addresses and all IPv6, and only the authorizer's and
-   the relay's users reach the broker's address. Built and asserted in the image; not yet run on
-   a booted gateway VM.*
+   the relay's users reach the broker's address. Built and asserted in the image. Loaded by one
+   booted gateway VM on 2026-11-27, which served a claim under it; its drops of a refused
+   connection are not yet observed on a VM (ADR-0053, *What was proven, and what was not*).*
 
 9. **Phase one is identity, allowlist and audit. No interception.** Credential
    injection (roadmap 07) needs the gateway to read or rewrite requests, which means a

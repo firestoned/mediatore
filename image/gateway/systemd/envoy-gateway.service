@@ -47,7 +47,11 @@ RestrictSUIDSGID=yes
 LockPersonality=yes
 SystemCallArchitectures=native
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
-ReadOnlyPaths=/run/mediatore-gateway /run/spire/sockets
+# "-" on the agent's socket directory, as on the authorizer's unit and for its reason: this unit
+# only Wants= the authorizer, so it is started after an authorizer whose start failed, and the
+# directory may not exist yet. ProtectSystem=strict keeps /run read-only either way. (The inject
+# Envoy Requires= the authorizer, whose health check has by then answered on that socket.)
+ReadOnlyPaths=/run/mediatore-gateway -/run/spire/sockets
 
 [Install]
 WantedBy=multi-user.target
