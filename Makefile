@@ -8,7 +8,7 @@
         kind-install kind-create kind-delete kind-down kind-spire kind-deploy kind-up \
         kind-images kind-dex kind-openbao kind-broker kind-banlieue-crds kind-e2e-entries kind-e2e-mtls kind-e2e-watcher kind-e2e-sandbox \
         kind-e2e-dex kind-e2e kind-e2e-ci kind-e2e-logs \
-        kind-spire-render kind-vtpm kind-e2e-tpm calm-validate calm-diagrams docs docs-serve docs-clean clean manifests dist-tpm-plugin
+        kind-spire-render kind-vtpm kind-e2e-tpm kind-rehearse-migration calm-validate calm-diagrams docs docs-serve docs-clean clean manifests dist-tpm-plugin
 
 # kind: a throwaway cluster with SPIRE for the live tests (docs/guides/testing.md).
 KIND_VERSION       ?= 0.33.0
@@ -46,7 +46,7 @@ SPIRE_TRUST_DOMAIN  ?= sandbox.test
 SPIRE_NAMESPACE     := spire-server
 SPIRE_CLASS_NAME    := spire-server-spire
 # The kind OpenBao as the server's upstream authority sees it (ADR-0031; dev/kind/openbao).
-KIND_OPENBAO_ADDR   := https://mediatore-openbao.banlieue-system.svc:8200
+KIND_OPENBAO_ADDR   := https://mediatore-openbao.mediatore-system.svc:8200
 # Images: `docker` or `podman` (kind follows KIND_EXPERIMENTAL_PROVIDER). The kind tags
 # are loaded into the cluster with `kind load`, never pulled, never pushed.
 CONTAINER_CLI      ?= docker
@@ -338,6 +338,8 @@ manifests: ## Render deploy/base, the example overlay, the per-namespace bundle 
 	kubectl kustomize deploy/overlays/homelab-example > /dev/null
 	kubectl kustomize deploy/policy-bundles > /dev/null
 	kubectl kustomize deploy/gateway > /dev/null
+	kubectl kustomize dev/kind/broker > /dev/null
+	kubectl kustomize dev/kind/migration > /dev/null
 	@echo "✓ deploy/base, deploy/overlays/homelab-example, deploy/policy-bundles and deploy/gateway render"
 
 # ----- Release assets: what the release page carries beside the two images --------------
@@ -515,8 +517,9 @@ kind-spire: kind-create kind-openbao ## Apply SPIRE (server, controller manager,
 	@echo "✓ SPIRE $(SPIRE_CHART_VERSION) up from $(SPIRE_KUSTOMIZATION); controller manager className $(SPIRE_CLASS_NAME); tpm node attestor loaded"
 
 kind-deploy: kind-create ## Apply the broker's CRD, ServiceAccount, RBAC and admission policies; mint its kubeconfig
-	@$(KIND_KUBECTL) get ns banlieue-system >/dev/null 2>&1 || $(KIND_KUBECTL) create ns banlieue-system
-	$(KIND_KUBECTL) apply -n banlieue-system -f deploy/base/crds -f deploy/base/serviceaccount.yaml -f deploy/base/rbac.yaml -f deploy/base/admission/clusterstaticentry-mediatore.yaml -f deploy/base/admission/clusterstaticentry-gateway.yaml -f deploy/base/admission/agentsandbox-subject.yaml -f deploy/base/admission/agentsandbox-status.yaml
+	@# The base's own Namespace (Pod Security restricted, ADR-0056), not a bare `create ns`.
+	$(KIND_KUBECTL) apply -f deploy/base/namespace.yaml
+	$(KIND_KUBECTL) apply -n mediatore-system -f deploy/base/crds -f deploy/base/serviceaccount.yaml -f deploy/base/rbac.yaml -f deploy/base/admission/clusterstaticentry-mediatore.yaml -f deploy/base/admission/clusterstaticentry-gateway.yaml -f deploy/base/admission/agentsandbox-subject.yaml -f deploy/base/admission/agentsandbox-status.yaml
 	@./dev/kind/sa-kubeconfig.sh $(KIND_KUBECONFIG) $(KIND_SA_KUBECONFIG)
 	@./dev/kind/admission-settled.sh $(KIND_SA_KUBECONFIG) $(SPIRE_TRUST_DOMAIN)
 
@@ -530,40 +533,41 @@ kind-images: kind-create $(if $(KIND_PREBUILT),,dist dist-e2e) ## The server ima
 	kind load docker-image --name $(KIND_CLUSTER_NAME) $(KIND_E2E_IMAGE)
 
 kind-dex: kind-create ## Dex over TLS with a glauth directory behind it (ADR-0013), and the broker's STS signing key, minted by this target
-	@$(KIND_KUBECTL) get ns banlieue-system >/dev/null 2>&1 || $(KIND_KUBECTL) create ns banlieue-system
-	$(call testkit,tls-fixture,--out-dir $(KIND_DIR)/dex --dns mediatore-dex.banlieue-system.svc)
-	$(KIND_KUBECTL) -n banlieue-system create secret generic mediatore-dex-tls --from-file=$(KIND_DIR)/dex/server.pem --from-file=$(KIND_DIR)/dex/server-key.pem --dry-run=client -o yaml | $(KIND_KUBECTL) apply -f -
-	$(KIND_KUBECTL) -n banlieue-system create configmap mediatore-dex-ca --from-file=$(KIND_DIR)/dex/ca.pem --dry-run=client -o yaml | $(KIND_KUBECTL) apply -f -
-	$(KIND_KUBECTL) -n banlieue-system create configmap mediatore-glauth-config --from-file=dev/kind/dex/glauth.cfg --dry-run=client -o yaml | $(KIND_KUBECTL) apply -f -
+	@$(KIND_KUBECTL) get ns mediatore-system >/dev/null 2>&1 || $(KIND_KUBECTL) apply -f deploy/base/namespace.yaml
+	$(call testkit,tls-fixture,--out-dir $(KIND_DIR)/dex --dns mediatore-dex.mediatore-system.svc)
+	$(KIND_KUBECTL) -n mediatore-system create secret generic mediatore-dex-tls --from-file=$(KIND_DIR)/dex/server.pem --from-file=$(KIND_DIR)/dex/server-key.pem --dry-run=client -o yaml | $(KIND_KUBECTL) apply -f -
+	$(KIND_KUBECTL) -n mediatore-system create configmap mediatore-dex-ca --from-file=$(KIND_DIR)/dex/ca.pem --dry-run=client -o yaml | $(KIND_KUBECTL) apply -f -
+	$(KIND_KUBECTL) -n mediatore-system create configmap mediatore-glauth-config --from-file=dev/kind/dex/glauth.cfg --dry-run=client -o yaml | $(KIND_KUBECTL) apply -f -
 	@[ -f $(KIND_DIR)/sts.pem ] || openssl ecparam -name prime256v1 -genkey -noout | openssl pkcs8 -topk8 -nocrypt -out $(KIND_DIR)/sts.pem
-	$(KIND_KUBECTL) -n banlieue-system create secret generic mediatore-sts --from-file=sts.pem=$(KIND_DIR)/sts.pem --dry-run=client -o yaml | $(KIND_KUBECTL) apply -f -
+	$(KIND_KUBECTL) -n mediatore-system create secret generic mediatore-sts --from-file=sts.pem=$(KIND_DIR)/sts.pem --dry-run=client -o yaml | $(KIND_KUBECTL) apply -f -
 	$(KIND_KUBECTL) apply -f dev/kind/dex/glauth.yaml -f dev/kind/dex/dex.yaml
 	@# A new certificate needs a new pod.
-	$(KIND_KUBECTL) -n banlieue-system rollout restart deploy/mediatore-dex
-	$(KIND_KUBECTL) -n banlieue-system rollout status deploy/mediatore-glauth --timeout=300s
-	$(KIND_KUBECTL) -n banlieue-system rollout status deploy/mediatore-dex --timeout=300s
+	$(KIND_KUBECTL) -n mediatore-system rollout restart deploy/mediatore-dex
+	$(KIND_KUBECTL) -n mediatore-system rollout status deploy/mediatore-glauth --timeout=300s
+	$(KIND_KUBECTL) -n mediatore-system rollout status deploy/mediatore-dex --timeout=300s
 
 kind-openbao: kind-create ## OpenBao over TLS (ADR-0015, ADR-0031): minted certificate, initialised and unsealed, transit with a derived key and a role for the broker, a PKI root and a role for the SPIRE server
-	@$(KIND_KUBECTL) get ns banlieue-system >/dev/null 2>&1 || $(KIND_KUBECTL) create ns banlieue-system
+	@$(KIND_KUBECTL) get ns mediatore-system >/dev/null 2>&1 || $(KIND_KUBECTL) apply -f deploy/base/namespace.yaml
 	@# Minted once per cluster: a new certificate would need a new pod, and in-memory storage would start over, with the root the SPIRE server chains to (ADR-0031).
-	@if ! $(KIND_KUBECTL) -n banlieue-system get secret mediatore-openbao-tls >/dev/null 2>&1; then \
-	  $(call testkit,tls-fixture,--out-dir $(KIND_DIR)/openbao --dns mediatore-openbao.banlieue-system.svc --dns localhost) && \
-	  $(KIND_KUBECTL) -n banlieue-system create secret generic mediatore-openbao-tls --from-file=$(KIND_DIR)/openbao/server.pem --from-file=$(KIND_DIR)/openbao/server-key.pem && \
-	  $(KIND_KUBECTL) -n banlieue-system create configmap mediatore-openbao-ca --from-file=$(KIND_DIR)/openbao/ca.pem && \
+	@if ! $(KIND_KUBECTL) -n mediatore-system get secret mediatore-openbao-tls >/dev/null 2>&1; then \
+	  $(call testkit,tls-fixture,--out-dir $(KIND_DIR)/openbao --dns mediatore-openbao.mediatore-system.svc --dns localhost) && \
+	  $(KIND_KUBECTL) -n mediatore-system create secret generic mediatore-openbao-tls --from-file=$(KIND_DIR)/openbao/server.pem --from-file=$(KIND_DIR)/openbao/server-key.pem && \
+	  $(KIND_KUBECTL) -n mediatore-system create configmap mediatore-openbao-ca --from-file=$(KIND_DIR)/openbao/ca.pem && \
 	  rm -f $(KIND_DIR)/openbao/init.json; \
 	fi
 	$(KIND_KUBECTL) apply -f dev/kind/openbao/openbao.yaml
-	$(KIND_KUBECTL) -n banlieue-system rollout status deploy/mediatore-openbao --timeout=300s
+	$(KIND_KUBECTL) -n mediatore-system rollout status deploy/mediatore-openbao --timeout=300s
 	./dev/kind/openbao-setup.sh $(KIND_KUBECONFIG) $(KIND_DIR)/openbao $(SPIRE_TRUST_DOMAIN)
 
 kind-broker: kind-up kind-images kind-dex kind-openbao ## deploy/base in kind on the CSI driver's socket, the kind Dex and OpenBao (dev/kind/broker overlay), rolled out
 	$(KIND_KUBECTL) apply -k dev/kind/broker
 	@# Same tag, new image: a restart is what makes the loaded image the running one.
-	$(KIND_KUBECTL) -n banlieue-system rollout restart deploy/mediatore
-	$(KIND_KUBECTL) -n banlieue-system rollout status deploy/mediatore --timeout=300s
+	$(KIND_KUBECTL) -n mediatore-system rollout restart deploy/mediatore
+	$(KIND_KUBECTL) -n mediatore-system rollout status deploy/mediatore --timeout=300s
 
 kind-e2e-entries: kind-up ## Live entries round trip (ADR-0006) as the broker ServiceAccount against SPIRE in kind
 	MEDIATORE_LIVE_KUBECONFIG=$(CURDIR)/$(KIND_SA_KUBECONFIG) MEDIATORE_LIVE_IDENTITY=self \
+	MEDIATORE_LIVE_ADMIN_KUBECONFIG=$(CURDIR)/$(KIND_KUBECONFIG) \
 	MEDIATORE_LIVE_TRUST_DOMAIN=$(SPIRE_TRUST_DOMAIN) MEDIATORE_LIVE_CLASS_NAME=$(SPIRE_CLASS_NAME) \
 	$(MAKE) live-admission-test
 
@@ -579,13 +583,13 @@ kind-banlieue-crds: kind-create ## banlieue's VirtualMachine and VirtualMachineC
 
 kind-e2e-watcher: kind-banlieue-crds kind-broker ## ADR-0011 live: the Lease, a member's certificate becoming a node entry, a claim without a record binding nothing
 	@# The controllers must start against existing CRDs: a broker that came up before them backs off for minutes.
-	$(KIND_KUBECTL) -n banlieue-system rollout restart deploy/mediatore
-	$(KIND_KUBECTL) -n banlieue-system rollout status deploy/mediatore --timeout=300s
+	$(KIND_KUBECTL) -n mediatore-system rollout restart deploy/mediatore
+	$(KIND_KUBECTL) -n mediatore-system rollout status deploy/mediatore --timeout=300s
 	./dev/kind/watcher-e2e.sh $(KIND_KUBECONFIG) $(SPIRE_TRUST_DOMAIN) $(KIND_DIR)/ek.pem $(KIND_DIR)/ek.hash
 
 kind-e2e-sandbox: kind-banlieue-crds kind-broker ## ADR-0008 live: the subject policy, an AgentSandbox becoming an owned claim and a record, bound to a claim entry, deleted through the finalizer
-	$(KIND_KUBECTL) -n banlieue-system rollout restart deploy/mediatore
-	$(KIND_KUBECTL) -n banlieue-system rollout status deploy/mediatore --timeout=300s
+	$(KIND_KUBECTL) -n mediatore-system rollout restart deploy/mediatore
+	$(KIND_KUBECTL) -n mediatore-system rollout status deploy/mediatore --timeout=300s
 	./dev/kind/sandbox-e2e.sh $(KIND_KUBECONFIG) $(KIND_SA_KUBECONFIG) $(SPIRE_TRUST_DOMAIN) $(KIND_DIR)/ek.pem $(KIND_DIR)/ek.hash
 
 kind-notaio: kind-create kind-openbao ## notaio from its release manifests (version and checksums pinned above), signing with the kind OpenBao; the public key the broker trusts into .kind/notaio
@@ -605,29 +609,34 @@ kind-gateway: kind-broker gateway-render-check ## The egress gateway in kind (AD
 	$(KIND_KUBECTL) -n mediatore-e2e-gateway rollout status deploy/destination --timeout=300s
 
 kind-e2e-gateway: kind-banlieue-crds kind-broker kind-gateway ## ADR-0028 live: the real egress proxy tunnelling a claim's requests through a real Envoy to its one destination and nothing else, a node SVID refused by the validator, the cache standing in through a broker outage then denying, a released claim cut off
-	$(KIND_KUBECTL) -n banlieue-system rollout restart deploy/mediatore
-	$(KIND_KUBECTL) -n banlieue-system rollout status deploy/mediatore --timeout=300s
+	$(KIND_KUBECTL) -n mediatore-system rollout restart deploy/mediatore
+	$(KIND_KUBECTL) -n mediatore-system rollout status deploy/mediatore --timeout=300s
 	./dev/kind/gateway-e2e.sh $(KIND_KUBECONFIG) $(KIND_SA_KUBECONFIG) $(SPIRE_TRUST_DOMAIN) $(KIND_DIR)/ek.pem $(KIND_DIR)/ek.hash $(KIND_DIR)/gateway/ca.pem
 
 kind-e2e-gateway-policy: kind-banlieue-crds kind-broker kind-notaio kind-gateway ## ADR-0030 live: the gateway tier under a notaio bundle whose direct egress names the destination's second port; refused under policy.egress shadow (the broker logging what it would add, P006), opened at the real Envoy under enforce (P007 for an entry with rules, the audience endpoints unchanged)
-	$(KIND_KUBECTL) -n banlieue-system rollout restart deploy/mediatore
-	$(KIND_KUBECTL) -n banlieue-system rollout status deploy/mediatore --timeout=300s
+	$(KIND_KUBECTL) -n mediatore-system rollout restart deploy/mediatore
+	$(KIND_KUBECTL) -n mediatore-system rollout status deploy/mediatore --timeout=300s
 	./dev/kind/gateway-e2e.sh $(KIND_KUBECONFIG) $(KIND_SA_KUBECONFIG) $(SPIRE_TRUST_DOMAIN) $(KIND_DIR)/ek.pem $(KIND_DIR)/ek.hash $(KIND_DIR)/gateway/ca.pem $(KIND_DIR)
 
 kind-e2e-gateway-audience: kind-banlieue-crds kind-broker kind-notaio kind-gateway ## ADR-0055 live: the gateway-policy tier, then the broker in policy.audience_definitions.mode: bundles; a team SandboxAudience's Secret placed on the claim's tunnel and rotated with no broker restart, a platform audience read from OpenBao KV, the team audience refused from another namespace
-	$(KIND_KUBECTL) -n banlieue-system rollout restart deploy/mediatore
-	$(KIND_KUBECTL) -n banlieue-system rollout status deploy/mediatore --timeout=300s
+	$(KIND_KUBECTL) -n mediatore-system rollout restart deploy/mediatore
+	$(KIND_KUBECTL) -n mediatore-system rollout status deploy/mediatore --timeout=300s
 	./dev/kind/gateway-e2e.sh $(KIND_KUBECONFIG) $(KIND_SA_KUBECONFIG) $(SPIRE_TRUST_DOMAIN) $(KIND_DIR)/ek.pem $(KIND_DIR)/ek.hash $(KIND_DIR)/gateway/ca.pem $(KIND_DIR) audiences
 
 kind-e2e-dex: kind-banlieue-crds kind-broker ## ADR-0013 live: the real CLI logs in at a real Dex and delegates the session, every token issue refreshes it, a group removal and a revocation at Dex release the claim
-	$(KIND_KUBECTL) -n banlieue-system rollout restart deploy/mediatore
-	$(KIND_KUBECTL) -n banlieue-system rollout status deploy/mediatore --timeout=300s
+	$(KIND_KUBECTL) -n mediatore-system rollout restart deploy/mediatore
+	$(KIND_KUBECTL) -n mediatore-system rollout status deploy/mediatore --timeout=300s
 	./dev/kind/dex-e2e.sh $(KIND_KUBECONFIG) $(SPIRE_TRUST_DOMAIN) $(KIND_DIR)/ek.pem $(KIND_DIR)/ek.hash
 
 kind-e2e-tpm: kind-vtpm kind-banlieue-crds kind-broker ## ADR-0018 live: an agent attesting with the vTPM behind the node on the image's agent.conf, the EK CA fail-closed, the node entry under that agent, re-attestation
-	$(KIND_KUBECTL) -n banlieue-system rollout restart deploy/mediatore
-	$(KIND_KUBECTL) -n banlieue-system rollout status deploy/mediatore --timeout=300s
+	$(KIND_KUBECTL) -n mediatore-system rollout restart deploy/mediatore
+	$(KIND_KUBECTL) -n mediatore-system rollout status deploy/mediatore --timeout=300s
 	TPM_PLUGIN_AGENT_IMG=$(TPM_PLUGIN_AGENT_IMG) UPSTREAM_ROOT=$(KIND_DIR)/openbao/upstream-root.pem ./dev/kind/tpm-e2e.sh $(KIND_KUBECONFIG) $(SPIRE_TRUST_DOMAIN) $(KIND_VTPM_DIR)
+
+kind-rehearse-migration: kind-banlieue-crds kind-broker ## ADR-0056 decision 7 rehearsed by the copy path: the broker put back in banlieue-system (dev/kind/migration), a claim bound there, the move to mediatore-system with the guide's commands, the same claim's token issued after; not part of kind-e2e
+	$(KIND_KUBECTL) -n mediatore-system rollout restart deploy/mediatore
+	$(KIND_KUBECTL) -n mediatore-system rollout status deploy/mediatore --timeout=300s
+	./dev/kind/migration-rehearsal.sh $(KIND_KUBECONFIG) $(SPIRE_TRUST_DOMAIN) $(KIND_DIR)/ek.pem $(KIND_DIR)/ek.hash $(KIND_DIR)
 
 kind-e2e: kind-e2e-entries kind-e2e-mtls kind-e2e-watcher kind-e2e-sandbox kind-e2e-dex kind-e2e-policy kind-e2e-gateway kind-e2e-gateway-audience ## Every live suite against kind that needs nothing of the host (grows with the roadmap); kind-e2e-tpm needs a vTPM
 
@@ -638,15 +647,15 @@ kind-e2e-ci: ## CI shape: $(KIND_E2E_SUITES), cluster state on failure, cluster 
 kind-e2e-logs: ## What a failing live suite needs: entries, policy, broker and client pods, controller-manager and server logs
 	-$(KIND_KUBECTL) get clusterstaticentries -o yaml
 	-$(KIND_KUBECTL) get clusterspiffeids -o yaml
-	-$(KIND_KUBECTL) -n banlieue-system get pods -o wide
-	-$(KIND_KUBECTL) -n banlieue-system logs deploy/mediatore --tail=200
-	-$(KIND_KUBECTL) -n banlieue-system logs deploy/mediatore-dex --tail=80
-	-$(KIND_KUBECTL) -n banlieue-system logs deploy/mediatore-openbao --tail=60
-	-$(KIND_KUBECTL) -n banlieue-system logs deploy/mediatore-glauth --tail=30
-	-$(KIND_KUBECTL) -n banlieue-system get refreshtokens.dex.coreos.com
+	-$(KIND_KUBECTL) -n mediatore-system get pods -o wide
+	-$(KIND_KUBECTL) -n mediatore-system logs deploy/mediatore --tail=200
+	-$(KIND_KUBECTL) -n mediatore-system logs deploy/mediatore-dex --tail=80
+	-$(KIND_KUBECTL) -n mediatore-system logs deploy/mediatore-openbao --tail=60
+	-$(KIND_KUBECTL) -n mediatore-system logs deploy/mediatore-glauth --tail=30
+	-$(KIND_KUBECTL) -n mediatore-system get refreshtokens.dex.coreos.com
 	-$(KIND_KUBECTL) -n mediatore-e2e-sandbox logs pod/cli-1 --tail=60
 	-$(KIND_KUBECTL) -n mediatore-e2e get pods -o wide
-	-$(KIND_KUBECTL) -n banlieue-system get lease mediatore-watcher -o yaml
+	-$(KIND_KUBECTL) -n mediatore-system get lease mediatore-watcher -o yaml
 	-$(KIND_KUBECTL) -n mediatore-e2e-watcher get virtualmachines,virtualmachineclaims -o yaml
 	-$(KIND_KUBECTL) -n mediatore-e2e-sandbox get agentsandboxes,virtualmachineclaims,pods -o yaml
 	-$(KIND_KUBECTL) -n mediatore-e2e-gateway get pods -o wide

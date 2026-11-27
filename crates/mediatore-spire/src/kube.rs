@@ -142,6 +142,10 @@ fn self_check_probe(naming: &Naming) -> ClusterStaticEntry {
     }
 }
 
+/// What the API server says in a denial that names a policy it could not evaluate: the
+/// binding's parameter was not found, or an expression failed (a key the parameter lacks).
+const NOT_EVALUATED: [&str; 2] = ["failed to configure binding", "resulted in error"];
+
 /// Read the API server's answer to the self-check's dry run. Only a refusal that names
 /// the entries policy is proof, and only when it is not the policy's sender validation.
 ///
@@ -157,6 +161,17 @@ fn self_check_probe(naming: &Naming) -> ClusterStaticEntry {
 ///
 /// The closing quote in the needle keeps `mediatore-clusterstaticentry-gateway`, the
 /// gateway entries' policy, from standing in for this one.
+///
+/// The policy reads the broker's username from a parameter (ADR-0056 decision 4). When
+/// the parameter is absent, or lacks the key, the API server still refuses and still
+/// names the policy, but it judged nothing: it could not configure the binding, or an
+/// expression failed. Both read as below (Kubernetes 1.30 and 1.36, the kind tiers), and
+/// neither is proof: the refusal would be the same for a permitted entry.
+///
+/// ```text
+/// ... ValidatingAdmissionPolicy 'POLICY' with binding 'BINDING' denied request: failed to configure binding: no params found for policy binding with `Deny` parameterNotFoundAction
+/// ... ValidatingAdmissionPolicy 'POLICY' with binding 'BINDING' denied request: expression '...' resulted in error: no such key: broker
+/// ```
 fn judge_self_check(
     name: &str,
     answer: Result<ClusterStaticEntry, kube::Error>,
@@ -173,6 +188,9 @@ fn judge_self_check(
     if by_the_policy {
         if status.message.contains(ENTRIES_POLICY_SENDER_MESSAGE) {
             return Err(SelfCheckError::NotTheBroker(status.message.clone()));
+        }
+        if NOT_EVALUATED.iter().any(|n| status.message.contains(n)) {
+            return Err(SelfCheckError::Parameter(status.message.clone()));
         }
         return Ok(());
     }
@@ -965,6 +983,26 @@ mod tests {
         let err = m.self_check().await.unwrap_err();
         assert!(matches!(err, SelfCheckError::NotTheBroker(_)), "{err:?}");
         finish(m, task).await;
+    }
+
+    #[tokio::test]
+    async fn a_policy_that_could_not_read_its_parameter_is_not_proof() {
+        // The two answers of an API server whose entries policy has no parameter to read:
+        // the ConfigMap is gone, or it has no `broker` key. Both name the policy and both
+        // would refuse a permitted entry too, so neither proves the policy judged anything.
+        for why in [
+            "failed to configure binding: no params found for policy binding with `Deny` parameterNotFoundAction",
+            "expression 'request.userInfo.username == params.data.broker.trim() || (request.operation == 'UPDATE' && oldObject.spec == object.spec)' resulted in error: no such key: broker",
+        ] {
+            let (m, task) = manager(vec![dry_run_post(
+                422,
+                &policy_denial(422, "Invalid", ENTRIES_POLICY, why),
+            )]);
+            let err = m.self_check().await.unwrap_err();
+            assert!(matches!(err, SelfCheckError::Parameter(_)), "{err:?}");
+            assert!(err.to_string().contains("cannot be evaluated"), "{err}");
+            finish(m, task).await;
+        }
     }
 
     #[tokio::test]

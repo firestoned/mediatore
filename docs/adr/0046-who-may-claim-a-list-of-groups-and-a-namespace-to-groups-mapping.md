@@ -5,7 +5,7 @@
 
 **Status:** Accepted 2026-11-17 (the seven open questions were answered by the maintainer the same day; their answers are
 folded into decisions 3, 4, 5, 14, 16 and 17 and listed at the end); implemented on `main` (#129)
-and released in v0.3.0 (2026-11-17; v0.2.10 predates it) · **Date:** 2026-11-17
+and released in v0.3.0 (2026-11-17; v0.2.10 predates it) · **Date:** 2026-11-17 · **Amended:** 2026-11-27 by [ADR-0072](0072-a-hand-created-sandbox-names-only-an-issuer-its-creator-can-come-from.md) (decision 11) and [ADR-0074](0074-a-namespaces-groups-read-only-from-the-issuers-it-names.md) (decisions 3, 14 and 18)
 
 Roadmap 08 (the `AgentSandbox` CRD) and roadmap 04 (issuer profiles). Amends
 [ADR-0017](0017-issuer-profiles.md) (the issuer's `required_group`),
@@ -147,6 +147,12 @@ What is already true and this ADR builds on (verified in the source):
    Control and tests are those of decisions 4 to 6; the config shape is `SandboxesSection`
    (`crates/mediatore/src/config.rs`) with `#[serde(deny_unknown_fields)]` on the entry type, so a
    typo (`group:` for `groups:`) is a start error, never an entry with no groups.
+
+   *Amended by [ADR-0074](0074-a-namespaces-groups-read-only-from-the-issuers-it-names.md)
+   (2026-11-27):* an entry gains `issuers`, the issuers whose tokens its groups are read from. A
+   token qualifies only when its issuer is listed and its groups intersect; a token of another
+   issuer gets the answer of an unqualified caller. With two or more issuers every entry lists its
+   issuers; with one the key is optional and read as that issuer.
 
 4. **The claim request gains an optional `namespace`; with the map set it is required.**
    `ClaimRequest.namespace: Option<String>` (`crates/mediatore-proto`, skipped when `None`, so
@@ -324,6 +330,13 @@ What is already true and this ADR builds on (verified in the source):
     RBAC. No test is added: the existing `make kind-e2e-sandbox` cases (admin, impersonated stranger,
     listed broker, `ServiceAccount`) are the proof and must stay green.
 
+    *Amended by [ADR-0072](0072-a-hand-created-sandbox-names-only-an-issuer-its-creator-can-come-from.md)
+    (2026-11-27):* the declarative requester is no longer unchanged when the broker trusts several
+    issuers. A sandbox the broker did not create through `POST /v1/claims` may name only an issuer
+    of `sandboxes.declarative_issuers` (none by default once two or more issuers are trusted), and
+    admission refuses an issuer the policy's `issuerPrefixes` does not list once it lists any. The
+    namespace map still does not apply to it.
+
 12. **`dev_mode`.** The map and the checks apply in `dev_mode` the same way: the dev token's
     groups (the testkit's fake IdP issues them) are checked against the namespace's groups, so a dev
     run does not skip the control it exists to exercise (`.claude/rules/testing.md`: a fake more permissive
@@ -366,6 +379,12 @@ What is already true and this ADR builds on (verified in the source):
     `a_listed_namespace_that_does_not_exist_fails_the_create_and_parks_nothing`
     (`crates/mediatore-api/src/lib.rs`) and `a_404_from_the_api_server_is_the_catch_all_error`
     (`crates/mediatore-claims/src/sandbox.rs`).
+
+    *Amended by [ADR-0074](0074-a-namespaces-groups-read-only-from-the-issuers-it-names.md)
+    (2026-11-27):* also refused at start, naming the key and the namespace: with two or more
+    issuers, an entry without `issuers`; on any entry, an empty `issuers`, a value that is not an
+    `issuers[].url` byte for byte, or an issuer listed twice. The per-namespace line names the
+    entry's issuers beside its groups.
 
 15. **Fail closed.** A path the build cannot honour answers `501 not_implemented`, as today: a
     namespace map on a broker with no Kubernetes front (`st.sandboxes` is `None`, outside
@@ -437,6 +456,10 @@ What is already true and this ADR builds on (verified in the source):
     the absence of a key, and the line is how an operator sees a gate that is not the one they
     meant. Tests: `startup_logs_the_gate_form_per_issuer`,
     `startup_logs_single_open_namespace_without_a_map`.
+
+    *Amended by [ADR-0074](0074-a-namespaces-groups-read-only-from-the-issuers-it-names.md)
+    (2026-11-27):* the `namespace groups` line gains `issuers=`, the entry's issuers, or the one
+    issuer followed by `(the only issuer)` when the entry lists none.
 
 19. **No gate must be written down: an issuer with neither key refuses to start unless it says
     `allow_any_authenticated: true`.** Today the absence of `required_group` is a silent "no

@@ -146,6 +146,13 @@ pub struct IssuerConfig {
     /// (`Validator::with_issuer_ca`); a missing or empty file stops the process.
     #[serde(default)]
     pub ca_file: Option<std::path::PathBuf>,
+    /// What the broker's STS puts in front of this issuer's subject id in `sub`, such as
+    /// `dex:` (ADR-0071): lower-case letters, digits, `.`, `_` and `-`, then one `:`.
+    /// Optional with one issuer (`sub` is then the bare id); with two or more under an
+    /// `sts`, every issuer needs one and no two may overlap, or the broker does not start.
+    /// The form and the set are checked by `mediatore_sts::SubjectPrefixes`.
+    #[serde(default)]
+    pub subject_prefix: Option<String>,
 }
 
 fn default_subject_claim() -> String {
@@ -1093,6 +1100,7 @@ mod tests {
             ca_file: None,
             entra: None,
             groups_claim: None,
+            subject_prefix: None,
         }
     }
 
@@ -1625,6 +1633,7 @@ mod tests {
             ca_file: None,
             entra: Some(cfg.clone()),
             groups_claim: None,
+            subject_prefix: None,
         };
         let assertion = ClientAssertion::build(&cfg).await.unwrap();
         let v = Validator::new(vec![issuer.clone()]).with_client_assertion(&idp.issuer, assertion);

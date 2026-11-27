@@ -63,13 +63,18 @@ order so the post-quantum hybrid stays the first key share every client offers.
 | `MEDIATORE_LIVE_KUBECONFIG` | kubeconfig for the cluster that runs the SPIRE Controller Manager |
 | `MEDIATORE_LIVE_TRUST_DOMAIN` | the SPIRE server's trust domain; the test refuses to guess it |
 | `MEDIATORE_LIVE_CLASS_NAME` | the controller manager's `className` (the hardened chart derives `<namespace>-<release>`) |
-| `MEDIATORE_LIVE_IDENTITY` | `impersonate` (default): the kubeconfig is an admin and every request impersonates `system:serviceaccount:banlieue-system:mediatore`; `self`: the kubeconfig already is that ServiceAccount, for example one built around `kubectl -n banlieue-system create token mediatore` |
+| `MEDIATORE_LIVE_IDENTITY` | `impersonate` (default): the kubeconfig is an admin and every request impersonates `system:serviceaccount:mediatore-system:mediatore`; `self`: the kubeconfig already is that ServiceAccount, for example one built around `kubectl -n mediatore-system create token mediatore` |
+
+| `MEDIATORE_LIVE_ADMIN_KUBECONFIG` | a kubeconfig that may impersonate, for the test of another sender; defaults to `MEDIATORE_LIVE_KUBECONFIG` under `impersonate`, required under `self` (the test fails without it, it never skips) |
 
 Either way, what is exercised is what production gets: the `ClusterRole` in
 `deploy/base/rbac.yaml` and the `ValidatingAdmissionPolicy` in
 `deploy/base/admission/clusterstaticentry-mediatore.yaml`, never the credential that
 runs the test. The scenario, in order:
 
+0. Run the broker's own self-check ([ADR-0056](../adr/0056-the-broker-in-a-namespace-of-its-own.md)
+   decision 5) as the ServiceAccount: a dry run of an entry the policy must refuse,
+   passing only on the policy's refusal, persisting nothing.
 1. Declare the node entry for a fixture EK hash (no real TPM has that key) and observe
    the controller manager set it on the server. Declare it again: a 409 is tolerated.
 2. Declare a claim entry for a fresh claim UID, observe it set, check its selector and
@@ -87,6 +92,14 @@ runs the test. The scenario, in order:
 
 Cleanup runs before the scenario and after it, whether it returned an error or panicked
 in an assertion, so a failing run leaves nothing behind.
+
+A second test in the same file, `another_account_is_refused_the_brokers_entries_and_fails_the_self_check`,
+is the other half of ADR-0056 decision 4. It impersonates
+`system:serviceaccount:banlieue-system:mediatore` (an account of the broker's name in
+another namespace, where the broker ran before the move) with the group `system:masters`,
+so RBAC lets everything through and admission alone answers: a dry run of a node entry in
+exactly the permitted shape is refused by the policy's sender validation, and the
+self-check run as that account fails with `NotTheBroker`.
 
 ### What the first live run found
 
@@ -106,12 +119,20 @@ homelab runs, rendered once by `make kind-spire-render` into tracked manifests f
 `dev/kind/spire/values.yaml`, release name `spire` in namespace `spire-server` so the
 controller manager's class is `spire-server-spire`; no Helm release, kustomize only)
 together with the TPM node attestor component `deploy/spire-tpm` (ADR-0018), whose
-loading `make kind-spire` asserts from the server's log, applies the broker's
-ServiceAccount, RBAC and admission policy from `deploy/base`, and mints a one-hour
+loading `make kind-spire` asserts from the server's log, applies the broker's own
+namespace (`mediatore-system`, `deploy/base/namespace.yaml`, Pod Security `restricted`),
+its ServiceAccount, RBAC and admission policies from `deploy/base`, and mints a one-hour
 token for that ServiceAccount into `.kind/mediatore-sa.yaml` (`dev/kind/sa-kubeconfig.sh`;
 the directory is git-ignored). `make kind-e2e` then runs every live suite with
 `MEDIATORE_LIVE_IDENTITY=self`. `make kind-e2e-ci` is the CI shape: suites, cluster
 state and logs on failure (`make kind-e2e-logs`), cluster deleted after.
+
+The cluster has the shape the guides describe
+([ADR-0056](../adr/0056-the-broker-in-a-namespace-of-its-own.md)): the broker in
+`mediatore-system`, with the tiers' Dex, glauth and OpenBao beside it (all three run under
+`restricted`), and the pools, claims and sandboxes of each tier in a namespace of its own
+(`mediatore-e2e-*`). So every tier that binds a claim proves the Lease, the session Secrets,
+the `SandboxNode`s and the `PolicyFloor`s in a home that is not where the sandboxes are.
 
 Suites today:
 
@@ -120,8 +141,8 @@ Suites today:
 | `make kind-e2e-entries` | 0006 | the live entries round trip above |
 | `make kind-e2e-mtls` | 0007 | the broker image on the CSI socket, agent-issued client SVIDs over SPIFFE mTLS, below |
 | `make kind-e2e-watcher` | 0011 | the watcher Lease, a member's certificate becoming a node entry, a claim without a record binding nothing, below |
-| `make kind-e2e-sandbox` | 0008, 0034 | the `AgentSandbox` CRD and its subject policy, a sandbox becoming an owned claim and a record on its own status, the claim bound end to end to a claim entry and the guest fetching the subject, a broker restart on the Kubernetes store with the sandbox staying `Ready`, deletion through the finalizer, the released sandbox held and then swept at resync, below |
-| `make kind-e2e-dex` | 0013 | the real CLI logging in at a real Dex from inside the cluster and delegating the session, a refresh at Dex before every issue, the claim released when the user leaves the gated group in the directory and when the refresh token is deleted at Dex, below |
+| `make kind-e2e-sandbox` | 0008, 0034, 0072 | the `AgentSandbox` CRD and its subject policy (with `issuerPrefixes` set: an unlisted issuer and an unsound list refused; the broker's `mediatore.io/front-door` mark refused to anybody else and immutable; a listed broker's sandbox at an undeclared issuer `Failed` by the reconciler), a sandbox becoming an owned claim and a record on its own status, the claim bound end to end to a claim entry and the guest fetching the subject, a broker restart on the Kubernetes store with the sandbox staying `Ready`, deletion through the finalizer, the released sandbox held and then swept at resync, below |
+| `make kind-e2e-dex` | 0013, 0073, 0074 | the real CLI logging in at a real Dex from inside the cluster and delegating the session, a refresh at Dex before every issue, the minted `groups` behind `dex:`, a two-namespace map admitting the Dex group in the namespace that lists Dex and refusing it in the one that lists the other issuer, the claim released when the user leaves the gated group in the directory and when the refresh token is deleted at Dex, below |
 | `make kind-e2e-policy` | 0026 | notaio installed from its release manifests and signing with the kind OpenBao, its bundle admitted by the broker and recorded on each claim, the `PolicyConformant` verdicts and codes on four sandboxes, a newer bundle followed, the earlier one delivered again refused by the version floor before and after a broker restart, nothing refused on the bundle's account, below |
 | `make kind-e2e-gateway` | 0028 | the real egress proxy tunnelling a claim's requests through a real Envoy on the gateway SVID to its one destination and nothing else, the authorizer's cache through a broker outage, the cut-off on release, below |
 | `make kind-e2e-gateway-policy` | 0030 | the gateway tier under a notaio bundle: a direct egress entry refused under `policy.egress: shadow` and opened at the real Envoy under `enforce`, an entry with rules never served, below |
@@ -148,7 +169,7 @@ between records and resources (status, Secret, the two CRDs) have their units in
 
 Every kind tier also runs the broker on the transit sealer
 ([ADR-0015](../adr/0015-transit-sealer.md)). `make kind-openbao` (a dependency of
-`make kind-broker`) mints a certificate for `mediatore-openbao.banlieue-system.svc`,
+`make kind-broker`) mints a certificate for `mediatore-openbao.mediatore-system.svc`,
 applies `dev/kind/openbao/openbao.yaml` (OpenBao 2.7.1, in-memory storage, TLS 1.3
 only) and runs `dev/kind/openbao-setup.sh`, which initialises and unseals it, enables
 transit with a derived key `mediatore`, configures the Kubernetes auth method against the
@@ -164,7 +185,7 @@ reopened there on every issue.
 
 `make kind-dex` (a dependency of `make kind-broker`) runs a Dex
 (`dev/kind/dex/dex.yaml`, storage in its own CRDs) over TLS with a certificate the
-target mints for `mediatore-dex.banlieue-system.svc`, and a glauth LDAP directory
+target mints for `mediatore-dex.mediatore-system.svc`, and a glauth LDAP directory
 behind it (`dev/kind/dex/glauth.yaml`, the users and groups in `dev/kind/dex/glauth.cfg`:
 `octocat` in group `sandbox-users`, the service account Dex binds as). It also mints
 the broker's STS signing key into a Secret. The broker overlay's config
@@ -503,7 +524,7 @@ listeners answer nothing before `broker_identity` returns.
 
 `dev/kind/mtls-e2e.sh` then applies `dev/kind/mtls/clients.yaml`: a namespace, four
 `ClusterSPIFFEID` fixtures an admin creates (nothing goes through mediatore's own entry
-path), and four pods that get their SVIDs from the real agent through the same CSI
+path), four pods that get their SVIDs from the real agent through the same CSI
 volume and run the shipped binary's `guest` and `token` roles against `mediatore-sandbox` (the same server image, ADR-0014):
 
 | Pod | SVID the agent issues | Expected |
@@ -512,6 +533,7 @@ volume and run the shipped binary's `guest` and `token` roles against `mediatore
 | `node` | `spiffe://<td>/banlieue/node/<fixture EK hash>` | `mediatore guest` logs `node registered`: `POST /v1/nodes` accepted because the peer ID matches the EK hash it claims |
 | `intruder` | `spiffe://<td>/intruder` | refused in the handshake, no HTTP answer; the broker logs `peer authenticated but not authorized here` |
 | `impersonator` | `spiffe://<td>/mediatore` | the same: the broker's own identity is not a client identity, even when a real agent issued it |
+| `lookalike` | none | a pod with the broker's label, a ServiceAccount named `mediatore` and a container named `mediatore`, in the tier's namespace: the `ClusterSPIFFEID` in `deploy/base` selects `mediatore-system`, so the SPIRE server holds no entry that selects this pod's UID (it holds one for the `claim` pod, read the same way), the `ClusterSPIFFEID`'s status counts one namespace, and the pod is still waiting on the Workload API, with no answer from the listener, after the four others have finished (ADR-0056 decision 2) |
 
 The script also reads the broker's log: the claim connection negotiated X25519MLKEM768
 and AES-256-GCM-SHA384, the node connected, both refusals were logged by the authorizer.
@@ -676,12 +698,98 @@ the `x86_64-unknown-linux-musl` target and a musl C compiler (`musl-tools`) for
 `aws-lc-rs`. `make kind-install` fetches the pinned kind CLI, checksum verified, into
 `KIND_BIN_DIR` (default `/usr/local/bin`).
 
+### The move to `mediatore-system`, rehearsed
+
+`make kind-rehearse-migration` (`dev/kind/migration-rehearsal.sh`) is the procedure of
+[ADR-0056](../adr/0056-the-broker-in-a-namespace-of-its-own.md) decision 7 run once, by the
+copy path, with the commands [the deploying guide](deploying.md#moving-a-running-broker-from-banlieue-system-to-mediatore-system)
+gives. It is not part of `make kind-e2e`: run it when that procedure changes, and replace
+the transcript below.
+
+It puts the kind broker back in `banlieue-system` under `dev/kind/migration` (an overlay of
+`dev/kind/broker`, so of `deploy/base`, with the five things an overlay that moves the
+broker must patch: step 1 of the procedure, the fail-closed policies in the old namespace
+with the parameter naming the old username), runs the first half of the Dex tier there (a
+login at Dex, a claim, the session delegated and sealed with the OpenBao transit key, the
+claim bound, a first token), then moves the broker: the namespace and the STS key, the
+OpenBao role bound to both namespaces, the old broker to zero, the `PolicyFloor`s and
+banned `SandboxNode`s (one of each made as a fixture in the old home, since the Dex tier
+reads no bundle and bans nobody, and found unchanged in the new), the session Secrets and
+bound `SandboxNode`s without owner references, the base in `mediatore-system`. The second half of the Dex tier then runs against the new
+broker: the claim bound before the move issues a token from the session copied into the new
+home (Dex's record of the refresh token shows the use), and the tier goes on to its two
+revocations and a second login and claim, so release, the sweep and a fresh claim are
+proven in the new home too. Dex, glauth and OpenBao stay in `mediatore-system` throughout:
+they stand for an issuer and a transit engine outside the broker's namespace. No banlieue
+controller runs and the pool is a fixture, as in the Dex tier.
+
+The run of 2026-11-27 on the build host (kind, Kubernetes 1.36.4, the transit sealer), as
+the script printed it, the terminal's colours removed:
+
+```text
+$ make kind-rehearse-migration
+./dev/kind/migration-rehearsal.sh .kind/kubeconfig sandbox.test .kind/ek.pem .kind/ek.hash .kind
+== before: the broker as it stood, in banlieue-system (step 1: this build and base, the parameter naming the old username)
+broker in banlieue-system: its self-check passed under the parameter broker=system:serviceaccount:banlieue-system:mediatore
+== broker: running, with the Dex issuer pinned to the CA kind-dex minted
+broker mediatore-75645c7d7f-tppgf, Dex and glauth up
+== fixtures: a namespace, the directory as shipped, and a node registering the fixture EK over mTLS
+node 72c566555391e835a15c522680b51ec3b840561ed70af5605a5ae4835f040ee8 registered
+== login and claim: the real CLI, from a pod, at the real Dex (PKCE, loopback redirect), the session delegated
+sandbox sandbox-f6a7cb45 created for octocat; one refresh token at Dex, delegated and parked
+claim 0409d94d-121d-4a0d-8749-a7cf4a6cc0da bound; sandbox-f6a7cb45 Ready; the claim SVID assigned to the workload pods
+== issue: the workload's claim SVID becomes an STS token, after a refresh at Dex
+token for octocat, aud e2e-sts, claim 0409d94d-121d-4a0d-8749-a7cf4a6cc0da; Dex refresh token used at 2026-11-27T13:25:28.69642499Z (was 2026-11-27T13:25:15.566929928Z)
+== PASS (first half): sandbox-f6a7cb45 bound as claim 0409d94d-121d-4a0d-8749-a7cf4a6cc0da and issuing, with the broker in banlieue-system; left standing for the second half
+in banlieue-system: 1 store Secret(s), 2 SandboxNode(s), 1 PolicyFloor(s)
+== step 2: the namespace, and what the operator created, copied (the same STS key, so the kid and the JWKS do not change)
+mediatore-sts in mediatore-system is the key in banlieue-system (digest of the data compared, never printed)
+== step 3: the bindings outside the repository name the new subject beside the old one
+OpenBao role mediatore: bound_service_account_namespaces=banlieue-system,mediatore-system (banlieue's brokers list and a policy namespace's RoleBinding take the same second line; neither exists in this cluster)
+== step 4: the old broker scaled to zero (the one outage starts)
+no broker pod in banlieue-system; the Lease there has no holder to renew it
+== step 5: every PolicyFloor and every banned SandboxNode
+  policyfloor.mediatore.io/mediatore-e2e-migration.rehearsal created
+  sandboxnode.mediatore.io/ba00000000000000000000000000000000000000000000000000000000000007 created
+in mediatore-system as in banlieue-system: floor mediatore-e2e-migration.rehearsal at version 7, node ba0000000000... banned; no unbanned node copied yet
+== step 6 (claims not drained): the store's Secrets and the bound SandboxNodes, with no ownerReferences, uid or resourceVersion
+  secret/mediatore-session-5c246cab-50ef-4224-899a-afe0b9950bf4 created
+  sandboxnode.mediatore.io/72c566555391e835a15c522680b51ec3b840561ed70af5605a5ae4835f040ee8 created
+  sandboxnode.mediatore.io/ba00000000000000000000000000000000000000000000000000000000000007 unchanged
+the copied session of sandbox-f6a7cb45 carries no owner reference
+== step 7: the base in mediatore-system, the parameter naming the new username
+2026-11-27T13:25:42.735951Z  INFO mediatore: store: the Kubernetes API (ADR-0034) namespace="mediatore-system" retention_secs=0
+parameter broker=system:serviceaccount:mediatore-system:mediatore; ClusterRoleBinding subject namespace=mediatore-system; ClusterSPIFFEID selects mediatore-system
+== step 8: verify (the claim bound before the move issues after it, then a new login and claim), then clean banlieue-system
+== broker: running, with the Dex issuer pinned to the CA kind-dex minted
+broker mediatore-56578bcb55-xnj4n, Dex and glauth up
+== after the move: the claim bound before it (0409d94d-121d-4a0d-8749-a7cf4a6cc0da, sandbox sandbox-f6a7cb45) issues again, the broker now in mediatore-system
+token for octocat, claim 0409d94d-121d-4a0d-8749-a7cf4a6cc0da, issued by the broker in mediatore-system from the session copied there; Dex refresh token used at 2026-11-27T13:25:58.788312754Z (was 2026-11-27T13:25:28.69642499Z)
+== revoked upstream, one way: octocat leaves the gated group in the directory
+403 session_revoked; the claim released: entry retracted
+== a second login and claim, for the other way
+claim 2adb2754-01f0-4fe3-9fdd-029a6172d596 bound; sandbox-affe8bf4 Ready; the claim SVID assigned to the workload pods
+sandbox sandbox-affe8bf4 created, bound, issuing
+== revoked upstream, the other way: the refresh token is deleted at Dex
+403 session_revoked; the claim released: entry retracted
+== PASS: ADR-0013 holds against a real Dex (the CLI's PKCE login, the delegated session, a refresh before every issue, revocation by group and by token)
+nothing of the broker's left in banlieue-system; the OpenBao role is bound to mediatore-system alone
+== PASS: ADR-0056 decision 7 by the copy path: claim 0409d94d-121d-4a0d-8749-a7cf4a6cc0da bound with the broker in banlieue-system, its token issued by the broker in mediatore-system
+```
+
+What it does not show, because kind has none of it: banlieue's `brokers` line and an Entra
+federated credential (the OpenBao role is the one binding outside the repository it
+exercises), a `LoadBalancer` address handed from the old Service to the new (the pods dial
+the Service by its new name), and a floor or a ban that the broker itself wrote. No running
+environment was migrated by this rehearsal.
+
 ## Live against a real cluster: `make live-admission-test`
 
 The same test against a deployment you operate, with the variables above set by hand.
 Pass the trust domain and class name from the deployment's own config (the controller
 manager's ConfigMap has both); never write them into the repo. With an admin kubeconfig
-the default `impersonate` mode is enough; where the admin credential is interactive
+the default `impersonate` mode is enough (the admin must be allowed to impersonate the
+group `system:masters` too, for the test of another sender); where the admin credential is interactive
 (an OIDC plugin, say) mint a token for the ServiceAccount and use `self`.
 
 Troubleshooting a timeout: the controller manager's log names every entry it created
@@ -691,6 +799,11 @@ present but not `rendered` means the controller manager refused the spec; `maske
 means another entry already claims the same parent, selectors and ID.
 
 ## Live proofs on the homelab, 2026-11-08
+
+The transcripts from here to the end of the page are records of the days they were taken.
+Until [ADR-0056](../adr/0056-the-broker-in-a-namespace-of-its-own.md) the broker ran in
+`banlieue-system`, which is why they show its Secrets, `SandboxNode`s and `PolicyFloor`s
+there; the base now deploys it into `mediatore-system`.
 
 What the tiers above cannot show is the whole path on real hardware: a pool member
 attested by its TPM, gateway VMs holding their own SPIFFE identity, the broker on a real

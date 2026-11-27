@@ -193,7 +193,8 @@ This ADR is how the broker reads it.
 9. **Deprecated, then removed.** `audiences[]` in `mediatore.yaml`, with ADR-0053 phase 1's
    `namespaces` map and `secret_file`, is deprecated by this ADR: kept under `config` and `shadow`,
    refused under `bundles`, removed in a later release once `bundles` is the default. Registries
-   keep their place in the file until ADR-0060.
+   keep their place in the file until ADR-0063 (with gateways, a registry is an audience marked
+   `role: registry`); the ADR-0060 named here on 2026-11-20 was never written.
 
 10. **Start checks and logs.** `shadow` and `bundles` require `policy.trusted_keys` and
     `platform_namespace` (an RFC 1123 label); `bundles` refuses a non-empty `audiences[]`. At start,

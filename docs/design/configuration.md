@@ -17,12 +17,12 @@ Every value in the example is a placeholder.
 | `trust_domain` | the SPIFFE trust domain of the deployment | the identity scheme, the mTLS verifiers ([Identity and mTLS](identity-and-mtls.md)) |
 | `listen` | `user`, `sandbox`: the two listener addresses | [Broker API](broker-api.md) |
 | `spire` | `workload_api_socket`; `entries.class_name` (the SPIRE Controller Manager's class) | [Identity and mTLS](identity-and-mtls.md) |
-| `issuers[]` | `url`, `backend`, `client_id`, `subject_claim`, `required_group`, `required_groups`, `allow_any_authenticated`, `groups_claim`, `session`, `entra`, `ca_file` | [Issuers and audiences](issuers-and-audiences.md) |
+| `issuers[]` | `url`, `backend`, `client_id`, `subject_claim`, `required_group`, `required_groups`, `allow_any_authenticated`, `groups_claim`, `session`, `entra`, `ca_file`, `subject_prefix` | [Issuers and audiences](issuers-and-audiences.md) |
 | `audiences[]` | `name`, `via`, `max_ttl`, `egress`, `rules`, `ca_file`, `secret_file`, `secret_header`, `secret_extra_headers`, `header`, `extra_headers`, `refresh`, `inject`, `credential` | [Issuers and audiences](issuers-and-audiences.md) |
 | `sts` | `issuer`, `kid`, `signing_key_file` | the token service |
 | `registries[]` | `host`, `username`, `password_file`, `reach` (`segment` or `relay`) | the pull ([The guest](guest.md)) |
 | `gateways`, `gateway_inject_port` | each gateway's sandbox address and data-plane port; the inject listener's own port | [The gateway](gateway.md), [Broker API](broker-api.md) |
-| `sandboxes` | `namespace`: where `POST /v1/claims` creates `AgentSandbox` resources; or `namespaces`: a map from a namespace to the groups whose members may claim there (the two are exclusive); `max_ttl_seconds`: the longest lifetime a claim may ask for (default `86400`, one day; positive) | [Claims and reconcilers](claims-and-reconcilers.md) |
+| `sandboxes` | `namespace`: where `POST /v1/claims` creates `AgentSandbox` resources; or `namespaces`: a map from a namespace to the groups whose members may claim there, and the issuers those groups are read from (the two are exclusive); `max_ttl_seconds`: the longest lifetime a claim may ask for (default `86400`, one day; positive); `declarative_issuers`: the issuers an `AgentSandbox` created through the Kubernetes API may name (default the one issuer, or none with two or more) | [Claims and reconcilers](claims-and-reconcilers.md) |
 | `watcher` | `resync_secs`, `resolve_timeout_secs`, `lease_duration_secs` | [Claims and reconcilers](claims-and-reconcilers.md) |
 | `store` | `retention_secs`, `node_grace_secs`, `sealing` (`key_file` or `transit`) | [The store and the sealing](store-and-sealing.md) |
 | `token` | `rate_per_minute`: the per-claim limit on `POST /v1/token` | [Broker API](broker-api.md) |
@@ -124,7 +124,18 @@ sandboxes:
   An issuer with none of the three, or with more than one, does not start.
 - `sandboxes.namespaces` maps a namespace (an RFC 1123 label) to `groups`, a non-empty list of exact values with no
   empty or whitespace-padded entry and no repeat inside one entry. The same group may appear under several namespaces.
-  An entry takes `groups` only; a typo such as `group:` is a start error.
+  An entry takes `groups` and `issuers`; a typo such as `group:` is a start error.
+- `issuers` on an entry lists the `issuers[].url` values whose tokens its groups are read from
+  ([ADR-0074](../adr/0074-a-namespaces-groups-read-only-from-the-issuers-it-names.md)): a token of another issuer does not
+  qualify, whatever its groups, and gets the answer of a caller without the group. With two or more issuers every entry
+  writes it; with one it is optional and read as that issuer.
+- `sandboxes.declarative_issuers` lists the issuers an `AgentSandbox` created through the Kubernetes API, not by
+  `POST /v1/claims`, may name in `spec.subject.issuer`
+  ([ADR-0072](../adr/0072-a-hand-created-sandbox-names-only-an-issuer-its-creator-can-come-from.md)). Not written, it is the
+  one issuer when there is one and none when there are two or more, so adding a second issuer closes that path until it
+  is written; `[]` closes it. A sandbox the broker created carries the annotation `mediatore.io/front-door: api`, which
+  the admission policy reserves to the broker, and is not asked. Where the list leaves an issuer out, the broker proves
+  at start that the policy guards the annotation (a dry-run create it must refuse) and does not start otherwise.
 - With the map set, a request must name its namespace (`namespace` in the body, `?namespace=` on `GET` and `DELETE`);
   omitted is `400 namespace_required`. A namespace outside the map, or one the caller holds no listed group for, is `403`
   on create and `404` on get and delete, with one message that names neither the groups nor the other namespaces.
@@ -157,6 +168,9 @@ These rules live in `Config::parse` and the section types, so a bad file never r
 - `sandboxes.namespaces` empty, with a key that is not an RFC 1123 label, a duplicate key, an entry with no, empty,
   padded or repeated `groups`, or written together with `sandboxes.namespace`; and, outside `dev_mode`, a map on a broker
   with no Kubernetes front;
+- with two or more issuers, a namespace entry without `issuers`; on any entry an empty `issuers`, a value that is not an
+  `issuers[].url` byte for byte, or one listed twice (ADR-0074);
+- a `sandboxes.declarative_issuers` value that is not an `issuers[].url` byte for byte, or one listed twice (ADR-0072);
 - a key the file spells wrongly at any level of `Config` and its sections, the top level included
   (`deny_unknown_fields`): a misspelt `sandboxes` is not silently the default;
 - an audience field the file spells wrongly (`deny_unknown_fields`): a misspelt `inject` must not fall back to the default.

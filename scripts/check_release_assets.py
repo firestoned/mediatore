@@ -17,15 +17,17 @@ import yaml
 
 # deploy/base, as kustomize renders it. The overlay (config, Secrets, ingress) is the
 # operator's and deliberately not in the manifest. Three CRDs since ADR-0034 (AgentSandbox,
-# SandboxNode, PolicyFloor); two Roles (the watcher Lease, the session Secrets); the one
-# NetworkPolicy, whose placeholder peers admit nothing until an overlay patches them.
+# SandboxNode, PolicyFloor); the broker's own Namespace and three Roles in it since ADR-0056
+# (the watcher Lease, the session Secrets, the store's two kinds); the one NetworkPolicy,
+# whose placeholder peers admit nothing until an overlay patches them.
 EXPECTED_KINDS = {
+    "Namespace": 1,
     "CustomResourceDefinition": 3,
     "ServiceAccount": 1,
     "ClusterRole": 1,
     "ClusterRoleBinding": 1,
-    "Role": 2,
-    "RoleBinding": 2,
+    "Role": 3,
+    "RoleBinding": 3,
     "Deployment": 1,
     "Service": 2,
     "NetworkPolicy": 1,
@@ -77,6 +79,20 @@ def main() -> None:
         fail(f"expected the server image pinned to {server}, found {images}")
     if text.count(server.split("@")[0] + ":") != 0:
         fail("a tag reference to the server image survived")
+    # ADR-0056: every namespaced object is in the broker's own namespace, the one the
+    # manifest ships, and nothing in the manifest names banlieue's.
+    home = [d["metadata"]["name"] for d in docs if d["kind"] == "Namespace"]
+    if home != ["mediatore-system"]:
+        fail(f"expected the one Namespace mediatore-system, found {home}")
+    elsewhere = sorted(
+        f'{d["kind"]}/{d["metadata"]["name"]}'
+        for d in docs
+        if d["metadata"].get("namespace", home[0]) != home[0]
+    )
+    if elsewhere:
+        fail(f"namespaced objects outside {home[0]}: {elsewhere}")
+    if "banlieue-system" in text:
+        fail("the install manifest names banlieue-system (ADR-0056: the broker has its own namespace)")
 
     for path, image in [(vmimage, guest), (gateway_vmimage, gateway)]:
         vm = path.read_text(encoding="utf-8")

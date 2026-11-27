@@ -58,6 +58,7 @@ impl Harness {
                 ca_file: None,
                 entra: None,
                 groups_claim: None,
+                subject_prefix: None,
             }]),
             sts: None,
             audiences: vec![AUDIENCE.into()],
@@ -525,6 +526,30 @@ async fn create_sandbox_in_the_default_namespace_is_byte_identical_to_before() {
         got.get("status").is_none(),
         "the reconciler writes the status"
     );
+    // ADR-0072 decision 3, the one thing new in what the broker writes: its mark, and no
+    // other annotation or label.
+    assert_eq!(
+        got["metadata"]["annotations"],
+        serde_json::json!({ "mediatore.io/front-door": "api" })
+    );
+    assert!(got["metadata"].get("labels").is_none(), "no label");
+}
+
+/// ADR-0072 decision 3: a sandbox `POST /v1/claims` creates is the broker's by its mark, which
+/// the reconciler reads through `created_through_the_api`; the same spec created by hand is not.
+#[tokio::test]
+async fn post_creates_an_agentsandbox_marked_as_created_through_the_api() {
+    let h = Harness::start(true).await;
+    let resp = h.create(&h.login("octocat"), &[AUDIENCE]).await;
+    assert_eq!(resp.status(), 201);
+    let all = h.sandboxes.all();
+    assert_eq!(all.len(), 1);
+    assert!(mediatore_claims::sandbox::created_through_the_api(&all[0]));
+    let mut by_hand = all[0].clone();
+    by_hand.metadata.annotations = None;
+    assert!(!mediatore_claims::sandbox::created_through_the_api(
+        &by_hand
+    ));
 }
 
 #[tokio::test]

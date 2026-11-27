@@ -8,7 +8,7 @@
 //! production gets: the `ClusterRole` verbs and the `ValidatingAdmissionPolicy`. Either
 //! the kubeconfig is an admin that impersonates it (the default), or it is the
 //! `ServiceAccount` itself (`MEDIATORE_LIVE_IDENTITY=self`, for example a kubeconfig built
-//! around `kubectl -n banlieue-system create token mediatore`). The test declares the two entry shapes, waits for
+//! around `kubectl -n mediatore-system create token mediatore`). The test declares the two entry shapes, waits for
 //! the controller manager to report `status.set` (a transient it catches with a watch
 //! opened before the create), proves that admission refuses the shapes
 //! ADR-0006 forbids and that RBAC refuses edits, then retracts everything it created.
@@ -34,15 +34,19 @@ use kube::api::{Api, DeleteParams, ObjectMeta, Patch, PatchParams, PostParams};
 use kube::config::{KubeConfigOptions, Kubeconfig};
 use kube::{Client, Config};
 use mediatore_spire::{
-    ClusterStaticEntry, ClusterStaticEntrySpec, EntriesConfig, EntryKind, EntryManager,
-    KubeEntryManager, Naming, claim_entry_name, node_entry_name,
+    ClusterStaticEntry, ClusterStaticEntrySpec, ENTRIES_POLICY_SENDER_MESSAGE, EntriesConfig,
+    EntryKind, EntryManager, KubeEntryManager, Naming, SelfCheckError, claim_entry_name,
+    node_entry_name,
 };
 use uuid::Uuid;
 
 /// The RSA fixture's hash from `mediatore_proto::ek`; no real TPM has this key.
 const EK: &str = "72c566555391e835a15c522680b51ec3b840561ed70af5605a5ae4835f040ee8";
 const UNIX_USER: &str = "sb-0123456789ab";
-const SERVICE_ACCOUNT: &str = "system:serviceaccount:banlieue-system:mediatore";
+const SERVICE_ACCOUNT: &str = "system:serviceaccount:mediatore-system:mediatore";
+/// An account of the broker's name in another namespace, the one the broker ran in before
+/// ADR-0056: what a policy matching on the `ServiceAccount`'s name alone would take for it.
+const ANOTHER_ACCOUNT: &str = "system:serviceaccount:banlieue-system:mediatore";
 /// Name used by the admission negatives; must be `mediatore-*` so only the field under
 /// test is what the policy refuses.
 const BAD_NAME: &str = "mediatore-live-negative";
@@ -64,6 +68,29 @@ async fn as_service_account() -> Client {
         Ok("impersonate") | Err(_) => cfg.auth_info.impersonate = Some(SERVICE_ACCOUNT.into()),
         Ok(other) => panic!("MEDIATORE_LIVE_IDENTITY must be impersonate or self, not {other:?}"),
     }
+    Client::try_from(cfg).expect("client")
+}
+
+/// A client that is [`ANOTHER_ACCOUNT`] with every RBAC verb (the group `system:masters`),
+/// so authorization lets its requests through and admission alone judges them. It needs a
+/// kubeconfig that may impersonate: `MEDIATORE_LIVE_ADMIN_KUBECONFIG`, or
+/// `MEDIATORE_LIVE_KUBECONFIG` when that one is already an admin's (the default identity).
+async fn as_another_account() -> Client {
+    let path = match std::env::var("MEDIATORE_LIVE_ADMIN_KUBECONFIG") {
+        Ok(path) => path,
+        Err(_) => match std::env::var("MEDIATORE_LIVE_IDENTITY").as_deref() {
+            Ok("self") => panic!(
+                "MEDIATORE_LIVE_ADMIN_KUBECONFIG is required with MEDIATORE_LIVE_IDENTITY=self: the test of another sender impersonates, and fails without its fixture, it never skips"
+            ),
+            _ => required("MEDIATORE_LIVE_KUBECONFIG"),
+        },
+    };
+    let kc = Kubeconfig::read_from(path).expect("read the admin kubeconfig");
+    let mut cfg = Config::from_custom_kubeconfig(kc, &KubeConfigOptions::default())
+        .await
+        .expect("kubeconfig to client config");
+    cfg.auth_info.impersonate = Some(ANOTHER_ACCOUNT.into());
+    cfg.auth_info.impersonate_groups = Some(vec!["system:masters".into()]);
     Client::try_from(cfg).expect("client")
 }
 
@@ -153,6 +180,18 @@ async fn run(
 ) -> Result<(), String> {
     let class = cfg.class_name.clone();
     let mgr = KubeEntryManager::new(client, naming.clone(), cfg);
+
+    // The broker's own proof, as it makes it at every start and resync (ADR-0056 decision
+    // 5): the policy binds this ServiceAccount and names it as the broker. Nothing is
+    // persisted by it.
+    mgr.self_check()
+        .await
+        .map_err(|e| format!("the self-check as the broker's ServiceAccount: {e}"))?;
+    let listed = mgr.list_entries().await.map_err(|e| e.to_string())?;
+    assert!(
+        listed.iter().all(|e| !e.name.contains("selfcheck")),
+        "the self-check persisted an entry: {listed:?}"
+    );
 
     // Node entry: declared, rendered and set by the controller manager.
     let node = match mgr.ensure_node_entry(EK).await {
@@ -362,4 +401,52 @@ async fn run(
         "retracted entries still listed: {listed:?}"
     );
     Ok(())
+}
+
+/// ADR-0056 decision 4: an entry that is the broker's by what it is, sent by anyone but the
+/// `ServiceAccount` the policy's parameter names, is refused by the policy's sender
+/// validation, here for an account of the broker's own name in another namespace that RBAC
+/// would let do anything. The same account running the broker's self-check is told it is
+/// not the broker, which is what stops a broker under a wrong name at start. Dry runs only.
+#[tokio::test]
+#[ignore = "needs a cluster with deploy/base applied and a kubeconfig that may impersonate"]
+async fn another_account_is_refused_the_brokers_entries_and_fails_the_self_check() {
+    let (naming, cfg) = fixture();
+    let client = as_another_account().await;
+    let api: Api<ClusterStaticEntry> = Api::all(client.clone());
+    let ek = "b".repeat(64);
+    let permitted_from_the_broker = ClusterStaticEntry {
+        metadata: ObjectMeta {
+            name: Some(node_entry_name(&ek)),
+            ..ObjectMeta::default()
+        },
+        spec: ClusterStaticEntrySpec {
+            spiffe_id: naming.node_id(&ek),
+            parent_id: naming.agent_id(&ek),
+            selectors: vec!["unix:uid:0".into()],
+            class_name: Some(cfg.class_name.clone()),
+            x509_svid_ttl: None,
+            hint: None,
+        },
+        status: None,
+    };
+    let dry_run = PostParams {
+        dry_run: true,
+        ..PostParams::default()
+    };
+    match api.create(&dry_run, &permitted_from_the_broker).await {
+        Err(kube::Error::Api(e)) if e.code == 403 => assert!(
+            e.message.contains(ENTRIES_POLICY_SENDER_MESSAGE),
+            "refused, but not by the sender validation: {:?}",
+            e.message
+        ),
+        Err(e) => panic!("wanted the policy's 403 for another sender, got {e}"),
+        Ok(_) => panic!("admission admitted one of the broker's entries from {ANOTHER_ACCOUNT}"),
+    }
+    let mgr = KubeEntryManager::new(client, naming, cfg);
+    let answer = mgr.self_check().await;
+    assert!(
+        matches!(answer, Err(SelfCheckError::NotTheBroker(_))),
+        "the self-check as {ANOTHER_ACCOUNT}: {answer:?}"
+    );
 }

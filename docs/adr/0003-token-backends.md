@@ -11,7 +11,7 @@ against the fake IdP; the live runs are roadmap 04's) · **Amended:** 2026-11-08
 [ADR-0032](0032-operator-held-credentials-as-an-audience-backend.md)); 2026-11-08 (`none`, a
 route without a credential: [ADR-0025](0025-phantom-token-egress-proxy.md) decision 8);
 2026-11-10 (a fourth backend, `delegated`, the requester's own session for an audience:
-[ADR-0035](0035-a-requesters-own-session-delegated-at-claim-time.md))
+[ADR-0035](0035-a-requesters-own-session-delegated-at-claim-time.md)) · **Amended:** 2026-11-27 by [ADR-0071](0071-sub-qualified-by-issuer-when-the-broker-trusts-several.md) (the STS token's `sub` carries its issuer's `subject_prefix` when one is set) · **Amended:** 2026-11-27 by [ADR-0073](0073-groups-qualified-by-issuer-when-the-broker-trusts-several.md) (each element of the STS token's `groups` carries the same prefix)
 
 ## Context
 

@@ -87,7 +87,7 @@ spec:
       imagePullPolicy: Never
       command: ["/usr/bin/mediatore", "token", "--audience", "e2e"]
       env:
-        - { name: MEDIATORE_URL, value: "https://mediatore-sandbox.banlieue-system.svc" }
+        - { name: MEDIATORE_URL, value: "https://mediatore-sandbox.mediatore-system.svc" }
         - { name: SPIFFE_ENDPOINT_SOCKET, value: "unix:///run/spire/sockets/spire-agent.sock" }
       volumeMounts:
         - { name: spire-agent-socket, mountPath: /run/spire/sockets, readOnly: true }
@@ -127,7 +127,7 @@ spec:
         - 1d2c3b4a-5f6e-4d7c-8b9a-0f1e2d3c4b5a
         - --dev-skip-setup
       env:
-        - { name: MEDIATORE_URL, value: "https://mediatore-sandbox.banlieue-system.svc" }
+        - { name: MEDIATORE_URL, value: "https://mediatore-sandbox.mediatore-system.svc" }
         - { name: SPIFFE_ENDPOINT_SOCKET, value: "unix:///run/spire/sockets/spire-agent.sock" }
       volumeMounts:
         - { name: spire-agent-socket, mountPath: /run/spire/sockets, readOnly: true }
@@ -159,7 +159,7 @@ spec:
       imagePullPolicy: Never
       command: ["/usr/bin/mediatore", "token", "--audience", "e2e"]
       env:
-        - { name: MEDIATORE_URL, value: "https://mediatore-sandbox.banlieue-system.svc" }
+        - { name: MEDIATORE_URL, value: "https://mediatore-sandbox.mediatore-system.svc" }
         - { name: SPIFFE_ENDPOINT_SOCKET, value: "unix:///run/spire/sockets/spire-agent.sock" }
       volumeMounts:
         - { name: spire-agent-socket, mountPath: /run/spire/sockets, readOnly: true }
@@ -190,7 +190,49 @@ spec:
       imagePullPolicy: Never
       command: ["/usr/bin/mediatore", "token", "--audience", "e2e"]
       env:
-        - { name: MEDIATORE_URL, value: "https://mediatore-sandbox.banlieue-system.svc" }
+        - { name: MEDIATORE_URL, value: "https://mediatore-sandbox.mediatore-system.svc" }
+        - { name: SPIFFE_ENDPOINT_SOCKET, value: "unix:///run/spire/sockets/spire-agent.sock" }
+      volumeMounts:
+        - { name: spire-agent-socket, mountPath: /run/spire/sockets, readOnly: true }
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities: { drop: ["ALL"] }
+  volumes:
+    - name: spire-agent-socket
+      csi: { driver: csi.spiffe.io, readOnly: true }
+---
+# A pod that looks like the broker everywhere but in its namespace (ADR-0056 decision 2):
+# the broker's pod label, a ServiceAccount of the broker's name, the broker's container
+# name. The ClusterSPIFFEID in deploy/base selects the broker's own namespace, so the
+# agent has no entry for this pod and it is issued nothing: the Workload API keeps it
+# waiting and it never reaches the listener.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: mediatore
+  namespace: mediatore-e2e
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: lookalike
+  namespace: mediatore-e2e
+  labels: { app.kubernetes.io/name: mediatore }
+spec:
+  restartPolicy: Never
+  serviceAccountName: mediatore
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    seccompProfile: { type: RuntimeDefault }
+  containers:
+    - name: mediatore
+      image: ghcr.io/firestoned/mediatore:kind
+      imagePullPolicy: Never
+      command: ["/usr/bin/mediatore", "token", "--audience", "e2e"]
+      env:
+        - { name: MEDIATORE_URL, value: "https://mediatore-sandbox.mediatore-system.svc" }
         - { name: SPIFFE_ENDPOINT_SOCKET, value: "unix:///run/spire/sockets/spire-agent.sock" }
       volumeMounts:
         - { name: spire-agent-socket, mountPath: /run/spire/sockets, readOnly: true }

@@ -12,7 +12,7 @@ set -euo pipefail
 ADMIN=${1:?admin kubeconfig}
 OUT=${2:?output path}
 DURATION=${3:-1h}
-NS=banlieue-system
+NS=mediatore-system
 SA=mediatore
 
 SERVER=$(kubectl --kubeconfig "$ADMIN" config view --raw --minify -o jsonpath='{.clusters[0].cluster.server}')

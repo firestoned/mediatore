@@ -1,0 +1,28 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+#
+# The broker's own namespace (ADR-0056 decisions 1 and 2). It holds the broker and what
+# is the broker's: its ServiceAccount, its keys (mediatore-sts, mediatore-sealing with the
+# local sealer, the audience and registry Secrets), the session, delegation and log
+# Secrets the store writes, the SandboxNode and PolicyFloor resources, the watcher's
+# Lease and the admission parameter that names the broker. Nothing of banlieue's lives
+# here, so "every verb on Secrets in this namespace" (the mediatore-sessions Role,
+# rbac.yaml) is a grant over the broker's Secrets and no one else's.
+#
+# Pod Security `restricted` is enforced: the broker's pod is written for it
+# (deployment.yaml: non-root, no privilege escalation, every capability dropped, the
+# runtime's seccomp profile, a CSI volume). Keep tenants' sandboxes, pools and claims out
+# of this namespace: the broker warns at start when a claimable namespace is its home
+# (ADR-0056 decision 6).
+#
+# An operator whose namespaces are created elsewhere deletes this object in the overlay
+# (`$patch: delete`) and carries the label there. A kustomize `namespace:` in an overlay
+# renames this object with everything else; the three strings it does not rewrite are
+# listed in admission/agentsandbox-subject.yaml.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mediatore-system
+  labels:
+    app.kubernetes.io/name: mediatore
+    pod-security.kubernetes.io/enforce: restricted

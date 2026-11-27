@@ -114,7 +114,7 @@ spec:
             - --stale-secs
             - "120"
           env:
-            - { name: MEDIATORE_URL, value: "https://mediatore-sandbox.banlieue-system.svc" }
+            - { name: MEDIATORE_URL, value: "https://mediatore-sandbox.mediatore-system.svc" }
             - { name: SPIFFE_ENDPOINT_SOCKET, value: "unix:///run/spire/sockets/spire-agent.sock" }
             - { name: RUST_LOG, value: "info" }
           volumeMounts:

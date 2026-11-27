@@ -97,6 +97,15 @@ What stays as it is, and why:
 
    Both are reported under `shadow` and refuse under `enforce`.
 
+*Note of 2026-11-27, from [ADR-0074](0074-a-namespaces-groups-read-only-from-the-issuers-it-names.md)
+decision 8 (implemented that day):* a group name is unique only inside the issuer that gave it.
+This ADR reads a policy's `subjects.groups`, names with no issuer, on the requester's token. It
+runs after the namespace gate, so the token's issuer is already one the namespace's entry
+lists; where the entry lists one issuer that is sufficient, and where it lists several the
+bundle's names are read from each, as ADR-0074 decision 4 says of the map. That is the floor this
+ADR inherits. Whether a bundle should carry an issuer per group is decided here, with notaio's
+schema, before this ADR is implemented.
+
 ## Security analysis
 
 | Threat | STRIDE | Control |

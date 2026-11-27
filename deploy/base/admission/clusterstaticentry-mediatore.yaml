@@ -28,16 +28,28 @@
 # from anyone, if the object is still of a permitted shape. DELETE is not
 # matched: retracting an entry by hand stays RBAC's.
 #
-# The ServiceAccount is a literal, `system:serviceaccount:banlieue-system:mediatore`,
-# twice below, the same string agentsandbox-subject.yaml and
-# agentsandbox-status.yaml carry. A kustomize `namespace:` does not rewrite a
-# string inside a CEL expression: AN OVERLAY THAT RENAMES THE ServiceAccount OR
-# MOVES IT TO ANOTHER NAMESPACE MUST PATCH BOTH OCCURRENCES. Forgetting to used
-# to leave the broker's entries unjudged, with no error anywhere (the policy
-# matched nothing the broker sent). It now refuses them: the entries are still
-# claimed by their names, the sender validation fails, no sandbox binds, and the
-# broker says so when it starts (its self-check, ADR-0056 decision 5,
-# crates/mediatore-spire/src/kube.rs) instead of serving.
+# The ServiceAccount is not a literal here: its username is the key `broker` of
+# the ConfigMap mediatore-agentsandbox-subject-policy in the broker's namespace
+# (agentsandbox-subject.yaml), read through `params` by the match condition and
+# by the sender validation, the same value agentsandbox-subject.yaml and
+# agentsandbox-status.yaml read (ADR-0056 decision 4). A kustomize `namespace:`
+# does not rewrite a string inside a ConfigMap's data, nor `paramRef.namespace`:
+# AN OVERLAY THAT RENAMES THE ServiceAccount OR MOVES IT TO ANOTHER NAMESPACE
+# PATCHES THE `broker` VALUE AND THE THREE BINDINGS' `paramRef.namespace`.
+# Forgetting to used to leave the broker's entries unjudged, with no error
+# anywhere (the policy matched nothing the broker sent). It now refuses them:
+# the entries are still claimed by their names, the sender validation fails, no
+# sandbox binds, and the broker says so when it starts and at each resync (its
+# self-check, ADR-0056 decision 5, crates/mediatore-spire/src/kube.rs).
+#
+# The parameter is namespaced and ClusterStaticEntry is cluster-scoped, so the
+# binding names the parameter's namespace (`paramRef.namespace`); a cluster-
+# scoped request has no namespace of its own to default to. With the ConfigMap
+# absent (parameterNotFoundAction: Deny) or the key absent (the expressions
+# fail, failurePolicy: Fail), EVERY create and update of a ClusterStaticEntry
+# is refused, the gateway's entries included, because the parameter is resolved
+# before the match condition is. That is the fail-closed side: restore the
+# ConfigMap (agentsandbox-subject.yaml) to declare anything.
 #
 # The gateway's entries (clusterstaticentry-gateway.yaml: gateway-*, a path of
 # /gateway or under it, labelled mediatore.io/role: gateway) carry none of the
@@ -55,6 +67,9 @@ metadata:
     app.kubernetes.io/component: admission
 spec:
   failurePolicy: Fail
+  paramKind:
+    apiVersion: v1
+    kind: ConfigMap
   matchConstraints:
     resourceRules:
       - apiGroups: ["spire.spiffe.io"]
@@ -70,7 +85,7 @@ spec:
   matchConditions:
     - name: is-from-the-broker-or-is-one-of-its-entries
       expression: >-
-        request.userInfo.username == 'system:serviceaccount:banlieue-system:mediatore' ||
+        request.userInfo.username == params.data.broker.trim() ||
         (has(object.metadata.name) && object.metadata.name.startsWith('mediatore-')) ||
         (has(object.metadata.labels) && 'app.kubernetes.io/managed-by' in object.metadata.labels &&
         object.metadata.labels['app.kubernetes.io/managed-by'] == 'mediatore') ||
@@ -92,7 +107,7 @@ spec:
     # self-check (ENTRIES_POLICY_SENDER_MESSAGE, crates/mediatore-spire/src/lib.rs)
     # and held to it by a unit test: change both or neither.
     - expression: >-
-        request.userInfo.username == 'system:serviceaccount:banlieue-system:mediatore' ||
+        request.userInfo.username == params.data.broker.trim() ||
         (request.operation == 'UPDATE' && oldObject.spec == object.spec)
       message: "an entry named mediatore-*, labelled app.kubernetes.io/managed-by=mediatore or under /banlieue/ is the broker's alone to declare, and this request is not from the broker's ServiceAccount as this policy spells it"
       reason: Forbidden
@@ -159,3 +174,7 @@ metadata:
 spec:
   policyName: mediatore-clusterstaticentry
   validationActions: ["Deny"]
+  paramRef:
+    name: mediatore-agentsandbox-subject-policy
+    namespace: mediatore-system
+    parameterNotFoundAction: Deny

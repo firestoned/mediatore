@@ -24,13 +24,15 @@ issuers:
     backend: sts
     client_id: mediatore
     allow_any_authenticated: true   # a placeholder issuer for the kind tier, no groups to gate on (ADR-0046 decision 19)
-  - url: https://mediatore-dex.banlieue-system.svc:5556
+    subject_prefix: "example:"      # two issuers under one sts: each qualifies `sub` (ADR-0071 decision 3)
+  - url: https://mediatore-dex.mediatore-system.svc:5556
     backend: sts
     client_id: mediatore
     subject_claim: preferred_username
     required_group: sandbox-users
     session: { client_id: mediatore }
     ca_file: /etc/mediatore-dex/ca.pem
+    subject_prefix: "dex:"
 audiences:
   - { name: e2e, via: sts }
   - { name: e2e-sts, via: sts, max_ttl: 900 }
@@ -51,13 +53,17 @@ sts:
   signing_key_file: /etc/mediatore-sts/sts.pem
 sandboxes:
   namespace: mediatore-e2e-sandbox
+  # Two issuers are trusted, and the tiers create sandboxes with kubectl naming the
+  # placeholder issuer: the declarative path names it and no other (ADR-0072 decision 4).
+  # Dex's sandboxes come through POST /v1/claims and carry the broker's mark.
+  declarative_issuers: [https://issuer.example.com]
 # The store is the Kubernetes API (ADR-0034). An ended claim is kept for 0 s and the
 # resync runs every 15 s, so the sandbox tier sees the sweep release the sandbox.
 store:
   retention_secs: 0
   sealing:
     transit:
-      url: https://mediatore-openbao.banlieue-system.svc:8200
+      url: https://mediatore-openbao.mediatore-system.svc:8200
       ca_file: /etc/mediatore-openbao/ca.pem
       key: mediatore
       role: mediatore

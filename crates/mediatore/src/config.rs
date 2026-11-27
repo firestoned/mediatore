@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-use mediatore_api::Namespaces;
+use mediatore_api::{NamespaceGrant, Namespaces};
 use mediatore_entra::{Backend, IssuerConfig};
 use mediatore_proto::image::canonical_registry;
 use mediatore_proto::{
@@ -14,6 +14,7 @@ use mediatore_proto::{
 };
 use mediatore_store::LogLimits;
 use mediatore_store::seal::TransitConfig;
+use mediatore_sts::{SubjectPrefixError, SubjectPrefixes};
 use serde::Deserialize;
 
 /// What an audience is for (ADR-0063 decision 2).
@@ -473,6 +474,13 @@ pub struct SandboxesSection {
     /// bound is not released when the key is lowered.
     #[serde(default = "default_max_ttl_seconds")]
     pub max_ttl_seconds: u32,
+    /// The issuers an `AgentSandbox` created through the Kubernetes API (not by
+    /// `POST /v1/claims`) may name in `spec.subject.issuer` (ADR-0072 decision 4): the issuers
+    /// the API server's users come from. Each must equal an `issuers[].url` byte for byte and
+    /// appear once. Not written: the one issuer when there is one, none when there are two
+    /// or more ([`Config::declarative_issuers`]). `[]` closes the declarative path.
+    #[serde(default)]
+    pub declarative_issuers: Option<Vec<String>>,
 }
 
 impl Default for SandboxesSection {
@@ -481,6 +489,7 @@ impl Default for SandboxesSection {
             namespace: None,
             namespaces: None,
             max_ttl_seconds: default_max_ttl_seconds(),
+            declarative_issuers: None,
         }
     }
 }
@@ -497,6 +506,11 @@ pub struct NamespaceEntry {
     /// Groups of which a caller must hold at least one, matched exactly (ADR-0046 decision 2).
     /// Required and non-empty.
     pub groups: Vec<String>,
+    /// The issuers whose tokens `groups` are read from (ADR-0074): each an `issuers[].url`,
+    /// byte for byte, once. Required when the broker trusts two or more issuers; with one,
+    /// optional and read as that issuer.
+    #[serde(default)]
+    pub issuers: Option<Vec<String>>,
 }
 
 fn default_sandbox_namespace() -> String {
@@ -514,22 +528,94 @@ impl SandboxesSection {
     }
 
     /// What the user API serves (ADR-0046 decision 3): the map when `namespaces` is set,
-    /// otherwise the single open namespace, exactly as before.
+    /// otherwise the single open namespace, exactly as before. `issuers` are the configured
+    /// `issuers[].url`: an entry without `issuers` is read from them, which [`Self::validate`]
+    /// allows only when there is one (ADR-0074 decision 3).
     #[must_use]
-    pub fn resolve(&self) -> Namespaces {
+    pub fn resolve(&self, issuers: &[String]) -> Namespaces {
         match &self.namespaces {
             Some(map) => Namespaces::Map(
                 map.iter()
-                    .map(|(ns, e)| (ns.clone(), e.groups.clone()))
+                    .map(|(ns, e)| {
+                        (
+                            ns.clone(),
+                            NamespaceGrant {
+                                groups: e.groups.clone(),
+                                issuers: e.issuers.clone().unwrap_or_else(|| issuers.to_vec()),
+                            },
+                        )
+                    })
                     .collect(),
             ),
             None => Namespaces::Single(self.single_namespace()),
         }
     }
 
-    /// ADR-0046 decision 14, each refusal naming the key and the value; and the ceiling of
-    /// ADR-0008 decision 9 (amended 2026-11-26), which zero would turn into "no claim at all".
-    fn validate(&self) -> anyhow::Result<()> {
+    /// ADR-0074 decision 2: with two or more issuers every entry lists its issuers; any list
+    /// written is non-empty, names configured issuers byte for byte and each once.
+    fn validate_namespace_issuers(
+        ns: &str,
+        entry: &NamespaceEntry,
+        issuers: &[String],
+    ) -> anyhow::Result<()> {
+        let Some(listed) = &entry.issuers else {
+            if issuers.len() >= 2 {
+                anyhow::bail!(
+                    "sandboxes.namespaces.{ns}.issuers is not set: with {} issuers a namespace's groups must say which issuers they are read from, or a group of the same name at another issuer would admit its members (ADR-0074)",
+                    issuers.len()
+                );
+            }
+            return Ok(());
+        };
+        if listed.is_empty() {
+            anyhow::bail!(
+                "sandboxes.namespaces.{ns}.issuers is empty: list the issuers (issuers[].url) whose tokens this namespace's groups are read from, or leave the key out with a single issuer (ADR-0074)"
+            );
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for issuer in listed {
+            if !issuers.iter().any(|i| i == issuer) {
+                anyhow::bail!(
+                    "sandboxes.namespaces.{ns}.issuers: {issuer:?} is not the url of a configured issuer, byte for byte (ADR-0074)"
+                );
+            }
+            if !seen.insert(issuer.as_str()) {
+                anyhow::bail!(
+                    "sandboxes.namespaces.{ns}.issuers: {issuer:?} is listed twice (ADR-0074)"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// ADR-0072 decision 4: `declarative_issuers`, when written, names configured issuers byte
+    /// for byte and each once, so a typo is a start error and not a silently closed path.
+    fn validate_declarative_issuers(&self, issuers: &[String]) -> anyhow::Result<()> {
+        let Some(listed) = &self.declarative_issuers else {
+            return Ok(());
+        };
+        let mut seen = std::collections::BTreeSet::new();
+        for issuer in listed {
+            if !issuers.iter().any(|i| i == issuer) {
+                anyhow::bail!(
+                    "sandboxes.declarative_issuers: {issuer:?} is not the url of a configured issuer, byte for byte (ADR-0072)"
+                );
+            }
+            if !seen.insert(issuer.as_str()) {
+                anyhow::bail!(
+                    "sandboxes.declarative_issuers: {issuer:?} is listed twice (ADR-0072)"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// ADR-0046 decision 14, each refusal naming the key and the value; the ceiling of
+    /// ADR-0008 decision 9 (amended 2026-11-26), which zero would turn into "no claim at all";
+    /// the issuers of each entry (ADR-0074) and the declarative issuers (ADR-0072), against
+    /// the configured `issuers[].url`.
+    fn validate(&self, issuers: &[String]) -> anyhow::Result<()> {
+        self.validate_declarative_issuers(issuers)?;
         if self.max_ttl_seconds == 0 {
             anyhow::bail!(
                 "sandboxes.max_ttl_seconds must be positive: it is the longest lifetime a claim may ask for, in seconds (default {})",
@@ -576,6 +662,7 @@ impl SandboxesSection {
                     );
                 }
             }
+            Self::validate_namespace_issuers(ns, entry, issuers)?;
         }
         Ok(())
     }
@@ -1373,6 +1460,7 @@ impl Config {
         cfg.check_entra()?;
         cfg.check_gates()?;
         cfg.check_issuer_urls()?;
+        cfg.check_subject_prefixes()?;
         if !cfg.dev_mode && cfg.spire.is_none() {
             anyhow::bail!("`spire` (workload_api_socket, entries) is required outside dev_mode");
         }
@@ -1390,7 +1478,7 @@ impl Config {
                 "watcher.resync_secs and resolve_timeout_secs must be positive and lease_duration_secs at least 3"
             );
         }
-        cfg.sandboxes.validate()?;
+        cfg.sandboxes.validate(&cfg.issuer_urls())?;
         cfg.check_audience_scopes()?;
         if let Some(e) = cfg.spire.as_ref().map(|s| &s.entries) {
             if e.class_name.trim().is_empty() {
@@ -1469,10 +1557,68 @@ impl Config {
         Ok(())
     }
 
-    /// What the user API serves: the map, or the single open namespace (ADR-0046 decision 3).
+    /// ADR-0071 decisions 1 and 3: a `subject_prefix` has the one form, and under an `sts` two
+    /// or more issuers each have one, no two overlapping, so the broker never signs the same
+    /// `sub` for two people who share a subject id at two issuers. Without an `sts` the
+    /// broker signs no token and only the form is checked. Refused at start with the key
+    /// and the issuer's `url`, never minted bare.
+    fn check_subject_prefixes(&self) -> anyhow::Result<()> {
+        if self.sts.is_some() {
+            self.subject_prefixes()?;
+            return Ok(());
+        }
+        for issuer in &self.issuers {
+            // One issuer at a time: the form alone, not the set.
+            SubjectPrefixes::new([(issuer.url.as_str(), issuer.subject_prefix.as_deref())])?;
+        }
+        Ok(())
+    }
+
+    /// The `sub` prefix of each issuer, checked as a set (ADR-0071): a malformed prefix is
+    /// refused whatever the number of issuers, and two or more issuers need one each, no two
+    /// overlapping. The STS is built with the result (`sts` in main.rs), so what was
+    /// checked is what mints.
+    ///
+    /// # Errors
+    /// The `mediatore_sts::SubjectPrefixError`, which names `issuers[<url>].subject_prefix`.
+    pub fn subject_prefixes(&self) -> Result<SubjectPrefixes, SubjectPrefixError> {
+        SubjectPrefixes::new(
+            self.issuers
+                .iter()
+                .map(|i| (i.url.as_str(), i.subject_prefix.as_deref())),
+        )
+    }
+
+    /// What the user API serves: the map, or the single open namespace (ADR-0046 decision 3),
+    /// each entry with the issuers its groups are read from (ADR-0074).
     #[must_use]
     pub fn namespaces(&self) -> Namespaces {
-        self.sandboxes.resolve()
+        self.sandboxes.resolve(&self.issuer_urls())
+    }
+
+    /// The configured `issuers[].url`, in configuration order.
+    #[must_use]
+    pub fn issuer_urls(&self) -> Vec<String> {
+        self.issuers.iter().map(|i| i.url.clone()).collect()
+    }
+
+    /// `sandboxes.declarative_issuers`, resolved (ADR-0072 decision 4): the list written; or,
+    /// not written, the one issuer when there is one and none when there are two or more.
+    #[must_use]
+    pub fn declarative_issuers(&self) -> Vec<String> {
+        match &self.sandboxes.declarative_issuers {
+            Some(listed) => listed.clone(),
+            None if self.issuers.len() == 1 => self.issuer_urls(),
+            None => vec![],
+        }
+    }
+
+    /// Whether the rule of ADR-0072 decision 4 decides anything: some configured issuer may
+    /// not be named on the declarative path, so the broker's mark matters and must be proven
+    /// guarded at start (decision 5).
+    #[must_use]
+    pub fn front_door_rule_in_force(&self) -> bool {
+        self.declarative_issuers().len() < self.issuers.len()
     }
 
     /// ADR-0046 decision 15: a map is enforced by the broker's own Kubernetes front door. A
@@ -1504,6 +1650,18 @@ impl Config {
                 .gate_form()
                 .unwrap_or_else(|e| format!("invalid ({e})"));
             tracing::info!(issuer = %issuer.url, gate = %form, "issuer gate in force");
+            // ADR-0071 and ADR-0073: what a resource server will read as `sub` and `groups` for
+            // this issuer's people.
+            if self.sts.is_some() {
+                match issuer.subject_prefix.as_deref() {
+                    Some(prefix) => {
+                        tracing::info!(issuer = %issuer.url, subject_prefix = %prefix, "sts: sub and each of groups are the subject_prefix followed by the upstream's value (ADR-0071, ADR-0073)");
+                    }
+                    None => {
+                        tracing::info!(issuer = %issuer.url, "sts: sub is the bare subject id and groups the upstream's names, this issuer has no subject_prefix (ADR-0071, ADR-0073)");
+                    }
+                }
+            }
         }
         if self.logs.enabled {
             tracing::info!(
@@ -1537,8 +1695,20 @@ impl Config {
                     namespaces = %format!("map of {} namespaces", map.len()),
                     "sandbox namespaces in force"
                 );
-                for (ns, groups) in &map {
-                    tracing::info!(namespace = %ns, groups = %groups.join(", "), "namespace groups");
+                for (ns, grant) in &map {
+                    // ADR-0074 decision 5: the issuers each entry's groups are read from.
+                    let written = self
+                        .sandboxes
+                        .namespaces
+                        .as_ref()
+                        .and_then(|m| m.get(ns))
+                        .is_some_and(|e| e.issuers.is_some());
+                    let issuers = if written {
+                        grant.issuers.join(", ")
+                    } else {
+                        format!("{} (the only issuer)", grant.issuers.join(", "))
+                    };
+                    tracing::info!(namespace = %ns, groups = %grant.groups.join(", "), %issuers, "namespace groups");
                 }
                 tracing::info!(
                     "a namespace in the map that does not exist fails the create with the API server's error (502)"
@@ -1549,7 +1719,42 @@ impl Config {
             max_ttl_seconds = self.sandboxes.max_ttl_seconds,
             "longest lifetime a claim may ask for (sandboxes.max_ttl_seconds)"
         );
+        self.log_declarative_issuers();
         self.log_policy_sources();
+    }
+
+    /// ADR-0072 decision 6: what an `AgentSandbox` created through the Kubernetes API may name
+    /// as its subject's issuer, one line always, and a second where the admission policy's
+    /// `issuerPrefixes` must tell several apart (the broker cannot read it).
+    fn log_declarative_issuers(&self) {
+        let resolved = self.declarative_issuers();
+        match (&self.sandboxes.declarative_issuers, self.issuers.len()) {
+            (None, 1) => {
+                tracing::info!(issuer = %resolved.join(", "), "an AgentSandbox created through the Kubernetes API may name this issuer (the only one configured) (ADR-0072)");
+            }
+            (None, 0) => {
+                tracing::info!(
+                    "no issuer is configured: an AgentSandbox created through the Kubernetes API is refused whatever issuer it names (ADR-0072)"
+                );
+            }
+            (None, n) => {
+                tracing::warn!(
+                    issuers = n,
+                    "sandboxes.declarative_issuers is not set and this broker trusts {n} issuers: an AgentSandbox created through the Kubernetes API is refused whatever issuer it names; list the issuers the API server's users come from (ADR-0072)"
+                );
+            }
+            (Some(_), _) if resolved.is_empty() => {
+                tracing::info!(
+                    "sandboxes.declarative_issuers is empty: the declarative path is closed, an AgentSandbox created through the Kubernetes API is refused whatever issuer it names (ADR-0072)"
+                );
+            }
+            (Some(_), _) => {
+                tracing::info!(declarative_issuers = %resolved.join(", "), "an AgentSandbox created through the Kubernetes API may name these issuers and no other (sandboxes.declarative_issuers, ADR-0072)");
+            }
+        }
+        if resolved.len() >= 2 {
+            tracing::warn!(declarative_issuers = %resolved.join(", "), "two or more issuers may be named on the declarative path: the ConfigMap mediatore-agentsandbox-subject-policy must list each of them in issuerPrefixes with a prefix of its own, which this broker does not read (ADR-0072)");
+        }
     }
 
     /// ADR-0045 decision 4: `logs.max_bytes` within its floor (one segment) and ceiling, checked
@@ -3227,8 +3432,8 @@ listen: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }
             panic!("a map was written");
         };
         assert_eq!(m.len(), 2);
-        assert_eq!(m["team-a"], ["APP_EXAMPLE_TEAM_A_USER"]);
-        assert_eq!(m["infra"].len(), 2);
+        assert_eq!(m["team-a"].groups, ["APP_EXAMPLE_TEAM_A_USER"]);
+        assert_eq!(m["infra"].groups.len(), 2);
     }
 
     #[test]
@@ -3996,7 +4201,7 @@ listen: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }
     #[test]
     fn startup_logs_the_namespace_names_and_no_token() {
         let logs = startup_log(&two_issuers(
-            "sandboxes:\n  namespaces:\n    infra: { groups: [\"example-org:APP_EXAMPLE_ADMIN\", APP_EXAMPLE_ADMIN] }\n    team-a: { groups: [APP_EXAMPLE_TEAM_A_USER] }\n",
+            "sandboxes:\n  namespaces:\n    infra: { groups: [\"example-org:APP_EXAMPLE_ADMIN\", APP_EXAMPLE_ADMIN], issuers: [\"https://dex.example.com\"] }\n    team-a: { groups: [APP_EXAMPLE_TEAM_A_USER], issuers: [\"https://dex.example.com\"] }\n",
         ));
         assert!(logs.contains("map of 2 namespaces"), "{logs}");
         let infra = logs
@@ -4022,7 +4227,7 @@ listen: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }
     #[test]
     fn startup_names_each_unscoped_audience_when_the_namespace_map_is_set() {
         // ADR-0053 decision 7: names only, no rules and no host.
-        let map = "sandboxes:\n  namespaces:\n    team-a: { groups: [ga] }\n";
+        let map = "sandboxes:\n  namespaces:\n    team-a: { groups: [ga], issuers: [\"https://dex.example.com\"] }\n";
         let two = "audiences:\n  - { name: open-one, via: none, egress: [\"open.example.test:443\"] }\n  - name: locked\n    via: none\n    egress: [\"locked.example.test:443\"]\n    namespaces:\n      team-a:\n        rules:\n          - { method: GET, path: \"/a/**\" }\n";
         let logs = startup_log(&two_issuers(&format!("{map}{two}")));
         let warn = logs
@@ -4407,5 +4612,372 @@ listen: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }
             "        rules: []\n",
         );
         assert!(scoped_err(&empty).contains("namespaces.team-a.rules"));
+    }
+
+    // ----- ADR-0071: `sub` qualified by upstream issuer ---------------------------------------------------------------
+
+    const STS: &str = "sts: { issuer: https://mediatore.test, kid: k, signing_key_file: /k }\n";
+
+    /// A dev configuration trusting `issuers` (each the keys after `url`, `backend` and
+    /// `client_id`), with `extra` top-level sections.
+    fn issuers_cfg(issuers: &[(&str, &str)], extra: &str) -> anyhow::Result<Config> {
+        use std::fmt::Write as _;
+        let mut text = format!("{}{extra}issuers:\n", DEV.replace("issuers: []\n", ""));
+        for (url, keys) in issuers {
+            writeln!(
+                text,
+                "  - {{ url: \"{url}\", backend: sts, client_id: m, allow_any_authenticated: true{keys} }}"
+            )
+            .unwrap();
+        }
+        Config::parse(&text)
+    }
+
+    const ISSUER_A: &str = "https://dex.example.com";
+    const ISSUER_B: &str = "https://accounts.example.com";
+
+    #[test]
+    fn two_issuers_without_subject_prefixes_refuse_to_start_under_an_sts() {
+        let err = issuers_cfg(&[(ISSUER_A, ""), (ISSUER_B, "")], STS)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(&format!("issuers[{ISSUER_A}].subject_prefix")),
+            "the start error names the key: {err}"
+        );
+        assert!(err.contains("ADR-0071"), "{err}");
+    }
+
+    #[test]
+    fn two_issuers_with_one_subject_prefix_missing_refuse_to_start() {
+        let err = issuers_cfg(
+            &[(ISSUER_A, ", subject_prefix: \"dex:\""), (ISSUER_B, "")],
+            STS,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains(&format!("issuers[{ISSUER_B}].subject_prefix is not set")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn two_issuers_with_the_same_subject_prefix_refuse_to_start() {
+        let same = ", subject_prefix: \"idp:\"";
+        let err = issuers_cfg(&[(ISSUER_A, same), (ISSUER_B, same)], STS)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("overlap"), "{err}");
+        assert!(err.contains(ISSUER_A) && err.contains(ISSUER_B), "{err}");
+    }
+
+    #[test]
+    fn two_issuers_with_distinct_subject_prefixes_start() {
+        let cfg = issuers_cfg(
+            &[
+                (ISSUER_A, ", subject_prefix: \"dex:\""),
+                (ISSUER_B, ", subject_prefix: \"google:\""),
+            ],
+            STS,
+        )
+        .unwrap();
+        let prefixes = cfg.subject_prefixes().unwrap();
+        assert_eq!(prefixes.get(ISSUER_A), Some("dex:"));
+        assert_eq!(prefixes.get(ISSUER_B), Some("google:"));
+    }
+
+    #[test]
+    fn one_issuer_needs_no_subject_prefix_and_may_have_one() {
+        let cfg = issuers_cfg(&[(ISSUER_A, "")], STS).unwrap();
+        assert!(cfg.issuers[0].subject_prefix.is_none());
+        assert!(cfg.subject_prefixes().unwrap().is_empty());
+        let cfg = issuers_cfg(&[(ISSUER_A, ", subject_prefix: \"dex:\"")], STS).unwrap();
+        assert_eq!(cfg.subject_prefixes().unwrap().get(ISSUER_A), Some("dex:"));
+    }
+
+    #[test]
+    fn a_malformed_subject_prefix_refuses_to_start_whatever_the_number_of_issuers() {
+        for bad in ["dex", "Dex:", "dex/", "a:b:", "", ":"] {
+            let keys = format!(", subject_prefix: \"{bad}\"");
+            for extra in [STS, ""] {
+                let err = issuers_cfg(&[(ISSUER_A, &keys)], extra)
+                    .unwrap_err()
+                    .to_string();
+                assert!(
+                    err.contains(&format!("issuers[{ISSUER_A}].subject_prefix")),
+                    "{bad:?}: {err}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn without_an_sts_no_sub_is_minted_and_two_issuers_need_no_subject_prefix() {
+        // No `sts`: the broker signs no token, so there is no `sub` to keep apart. The day an
+        // `sts` section is added, the same file is refused until the prefixes are there.
+        let cfg = issuers_cfg(&[(ISSUER_A, ""), (ISSUER_B, "")], "").unwrap();
+        assert!(cfg.sts.is_none());
+        assert!(issuers_cfg(&[(ISSUER_A, ""), (ISSUER_B, "")], STS).is_err());
+    }
+
+    #[test]
+    fn startup_logs_each_issuers_subject_prefix_or_that_sub_is_the_bare_id() {
+        let cfg = issuers_cfg(
+            &[
+                (ISSUER_A, ", subject_prefix: \"dex:\""),
+                (ISSUER_B, ", subject_prefix: \"google:\""),
+            ],
+            STS,
+        )
+        .unwrap();
+        let logs = startup_log(&cfg);
+        for (issuer, prefix) in [(ISSUER_A, "dex:"), (ISSUER_B, "google:")] {
+            assert!(
+                logs.lines().any(|l| l.contains(issuer)
+                    && l.contains(&format!("subject_prefix={prefix}"))
+                    && l.contains("sub and each of groups")
+                    && l.contains("ADR-0071")
+                    && l.contains("ADR-0073")),
+                "{logs}"
+            );
+        }
+        let logs = startup_log(&issuers_cfg(&[(ISSUER_A, "")], STS).unwrap());
+        assert!(
+            logs.lines().any(|l| l.contains(ISSUER_A)
+                && l.contains("sub is the bare subject id")
+                && l.contains("groups the upstream's names")),
+            "{logs}"
+        );
+    }
+
+    // ----- ADR-0072: what a hand-created sandbox may name ---------------------------------------------
+
+    #[test]
+    fn one_issuer_needs_no_declarative_issuers() {
+        let cfg = issuers_cfg(&[(ISSUER_A, "")], "").unwrap();
+        assert_eq!(cfg.declarative_issuers(), [ISSUER_A]);
+        assert!(!cfg.front_door_rule_in_force(), "the one issuer, as before");
+    }
+
+    #[test]
+    fn two_issuers_without_declarative_issuers_close_the_declarative_path_and_say_so() {
+        let cfg = issuers_cfg(&[(ISSUER_A, ""), (ISSUER_B, "")], "").unwrap();
+        assert!(cfg.declarative_issuers().is_empty(), "the default is none");
+        assert!(cfg.front_door_rule_in_force());
+        let logs = startup_log(&cfg);
+        assert!(
+            logs.lines().any(|l| l.contains("WARN")
+                && l.contains("sandboxes.declarative_issuers is not set")
+                && l.contains("trusts 2 issuers")),
+            "{logs}"
+        );
+        // Declared: that issuer alone, and the rule is still in force for the other.
+        let cfg = issuers_cfg(
+            &[(ISSUER_A, ""), (ISSUER_B, "")],
+            &format!("sandboxes: {{ declarative_issuers: [\"{ISSUER_A}\"] }}\n"),
+        )
+        .unwrap();
+        assert_eq!(cfg.declarative_issuers(), [ISSUER_A]);
+        assert!(cfg.front_door_rule_in_force());
+        // Both declared: nothing left for the mark to decide.
+        let cfg = issuers_cfg(
+            &[(ISSUER_A, ""), (ISSUER_B, "")],
+            &format!("sandboxes: {{ declarative_issuers: [\"{ISSUER_A}\", \"{ISSUER_B}\"] }}\n"),
+        )
+        .unwrap();
+        assert!(!cfg.front_door_rule_in_force());
+    }
+
+    #[test]
+    fn a_declarative_issuer_that_is_not_configured_refuses_to_start() {
+        for bad in [
+            "https://elsewhere.example.com",
+            "https://dex.example.com/",
+            "https://DEX.example.com",
+        ] {
+            let err = issuers_cfg(
+                &[(ISSUER_A, "")],
+                &format!("sandboxes: {{ declarative_issuers: [\"{bad}\"] }}\n"),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains("sandboxes.declarative_issuers") && err.contains(bad),
+                "{err}"
+            );
+        }
+        // An empty list is a decision, not a typo.
+        let cfg = issuers_cfg(
+            &[(ISSUER_A, "")],
+            "sandboxes: { declarative_issuers: [] }\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.declarative_issuers(), Vec::<String>::new());
+        assert!(cfg.front_door_rule_in_force());
+    }
+
+    #[test]
+    fn a_declarative_issuer_listed_twice_refuses_to_start() {
+        let err = issuers_cfg(
+            &[(ISSUER_A, ""), (ISSUER_B, "")],
+            &format!("sandboxes: {{ declarative_issuers: [\"{ISSUER_A}\", \"{ISSUER_A}\"] }}\n"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("sandboxes.declarative_issuers") && err.contains("listed twice"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn startup_logs_what_the_declarative_path_may_name() {
+        let logs = startup_log(&issuers_cfg(&[(ISSUER_A, "")], "").unwrap());
+        assert!(
+            logs.lines().any(|l| l.contains("INFO")
+                && l.contains(ISSUER_A)
+                && l.contains("the only one configured")),
+            "{logs}"
+        );
+        let logs = startup_log(
+            &issuers_cfg(
+                &[(ISSUER_A, "")],
+                "sandboxes: { declarative_issuers: [] }\n",
+            )
+            .unwrap(),
+        );
+        assert!(
+            logs.lines()
+                .any(|l| l.contains("INFO") && l.contains("the declarative path is closed")),
+            "{logs}"
+        );
+        let both = issuers_cfg(
+            &[(ISSUER_A, ""), (ISSUER_B, "")],
+            &format!("sandboxes: {{ declarative_issuers: [\"{ISSUER_A}\", \"{ISSUER_B}\"] }}\n"),
+        )
+        .unwrap();
+        let logs = startup_log(&both);
+        assert!(
+            logs.lines().any(|l| l.contains("INFO")
+                && l.contains("may name these issuers and no other")
+                && l.contains(ISSUER_A)
+                && l.contains(ISSUER_B)),
+            "{logs}"
+        );
+        assert!(
+            logs.lines().any(|l| l.contains("WARN")
+                && l.contains("issuerPrefixes")
+                && l.contains("prefix of its own")),
+            "{logs}"
+        );
+    }
+
+    // ----- ADR-0074: a namespace's groups are read only from the issuers it names -------------------
+
+    /// `sandboxes.namespaces` with one entry, `team-a`, whose fields after `groups` are `keys`.
+    fn team_a(keys: &str) -> String {
+        format!("sandboxes:\n  namespaces:\n    team-a: {{ groups: [G]{keys} }}\n")
+    }
+
+    #[test]
+    fn one_issuer_needs_no_namespace_issuers_and_may_name_it() {
+        for keys in [String::new(), format!(", issuers: [\"{ISSUER_A}\"]")] {
+            let cfg = issuers_cfg(&[(ISSUER_A, "")], &team_a(&keys)).unwrap();
+            let Namespaces::Map(m) = cfg.namespaces() else {
+                panic!("a map was written");
+            };
+            assert_eq!(m["team-a"].issuers, [ISSUER_A], "{keys}");
+            assert_eq!(m["team-a"].groups, ["G"]);
+        }
+    }
+
+    #[test]
+    fn two_issuers_with_a_namespace_entry_without_issuers_refuse_to_start() {
+        let err = issuers_cfg(&[(ISSUER_A, ""), (ISSUER_B, "")], &team_a(""))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("sandboxes.namespaces.team-a.issuers is not set")
+                && err.contains("with 2 issuers")
+                && err.contains("ADR-0074"),
+            "{err}"
+        );
+        // Listed, it starts, and the entry reads its groups from the issuer it names alone.
+        let cfg = issuers_cfg(
+            &[(ISSUER_A, ""), (ISSUER_B, "")],
+            &team_a(&format!(", issuers: [\"{ISSUER_B}\"]")),
+        )
+        .unwrap();
+        let Namespaces::Map(m) = cfg.namespaces() else {
+            panic!("a map was written");
+        };
+        assert_eq!(m["team-a"].issuers, [ISSUER_B]);
+    }
+
+    #[test]
+    fn a_namespace_entry_with_an_empty_issuers_list_refuses_to_start() {
+        for issuers in [&[(ISSUER_A, "")][..], &[(ISSUER_A, ""), (ISSUER_B, "")][..]] {
+            let err = issuers_cfg(issuers, &team_a(", issuers: []"))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("sandboxes.namespaces.team-a.issuers is empty"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_namespace_entry_naming_an_unknown_issuer_refuses_to_start() {
+        for bad in ["https://elsewhere.example.com", "https://dex.example.com/"] {
+            let err = issuers_cfg(
+                &[(ISSUER_A, ""), (ISSUER_B, "")],
+                &team_a(&format!(", issuers: [\"{bad}\"]")),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains("sandboxes.namespaces.team-a.issuers") && err.contains(bad),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_namespace_entry_naming_an_issuer_twice_refuses_to_start() {
+        let err = issuers_cfg(
+            &[(ISSUER_A, ""), (ISSUER_B, "")],
+            &team_a(&format!(", issuers: [\"{ISSUER_A}\", \"{ISSUER_A}\"]")),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("sandboxes.namespaces.team-a.issuers") && err.contains("listed twice"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn startup_logs_each_namespaces_groups_with_its_issuers() {
+        let logs = startup_log(&issuers_cfg(&[(ISSUER_A, "")], &team_a("")).unwrap());
+        assert!(
+            logs.lines().any(|l| l.contains("namespace=team-a")
+                && l.contains("groups=G")
+                && l.contains(&format!("issuers={ISSUER_A} (the only issuer)"))),
+            "{logs}"
+        );
+        let cfg = issuers_cfg(
+            &[(ISSUER_A, ""), (ISSUER_B, "")],
+            &team_a(&format!(", issuers: [\"{ISSUER_A}\", \"{ISSUER_B}\"]")),
+        )
+        .unwrap();
+        let logs = startup_log(&cfg);
+        assert!(
+            logs.lines().any(|l| l.contains("namespace=team-a")
+                && l.contains(&format!("issuers={ISSUER_A}, {ISSUER_B}"))
+                && !l.contains("the only issuer")),
+            "{logs}"
+        );
     }
 }

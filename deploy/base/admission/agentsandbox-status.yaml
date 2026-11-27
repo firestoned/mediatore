@@ -26,12 +26,15 @@
 #   administrator who must repair a status by hand removes the binding below
 #   for the time it takes, which the API server's audit log records.
 #
-# The ServiceAccount is matched by its full username, as the policy on the
-# broker's registration entries does (clusterstaticentry-mediatore.yaml). An
-# overlay that renames the ServiceAccount or moves it to another namespace
-# must patch the name in every policy, or the broker's own status writes are
-# refused: sandboxes then stay Pending with the denial in the broker's log,
-# which is the failure to look for.
+# The ServiceAccount is matched by its full username, read from the key
+# `broker` of the ConfigMap mediatore-agentsandbox-subject-policy
+# (agentsandbox-subject.yaml), the one place the three policies that name the
+# broker read it (ADR-0056 decision 4). An overlay that renames the
+# ServiceAccount or moves it to another namespace patches that value and the
+# `paramRef.namespace` below, or the broker's own status writes are refused:
+# sandboxes then stay Pending with the denial in the broker's log, which is
+# the failure to look for. Without the ConfigMap, or without the key, every
+# status write is refused (parameterNotFoundAction: Deny, failurePolicy: Fail).
 #
 # Requires Kubernetes 1.30+ (ValidatingAdmissionPolicy GA).
 apiVersion: admissionregistration.k8s.io/v1
@@ -43,6 +46,9 @@ metadata:
     app.kubernetes.io/component: admission
 spec:
   failurePolicy: Fail
+  paramKind:
+    apiVersion: v1
+    kind: ConfigMap
   # Every served version, by name (ADR-0049 decision 3): a served version left out would
   # be ungoverned. Kept equal to the CRD's served versions by a unit test in
   # crates/mediatore-claims/src/sandbox.rs; never `*`.
@@ -59,7 +65,7 @@ spec:
         resources: ["agentsandboxes/status"]
   # No matchConditions: every write of the subresource is checked.
   validations:
-    - expression: "request.userInfo.username == 'system:serviceaccount:banlieue-system:mediatore'"
+    - expression: "request.userInfo.username == params.data.broker.trim()"
       messageExpression: >-
         'the status of an AgentSandbox is written by mediatore alone (it'
         + ' carries the claim record), and you are authenticated as '
@@ -79,3 +85,10 @@ spec:
   policyName: mediatore-agentsandbox-status
   # Bound everywhere: no matchResources, so no namespace is left out.
   validationActions: ["Deny"]
+  # The parameter is one ConfigMap in the broker's namespace, named with its namespace,
+  # so it is the same object whatever namespace the AgentSandbox is in. Fail closed: no
+  # parameter, no status write.
+  paramRef:
+    name: mediatore-agentsandbox-subject-policy
+    namespace: mediatore-system
+    parameterNotFoundAction: Deny

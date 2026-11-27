@@ -23,7 +23,7 @@ use mediatore_proto::{
 use mediatore_spire::{MemoryEntries, Naming};
 use mediatore_store::seal::LocalKeySealer;
 use mediatore_store::{ClaimStore, MemoryStore};
-use mediatore_sts::Sts;
+use mediatore_sts::{Sts, SubjectPrefixes};
 use mediatore_testkit::FakeIdp;
 use mediatore_testkit::entra::write_client_credential;
 
@@ -90,7 +90,7 @@ async fn credential(
         }
         Credential::Federated => {
             let cluster = FakeIdp::start().await;
-            let subject = "system:serviceaccount:banlieue-system:mediatore";
+            let subject = "system:serviceaccount:mediatore-system:mediatore";
             idp.register_federated_credential(
                 CLIENT_ID,
                 &cluster.issuer,
@@ -116,6 +116,22 @@ async fn credential(
     }
 }
 
+/// The STS over two issuers: each has its `subject_prefix`, as `Config::parse` requires and as
+/// `sts` in main.rs hands them over (ADR-0071).
+fn sts_for(issuers: [&IssuerConfig; 2]) -> Sts {
+    let prefixes =
+        SubjectPrefixes::new(issuers.map(|i| (i.url.as_str(), i.subject_prefix.as_deref())))
+            .expect("subject prefixes");
+    Sts::new(
+        "https://mediatore.test",
+        "e2e-1",
+        mediatore_testkit::entra::fresh_p256_key_pem().as_bytes(),
+        SignedDuration::from_mins(15),
+    )
+    .expect("sts")
+    .with_subject_prefixes(prefixes)
+}
+
 impl Harness {
     async fn start(which: Credential) -> Self {
         let idp = FakeIdp::start().await;
@@ -134,6 +150,7 @@ impl Harness {
             ca_file: None,
             entra: Some(entra_cfg.clone()),
             groups_claim: None,
+            subject_prefix: Some("entra:".into()),
         };
         let dex_issuer = IssuerConfig {
             url: dex.issuer.clone(),
@@ -147,19 +164,14 @@ impl Harness {
             ca_file: None,
             entra: None,
             groups_claim: None,
+            subject_prefix: Some("dex:".into()),
         };
         let assertion = ClientAssertion::build(&entra_cfg)
             .await
             .expect("the credential builds and probes");
+        let sts = sts_for([&entra_issuer, &dex_issuer]);
         let validator = Validator::new(vec![entra_issuer, dex_issuer])
             .with_client_assertion(&idp.issuer, assertion);
-        let sts = Sts::new(
-            "https://mediatore.test",
-            "e2e-1",
-            mediatore_testkit::entra::fresh_p256_key_pem().as_bytes(),
-            SignedDuration::from_mins(15),
-        )
-        .expect("sts");
         let store = MemoryStore::shared();
         let entries = Arc::new(MemoryEntries::default());
         let state = Arc::new(AppState {
@@ -352,7 +364,11 @@ async fn the_bearer_is_exchanged_once_and_every_issue_refreshes_for_the_audience
     let claims = payload(&sts.access_token);
     assert_eq!(claims["iss"], "https://mediatore.test");
     assert_eq!(claims["aud"], STS_AUDIENCE);
-    assert_eq!(claims["groups"], serde_json::json!([REQUIRED_GROUP]));
+    // Behind the issuer's `subject_prefix`, as `sub` is (ADR-0073).
+    assert_eq!(
+        claims["groups"],
+        serde_json::json!([format!("entra:{REQUIRED_GROUP}")])
+    );
     assert_eq!(
         h.idp.refresh_scopes().last().unwrap(),
         &format!("offline_access {CLIENT_ID}/.default")
@@ -370,7 +386,10 @@ async fn the_bearer_is_exchanged_once_and_every_issue_refreshes_for_the_audience
     let sts: TokenResponse = h.token(&claim, STS_AUDIENCE).await.json().await.unwrap();
     assert_eq!(
         payload(&sts.access_token)["groups"],
-        serde_json::json!([REQUIRED_GROUP, "firestoned:traders"])
+        serde_json::json!([
+            format!("entra:{REQUIRED_GROUP}"),
+            "entra:firestoned:traders"
+        ])
     );
 }
 

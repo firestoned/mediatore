@@ -8,7 +8,7 @@
 # SPIRE_TRUST_DOMAIN placeholder.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
-namespace: banlieue-system
+namespace: mediatore-system
 resources:
   - ../../../deploy/base
 images:
@@ -28,7 +28,7 @@ patches:
       kind: ConfigMap
       metadata:
         name: mediatore-agentsandbox-subject-policy
-        namespace: banlieue-system
+        namespace: mediatore-system
       data:
         brokers: |
           e2e-broker

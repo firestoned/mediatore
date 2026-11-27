@@ -52,6 +52,9 @@ struct Cli {
     /// The workload argv (repeatable)
     #[arg(long = "arg")]
     args: Vec<String>,
+    /// The namespace to claim in, for a broker with a namespace map (ADR-0046)
+    #[arg(long)]
+    namespace: Option<String>,
 }
 
 #[tokio::main]
@@ -112,6 +115,9 @@ async fn main() -> anyhow::Result<()> {
         ]);
     for a in &cli.args {
         create.args(["--arg", a]);
+    }
+    if let Some(namespace) = &cli.namespace {
+        create.args(["--namespace", namespace]);
     }
     let out = create
         .stdin(Stdio::null())

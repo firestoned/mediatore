@@ -18,7 +18,7 @@ TD=${2:?trust domain}
 EK_PEM=${3:?ek pem}
 EK_HASH=$(tr -d '\n' < "${4:?ek hash file}")
 K=(kubectl --kubeconfig "$KUBECONFIG_PATH")
-BROKER_NS=banlieue-system
+BROKER_NS=mediatore-system
 NS=mediatore-e2e-watcher
 TIMEOUT=${MEDIATORE_KIND_TIMEOUT:-120}
 ENTRY_SELECTOR=app.kubernetes.io/managed-by=mediatore

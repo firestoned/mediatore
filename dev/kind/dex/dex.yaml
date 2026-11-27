@@ -3,7 +3,7 @@
 #
 # Dex for the kind tiers (`make kind-dex`, ADR-0013): the real protocol the Dex path is
 # built against, over TLS with the certificate the make target mints into Secret
-# mediatore-dex-tls (tls-fixture, DNS name mediatore-dex.banlieue-system.svc), its state in
+# mediatore-dex-tls (tls-fixture, DNS name mediatore-dex.mediatore-system.svc), its state in
 # CRDs (storage: kubernetes), and the glauth directory beside it as its only connector.
 # mediatore is its one client, public (PKCE, loopback redirect). The broker verifies it
 # against the CA in ConfigMap mediatore-dex-ca, as it would a real issuer on a private PKI.
@@ -12,7 +12,7 @@ apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: mediatore-dex
-  namespace: banlieue-system
+  namespace: mediatore-system
 ---
 # Dex keeps its state in custom resources of its own group and creates the CRDs itself.
 apiVersion: rbac.authorization.k8s.io/v1
@@ -38,16 +38,16 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: mediatore-dex
-    namespace: banlieue-system
+    namespace: mediatore-system
 ---
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: mediatore-dex-config
-  namespace: banlieue-system
+  namespace: mediatore-system
 data:
   config.yaml: |
-    issuer: https://mediatore-dex.banlieue-system.svc:5556
+    issuer: https://mediatore-dex.mediatore-system.svc:5556
     storage:
       type: kubernetes
       config:
@@ -78,7 +78,7 @@ data:
         id: ldap
         name: glauth
         config:
-          host: mediatore-glauth.banlieue-system.svc:3893
+          host: mediatore-glauth.mediatore-system.svc:3893
           insecureNoSSL: true
           bindDN: cn=dex,ou=svcaccts,ou=users,dc=sandbox,dc=test
           bindPW: dex-e2e
@@ -104,7 +104,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: mediatore-dex
-  namespace: banlieue-system
+  namespace: mediatore-system
 spec:
   selector: { app.kubernetes.io/name: mediatore-dex }
   ports:
@@ -114,7 +114,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: mediatore-dex
-  namespace: banlieue-system
+  namespace: mediatore-system
 spec:
   replicas: 1
   strategy: { type: Recreate }

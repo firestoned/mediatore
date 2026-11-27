@@ -79,7 +79,7 @@ register and to name in `certificate_file`.
 
 **A federated credential**: no key anywhere. On AKS, or any cluster whose OIDC issuer
 Entra can reach, add a federated credential on the app naming the cluster's issuer, the
-subject `system:serviceaccount:banlieue-system:mediatore` and the audience
+subject `system:serviceaccount:mediatore-system:mediatore` and the audience
 `api://AzureADTokenExchange`, project a token with that audience into the pod, and point
 at it:
 

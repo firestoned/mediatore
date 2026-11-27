@@ -18,10 +18,24 @@
 #                     the username, so this is a real binding. The field holds
 #                     the RAW subject as the issuer spells it, because that is
 #                     what a token carries and what the guest compares against.
-#   subject.issuer  is not checked here: the API server cannot tell which
-#                     issuer minted the caller's token. mediatore refuses, at
+#   subject.issuer  the API server cannot tell which issuer minted the
+#                     caller's token. With `issuerPrefixes` empty the issuer is
+#                     not checked here (one issuer, ADR-0008). Once it lists
+#                     anything, an issuer it does not list is refused, and the
+#                     id is checked under the listed issuer's own prefix
+#                     (ADR-0072 decision 1); a list that cannot tell its issuers
+#                     apart admits nothing (decision 2). mediatore refuses, at
 #                     reconcile and before any claim exists, an issuer it is
-#                     not configured with (crates/mediatore-claims/src/sandbox.rs).
+#                     not configured with, and, for a sandbox it did not create
+#                     itself, an issuer outside `sandboxes.declarative_issuers`
+#                     (crates/mediatore-claims/src/sandbox.rs).
+#
+# The annotation `mediatore.io/front-door: api` marks a sandbox the broker
+# created through POST /v1/claims (ADR-0072 decision 3). On CREATE it is
+# admitted only from the broker's username and only with the value `api`; on
+# UPDATE nobody may add, change or remove it. The `brokers` list does not lift
+# this. The broker proves at start that this rule is in force before it relies
+# on the mark (decision 5).
 #
 # Two exemptions from the id check, both deliberate trust concentrations:
 #
@@ -40,11 +54,32 @@
 # Requires Kubernetes 1.30+ (ValidatingAdmissionPolicy GA) and CEL variables.
 # The ConfigMap comes first: the binding sets parameterNotFoundAction: Deny,
 # so it must exist or every AgentSandbox is rejected.
+#
+# The ConfigMap is also where the three policies that name the broker read its
+# username (ADR-0056 decision 4): this one, agentsandbox-status.yaml and
+# clusterstaticentry-mediatore.yaml are each bound to it, with
+# parameterNotFoundAction: Deny, and each reads the key `broker`. One value, in
+# place of a literal in three files. Without the ConfigMap, or without the key,
+# all three refuse: no AgentSandbox, no status write and no ClusterStaticEntry
+# (the gateway's included) is admitted until it is back.
+#
+# AN OVERLAY THAT RENAMES THE ServiceAccount OR MOVES THE BROKER TO ANOTHER
+# NAMESPACE patches what a kustomize `namespace:` does not rewrite:
+#
+#   1. the value of `broker` below (a string, not object metadata);
+#   2. `paramRef.namespace` in the three bindings (this file, the status policy
+#      and the entries policy), which must be the namespace this ConfigMap is in;
+#   3. `namespaceSelector` in clusterspiffeid.yaml.
+#
+# Forgetting 1 or 2 fails closed and loudly: the broker's entries and status
+# writes are refused, and the broker says so when it starts (its self-check,
+# crates/mediatore-spire/src/kube.rs) instead of serving. Forgetting 3 leaves
+# the broker without an SVID, which also stops it at start.
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: mediatore-agentsandbox-subject-policy
-  namespace: banlieue-system
+  namespace: mediatore-system
   labels:
     app.kubernetes.io/name: mediatore
     app.kubernetes.io/component: admission
@@ -57,9 +92,16 @@ data:
 
   # Per-issuer prefixes, for an API server that trusts more than one issuer:
   # one `<issuer> <prefix>` pair per line, each exactly as the
-  # AuthenticationConfiguration spells it. A sandbox naming an issuer listed
-  # here is checked against that issuer's prefix; any other issuer falls back
-  # to `usernamePrefix`. Empty by default.
+  # AuthenticationConfiguration spells it. Empty by default, and then every
+  # sandbox is checked against `usernamePrefix`, whatever issuer it names.
+  # Once any non-blank line is here (ADR-0072):
+  #   - a sandbox naming an issuer listed here is checked against that
+  #     issuer's prefix, and one naming an issuer NOT listed is refused: there
+  #     is no fallback to `usernamePrefix`;
+  #   - every non-blank line must be exactly `<issuer> <prefix>`, no issuer may
+  #     appear twice, and no prefix may equal another or be the start of
+  #     another. A list that breaks any of these admits no AgentSandbox from
+  #     anybody the id check applies to, until it is corrected.
   #
   #   issuerPrefixes: |
   #     https://dex.example.com github:
@@ -71,6 +113,15 @@ data:
   # `system:serviceaccount:<namespace>:<name>`). mediatore's own ServiceAccount
   # is exempt without being listed. Deliberately empty.
   brokers: |
+
+  # The broker's own username, exactly as the API server spells it:
+  # `system:serviceaccount:<namespace>:<ServiceAccount>`. Read by this policy (the
+  # exemption for the broker's own creates), by agentsandbox-status.yaml (the one
+  # writer of a status) and by clusterstaticentry-mediatore.yaml (the one sender
+  # of the broker's SPIRE entries). Whoever can edit this value can name another
+  # account as the broker: audit changes to this ConfigMap, and keep `update` on
+  # ConfigMaps in this namespace to whoever deploys the broker.
+  broker: system:serviceaccount:mediatore-system:mediatore
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
@@ -96,7 +147,7 @@ spec:
         resources: ["agentsandboxes"]
   variables:
     - name: isMediatore
-      expression: "request.userInfo.username == 'system:serviceaccount:banlieue-system:mediatore'"
+      expression: "request.userInfo.username == params.data.broker.trim()"
     # Split on newlines and drop blanks, so a trailing newline or an empty
     # list never yields a phantom "" entry.
     - name: brokers
@@ -108,28 +159,74 @@ spec:
     # Trailing newline stripped; an empty prefix is a valid value.
     - name: usernamePrefix
       expression: "params.data.?usernamePrefix.orValue('').trim()"
-    - name: issuerPrefixes
+    # ADR-0072 decision 1: every non-blank line counts, whether or not it
+    # parses, so a list of typos is not read as an empty list.
+    - name: issuerLines
       expression: >-
         params.data.?issuerPrefixes.orValue('').split('\n')
-          .map(l, l.trim().split(' ').filter(w, w != ''))
-          .filter(e, size(e) == 2)
+          .filter(l, l.trim() != '')
+    # Each line as its words. A line that is not exactly two words is kept,
+    # so that issuerPrefixesAreSound can refuse it; nothing is dropped.
+    - name: issuerPrefixes
+      expression: >-
+        variables.issuerLines.map(l, l.trim().split(' ').filter(w, w != ''))
+    # ADR-0072 decision 2: every line a pair, no issuer twice, and no prefix
+    # equal to another or the start of another (a prefix starts with itself,
+    # so each must be the start of exactly one). With it, a username names one
+    # listed issuer at most.
+    - name: issuerPrefixesAreSound
+      expression: >-
+        variables.issuerPrefixes.all(e, size(e) == 2)
+        && variables.issuerPrefixes.all(a,
+             size(variables.issuerPrefixes.filter(b, b[0] == a[0])) == 1)
+        && variables.issuerPrefixes.all(a,
+             size(variables.issuerPrefixes.filter(b, b[1].startsWith(a[1]))) == 1)
+    # The issuer the sandbox names is one this cluster's users can come from:
+    # any, while nothing is listed; otherwise only a listed one. No fallback.
+    - name: issuerListed
+      expression: >-
+        size(variables.issuerLines) == 0
+        || variables.issuerPrefixes.exists(e,
+             size(e) == 2 && e[0] == object.spec.subject.issuer)
     - name: expectedPrefix
       expression: >-
-        variables.issuerPrefixes.exists(e, e[0] == object.spec.subject.issuer)
-          ? variables.issuerPrefixes.filter(e, e[0] == object.spec.subject.issuer)[0][1]
-          : variables.usernamePrefix
+        size(variables.issuerLines) == 0
+          ? variables.usernamePrefix
+          : variables.issuerPrefixes.filter(e,
+              size(e) == 2 && e[0] == object.spec.subject.issuer)[0][1]
+    # ADR-0072 decision 3: the broker's mark on a sandbox it created through
+    # POST /v1/claims. Kept equal to FRONT_DOOR_ANNOTATION in
+    # crates/mediatore-claims/src/sandbox.rs by a unit test.
+    - name: frontDoor
+      expression: "object.metadata.?annotations[?'mediatore.io/front-door']"
   validations:
     # 1. The binding the API server can vouch for. CREATE only: on UPDATE the
     #    requester is mediatore's reconciler writing its finalizer, and
-    #    validation 2 makes the spec immutable anyway.
+    #    validation 2 makes the spec immutable anyway. Once issuerPrefixes
+    #    lists anything, the issuer must be listed and the list sound
+    #    (ADR-0072 decisions 1 and 2); the expectedPrefix comparison is only
+    #    reached when both hold, so it never reads a pair that is not there.
     - expression: >-
         request.operation != 'CREATE'
         || variables.isMediatore
         || variables.isBroker
-        || variables.expectedPrefix + object.spec.subject.id
-             == request.userInfo.username
+        || (variables.issuerPrefixesAreSound
+            && variables.issuerListed
+            && variables.expectedPrefix + object.spec.subject.id
+                 == request.userInfo.username)
       messageExpression: >-
-        'spec.subject.id is ' + object.spec.subject.id
+        !variables.issuerPrefixesAreSound
+        ? 'issuerPrefixes of ConfigMap mediatore-agentsandbox-subject-policy'
+          + ' cannot tell its issuers apart: every non-blank line must be'
+          + ' exactly <issuer> <prefix>, no issuer may be listed twice, and no'
+          + ' prefix may equal another or be the start of another. No'
+          + ' AgentSandbox is admitted until it is corrected (ADR-0072).'
+        : !variables.issuerListed
+        ? 'spec.subject.issuer ' + object.spec.subject.issuer
+          + ' is not listed in issuerPrefixes of ConfigMap'
+          + ' mediatore-agentsandbox-subject-policy: this cluster\'s users'
+          + ' come from the issuers listed there and no other'
+        : 'spec.subject.id is ' + object.spec.subject.id
         + ' (which this cluster would spell '
         + variables.expectedPrefix + object.spec.subject.id
         + ') but you are authenticated as ' + request.userInfo.username
@@ -151,6 +248,33 @@ spec:
         + ' AgentSandbox was created and that mediatore acted on then. Delete'
         + ' it and make a new one (which releases the VM, by design).'
       reason: Forbidden
+
+    # 3. The broker's mark, on CREATE (ADR-0072 decision 3): admitted only from
+    #    the broker's own username and only with the value `api`. This binds
+    #    the broker too, and the `brokers` list does not lift it.
+    - expression: >-
+        request.operation != 'CREATE'
+        || !variables.frontDoor.hasValue()
+        || (variables.isMediatore && variables.frontDoor.value() == 'api')
+      messageExpression: >-
+        'the annotation mediatore.io/front-door is the broker\'s own: it marks'
+        + ' a sandbox the broker created through POST /v1/claims, only the'
+        + ' broker may set it, and only to api (ADR-0072)'
+      reason: Forbidden
+
+    # 4. The mark is immutable (ADR-0072 decision 3): on UPDATE it can be
+    #    neither added, changed nor removed, by anybody.
+    - expression: >-
+        request.operation != 'UPDATE'
+        || (variables.frontDoor.hasValue()
+              == oldObject.metadata.?annotations[?'mediatore.io/front-door'].hasValue()
+            && variables.frontDoor.orValue('')
+              == oldObject.metadata.?annotations[?'mediatore.io/front-door'].orValue(''))
+      messageExpression: >-
+        'the annotation mediatore.io/front-door is immutable: it records how'
+        + ' the sandbox was created, and cannot be added, changed or removed'
+        + ' (ADR-0072)'
+      reason: Forbidden
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding
@@ -164,6 +288,6 @@ spec:
   validationActions: ["Deny"]
   paramRef:
     name: mediatore-agentsandbox-subject-policy
-    namespace: banlieue-system
+    namespace: mediatore-system
     # Fail closed: no policy object, no sandboxes.
     parameterNotFoundAction: Deny

@@ -35,7 +35,7 @@ SA_KUBECONFIG=${2:?broker ServiceAccount kubeconfig}
 STATE=${3:?state dir}
 K=(kubectl --kubeconfig "$ADMIN_KUBECONFIG")
 KSA=(kubectl --kubeconfig "$SA_KUBECONFIG")
-BROKER_NS=banlieue-system
+BROKER_NS=mediatore-system
 NS=mediatore-e2e-sandbox
 # A policy namespace beside the sandbox one (ADR-0054): read by the broker, drawn from only
 # when policy.sources says so.

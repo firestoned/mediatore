@@ -31,8 +31,8 @@ use base64::Engine as _;
 use jiff::{SignedDuration, Timestamp};
 use mediatore_claims::Reconciler;
 use mediatore_claims::sandbox::{
-    AgentSandbox, AgentSandboxSpec, FrontDoorError, SandboxFrontDoor, SandboxSubject,
-    SandboxWorkload, claim_selection_of, label_selector_of,
+    AgentSandbox, AgentSandboxSpec, FRONT_DOOR_ANNOTATION, FRONT_DOOR_API, FrontDoorError,
+    SandboxFrontDoor, SandboxSubject, SandboxWorkload, claim_selection_of, label_selector_of,
 };
 use mediatore_entra::{IdpError, Validated, Validator};
 use mediatore_proto::ek::is_ek_hash;
@@ -398,9 +398,21 @@ pub enum Namespaces {
     /// Today's form: `sandboxes.namespace` only; every caller who passed the issuer gate may
     /// claim here.
     Single(String),
-    /// `sandboxes.namespaces`: namespace -> groups (any-of, exact). With the map set there is
-    /// no default namespace.
-    Map(BTreeMap<String, Vec<String>>),
+    /// `sandboxes.namespaces`: namespace -> the groups (any-of, exact) and the issuers whose
+    /// tokens they are read from (ADR-0074). With the map set there is no default namespace.
+    Map(BTreeMap<String, NamespaceGrant>),
+}
+
+/// One entry of the namespace map (ADR-0046 decision 3, ADR-0074 decision 1): a token
+/// qualifies when its issuer is one of `issuers` and its groups intersect `groups`. There is
+/// no form without issuers, so no caller can match groups without saying where they came
+/// from; the configuration fills in the one issuer when it is the only one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamespaceGrant {
+    /// Groups of which a caller must hold at least one, matched exactly.
+    pub groups: Vec<String>,
+    /// The issuers (`issuers[].url`, byte for byte) whose tokens `groups` are read from.
+    pub issuers: Vec<String>,
 }
 
 /// Why a namespace was refused. One rendering per variant, so the response carries nothing
@@ -441,12 +453,17 @@ impl Namespaces {
     /// The namespace a create targets (decision 4). A malformed name is refused first, from
     /// the string alone.
     ///
+    /// `issuer` is the one the caller's token was validated as: an entry's groups are read
+    /// only from the issuers it lists (ADR-0074), and a token of another issuer gets the
+    /// answer of a caller who holds none of them.
+    ///
     /// # Errors
-    /// [`NsDenied`] when the name is malformed, missing with a map, unlisted, or the groups
-    /// do not intersect the namespace's.
+    /// [`NsDenied`] when the name is malformed, missing with a map, unlisted, or the token's
+    /// issuer and groups do not qualify for the namespace.
     pub fn resolve_for_create(
         &self,
         requested: Option<&str>,
+        issuer: &str,
         groups: &[String],
     ) -> Result<String, NsDenied> {
         if let Some(r) = requested
@@ -460,7 +477,7 @@ impl Namespaces {
             (Self::Single(_), Some(r)) => Err(NsDenied::Forbidden(r.to_owned())),
             (Self::Map(_), None) => Err(NsDenied::Required),
             (Self::Map(_), Some(r)) => {
-                if self.matched_group(r, groups).is_some() {
+                if self.matched_group(r, issuer, groups).is_some() {
                     Ok(r.to_owned())
                 } else {
                     Err(NsDenied::Forbidden(r.to_owned()))
@@ -477,9 +494,10 @@ impl Namespaces {
     pub fn authorise_existing(
         &self,
         requested: Option<&str>,
+        issuer: &str,
         groups: &[String],
     ) -> Result<String, NsDenied> {
-        self.resolve_for_create(requested, groups)
+        self.resolve_for_create(requested, issuer, groups)
             .map_err(|d| match d {
                 NsDenied::Forbidden(_) => NsDenied::NotFound,
                 other => other,
@@ -487,17 +505,29 @@ impl Namespaces {
     }
 
     /// The listed group of `namespace` the caller holds, for the audit line: a configuration
-    /// value, never the caller's group list. `None` when unlisted or unqualified, and for the
-    /// single form, which has no listed group.
+    /// value, never the caller's group list. `None` when unlisted or unqualified, when the
+    /// token's `issuer` is not one the entry lists (ADR-0074), and for the single form, which
+    /// has no listed group.
     #[must_use]
-    pub fn matched_group<'a>(&'a self, namespace: &str, groups: &[String]) -> Option<&'a str> {
+    pub fn matched_group<'a>(
+        &'a self,
+        namespace: &str,
+        issuer: &str,
+        groups: &[String],
+    ) -> Option<&'a str> {
         match self {
             Self::Single(_) => None,
-            Self::Map(m) => m
-                .get(namespace)?
-                .iter()
-                .find(|l| mediatore_entra::groups_intersect(groups, std::slice::from_ref(l)))
-                .map(String::as_str),
+            Self::Map(m) => {
+                let grant = m.get(namespace)?;
+                if !grant.issuers.iter().any(|i| i == issuer) {
+                    return None;
+                }
+                grant
+                    .groups
+                    .iter()
+                    .find(|l| mediatore_entra::groups_intersect(groups, std::slice::from_ref(l)))
+                    .map(String::as_str)
+            }
         }
     }
 }
@@ -1114,14 +1144,14 @@ fn refuse_unresolved_policy(
     let ambiguous = matches!(resolution, Resolution::Ambiguous);
     match pe.mode {
         EgressMode::Enforce => {
-            tracing::warn!(subject = %validated.subject.id, %namespace, %policy, %sources, %held_outside, ambiguous, "claim refused: the policy named does not resolve in the namespace's policy sources (ADR-0054)");
+            tracing::warn!(subject = %validated.subject.id, issuer = %validated.subject.issuer, %namespace, %policy, %sources, %held_outside, ambiguous, "claim refused: the policy named does not resolve in the namespace's policy sources (ADR-0054)");
             Err(ApiError::bad_request(
                 POLICY_NOT_RESOLVED,
                 not_resolved(policy, namespace),
             ))
         }
         EgressMode::Shadow => {
-            tracing::info!(subject = %validated.subject.id, %namespace, %policy, %sources, %held_outside, ambiguous, "policy.egress is shadow: enforce would refuse this claim, the policy named does not resolve in the namespace's policy sources (ADR-0054)");
+            tracing::info!(subject = %validated.subject.id, issuer = %validated.subject.issuer, %namespace, %policy, %sources, %held_outside, ambiguous, "policy.egress is shadow: enforce would refuse this claim, the policy named does not resolve in the namespace's policy sources (ADR-0054)");
             Ok(())
         }
     }
@@ -1135,15 +1165,15 @@ fn resolve_create(
     validated: &Validated,
     requested: Option<&str>,
 ) -> Result<String, ApiError> {
-    let result = st
-        .namespaces
-        .resolve_for_create(requested, &validated.groups);
+    let result =
+        st.namespaces
+            .resolve_for_create(requested, &validated.subject.issuer, &validated.groups);
     let shown = requested.unwrap_or("omitted");
     match &result {
         Ok(ns) => {
             let matched = st
                 .namespaces
-                .matched_group(ns, &validated.groups)
+                .matched_group(ns, &validated.subject.issuer, &validated.groups)
                 .unwrap_or("open");
             tracing::info!(subject = %validated.subject.id, issuer = %validated.subject.issuer, requested = %shown, namespace = %ns, decision = "allowed", matched_group = %matched, "namespace decision");
         }
@@ -1161,7 +1191,7 @@ fn resolve_existing(
     requested: Option<&str>,
 ) -> Result<String, ApiError> {
     st.namespaces
-        .authorise_existing(requested, &validated.groups)
+        .authorise_existing(requested, &validated.subject.issuer, &validated.groups)
         .map_err(NsDenied::into_error)
 }
 
@@ -1337,7 +1367,7 @@ async fn session_for(
         .exchange(&validated.issuer, bearer_token, &resource)
         .await
         .map_err(|e| exchange_error(validated, &resource, &e))?;
-    tracing::info!(subject = %validated.subject.id, %resource, "session obtained on behalf of the caller");
+    tracing::info!(subject = %validated.subject.id, issuer = %validated.subject.issuer, %resource, "session obtained on behalf of the caller");
     Ok(Some(refresh))
 }
 
@@ -1499,6 +1529,13 @@ async fn create_sandbox(
         },
     );
     sandbox.metadata.namespace = Some(namespace.to_owned());
+    // ADR-0072 decision 3: the broker's mark, which the subject admission policy admits from
+    // the broker's username alone and makes immutable. The reconciler reads it through
+    // `created_through_the_api`: this sandbox's issuer is the one that validated the token.
+    sandbox.metadata.annotations = Some(BTreeMap::from([(
+        FRONT_DOOR_ANNOTATION.to_owned(),
+        FRONT_DOOR_API.to_owned(),
+    )]));
     let created = front.create(sandbox).await?;
     tracing::info!(subject = %validated.subject.id, pool = %pool_of(req), strategy = %strategy_of(req), sandbox = %name, %namespace, "sandbox created");
     // ADR-0013 decision 2: the session is parked under the sandbox's UID, sealed with it,
@@ -2979,7 +3016,7 @@ async fn store_refreshed(
 fn exchange_error(validated: &Validated, resource: &str, e: &IdpError) -> ApiError {
     match e {
         IdpError::SessionRevoked(code) => {
-            tracing::warn!(subject = %validated.subject.id, %resource, %code, "on-behalf-of exchange refused");
+            tracing::warn!(subject = %validated.subject.id, issuer = %validated.subject.issuer, %resource, %code, "on-behalf-of exchange refused");
             ApiError::new(
                 StatusCode::FORBIDDEN,
                 "session_refused",
@@ -2989,7 +3026,7 @@ fn exchange_error(validated: &Validated, resource: &str, e: &IdpError) -> ApiErr
             )
         }
         other => {
-            tracing::warn!(subject = %validated.subject.id, %resource, error = %other, "on-behalf-of exchange unavailable");
+            tracing::warn!(subject = %validated.subject.id, issuer = %validated.subject.issuer, %resource, error = %other, "on-behalf-of exchange unavailable");
             ApiError::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "upstream_unavailable",
@@ -3814,6 +3851,7 @@ mod tests {
             ca_file: None,
             entra: None,
             groups_claim: None,
+            subject_prefix: None,
         }
     }
 
@@ -5735,11 +5773,68 @@ mod tests {
     const TEAM_A: &str = "APP_EXAMPLE_TEAM_A_USER";
     const ADMIN: &str = "example-org:APP_EXAMPLE_ADMIN";
 
+    /// Stands for the fake issuer's URL in a fixture written before it listens: [`broker`]
+    /// replaces it with the URL the fake took (ADR-0074, every entry names its issuers).
+    const FIXTURE_ISSUER: &str = "https://fixture-issuer.test";
+    /// Stands for the second issuer of [`with_second_issuer`], replaced the same way.
+    const SECOND_ISSUER: &str = "https://second-issuer.test";
+
+    /// An entry of the namespace map reading `groups` from `issuers`.
+    fn grant(groups: &[&str], issuers: &[&str]) -> NamespaceGrant {
+        NamespaceGrant {
+            groups: groups.iter().map(|g| (*g).to_owned()).collect(),
+            issuers: issuers.iter().map(|i| (*i).to_owned()).collect(),
+        }
+    }
+
     fn tenant_map() -> Namespaces {
         Namespaces::Map(BTreeMap::from([
-            ("infra".to_owned(), vec![ADMIN.to_owned()]),
-            ("team-a".to_owned(), vec![TEAM_A.to_owned()]),
+            ("infra".to_owned(), grant(&[ADMIN], &[FIXTURE_ISSUER])),
+            ("team-a".to_owned(), grant(&[TEAM_A], &[FIXTURE_ISSUER])),
         ]))
+    }
+
+    /// `namespaces` with each placeholder issuer replaced by the URL it stands for.
+    fn with_issuers(namespaces: Namespaces, placeholder: &str, issuer: &str) -> Namespaces {
+        match namespaces {
+            Namespaces::Map(map) => Namespaces::Map(
+                map.into_iter()
+                    .map(|(ns, mut g)| {
+                        for i in &mut g.issuers {
+                            if i == placeholder {
+                                issuer.clone_into(i);
+                            }
+                        }
+                        (ns, g)
+                    })
+                    .collect(),
+            ),
+            single @ Namespaces::Single(_) => single,
+        }
+    }
+
+    /// The broker `b` trusting a second issuer beside its own, with the same gate, and the
+    /// map's [`SECOND_ISSUER`] standing for it. Returns the second issuer's fake.
+    async fn with_second_issuer(mut b: Broker) -> (Broker, FakeIdp) {
+        let second = FakeIdp::start().await;
+        let st = Arc::get_mut(&mut b.st).expect("the state is not shared yet");
+        let issuer = |url: &str| IssuerConfig {
+            url: url.to_owned(),
+            backend: Backend::Sts,
+            client_id: "mediatore".into(),
+            subject_claim: "preferred_username".into(),
+            required_group: None,
+            required_groups: None,
+            allow_any_authenticated: true,
+            session: None,
+            ca_file: None,
+            entra: None,
+            groups_claim: None,
+            subject_prefix: None,
+        };
+        st.validator = Validator::new(vec![issuer(&b.idp.issuer), issuer(&second.issuer)]);
+        st.namespaces = with_issuers(st.namespaces.clone(), SECOND_ISSUER, &second.issuer);
+        (b, second)
     }
 
     /// A front door that counts the reads it is asked for and forwards to the in-memory API.
@@ -5798,8 +5893,9 @@ mod tests {
             ca_file: None,
             entra: None,
             groups_claim: None,
+            subject_prefix: None,
         }]);
-        st.namespaces = namespaces;
+        st.namespaces = with_issuers(namespaces, FIXTURE_ISSUER, &idp.issuer);
         st.dev_mode = dev_mode;
         st.logs = logs;
         if !dev_mode {
@@ -5950,56 +6046,192 @@ mod tests {
     #[test]
     fn the_single_form_resolves_an_omitted_or_equal_namespace_and_refuses_any_other() {
         let n = Namespaces::Single("sandboxes".into());
-        assert_eq!(n.resolve_for_create(None, &[]).as_deref(), Ok("sandboxes"));
+        let i = FIXTURE_ISSUER;
         assert_eq!(
-            n.resolve_for_create(Some("sandboxes"), &[]).as_deref(),
+            n.resolve_for_create(None, i, &[]).as_deref(),
             Ok("sandboxes")
         );
         assert_eq!(
-            n.resolve_for_create(Some("team-a"), &[]),
+            n.resolve_for_create(Some("sandboxes"), i, &[]).as_deref(),
+            Ok("sandboxes")
+        );
+        assert_eq!(
+            n.resolve_for_create(Some("team-a"), i, &[]),
             Err(NsDenied::Forbidden("team-a".into()))
         );
-        assert_eq!(n.authorise_existing(None, &[]).as_deref(), Ok("sandboxes"));
         assert_eq!(
-            n.authorise_existing(Some("team-a"), &[]),
+            n.authorise_existing(None, i, &[]).as_deref(),
+            Ok("sandboxes")
+        );
+        assert_eq!(
+            n.authorise_existing(Some("team-a"), i, &[]),
             Err(NsDenied::NotFound)
         );
+    }
+
+    fn held(groups: &[&str]) -> Vec<String> {
+        groups.iter().map(|s| (*s).to_owned()).collect()
     }
 
     #[test]
     fn the_map_form_needs_a_named_listed_namespace_and_a_listed_group() {
         let n = tenant_map();
-        let held = |g: &[&str]| g.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        let i = FIXTURE_ISSUER;
         assert_eq!(
-            n.resolve_for_create(None, &held(&[TEAM_A])),
+            n.resolve_for_create(None, i, &held(&[TEAM_A])),
             Err(NsDenied::Required)
         );
         assert_eq!(
-            n.resolve_for_create(Some("team-a"), &held(&[TEAM_A]))
+            n.resolve_for_create(Some("team-a"), i, &held(&[TEAM_A]))
                 .as_deref(),
             Ok("team-a")
         );
         assert_eq!(
-            n.resolve_for_create(Some("team-a"), &held(&[ADMIN])),
+            n.resolve_for_create(Some("team-a"), i, &held(&[ADMIN])),
             Err(NsDenied::Forbidden("team-a".into()))
         );
         assert_eq!(
-            n.resolve_for_create(Some("Team_A"), &held(&[TEAM_A])),
+            n.resolve_for_create(Some("Team_A"), i, &held(&[TEAM_A])),
             Err(NsDenied::Invalid)
         );
         assert_eq!(
-            n.matched_group("team-a", &held(&["x", TEAM_A])),
+            n.matched_group("team-a", i, &held(&["x", TEAM_A])),
             Some(TEAM_A)
         );
-        assert_eq!(n.matched_group("team-a", &held(&["x"])), None);
+        assert_eq!(n.matched_group("team-a", i, &held(&["x"])), None);
         assert_eq!(
-            n.authorise_existing(None, &held(&[TEAM_A])),
+            n.authorise_existing(None, i, &held(&[TEAM_A])),
             Err(NsDenied::Required)
         );
         assert_eq!(
-            n.authorise_existing(Some("infra"), &held(&[TEAM_A])),
+            n.authorise_existing(Some("infra"), i, &held(&[TEAM_A])),
             Err(NsDenied::NotFound)
         );
+    }
+
+    // ----- ADR-0074: a namespace's groups are read only from the issuers it names -----
+
+    #[test]
+    fn the_map_form_matches_a_group_only_from_a_listed_issuer() {
+        let n = tenant_map();
+        assert_eq!(
+            n.matched_group("team-a", FIXTURE_ISSUER, &held(&[TEAM_A])),
+            Some(TEAM_A)
+        );
+        assert_eq!(
+            n.matched_group("team-a", SECOND_ISSUER, &held(&[TEAM_A])),
+            None,
+            "the same name at an issuer the entry does not list"
+        );
+        assert_eq!(
+            n.resolve_for_create(Some("team-a"), SECOND_ISSUER, &held(&[TEAM_A])),
+            Err(NsDenied::Forbidden("team-a".into()))
+        );
+        assert_eq!(
+            n.authorise_existing(Some("team-a"), SECOND_ISSUER, &held(&[TEAM_A])),
+            Err(NsDenied::NotFound)
+        );
+        // The issuer is compared byte for byte.
+        for near in [
+            "https://fixture-issuer.test/",
+            "https://FIXTURE-ISSUER.test",
+            "",
+        ] {
+            assert_eq!(
+                n.matched_group("team-a", near, &held(&[TEAM_A])),
+                None,
+                "{near:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_single_form_reads_no_issuer_and_no_group() {
+        let n = Namespaces::Single("sandboxes".into());
+        for issuer in [FIXTURE_ISSUER, SECOND_ISSUER, ""] {
+            assert_eq!(
+                n.resolve_for_create(None, issuer, &held(&[])).as_deref(),
+                Ok("sandboxes")
+            );
+            assert_eq!(
+                n.authorise_existing(Some("sandboxes"), issuer, &held(&["anything"]))
+                    .as_deref(),
+                Ok("sandboxes")
+            );
+            assert_eq!(n.matched_group("sandboxes", issuer, &held(&[TEAM_A])), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_group_of_the_same_name_at_an_unlisted_issuer_does_not_qualify() {
+        let (b, second) = with_second_issuer(broker(tenant_map(), false).await).await;
+        let own = b.token("alice", &[TEAM_A]);
+        let name = created(&b.create(&own, Some("team-a")).await);
+        // The same login and the same group name, at the issuer team-a does not list.
+        let elsewhere = second.token(serde_json::json!({
+            "aud": "mediatore",
+            "sub": "alice",
+            "preferred_username": "alice",
+            "groups": [TEAM_A],
+        }));
+        let (status, body, _) = b.create(&elsewhere, Some("team-a")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(code(&body), "forbidden");
+        assert_eq!(
+            b.get(&elsewhere, &name, Some("team-a")).await.0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            b.delete(&elsewhere, &name, Some("team-a")).await.0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(b.front.all().len(), 1, "nothing created, nothing deleted");
+        assert_eq!(b.get(&own, &name, Some("team-a")).await.0, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn an_entry_listing_two_issuers_reads_its_groups_from_each() {
+        let both = Namespaces::Map(BTreeMap::from([(
+            "infra".to_owned(),
+            grant(&[ADMIN], &[FIXTURE_ISSUER, SECOND_ISSUER]),
+        )]));
+        let (b, second) = with_second_issuer(broker(both, false).await).await;
+        let at_first = b.token("alice", &[ADMIN]);
+        let at_second = second.token(serde_json::json!({
+            "aud": "mediatore",
+            "sub": "bob",
+            "preferred_username": "bob",
+            "groups": [ADMIN],
+        }));
+        created(&b.create(&at_first, Some("infra")).await);
+        created(&b.create(&at_second, Some("infra")).await);
+        assert_eq!(b.front.all().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn the_refusal_for_an_unlisted_issuer_equals_the_refusal_for_an_unlisted_group() {
+        let (b, second) = with_second_issuer(broker(tenant_map(), false).await).await;
+        // The listed issuer, a group the entry does not list ...
+        let unqualified = b
+            .create(&b.token("alice", &["SOME_OTHER_GROUP"]), Some("team-a"))
+            .await;
+        // ... and the listed group, from an issuer the entry does not list.
+        let unlisted = b
+            .create(
+                &second.token(serde_json::json!({
+                    "aud": "mediatore",
+                    "sub": "alice",
+                    "preferred_username": "alice",
+                    "groups": [TEAM_A],
+                })),
+                Some("team-a"),
+            )
+            .await;
+        assert_eq!(unqualified.0, StatusCode::FORBIDDEN);
+        assert_eq!(unqualified.0, unlisted.0);
+        assert_eq!(unqualified.2, unlisted.2, "byte-equal bodies");
+        assert!(!unlisted.2.contains(&b.idp.issuer), "{}", unlisted.2);
+        assert!(!unlisted.2.contains(&second.issuer), "{}", unlisted.2);
     }
 
     // ----- create -----
@@ -6021,6 +6253,25 @@ mod tests {
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(code(&body), "forbidden");
         assert_eq!(b.front.all().len(), 2, "the refused request wrote nothing");
+    }
+
+    /// ADR-0072 decision 3: what `POST /v1/claims` writes says it came through the API, with
+    /// the one key and the one value the admission policy reserves to the broker.
+    #[tokio::test]
+    async fn a_sandbox_created_through_the_api_carries_the_front_door_annotation() {
+        let b = broker(Namespaces::Single("sandboxes".into()), false).await;
+        created(&b.create(&b.token("alice", &[]), None).await);
+        let all = b.front.all();
+        assert_eq!(all.len(), 1);
+        assert_eq!(
+            all[0].metadata.annotations,
+            Some(BTreeMap::from([(
+                "mediatore.io/front-door".to_owned(),
+                "api".to_owned()
+            )])),
+            "that annotation and no other"
+        );
+        assert!(mediatore_claims::sandbox::created_through_the_api(&all[0]));
     }
 
     // ADR-0046 decision 8. The broker does not match pools (banlieue does, in the sandbox's own
@@ -6143,6 +6394,7 @@ mod tests {
                 ca_file: None,
                 entra: None,
                 groups_claim: None,
+                subject_prefix: None,
             }]);
         }
         let mut body = request(Some("team-a"));
@@ -6246,6 +6498,7 @@ mod tests {
                 ca_file: None,
                 entra: None,
                 groups_claim: None,
+                subject_prefix: None,
             }]);
         }
         let mut body = request(None);
@@ -6387,7 +6640,7 @@ mod tests {
         // ... and not listed here.
         let only_a = Namespaces::Map(BTreeMap::from([(
             "team-a".to_owned(),
-            vec![TEAM_A.to_owned()],
+            grant(&[TEAM_A], &[FIXTURE_ISSUER]),
         )]));
         let unlisted = broker(only_a, false).await;
         let b = unlisted
@@ -6703,7 +6956,8 @@ mod tests {
 
     #[tokio::test]
     async fn dev_mode_enforces_the_namespace_groups() {
-        let b = broker(tenant_map(), true).await;
+        // Two issuers from the start, the map's entries listing the first (ADR-0074).
+        let (b, second) = with_second_issuer(broker(tenant_map(), true).await).await;
         let (status, _, _) = b
             .create(&b.token("alice", &["SOME_OTHER_GROUP"]), Some("team-a"))
             .await;
@@ -6727,6 +6981,25 @@ mod tests {
         );
         assert_eq!(
             b.delete(&left, &name, Some("team-a")).await.0,
+            StatusCode::NOT_FOUND
+        );
+        // ADR-0074: a dev token of an issuer the entry does not list, with the listed group.
+        let unlisted = second.token(serde_json::json!({
+            "aud": "mediatore",
+            "sub": "alice",
+            "preferred_username": "alice",
+            "groups": [TEAM_A],
+        }));
+        assert_eq!(
+            b.create(&unlisted, Some("team-a")).await.0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            b.get(&unlisted, &name, Some("team-a")).await.0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            b.delete(&unlisted, &name, Some("team-a")).await.0,
             StatusCode::NOT_FOUND
         );
         assert_eq!(

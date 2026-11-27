@@ -29,7 +29,7 @@ PLUGIN_IMG=${TPM_PLUGIN_AGENT_IMG:?TPM_PLUGIN_AGENT_IMG}
 # The root the server's CA chains to, as `make kind-openbao` read it from the PKI mount (ADR-0031).
 UPSTREAM_ROOT=${UPSTREAM_ROOT:?UPSTREAM_ROOT}
 K=(kubectl --kubeconfig "$KUBECONFIG_PATH")
-BROKER_NS=banlieue-system
+BROKER_NS=mediatore-system
 SPIRE_NS=spire-server
 SERVER_POD=spire-server-0
 NS=mediatore-e2e-tpm
@@ -119,7 +119,7 @@ member() { # <role> <with guest: yes|no>
             - $DMI
             - --dev-skip-setup
           env:
-            - { name: MEDIATORE_URL, value: "https://mediatore-sandbox.banlieue-system.svc" }
+            - { name: MEDIATORE_URL, value: "https://mediatore-sandbox.mediatore-system.svc" }
             - { name: SPIFFE_ENDPOINT_SOCKET, value: "unix:///run/spire/sockets/agent.sock" }
           securityContext:
             runAsUser: 0

@@ -2758,8 +2758,8 @@ mod tests {
             },
         );
         sb.metadata.uid = Some("u-1".into());
-        sb.metadata.namespace = Some("banlieue-system".into());
-        let owners = owner_refs("banlieue-system", &sb).expect("same namespace: owned");
+        sb.metadata.namespace = Some("mediatore-system".into());
+        let owners = owner_refs("mediatore-system", &sb).expect("same namespace: owned");
         assert_eq!(owners[0].kind, "AgentSandbox");
         assert_eq!(owners[0].uid, "u-1");
         assert!(
@@ -3427,6 +3427,87 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// ADR-0056 decision 7 step 6: a session Secret written while the broker's home was one
+    /// namespace and re-created in another (no `ownerReferences`, no `uid`, no
+    /// `resourceVersion`: an owner reference cannot cross a namespace, and the other two are
+    /// the old object's) is read by the store in its new home and opens for its sandbox,
+    /// and for no other. The envelope is bound to the sandbox's UID and its slot; neither
+    /// the namespace nor the Secret's metadata is in the binding, and the sandbox did not
+    /// move.
+    #[tokio::test]
+    async fn a_session_secret_without_an_owner_reference_in_a_new_home_opens_for_its_sandbox() {
+        use mediatore_store::seal::{LocalKeySealer, Slot};
+        let (state, claim) = fake::seed(false);
+        let sandbox = fake::sandbox_uid(&state.lock().unwrap());
+        let sealer = LocalKeySealer::new([7; 32]);
+        let refresh = sealer
+            .seal_session(Slot::Issuer, sandbox, b"the refresh material")
+            .await
+            .unwrap();
+        // As the old broker held it, in its old home, owned and versioned there.
+        let mut written = serde_json::to_value(session_secret(
+            &SessionRecord {
+                sandbox_uid: sandbox,
+                subject: Subject {
+                    issuer: "https://idp.example".into(),
+                    id: "octocat".into(),
+                    display: None,
+                },
+                issuer: String::new(),
+                refresh,
+                created_at: Timestamp::now(),
+                audience: None,
+                expires_at: None,
+            },
+            "claimed",
+        ))
+        .unwrap();
+        written["apiVersion"] = "v1".into();
+        written["kind"] = "Secret".into();
+        written["metadata"]["namespace"] = "the-old-home".into();
+        written["metadata"]["uid"] = Uuid::new_v4().to_string().into();
+        written["metadata"]["resourceVersion"] = "4711".into();
+        written["metadata"]["ownerReferences"] = serde_json::json!([{
+            "apiVersion": "mediatore.io/v1beta1", "kind": "AgentSandbox",
+            "name": "sb-1", "uid": sandbox.to_string(),
+        }]);
+        // The copy: the same name, labels and data; the three fields dropped; the new home.
+        let mut copy = written.clone();
+        let metadata = copy["metadata"].as_object_mut().unwrap();
+        for dropped in ["ownerReferences", "uid", "resourceVersion"] {
+            metadata.remove(dropped);
+        }
+        copy["metadata"]["namespace"] = fake::HOME.into();
+        {
+            let mut st = state.lock().unwrap();
+            let name = written["metadata"]["name"].clone();
+            st.secrets.retain(|s| s["metadata"]["name"] != name);
+            st.secrets.push(copy);
+        }
+
+        let store = fake::store(&state);
+        let rec = store.get_claim(claim).await.unwrap();
+        assert_eq!(
+            rec.seal_binding(),
+            sandbox,
+            "the binding is the sandbox's UID"
+        );
+        let envelope = rec.refresh.clone().expect("the copied session is read");
+        let opened = sealer
+            .unseal_session(Slot::Issuer, rec.seal_binding(), &envelope)
+            .await
+            .expect("it opens for its sandbox");
+        assert!(opened == b"the refresh material", "the material is intact");
+        assert!(
+            sealer
+                .unseal_session(Slot::Issuer, Uuid::new_v4(), &envelope)
+                .await
+                .is_err(),
+            "and for no other sandbox"
+        );
+        fake::assert_only_home_secrets(&state.lock().unwrap());
     }
 
     #[tokio::test]

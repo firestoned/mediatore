@@ -54,6 +54,7 @@ async fn the_live_tenant_exchanges_refreshes_for_mediatore_and_refreshes_for_the
         ca_file: None,
         entra: Some(entra.clone()),
         groups_claim: None,
+        subject_prefix: None,
     };
     let assertion = ClientAssertion::build(&entra)
         .await

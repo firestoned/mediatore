@@ -11,7 +11,7 @@ the same commit that changes a roadmap item's state.
 | --- | --- | --- | --- |
 | 00 | Dev-mode loop | ✅ done | [00-dev-mode-loop.md](.github/community/00-dev-mode-loop.md) |
 | 01 | SPIFFE mTLS + SPIRE entries | ✅ done | [01-spiffe-mtls-and-entries.md](.github/community/01-spiffe-mtls-and-entries.md) |
-| 02 | SPIRE on the homelab cluster | 🔶 in progress | [02-spire-on-the-cluster.md](.github/community/02-spire-on-the-cluster.md) |
+| 02 | SPIRE on the homelab cluster (ADR-0056, the broker in `mediatore-system`, a namespace of its own, built and rehearsed in kind 2026-11-27) | 🔶 in progress (ADR-0056's migration of the running cluster, by the procedure in the deploying guide, is open) | [02-spire-on-the-cluster.md](.github/community/02-spire-on-the-cluster.md) |
 | 03 | Claim watcher against banlieue | ✅ done | [03-claim-watcher.md](.github/community/03-claim-watcher.md) |
 | 04 | Token backends live (OBO + Dex/STS) | 🔶 in progress | [04-token-backends-live.md](.github/community/04-token-backends-live.md) |
 | 05 | Persistent store (ADR-0012; the Kubernetes API as the store, ADR-0034; ADR-0057, a record written by compare-and-set and bound to its sandbox, built 2026-11-19) | 🔶 in progress (ADR-0039's live proof: a recycled pool with the `SandboxNode` register settling at the pool's size, once a release carries it; ADR-0057's live steps in the kind tiers and its follow-ups) | [05-persistent-store.md](.github/community/05-persistent-store.md) |
