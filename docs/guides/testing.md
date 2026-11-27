@@ -713,8 +713,9 @@ with the parameter naming the old username), runs the first half of the Dex tier
 login at Dex, a claim, the session delegated and sealed with the OpenBao transit key, the
 claim bound, a first token), then moves the broker: the namespace and the STS key, the
 OpenBao role bound to both namespaces, the old broker to zero, the `PolicyFloor`s and
-banned `SandboxNode`s, the session Secrets and bound `SandboxNode`s without owner references,
-the base in `mediatore-system`. The second half of the Dex tier then runs against the new
+banned `SandboxNode`s (one of each made as a fixture in the old home, since the Dex tier
+reads no bundle and bans nobody, and found unchanged in the new), the session Secrets and
+bound `SandboxNode`s without owner references, the base in `mediatore-system`. The second half of the Dex tier then runs against the new
 broker: the claim bound before the move issues a token from the session copied into the new
 home (Dex's record of the refresh token shows the use), and the tier goes on to its two
 revocations and a second login and claim, so release, the sweep and a fresh claim are

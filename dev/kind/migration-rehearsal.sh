@@ -73,6 +73,9 @@ say "before: the broker as it stood, in $OLD (step 1: this build and base, the p
 "${K[@]}" -n "$NEW" scale deploy/mediatore --replicas=0 >/dev/null
 wait_no_pods "$NEW"
 "${K[@]}" -n "$NEW" delete lease mediatore-watcher --ignore-not-found >/dev/null
+# The new home starts empty of store objects, as a namespace just created is (earlier tiers left theirs).
+"${K[@]}" -n "$NEW" delete sandboxnodes,policyfloors --all --ignore-not-found >/dev/null
+"${K[@]}" -n "$NEW" delete secrets -l mediatore.io/sandbox-uid --ignore-not-found >/dev/null
 "${K[@]}" get namespace "$OLD" >/dev/null 2>&1 || "${K[@]}" create namespace "$OLD" >/dev/null
 # What the operator created there: the STS key and the two CA bundles the kind broker mounts.
 "${K[@]}" -n "$NEW" get secret mediatore-sts -o json | jq '{items: [.]}' | copied "$OLD" | "${K[@]}" apply -f - >/dev/null
@@ -92,6 +95,33 @@ MEDIATORE_BROKER_NS=$OLD MEDIATORE_DEX_PHASE=until-first-token MEDIATORE_DEX_STA
 read -r SANDBOX CLAIM_UID < "$DEX_STATE"
 SANDBOX_UID=$("${K[@]}" -n mediatore-e2e-sandbox get agentsandbox "$SANDBOX" -o jsonpath='{.metadata.uid}')
 "${K[@]}" -n "$OLD" get secret "mediatore-session-$SANDBOX_UID" >/dev/null || fail "no session Secret for $SANDBOX in $OLD"
+# What step 5 exists for, as fixtures (the Dex tier reads no bundle and bans nobody): a
+# version floor and a banned node in the old home, each to be found unchanged in the new.
+FLOOR=mediatore-e2e-migration.rehearsal
+BANNED=$(printf 'ba%062x' 7)
+"${K[@]}" apply -f - >/dev/null <<YAML
+apiVersion: mediatore.io/v1alpha1
+kind: PolicyFloor
+metadata: { name: $FLOOR, namespace: $OLD }
+spec:
+  policyNamespace: mediatore-e2e-migration
+  policyName: rehearsal
+  uid: 5f0c1e2d-3b4a-4c5d-8e6f-7a8b9c0d1e2f
+  version: 7
+  issuedAt: "2026-11-27T00:00:00Z"
+---
+apiVersion: mediatore.io/v1alpha1
+kind: SandboxNode
+metadata: { name: $BANNED, namespace: $OLD }
+spec:
+  ekHash: $BANNED
+  nodeId: spiffe://$TD/spire/agent/tpm/$BANNED
+  dmiUuid: 0b0a0d00-0000-4000-8000-000000000007
+  hostname: banned-fixture
+  banned: true
+  registeredAt: "2026-11-27T00:00:00Z"
+YAML
+spec_of() { "${K[@]}" -n "$1" get "$2" "$3" -o json | jq -cS .spec; }
 echo "in $OLD: $("${K[@]}" -n "$OLD" get secrets -l mediatore.io/sandbox-uid -o name | wc -l | tr -d ' ') store Secret(s), $("${K[@]}" -n "$OLD" get sandboxnodes -o name | wc -l | tr -d ' ') SandboxNode(s), $("${K[@]}" -n "$OLD" get policyfloors -o name | wc -l | tr -d ' ') PolicyFloor(s)"
 
 say "step 2: the namespace, and what the operator created, copied (the same STS key, so the kid and the JWKS do not change)"
@@ -110,9 +140,12 @@ wait_no_pods "$OLD"
 echo "no broker pod in $OLD; the Lease there has no holder to renew it"
 
 say "step 5: every PolicyFloor and every banned SandboxNode"
-"${K[@]}" -n "$OLD" get policyfloors -o json | copied "$NEW" | "${K[@]}" apply -f - 2>/dev/null | sed 's/^/  /' || true
-"${K[@]}" -n "$OLD" get sandboxnodes -o json | jq '.items |= map(select(.spec.banned == true))' | copied "$NEW" | "${K[@]}" apply -f - 2>/dev/null | sed 's/^/  /' || true
-echo "copied: $("${K[@]}" -n "$NEW" get policyfloors -o name | wc -l | tr -d ' ') PolicyFloor(s), $("${K[@]}" -n "$NEW" get sandboxnodes -o json | jq '[.items[] | select(.spec.banned == true)] | length') banned SandboxNode(s)"
+"${K[@]}" -n "$OLD" get policyfloors -o json | copied "$NEW" | "${K[@]}" apply -f - | sed 's/^/  /'
+"${K[@]}" -n "$OLD" get sandboxnodes -o json | jq '.items |= map(select(.spec.banned == true))' | copied "$NEW" | "${K[@]}" apply -f - | sed 's/^/  /'
+[ "$(spec_of "$NEW" policyfloor "$FLOOR")" = "$(spec_of "$OLD" policyfloor "$FLOOR")" ] || fail "the floor $FLOOR did not arrive in $NEW as it was in $OLD"
+[ "$(spec_of "$NEW" sandboxnode "$BANNED" | jq .banned)" = "true" ] || fail "the banned node did not arrive in $NEW banned"
+"${K[@]}" -n "$NEW" get sandboxnodes -o json | jq -e '[.items[] | select(.spec.banned != true)] | length == 0' >/dev/null || fail "step 5 copied a node that is not banned"
+echo "in $NEW as in $OLD: floor $FLOOR at version $(spec_of "$NEW" policyfloor "$FLOOR" | jq .version), node ${BANNED:0:12}... banned; no unbanned node copied yet"
 
 say "step 6 (claims not drained): the store's Secrets and the bound SandboxNodes, with no ownerReferences, uid or resourceVersion"
 "${K[@]}" -n "$OLD" get secrets -l mediatore.io/sandbox-uid -o json | copied "$NEW" | "${K[@]}" apply -f - | sed 's/^/  /'
@@ -143,6 +176,8 @@ MEDIATORE_BROKER_NS=$NEW MEDIATORE_DEX_PHASE=from-second-token MEDIATORE_DEX_STA
 "${K[@]}" -n "$OLD" delete sandboxnodes,policyfloors --all --ignore-not-found >/dev/null
 "${K[@]}" -n "$OLD" delete secret mediatore-sts --ignore-not-found >/dev/null
 bao_role "$NEW"
+"${K[@]}" -n "$NEW" delete policyfloor "$FLOOR" --ignore-not-found >/dev/null
+"${K[@]}" -n "$NEW" delete sandboxnode "$BANNED" --ignore-not-found >/dev/null
 left=$("${K[@]}" -n "$OLD" get secrets,serviceaccounts,roles,rolebindings,leases,sandboxnodes,policyfloors -o name 2>/dev/null | grep -c mediatore || true)
 [ "$left" -eq 0 ] || fail "$left object(s) of the broker's left in $OLD"
 echo "nothing of the broker's left in $OLD; the OpenBao role is bound to $NEW alone"

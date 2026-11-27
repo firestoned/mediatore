@@ -400,8 +400,9 @@ the cluster's administrators are trusted. Its revisit condition is this move.
    not cover: banlieue's `brokers` line and an Entra federated credential (neither exists
    in kind; the OpenBao role is the one outside binding it exercises), a `LoadBalancer`
    address handed from the old Service to the new (the kind pods dial the Service by its
-   new name), and a `PolicyFloor` in the copy (the Dex tier reads no bundle; the command
-   runs over an empty list). Step 1 has one more case than the text: on a base that
+   new name), and a floor or a ban the broker itself wrote (the Dex tier reads no bundle
+   and bans nobody, so the `PolicyFloor` and the banned `SandboxNode` that step 5 carries
+   are fixtures the rehearsal makes in the old home and finds unchanged in the new). Step 1 has one more case than the text: on a base that
    carries the parameter, "the old username" is the parameter's `broker` in an overlay that
    keeps the broker in the old namespace, which is what the rehearsal's overlay is. Unit:
    `a_session_secret_without_an_owner_reference_in_a_new_home_opens_for_its_sandbox`
