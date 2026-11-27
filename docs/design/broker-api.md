@@ -67,7 +67,11 @@ needs a claim identity checks the SPIFFE ID's shape (`/banlieue/claim/<uid>`), a
 3. **`invalid_pool`.** Exactly one of `pool_ref` and `pool_selector` (ADR-0044); neither is never read as "any pool".
    `selection.strategy`, when present, is one of banlieue's `LongestReady`, `MostAvailable` and `Spread` or the body does
    not parse (`422`, ADR-0047); absent stays absent on the sandbox and the claim.
-4. **`unknown_audience`.** Every audience the body names must be one the broker is configured to serve.
+4. **`unknown_audience`.** Every audience the body names must be one the broker is configured to serve. Then, still
+   before the image is parsed or a session is built, the lifetime: under `policy.audiences: enforce` a `ttl_seconds`
+   above the policy's lease is `ttl_exceeds_policy`, and with or without a policy one above `sandboxes.max_ttl_seconds`
+   (one day unless configured) is **`ttl_exceeds_maximum`** (`refuse_above_maximum`; ADR-0008 decision 9, amended
+   2026-11-26). The smaller of the two bounds the claim.
 5. **`invalid_workload_image`**, then **`registry_not_granted`.** The image must parse, and in an environment with
    gateways its registry must be served by one of the claim's own audiences of `role: registry` (ADR-0063); the
    sentence names no other registry.

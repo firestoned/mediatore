@@ -367,3 +367,8 @@ What already exists and shapes the answer:
 3. Quarantine, if a responder's need for a live VM proves real.
 4. Whether roadmap 16's attribution should add the tripping binary to the event, and under which
    `source`.
+
+The actors past the jail (a process outside it holding the claim SVID, root on a pool VM, a
+compromised gateway process) are
+[ADR-0070](0070-tripwires-beyond-the-sandbox-a-request-no-honest-build-makes.md)'s, which adds the
+kinds `protocol` and `segment` and the source `peer` to decisions 2 and 8.

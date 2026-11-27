@@ -51,7 +51,7 @@ audience). The sources, parsed by `Source` (`delegate.rs`):
 | Source | Reads |
 | --- | --- |
 | `claude-code` | Claude Code's own credential store (the macOS Keychain, or its credentials file) |
-| `prompt` | asks at the terminal: a user name, then a secret **with echo off** (through `stty`). Terminal only; a script uses `env:` or `file:` |
+| `prompt` | asks at the terminal: a user name, then a secret **with echo off** (through `stty`). Terminal only; a script uses `env:` or `file:`. Fails closed: when `stty -echo` fails on a terminal, the secret is neither asked for nor read (`read_unechoed`) |
 | `store` | mediatore's own item in the macOS Keychain, saved earlier |
 | `env:<NAME>` | the environment variable `NAME`; a bare token, or `user:secret` for a `basic` audience |
 | `file:<path>` | the file's contents, the same shapes |

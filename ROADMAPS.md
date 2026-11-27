@@ -27,6 +27,7 @@ the same commit that changes a roadmap item's state.
 | 15 | Observability (OpenTelemetry) that never weakens security or speed | ⛔ not started | [15-observability.md](.github/community/15-observability.md) |
 | 16 | Per-binary policy inside a sandbox (a route narrowed to the binaries that may use it, enforced at the guest's egress proxy; ADR-0066, not yet written) | ⛔ not started | [16-per-binary-egress-policy.md](.github/community/16-per-binary-egress-policy.md) |
 | 17 | Tripwires (decoy ports, proxy routes and credentials, all decided on the VM before anything leaves it, drawn at random per sandbox from catalogues of possible traps; the first use of one ends the sandbox; off by default, then shadow; every event and host recorded on the status and in OpenTelemetry; ADR-0069, proposed) | ⛔ not started | [17-tripwires.md](.github/community/17-tripwires.md) |
+| 18 | Tripwires beyond the sandbox (past the jail both ends of every boundary are mediatore's own code, so the trap is the request no honest build makes: the broker classifies refusals it already gives, the host tables count drops they already make; no bait, no decoy listener; a class scoped to one claim can end it, every other is recorded only; ADR-0070, proposed) | ⛔ not started | [18-tripwires-beyond-the-sandbox.md](.github/community/18-tripwires-beyond-the-sandbox.md) |
 
 Statuses: ✅ done · 🔶 in progress · ⛔ not started · 📄 reference doc.
 ADRs are separate and live in [`docs/adr/`](docs/adr/).
