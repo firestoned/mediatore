@@ -190,7 +190,7 @@ pub fn run(args: &JailExecArgs) -> JailExecError {
     };
     tracing::info!(
         writable = ?plan.writable,
-        connect_ports = ?plan.connect_ports,
+        connect_ports = %logged_ports(&plan.connect_ports),
         seccomp_filters,
         "confinement applied; exec"
     );
@@ -199,6 +199,19 @@ pub fn run(args: &JailExecArgs) -> JailExecError {
         .args(&args.argv[1..])
         .exec();
     JailExecError::Exec { argv0, source }
+}
+
+/// The connect ports as the `confinement applied` line shows them. That line is written on
+/// the jail's stderr, which is the workload's output: shipped to the claim's owner under
+/// ADR-0045 and copied to the console. One port is the egress proxy's and is printed, as it
+/// always was. More than one means the others are an armed tripwire's decoy ports (ADR-0069
+/// decision 10), and nothing of a draw leaves the VM (decision 3): only how many is printed.
+#[must_use]
+pub fn logged_ports(ports: &[u16]) -> String {
+    match ports {
+        [one] => format!("[{one}]"),
+        many => format!("{} ports", many.len()),
+    }
 }
 
 /// Not Linux: no Landlock, no substitute, no workload (ADR-0024 decision 4).
@@ -283,6 +296,18 @@ mod tests {
         assert_eq!(exec.exit_code(), EXIT_EXEC_FAILED);
         assert_ne!(EXIT_CONFINEMENT_REFUSED, EXIT_EXEC_FAILED);
         assert!(refused.to_string().contains("confinement refused"));
+    }
+
+    #[test]
+    fn the_confinement_line_prints_the_proxys_port_alone_and_never_a_decoy_port() {
+        // With no tripwire the line is what it was: `connect_ports=[3128]`.
+        assert_eq!(logged_ports(&[3128]), format!("{:?}", [3128]));
+        // With one, the line goes out with the workload's output: no port of the draw is in it.
+        let printed = logged_ports(&[80, 3128, 6379, 31337]);
+        assert_eq!(printed, "4 ports");
+        for port in ["3128", "6379", "31337"] {
+            assert!(!printed.contains(port));
+        }
     }
 
     #[cfg(not(target_os = "linux"))]

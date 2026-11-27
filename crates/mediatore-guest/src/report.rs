@@ -12,11 +12,13 @@
 
 use std::time::Duration;
 
+use mediatore_proto::trip::TripReport;
 use mediatore_proto::{GuestExit, GuestReport, HostTable};
 use reqwest::Method;
 use sha2::{Digest, Sha256};
 
 use crate::client::SandboxClient;
+use crate::trip::PostOutcome;
 
 /// The host table's name (`image/host-table`).
 pub const HOST_TABLE: &str = "mediatore_host";
@@ -87,6 +89,44 @@ pub async fn send_exit(client: &SandboxClient, exit: &GuestExit) -> anyhow::Resu
     Ok(())
 }
 
+/// What the broker's answer to a trip report means for the sender (ADR-0069 decision 8):
+/// `204` (any `2xx`) is recorded; `429` and a `5xx` but `501` are tried again, after
+/// `Retry-After` when it is a number of seconds; anything else (`400 invalid_trip`, `403`,
+/// `501` under `off`) would be answered the same way again.
+#[must_use]
+pub fn trip_outcome(status: u16, retry_after: Option<&str>) -> PostOutcome {
+    match status {
+        200..=299 => PostOutcome::Acknowledged,
+        // `not_implemented`: the broker's mode is `off`, and stays so however often asked.
+        501 => PostOutcome::Refused,
+        429 | 500..=599 => PostOutcome::Retry {
+            after: retry_after
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .map(Duration::from_secs),
+        },
+        _ => PostOutcome::Refused,
+    }
+}
+
+/// `POST /v1/me/trip` (ADR-0069 decision 8), once, over the node SVID. The answer's body is
+/// not read: the status says everything the sender acts on.
+///
+/// # Errors
+/// The broker unreachable within the bound, which the caller retries.
+pub async fn send_trip(client: &SandboxClient, report: &TripReport) -> anyhow::Result<PostOutcome> {
+    let resp = tokio::time::timeout(
+        SEND_TIMEOUT,
+        client.send(Method::POST, "/v1/me/trip", Some(report)),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("no answer within {}s", SEND_TIMEOUT.as_secs()))??;
+    let retry_after = resp
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok());
+    Ok(trip_outcome(resp.status().as_u16(), retry_after))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,5 +186,36 @@ mod tests {
         let mut bad = good;
         bad.sandbox_ruleset_sha256 = "cd".repeat(31);
         assert!(bad.validate().is_err(), "too short");
+    }
+
+    #[test]
+    fn the_brokers_answer_to_a_trip_report_is_recorded_retried_or_final() {
+        assert_eq!(trip_outcome(204, None), PostOutcome::Acknowledged);
+        assert_eq!(trip_outcome(200, None), PostOutcome::Acknowledged);
+        assert_eq!(
+            trip_outcome(429, Some("1")),
+            PostOutcome::Retry {
+                after: Some(Duration::from_secs(1))
+            }
+        );
+        assert_eq!(
+            trip_outcome(429, Some(" 7 ")),
+            PostOutcome::Retry {
+                after: Some(Duration::from_secs(7))
+            }
+        );
+        // A date, or nothing: the sender's own backoff.
+        for header in [None, Some("Wed, 21 Oct 2026 07:28:00 GMT"), Some("-1")] {
+            assert_eq!(
+                trip_outcome(503, header),
+                PostOutcome::Retry { after: None }
+            );
+        }
+        assert_eq!(trip_outcome(500, None), PostOutcome::Retry { after: None });
+        // `400 invalid_trip`, `403`, `404` (an older broker has no such route), `501` under
+        // `off`: the same answer every time, so it is not asked again.
+        for status in [400, 401, 403, 404, 415, 501, 301] {
+            assert_eq!(trip_outcome(status, Some("1")), PostOutcome::Refused);
+        }
     }
 }

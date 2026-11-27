@@ -19,7 +19,10 @@ use reqwest::Method;
 use uuid::Uuid;
 
 use crate::client::SandboxClient;
-use crate::{egress, identity, image, jail, logs, net, ready, report, sandboxfs, supervise, user};
+use crate::{
+    arm, egress, identity, image, jail, logs, net, ready, report, sandboxfs, segment, supervise,
+    trip, user,
+};
 
 /// Seconds between registration retries while mediatore is unreachable.
 const REGISTER_RETRY_SECS: u64 = 5;
@@ -435,6 +438,11 @@ pub async fn run(args: GuestArgs) -> anyhow::Result<()> {
     let client = Arc::new(connect(&args).await?);
     let registered = register(&client, &args, reg).await?;
     tracing::info!(node_id = %registered.node_id, "node registered");
+    // The pool VM's segment reader (ADR-0070 decision 4): for the guest's life, a no-op where no host table is loaded.
+    let _segment = segment::spawn(
+        Arc::new(trip::BrokerTripSink::new(client.clone())),
+        std::time::Duration::from_secs(60),
+    );
     // Only now is this member ready for a claim (ADR-0019): attested (the SVID came from
     // the agent) and known to mediatore as a node. Tell the pool, on whatever channel the
     // hypervisor reads. Not fatal: a member that cannot say so is never handed out.
@@ -484,8 +492,20 @@ pub async fn run(args: GuestArgs) -> anyhow::Result<()> {
 
     // 5. Build and run the sandbox, then tear down. Also tear down on an error: no
     //    partial-trust mode.
-    let result = serve_claim(&args, &client, &me, &username, &reference, uid, gid).await;
-    supervise::teardown(&args.sandbox_root, &username).await;
+    let mut tripped = false;
+    let result = serve_claim(
+        &args,
+        &client,
+        &me,
+        &username,
+        &reference,
+        uid,
+        gid,
+        &mut tripped,
+    )
+    .await;
+    // After a trip the claim's table is the cut and stays (ADR-0069 decision 7).
+    supervise::teardown_after(&args.sandbox_root, &username, tripped).await;
     result
 }
 
@@ -515,6 +535,11 @@ async fn pull_image(
 /// Tmpfs, rootfs, ruleset, egress proxy, jail (ADR-0021 decision 5, ADR-0025), then
 /// supervise until the deadline. No jail without the ruleset (ADR-0020 decision 5) or
 /// without the proxy (ADR-0025 decision 1), no ruleset without the rootfs.
+///
+/// With `traps` in `GET /v1/me` under `shadow` or `enforce` the claim's tripwire is armed
+/// before the proxy and the jail ([`arm`], ADR-0069): under `enforce` a failure to arm is
+/// returned before any jail starts; under `shadow` the claim runs unarmed. `tripped` is set
+/// once a trip has cut the sandbox uid off: the caller's teardown must then keep the table.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)] // one straight line of steps, each logged; splitting it would hide the order
 async fn serve_claim(
     args: &GuestArgs,
@@ -524,6 +549,7 @@ async fn serve_claim(
     reference: &mediatore_proto::image::ImageReference,
     uid: u32,
     gid: u32,
+    tripped: &mut bool,
 ) -> anyhow::Result<()> {
     let tmpfs = sandboxfs::Tmpfs {
         root: args.sandbox_root.clone(),
@@ -657,13 +683,33 @@ async fn serve_claim(
             args.egress_min_tls
         );
     }
-    let sha256 = net::load(&ruleset).await?;
+    // The claim's traps (ADR-0069), when the broker asks for them: the draw, the decoy ports in the ruleset, the planted
+    // home, the listeners and the trap socket, in `arm`'s order. With none asked, the ruleset is loaded as ever.
+    let arming = arm::requested(me.traps.as_ref()).map(|(mode, policy)| arm::Arming {
+        policy,
+        mode,
+        uid,
+        gid,
+        routes: &me.routes,
+        proxy_port: args.egress_proxy_port,
+        pull_port: args.egress_pull_port,
+        sandbox_root: &args.sandbox_root,
+        socket_dir: Path::new(mediatore_proto::trip::TRAP_SOCKET_DIR),
+        sink: Arc::new(trip::BrokerTripSink::new(client.clone())),
+    });
+    // What the log line below says of the ruleset is the claim's own: never how many decoys were drawn.
+    let destinations = ruleset.allow.len();
+    let mut loaded = arm::load(arming.as_ref(), ruleset).await?;
+    let (ruleset, sha256) = (loaded.ruleset.clone(), loaded.sha256.clone());
+    if let Some(mode) = loaded.mode() {
+        tracing::info!(claim_uid = %me.claim_uid, mode = mode.as_str(), "the claim's traps are armed (ADR-0069)");
+    }
     tracing::info!(
         claim_uid = %me.claim_uid,
         user = username,
         uid,
         shape = %ruleset.shape,
-        destinations = ruleset.allow.len(),
+        destinations,
         resolvers = ruleset.dns.len(),
         proxy_port = ruleset.proxy_port,
         ruleset_sha256 = %sha256,
@@ -672,14 +718,15 @@ async fn serve_claim(
     // The proxy before the jail: the workload's only route out must exist when its first
     // instruction runs (ADR-0025 decision 1). For a gateway-placed registry it is also the pull's route, so it starts
     // before the pull (ADR-0043 decision 3).
-    let mut proxy = egress::spawn(
-        &args.agent_binary,
-        &proxy_args,
-        uid,
-        gid,
-        std::time::Duration::from_secs(PROXY_READY_SECS),
-    )
-    .await?;
+    let mut proxy = loaded
+        .start_proxy(arm::ProxyStart {
+            binary: &args.agent_binary,
+            args: &proxy_args,
+            uid,
+            gid,
+            ready: std::time::Duration::from_secs(PROXY_READY_SECS),
+        })
+        .await?;
     tracing::info!(
         claim_uid = %me.claim_uid,
         pid = proxy.id(),
@@ -707,6 +754,7 @@ async fn serve_claim(
             Err(e) => {
                 let _ = proxy.start_kill();
                 let _ = proxy.wait().await;
+                *tripped = loaded.cause().is_some();
                 return Err(e);
             }
         }
@@ -740,6 +788,7 @@ async fn serve_claim(
         rlimit_as_mib: jail::DEFAULT_RLIMIT_AS_MIB,
         proxy_port: args.egress_proxy_port,
         phantom,
+        traps: loaded.jail_traps(),
     };
     // The workload's output, when the claim asked for it (ADR-0045 decision 1): tee'd,
     // redacted (the phantom and every other credential the jail was given, decision 2) and
@@ -758,12 +807,34 @@ async fn serve_claim(
         &mut proxy,
         me.workload.restart,
         shipping.as_ref().map(|(c, _)| c),
+        loaded.tripped(),
     )
     .await;
+    // From a trip on, the claim's table is the cut (ADR-0069 decision 7): the teardown keeps it. A trip is what ended
+    // the run whatever the supervision returned in the same instant (the deadline, the workload's own exit, the proxy):
+    // before anything is reported or torn down, a use still on its way and a cut still in `nft` are waited for
+    // (bounded), so a workload that takes a trap and exits at once is the tripped run (decision 12 of 2026-11-27).
+    let cause = loaded.settle().await;
+    *tripped = cause.is_some();
+    let ended_by_trip = cause.is_some();
+    if ended_by_trip && !matches!(result, Ok(supervise::Outcome::Tripped)) {
+        tracing::warn!(claim_uid = %me.claim_uid, "the run ended as a trap was used: it is the tripped run, no exit is reported (ADR-0069 decision 7)");
+    }
     // What is still queued goes before the exit is reported, bounded: the exit releases
-    // the claim and the broker drops a batch after it (ADR-0045 decision 8).
-    if let Some((_, shipping)) = shipping {
-        let flushed = shipping.flush(logs::FLUSH_TIMEOUT).await;
+    // the claim and the broker drops a batch after it (ADR-0045 decision 8). After a trip the last line names the
+    // trap (its kind and name, never a target or a value) and the flush has two seconds (ADR-0069 decision 7 step 4).
+    if let Some((capture, shipping)) = shipping {
+        let mut within = logs::FLUSH_TIMEOUT;
+        if let Some(cause) = &cause {
+            capture
+                .read_stream(
+                    cause.final_line().as_bytes(),
+                    mediatore_proto::LogStream::Stderr,
+                )
+                .await;
+            within = trip::FINAL_FLUSH;
+        }
+        let flushed = shipping.flush(within).await;
         tracing::info!(claim_uid = %me.claim_uid, flushed, "workload output flushed");
     }
     // The proxy ends with the claim, whichever way it ended.
@@ -771,9 +842,29 @@ async fn serve_claim(
         tracing::debug!(error = %e, "egress proxy already gone");
     }
     let _ = proxy.wait().await;
+    if ended_by_trip {
+        // No exit is reported for a tripped run: the trip report ends the claim (ADR-0069 decision 9). It is retried
+        // until the broker has it or refuses it for good, for at most `REPORT_WAIT`; the cut and the kill are done and
+        // wait on nothing, and the teardown keeps the cut and the user either way.
+        if loaded.reported_within(trip::REPORT_WAIT).await {
+            tracing::warn!(claim_uid = %me.claim_uid, "the run was ended by a tripwire and the broker was told (ADR-0069)");
+        } else {
+            tracing::error!(
+                claim_uid = %me.claim_uid,
+                waited_secs = trip::REPORT_WAIT.as_secs(),
+                "the run was ended by a tripwire and the broker did not acknowledge the report in time: the teardown goes ahead, the cut and the user stay, and the claim ends at its deadline if the report never arrives"
+            );
+        }
+    } else if loaded.is_armed() {
+        // Uses that ended nothing (`would_trip`, `reported`) are not lost with the claim.
+        let flushed = loaded.flush().await;
+        tracing::info!(claim_uid = %me.claim_uid, flushed, "pending tripwire events flushed");
+    }
     // A workload done by its restart policy: the broker ends the claim (ADR-0033
     // decision 2). Said once, bounded; the deadline still bounds the claim if unheard.
-    if let Ok(supervise::Outcome::WorkloadDone { status, restarts }) = &result {
+    if let (false, Ok(supervise::Outcome::WorkloadDone { status, restarts })) =
+        (ended_by_trip, &result)
+    {
         use std::os::unix::process::ExitStatusExt as _;
         let exit = mediatore_proto::GuestExit {
             code: status.code(),
@@ -1004,6 +1095,7 @@ mod tests {
     fn with_gateways_every_pull_goes_through_the_proxy_and_one_with_no_route_is_refused() {
         // ADR-0063 decision 1: there is no path around the gateway, the pull included.
         let mirror = mediatore_proto::Route {
+            traps_body: mediatore_proto::trip::TrapsBody::Match,
             audience: Some("mirror".into()),
             endpoint: "mirror.home.example:443".parse().unwrap(),
             rules: vec![],

@@ -1,0 +1,16 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+
+[Unit]
+Description=Read the gateway's host-table drop counters every half minute (ADR-0070 decision 4)
+ConditionPathExists=|/run/cos/active_mode
+ConditionPathExists=|/run/cos/passive_mode
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=30s
+AccuracySec=1s
+Unit=mediatore-gateway-probes.service
+
+[Install]
+WantedBy=timers.target

@@ -50,6 +50,26 @@ down: there is no partial-trust mode.
 | supervise | `supervise.rs` | run the workload until the claim's deadline, restart it as its restart policy says, end the claim when the proxy goes, and post the exit when the workload is done by its policy (`POST /v1/me/exit`). With the opt-in (`workload.logs`, ADR-0045) the jail's stdout and stderr are pipes the guest reads |
 | the output | `logs.rs`, `redact.rs` | when the claim opted in: each line redacted in the VM (the phantom and every secret-bearing environment value, literally and encoded; JWTs, `Authorization` values and private keys by shape; best effort), written through to the console, queued (1 MiB, drop-oldest, the loss counted) and shipped to `POST /v1/me/logs` over the node SVID on the leading edge (at once after a quiet half second, otherwise every half second, or at 32 KiB), never blocking the workload; a line ends at a newline or a bare carriage return, and one that has not ended after 150 ms of silence is shipped as a `partial` record, less the end the redactor holds back; flushed, five seconds at most, before the exit is posted
 
+### Under tripwires (ADR-0069)
+
+When `GET /v1/me` carries `traps` with the mode `shadow` or `enforce` (`arm.rs`), the guest arms the claim before the jail,
+in this order: the draw (`draw.rs`, from the OS's random source, the claim's routes, ports and variables reserved), the
+ruleset with the decoys (`Ruleset::with_decoys`), the home planted on the claim's tmpfs (`sandboxfs::plant_home`), the
+tripwire (`trip::start`), the table loaded so that the sandbox uid's connections to the decoy ports (and to the metadata
+address, when drawn) are redirected to one trap listener on a port drawn per claim and no other uid reaches either, the
+trap listener (`decoy.rs`), which names the decoy from the connection's original destination, the trap socket (`/run/mediatore-guest/trap/trap.sock`, admitting the sandbox uid alone), the proxy started with
+`--trap-socket` and waited on until it says `armed`, and the reader of what the chain dropped. Under `enforce` any failure
+there is an error before the jail; under `shadow` the claim runs unarmed. Under `off`, or with no `traps`, none of it
+happens and the ruleset, the jail's arguments and the proxy's are byte for byte what they were.
+
+A trip ends the supervision with `Outcome::Tripped` ahead of anything else: the guest tells the proxy (which then answers
+`403 trap` to everything), cuts the sandbox uid's network with one `nft` transaction (`trip::drop_all_ruleset`), kills
+every process of the uid, flushes the output with a final line, reports `POST /v1/me/trip` and waits at most 120 s for
+the broker's acknowledgement (`trip::REPORT_WAIT`), and sends no exit. Under `enforce`, a run that ends for any other
+reason is held `trip::SETTLE` (600 ms) for a trip still on its way, and one found then takes the same path. The teardown then keeps the cut table and the
+user (`teardown_after`). After registration the guest also reads the pool's host table every 60 s and reports what it
+dropped as `segment` events (`segment.rs`, ADR-0070). See [Tripwires](../guides/tripwires.md).
+
 **The order is the point.** There is no jail without the ruleset (ADR-0020 decision 5), no ruleset without the rootfs
 layout, and no workload before its only route out, the proxy, exists (ADR-0025 decision 1).
 
@@ -83,9 +103,12 @@ be zero. A registry that stalls no longer holds a claim until its TTL.
 The workload runs as the sandbox user in a PID namespace of its own, with `/proc` showing only its own processes
 (ADR-0036), a root filesystem that is the pulled image on the tmpfs, the pinned binary mounted read-only, no Workload
 API socket and no route to the broker. Landlock, applied by `jail-exec` before the workload runs, bounds what it may
-write and which TCP ports it may connect to: **only the proxy's port** (a refusal ends the claim). The environment it
+write and which TCP ports it may connect to: **only the proxy's port** (a refusal ends the claim); under tripwires also the drawn decoy ports, and 80 with the metadata
+decoy. The environment it
 gets carries `MEDIATORE_EGRESS_PROXY` (the proxy's base URL) and `MEDIATORE_TOKEN` (the phantom token, 256 random bits
-that mean nothing anywhere but at this proxy during this claim). It holds no credential.
+that mean nothing anywhere but at this proxy during this claim). It holds no credential. Under tripwires it also
+gets the decoy routes' variables and bait values, and its home is a bind mount of a directory the guest planted, which
+persists across the workload's restarts within the claim (under `off` the home is a fresh tmpfs at each start).
 
 Two firewalls bound the VM. The **claim's table** (above) binds the sandbox uid. The **host table**
 (`image/host-table`) binds the VM: output is default-drop, admitting only the gateways and the relay legs, no registry for
@@ -113,4 +136,4 @@ It loads before the network, and `image/host-quiet` then masks for the boot the 
 
 ADR-0014 (one binary), ADR-0019 (`GuestReady`), ADR-0020 (the jail's network), ADR-0021 (the filesystem and the
 pull), ADR-0023 (the VM image), ADR-0024 (Landlock), ADR-0029 (the pull on a routeless segment), ADR-0033 (the restart
-policy), ADR-0036 (`/proc`), ADR-0038 (the registry leg, removed by ADR-0063), ADR-0043 and ADR-0063 (the pull through the proxy). Threat model TB-6, TB-11, TB-12, TB-15. Roadmap 06.
+policy), ADR-0036 (`/proc`), ADR-0069 and ADR-0070 (tripwires), ADR-0038 (the registry leg, removed by ADR-0063), ADR-0043 and ADR-0063 (the pull through the proxy). Threat model TB-6, TB-11, TB-12, TB-15. Roadmap 06.

@@ -79,6 +79,18 @@ The name is attribution, not authentication: every gateway's authorizer has the 
 decision's path: a decision is queued without waiting, a full queue (1024) drops and counts it, and a failed batch is
 dropped, logged once per run of failures. The gateway's own decision line stays the complete record.
 
+### What the host table dropped (ADR-0070)
+
+The gateway's host table counts by name what it drops and no honest machine sends: `gateway_port` (a new TCP connection
+from the sandbox interface to a port the gateway does not serve, its source and port kept in the set `probe_sources`) and
+one `gateway_output_*` counter on each dropping rule of the output chains. A fifth user, `mediatore-probes`, runs
+`mediatore gateway-probes` every 30 s (`mediatore-gateway-probes.service` and `.timer`): a oneshot with `CAP_NET_ADMIN`
+alone, no socket family but netlink, that reads and zeroes the counters with `nft reset` and writes `summary.json` in
+`/run/mediatore-gateway/probes` (`2750`, group `mediatore-gateway`). The authorizer reads it (`--probes-dir`), can neither
+write nor delete it, and sends at most 64 probes on its next batch. The broker writes one `gateway probe` line each and
+acts on none: a dropped SYN proves nothing about its sender, and the report is the word of whoever holds the authorizer's
+identity. See [Tripwires](../guides/tripwires.md#the-gateways-and-the-pools-probes).
+
 ## The two sockets
 
 The authorizer serves the data plane and the inject Envoy on **two unix sockets in two directories**, never one:
@@ -104,7 +116,7 @@ so the hardening stays on. (Found on the first live roll of the inject path, fix
 | Path | What |
 | --- | --- |
 | `envoy/gateway.yaml.in`, `relay.yaml.in`, `inject.yaml.in` | the three Envoy bootstrap templates |
-| `systemd/` | the units, each its own user, no capability and a read-only root |
+| `systemd/` | the units, each its own user, no capability and a read-only root, but `mediatore-gateway-probes.service`, which holds `CAP_NET_ADMIN` alone (ADR-0070) |
 | `nftables.conf.in`, `network.in` | the gateway's own firewall: the sandbox filter, with a per-source connection cap, and the two interfaces |
 | `render` | fills a template's placeholders from the env file; it refuses one left unfilled or a value that holds its delimiter |
 | `env.example`, `env.inject.example`, `vm.env.example` | the settings, including `INJECT_HOST`, `INJECT_UPSTREAM_PORT` and `INJECT_DOMAIN` (the one upstream the inject Envoy may originate to; a second is a reviewed change to the template, never a parameter) and `INJECT_PORT` |
@@ -133,4 +145,4 @@ Settings that must agree across the repository and the deployment: the broker's 
 ## Read next
 
 ADR-0027 (the control relay), ADR-0028 (the gateway), ADR-0030, ADR-0037 (the bundle leg), ADR-0038 (the registry leg, removed by ADR-0063),
-ADR-0040 (placing a credential). Threat model TB-13 to TB-15 and TB-17, risks R-27 to R-29. Roadmaps 10 and 11.
+ADR-0040 (placing a credential), ADR-0062 (the decisions), ADR-0070 (the probes). Threat model TB-13 to TB-15 and TB-17, risks R-27 to R-29. Roadmaps 10 and 11.

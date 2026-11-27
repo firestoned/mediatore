@@ -89,6 +89,7 @@ fn state_in(
     )
     .expect("sts");
     Arc::new(AppState {
+        tripwires: mediatore_api::Tripwires::default(),
         inject: std::collections::BTreeMap::new(),
         inject_port: None,
         audience_catalog: None,
@@ -586,6 +587,239 @@ async fn decisions_are_taken_from_the_authorizer_alone_and_a_bad_batch_is_refuse
     }
 }
 
+/// The authorizer's own reporter, sending to the real listener and keeping what it sent and
+/// what the broker said.
+struct Watched {
+    broker: Broker,
+    sent: std::sync::Mutex<Vec<(mediatore_proto::GatewayDecisions, bool)>>,
+}
+
+#[async_trait::async_trait]
+impl mediatore_gateway::report::Reports for Watched {
+    async fn report(
+        &self,
+        batch: &mediatore_proto::GatewayDecisions,
+    ) -> Result<(), mediatore_gateway::broker::AskError> {
+        let said = mediatore_gateway::report::Reports::report(&self.broker, batch).await;
+        self.sent
+            .lock()
+            .expect("lock")
+            .push((batch.clone(), said.is_ok()));
+        said
+    }
+}
+
+impl Watched {
+    /// The batches sent so far, once `enough` says so.
+    async fn wait(
+        &self,
+        enough: impl Fn(&[(mediatore_proto::GatewayDecisions, bool)]) -> bool,
+    ) -> Vec<(mediatore_proto::GatewayDecisions, bool)> {
+        for _ in 0..300 {
+            let got = self.sent.lock().expect("lock").clone();
+            if enough(&got) {
+                return got;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        self.sent.lock().expect("lock").clone()
+    }
+}
+
+/// The authorizer's reporter as `mediatore gateway` runs it, with a probes directory: sending
+/// to the real listener under the authorizer's SVID, every 20 ms.
+fn probes_reporter(
+    h: &Harness,
+) -> (
+    Arc<Watched>,
+    mediatore_gateway::report::Reporter,
+    std::path::PathBuf,
+) {
+    let broker = Broker::with_material(
+        &h.sandbox_url,
+        MemoryMaterial::new(h.ca.svid(&authorizer_svid())),
+    )
+    .expect("broker client");
+    let watched = Arc::new(Watched {
+        broker,
+        sent: std::sync::Mutex::new(Vec::new()),
+    });
+    let dir = mediatore_testkit::tempdir();
+    let (reporter, _task) = mediatore_gateway::report::Reporter::spawn(
+        "gateway-02".into(),
+        watched.clone(),
+        Duration::from_millis(20),
+        Some(mediatore_gateway::probes::Inbox::open(&dir)),
+    );
+    (watched, reporter, dir)
+}
+
+/// When the probes of these tests were read.
+fn probed_at() -> jiff::Timestamp {
+    "2026-11-27T10:00:00Z".parse().expect("timestamp")
+}
+
+fn probe(
+    class: mediatore_proto::trip::TripClass,
+    count: u64,
+) -> mediatore_proto::trip::GatewayProbe {
+    mediatore_proto::trip::GatewayProbe {
+        at: probed_at(),
+        class,
+        count,
+        port: None,
+        source_address: None,
+        user: None,
+    }
+}
+
+/// Leave `probes` where the probes reader would.
+fn leave_summary(dir: &std::path::Path, probes: &[mediatore_proto::trip::GatewayProbe]) {
+    let summary = mediatore_gateway::probes::Summary {
+        at: probed_at(),
+        probes: probes.to_vec(),
+    };
+    mediatore_gateway::probes::write_summary(dir, &summary).expect("summary");
+}
+
+/// A deny the authorizer would report for `uid`.
+fn denied(uid: uuid::Uuid) -> mediatore_proto::GatewayDecision {
+    mediatore_proto::GatewayDecision {
+        at: probed_at(),
+        claim_uid: uid,
+        kind: mediatore_proto::DecisionKind::Tunnel,
+        authority: "elsewhere.example:443".into(),
+        audience: None,
+        verdict: mediatore_proto::DecisionVerdict::Deny,
+        reason: Some("not_allowed".into()),
+        served: Some("cache".into()),
+    }
+}
+
+/// ADR-0070 decisions 4 and 8, the gateway's half over the real listener: the summary the
+/// probes reader leaves is carried by the authorizer's next batch of decisions, once, under
+/// the authorizer's own SVID, and the broker takes it (`204`). A batch of probes alone is
+/// taken too. What the broker then does with a probe (one `warn` line each) is its own test,
+/// in `mediatore-api`.
+#[tokio::test]
+async fn a_gateways_probes_reach_the_broker_in_its_batch() {
+    use mediatore_proto::trip::{GatewayProbe, TripClass};
+
+    let h = Harness::start(&authorizer_svid(), CacheConfig::default(), None).await;
+    let (_, claim) = h.bound_claim().await;
+    let uid = claim.uid.expect("uid");
+    let (watched, reporter, dir) = probes_reporter(&h);
+    let probes = vec![
+        GatewayProbe {
+            user: Some("envoy-relay".into()),
+            ..probe(TripClass::GatewayOutput, 1)
+        },
+        GatewayProbe {
+            port: Some(2375),
+            source_address: Some("198.51.100.9".into()),
+            ..probe(TripClass::GatewayPort, 2)
+        },
+        probe(TripClass::GatewayPort, 7),
+    ];
+
+    // A summary and a decision: one batch carries both, and the broker takes it.
+    leave_summary(&dir, &probes);
+    reporter.note(denied(uid));
+    let got = watched
+        .wait(|sent| sent.iter().any(|(b, _)| !b.probes.is_empty()))
+        .await;
+    let with: Vec<_> = got.iter().filter(|(b, _)| !b.probes.is_empty()).collect();
+    assert_eq!(with.len(), 1, "one batch carries the summary");
+    assert!(with[0].1, "the broker took the batch");
+    assert_eq!(with[0].0.probes, probes);
+    assert_eq!(
+        serde_json::to_value(&with[0].0).expect("json")["probes"],
+        serde_json::json!([
+            { "at": "2026-11-27T10:00:00Z", "class": "gateway_output", "count": 1, "user": "envoy-relay" },
+            { "at": "2026-11-27T10:00:00Z", "class": "gateway_port", "count": 2, "port": 2375,
+              "source_address": "198.51.100.9" },
+            { "at": "2026-11-27T10:00:00Z", "class": "gateway_port", "count": 7 }
+        ]),
+        "the probes on the wire"
+    );
+    // The same body by hand: the status is 204, as for decisions alone; and from anyone but
+    // the authorizer it is refused, as decisions are.
+    let url = format!("{}/v1/gateway/decisions", h.sandbox_url);
+    let post = |peer: String| {
+        let request = h.mtls_as(&peer).post(&url).json(&with[0].0);
+        async move { request.send().await.expect("report").status() }
+    };
+    assert_eq!(post(authorizer_svid()).await, 204);
+    for peer in [claim_svid(&uid), node_svid()] {
+        assert_eq!(post(peer).await, 403, "a peer that is not the authorizer");
+    }
+
+    // Reported once: later batches carry no probe, with the file still in place.
+    let before = got.len();
+    reporter.note(denied(uid));
+    let got = watched.wait(|sent| sent.len() > before).await;
+    assert!(got.len() > before, "a later batch was sent");
+    assert_eq!(
+        got.iter().map(|(b, _)| b.probes.len()).sum::<usize>(),
+        probes.len()
+    );
+
+    // Probes alone are still a batch, and still taken.
+    let before = got.len();
+    leave_summary(&dir, &probes[..1]);
+    let got = watched.wait(|sent| sent.len() > before).await;
+    assert_eq!(got.len(), before + 1);
+    let (alone, took) = &got[before];
+    assert!(alone.decisions.is_empty() && alone.probes.len() == 1 && *took);
+}
+
+/// The broker refuses a batch whole when one probe in it is off (`400`), so the authorizer
+/// drops a summary that would fail that check before it can cost the decisions beside it: the
+/// decision is still reported and taken, and nothing of the summary is.
+#[tokio::test]
+async fn a_summary_the_broker_would_refuse_costs_the_decisions_nothing() {
+    use mediatore_proto::trip::{MAX_GATEWAY_PROBES, TripClass};
+
+    let h = Harness::start(&authorizer_svid(), CacheConfig::default(), None).await;
+    let (_, claim) = h.bound_claim().await;
+    let uid = claim.uid.expect("uid");
+    let (watched, reporter, dir) = probes_reporter(&h);
+
+    // A class no gateway decides.
+    leave_summary(&dir, &[probe(TripClass::PoolInbound, 1)]);
+    reporter.note(denied(uid));
+    let got = watched.wait(|sent| !sent.is_empty()).await;
+    assert_eq!(got.len(), 1);
+    let (kept, took) = &got[0];
+    assert!(kept.decisions.len() == 1 && kept.probes.is_empty() && *took);
+
+    // What the gateway's own check spared that batch: sent as it was, the broker refuses it.
+    let mut off_class = serde_json::to_value(kept).expect("json");
+    off_class["probes"] =
+        serde_json::json!([{ "at": "2026-11-27T10:00:00Z", "class": "pool_inbound", "count": 1 }]);
+    let mut too_many = serde_json::to_value(kept).expect("json");
+    too_many["probes"] = serde_json::Value::Array(vec![
+        serde_json::json!({ "at": "2026-11-27T10:00:00Z", "class": "gateway_port", "count": 1 });
+        MAX_GATEWAY_PROBES + 1
+    ]);
+    let authorizer = h.mtls_as(&authorizer_svid());
+    let url = format!("{}/v1/gateway/decisions", h.sandbox_url);
+    for (why, body) in [
+        ("a class no gateway decides", off_class),
+        ("more than 64 probes", too_many),
+    ] {
+        let refused = authorizer
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .expect("report");
+        assert_eq!(refused.status(), 400, "{why}");
+        let body: serde_json::Value = refused.json().await.expect("error body");
+        assert_eq!(body["error"], "invalid_decisions", "{why}");
+    }
+}
+
 /// The dev transport: the gateway identity as a header against a loopback `dev_mode`
 /// broker, which is what the dev loop runs.
 #[cfg(feature = "dev")]
@@ -1063,4 +1297,258 @@ async fn under_enforce_a_claim_naming_a_policy_outside_its_sources_is_400_and_pa
         h.store.list_claims().await.expect("list").is_empty(),
         "nothing was written for the refused request"
     );
+}
+
+// ---------- ADR-0070 at the broker: what it does with a probe, and with a handshake ----------
+
+/// ADR-0070 decisions 5, 8 and 9, the broker's half over the real listener: each probe of a
+/// batch the authorizer's reporter sent is one `warn` line with the class, the gateway, the
+/// count, the port, and the source or the user, and with nothing else; no claim is touched.
+#[tokio::test]
+async fn the_broker_writes_one_line_a_probe_naming_only_what_a_probe_is() {
+    use crate::e2e_dev::logs;
+    use mediatore_proto::trip::{GatewayProbe, TripClass};
+
+    logs::capture();
+    let h = Harness::start(&authorizer_svid(), CacheConfig::default(), None).await;
+    let (user, claim) = h.bound_claim().await;
+    let (watched, _reporter, dir) = probes_reporter(&h);
+    let probes = vec![
+        GatewayProbe {
+            port: Some(2375),
+            source_address: Some("198.51.100.9".into()),
+            ..probe(TripClass::GatewayPort, 2)
+        },
+        GatewayProbe {
+            user: Some("envoy-relay".into()),
+            ..probe(TripClass::GatewayOutput, 1)
+        },
+        // The remainder of a full set, and a chain with no user: a class and a count.
+        probe(TripClass::GatewayPort, 7),
+        probe(TripClass::GatewayOutput, 3),
+    ];
+    leave_summary(&dir, &probes);
+    let got = watched
+        .wait(|sent| sent.iter().any(|(b, _)| !b.probes.is_empty()))
+        .await;
+    assert!(got.iter().any(|(b, took)| !b.probes.is_empty() && *took));
+
+    let lines = logs::captured();
+    let written: Vec<&str> = lines
+        .lines()
+        .filter(|l| l.contains("gateway probe"))
+        .collect();
+    assert_eq!(written.len(), probes.len(), "one line a probe");
+    for (line, want) in written.iter().zip([
+        vec![
+            "class=\"gateway_port\"",
+            "count=2",
+            "port=2375",
+            "source_address=\"198.51.100.9\"",
+            "user=\"\"",
+        ],
+        vec![
+            "class=\"gateway_output\"",
+            "count=1",
+            "user=\"envoy-relay\"",
+            "source_address=\"\"",
+        ],
+        vec!["class=\"gateway_port\"", "count=7", "source_address=\"\""],
+        vec!["class=\"gateway_output\"", "count=3", "user=\"\""],
+    ]) {
+        assert!(line.contains(" WARN "), "a probe is said at warn");
+        for part in want
+            .into_iter()
+            .chain(["kind=\"segment\"", "gateway=gateway-02"])
+        {
+            assert!(line.contains(part), "{part} in a probe's line");
+        }
+        // The fields of the line are these and no other: nothing else a peer chose has a
+        // place in it.
+        let fields = line.split("gateway probe").nth(1).expect("the fields");
+        let mut keys: Vec<&str> = fields
+            .split_whitespace()
+            .filter_map(|pair| pair.split_once('=').map(|(key, _)| key))
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "at",
+                "class",
+                "count",
+                "gateway",
+                "kind",
+                "port",
+                "source_address",
+                "user"
+            ]
+        );
+    }
+
+    // A probe is on no claim: the owner reads no trip and no summary, and the claim lives.
+    let held: ClaimResponse = h
+        .http
+        .get(format!("{}/v1/claims/{}", h.user_url, claim.name))
+        .bearer_auth(&user)
+        .send()
+        .await
+        .expect("get claim")
+        .json()
+        .await
+        .expect("claim body");
+    assert!(held.tripped.is_none() && held.tripwires.is_none());
+    assert_eq!(held.phase, mediatore_proto::ClaimPhase::Bound);
+}
+
+/// ADR-0070 decision 9 for the probes: a probe with a field of its own, or a value outside its
+/// grammar, is refused with the whole batch, and none of it reaches a line of the broker.
+#[tokio::test]
+async fn a_probe_that_is_off_is_refused_with_its_batch_and_none_of_it_is_logged() {
+    use crate::e2e_dev::logs;
+    use mediatore_proto::trip::{GatewayProbe, TripClass};
+
+    let h = Harness::start(&authorizer_svid(), CacheConfig::default(), None).await;
+    let probes = vec![
+        GatewayProbe {
+            port: Some(2375),
+            source_address: Some("198.51.100.9".into()),
+            ..probe(TripClass::GatewayPort, 2)
+        },
+        GatewayProbe {
+            user: Some("envoy-relay".into()),
+            ..probe(TripClass::GatewayOutput, 1)
+        },
+    ];
+    let url = format!("{}/v1/gateway/decisions", h.sandbox_url);
+    let good = serde_json::to_value(mediatore_proto::GatewayDecisions {
+        gateway: "gateway-02".into(),
+        decisions: vec![],
+        probes: probes.clone(),
+    })
+    .expect("json");
+    let mut with_a_path = good.clone();
+    with_a_path["probes"][0]["path"] = "/canary-path-0c4e".into();
+    let mut odd_user = good.clone();
+    odd_user["probes"][1]["user"] = "canary user/0c4e".into();
+    let mut odd_source = good.clone();
+    odd_source["probes"][0]["source_address"] = "canary-host-0c4e.example".into();
+    let mut odd_gateway = good.clone();
+    odd_gateway["gateway"] = "Canary Gateway 0c4e".into();
+    logs::capture();
+    for body in [with_a_path, odd_user, odd_source, odd_gateway] {
+        let resp = h
+            .mtls_as(&authorizer_svid())
+            .post(&url)
+            .header("x-canary", "canary-header-0c4e")
+            .json(&body)
+            .send()
+            .await
+            .expect("report");
+        assert!(resp.status().is_client_error());
+    }
+    let lines = logs::captured();
+    assert!(!lines.contains("gateway probe"), "refused whole");
+    assert!(
+        !lines
+            .lines()
+            .filter(|l| !l.contains(" reqwest::") && !l.contains(" hyper_util::client::"))
+            .any(|l| l.to_ascii_lowercase().contains("0c4e")),
+        "nothing of a refused batch is in a line of the broker"
+    );
+    // The good batch is taken, so the refusals above were of what was off and nothing else.
+    let resp = h
+        .mtls_as(&authorizer_svid())
+        .post(&url)
+        .json(&good)
+        .send()
+        .await
+        .expect("report");
+    assert_eq!(resp.status(), 204);
+    assert!(logs::captured().contains("gateway probe"));
+}
+
+/// ADR-0070 decision 3, `identity_shape`, over a real handshake: a valid SVID of the trust
+/// domain that is none of the admitted shapes is refused as before and counted; one a
+/// foreign authority signed never reaches the count; an admitted identity is not counted.
+#[tokio::test]
+async fn a_handshake_under_an_identity_of_no_admitted_shape_is_refused_and_counted() {
+    use crate::e2e_dev::logs;
+    use mediatore_proto::trip::TripClass;
+
+    logs::capture();
+    mediatore_proto::tls::ensure_provider();
+    let ca = TestCa::new(TRUST_DOMAIN);
+    let idp = FakeIdp::start().await;
+    let st = state(&idp, None);
+    let sandbox = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind sandbox");
+    let url = format!("https://{}/healthz", sandbox.local_addr().expect("addr"));
+    let configs = TlsConfigs::spawn(
+        MemoryMaterial::new(ca.svid(&broker_id().to_string())),
+        mediatore_api::sandbox_authorizer_classified(
+            st.naming.clone(),
+            false,
+            st.tripwires.fold.clone(),
+        ),
+    )
+    .expect("tls configs");
+    tokio::spawn(mediatore_tls::serve(
+        sandbox,
+        configs,
+        mediatore_api::sandbox_router(st.clone()),
+        std::future::pending(),
+    ));
+    let ask = |material: mediatore_tls::Material| {
+        let cfg = mediatore_tls::client_config(&material, &broker_id()).expect("client config");
+        let client = reqwest::Client::builder()
+            .tls_backend_preconfigured(cfg)
+            .build()
+            .expect("client");
+        let url = url.clone();
+        async move { client.get(url).send().await.map(|r| r.status().as_u16()) }
+    };
+
+    assert_eq!(ask(ca.svid(&authorizer_svid())).await.ok(), Some(200));
+    assert_eq!(ask(ca.svid(&node_svid())).await.ok(), Some(200));
+    let other_broker = format!("spiffe://{TRUST_DOMAIN}/mediatore-two");
+    let strangers = [gateway_svid(), other_broker];
+    for stranger in &strangers {
+        assert!(
+            ask(ca.svid(stranger)).await.is_err(),
+            "refused at the handshake, as before"
+        );
+    }
+    // The same name from another authority: the chain does not verify, so it is no
+    // identity of this trust domain and no class.
+    let forged = TestCa::new(TRUST_DOMAIN).svid(&format!("spiffe://{TRUST_DOMAIN}/forged"));
+    let trusted_broker = mediatore_tls::Material {
+        roots: ca.svid(&authorizer_svid()).roots,
+        ..forged
+    };
+    assert!(ask(trusted_broker).await.is_err());
+
+    mediatore_api::flush_classified(&st).await;
+    let lines = logs::captured();
+    let counted: Vec<&str> = lines
+        .lines()
+        .filter(|l| l.contains("a refusal no honest build earns"))
+        .collect();
+    assert_eq!(counted.len(), strangers.len(), "one line an identity");
+    for stranger in &strangers {
+        let line = counted
+            .iter()
+            .find(|l| l.contains(&format!("peer={stranger} ")))
+            .expect("a line for the identity");
+        for part in [
+            format!("class=\"{}\"", TripClass::IdentityShape.as_str()),
+            "scope=\"none\"".to_owned(),
+            "action=\"report\"".to_owned(),
+            "route=\"(handshake)\"".to_owned(),
+        ] {
+            assert!(line.contains(&part), "{part} in the line");
+        }
+    }
+    assert!(!lines.contains("/forged"));
 }

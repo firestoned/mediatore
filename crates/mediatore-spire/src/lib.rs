@@ -859,7 +859,12 @@ mod tests {
         let node = gated.ensure_node_entry(&tpm()).await.unwrap();
         let claim = Uuid::new_v4();
         let entry = gated
-            .create_claim_entry(&identity(&tpm()), claim, "sb-0123456789ab", Duration::from_hours(1))
+            .create_claim_entry(
+                &identity(&tpm()),
+                claim,
+                "sb-0123456789ab",
+                Duration::from_hours(1),
+            )
             .await
             .unwrap();
 

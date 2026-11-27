@@ -142,7 +142,7 @@ Suites today:
 | `make kind-e2e-entries` | 0006 | the live entries round trip above |
 | `make kind-e2e-mtls` | 0007 | the broker image on the CSI socket, agent-issued client SVIDs over SPIFFE mTLS, below |
 | `make kind-e2e-watcher` | 0011 | the watcher Lease, a member's certificate becoming a node entry, a claim without a record binding nothing, below |
-| `make kind-e2e-sandbox` | 0008, 0034, 0072 | the `AgentSandbox` CRD and its subject policy (with `issuerPrefixes` set: an unlisted issuer and an unsound list refused; the broker's `mediatore.io/front-door` mark refused to anybody else and immutable; a listed broker's sandbox at an undeclared issuer `Failed` by the reconciler), a sandbox becoming an owned claim and a record on its own status, the claim bound end to end to a claim entry and the guest fetching the subject, a broker restart on the Kubernetes store with the sandbox staying `Ready`, deletion through the finalizer, the released sandbox held and then swept at resync, below |
+| `make kind-e2e-sandbox` | 0008, 0034, 0069, 0072 | the `AgentSandbox` CRD and its subject policy (with `issuerPrefixes` set: an unlisted issuer and an unsound list refused; the broker's `mediatore.io/front-door` mark refused to anybody else and immutable; a listed broker's sandbox at an undeclared issuer `Failed` by the reconciler), a sandbox becoming an owned claim and a record on its own status, the claim bound end to end to a claim entry and the guest fetching the subject, a broker restart on the Kubernetes store with the sandbox staying `Ready`, deletion through the finalizer, the released sandbox held and then swept at resync; since ADR-0069 `status.tripwires` in both served versions and a tripped record failing its sandbox with `Tripped=True`, never claimed again, below |
 | `make kind-e2e-dex` | 0013, 0073, 0074 | the real CLI logging in at a real Dex from inside the cluster and delegating the session, a refresh at Dex before every issue, the minted `groups` behind `dex:`, a two-namespace map admitting the Dex group in the namespace that lists Dex and refusing it in the one that lists the other issuer, the claim released when the user leaves the gated group in the directory and when the refresh token is deleted at Dex, below |
 | `make kind-e2e-policy` | 0026 | notaio installed from its release manifests and signing with the kind OpenBao, its bundle admitted by the broker and recorded on each claim, the `PolicyConformant` verdicts and codes on four sandboxes, a newer bundle followed, the earlier one delivered again refused by the version floor before and after a broker restart, nothing refused on the bundle's account, below |
 | `make kind-e2e-gateway` | 0028 | the real egress proxy tunnelling a claim's requests through a real Envoy on the gateway SVID to its one destination and nothing else, the authorizer's cache through a broker outage, the cut-off on release, below |
@@ -250,7 +250,8 @@ MEDIATORE_NFT='sudo /usr/sbin/nft' cargo test -p mediatore-guest net:: -- --incl
 ```
 
 Run it on the build host whenever `net.rs` changes; it hands `nft -c` both shapes, the
-direct one and the gateway one ([ADR-0028](../adr/0028-egress-gateway-envoy-with-spiffe-identity.md)
+direct one and the gateway one, the table with a tripwire draw on it (the decoys, the `denied` sets and the metadata
+redirect, ADR-0069) and the cut a trip loads, ([ADR-0028](../adr/0028-egress-gateway-envoy-with-spiffe-identity.md)
 decision 6: the relay, the gateways and the proxy by address, no DNS). The gateway host's
 own table (`image/gateway/nftables.conf.in`, [ADR-0027](../adr/0027-control-plane-relay-on-the-egress-gateway.md)
 decision 5) is checked the same way, rendered from the examples:
@@ -322,6 +323,61 @@ cargo test -p mediatore --test jail_exec_live -- --include-ignored
 
 Run it on the build host whenever `confine.rs` or `jail.rs` changes. The kind tiers run the
 guest with `--dev-skip-setup` and start no jail.
+
+### Tripwires: by hand, on the build host
+
+ADR-0069's traps are proven in `make check` against fakes: the draw, the matcher, the proxy's refusals
+(`crates/mediatore/tests/e2e_egress.rs`), containment against a fake `nft` and a broker that never answers
+(`crates/mediatore-guest/src/trip.rs`), the route, the record and the summary (`crates/mediatore/tests/e2e_dev.rs`,
+`crates/mediatore-api`). ADR-0070's classes are proven the same way (`crates/mediatore-api/src/classify.rs`, the
+claim-scoped classes at both values in `e2e_dev.rs`, the gateway's probes over the real listener in `e2e_gateway.rs`).
+What the kernel does is the question nine ignored tests in `crates/mediatore/tests/jail_exec_live.rs` answer: a real
+jail (`nsjail`, `jail-exec`, Landlock and seccomp) beside a claim's armed tripwire, with the real draw, the real ruleset
+loaded by the real `nft` (the decoy ports redirected to the trap listener), the real trap listener, the real cut and the
+real kill. A process of the sandbox uid that
+answers `armed` on the trap socket stands in for the proxy (the real one needs a claim SVID), and a recorder, or nothing,
+for the broker.
+
+They load a table and cut a uid off, so they refuse to run in the machine's own network or mount namespace: each test
+asserts it is root **and** that its namespaces differ from pid 1's, or panics. Run them as root inside throwaway ones,
+with a scratch directory on a mount of that namespace and `nsjail`, `nft`, `useradd` and `python3` on `PATH`:
+
+```sh
+cargo test -p mediatore --test jail_exec_live --no-run
+sudo unshare --net --mount sh -c '
+  mount -t tmpfs tmpfs /mnt &&
+  MEDIATORE_LIVE_ROOT=/mnt PATH=<dir of nsjail>:/usr/sbin:/usr/bin \
+    <the test binary> --ignored --test-threads=1 --nocapture --skip jail_exec_confines'
+```
+
+Each test makes a system user of its own (`sbt-` and eight random characters), loads only the guest's own table
+(`inet mediatore_sandbox`, never `flush ruleset`) keyed on that user, kills only that user's processes, and removes the
+user at the end; the metadata test adds a route inside the namespace only. Check afterwards that no `sbt-` user is left
+and that `nft list tables` on the host is unchanged.
+
+| Test | Proves |
+| --- | --- |
+| `every_drawn_port_trips_from_the_jail` | each drawn decoy port, redirected to the trap listener, answers the jail as that decoy and is reported `would_trip`; root is refused |
+| `nothing_is_open_under_off` | under `off`: the guest's three variables, an empty home, no decoy set, no listener, no socket |
+| `after_a_trip_nothing_from_the_sandbox_uid_leaves_and_no_jail_process_remains` | the cut and the kill: `containment_ms`, every process of the uid gone, a new process of the uid reaches nothing and root still does; the teardown keeps the cut and the user |
+| `containment_holds_with_the_broker_unreachable` | the cut and the kill with no broker; nothing waits on the report |
+| `reading_the_bait_files_and_running_env_trips_nothing` | discovery is not use; no bait value in the redacted output; a file the workload wrote in its home persists |
+| `a_closed_loopback_port_is_refused_by_landlock_and_trips_nothing` | a port Landlock does not admit fails in the syscall, so no `loopback_port` event, even with the class at `trip` |
+| `the_jail_cannot_read_its_connect_ports_or_list_the_listeners` | the jail sees no command line with the `--connect-port` list, no `/proc/net` and no `ss` listing |
+| `the_jail_cannot_list_the_decoys_through_its_own_proc_net` | no decoy port in any per-process table the jail can read (`/proc/self/net/tcp`, `/proc/1/net/tcp`, `/proc/thread-self/net/tcp` and their `tcp6`); the one listener listed is the trap listener, which Landlock refuses the jail; a direct connection to it is refused to the sandbox uid and to root; nothing is reported |
+| `the_metadata_address_trips_from_the_jail_where_it_is_routed` | the `nat` redirect carries the jail's connect to the trap listener, which trips as `metadata` |
+
+The run of 2026-11-27 on the merged tree (kernel 6.12, nftables 1.1.3, a debug build): 9 passed; `containment_ms=54`,
+every process of the uid gone 242 ms after the verdict, 256 ms with the broker unreachable. An earlier run of the same
+day showed the eighth test's reading too narrow: the jail could list every decoy listener in its own
+`/proc/self/net/tcp`, which the ninth test now pins and the redirect to one trap listener closed. That is a namespace, not a VM: the guest binary
+end to end as root, the real proxy over the socket, a pool VM beside its host table and Azure are not proven by it.
+
+The host tables' counters (ADR-0070) were proven the same way, by hand in fresh network namespaces on the build host:
+both tables load, each class's counter moves for its case and not for honest traffic, a full set fails closed, and the
+gateway's reader under its unit's exact `[Service]` lines holds `CAP_NET_ADMIN` alone, opens netlink alone and writes
+nowhere but its directory. On every platform, `make host-table-test` and `make gateway-render-check`
+(`image/gateway/table-test.sh`) pin both renders and require every verdict unchanged.
 
 ### The egress proxy: in `make check`
 
@@ -427,7 +483,9 @@ names and either gateway ID as the broker's ServiceAccount are refused. Since AD
 (seccomp, all threads)`, the line it writes once its seccomp family filter is loaded and proven
 (`seccomp::restrict_families`); a proxy without it fails the tier. The tier's gateway is a
 pod: it has no `unix:user` selector, no host table and no systemd unit, so the output chain
-and the entries of a gateway VM are not what it proves. The checks are listed in the script; a
+and the entries of a gateway VM are not what it proves. Nor are ADR-0070's probes: with no host table and no probes
+directory the authorizer reports none, silently, and the tier asserts nothing about the broker's request span; both
+are proven in process only (`e2e_gateway.rs`, `crates/mediatore-api`). The checks are listed in the script; a
 mismatch names the authority, the status and what was expected.
 
 `make kind-e2e-gateway-audience` (ADR-0055) runs all of that and then the audience stage: notaio's
@@ -595,6 +653,7 @@ restarted so its controllers start against existing CRDs, then
 | the reconciler sees `sb-e2e` | a finalizer `mediatore.io/sandbox`; a `VirtualMachineClaim` `sb-e2e` with a controller `ownerReference` to the sandbox, the managed-by label and the sandbox's `subject`, `poolRef` and `ttlSeconds`; the broker logs `record created` with the claim's UID; status `Pending` with `claimUid` |
 | the claim is patched `Bound` with the fixture certificate and a `virtualMachineRef` | `ClusterStaticEntry` `mediatore-claim-<uid>` appears; the sandbox's status mirrors the member and `expiresAt`, `entrySet` and `ready` turn true; the `node` pod logs `subject fetched` for `octocat` and that claim UID (`GET /v1/me` over the node SVID) |
 | the broker ServiceAccount creates `sb-bad` with audience `nope` | status `Failed`, reason `audience nope is not configured`, no claim |
+| the broker ServiceAccount creates `sb-trip`; `status.tripwires` is written through `v1alpha1` and read back through `v1beta1`; an entry with an effect the schema lacks is patched; `status.record.tripped` is written as the API writes it ([ADR-0069](../adr/0069-tripwires-on-the-vm-a-decoy-the-workload-takes-ends-its-sandbox.md)) | the entry read back whole; the bad effect refused by the schema's enum; the sandbox `Failed`, reason `tripped: credential`, exactly one `Tripped=True` with reason `credential`, the record revoked with `tripped` kept, `status.tripwires` kept, its claim deleted, the broker's `sandbox tripped` line; no second claim ever, and the sandbox swept at the retention with its audit line |
 | `kubectl delete agentsandbox sb-e2e` | the claim entry is retracted, the claim deleted, the sandbox gone, the broker logs `sandbox released`; no claim entry remains |
 
 No banlieue controller runs, so the bind is the script's patch; everything else (the
@@ -604,6 +663,12 @@ logic is unit-tested in `crates/mediatore-claims/src/sandbox.rs` over the in-mem
 entries and a fake API that refuses what the API server refuses; the user API's front door
 (`POST/GET/DELETE /v1/claims` creating, reading and deleting the resource) in
 `crates/mediatore/tests/e2e_sandbox.rs` over `mediatore_testkit::MemorySandboxes`.
+
+The trip step writes `status.tripwires` and `tripped` by hand, under the broker ServiceAccount's name (the status
+admission policy admits no one else, and that account's RBAC has `patch` on the subresource but not the `get` that
+`kubectl patch` makes first, so the script adds the admin's group). It proves the CRD's schema in both served versions
+and the reconciler's handling of a tripped record against a real API server. It does not prove `POST /v1/me/trip`, the
+classifier or the broker's own status write: no kind tier runs a broker with traps on.
 
 What this tier proves and the hermetic suite cannot: the `ClusterSPIFFEID` in
 `deploy/base` renders to `spiffe://<td>/mediatore` for the broker pod; the CSI inline

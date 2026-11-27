@@ -152,6 +152,10 @@ Measured, not asserted. Phase 0 records a baseline on the build host; every late
 - [ ] The cardinality ceiling test (I-14)
 - [ ] Speed budget re-measured against the baseline
 
+*2026-11-27: the tripwire signals wait here, unbuilt: the `mediatore.trip.report` span, its events and the five
+instruments of ADR-0069 decision 11, and `mediatore.trips` with the `protocol` and `segment` kinds and the `class` label
+of ADR-0070 decision 8 (roadmaps 17 and 18). Their audit lines and `status.tripwires` are the record until then.*
+
 ### Phase 3: the gateway
 
 - [ ] Authorizer spans and metrics, exported with the gateway SVID

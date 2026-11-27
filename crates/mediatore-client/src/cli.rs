@@ -352,6 +352,11 @@ pub async fn run(cmd: UserCmd) -> anyhow::Result<()> {
             let session = Session::load(&target.session.path()?)?;
             let claim = get_claim(&target.api()?, &session, &name, namespace.as_deref()).await?;
             println!("{}", serde_json::to_string_pretty(&claim)?);
+            // The document on stdout carries `tripped` and `tripwires` whole; what they say
+            // is also said in words, beside it, where a person looks.
+            for line in trip_lines(&claim) {
+                eprintln!("{line}");
+            }
             Ok(())
         }
         UserCmd::Sandbox(SandboxCmd::Delete {
@@ -623,11 +628,13 @@ async fn create(args: CreateArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The guest's report, when the claim has one (ADR-0029 decision 5): which image digest
-/// and which rules ran, as the broker recorded them.
-fn print_report(claim: &mediatore_proto::ClaimResponse) {
+/// What `sandbox create` prints of a claim after its first line: the workload's exit and the
+/// guest's report (ADR-0029 decision 5: which image digest and which rules ran, as the broker
+/// recorded them), when the claim has them, then what tripwires recorded ([`trip_lines`]).
+fn report_lines(claim: &mediatore_proto::ClaimResponse) -> Vec<String> {
+    let mut lines = Vec::new();
     if let Some(x) = &claim.exit {
-        println!(
+        lines.push(format!(
             "exited_at={}\tcode={}\tsignal={}\trestarts={}",
             x.exited_at,
             x.exit
@@ -637,20 +644,93 @@ fn print_report(claim: &mediatore_proto::ClaimResponse) {
                 .signal
                 .map_or_else(|| "-".to_owned(), |s| s.to_string()),
             x.exit.restarts
-        );
+        ));
     }
-    let Some(r) = &claim.report else {
-        return;
+    if let Some(r) = &claim.report {
+        let host = match &r.report.host_table {
+            mediatore_proto::HostTable::Loaded { sha256 } => format!("loaded sha256={sha256}"),
+            mediatore_proto::HostTable::Missing => {
+                "MISSING (the environment has gateways)".to_owned()
+            }
+            mediatore_proto::HostTable::NotLoaded => "none (no gateways)".to_owned(),
+        };
+        lines.push(format!(
+            "reported_at={}\timage_digest={}\tsandbox_ruleset_sha256={}\thost_table={host}",
+            r.reported_at, r.report.image_digest, r.report.sandbox_ruleset_sha256
+        ));
+    }
+    lines.extend(trip_lines(claim));
+    lines
+}
+
+/// The trap's name or the class of a trip, whichever it carries: `trap=<name>` for a trap on
+/// the VM, `class=<class>` for a `denied`, `protocol` or `segment` event.
+fn trap_or_class(trap: Option<&str>, class: Option<mediatore_proto::trip::TripClass>) -> String {
+    match (trap, class) {
+        (Some(trap), _) => format!("trap={trap}"),
+        (None, Some(class)) => format!("class={}", class.as_str()),
+        (None, None) => "trap=-".to_owned(),
+    }
+}
+
+/// What a trip reached for, or `-`.
+fn target_of(target: Option<&mediatore_proto::trip::TripTarget>) -> String {
+    target.map_or_else(|| "-".to_owned(), ToString::to_string)
+}
+
+/// What the owner is shown of tripwires (ADR-0069 decision 9, ADR-0070 decision 8): the trip
+/// that ended the claim, when one did, then the latest folded events as the broker keeps them
+/// (at most sixteen), what did not fit, and that the counts are a lower bound. A claim with
+/// `tripped` is ended whatever its phase still says. Nothing for a claim nothing happened to.
+/// Only these fields: an event's id is not shown.
+fn trip_lines(claim: &mediatore_proto::ClaimResponse) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(t) = &claim.tripped {
+        lines.push(format!(
+            "ended=tripped\tat={}\trecorded_at={}\tkind={}\t{}\ttarget={}\tsource={}",
+            t.at,
+            t.recorded_at,
+            t.kind.as_str(),
+            trap_or_class(t.trap.as_deref(), t.class),
+            target_of(t.target.as_ref()),
+            t.source.as_str()
+        ));
+    }
+    let Some(summary) = &claim.tripwires else {
+        return lines;
     };
-    let host = match &r.report.host_table {
-        mediatore_proto::HostTable::Loaded { sha256 } => format!("loaded sha256={sha256}"),
-        mediatore_proto::HostTable::Missing => "MISSING (the environment has gateways)".to_owned(),
-        mediatore_proto::HostTable::NotLoaded => "none (no gateways)".to_owned(),
-    };
-    println!(
-        "reported_at={}\timage_digest={}\tsandbox_ruleset_sha256={}\thost_table={host}",
-        r.reported_at, r.report.image_digest, r.report.sandbox_ruleset_sha256
-    );
+    for e in &summary.entries {
+        let mut fields = vec![
+            "tripwire".to_owned(),
+            format!("effect={}", e.effect.as_str()),
+            format!("kind={}", e.kind.as_str()),
+            trap_or_class(e.trap.as_deref(), e.class),
+            format!("target={}", target_of(e.target.as_ref())),
+            format!("count={}", e.count),
+            format!("first_at={}", e.first_at),
+            format!("last_at={}", e.last_at),
+        ];
+        if let Some(ms) = e.containment_ms {
+            fields.push(format!("containment_ms={ms}"));
+        }
+        if let Some(address) = &e.source_address {
+            fields.push(format!("source_address={address}"));
+        }
+        lines.push(fields.join("\t"));
+    }
+    if summary.overflow > 0 {
+        lines.push(format!("tripwires_overflow={}", summary.overflow));
+    }
+    if !summary.entries.is_empty() || summary.overflow > 0 {
+        lines.push("tripwire counts are a lower bound of what was reported, not a ledger".into());
+    }
+    lines
+}
+
+fn print_report(claim: &mediatore_proto::ClaimResponse) {
+    for line in report_lines(claim) {
+        println!("{line}");
+    }
 }
 
 #[cfg(test)]
@@ -1354,6 +1434,106 @@ mod tests {
             lines(&log)[0].starts_with("GET /v1/claims/sb-1 "),
             "{:?}",
             lines(&log)
+        );
+    }
+
+    // ----- ADR-0069 decision 9 and ADR-0070 decision 8: what the owner is shown of a trip -----
+
+    fn claim_of(json: &serde_json::Value) -> mediatore_proto::ClaimResponse {
+        serde_json::from_value(json.clone()).expect("a claim")
+    }
+
+    #[test]
+    fn a_claim_with_no_trip_prints_what_it_printed_before() {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let hash = "b".repeat(64);
+        let claim = claim_of(&serde_json::json!({
+            "name": "sb-1", "phase": "Releasing",
+            "exit": { "exited_at": "2026-11-27T10:05:00Z", "code": 0, "restarts": 2 },
+            "report": {
+                "reported_at": "2026-11-27T10:00:00Z", "image_digest": digest,
+                "sandbox_ruleset_sha256": hash, "host_table": { "state": "not_loaded" },
+            },
+        }));
+        assert_eq!(
+            report_lines(&claim),
+            [
+                "exited_at=2026-11-27T10:05:00Z\tcode=0\tsignal=-\trestarts=2".to_owned(),
+                format!(
+                    "reported_at=2026-11-27T10:00:00Z\timage_digest={digest}\tsandbox_ruleset_sha256={hash}\thost_table=none (no gateways)"
+                ),
+            ]
+        );
+        assert_eq!(trip_lines(&claim), Vec::<String>::new());
+        // And a claim with nothing to report prints nothing after its first line.
+        let bare = claim_of(&serde_json::json!({ "name": "sb-1", "phase": "Pending" }));
+        assert_eq!(report_lines(&bare), Vec::<String>::new());
+    }
+
+    #[test]
+    fn sandbox_get_shows_a_trip_and_its_latest_events() {
+        let claim = claim_of(&serde_json::json!({
+            // The phase lags a trip until the reconciler's pass: the trip is what is shown.
+            "name": "sb-1", "phase": "Bound", "ready": false,
+            "tripped": {
+                "id": "08799118-4721-4406-85ce-21fcfb09f75b",
+                "at": "2026-11-27T10:01:00Z", "recorded_at": "2026-11-27T10:01:01Z",
+                "kind": "credential", "trap": "aws", "target": { "host": "git.example" },
+                "source": "workload",
+            },
+            "tripwires": {
+                "updated_at": "2026-11-27T10:02:00Z",
+                "overflow": 5,
+                "entries": [
+                    { "effect": "tripped", "kind": "credential", "trap": "aws",
+                      "target": { "host": "git.example" }, "source": "workload",
+                      "containment_ms": 41, "count": 1,
+                      "first_at": "2026-11-27T10:01:00Z", "last_at": "2026-11-27T10:01:00Z" },
+                    { "effect": "reported", "kind": "protocol", "class": "foreign_route",
+                      "source": "peer", "count": 3,
+                      "first_at": "2026-11-27T09:58:00Z", "last_at": "2026-11-27T10:00:30Z" },
+                    { "effect": "would_trip", "kind": "port", "trap": "redis",
+                      "target": { "port": 6379 }, "source": "drawn", "count": 2,
+                      "first_at": "2026-11-27T09:50:00Z", "last_at": "2026-11-27T09:51:00Z" },
+                    { "effect": "reported", "kind": "segment", "class": "pool_inbound",
+                      "target": { "port": 22 }, "source": "peer",
+                      "source_address": "198.51.100.9", "count": 4,
+                      "first_at": "2026-11-27T09:40:00Z", "last_at": "2026-11-27T09:41:00Z" },
+                ],
+            },
+        }));
+        assert_eq!(
+            trip_lines(&claim),
+            [
+                "ended=tripped\tat=2026-11-27T10:01:00Z\trecorded_at=2026-11-27T10:01:01Z\tkind=credential\ttrap=aws\ttarget=git.example\tsource=workload",
+                "tripwire\teffect=tripped\tkind=credential\ttrap=aws\ttarget=git.example\tcount=1\tfirst_at=2026-11-27T10:01:00Z\tlast_at=2026-11-27T10:01:00Z\tcontainment_ms=41",
+                "tripwire\teffect=reported\tkind=protocol\tclass=foreign_route\ttarget=-\tcount=3\tfirst_at=2026-11-27T09:58:00Z\tlast_at=2026-11-27T10:00:30Z",
+                "tripwire\teffect=would_trip\tkind=port\ttrap=redis\ttarget=6379\tcount=2\tfirst_at=2026-11-27T09:50:00Z\tlast_at=2026-11-27T09:51:00Z",
+                "tripwire\teffect=reported\tkind=segment\tclass=pool_inbound\ttarget=22\tcount=4\tfirst_at=2026-11-27T09:40:00Z\tlast_at=2026-11-27T09:41:00Z\tsource_address=198.51.100.9",
+                "tripwires_overflow=5",
+                "tripwire counts are a lower bound of what was reported, not a ledger",
+            ]
+        );
+        // The trip follows what the claim printed before, and the event's id is not shown.
+        let lines = report_lines(&claim);
+        assert_eq!(lines, trip_lines(&claim));
+        assert!(!lines.iter().any(|l| l.contains("08799118")));
+        // A protocol trip names its class where a trap would be; no overflow, no line for it.
+        let claim = claim_of(&serde_json::json!({
+            "name": "sb-1", "phase": "Failed",
+            "tripped": {
+                "id": "08799118-4721-4406-85ce-21fcfb09f75b",
+                "at": "2026-11-27T10:01:00Z", "recorded_at": "2026-11-27T10:01:00Z",
+                "kind": "protocol", "class": "deny_outside_rendered",
+                "target": { "address": "192.0.2.7:22" }, "source": "peer",
+            },
+            "tripwires": { "entries": [] },
+        }));
+        assert_eq!(
+            trip_lines(&claim),
+            [
+                "ended=tripped\tat=2026-11-27T10:01:00Z\trecorded_at=2026-11-27T10:01:00Z\tkind=protocol\tclass=deny_outside_rendered\ttarget=192.0.2.7:22\tsource=peer"
+            ]
         );
     }
 }

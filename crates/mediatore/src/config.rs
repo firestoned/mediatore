@@ -5,9 +5,10 @@
 
 use std::path::{Path, PathBuf};
 
-use mediatore_api::{NamespaceGrant, Namespaces};
+use mediatore_api::{NamespaceGrant, Namespaces, Tripwires};
 use mediatore_entra::{Backend, IssuerConfig};
 use mediatore_proto::image::canonical_registry;
+use mediatore_proto::trip::{ClassAction, DeniedSwitches, TrapsBody, TrapsMode, TripClass};
 use mediatore_proto::{
     DEFAULT_LOG_MAX_BYTES, Endpoint, EndpointRule, GATEWAY_CREDENTIAL_MAX_TTL_SECS, HeaderPair,
     InjectRoute, LOG_MAX_BYTES_CEILING, LOG_SEGMENT_BYTES,
@@ -132,6 +133,13 @@ pub struct AudienceConfig {
     /// Present, the map is the whole of where it is usable, and the top-level `rules` must be empty.
     #[serde(default)]
     pub namespaces: Option<std::collections::BTreeMap<String, NamespaceRules>>,
+    /// Whether the egress proxy matches bait in the request bodies of this audience's routes
+    /// (ADR-0069 decision 6): `match` (the default) or `skip`, for an audience whose bodies
+    /// carry the agent's own conversation, a model API, where a bait value the agent read
+    /// and quoted would end its run. Under `skip` the headers, the path and the query are
+    /// still matched. For the audiences of this file; a bundle-defined audience has no mark.
+    #[serde(default)]
+    pub traps_body: TrapsBody,
 }
 
 /// One namespace of an audience's `namespaces` (ADR-0053 decision 1). A typo in the field is a
@@ -767,6 +775,90 @@ pub struct PolicySection {
     /// `audiences[]` in this file, and no audience bundle is read.
     #[serde(default)]
     pub audience_definitions: Option<AudienceDefinitionsSection>,
+    /// Tripwires on the VM (ADR-0069 decision 5): `off` (the default), `shadow` or `enforce`,
+    /// for the whole broker. Under `off` the guests are handed no traps and
+    /// `POST /v1/me/trip` answers `501`; under `shadow` a trip is recorded and ends nothing;
+    /// under `enforce` it ends the claim. Any other value does not start. `enforce` does not
+    /// start under `audience_definitions.mode: bundles`, where no audience can be marked
+    /// `traps_body: skip`.
+    #[serde(default)]
+    pub traps: TrapsMode,
+    /// What each `denied` class does under `enforce` (ADR-0069 decision 10): `report` (the
+    /// default) or `trip`, for `loopback_port`, `private_range` and `unknown_host`. Served to
+    /// the guest with the mode. An unknown class or value does not start.
+    #[serde(default)]
+    pub traps_denied: DeniedSwitches,
+}
+
+/// The `tripwires` section (ADR-0070 decision 7): what each class decided past the jail does,
+/// `report` (the default) or `trip`. There is no `off`: recording arms nothing. An unknown
+/// class or value does not start, and neither does `trip` on a class that decisions 5 and 6
+/// hold to `report` ([`TripClass::may_trip`]): the four `segment` classes, the authorizer's
+/// two, `deny_outside_rendered` (a claim the authorizer names), and the two scoped to nothing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TripwiresSection {
+    /// A handshake under a valid SVID of no admitted shape. `report` only.
+    #[serde(default)]
+    pub identity_shape: ClassAction,
+    /// An admitted identity on a route of another kind.
+    #[serde(default)]
+    pub foreign_route: ClassAction,
+    /// A path the sandbox listener does not serve.
+    #[serde(default)]
+    pub unknown_route: ClassAction,
+    /// A claim identity with no record, a node identity not registered. `report` only.
+    #[serde(default)]
+    pub no_record: ClassAction,
+    /// `POST /v1/token` for an audience in no route the claim's guest was handed.
+    #[serde(default)]
+    pub audience_outside_rendered: ClassAction,
+    /// The authorizer asking about a uid the store never held. `report` only.
+    #[serde(default)]
+    pub claim_never_issued: ClassAction,
+    /// The authorizer asking for a credential that is not gateway-placed. `report` only.
+    #[serde(default)]
+    pub credential_outside_inject: ClassAction,
+    /// A gateway's reported deny for an authority the claim was never handed. `report` only:
+    /// the claim is the one the authorizer's batch names (ADR-0070 decision 6, amended).
+    #[serde(default)]
+    pub deny_outside_rendered: ClassAction,
+    /// A connection to a port a gateway does not serve. `report` only.
+    #[serde(default)]
+    pub gateway_port: ClassAction,
+    /// A gateway user's connection outside its allowlist. `report` only.
+    #[serde(default)]
+    pub gateway_output: ClassAction,
+    /// An inbound connection to a pool VM. `report` only.
+    #[serde(default)]
+    pub pool_inbound: ClassAction,
+    /// A connection from a pool VM that its host table drops. `report` only.
+    #[serde(default)]
+    pub pool_output: ClassAction,
+}
+
+impl TripwiresSection {
+    /// What `class` does. A `denied` class is not of this section (`policy.traps_denied`).
+    #[must_use]
+    pub const fn action(&self, class: TripClass) -> ClassAction {
+        match class {
+            TripClass::IdentityShape => self.identity_shape,
+            TripClass::ForeignRoute => self.foreign_route,
+            TripClass::UnknownRoute => self.unknown_route,
+            TripClass::NoRecord => self.no_record,
+            TripClass::AudienceOutsideRendered => self.audience_outside_rendered,
+            TripClass::ClaimNeverIssued => self.claim_never_issued,
+            TripClass::CredentialOutsideInject => self.credential_outside_inject,
+            TripClass::DenyOutsideRendered => self.deny_outside_rendered,
+            TripClass::GatewayPort => self.gateway_port,
+            TripClass::GatewayOutput => self.gateway_output,
+            TripClass::PoolInbound => self.pool_inbound,
+            TripClass::PoolOutput => self.pool_output,
+            TripClass::LoopbackPort | TripClass::PrivateRange | TripClass::UnknownHost => {
+                ClassAction::Report
+            }
+        }
+    }
 }
 
 /// Where the broker's audience definitions come from (ADR-0055 decision 8).
@@ -1053,6 +1145,10 @@ pub struct Config {
     /// where a config still carrying it is refused as an unknown field.
     #[serde(default)]
     pub accept_plain_gateway_identity: bool,
+    /// What each class of ADR-0070 does: `report` or `trip`, `report` by default. Absent:
+    /// every class at `report`.
+    #[serde(default)]
+    pub tripwires: TripwiresSection,
 }
 
 fn default_listen() -> ListenConfig {
@@ -1552,8 +1648,10 @@ impl Config {
         }
         // The store needs no URL since ADR-0034 (the Kubernetes API, or memory under
         // dev_mode), and any retention is valid: zero means an ended claim is swept at the
-        // next resync, which is how the kind tiers run.
+        // next resync, which is how the kind tiers run. At a retention not above the claim
+        // SVID's lifetime the `no_record` class is not judged (`Config::no_record_judged`).
         cfg.check_policy()?;
+        cfg.check_tripwires()?;
         cfg.check_gateways()?;
         if cfg.store.node_grace_secs == 0 {
             anyhow::bail!(
@@ -1597,6 +1695,122 @@ impl Config {
 }
 
 impl Config {
+    /// `policy.traps` (ADR-0069 decision 5): `off` without a `policy` section.
+    #[must_use]
+    pub fn traps_mode(&self) -> TrapsMode {
+        self.policy.as_ref().map(|p| p.traps).unwrap_or_default()
+    }
+
+    /// Whether the `no_record` class is judged (ADR-0070 decision 3, amended): only where an
+    /// ended claim's record outlives its SVID, so `store.retention_secs` above
+    /// [`mediatore_spire::MAX_CLAIM_SVID_TTL`]. At or below it a claim released a moment ago
+    /// has no record while its SVID is still valid, and every honest request of its proxy
+    /// would read as one. Not a refusal: the class is left out, and the start says so.
+    #[must_use]
+    pub fn no_record_judged(&self) -> bool {
+        self.store.retention_secs > mediatore_spire::MAX_CLAIM_SVID_TTL.as_secs()
+    }
+
+    /// The start-up refusals of ADR-0069 decision 5 and ADR-0070 decision 7. An unknown class
+    /// and an unknown value are refused by the parse; here, `trip` on a class that may not
+    /// trip, and `policy.traps: enforce` where the audiences are bundle-defined.
+    ///
+    /// # Errors
+    /// The first of them, naming the key.
+    pub fn check_tripwires(&self) -> anyhow::Result<()> {
+        for class in TripClass::PROTOCOL.into_iter().chain(TripClass::SEGMENT) {
+            if self.tripwires.action(class) == ClassAction::Trip && !class.may_trip() {
+                anyhow::bail!(
+                    "tripwires.{}: trip is refused, this class records only: a segment class proves nothing about its sender, a class of the authorizer's or on its word (a reported deny names a claim any holder of the shared authorizer identity could name) must not end one, and a class with no scope has no claim to end (ADR-0070 decisions 5 and 6); set it to report or leave it out",
+                    class.as_str()
+                );
+            }
+        }
+        if self.traps_mode() == TrapsMode::Enforce && self.audience_mode() == AudienceMode::Bundles
+        {
+            anyhow::bail!(
+                "policy.traps is enforce but policy.audience_definitions.mode is bundles: a bundle-defined audience cannot be marked traps_body: skip yet, so an agent that quoted a bait value to its model API would end its own run; run shadow, or define the audiences in this file (ADR-0069 decision 5)"
+            );
+        }
+        Ok(())
+    }
+
+    /// What the API holds for tripwires ([`Tripwires`], the one field of its state for both
+    /// ADRs), from this file: the mode, the `denied` switches, what each class does, the
+    /// audiences marked `traps_body: skip`, and whether `no_record` is judged. No catalogue:
+    /// no bundle carries one.
+    ///
+    /// # Errors
+    /// `trip` on a class that may not trip: the table refuses it as [`Self::check_tripwires`]
+    /// does, so a configuration that was not checked fills no state either.
+    pub fn tripwires(&self) -> anyhow::Result<Tripwires> {
+        let mut wired = Tripwires {
+            mode: self.traps_mode(),
+            denied: self
+                .policy
+                .as_ref()
+                .map(|p| p.traps_denied)
+                .unwrap_or_default(),
+            body_skip: self
+                .audiences
+                .iter()
+                .filter(|a| a.traps_body == TrapsBody::Skip)
+                .map(|a| a.name.clone())
+                .collect(),
+            no_record_judged: self.no_record_judged(),
+            ..Tripwires::default()
+        };
+        for class in TripClass::PROTOCOL.into_iter().chain(TripClass::SEGMENT) {
+            wired
+                .classes
+                .set(class, self.tripwires.action(class))
+                .map_err(|why| anyhow::anyhow!("tripwires.{}: {why}", class.as_str()))?;
+        }
+        Ok(wired)
+    }
+
+    /// The start lines of tripwires: the mode, one line per class that ends a claim, and one
+    /// when `no_record` is not judged. Configuration only.
+    fn log_tripwires(&self) {
+        match self.traps_mode() {
+            TrapsMode::Off => tracing::info!(
+                traps = "off",
+                "tripwires on the VM are off: guests are handed no traps and POST /v1/me/trip answers 501 (policy.traps, ADR-0069)"
+            ),
+            mode => tracing::warn!(
+                traps = mode.as_str(),
+                "tripwires on the VM are armed: under enforce a trip ends its claim, under shadow it is recorded and ends nothing (policy.traps, ADR-0069)"
+            ),
+        }
+        let denied = self
+            .policy
+            .as_ref()
+            .map(|p| p.traps_denied)
+            .unwrap_or_default();
+        let tripping = TripClass::DENIED
+            .into_iter()
+            .filter(|c| denied.action(*c) == ClassAction::Trip)
+            .chain(
+                TripClass::PROTOCOL
+                    .into_iter()
+                    .filter(|c| self.tripwires.action(*c) == ClassAction::Trip),
+            );
+        for class in tripping {
+            tracing::warn!(
+                class = class.as_str(),
+                kind = class.kind().as_str(),
+                "a class at trip: an event of this class ends the claim it is scoped to (policy.traps_denied, tripwires)"
+            );
+        }
+        if !self.no_record_judged() {
+            tracing::warn!(
+                retention_secs = self.store.retention_secs,
+                claim_svid_secs = mediatore_spire::MAX_CLAIM_SVID_TTL.as_secs(),
+                "the no_record class is not judged: store.retention_secs is not above the claim SVID's lifetime, so a claim released a moment ago has no record while its SVID is still valid (ADR-0070 decision 3)"
+            );
+        }
+    }
+
     /// ADR-0046 decision 19: every issuer carries exactly one written gate. Refused at start
     /// with the issuer's `url` and the keys, never read as "no gate".
     fn check_gates(&self) -> anyhow::Result<()> {
@@ -1782,6 +1996,7 @@ impl Config {
         );
         self.log_declarative_issuers();
         self.log_policy_sources();
+        self.log_tripwires();
     }
 
     /// ADR-0072 decision 6: what an `AgentSandbox` created through the Kubernetes API may name
@@ -4752,6 +4967,319 @@ listen: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }
             "        rules: []\n",
         );
         assert!(scoped_err(&empty).contains("namespaces.team-a.rules"));
+    }
+
+    // ----- ADR-0069 decision 5 and ADR-0070 decision 7: policy.traps, the denied switches, tripwires ---------------
+
+    use mediatore_proto::trip::{
+        ClassAction, DeniedSwitches, TrapsBody, TrapsMode, TrapsPolicy, TripClass,
+    };
+
+    /// A `policy` section with `rest` under it, in a `dev_mode` configuration.
+    fn with_traps(rest: &str) -> anyhow::Result<Config> {
+        with(&policy_reading("sandboxes", rest))
+    }
+
+    #[test]
+    fn policy_traps_is_off_by_default_and_takes_shadow_and_enforce() {
+        // Without a policy section, and with one that does not say: off.
+        assert_eq!(with("").unwrap().traps_mode(), TrapsMode::Off);
+        assert_eq!(with_traps("").unwrap().traps_mode(), TrapsMode::Off);
+        assert_eq!(
+            with_traps("  traps: off\n").unwrap().traps_mode(),
+            TrapsMode::Off
+        );
+        assert_eq!(
+            with_traps("  traps: shadow\n").unwrap().traps_mode(),
+            TrapsMode::Shadow
+        );
+        assert_eq!(
+            with_traps("  traps: enforce\n").unwrap().traps_mode(),
+            TrapsMode::Enforce
+        );
+        // Off hands the guest nothing and answers the trip route `501`.
+        let off = with("").unwrap().tripwires().unwrap();
+        assert_eq!(off.mode, TrapsMode::Off);
+        assert_eq!(off.policy(), None);
+    }
+
+    #[test]
+    fn any_other_value_of_policy_traps_refuses_the_start() {
+        for value in [
+            "enforced", "on", "true", "report", "trip", "Enforce", "\"\"", "[shadow]",
+        ] {
+            assert!(
+                with_traps(&format!("  traps: {value}\n")).is_err(),
+                "{value} is not read as a mode"
+            );
+        }
+    }
+
+    #[test]
+    fn the_denied_switches_are_report_by_default_and_an_unknown_class_refuses_the_start() {
+        let cfg = with_traps("  traps: enforce\n").unwrap();
+        assert_eq!(
+            cfg.policy.as_ref().unwrap().traps_denied,
+            DeniedSwitches::default()
+        );
+        for class in TripClass::DENIED {
+            assert_eq!(
+                cfg.tripwires().unwrap().denied.action(class),
+                ClassAction::Report
+            );
+        }
+        let cfg = with_traps(
+            "  traps: enforce\n  traps_denied: { unknown_host: trip, loopback_port: report }\n",
+        )
+        .unwrap();
+        let wired = cfg.tripwires().unwrap();
+        assert_eq!(wired.denied.unknown_host, ClassAction::Trip);
+        assert_eq!(wired.denied.loopback_port, ClassAction::Report);
+        assert_eq!(wired.denied.private_range, ClassAction::Report);
+        // What the guest is told is what the file says.
+        assert_eq!(
+            wired.policy(),
+            Some(TrapsPolicy {
+                mode: TrapsMode::Enforce,
+                denied: wired.denied,
+                catalogue: None,
+            })
+        );
+        for off in [
+            "  traps_denied: { unknown_hosts: trip }\n",
+            "  traps_denied: { foreign_route: trip }\n",
+            "  traps_denied: { unknown_host: enforce }\n",
+            "  traps_denied: { unknown_host: off }\n",
+            "  traps_denied: trip\n",
+        ] {
+            assert!(with_traps(off).is_err(), "{off}");
+        }
+    }
+
+    #[test]
+    fn the_tripwires_section_is_report_everywhere_by_default() {
+        for cfg in [with("").unwrap(), with("tripwires: {}\n").unwrap()] {
+            assert_eq!(cfg.tripwires, TripwiresSection::default());
+            let wired = cfg.tripwires().unwrap();
+            for class in TripClass::PROTOCOL.into_iter().chain(TripClass::SEGMENT) {
+                assert_eq!(cfg.tripwires.action(class), ClassAction::Report);
+                assert_eq!(wired.classes.action(class), ClassAction::Report);
+            }
+            assert_eq!(wired.classes.tripping().count(), 0);
+        }
+        // The section needs no `policy` and no `policy.traps`: recording arms nothing.
+        let cfg =
+            with("tripwires: { foreign_route: trip, deny_outside_rendered: report }\n").unwrap();
+        let wired = cfg.tripwires().unwrap();
+        assert_eq!(wired.mode, TrapsMode::Off);
+        assert_eq!(
+            wired.classes.tripping().collect::<Vec<_>>(),
+            [TripClass::ForeignRoute]
+        );
+    }
+
+    #[test]
+    fn an_unknown_class_or_value_in_tripwires_refuses_the_start() {
+        for off in [
+            "tripwires: { foreign_routes: trip }\n",
+            "tripwires: { unknown_host: trip }\n",
+            "tripwires: { protocol: trip }\n",
+            "tripwires: { foreign_route: enforce }\n",
+            "tripwires: { foreign_route: shadow }\n",
+            "tripwires: { foreign_route: off }\n",
+            "tripwires: { foreign_route: true }\n",
+            "tripwires: trip\n",
+            "tripwire: { foreign_route: trip }\n",
+        ] {
+            assert!(with(off).is_err(), "{off}");
+        }
+        let err = refused("tripwires: { foreign_routes: trip }\n");
+        assert!(err.contains("foreign_routes"), "{err}");
+    }
+
+    #[test]
+    fn trip_on_a_segment_class_or_an_authorizer_class_or_an_unscoped_class_refuses_the_start() {
+        let mut held_to_report = 0;
+        for class in TripClass::PROTOCOL.into_iter().chain(TripClass::SEGMENT) {
+            let name = class.as_str();
+            let trip = with(&format!("tripwires: {{ {name}: trip }}\n"));
+            if class.may_trip() {
+                assert_eq!(trip.unwrap().tripwires.action(class), ClassAction::Trip);
+                continue;
+            }
+            held_to_report += 1;
+            let err = trip.unwrap_err().to_string();
+            assert!(
+                err.contains(&format!("tripwires.{name}")) && err.contains("ADR-0070"),
+                "{err}"
+            );
+            // At report it starts.
+            assert!(with(&format!("tripwires: {{ {name}: report }}\n")).is_ok());
+        }
+        assert_eq!(
+            held_to_report, 9,
+            "the four segment classes, the authorizer's two, the deny the authorizer reports, and the two with no scope"
+        );
+        // ADR-0070 decision 6 (amended 2026-11-27): the claim a reported deny names is the
+        // authorizer's word, so the class refuses trip the way the authorizer's own two do.
+        let err = refused("tripwires: { deny_outside_rendered: trip }\n");
+        assert!(
+            err.contains("tripwires.deny_outside_rendered") && err.contains("records only"),
+            "{err}"
+        );
+        let mut cfg = with("").unwrap();
+        cfg.tripwires.deny_outside_rendered = ClassAction::Trip;
+        assert!(cfg.tripwires().is_err());
+    }
+
+    #[test]
+    fn a_forbidden_trip_that_got_past_the_parse_is_refused_where_the_state_is_filled() {
+        // The second place a class held to report cannot get past (ADR-0070 decisions 5 and
+        // 6): a configuration that was not checked still fills no state.
+        let mut cfg = with("").unwrap();
+        cfg.tripwires.claim_never_issued = ClassAction::Trip;
+        let err = cfg.tripwires().err().expect("refused").to_string();
+        assert!(err.contains("tripwires.claim_never_issued"), "{err}");
+        let mut cfg = with("").unwrap();
+        cfg.tripwires.pool_inbound = ClassAction::Trip;
+        assert!(cfg.tripwires().is_err());
+        assert!(cfg.check_tripwires().is_err());
+    }
+
+    #[test]
+    fn a_retention_at_or_below_the_claim_svid_lifetime_leaves_no_record_unjudged_and_says_so() {
+        let lifetime = mediatore_spire::MAX_CLAIM_SVID_TTL.as_secs();
+        // The default retention is an hour: the class is judged, and nothing is said.
+        let cfg = with("").unwrap();
+        assert!(cfg.tripwires().unwrap().no_record_judged);
+        assert!(!startup_log(&cfg).contains("no_record"));
+        let above = with(&format!("store: {{ retention_secs: {} }}\n", lifetime + 1)).unwrap();
+        assert!(above.tripwires().unwrap().no_record_judged);
+        // At the lifetime, below it, and at the kind tiers' zero: the start is not refused,
+        // the class is not judged, and one line says so.
+        for retention in [lifetime, lifetime - 1, 0] {
+            let cfg = with(&format!("store: {{ retention_secs: {retention} }}\n")).unwrap();
+            assert!(!cfg.tripwires().unwrap().no_record_judged, "{retention}");
+            let logs = startup_log(&cfg);
+            let said: Vec<&str> = logs.lines().filter(|l| l.contains("no_record")).collect();
+            assert_eq!(said.len(), 1, "{logs}");
+            assert!(said[0].contains("WARN"), "{}", said[0]);
+            assert!(
+                said[0].contains(&format!("retention_secs={retention}"))
+                    && said[0].contains(&format!("claim_svid_secs={lifetime}")),
+                "{}",
+                said[0]
+            );
+        }
+    }
+
+    #[test]
+    fn the_kind_tiers_broker_configuration_parses_and_keeps_its_zero_retention() {
+        // `dev/kind/broker/mediatore.yaml`: outside dev_mode with `retention_secs: 0`, which
+        // the sandbox tier relies on. It starts, with tripwires off and `no_record` unjudged.
+        let cfg = Config::parse(include_str!("../../../dev/kind/broker/mediatore.yaml")).unwrap();
+        assert!(!cfg.dev_mode);
+        assert_eq!(cfg.store.retention_secs, 0);
+        let wired = cfg.tripwires().unwrap();
+        assert_eq!(wired.mode, TrapsMode::Off);
+        assert!(!wired.no_record_judged);
+        assert_eq!(wired.classes.tripping().count(), 0);
+        assert!(wired.body_skip.is_empty());
+    }
+
+    #[test]
+    fn traps_body_on_an_audience_reaches_its_routes() {
+        let audiences = "audiences:\n  - { name: model, via: none, egress: [\"model.example:443\"], traps_body: skip }\n  - { name: git, via: none, egress: [\"git.example:443\"], traps_body: match }\n  - { name: plain, via: none, egress: [\"plain.example:443\"] }\n";
+        let cfg = Config::parse(&format!(
+            "{}{audiences}",
+            DEV.replace("audiences: []\n", "")
+        ))
+        .unwrap();
+        assert_eq!(
+            cfg.audiences
+                .iter()
+                .map(|a| a.traps_body)
+                .collect::<Vec<_>>(),
+            [TrapsBody::Skip, TrapsBody::Match, TrapsBody::Match]
+        );
+        let wired = cfg.tripwires().unwrap();
+        assert_eq!(wired.traps_body("model"), TrapsBody::Skip);
+        assert_eq!(wired.traps_body("git"), TrapsBody::Match);
+        assert_eq!(wired.traps_body("plain"), TrapsBody::Match);
+        assert_eq!(wired.body_skip.len(), 1);
+        // Anything else is refused, never read as the default.
+        for value in ["skipped", "none", "true", "off"] {
+            let off = audiences.replace("traps_body: skip", &format!("traps_body: {value}"));
+            assert!(
+                Config::parse(&format!("{}{off}", DEV.replace("audiences: []\n", ""))).is_err(),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn enforce_under_bundle_defined_audiences_refuses_the_start() {
+        let bundles = "  audience_definitions: { mode: bundles, platform_namespace: p }\n";
+        let err = refused(&policy_reading(
+            "sandboxes",
+            &format!("  traps: enforce\n{bundles}"),
+        ));
+        assert!(
+            err.contains("policy.traps") && err.contains("bundles") && err.contains("ADR-0069"),
+            "{err}"
+        );
+        // Shadow and off start there, and enforce starts where the file defines the audiences.
+        for mode in ["shadow", "off"] {
+            assert!(with_traps(&format!("  traps: {mode}\n{bundles}")).is_ok());
+        }
+        for mode in ["config", "shadow"] {
+            let definitions =
+                format!("  audience_definitions: {{ mode: {mode}, platform_namespace: p }}\n");
+            assert!(with_traps(&format!("  traps: enforce\n{definitions}")).is_ok());
+        }
+    }
+
+    #[test]
+    fn startup_says_the_traps_mode_and_every_class_that_is_not_at_its_default() {
+        // Nothing configured: one line for the mode, none for a class.
+        let logs = startup_log(&with("").unwrap());
+        let mode: Vec<&str> = logs
+            .lines()
+            .filter(|l| l.contains("tripwires on the VM"))
+            .collect();
+        assert_eq!(mode.len(), 1, "{logs}");
+        assert!(mode[0].contains("INFO") && mode[0].contains("traps=\"off\""));
+        assert!(!logs.contains("ends the claim"), "{logs}");
+        let cfg = with(&format!(
+            "{}tripwires: {{ foreign_route: trip, audience_outside_rendered: trip }}\n",
+            policy_reading(
+                "sandboxes",
+                "  traps: enforce\n  traps_denied: { unknown_host: trip }\n"
+            )
+        ))
+        .unwrap();
+        let logs = startup_log(&cfg);
+        let mode = logs
+            .lines()
+            .find(|l| l.contains("tripwires on the VM"))
+            .expect("the mode");
+        assert!(
+            mode.contains("WARN") && mode.contains("traps=\"enforce\""),
+            "{mode}"
+        );
+        let tripping: Vec<&str> = logs
+            .lines()
+            .filter(|l| l.contains("ends the claim"))
+            .collect();
+        assert_eq!(tripping.len(), 3, "{logs}");
+        for class in ["unknown_host", "foreign_route", "audience_outside_rendered"] {
+            assert!(
+                tripping
+                    .iter()
+                    .any(|l| l.contains("WARN") && l.contains(&format!("class=\"{class}\""))),
+                "{class}: {logs}"
+            );
+        }
     }
 
     // ----- ADR-0071: `sub` qualified by upstream issuer ---------------------------------------------------------------

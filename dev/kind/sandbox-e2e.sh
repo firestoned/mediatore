@@ -21,7 +21,10 @@
 # `issuerPrefixes` lists anything, an unlisted issuer is refused and a list that cannot tell
 # its issuers apart admits nothing; `mediatore.io/front-door` is the broker's alone and
 # immutable; a sandbox created by hand naming an issuer outside
-# `sandboxes.declarative_issuers` is Failed by the reconciler. No banlieue controller runs: the claim's status is patched by hand, as in the
+# `sandboxes.declarative_issuers` is Failed by the reconciler. ADR-0069: a sandbox whose record a
+# trap ended (`tripped` patched on the record, as the API writes it) is Failed with
+# `Tripped=True`, its claim deleted and never recreated, and `status.tripwires` is held by the
+# schema under both names. No banlieue controller runs: the claim's status is patched by hand, as in the
 # watcher tier.
 #
 #   sandbox-e2e.sh <admin kubeconfig> <broker SA kubeconfig> <trust domain> <ek pem> <ek hash file>
@@ -438,6 +441,51 @@ alpha_gone() { [ -z "$(sandbox sb-alpha)" ]; }
 wait_for "$TIMEOUT" "agentsandbox sb-alpha gone" alpha_gone
 echo "sb-alpha: created as v1alpha1, read as v1beta1, its claim owned through v1beta1, the spec frozen through either name; deleted"
 
+say "trip (ADR-0069 decision 9): a record a trap ended fails its sandbox with Tripped=True; the sandbox stays and gets no second claim; status.tripwires is served by both versions"
+manifest sb-trip octocat '[]' | admitted "the broker ServiceAccount naming octocat for the trip" "${KSA[@]}" create -f -
+has_trip_claim() { "${K[@]}" -n "$NS" get virtualmachineclaim sb-trip >/dev/null 2>&1; }
+wait_for "$TIMEOUT" "claim sb-trip" has_trip_claim
+TRIP_UID=$("${K[@]}" -n "$NS" get virtualmachineclaim sb-trip -o jsonpath='{.metadata.uid}')
+trip_recorded() { [ "$(field sb-trip '.status.record.claimUid')" = "$TRIP_UID" ]; }
+wait_for "$TIMEOUT" "a record on sb-trip" trip_recorded
+# What the API writes on a trip (`trip::end_claim`): `tripped` on the record, as `Tripped`
+# serialises, under the broker ServiceAccount's name (the status admission policy admits no
+# other; its RBAC has patch on the subresource but not the get kubectl does first, so the
+# group is the admin's).
+KBROKER=("${K[@]}" --as=system:serviceaccount:"$BROKER_NS":mediatore --as-group=system:masters --as-group=system:authenticated)
+# The fold's entry goes through v1alpha1 and is read back through v1beta1, so the API server
+# holds the schema the same under both names and prunes nothing of it.
+NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+"${KBROKER[@]}" -n "$NS" patch agentsandboxes.v1alpha1.mediatore.io sb-trip --subresource=status --type=merge \
+  -p "{\"status\":{\"tripwires\":{\"updatedAt\":\"$NOW\",\"entries\":[{\"effect\":\"tripped\",\"kind\":\"credential\",\"trap\":\"aws\",\"target\":{\"host\":\"git.example\"},\"source\":\"workload\",\"count\":1,\"firstAt\":\"$NOW\",\"lastAt\":\"$NOW\"}]}}}" >/dev/null \
+  || fail "status.tripwires refused through v1alpha1"
+"${K[@]}" -n "$NS" get agentsandboxes.v1beta1.mediatore.io sb-trip -o json \
+  | jq -e '.status.tripwires.entries[0] | .effect == "tripped" and .kind == "credential" and .trap == "aws" and .target.host == "git.example" and .count == 1' >/dev/null \
+  || fail "status.tripwires written as v1alpha1 is not read back whole as v1beta1"
+if out=$("${KBROKER[@]}" -n "$NS" patch agentsandbox sb-trip --subresource=status --type=merge \
+  -p '{"status":{"tripwires":{"entries":[{"effect":"exploded","kind":"credential","source":"workload","count":1,"firstAt":"2026-10-14T10:00:00Z","lastAt":"2026-10-14T10:00:00Z"}]}}}' 2>&1); then
+  fail "a status.tripwires entry with an effect the schema does not have was admitted"
+fi
+echo "$out" | grep -qF 'Unsupported value' || fail "the bad effect was refused, but not by the schema's enum: $out"
+"${KBROKER[@]}" -n "$NS" patch agentsandbox sb-trip --subresource=status --type=merge \
+  -p "{\"status\":{\"record\":{\"tripped\":{\"id\":\"$(cat /proc/sys/kernel/random/uuid)\",\"at\":\"$NOW\",\"recorded_at\":\"$NOW\",\"kind\":\"credential\",\"trap\":\"aws\",\"target\":{\"host\":\"git.example\"},\"source\":\"workload\"}}}}" >/dev/null
+TRIPPED_SB=""
+tripped_failed() {
+  TRIPPED_SB=$(sandbox sb-trip)
+  echo "$TRIPPED_SB" | jq -e '.status.phase == "Failed" and .status.reason == "tripped: credential" and .status.ready != true and ([.status.conditions[]? | select(.type == "Tripped" and .status == "True" and .reason == "credential")] | length == 1)' >/dev/null
+}
+wait_for "$TIMEOUT" "sb-trip Failed with Tripped=True" tripped_failed
+echo "$TRIPPED_SB" | jq -e '.status.record.revokedAt != null and .status.record.tripped.kind == "credential" and .status.tripwires.entries[0].effect == "tripped"' >/dev/null \
+  || fail "the tripped sandbox's record is not released with tripped kept, or its status.tripwires went"
+wait_for "$TIMEOUT" "'sandbox tripped' in the broker log" log_has "sandbox tripped" "$TRIP_UID"
+# The reconciler never deletes the sandbox; the kind config's zero retention (ADR-0034
+# decision 4) sweeps its released record, and the object with it, at the next resync. Until
+# then, and through it, no second claim.
+trip_swept() { has_trip_claim && fail "a tripped sandbox got a second claim"; [ -z "$(sandbox sb-trip)" ]; }
+wait_for "$TIMEOUT" "sb-trip swept with its released record, never claiming again" trip_swept
+log_has "claim swept after its retention" "$TRIP_UID" || fail "sb-trip went without the sweep's audit line"
+echo "sb-trip: tripped on its record, Failed with Tripped=True, claim deleted, record released, never a second claim, swept at retention; status.tripwires served by both versions"
+
 say "delete: the finalizer retracts the entry, deletes the claim, then lets the sandbox go"
 "${K[@]}" -n "$NS" delete agentsandbox sb-e2e --wait=false >/dev/null
 claim_gone() { ! "${K[@]}" -n "$NS" get virtualmachineclaim sb-e2e >/dev/null 2>&1; }
@@ -457,4 +505,4 @@ archived() { broker_logs | grep -F "resync" | grep -qE 'archived=[1-9]'; }
 wait_for "$TIMEOUT" "a resync archiving at least one row" archived
 echo "archived at resync"
 
-say "PASS: ADR-0008, ADR-0034, ADR-0044, ADR-0047, ADR-0049 and ADR-0072 hold against a real cluster (subject policy, the issuer list with no fallback and the broker's mark, owned claim and record on the resource, bind to Ready, a restart on the Kubernetes store, fail-closed audience, the pool selector and its exactly-one rule, the selection strategy carried as written, v1alpha1 served as the same object, finalizer, the retention sweep)"
+say "PASS: ADR-0008, ADR-0034, ADR-0044, ADR-0047, ADR-0049, ADR-0069 and ADR-0072 hold against a real cluster (subject policy, the issuer list with no fallback and the broker's mark, owned claim and record on the resource, bind to Ready, a restart on the Kubernetes store, fail-closed audience, the pool selector and its exactly-one rule, the selection strategy carried as written, v1alpha1 served as the same object, a tripped sandbox failed and never claiming again, finalizer, the retention sweep)"

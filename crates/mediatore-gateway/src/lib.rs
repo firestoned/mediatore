@@ -39,6 +39,7 @@
 #![forbid(unsafe_code)]
 
 pub mod broker;
+pub mod probes;
 pub mod report;
 pub mod serve;
 

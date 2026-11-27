@@ -36,6 +36,7 @@ fn router() -> axum::Router {
 async fn through_proxy(upstream: &TlsUpstream, ca: Option<&str>, min: UpstreamTls) -> u16 {
     mediatore_proto::tls::ensure_provider();
     let route = Route {
+        traps_body: mediatore_proto::trip::TrapsBody::Match,
         audience: None,
         endpoint: upstream.endpoint(),
         rules: vec![],
@@ -114,6 +115,7 @@ async fn allowing_tls12_does_not_downgrade_a_host_that_has_tls13() {
 #[tokio::test]
 async fn an_egress_ca_with_no_certificate_refuses_the_proxy_rather_than_doing_nothing() {
     let route = Route {
+        traps_body: mediatore_proto::trip::TrapsBody::Match,
         audience: None,
         endpoint: "192.0.2.1:443".parse().unwrap(),
         rules: vec![],

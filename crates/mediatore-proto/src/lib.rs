@@ -11,6 +11,7 @@ pub mod cert;
 pub mod ek;
 pub mod image;
 pub mod tls;
+pub mod trip;
 pub mod x509pop;
 
 use jiff::Timestamp;
@@ -907,6 +908,11 @@ pub struct Route {
     /// Absent on every other route.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub pull_only: bool,
+    /// Whether the proxy matches bait in this route's request body (ADR-0069 decision 6):
+    /// `skip` on a route of an audience that carries the agent's own conversation, where only
+    /// the headers, the path and the query count. `match` when absent, and from an older broker.
+    #[serde(default, skip_serializing_if = "trip::TrapsBody::is_match")]
+    pub traps_body: trip::TrapsBody,
 }
 
 impl Route {
@@ -1251,6 +1257,13 @@ pub struct ClaimResponse {
     /// How the workload ended, when its restart policy ended the claim (ADR-0033).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit: Option<WorkloadExit>,
+    /// The trip that ended the claim (ADR-0069 decision 9, ADR-0070 decision 6); absent for a
+    /// claim no trap ended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tripped: Option<trip::Tripped>,
+    /// The claim's trip events, folded (ADR-0069 decision 9); absent when it has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tripwires: Option<trip::TripSummary>,
 }
 
 /// `GET /v1/me`, answered to the in-guest agent over the node SVID.
@@ -1290,6 +1303,11 @@ pub struct Me {
     /// environment with no gateway yet: the jail then reaches what `egress` names directly.
     #[serde(default)]
     pub gateways: Vec<Endpoint>,
+    /// The traps to arm for this claim (ADR-0069 decisions 4, 5 and 10): the mode, what each
+    /// `denied` class does, the deployment's catalogue. Absent under `policy.traps: off` and
+    /// from an older broker: the guest then arms nothing and changes nothing of the jail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traps: Option<trip::TrapsPolicy>,
 }
 
 /// `GET /v1/gateway/claims/{uid}` response (ADR-0028 decision 4): what a gateway may let
@@ -1384,6 +1402,13 @@ pub mod error_code {
     pub const NAMESPACE_REQUIRED: &str = "namespace_required";
     /// A namespace that is not an RFC 1123 label (`400`, ADR-0046 decision 4).
     pub const INVALID_NAMESPACE: &str = "invalid_namespace";
+    /// `POST /v1/me/trip` with a body that is off in any part (`400`, ADR-0069 decision 8).
+    pub const INVALID_TRIP: &str = "invalid_trip";
+    /// `POST /v1/me/trip` beyond the claim's rate (`429` with `Retry-After`).
+    pub const TOO_MANY_TRIPS: &str = "too_many_trips";
+    /// The egress proxy's `403` to the workload for a request that used a trap, and for every
+    /// request after it (ADR-0069 decisions 6 and 7).
+    pub const TRAP: &str = "trap";
     /// `POST /v1/nodes` with an EK hash that is not 64 lowercase hex, or with neither an
     /// attestation nor an `ek_hash` (`400`). The code every broker has answered a bad TPM
     /// registration with.
@@ -1540,6 +1565,11 @@ pub struct GatewayDecisions {
     pub gateway: String,
     /// At most [`MAX_GATEWAY_DECISIONS`].
     pub decisions: Vec<GatewayDecision>,
+    /// The host table's drops read on this gateway since its last batch (ADR-0070 decision 8):
+    /// at most [`trip::MAX_GATEWAY_PROBES`]. Empty, and absent on the wire, from a gateway
+    /// that reads none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub probes: Vec<trip::GatewayProbe>,
 }
 
 /// What kind of check a reported decision answered.
@@ -1593,6 +1623,9 @@ impl GatewayDecisions {
         if self.decisions.len() > MAX_GATEWAY_DECISIONS {
             return Err("more than 256 decisions");
         }
+        if self.probes.len() > trip::MAX_GATEWAY_PROBES {
+            return Err("more than 64 probes");
+        }
         if !gateway_name_ok(&self.gateway) {
             return Err("gateway name is not 1 to 63 of a-z, 0-9, '-' and '.'");
         }
@@ -1610,7 +1643,7 @@ impl GatewayDecisions {
                 return Err("served is not a word");
             }
         }
-        Ok(())
+        self.probes.iter().try_for_each(trip::GatewayProbe::check)
     }
 }
 
@@ -1659,6 +1692,7 @@ mod tests {
     #[test]
     fn a_decision_batch_is_on_the_wire_as_adr_0062_writes_it() {
         let batch = GatewayDecisions {
+            probes: vec![],
             gateway: "gateway-02".into(),
             decisions: vec![decision()],
         };
@@ -1688,6 +1722,7 @@ mod tests {
     fn a_batch_that_could_write_anything_else_into_the_brokers_log_is_refused() {
         let with = |f: &dyn Fn(&mut GatewayDecisions)| {
             let mut b = GatewayDecisions {
+                probes: vec![],
                 gateway: "gateway-02".into(),
                 decisions: vec![decision()],
             };
@@ -1981,6 +2016,7 @@ mod tests {
     #[test]
     fn a_route_without_rules_admits_everything_and_one_with_rules_only_what_they_say() {
         let open = Route {
+            traps_body: trip::TrapsBody::Match,
             audience: Some("internal-git".into()),
             endpoint: "git.home.example:443".parse().unwrap(),
             rules: vec![],
@@ -2357,6 +2393,7 @@ mod tests {
     fn a_gateway_route_says_gateway_on_the_wire_carries_the_inject_port_and_the_proxy_never_swaps_there()
      {
         let route = Route {
+            traps_body: trip::TrapsBody::Match,
             audience: Some("anthropic".into()),
             endpoint: "api.anthropic.example:443".parse().unwrap(),
             rules: vec![rule("POST", "/v1/messages")],

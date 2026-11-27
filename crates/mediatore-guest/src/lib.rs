@@ -19,8 +19,11 @@
 //! only, `--dev-spiffe-id` sends the identity as a header to a loopback `dev_mode` server
 //! instead; release builds have no such path.
 
+pub mod arm;
 pub mod client;
 pub mod confine;
+pub mod decoy;
+pub mod draw;
 pub mod egress;
 pub mod forward;
 pub mod guest;
@@ -35,6 +38,9 @@ pub mod redact;
 pub mod report;
 pub mod sandboxfs;
 pub mod seccomp;
-mod supervise;
+pub mod segment;
+pub mod supervise;
 pub mod token;
+pub mod trapmatch;
+pub mod trip;
 mod user;

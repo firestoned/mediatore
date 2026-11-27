@@ -19,6 +19,9 @@
 use std::collections::BTreeMap;
 
 use jiff::{SignedDuration, Timestamp};
+use mediatore_proto::trip::{
+    TripEffect, TripEntry, TripKind, TripSource, TripSummary, TripTarget, Tripped,
+};
 use mediatore_proto::{Subject, Workload};
 use uuid::Uuid;
 
@@ -77,6 +80,21 @@ macro_rules! shared_suite {
     };
 }
 
+/// One `#[tokio::test]` per case of `tripped` and the trip summary (ADR-0069 decision 9),
+/// each over a fresh fixture from `$make`. Apart from [`shared_suite!`] so that a store can
+/// take the storage contract of ADR-0057 before it takes this one.
+#[macro_export]
+macro_rules! shared_trip_suite {
+    ($make:expr) => {
+        $crate::shared_suite!(@each $make;
+            tripped_round_trips_on_the_record,
+            a_fold_on_a_released_claim_is_kept,
+            the_last_claim_of_a_node_is_found_after_its_release,
+            a_fold_for_an_unknown_claim_is_not_found,
+        );
+    };
+}
+
 /// A whole second: a Kubernetes `Time` keeps no more.
 fn at(secs: i64) -> Timestamp {
     Timestamp::from_second(1_700_000_000 + secs).unwrap()
@@ -118,6 +136,7 @@ fn record(uid: Uuid) -> ClaimRecord {
         bundle_version: None,
         report: None,
         exit: None,
+        tripped: None,
         delegations: BTreeMap::new(),
         version: None,
     }
@@ -563,4 +582,187 @@ pub async fn modify_claim_gives_up_after_its_attempts_with_a_conflict(f: &dyn Fi
     let got = s.get_claim(uid).await.unwrap();
     assert!(got.entry_id.is_none(), "nothing of the loser was written");
     assert_eq!(got.node_id.as_deref(), Some("node-other"));
+}
+
+/// What a record keeps of a trip: a credential trap used towards a routed host.
+fn tripped_at(secs: i64) -> Tripped {
+    Tripped {
+        id: Uuid::new_v4(),
+        at: at(secs),
+        recorded_at: at(secs + 1),
+        kind: TripKind::Credential,
+        trap: Some("aws".into()),
+        class: None,
+        target: Some(TripTarget::Host("git.example".into())),
+        source: TripSource::Workload,
+    }
+}
+
+/// One entry of a summary: a decoy port, used `count` times at `secs`.
+fn trip_entry(effect: TripEffect, port: u16, secs: i64, count: u64) -> TripEntry {
+    TripEntry {
+        effect,
+        kind: TripKind::Port,
+        trap: Some("redis".into()),
+        class: None,
+        target: Some(TripTarget::Port(port)),
+        source: TripSource::Drawn,
+        source_address: None,
+        containment_ms: None,
+        count,
+        first_at: at(secs),
+        last_at: at(secs),
+    }
+}
+
+/// ADR-0069 decision 9: `tripped` is a field of the record, kept field for field by an update
+/// and by the release that follows it, and absent on a record no trap ended.
+pub async fn tripped_round_trips_on_the_record(f: &dyn Fixture) {
+    let s = f.store();
+    let (uid, _) = stored(f, record(Uuid::new_v4())).await;
+    let mut rec = s.get_claim(uid).await.unwrap();
+    assert!(rec.tripped.is_none(), "a new record is not tripped");
+    let tripped = tripped_at(10);
+    rec.tripped = Some(tripped.clone());
+    s.update_claim(rec).await.unwrap();
+    let read = s.get_claim(uid).await.unwrap();
+    assert!(
+        read.tripped.as_ref() == Some(&tripped),
+        "the trip is kept on the record"
+    );
+    s.revoke_claim(uid, at(12)).await.unwrap();
+    let released = s.get_claim(uid).await.unwrap();
+    assert!(
+        released.revoked_at.is_some() && released.tripped == Some(tripped),
+        "the release keeps the trip"
+    );
+}
+
+/// ADR-0069 decision 9: the summary is apart from the record. A fold lands on a live claim
+/// and sets nothing on its record, lands on a released one all the same (a second trip report
+/// is recorded on the status only), and two folds add up.
+pub async fn a_fold_on_a_released_claim_is_kept(f: &dyn Fixture) {
+    let s = f.store();
+    let (uid, _) = stored(f, record(Uuid::new_v4())).await;
+    assert!(
+        s.trips(uid).await.unwrap().is_none(),
+        "a claim nothing was folded for has no summary"
+    );
+    s.fold_trips(
+        uid,
+        &[trip_entry(TripEffect::WouldTrip, 6379, 10, 2)],
+        at(11),
+    )
+    .await
+    .unwrap();
+    let after = s.get_claim(uid).await.unwrap();
+    assert!(
+        after.tripped.is_none() && after.revoked_at.is_none(),
+        "a fold sets nothing on the record"
+    );
+
+    s.revoke_claim(uid, at(20)).await.unwrap();
+    s.fold_trips(
+        uid,
+        &[
+            trip_entry(TripEffect::WouldTrip, 6379, 30, 3),
+            trip_entry(TripEffect::Tripped, 22, 31, 1),
+        ],
+        at(32),
+    )
+    .await
+    .unwrap();
+    let mut expected = TripSummary::default();
+    expected.fold(&[trip_entry(TripEffect::WouldTrip, 6379, 10, 2)], at(11));
+    expected.fold(
+        &[
+            trip_entry(TripEffect::WouldTrip, 6379, 30, 3),
+            trip_entry(TripEffect::Tripped, 22, 31, 1),
+        ],
+        at(32),
+    );
+    let held = s.trips(uid).await.unwrap().expect("a summary");
+    assert!(held == expected, "both folds are in the summary, merged");
+    assert!(held.entries.len() == 2 && held.entries[1].count == 5);
+    assert!(
+        s.get_claim(uid).await.unwrap().revoked_at == Some(at(20)),
+        "a fold changes nothing of a released record"
+    );
+    // An empty delta is a no-op, not an error and not a write.
+    s.fold_trips(uid, &[], at(40)).await.unwrap();
+    assert!(
+        s.trips(uid).await.unwrap() == Some(expected),
+        "an empty delta changes nothing"
+    );
+}
+
+/// ADR-0069 decision 9: a trip report can arrive after its claim ended, so the newest claim a
+/// node was ever bound to is found whether it is live or not, where the lookup of a live
+/// claim finds nothing.
+pub async fn the_last_claim_of_a_node_is_found_after_its_release(f: &dyn Fixture) {
+    let s = f.store();
+    let node = "spiffe://sandbox.test/spire/agent/tpm/ek-last";
+    let absent = matches!(
+        s.last_claim_by_node(node).await,
+        Err(StoreError::NotFound(_))
+    );
+    assert!(absent, "a node that never had a claim has no last claim");
+
+    let far = Timestamp::now() + SignedDuration::from_hours(1);
+    let bind = |secs: i64| {
+        let mut rec = record(Uuid::new_v4());
+        rec.created_at = at(secs);
+        rec.node_id = Some(node.into());
+        rec.expires_at = Some(far);
+        rec
+    };
+    let (old, _) = stored(f, bind(0)).await;
+    assert!(
+        s.last_claim_by_node(node).await.unwrap().uid == old,
+        "a live claim is its node's last"
+    );
+    s.revoke_claim(old, at(5)).await.unwrap();
+    let live = s.get_claim_by_node(node).await;
+    assert!(
+        matches!(live, Err(StoreError::NotFound(_))),
+        "the released claim is not the node's live one"
+    );
+    let last = s.last_claim_by_node(node).await.unwrap();
+    assert!(
+        last.uid == old && last.revoked_at.is_some() && last.version.is_some(),
+        "and it is still the node's last, read with its version"
+    );
+
+    // A newer claim on the same node wins, live or released; another node's never does.
+    let (new, _) = stored(f, bind(60)).await;
+    let mut other = bind(120);
+    other.node_id = Some("spiffe://sandbox.test/spire/agent/tpm/ek-other".into());
+    stored(f, other).await;
+    assert!(
+        s.last_claim_by_node(node).await.unwrap().uid == new,
+        "the newer claim is the node's last"
+    );
+    s.revoke_claim(new, at(65)).await.unwrap();
+    assert!(
+        s.last_claim_by_node(node).await.unwrap().uid == new,
+        "and stays it once released"
+    );
+}
+
+/// A fold names a claim the store holds: for any other it is `NotFound`, and nothing is kept
+/// under a uid a caller made up.
+pub async fn a_fold_for_an_unknown_claim_is_not_found(f: &dyn Fixture) {
+    let s = f.store();
+    let unknown = Uuid::new_v4();
+    let refused = matches!(
+        s.fold_trips(
+            unknown,
+            &[trip_entry(TripEffect::WouldTrip, 6379, 10, 1)],
+            at(11)
+        )
+        .await,
+        Err(StoreError::NotFound(_))
+    );
+    assert!(refused, "a fold for a claim with no record is not found");
+    assert!(s.trips(unknown).await.unwrap().is_none());
 }

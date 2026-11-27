@@ -38,6 +38,17 @@
 //! gateway answered the tunnel with the environment's no (the authorizer's code is logged),
 //! `gateway_unreachable` when no gateway carried it. Nothing but the audience, the host,
 //! the method, the path, the gateway and the status is logged.
+//!
+//! With `--trap-socket` the proxy is armed (ADR-0069): the guest hands it the claim's drawn
+//! decoy routes and bait values over a unix socket, and every request is checked before any
+//! upstream is opened. A host that is a decoy route, or bait in the path, the query or any
+//! header, is `403 trap` and a trip told to the guest; a host that is no route is the same `404`
+//! as ever and a `denied` event; a request body on a route that is not marked `traps_body: skip`
+//! is streamed through the matcher ([`crate::trapmatch::ScanBody`]), which never forwards a
+//! complete bait value. Under `shadow` every use is told to the guest and everything is
+//! forwarded as it came. After a trip under `enforce` every request is `403 trap`. Without the
+//! socket nothing of this exists and the proxy is what it was. The query is in no log line, and
+//! a request a trap matched logs no path (decision 12).
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
@@ -52,6 +63,10 @@ use hyper::body::{Bytes, Incoming};
 use hyper_util::rt::TokioIo;
 use jiff::{SignedDuration, Timestamp};
 use mediatore_proto::tls::UpstreamTls;
+use mediatore_proto::trip::{
+    ClassAction, GuestToProxy, ProxyToGuest, ProxyTraps, ProxyTrip, TRAP_FRAME_MAX, TrapsBody,
+    TripClass, TripKind, TripMode,
+};
 use mediatore_proto::{Endpoint, Route, TokenRequest, TokenResponse};
 use rustls::pki_types::ServerName;
 use tokio::io::AsyncBufReadExt as _;
@@ -59,6 +74,9 @@ use tokio::net::TcpListener;
 
 use crate::client::SandboxClient;
 use crate::forward::{DialError, Dialer, Forwarder};
+use crate::trapmatch::{
+    Encoding, Hit, HitSink, Matcher, ScanBody, TRAP_EXPANSION, TRAP_UNDECODABLE, encoding_of,
+};
 
 /// The proxy's loopback port unless the guest is told otherwise.
 pub const DEFAULT_PORT: u16 = 3128;
@@ -124,6 +142,10 @@ pub struct EgressArgs {
     /// not 443).
     #[arg(long, requires = "pull_listen")]
     pub pull_host: Option<String>,
+    /// The guest's trap socket (ADR-0069 decision 7): the proxy connects, is handed the claim's drawn traps, and
+    /// reports ready only once its matcher is built. Absent, the proxy holds no trap and is what it was.
+    #[arg(long, value_name = "PATH")]
+    pub trap_socket: Option<PathBuf>,
 }
 
 /// The trust the guest hands the proxy for upstreams that carry no CA of their own.
@@ -686,14 +708,475 @@ pub struct Proxy {
     /// CA and nothing else (decision 7); keyed by the endpoint since a route without a
     /// credential may carry one too and names no audience (decision 8).
     tls_by_endpoint: HashMap<Endpoint, Arc<rustls::ClientConfig>>,
+    /// The claim's traps (ADR-0069), when the guest armed the proxy; `None` under `off`.
+    traps: Option<Arc<Traps>>,
 }
 
 type Body = BoxBody<Bytes, hyper::Error>;
+
+/// What a request body's error is to a client connection of hyper's.
+type BodyError = Box<dyn std::error::Error + Send + Sync>;
 
 /// `tls` with HTTP/1.1 as the one application protocol.
 fn http1_only(mut tls: rustls::ClientConfig) -> Arc<rustls::ClientConfig> {
     tls.alpn_protocols = vec![b"http/1.1".to_vec()];
     Arc::new(tls)
+}
+
+/// How long the proxy waits for the trap socket to accept, and then for the guest's `arm`.
+const ARM_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+/// How many messages for the guest may wait for the socket.
+const TRAP_QUEUE: usize = 1024;
+/// What stands for a host outside the report's grammar (RFC 2606's reserved name): the use is
+/// still told, and nothing the workload chose outside the grammar is.
+const HOST_OUTSIDE_THE_GRAMMAR: &str = "invalid";
+/// The code of the `404` a host outside the routes gets.
+const NO_ROUTE: &str = "no_route";
+
+/// The claim's drawn traps as the proxy checks them (ADR-0069 decisions 2 and 6): the decoy
+/// routes by host and the matcher over every bait value. Built from what the guest handed
+/// over; it prints nothing of it.
+pub struct TrapPlan {
+    mode: TripMode,
+    unknown_host: ClassAction,
+    /// A decoy route's host, lower case, to the decoy's name.
+    decoys: HashMap<String, String>,
+    matcher: Arc<Matcher>,
+}
+
+impl std::fmt::Debug for TrapPlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never a decoy's host or a pattern: they are the draw.
+        f.debug_struct("TrapPlan")
+            .field("mode", &self.mode)
+            .field("patterns", &self.matcher.patterns())
+            .finish_non_exhaustive()
+    }
+}
+
+impl TrapPlan {
+    /// The plan for `drawn` beside the claim's real `routes`.
+    ///
+    /// # Errors
+    /// The matcher could not be built, or a decoy route is one of the claim's routes: the
+    /// proxy cannot be armed, so it never reports ready and under `enforce` no jail starts
+    /// (ADR-0069 decision 5). The error names nothing of the draw.
+    pub fn new(drawn: &ProxyTraps, routes: &Routes) -> anyhow::Result<Self> {
+        Self::with_matcher(drawn, routes, Matcher::new(&drawn.bait))
+    }
+
+    /// [`Self::new`] with the matcher already built from `drawn`'s bait.
+    fn with_matcher(drawn: &ProxyTraps, routes: &Routes, matcher: Matcher) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            matcher.built(),
+            "the bait matcher could not be built: the proxy cannot be armed (ADR-0069 decision 5)"
+        );
+        let mut decoys = HashMap::new();
+        for decoy in &drawn.routes {
+            let host = decoy.host.to_ascii_lowercase();
+            anyhow::ensure!(
+                !routes.by_host.keys().any(|h| h.eq_ignore_ascii_case(&host)),
+                "a decoy route is one of the claim's routes: the proxy cannot be armed (ADR-0069 decision 3)"
+            );
+            decoys.insert(host, decoy.name.clone());
+        }
+        Ok(Self {
+            mode: drawn.mode,
+            unknown_host: drawn.unknown_host,
+            decoys,
+            matcher: Arc::new(matcher),
+        })
+    }
+
+    /// How many patterns the matcher holds: what the `armed` message says.
+    #[must_use]
+    pub fn patterns(&self) -> u32 {
+        self.matcher.patterns()
+    }
+
+    /// The mode the guest armed the proxy under.
+    #[must_use]
+    pub fn mode(&self) -> TripMode {
+        self.mode
+    }
+}
+
+/// What both ends of a [`TrapLink`] share.
+struct LinkState {
+    /// A trip under `enforce`, or the link gone: every request is `403 trap` from here.
+    tripped: std::sync::atomic::AtomicBool,
+    closed: tokio::sync::watch::Sender<bool>,
+    /// Uses that could not be queued under `shadow`.
+    unsent: std::sync::atomic::AtomicU64,
+}
+
+impl LinkState {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            tripped: std::sync::atomic::AtomicBool::new(false),
+            closed: tokio::sync::watch::channel(false).0,
+            unsent: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+
+    /// The guest can be told nothing more: the proxy treats itself as tripped, and whoever
+    /// waits on [`TrapLink::closed`] ends it (ADR-0069 decision 7; fail closed).
+    fn close(&self, why: &'static str) {
+        self.tripped
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        if !self.closed.send_replace(true) {
+            tracing::error!(
+                why,
+                "the trap socket is closed: every request is 403 trap from here and the proxy ends, and the claim with it (ADR-0069 decision 7)"
+            );
+        }
+    }
+}
+
+/// The proxy's end of the guest's trap socket (ADR-0069 decision 7), once armed: every use of
+/// a trap is queued on it and written to the guest. When the socket closes the proxy treats
+/// itself as tripped.
+#[derive(Clone)]
+pub struct TrapLink {
+    tx: tokio::sync::mpsc::Sender<ProxyToGuest>,
+    state: Arc<LinkState>,
+}
+
+impl std::fmt::Debug for TrapLink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TrapLink")
+            .field("tripped", &self.is_tripped())
+            .finish_non_exhaustive()
+    }
+}
+
+/// The trap socket connected and the draw read, before the proxy has said it is armed.
+#[derive(Debug)]
+pub struct PendingLink {
+    reader: tokio::io::BufReader<tokio::net::unix::OwnedReadHalf>,
+    write: tokio::net::unix::OwnedWriteHalf,
+}
+
+impl TrapLink {
+    /// Connect to the guest's trap socket at `path` and read the one `arm` message it sends:
+    /// the claim's drawn traps, and the connection to answer on.
+    ///
+    /// # Errors
+    /// No socket, no `arm` within the wait, or a first message that is not one: the proxy is
+    /// not armed and must not report ready. The error carries nothing of the message.
+    pub async fn connect(path: &Path) -> anyhow::Result<(ProxyTraps, PendingLink)> {
+        let stream = tokio::time::timeout(ARM_WAIT, tokio::net::UnixStream::connect(path))
+            .await
+            .map_err(|_| anyhow::anyhow!("the trap socket {} did not accept", path.display()))?
+            .map_err(|e| anyhow::anyhow!("the trap socket {}: {e}", path.display()))?;
+        let (read, write) = stream.into_split();
+        let mut reader = tokio::io::BufReader::new(read);
+        let frame = tokio::time::timeout(ARM_WAIT, crate::trip::read_frame(&mut reader))
+            .await
+            .map_err(|_| anyhow::anyhow!("the guest sent no `arm` on the trap socket"))?;
+        let Ok(Some(frame)) = frame else {
+            anyhow::bail!(
+                "the trap socket closed before the guest's `arm` (only the first connection of the sandbox uid is armed)"
+            );
+        };
+        // Never a byte of the frame in an error: it is the draw.
+        let Ok(GuestToProxy::Arm(drawn)) = serde_json::from_slice(&frame) else {
+            anyhow::bail!("the guest's first message on the trap socket is not an `arm`");
+        };
+        Ok((drawn, PendingLink { reader, write }))
+    }
+
+    /// A link whose messages come out of the receiver instead of going to a socket: for a
+    /// harness that stands where the guest does. Dropping the receiver closes the link.
+    #[must_use]
+    pub fn channel() -> (Self, tokio::sync::mpsc::Receiver<ProxyToGuest>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(TRAP_QUEUE);
+        (
+            Self {
+                tx,
+                state: LinkState::new(),
+            },
+            rx,
+        )
+    }
+
+    /// Whether the proxy forwards nothing more: a trip under `enforce`, or the link gone.
+    #[must_use]
+    pub fn is_tripped(&self) -> bool {
+        self.state.tripped.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Resolves when the guest can be told nothing more (the socket closed, a write failed,
+    /// a use under `enforce` could not be queued): the proxy must end.
+    pub async fn closed(&self) {
+        let mut closed = self.state.closed.subscribe();
+        if closed.wait_for(|gone| *gone).await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+impl PendingLink {
+    /// Answer `armed` with the number of patterns the matcher holds, and start relaying. The
+    /// proxy prints its ready line only after this returns.
+    ///
+    /// # Errors
+    /// The answer could not be written: the guest does not know the proxy is armed.
+    pub async fn armed(mut self, patterns: u32) -> anyhow::Result<TrapLink> {
+        use tokio::io::AsyncWriteExt as _;
+        let mut line = serde_json::to_vec(&ProxyToGuest::Armed { patterns })?;
+        line.push(b'\n');
+        self.write
+            .write_all(&line)
+            .await
+            .map_err(|e| anyhow::anyhow!("answering `armed` on the trap socket: {e}"))?;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ProxyToGuest>(TRAP_QUEUE);
+        let state = LinkState::new();
+        let (mut write, mut reader) = (self.write, self.reader);
+        let writing = state.clone();
+        tokio::spawn(async move {
+            while let Some(message) = rx.recv().await {
+                let Ok(mut line) = serde_json::to_vec(&message) else {
+                    writing.close("a message could not be written out");
+                    return;
+                };
+                line.push(b'\n');
+                if line.len() > TRAP_FRAME_MAX || write.write_all(&line).await.is_err() {
+                    writing.close("a write failed");
+                    return;
+                }
+            }
+        });
+        let reading = state.clone();
+        tokio::spawn(async move {
+            // After `arm` the guest says one thing, that it decided a trip: from then on
+            // nothing more is forwarded, ahead of the cut, and the proxy stays up for the kill.
+            // Anything else is dropped, and the end of the stream is the guest gone.
+            while let Ok(Some(frame)) = crate::trip::read_frame(&mut reader).await {
+                if let Ok(GuestToProxy::Tripped) = serde_json::from_slice(&frame)
+                    && !reading
+                        .tripped
+                        .swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    tracing::error!(
+                        "the guest decided a trip: every request is 403 trap from here (ADR-0069 decision 7)"
+                    );
+                }
+            }
+            reading.close("the guest closed it");
+        });
+        Ok(TrapLink { tx, state })
+    }
+}
+
+/// An armed proxy's traps and the way to the guest.
+struct Traps {
+    plan: TrapPlan,
+    link: TrapLink,
+}
+
+impl Traps {
+    fn enforcing(&self) -> bool {
+        self.plan.mode == TripMode::Enforce
+    }
+
+    /// Tell the guest of one use, with the proxy's clock at its verdict. `ends`: under
+    /// `enforce` this use ends the sandbox, so the proxy forwards nothing from this instant,
+    /// before the guest has even read the message. A use that cannot be queued under
+    /// `enforce` closes the link (fail closed); under `shadow` it is counted.
+    fn tell(
+        &self,
+        kind: TripKind,
+        trap: Option<&str>,
+        class: Option<TripClass>,
+        host: &str,
+        ends: bool,
+    ) {
+        use std::sync::atomic::Ordering;
+        if ends && self.enforcing() {
+            self.link.state.tripped.store(true, Ordering::SeqCst);
+        }
+        // The second line of S4: a target in which the matcher finds a bait value, in any
+        // case, is never told.
+        let host = if self.plan.matcher.in_name(host.as_bytes()).is_some() {
+            HOST_OUTSIDE_THE_GRAMMAR
+        } else {
+            host
+        };
+        let message = ProxyToGuest::Trip(ProxyTrip {
+            at: Timestamp::now(),
+            kind,
+            trap: trap.map(ToOwned::to_owned),
+            class,
+            host: host.to_owned(),
+        });
+        if self.link.tx.try_send(message).is_err() {
+            if self.enforcing() {
+                self.link
+                    .state
+                    .close("a use could not be queued for the guest");
+            } else {
+                let unsent = self.link.state.unsent.fetch_add(1, Ordering::Relaxed) + 1;
+                if unsent.is_power_of_two() {
+                    tracing::warn!(
+                        unsent,
+                        "uses of traps are not told to the guest: its socket takes no more"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The first path segment of a request, which names the host ([`judge_headers`] reads it the
+/// same way).
+fn host_segment(path_and_query: &str) -> &str {
+    let rest = path_and_query.strip_prefix('/').unwrap_or(path_and_query);
+    rest.find(['/', '?']).map_or(rest, |i| &rest[..i])
+}
+
+/// The host a segment names, lower case, without its port and without an address's brackets.
+fn segment_host(segment: &str) -> String {
+    let host = if let Some(inner) = segment.strip_prefix('[') {
+        inner.split(']').next().unwrap_or(inner)
+    } else {
+        match segment.split_once(':') {
+            Some((host, port)) if !port.contains(':') => host,
+            _ => segment,
+        }
+    };
+    host.to_ascii_lowercase()
+}
+
+/// `host` as a report may carry it (`TripTarget::Host`'s grammar: a lower-case name or an
+/// address, at most 253 bytes), or `invalid`: never a path, never anything else the workload
+/// chose.
+fn reportable_host(host: &str) -> &str {
+    let name = !host.is_empty()
+        && host.len() <= mediatore_proto::trip::MAX_TARGET_HOST_BYTES
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'-'));
+    let v6 = host.parse::<std::net::Ipv6Addr>().is_ok()
+        && host
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f' | b':' | b'.'));
+    if name || v6 {
+        host
+    } else {
+        HOST_OUTSIDE_THE_GRAMMAR
+    }
+}
+
+/// The method a log line may carry: a standard one by its name, and `extension` for any
+/// other, which is a token the workload chose and could be a bait value (S3 of the review).
+fn method_for_log(method: &http::Method) -> &str {
+    let standard = [
+        http::Method::GET,
+        http::Method::HEAD,
+        http::Method::POST,
+        http::Method::PUT,
+        http::Method::DELETE,
+        http::Method::PATCH,
+        http::Method::OPTIONS,
+        http::Method::CONNECT,
+        http::Method::TRACE,
+    ];
+    if standard.contains(method) {
+        method.as_str()
+    } else {
+        "extension"
+    }
+}
+
+/// The path a log line may carry: never its query, which can carry what the workload put in
+/// it, and none at all for a request a trap matched (ADR-0069 decision 12).
+fn path_for_log(path_and_query: &str, trapped: bool) -> Option<&str> {
+    if trapped {
+        None
+    } else {
+        Some(path_and_query.split('?').next().unwrap_or("/"))
+    }
+}
+
+/// The `403` a request that used a trap gets, and every request after a trip.
+fn trap_refusal() -> Response<Body> {
+    refuse(&Refusal::new(
+        StatusCode::FORBIDDEN,
+        mediatore_proto::error_code::TRAP,
+    ))
+}
+
+/// What the trap checks made of a request's head, before anything else is read of it.
+enum Trapped {
+    /// No trap, or no traps at all.
+    No,
+    /// Bait in the head under `shadow`: told to the guest, and the request goes on.
+    Matched,
+    /// Not forwarded: this is the answer.
+    Refuse(Response<Body>),
+}
+
+/// Why a scanned request body stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BodyStop {
+    /// A bait value completed in it.
+    Bait,
+    /// A compressed body passed the expansion bound.
+    Expansion,
+    /// A body that is not what its `Content-Encoding` says.
+    Undecodable,
+}
+
+impl BodyStop {
+    /// What the workload gets when the response had not started.
+    fn refusal(self) -> Refusal {
+        match self {
+            Self::Bait => Refusal::new(StatusCode::FORBIDDEN, mediatore_proto::error_code::TRAP),
+            Self::Expansion => Refusal::new(StatusCode::PAYLOAD_TOO_LARGE, "body_expansion"),
+            Self::Undecodable => Refusal::new(StatusCode::BAD_REQUEST, "body_undecodable"),
+        }
+    }
+}
+
+/// What the trap checks know of one request while it is forwarded.
+#[derive(Default)]
+struct Guard {
+    /// A trap matched in the head (under `shadow`, or the request would not be here): its
+    /// path is in no log line.
+    trapped: bool,
+    /// Set by the body's matcher when it stops the body.
+    body: Option<Arc<std::sync::OnceLock<BodyStop>>>,
+}
+
+impl Guard {
+    /// Whether a trap matched this request so far, in its head or in its body: from then on
+    /// its path is in no log line (the plan's D7). Asked when the line is written, so a body
+    /// scanned to its end under `shadow` before the upstream answered counts.
+    fn trapped_now(&self) -> bool {
+        self.trapped
+            || self
+                .body
+                .as_ref()
+                .and_then(|verdict| verdict.get())
+                .is_some_and(|stop| *stop == BodyStop::Bait)
+    }
+
+    /// The answer for a request whose body the matcher stopped before a response came.
+    fn stopped(&self) -> Option<Response<Body>> {
+        let stop = self.body.as_ref()?.get()?;
+        Some(refuse(&stop.refusal()))
+    }
+}
+
+/// A request after the body's guard.
+enum Guarded {
+    /// Forwarded as it came: no traps, a `traps_body: skip` route, or no body.
+    Plain(Request<Incoming>, Guard),
+    /// The body goes through the matcher.
+    Scanned(Box<Request<ScanBody<Incoming>>>, Guard),
+    /// Not forwarded.
+    Refused(Response<Body>),
 }
 
 impl Proxy {
@@ -743,7 +1226,17 @@ impl Proxy {
             dialer,
             tls: http1_only(tls),
             tls_by_endpoint,
+            traps: None,
         })
+    }
+
+    /// Arm this proxy with the claim's traps (ADR-0069): from here every request is checked
+    /// against `plan` before any upstream is opened, and every use is told to the guest over
+    /// `link`.
+    #[must_use]
+    pub fn with_traps(mut self, plan: TrapPlan, link: TrapLink) -> Self {
+        self.traps = Some(Arc::new(Traps { plan, link }));
+        self
     }
 
     /// The production trust for routes without a CA: TLS 1.3 to the Mozilla roots, like
@@ -829,9 +1322,19 @@ impl Proxy {
 
     /// One request from the jail: judged, rewritten, forwarded, relayed.
     pub async fn handle(&self, req: Request<Incoming>) -> Response<Body> {
+        // After a trip nothing more is forwarded, whatever is asked (ADR-0069 decision 7).
+        if self.is_tripped() {
+            return trap_refusal();
+        }
         let method = req.method().clone();
         let Some(path_and_query) = req.uri().path_and_query().map(ToString::to_string) else {
             return refuse(&Refusal::new(StatusCode::BAD_REQUEST, "bad_request"));
+        };
+        // The traps come before everything else and before any log line (decisions 6 and 12).
+        let trapped = match self.check_traps(&method, &path_and_query, req.headers()) {
+            Trapped::Refuse(answer) => return answer,
+            Trapped::Matched => true,
+            Trapped::No => false,
         };
         let forward = match judge_headers(
             &self.routes,
@@ -842,32 +1345,203 @@ impl Proxy {
         ) {
             Ok(f) => f,
             Err(r) => {
-                tracing::warn!(%method, path = %path_and_query, status = %r.status, code = r.code, "request refused");
+                if r.code == NO_ROUTE {
+                    self.tell_unknown_host(&path_and_query, trapped);
+                }
+                tracing::warn!(method = method_for_log(&method), path = path_for_log(&path_and_query, trapped).map(tracing::field::display), status = %r.status, code = r.code, "request refused");
                 return refuse(&r);
             }
         };
         if forward.route.pull_only {
             // A registry audience's route (ADR-0063 decision 5): the puller's, through the pull listener, never the
             // workload's. The workload cannot fetch further images.
-            tracing::warn!(audience = forward.route.audience_label(), host = %forward.route.endpoint, %method, "a pull-only route asked from the jail; refused");
+            tracing::warn!(audience = forward.route.audience_label(), host = %forward.route.endpoint, method = method_for_log(&method), "a pull-only route asked from the jail; refused");
             return refuse(&Refusal::new(StatusCode::NOT_FOUND, "pull_only"));
         }
-        if forward.route.placed_at_gateway() {
-            return self.handle_at_gateway(req, &forward).await;
+        match self.guard_body(req, forward.route, trapped) {
+            Guarded::Refused(answer) => answer,
+            Guarded::Plain(req, guard) => self.dispatch(req, forward, &guard).await,
+            Guarded::Scanned(req, guard) => self.dispatch(*req, forward, &guard).await,
         }
-        self.handle_tunnelled(req, forward).await
+    }
+
+    /// Whether this proxy forwards nothing more: a trip under `enforce`, or its trap socket
+    /// gone. Never true without traps.
+    fn is_tripped(&self) -> bool {
+        self.traps.as_ref().is_some_and(|t| t.link.is_tripped())
+    }
+
+    /// The checks on a request's head (ADR-0069 decision 6), before any route is consulted,
+    /// any name resolved or any upstream opened: a host that is a decoy route, then bait in the
+    /// path, the query or any header. Each use is told to the guest. Under `enforce` the answer
+    /// is `403 trap`; under `shadow` a decoy route gets what an unknown host gets and a request
+    /// with bait goes on.
+    fn check_traps(
+        &self,
+        method: &http::Method,
+        path_and_query: &str,
+        headers: &http::HeaderMap,
+    ) -> Trapped {
+        let Some(traps) = &self.traps else {
+            return Trapped::No;
+        };
+        let mode = traps.plan.mode.as_str();
+        let segment = host_segment(path_and_query);
+        let host = segment_host(segment);
+        if let Some(name) = traps.plan.decoys.get(&host) {
+            traps.tell(TripKind::Route, Some(name), None, &host, true);
+            tracing::warn!(kind = "route", trap = %name, %host, mode, "a decoy route was named at the proxy: nothing is forwarded, resolved or tunnelled (ADR-0069)");
+            return Trapped::Refuse(if traps.enforcing() {
+                trap_refusal()
+            } else {
+                refuse(&Refusal::new(StatusCode::NOT_FOUND, NO_ROUTE))
+            });
+        }
+        let matcher = &traps.plan.matcher;
+        let Some(hit) = matcher
+            .in_method(method.as_str())
+            .or_else(|| matcher.in_head(path_and_query, headers))
+        else {
+            return Trapped::No;
+        };
+        // The target is the host of the route the request named (decision 8). A request that
+        // names no route names its host itself, and that is the workload's own text, the bait
+        // perhaps: the target is then `invalid` (S4 of the review, decision 12).
+        let host = self.routes.resolve(segment).map_or_else(
+            || HOST_OUTSIDE_THE_GRAMMAR.to_owned(),
+            |route| route.endpoint.host.to_ascii_lowercase(),
+        );
+        traps.tell(TripKind::Credential, Some(&hit.trap), None, &host, true);
+        tracing::warn!(kind = "credential", trap = %hit.trap, %host, mode, "bait in a request's method, path, query or headers at the proxy (ADR-0069)");
+        if traps.enforcing() {
+            Trapped::Refuse(trap_refusal())
+        } else {
+            Trapped::Matched
+        }
+    }
+
+    /// A request for a host that is no route (ADR-0069 decision 10): the `denied` class
+    /// `unknown_host`, told to the guest, which decides by the class's switch. The request's
+    /// own answer is not changed. A request that names no host at all is not a use. When a
+    /// trap matched the request (`trapped`, under `shadow`) its host may be the bait itself:
+    /// the target is then `invalid`.
+    fn tell_unknown_host(&self, path_and_query: &str, trapped: bool) {
+        let Some(traps) = &self.traps else {
+            return;
+        };
+        let host = segment_host(host_segment(path_and_query));
+        if host.is_empty() {
+            return;
+        }
+        traps.tell(
+            TripKind::Denied,
+            None,
+            Some(TripClass::UnknownHost),
+            if trapped {
+                HOST_OUTSIDE_THE_GRAMMAR
+            } else {
+                reportable_host(&host)
+            },
+            traps.plan.unknown_host == ClassAction::Trip,
+        );
+    }
+
+    /// The body's guard (ADR-0069 decision 6): on a route whose body is matched, the body is
+    /// wrapped in the matcher, which yields only bytes that can no longer be part of a bait
+    /// value. A `traps_body: skip` route (the agent's own conversation) and a request with no
+    /// body are forwarded as they came. An encoding the matcher cannot read is `415` under
+    /// `enforce`, and under `shadow` forwarded unscanned and logged.
+    fn guard_body(&self, req: Request<Incoming>, route: &Route, trapped: bool) -> Guarded {
+        use hyper::body::Body as _;
+        let plain = Guard {
+            trapped,
+            body: None,
+        };
+        let Some(traps) = &self.traps else {
+            return Guarded::Plain(req, plain);
+        };
+        if route.traps_body == TrapsBody::Skip || req.body().is_end_stream() {
+            return Guarded::Plain(req, plain);
+        }
+        let encoding = encoding_of(req.headers());
+        if encoding == Encoding::Unsupported {
+            tracing::warn!(audience = route.audience_label(), host = %route.endpoint, mode = traps.plan.mode.as_str(), "a request body in an encoding the bait matcher cannot read: 415 under enforce, forwarded unscanned under shadow (ADR-0069 decision 6)");
+            if traps.enforcing() {
+                return Guarded::Refused(refuse(&Refusal::new(
+                    StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                    "unsupported_encoding",
+                )));
+            }
+            return Guarded::Plain(req, plain);
+        }
+        let verdict = Arc::new(std::sync::OnceLock::new());
+        let on_hit: HitSink = {
+            let (traps, verdict) = (traps.clone(), verdict.clone());
+            let host = route.endpoint.host.to_ascii_lowercase();
+            Box::new(move |hit: &Hit| {
+                let stop = match hit.trap.as_str() {
+                    TRAP_EXPANSION => BodyStop::Expansion,
+                    TRAP_UNDECODABLE => BodyStop::Undecodable,
+                    _ => BodyStop::Bait,
+                };
+                let _ = verdict.set(stop);
+                // A body the matcher could not finish is refused and told, and ends nothing:
+                // only a bait value that completed is a trip.
+                traps.tell(
+                    TripKind::Credential,
+                    Some(&hit.trap),
+                    None,
+                    &host,
+                    stop == BodyStop::Bait,
+                );
+                tracing::warn!(kind = "credential", trap = %hit.trap, %host, mode = traps.plan.mode.as_str(), "the bait matcher stopped on a request body at the proxy (ADR-0069)");
+            })
+        };
+        let (parts, body) = req.into_parts();
+        let mut body = ScanBody::new(body, traps.plan.matcher.clone(), encoding, Some(on_hit));
+        if !traps.enforcing() {
+            body = body.report_only();
+        }
+        Guarded::Scanned(
+            Box::new(Request::from_parts(parts, body)),
+            Guard {
+                trapped,
+                body: Some(verdict),
+            },
+        )
+    }
+
+    /// A judged request to where its route sends it: a gateway's inject port, or a tunnel.
+    async fn dispatch<B>(
+        &self,
+        req: Request<B>,
+        forward: Forward<'_>,
+        guard: &Guard,
+    ) -> Response<Body>
+    where
+        B: hyper::body::Body<Data = Bytes> + Send + 'static,
+        B::Error: Into<BodyError>,
+    {
+        if forward.route.placed_at_gateway() {
+            return self.handle_at_gateway(req, &forward, guard).await;
+        }
+        self.handle_tunnelled(req, forward, guard).await
     }
 
     /// A request on a route the proxy places itself (or sends bare), through a gateway's tunnel or, without gateways,
     /// directly (ADR-0025, ADR-0028). It has been judged.
-    async fn handle_tunnelled(
+    async fn handle_tunnelled<B>(
         &self,
-        req: Request<Incoming>,
+        req: Request<B>,
         forward: Forward<'_>,
-    ) -> Response<Body> {
+        guard: &Guard,
+    ) -> Response<Body>
+    where
+        B: hyper::body::Body<Data = Bytes> + Send + 'static,
+        B::Error: Into<BodyError>,
+    {
         let method = req.method().clone();
         let route = forward.route.clone();
-        let path_log = forward.path_and_query.clone();
         let placed = match (forward.inject, route.audience.as_deref()) {
             (true, Some(audience)) => match self.cache.placement(&*self.tokens, audience).await {
                 Ok(p) => Some(p),
@@ -889,11 +1563,14 @@ impl Proxy {
         .await
         {
             Ok((resp, via)) => {
+                // The path alone is logged, never the query, and no path for a request a trap
+                // matched.
                 tracing::info!(
                     audience = route.audience_label(),
                     host = %route.endpoint,
-                    %method,
-                    path = %path_log,
+                    method = method_for_log(&method),
+                    path = path_for_log(&forward.path_and_query, guard.trapped_now())
+                        .map(tracing::field::display),
                     status = %resp.status(),
                     credential = forward.inject,
                     via = %via.as_ref().map_or_else(|| "direct".to_owned(), ToString::to_string),
@@ -915,6 +1592,11 @@ impl Proxy {
                 refuse(&Refusal::new(StatusCode::BAD_GATEWAY, e.code()))
             }
             Err(SendError::Upstream(e)) => {
+                // The matcher ended the body before the upstream answered: the request is
+                // incomplete there, and the workload gets the matcher's answer.
+                if let Some(answer) = guard.stopped() {
+                    return answer;
+                }
                 tracing::error!(audience = route.audience_label(), host = %route.endpoint, error = %e, "upstream unreachable");
                 refuse(&Refusal::new(
                     StatusCode::BAD_GATEWAY,
@@ -964,6 +1646,11 @@ impl Proxy {
     /// registry audience's route (pull-only) or a gateway-placed one is served here; any other route is refused, so this
     /// port never serves the workload's APIs.
     async fn handle_pull(&self, req: Request<Incoming>, host: &str) -> Response<Body> {
+        // The puller is root's, outside the jail: its requests are matched against no trap. After a trip nothing more
+        // is forwarded here either (ADR-0069 decision 7).
+        if self.is_tripped() {
+            return trap_refusal();
+        }
         let method = req.method().clone();
         let Some(path_and_query) = req.uri().path_and_query().map(ToString::to_string) else {
             return refuse(&Refusal::new(StatusCode::BAD_REQUEST, "bad_request"));
@@ -974,7 +1661,10 @@ impl Proxy {
             .next()
             .unwrap_or_default();
         if !segment.eq_ignore_ascii_case(host) {
-            tracing::warn!(%method, "pull request for a host that is not the pull host refused");
+            tracing::warn!(
+                method = method_for_log(&method),
+                "pull request for a host that is not the pull host refused"
+            );
             return refuse(&Refusal::new(StatusCode::NOT_FOUND, "not_the_pull_host"));
         }
         let forward = match judge_headers(
@@ -986,12 +1676,14 @@ impl Proxy {
         ) {
             Ok(f) => f,
             Err(r) => {
-                tracing::warn!(%method, path = %path_and_query, status = %r.status, code = r.code, "pull request refused");
+                tracing::warn!(method = method_for_log(&method), path = path_for_log(&path_and_query, false).map(tracing::field::display), status = %r.status, code = r.code, "pull request refused");
                 return refuse(&r);
             }
         };
         if forward.route.placed_at_gateway() {
-            return self.handle_at_gateway(req, &forward).await;
+            return self
+                .handle_at_gateway(req, &forward, &Guard::default())
+                .await;
         }
         if !forward.route.pull_only {
             tracing::warn!(host, "the pull host's route is not a registry's; refused");
@@ -1003,7 +1695,7 @@ impl Proxy {
             inject: forward.route.injects(),
             ..forward
         };
-        self.handle_tunnelled(req, forward).await
+        self.handle_tunnelled(req, forward, &Guard::default()).await
     }
 }
 
@@ -1016,20 +1708,21 @@ impl Proxy {
     /// audience's TLS and places the credential, so this process never asks for a token and
     /// never holds one for the route. The response comes back as it was, streamed, unless the
     /// gateway marked it as its own refusal ([`GATEWAY_REFUSAL_HEADER`]).
-    async fn handle_at_gateway(
+    async fn handle_at_gateway<B>(
         &self,
-        req: Request<Incoming>,
+        req: Request<B>,
         forward: &Forward<'_>,
-    ) -> Response<Body> {
+        guard: &Guard,
+    ) -> Response<Body>
+    where
+        B: hyper::body::Body<Data = Bytes> + Send + 'static,
+        B::Error: Into<BodyError>,
+    {
         let route = forward.route;
         let method = req.method().clone();
-        // The path alone is logged (the query can carry what the workload put in it).
-        let path_log = forward
-            .path_and_query
-            .split('?')
-            .next()
-            .unwrap_or("/")
-            .to_owned();
+        // The path alone is logged (the query can carry what the workload put in it), and no path for a request a trap
+        // matched (ADR-0069 decision 12), asked once the gateway answered: by then a scanned body has been read.
+        let path_log = || path_for_log(&forward.path_and_query, guard.trapped_now());
         let Some(port) = route.inject_port.filter(|p| *p != 0) else {
             // `Routes::new` refuses this route at start; failing closed here too costs nothing.
             tracing::error!(audience = route.audience_label(), host = %route.endpoint, "a gateway-placed route has no inject port; nothing is sent");
@@ -1043,8 +1736,8 @@ impl Proxy {
                     tracing::warn!(
                         audience = route.audience_label(),
                         host = %route.endpoint,
-                        %method,
-                        path = %path_log,
+                        method = method_for_log(&method),
+                        path = path_log().map(tracing::field::display),
                         code = %log_safe(code.as_bytes()),
                         "the gateway refused the request"
                     );
@@ -1053,8 +1746,8 @@ impl Proxy {
                 tracing::info!(
                     audience = route.audience_label(),
                     host = %route.endpoint,
-                    %method,
-                    path = %path_log,
+                    method = method_for_log(&method),
+                    path = path_log().map(tracing::field::display),
                     status = %resp.status(),
                     credential = "gateway",
                     via = %via.as_ref().map_or_else(|| "-".to_owned(), ToString::to_string),
@@ -1071,6 +1764,10 @@ impl Proxy {
                 refuse(&Refusal::new(StatusCode::BAD_GATEWAY, e.code()))
             }
             Err(SendError::Upstream(e)) => {
+                // As on a tunnelled route: the matcher's answer when it ended the body.
+                if let Some(answer) = guard.stopped() {
+                    return answer;
+                }
                 tracing::error!(audience = route.audience_label(), host = %route.endpoint, error = %e, "the gateway's connection failed");
                 refuse(&Refusal::new(
                     StatusCode::BAD_GATEWAY,
@@ -1097,11 +1794,11 @@ fn log_safe(v: &[u8]) -> String {
 /// route owns is refused before it gets here, so that drop is a second line and not the
 /// control. The gateway's authorizer strips the client credential headers too; this layer does
 /// not wait for it.
-fn rewrite_for_gateway(
-    req: Request<Incoming>,
+fn rewrite_for_gateway<B>(
+    req: Request<B>,
     forward: &Forward<'_>,
     owned: &[HeaderName],
-) -> Request<Incoming> {
+) -> Request<B> {
     let mut req = rewrite(req, forward, None, owned);
     req.headers_mut()
         .remove(HeaderName::from_static("x-api-key"));
@@ -1111,11 +1808,15 @@ fn rewrite_for_gateway(
 /// To a gateway's inject port through `dialer`, one HTTP/1.1 connection over the claim's mutual
 /// TLS, one request, the body streamed. No second gateway is tried once one holds the
 /// connection: the body cannot be replayed, and whatever answers is the answer.
-async fn send_to_gateway(
+async fn send_to_gateway<B>(
     dialer: &Dialer,
     port: u16,
-    req: Request<Incoming>,
-) -> Result<(Response<Incoming>, Option<Endpoint>), SendError> {
+    req: Request<B>,
+) -> Result<(Response<Incoming>, Option<Endpoint>), SendError>
+where
+    B: hyper::body::Body<Data = Bytes> + Send + 'static,
+    B::Error: Into<BodyError>,
+{
     let opened = dialer.inject(port).await.map_err(SendError::Dial)?;
     let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(opened.conn))
         .await
@@ -1137,12 +1838,12 @@ async fn send_to_gateway(
 /// ([`strip_hop_by_hop`]), every header the proxy owns dropped (the phantom never
 /// leaves, ADR-0032 decision 3), and the credential placed where the broker said when one
 /// goes in, with the headers that travel beside it.
-fn rewrite(
-    req: Request<Incoming>,
+fn rewrite<B>(
+    req: Request<B>,
     forward: &Forward<'_>,
     placed: Option<&Placement>,
     owned: &[HeaderName],
-) -> Request<Incoming> {
+) -> Request<B> {
     let (mut parts, body) = req.into_parts();
     parts.uri = forward
         .path_and_query
@@ -1191,12 +1892,16 @@ enum SendError {
 /// bytes are relayed untouched by the gateway, so the upstream sees this handshake and
 /// nothing in between does), one HTTP/1.1 connection, one request. Returns the response
 /// and the gateway that carried it, if one did.
-async fn connect_and_send(
+async fn connect_and_send<B>(
     dialer: &Dialer,
     endpoint: &Endpoint,
     tls: Arc<rustls::ClientConfig>,
-    req: Request<Incoming>,
-) -> Result<(Response<Incoming>, Option<Endpoint>), SendError> {
+    req: Request<B>,
+) -> Result<(Response<Incoming>, Option<Endpoint>), SendError>
+where
+    B: hyper::body::Body<Data = Bytes> + Send + 'static,
+    B::Error: Into<BodyError>,
+{
     let opened = dialer.dial(endpoint).await.map_err(SendError::Dial)?;
     let name = ServerName::try_from(endpoint.host.clone()).map_err(|e| {
         SendError::Upstream(anyhow::anyhow!(
@@ -1354,6 +2059,13 @@ pub fn pull_args(listen: SocketAddr, host: &str) -> Vec<String> {
     ]
 }
 
+/// The option that arms the proxy (ADR-0069 decision 7), appended to [`command_args`] only for a claim whose traps
+/// are armed: under `off` the argument list is what it always was.
+#[must_use]
+pub fn trap_args(socket: &Path) -> Vec<String> {
+    vec!["--trap-socket".into(), socket.display().to_string()]
+}
+
 /// Start the proxy as `uid:gid` and wait for its ready line, at most `timeout`.
 ///
 /// # Errors
@@ -1448,14 +2160,37 @@ pub async fn run(args: EgressArgs) -> anyhow::Result<()> {
         ),
         None => None,
     };
-    let proxy = Arc::new(Proxy::with_upstream_trust(
+    // The traps (ADR-0069): the draw from the guest and the matcher over it, before the proxy says anything. A proxy
+    // that cannot be armed ends here, with no ready line, so the guest starts no jail on it.
+    let traps = match &args.trap_socket {
+        Some(path) => {
+            let (drawn, pending) = TrapLink::connect(path).await?;
+            Some((TrapPlan::new(&drawn, &routes)?, pending))
+        }
+        None => None,
+    };
+    let proxy = Proxy::with_upstream_trust(
         routes,
         phantom,
         Arc::new(BrokerTokens { client }),
         dialer,
         upstream_ca.as_deref(),
         args.upstream_min_tls,
-    )?);
+    )?;
+    let (proxy, link) = match traps {
+        Some((plan, pending)) => {
+            let (patterns, mode) = (plan.patterns(), plan.mode());
+            let link = pending.armed(patterns).await?;
+            tracing::info!(
+                patterns,
+                mode = mode.as_str(),
+                "traps armed: every request is checked before it is forwarded (ADR-0069)"
+            );
+            (proxy.with_traps(plan, link.clone()), Some(link))
+        }
+        None => (proxy, None),
+    };
+    let proxy = Arc::new(proxy);
     tracing::info!(%addr, routes = proxy.routes.len(), dial = %proxy.dialer, "egress proxy listening");
     // The one line on standard output: the guest starts the jail when it reads it.
     // The pull listener is bound before the ready line, so the guest's puller never meets a closed port.
@@ -1472,13 +2207,23 @@ pub async fn run(args: EgressArgs) -> anyhow::Result<()> {
         _ => None,
     };
     println!("{READY_LINE} {addr}");
-    let Some((pull, pull_host)) = pull else {
-        return proxy.serve(listener).await;
+    let serve = async move {
+        let Some((pull, pull_host)) = pull else {
+            return proxy.serve(listener).await;
+        };
+        // Either listener ending ends the proxy, and so the claim.
+        tokio::select! {
+            r = proxy.clone().serve(listener) => r,
+            r = proxy.clone().serve_pull(pull, pull_host) => r,
+        }
     };
-    // Either listener ending ends the proxy, and so the claim.
+    let Some(link) = link else {
+        return serve.await;
+    };
+    // The trap socket gone is the proxy gone (ADR-0069 decision 7): it can report no trip, so it serves nothing.
     tokio::select! {
-        r = proxy.clone().serve(listener) => r,
-        r = proxy.serve_pull(pull, pull_host) => r,
+        r = serve => r,
+        () = link.closed() => anyhow::bail!("the trap socket closed: the proxy ends, and the claim with it (ADR-0069 decision 7)"),
     }
 }
 
@@ -1489,6 +2234,7 @@ mod tests {
 
     fn route(audience: &str, endpoint: &str, rules: &[(&str, &str)]) -> Route {
         Route {
+            traps_body: mediatore_proto::trip::TrapsBody::Match,
             audience: Some(audience.into()),
             endpoint: endpoint.parse().unwrap(),
             rules: rules
@@ -3667,5 +4413,1093 @@ mod tests {
             at_gateway.route.placed_at_gateway() && !at_gateway.inject,
             "the proxy places no credential here: the gateway does"
         );
+    }
+
+    // ---- The traps (ADR-0069): the proxy armed, driven as the workload drives it. The upstream is the fake gateway
+    // above, which records every request that reached it, so "nothing was forwarded" is what it did not see.
+
+    use mediatore_proto::Secret;
+    use mediatore_proto::trip::{ProxyBait, ProxyDecoyRoute};
+
+    /// A bait value in the shape a provider issues; it is planted nowhere but in these tests.
+    const BAIT: &str = "AKIAQ7TRIPWIREBAIT42";
+    const DECOY_HOST: &str = "secrets.prod.internal";
+
+    /// This thread's log lines at every level, for the tests that pin what is never logged. A
+    /// `#[tokio::test]` runs the proxy on the test's own thread, so the buffer holds that test's lines alone.
+    mod captured {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        use tracing_subscriber::{Layer as _, Registry};
+
+        thread_local! {
+            static CAPTURING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+            static LINES: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+
+        struct ThreadLines;
+
+        impl std::io::Write for ThreadLines {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                LINES.with(|l| l.borrow_mut().extend_from_slice(buf));
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        pub(super) fn start() {
+            static INSTALL: std::sync::Once = std::sync::Once::new();
+            INSTALL.call_once(|| {
+                let lines = tracing_subscriber::fmt::layer()
+                    .with_writer(|| ThreadLines)
+                    .with_ansi(false)
+                    .with_filter(tracing_subscriber::filter::dynamic_filter_fn(|_, _| {
+                        CAPTURING.with(std::cell::Cell::get)
+                    }));
+                tracing::subscriber::set_global_default(Registry::default().with(lines))
+                    .expect("the one subscriber of this test binary");
+            });
+            CAPTURING.with(|c| c.set(true));
+            LINES.with(|l| l.borrow_mut().clear());
+        }
+
+        pub(super) fn lines() -> String {
+            LINES.with(|l| String::from_utf8_lossy(&l.borrow()).into_owned())
+        }
+    }
+
+    fn drawn(mode: TripMode, unknown_host: ClassAction) -> ProxyTraps {
+        ProxyTraps {
+            mode,
+            unknown_host,
+            routes: vec![ProxyDecoyRoute {
+                name: "vault".into(),
+                host: DECOY_HOST.into(),
+            }],
+            bait: vec![ProxyBait {
+                name: "aws".into(),
+                values: vec![Secret(BAIT.into())],
+            }],
+        }
+    }
+
+    /// The harness of the tests above with the proxy armed: what it tells the guest comes out of the receiver.
+    async fn armed_harness(
+        ca: &TestCa,
+        routes: Vec<Route>,
+        traps: &ProxyTraps,
+    ) -> (Harness, mpsc::Receiver<ProxyToGuest>) {
+        let material = MemoryMaterial::new(ca.svid(CLAIM_ID));
+        let forwarder = Forwarder::new(vec![gw("127.0.0.1:1")], material).unwrap();
+        let phantom = Phantom::generate().unwrap();
+        let tokens = Arc::new(CountingTokens(AtomicUsize::new(0)));
+        let routes = Routes::new(routes).unwrap();
+        let plan = TrapPlan::new(traps, &routes).unwrap();
+        let (link, told) = TrapLink::channel();
+        let proxy = Proxy::with_webpki_roots(
+            routes,
+            phantom.clone(),
+            tokens.clone(),
+            Dialer::Gateways(forwarder),
+        )
+        .unwrap()
+        .with_traps(plan, link);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let _ = Arc::new(proxy).serve(listener).await;
+        });
+        (
+            Harness {
+                base,
+                phantom,
+                tokens,
+                _task: task,
+            },
+            told,
+        )
+    }
+
+    /// Every trip told so far.
+    fn trips(told: &mut mpsc::Receiver<ProxyToGuest>) -> Vec<ProxyTrip> {
+        let mut trips = Vec::new();
+        while let Ok(message) = told.try_recv() {
+            if let ProxyToGuest::Trip(trip) = message {
+                trips.push(trip);
+            }
+        }
+        trips
+    }
+
+    async fn code_of(resp: reqwest::Response) -> (u16, String) {
+        let status = resp.status().as_u16();
+        let body: serde_json::Value = resp.json().await.unwrap_or_default();
+        (
+            status,
+            body["error"].as_str().unwrap_or_default().to_owned(),
+        )
+    }
+
+    fn gzip(plain: &[u8]) -> Vec<u8> {
+        use std::io::Write as _;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(plain).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    #[test]
+    fn without_a_trap_socket_the_argv_and_the_proxy_are_what_they_were() {
+        use clap::Parser as _;
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[command(flatten)]
+            egress: EgressArgs,
+        }
+        let base = [
+            "egress-proxy",
+            "--mediatore-url",
+            "https://mediatore.test:8443",
+            "--routes",
+            "/r",
+            "--gateways",
+            "/g",
+            "--phantom-file",
+            "/p",
+        ];
+        let plain = Cli::try_parse_from(base).unwrap().egress;
+        assert_eq!(
+            plain.trap_socket, None,
+            "no socket unless the guest names one"
+        );
+        // The option is two arguments of its own, appended by the guest only when it armed.
+        assert_eq!(
+            trap_args(Path::new("/run/mediatore-guest/trap/trap.sock")),
+            ["--trap-socket", "/run/mediatore-guest/trap/trap.sock"]
+        );
+        let mut with = base.to_vec();
+        with.extend(["--trap-socket", "/run/mediatore-guest/trap/trap.sock"]);
+        assert_eq!(
+            Cli::try_parse_from(with).unwrap().egress.trap_socket,
+            Some(PathBuf::from("/run/mediatore-guest/trap/trap.sock"))
+        );
+        // And a proxy built without traps checks nothing and is never tripped.
+        let proxy =
+            Proxy::with_webpki_roots(routes(), phantom(), Arc::new(NoTokens), Dialer::Direct)
+                .unwrap();
+        assert!(proxy.traps.is_none());
+        assert!(!proxy.is_tripped());
+        assert!(matches!(
+            proxy.check_traps(
+                &http::Method::GET,
+                &format!("/{DECOY_HOST}/v1?k={BAIT}"),
+                &http::HeaderMap::new()
+            ),
+            Trapped::No
+        ));
+    }
+
+    #[tokio::test]
+    async fn the_proxy_is_not_ready_until_it_is_armed() {
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trap.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let traps = drawn(TripMode::Enforce, ClassAction::Report);
+        let mut arm = serde_json::to_vec(&GuestToProxy::Arm(traps.clone())).unwrap();
+        arm.push(b'\n');
+        // The guest's end: the draw out, then whatever the proxy says.
+        let guest = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            write.write_all(&arm).await.unwrap();
+            let mut lines = tokio::io::BufReader::new(read).lines();
+            let first = lines.next_line().await.unwrap();
+            (first, write)
+        });
+        let (handed, pending) = TrapLink::connect(&path)
+            .await
+            .expect("the draw is handed over");
+        assert_eq!(handed, traps);
+        let plan = TrapPlan::new(&handed, &routes()).unwrap();
+        assert!(plan.patterns() > 0, "the matcher holds the bait's forms");
+        // Until `armed()` returns nothing was said: that call is what `run` makes before its ready line.
+        assert!(!guest.is_finished(), "the guest has heard nothing yet");
+        let link = pending
+            .armed(plan.patterns())
+            .await
+            .expect("armed is written");
+        let (first, write) = guest.await.unwrap();
+        assert_eq!(
+            serde_json::from_str::<ProxyToGuest>(&first.expect("a line")).unwrap(),
+            ProxyToGuest::Armed {
+                patterns: plan.patterns()
+            }
+        );
+        assert!(!link.is_tripped());
+        // The guest's end closing is the proxy tripped and told to end (the plan's D32).
+        drop(write);
+        tokio::time::timeout(std::time::Duration::from_secs(10), link.closed())
+            .await
+            .expect("the closed socket is noticed");
+        assert!(
+            link.is_tripped(),
+            "a proxy that can report no trip forwards nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_proxy_that_is_handed_no_draw_or_a_draw_it_cannot_check_is_not_armed() {
+        use tokio::io::AsyncWriteExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        // No socket at all.
+        assert!(
+            TrapLink::connect(&dir.path().join("none.sock"))
+                .await
+                .is_err()
+        );
+        // A first message that is not `arm`, and a connection closed with nothing said (what a second connection of
+        // the sandbox uid gets from the guest).
+        for (name, said) in [
+            ("other.sock", Some("{\"type\":\"armed\",\"patterns\":1}\n")),
+            ("closed.sock", None),
+        ] {
+            let path = dir.path().join(name);
+            let listener = tokio::net::UnixListener::bind(&path).unwrap();
+            let guest = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                if let Some(said) = said {
+                    stream.write_all(said.as_bytes()).await.unwrap();
+                    // Held open: the refusal is of the message, not of a closed stream.
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+            });
+            let refused = TrapLink::connect(&path).await;
+            let error = format!("{:#}", refused.expect_err("not armed"));
+            assert!(!error.contains("patterns"), "the message is in no error");
+            guest.abort();
+        }
+        // A decoy that is one of the claim's own routes: the plan is refused, and names no host.
+        let mut traps = drawn(TripMode::Enforce, ClassAction::Report);
+        traps.routes[0].host = "GIT.home.example".into();
+        let error = format!("{:#}", TrapPlan::new(&traps, &routes()).unwrap_err());
+        assert!(error.contains("one of the claim's routes"), "{error}");
+        assert!(!error.to_ascii_lowercase().contains("git.home.example"));
+        // A matcher whose automaton could not be built: the proxy is not armed (`matcher-not-built` is a failure to
+        // arm, never a proxy that trips on everything or on nothing).
+        let error = format!(
+            "{:#}",
+            TrapPlan::with_matcher(
+                &drawn(TripMode::Enforce, ClassAction::Report),
+                &routes(),
+                Matcher::broken()
+            )
+            .unwrap_err()
+        );
+        assert!(error.contains("could not be built"), "{error}");
+        let printed = format!(
+            "{:?}",
+            TrapPlan::new(&drawn(TripMode::Shadow, ClassAction::Report), &routes()).unwrap()
+        );
+        assert!(!printed.contains(DECOY_HOST) && !printed.contains(BAIT));
+    }
+
+    #[tokio::test]
+    async fn a_request_naming_a_decoy_route_is_403_trap_under_enforce_and_404_under_shadow_and_nothing_is_dialled()
+     {
+        for mode in [TripMode::Enforce, TripMode::Shadow] {
+            let ca = TestCa::new(TD);
+            let fake = FakeGateway::start(&ca, Script::Echo).await;
+            let (h, mut told) = armed_harness(
+                &ca,
+                vec![placed(UPSTREAM, Some(fake.addr.port()), &[])],
+                &drawn(mode, ClassAction::Report),
+            )
+            .await;
+            // By host, by host and port, in any case: the decoy is the host, whatever follows.
+            for segment in [
+                DECOY_HOST.to_owned(),
+                format!("{DECOY_HOST}:8200"),
+                DECOY_HOST.to_ascii_uppercase(),
+            ] {
+                let resp = workload()
+                    .get(format!("{}/{segment}/v1/secret/data/prod", h.base))
+                    .bearer_auth(h.phantom.expose())
+                    .send()
+                    .await
+                    .unwrap();
+                let answer = code_of(resp).await;
+                let told_now = trips(&mut told);
+                assert_eq!(told_now.len(), 1, "one use, told once");
+                let trip = &told_now[0];
+                assert_eq!(
+                    (
+                        trip.kind,
+                        trip.trap.as_deref(),
+                        trip.class,
+                        trip.host.as_str()
+                    ),
+                    (TripKind::Route, Some("vault"), None, DECOY_HOST)
+                );
+                if mode == TripMode::Shadow {
+                    assert_eq!(
+                        answer,
+                        (404, "no_route".to_owned()),
+                        "what an unknown host gets"
+                    );
+                } else {
+                    assert_eq!(answer, (403, "trap".to_owned()));
+                    break; // every request after it is 403 trap for another reason
+                }
+            }
+            assert!(fake.seen().is_empty(), "a decoy route is never forwarded");
+            assert_eq!(h.tokens.0.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn bait_in_a_header_is_refused_before_any_upstream_is_opened() {
+        use base64::Engine as _;
+        let basic = base64::engine::general_purpose::STANDARD.encode(format!("user:{BAIT}"));
+        // Each position the head is checked in (ADR-0069 decision 6): a credential header, any other header, a Basic
+        // pair, the path, the query, raw and percent-encoded.
+        let cases: Vec<(&str, Vec<(&str, String)>)> = vec![
+            ("/v1/messages", vec![("x-custom", BAIT.to_owned())]),
+            ("/v1/messages", vec![("x-api-key", BAIT.to_owned())]),
+            (
+                "/v1/messages",
+                vec![("authorization", format!("Bearer {BAIT}"))],
+            ),
+            (
+                "/v1/messages",
+                vec![("authorization", format!("Basic {basic}"))],
+            ),
+            ("/v1/AKIAQ7TRIPWIREBAIT42/x", vec![]),
+            ("/v1/messages?key=AKIAQ7TRIPWIREBAIT42", vec![]),
+            ("/v1/messages?key=%41KIAQ7TRIPWIREBAIT42", vec![]),
+        ];
+        for (path, headers) in cases {
+            let ca = TestCa::new(TD);
+            let fake = FakeGateway::start(&ca, Script::Echo).await;
+            let (h, mut told) = armed_harness(
+                &ca,
+                vec![placed(UPSTREAM, Some(fake.addr.port()), &[])],
+                &drawn(TripMode::Enforce, ClassAction::Report),
+            )
+            .await;
+            let mut request = workload().post(format!("{}/{UPSTREAM}{path}", h.base));
+            for (name, value) in &headers {
+                request = request.header(*name, value);
+            }
+            let resp = request.body("{}").send().await.unwrap();
+            assert_eq!(code_of(resp).await, (403, "trap".to_owned()));
+            let told_now = trips(&mut told);
+            assert_eq!(told_now.len(), 1);
+            assert_eq!(
+                (
+                    told_now[0].kind,
+                    told_now[0].trap.as_deref(),
+                    told_now[0].class,
+                    told_now[0].host.as_str()
+                ),
+                (
+                    TripKind::Credential,
+                    Some("aws"),
+                    None,
+                    "api.anthropic.example"
+                ),
+                "the catalogue entry's name and the route's host, never the value"
+            );
+            assert!(fake.seen().is_empty(), "no upstream was opened");
+        }
+    }
+
+    #[tokio::test]
+    async fn bait_in_a_body_is_never_forwarded_under_enforce_and_passes_untouched_under_shadow() {
+        let filler = "x".repeat(4096);
+        let body = format!("{filler}{{\"token\":\"{BAIT}\"}}{filler}");
+        for (encoded, wire) in [
+            (false, body.clone().into_bytes()),
+            (true, gzip(body.as_bytes())),
+        ] {
+            for mode in [TripMode::Enforce, TripMode::Shadow] {
+                let ca = TestCa::new(TD);
+                let fake = FakeGateway::start(&ca, Script::Echo).await;
+                let (h, mut told) = armed_harness(
+                    &ca,
+                    vec![placed(UPSTREAM, Some(fake.addr.port()), &[])],
+                    &drawn(mode, ClassAction::Report),
+                )
+                .await;
+                let mut request = workload()
+                    .post(format!("{}/{UPSTREAM}/v1/gists", h.base))
+                    .bearer_auth(h.phantom.expose());
+                if encoded {
+                    request = request.header("content-encoding", "gzip");
+                }
+                let resp = request.body(wire.clone()).send().await.unwrap();
+                let told_now = trips(&mut told);
+                assert_eq!(told_now.len(), 1, "one use, told once");
+                assert_eq!(
+                    (
+                        told_now[0].kind,
+                        told_now[0].trap.as_deref(),
+                        told_now[0].host.as_str()
+                    ),
+                    (TripKind::Credential, Some("aws"), "api.anthropic.example")
+                );
+                if mode == TripMode::Enforce {
+                    assert_eq!(code_of(resp).await, (403, "trap".to_owned()));
+                    for seen in fake.seen() {
+                        assert!(
+                            !String::from_utf8_lossy(&seen.body).contains(BAIT)
+                                && seen.body != wire,
+                            "the bait reached the upstream"
+                        );
+                    }
+                } else {
+                    assert_eq!(resp.status(), 200);
+                    assert_eq!(
+                        resp.bytes().await.unwrap(),
+                        wire,
+                        "echoed: what came is what left"
+                    );
+                    let seen = fake.seen();
+                    assert_eq!(seen.len(), 1);
+                    assert_eq!(seen[0].body, wire, "forwarded byte for byte under shadow");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn on_a_traps_body_skip_route_bait_in_the_body_passes_and_in_authorization_trips() {
+        let ca = TestCa::new(TD);
+        let fake = FakeGateway::start(&ca, Script::Echo).await;
+        let model = Route {
+            traps_body: TrapsBody::Skip,
+            ..placed(UPSTREAM, Some(fake.addr.port()), &[])
+        };
+        let (h, mut told) = armed_harness(
+            &ca,
+            vec![model],
+            &drawn(TripMode::Enforce, ClassAction::Report),
+        )
+        .await;
+        // The agent telling its model what it read is discovery, not use.
+        let conversation =
+            format!("{{\"messages\":[{{\"content\":\"I found {BAIT} in ~/.aws/credentials\"}}]}}");
+        let resp = workload()
+            .post(format!("{}/{UPSTREAM}/v1/messages", h.base))
+            .bearer_auth(h.phantom.expose())
+            .body(conversation.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.text().await.unwrap(), conversation);
+        assert!(
+            trips(&mut told).is_empty(),
+            "the body of a skip route is not matched"
+        );
+        assert_eq!(fake.seen().len(), 1);
+        // The head still counts on that route.
+        let resp = workload()
+            .post(format!("{}/{UPSTREAM}/v1/messages", h.base))
+            .header("authorization", format!("Bearer {BAIT}"))
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(code_of(resp).await, (403, "trap".to_owned()));
+        assert_eq!(trips(&mut told).len(), 1);
+        assert_eq!(fake.seen().len(), 1, "the second request went nowhere");
+    }
+
+    #[tokio::test]
+    async fn after_a_trip_every_request_is_403_trap() {
+        let ca = TestCa::new(TD);
+        let fake = FakeGateway::start(&ca, Script::Echo).await;
+        let (h, mut told) = armed_harness(
+            &ca,
+            vec![placed(UPSTREAM, Some(fake.addr.port()), &[])],
+            &drawn(TripMode::Enforce, ClassAction::Report),
+        )
+        .await;
+        let clean = || {
+            workload()
+                .post(format!("{}/{UPSTREAM}/v1/messages", h.base))
+                .bearer_auth(h.phantom.expose())
+                .body("{}")
+                .send()
+        };
+        assert_eq!(
+            clean().await.unwrap().status(),
+            200,
+            "before the trip it is forwarded"
+        );
+        let resp = workload()
+            .get(format!("{}/{DECOY_HOST}/", h.base))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(code_of(resp).await, (403, "trap".to_owned()));
+        // The same clean request, an unknown host, a request with no path: all the same answer now.
+        assert_eq!(
+            code_of(clean().await.unwrap()).await,
+            (403, "trap".to_owned())
+        );
+        for path in [
+            "/unknown.example/x",
+            "/",
+            "/api.anthropic.example/v1/messages?x=1",
+        ] {
+            let resp = workload()
+                .get(format!("{}{path}", h.base))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(code_of(resp).await, (403, "trap".to_owned()));
+        }
+        assert_eq!(fake.seen().len(), 1, "nothing was forwarded after the trip");
+        assert_eq!(
+            trips(&mut told).len(),
+            1,
+            "and nothing more is told: the claim is ending"
+        );
+        // Under shadow nothing is ended: the same sequence keeps forwarding.
+        let fake = FakeGateway::start(&ca, Script::Echo).await;
+        let (h, _told) = armed_harness(
+            &ca,
+            vec![placed(UPSTREAM, Some(fake.addr.port()), &[])],
+            &drawn(TripMode::Shadow, ClassAction::Report),
+        )
+        .await;
+        let resp = workload()
+            .get(format!("{}/{DECOY_HOST}/", h.base))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+        let resp = workload()
+            .post(format!("{}/{UPSTREAM}/v1/messages", h.base))
+            .bearer_auth(h.phantom.expose())
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn an_undecodable_body_is_415_under_enforce_on_a_matched_route() {
+        for (mode, skip) in [
+            (TripMode::Enforce, false),
+            (TripMode::Shadow, false),
+            (TripMode::Enforce, true),
+        ] {
+            let ca = TestCa::new(TD);
+            let fake = FakeGateway::start(&ca, Script::Echo).await;
+            let mut route = placed(UPSTREAM, Some(fake.addr.port()), &[]);
+            if skip {
+                route.traps_body = TrapsBody::Skip;
+            }
+            let (h, mut told) =
+                armed_harness(&ca, vec![route], &drawn(mode, ClassAction::Report)).await;
+            let resp = workload()
+                .post(format!("{}/{UPSTREAM}/v1/upload", h.base))
+                .bearer_auth(h.phantom.expose())
+                .header("content-encoding", "br")
+                .body("a body the matcher cannot read")
+                .send()
+                .await
+                .unwrap();
+            if mode == TripMode::Enforce && !skip {
+                assert_eq!(
+                    code_of(resp).await,
+                    (415, "unsupported_encoding".to_owned())
+                );
+                assert!(fake.seen().is_empty(), "nothing is forwarded");
+            } else {
+                assert_eq!(
+                    resp.status(),
+                    200,
+                    "forwarded: shadow, or a route whose body is not matched"
+                );
+                assert_eq!(fake.seen().len(), 1);
+            }
+            assert!(
+                trips(&mut told).is_empty(),
+                "an encoding the matcher cannot read is no use of a trap"
+            );
+            // And the proxy goes on: it was not a trip.
+            let resp = workload()
+                .post(format!("{}/{UPSTREAM}/v1/upload", h.base))
+                .bearer_auth(h.phantom.expose())
+                .body("plain")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_body_past_the_expansion_bound_is_413_and_one_that_does_not_decode_is_400_and_neither_ends_anything()
+     {
+        // The maintainer's decision 4 of 2026-11-27: the request is refused, nothing unscanned is forwarded, and it
+        // is told to the guest under a reserved name that never trips.
+        let bomb = gzip(&vec![0u8; 8 * 1024 * 1024]);
+        let cases: [(Vec<u8>, u16, &str, &str); 2] = [
+            (bomb, 413, "body_expansion", TRAP_EXPANSION),
+            (
+                b"this is not a gzip stream at all, whatever its header says".to_vec(),
+                400,
+                "body_undecodable",
+                TRAP_UNDECODABLE,
+            ),
+        ];
+        for (wire, status, code, trap) in cases {
+            let ca = TestCa::new(TD);
+            let fake = FakeGateway::start(&ca, Script::Echo).await;
+            let (h, mut told) = armed_harness(
+                &ca,
+                vec![placed(UPSTREAM, Some(fake.addr.port()), &[])],
+                &drawn(TripMode::Enforce, ClassAction::Report),
+            )
+            .await;
+            let resp = workload()
+                .post(format!("{}/{UPSTREAM}/v1/upload", h.base))
+                .bearer_auth(h.phantom.expose())
+                .header("content-encoding", "gzip")
+                .body(wire.clone())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(code_of(resp).await, (status, code.to_owned()));
+            for seen in fake.seen() {
+                assert_ne!(seen.body, wire, "the whole body reached the upstream");
+            }
+            let told_now = trips(&mut told);
+            assert_eq!(told_now.len(), 1);
+            assert_eq!(
+                (told_now[0].kind, told_now[0].trap.as_deref()),
+                (TripKind::Credential, Some(trap))
+            );
+            // Not a trip: the next request is forwarded.
+            let resp = workload()
+                .post(format!("{}/{UPSTREAM}/v1/upload", h.base))
+                .bearer_auth(h.phantom.expose())
+                .body("plain")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                200,
+                "the proxy did not treat itself as tripped"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unknown_host_is_reported_as_denied_unknown_host() {
+        for (mode, action) in [
+            (TripMode::Shadow, ClassAction::Report),
+            (TripMode::Enforce, ClassAction::Report),
+            (TripMode::Enforce, ClassAction::Trip),
+        ] {
+            let ca = TestCa::new(TD);
+            let fake = FakeGateway::start(&ca, Script::Echo).await;
+            let (h, mut told) = armed_harness(
+                &ca,
+                vec![placed(UPSTREAM, Some(fake.addr.port()), &[])],
+                &drawn(mode, action),
+            )
+            .await;
+            // The answer is the one an unarmed proxy gives, to the byte.
+            let unarmed = harness(
+                &ca,
+                vec![placed(UPSTREAM, Some(fake.addr.port()), &[])],
+                vec![gw("127.0.0.1:1")],
+            )
+            .await;
+            let before = workload()
+                .get(format!("{}/Mirror.Example:8443/simple/x?q=1", unarmed.base))
+                .send()
+                .await
+                .unwrap();
+            let after = workload()
+                .get(format!("{}/Mirror.Example:8443/simple/x?q=1", h.base))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(after.status(), before.status());
+            assert_eq!(after.status(), 404);
+            assert_eq!(
+                after.headers().get("content-type"),
+                before.headers().get("content-type")
+            );
+            assert_eq!(after.bytes().await.unwrap(), before.bytes().await.unwrap());
+            let told_now = trips(&mut told);
+            assert_eq!(told_now.len(), 1);
+            assert_eq!(
+                (
+                    told_now[0].kind,
+                    told_now[0].trap.as_deref(),
+                    told_now[0].class,
+                    told_now[0].host.as_str()
+                ),
+                (
+                    TripKind::Denied,
+                    None,
+                    Some(TripClass::UnknownHost),
+                    "mirror.example"
+                ),
+                "the host alone, lower case, no port and no path"
+            );
+            // A host outside the report's grammar is told as `invalid`; a request that names no host is no use.
+            let odd = workload()
+                .get(format!("{}/bad_host%7Bx%7D/x", h.base))
+                .send()
+                .await
+                .unwrap();
+            let nothing = workload().get(format!("{}/", h.base)).send().await.unwrap();
+            if mode == TripMode::Enforce && action == ClassAction::Trip {
+                // The class is switched to `trip`: the proxy forwards nothing more.
+                assert_eq!(code_of(odd).await, (403, "trap".to_owned()));
+                assert_eq!(code_of(nothing).await, (403, "trap".to_owned()));
+            } else {
+                assert_eq!(odd.status(), 404);
+                assert_eq!(nothing.status(), 404);
+                let told_now = trips(&mut told);
+                assert_eq!(told_now.len(), 1, "the empty path told nothing");
+                assert_eq!(told_now[0].host, "invalid");
+            }
+            assert!(fake.seen().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn the_query_is_in_no_log_line_and_a_trapped_request_logs_no_path() {
+        captured::start();
+        let ca = TestCa::new(TD);
+        let fake = FakeGateway::start(&ca, Script::Echo).await;
+        let direct = Route {
+            credential: Credential::None,
+            ..route("public", "198.51.100.9:443", &[("GET", "/pub/**")])
+        };
+        let (h, mut told) = armed_harness(
+            &ca,
+            vec![
+                placed(UPSTREAM, Some(fake.addr.port()), &[("POST", "/v1/**")]),
+                direct,
+            ],
+            &drawn(TripMode::Shadow, ClassAction::Report),
+        )
+        .await;
+        // 1. Clean requests with a planted query: forwarded at a gateway, refused by the rules, refused as an unknown
+        //    host. The two lines the proxy has (`forwarded`, `request refused`) show the path and never the query.
+        let resp = workload()
+            .post(format!(
+                "{}/{UPSTREAM}/v1/forwarded-path?planted-query-one=1",
+                h.base
+            ))
+            .bearer_auth(h.phantom.expose())
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let resp = workload()
+            .get(format!(
+                "{}/{UPSTREAM}/outside-rules-path?planted-query-two=1",
+                h.base
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403);
+        let resp = workload()
+            .get(format!(
+                "{}/nowhere.example/unknown-host-path?planted-query-three=1",
+                h.base
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+        // 2. Under shadow a request with bait in its path, query or a header goes on to be forwarded or refused: none
+        //    of them logs a path at all.
+        let resp = workload()
+            .post(format!(
+                "{}/{UPSTREAM}/v1/trapped-path-one/{BAIT}?planted-query-four=1",
+                h.base
+            ))
+            .bearer_auth(h.phantom.expose())
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "shadow forwards");
+        let resp = workload()
+            .post(format!(
+                "{}/{UPSTREAM}/v1/trapped-path-two?planted-query-five={BAIT}",
+                h.base
+            ))
+            .bearer_auth(h.phantom.expose())
+            .header("x-custom", BAIT)
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let resp = workload()
+            .get(format!("{}/{UPSTREAM}/trapped-path-three/{BAIT}", h.base))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403, "outside the rules, and trapped");
+        // 3. A tunnelled route, whose `forwarded` line is the other of the two: the upstream is unreachable, so the
+        //    line is the error's, which has no path either.
+        let resp = workload()
+            .get(format!(
+                "{}/198.51.100.9/pub/tunnelled-path?planted-query-six={BAIT}",
+                h.base
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 502);
+        // 4. A decoy route and a body with bait.
+        let _ = workload()
+            .get(format!(
+                "{}/{DECOY_HOST}/decoy-path?planted-query-seven=1",
+                h.base
+            ))
+            .send()
+            .await
+            .unwrap();
+        let _ = workload()
+            .post(format!(
+                "{}/{UPSTREAM}/v1/body-path?planted-query-eight=1",
+                h.base
+            ))
+            .bearer_auth(h.phantom.expose())
+            .body(format!("a body with {BAIT} in it"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(trips(&mut told).len(), 7, "every use above was told");
+        let lines = captured::lines();
+        // The lines are there, with their paths.
+        assert!(
+            lines.contains("forwarded") && lines.contains("/v1/forwarded-path"),
+            "no forwarded line was captured"
+        );
+        assert!(
+            lines.contains("request refused") && lines.contains("/outside-rules-path"),
+            "no refused line was captured"
+        );
+        assert!(lines.contains("/nowhere.example/unknown-host-path"));
+        assert!(
+            !lines.contains("/v1/body-path"),
+            "a request whose body a trap matched logs no path (the plan's D7)"
+        );
+        // No query, anywhere.
+        assert!(!lines.contains("planted-query"), "a query is in a log line");
+        assert!(
+            !lines.contains('?'),
+            "something of a query is in a log line"
+        );
+        // No path of a request a trap matched, in its head or in its body.
+        for path in ["trapped-path", "tunnelled-path", "decoy-path", "body-path"] {
+            assert!(
+                !lines.contains(path),
+                "a trapped request's path is in a log line"
+            );
+        }
+        // And never the bait, nor the phantom.
+        assert!(!lines.contains(BAIT), "the bait is in a log line");
+        assert!(
+            !lines.contains(h.phantom.expose()),
+            "the phantom is in a log line"
+        );
+        // What a trap line does carry: the kind, the trap's name, the host.
+        assert!(lines.contains("kind=\"route\"") && lines.contains("trap=vault"));
+        assert!(lines.contains("kind=\"credential\"") && lines.contains("trap=aws"));
+    }
+
+    #[tokio::test]
+    async fn a_proxy_whose_guest_is_gone_answers_403_trap_to_everything() {
+        // The plan's D32, in process: the receiver is the guest's end. With it gone a use under enforce cannot be
+        // told, so the proxy treats itself as tripped and whoever waits on `closed` ends it.
+        let ca = TestCa::new(TD);
+        let fake = FakeGateway::start(&ca, Script::Echo).await;
+        let routes = Routes::new(vec![placed(UPSTREAM, Some(fake.addr.port()), &[])]).unwrap();
+        let plan = TrapPlan::new(&drawn(TripMode::Enforce, ClassAction::Report), &routes).unwrap();
+        let (link, told) = TrapLink::channel();
+        drop(told);
+        let proxy = Proxy::with_webpki_roots(
+            routes,
+            phantom(),
+            Arc::new(NoTokens),
+            Dialer::Gateways(
+                Forwarder::new(
+                    vec![gw("127.0.0.1:1")],
+                    MemoryMaterial::new(ca.svid(CLAIM_ID)),
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap()
+        .with_traps(plan, link.clone());
+        assert!(!proxy.is_tripped());
+        proxy.tell_unknown_host("/nowhere.example/x", false);
+        assert!(
+            proxy.is_tripped(),
+            "a use that cannot be told ends the proxy's service"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), link.closed())
+            .await
+            .expect("the proxy is told to end");
+        assert!(matches!(
+            proxy.check_traps(
+                &http::Method::GET,
+                "/api.anthropic.example/v1/messages",
+                &http::HeaderMap::new()
+            ),
+            Trapped::No
+        ));
+        assert!(fake.seen().is_empty());
+    }
+
+    #[tokio::test]
+    async fn bait_as_the_method_or_a_header_name_is_matched_like_any_other_position() {
+        // S3 of the review: hyper forwards an extension method as it came and a header name
+        // lower-cased, so a bait value can leave as either unless both are matched.
+        for mode in [TripMode::Enforce, TripMode::Shadow] {
+            for position in ["method", "header name"] {
+                let ca = TestCa::new(TD);
+                let fake = FakeGateway::start(&ca, Script::Echo).await;
+                let (h, mut told) = armed_harness(
+                    &ca,
+                    vec![placed(UPSTREAM, Some(fake.addr.port()), &[])],
+                    &drawn(mode, ClassAction::Report),
+                )
+                .await;
+                let url = format!("{}/{UPSTREAM}/v1/messages", h.base);
+                let request = if position == "method" {
+                    workload().request(http::Method::from_bytes(BAIT.as_bytes()).unwrap(), url)
+                } else {
+                    workload().get(url).header(BAIT, "1")
+                };
+                let resp = request.send().await.unwrap();
+                let answer = code_of(resp).await;
+                let told_now = trips(&mut told);
+                assert_eq!(told_now.len(), 1, "the use was told once");
+                assert_eq!(
+                    (
+                        told_now[0].kind,
+                        told_now[0].trap.as_deref(),
+                        told_now[0].host.as_str()
+                    ),
+                    (TripKind::Credential, Some("aws"), "api.anthropic.example")
+                );
+                if mode == TripMode::Enforce {
+                    assert_eq!(answer, (403, "trap".to_owned()));
+                    assert!(fake.seen().is_empty(), "no upstream was opened");
+                } else {
+                    assert_ne!(answer.1, "trap", "shadow refuses nothing");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn bait_that_names_no_route_is_never_a_target_nor_a_logged_segment() {
+        // S4 of the review: with no route the first path segment is the workload's, and when
+        // it is the bait it must reach no event, no log line and no report.
+        captured::start();
+        let lower = BAIT.to_ascii_lowercase();
+        for mode in [TripMode::Shadow, TripMode::Enforce] {
+            let ca = TestCa::new(TD);
+            let fake = FakeGateway::start(&ca, Script::Echo).await;
+            let (h, mut told) = armed_harness(
+                &ca,
+                vec![placed(UPSTREAM, Some(fake.addr.port()), &[])],
+                &drawn(mode, ClassAction::Report),
+            )
+            .await;
+            let resp = workload()
+                .get(format!("{}/{BAIT}/x?k=1", h.base))
+                .send()
+                .await
+                .unwrap();
+            let answer = code_of(resp).await;
+            if mode == TripMode::Enforce {
+                assert_eq!(answer, (403, "trap".to_owned()));
+            } else {
+                assert_eq!(answer.0, 404, "what a host that is no route gets");
+            }
+            let told_now = trips(&mut told);
+            assert_eq!(told_now.first().map(|t| t.kind), Some(TripKind::Credential));
+            for trip in &told_now {
+                assert_eq!(trip.host, "invalid", "a target the workload chose");
+            }
+            assert!(fake.seen().is_empty());
+        }
+        let lines = captured::lines();
+        assert!(
+            lines.contains("kind=\"credential\""),
+            "the lines were captured"
+        );
+        assert!(
+            !lines.contains(BAIT) && !lines.contains(&lower),
+            "the bait is in a log line"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_guest_that_decided_a_trip_stops_the_proxy_at_once_and_the_proxy_stays_up() {
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trap.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let traps = drawn(TripMode::Enforce, ClassAction::Report);
+        let mut arm = serde_json::to_vec(&GuestToProxy::Arm(traps.clone())).unwrap();
+        arm.push(b'\n');
+        let (say_tripped, said) = tokio::sync::oneshot::channel::<()>();
+        let guest = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            write.write_all(&arm).await.unwrap();
+            let mut lines = tokio::io::BufReader::new(read).lines();
+            let _armed = lines.next_line().await.unwrap();
+            let _ = said.await;
+            write.write_all(b"{\"type\":\"tripped\"}\n").await.unwrap();
+            // Held open: the proxy is stopped by the word, not by a closed socket.
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            drop(write);
+        });
+        let (handed, pending) = TrapLink::connect(&path).await.unwrap();
+        let plan = TrapPlan::new(&handed, &routes()).unwrap();
+        let link = pending.armed(plan.patterns()).await.unwrap();
+        assert!(!link.is_tripped());
+        say_tripped.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !link.is_tripped() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the proxy stopped forwarding on the guest's word");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), link.closed())
+                .await
+                .is_err(),
+            "the proxy stays up: the kill ends it, not the word"
+        );
+        guest.abort();
     }
 }

@@ -5,10 +5,72 @@
 //! is the binary's `jail-exec` role, the inner layer (ADR-0024), then the workload. The jail's
 //! only route out is the egress proxy on loopback (ADR-0025): no Workload API socket, no
 //! broker, a phantom token in the environment.
+//!
+//! Under an armed tripwire (ADR-0069) the jail also gets what the guest drew for the claim
+//! ([`JailTraps`]): the decoy routes' and the bait's variables, a home prepared by the guest
+//! with the bait files in it, and the decoy ports as ports it may connect to. With no
+//! tripwire nothing of that exists and the jail is what it always was.
 
 use std::path::PathBuf;
 
 use crate::egress::{PHANTOM_ENV, PROXY_URL_ENV, Phantom};
+
+/// The jail's home, a tmpfs of its own unless a tripwire is armed.
+pub const JAIL_HOME: &str = "/home/sandbox";
+
+/// What an armed tripwire adds to the jail (ADR-0069 decisions 2, 3 and 10). It prints no
+/// value, no port and no path: they are the draw.
+#[derive(Clone, PartialEq, Eq)]
+pub struct JailTraps {
+    /// The planted variables, each decoy route's and each bait's: names on `nsjail`'s
+    /// argument list, values through its environment ([`JailSpec::env`]), never its argv.
+    env: Vec<(String, String)>,
+    /// The TCP ports the workload may connect to beside the proxy's: the decoy listeners',
+    /// and 80 when the metadata decoy was drawn (decision 10).
+    connect_ports: Vec<u16>,
+    /// The guest-prepared home on the claim's tmpfs, with the bait files in it
+    /// ([`crate::sandboxfs::plant_home`]), bound at [`JAIL_HOME`] in place of the tmpfs.
+    home: PathBuf,
+    /// Every bait value, for the output redactor ([`JailSpec::secret_values`]).
+    secrets: Vec<String>,
+}
+
+impl std::fmt::Debug for JailTraps {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JailTraps")
+            .field("variables", &self.env.len())
+            .field("connect_ports", &self.connect_ports.len())
+            .field("secrets", &self.secrets.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl JailTraps {
+    /// What `draw` plants in a jail whose proxy is at `proxy_url` and whose home was prepared
+    /// at `home`.
+    ///
+    /// # Errors
+    /// A variable that is not a plain name, or one the guest sets itself: it would put a
+    /// value on `nsjail`'s argument list, or replace the phantom or the proxy's address. The
+    /// draw never makes one; the jail is not started on one.
+    pub fn new(draw: &crate::draw::Draw, proxy_url: &str, home: PathBuf) -> anyhow::Result<Self> {
+        let env = draw.env(proxy_url);
+        for (name, _) in &env {
+            let plain = name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                && name.bytes().next().is_some_and(|b| !b.is_ascii_digit());
+            anyhow::ensure!(
+                plain && !["HOME", PROXY_URL_ENV, PHANTOM_ENV].contains(&name.as_str()),
+                "a drawn variable is not one the jail can be given (ADR-0069 decision 3)"
+            );
+        }
+        Ok(Self {
+            env,
+            connect_ports: draw.connect_ports(),
+            home,
+            secrets: draw.secret_values(),
+        })
+    }
+}
 
 /// Where the sandbox lives on the guest.
 pub const SANDBOX_ROOT: &str = "/mnt/sandbox";
@@ -59,6 +121,9 @@ pub struct JailSpec {
     /// The phantom token the workload presents to the proxy, handed over through `nsjail`'s
     /// environment and never its argument list (ADR-0025 decision 3).
     pub phantom: Phantom,
+    /// What an armed tripwire plants (ADR-0069); `None` under `off`, and the jail is then
+    /// exactly what it was before the ADR.
+    pub traps: Option<JailTraps>,
 }
 
 impl JailSpec {
@@ -88,9 +153,17 @@ impl JailSpec {
             format!("{}:/work", self.work.display()),
             "--tmpfsmount".into(),
             "/tmp".into(),
-            "--tmpfsmount".into(),
-            "/home/sandbox".into(),
         ];
+        // The home: a tmpfs of the jail's own, or, under an armed tripwire, the directory the
+        // guest prepared on the claim's tmpfs with the bait files in it (ADR-0069 decision 2).
+        // Never under `/work`.
+        match &self.traps {
+            None => a.extend(["--tmpfsmount".into(), JAIL_HOME.into()]),
+            Some(traps) => a.extend([
+                "--bindmount".into(),
+                format!("{}:{JAIL_HOME}", traps.home.display()),
+            ]),
+        }
         // Read-only mounts: the flag covers files, directories and symlinks, not device nodes,
         // so `/dev/null` still opens for writing, and the one read-write mount stays `/work`.
         for dev in DEVICES_IN_JAIL {
@@ -126,6 +199,14 @@ impl JailSpec {
             format!("{PROXY_URL_ENV}={}", self.proxy_url()),
             "--env".into(),
             PHANTOM_ENV.into(),
+        ]);
+        // The planted variables by name alone, like the phantom: a value on this list would be
+        // readable in the VM's process table.
+        for (name, _) in self.traps.iter().flat_map(|t| &t.env) {
+            a.push("--env".into());
+            a.push(name.clone());
+        }
+        a.extend([
             "--".into(),
             // The inner layer (ADR-0024): the binary confines itself, then execs the argv.
             JAIL_BINARY.into(),
@@ -141,6 +222,12 @@ impl JailSpec {
         }
         a.push("--connect-port".into());
         a.push(self.proxy_port.to_string());
+        // The decoy ports (ADR-0069 decision 10): Landlock admits a connect to them, so one
+        // reaches a listener and trips. Nothing else is opened.
+        for port in self.traps.iter().flat_map(|t| &t.connect_ports) {
+            a.push("--connect-port".into());
+            a.push(port.to_string());
+        }
         a.push("--".into());
         a.extend(self.argv.iter().cloned());
         a
@@ -149,16 +236,21 @@ impl JailSpec {
     /// The environment `nsjail` itself runs with, for the variables it copies into the jail.
     #[must_use]
     pub fn env(&self) -> Vec<(String, String)> {
-        vec![(PHANTOM_ENV.to_owned(), self.phantom.expose().to_owned())]
+        let mut env = vec![(PHANTOM_ENV.to_owned(), self.phantom.expose().to_owned())];
+        env.extend(self.traps.iter().flat_map(|t| t.env.iter().cloned()));
+        env
     }
 
     /// Every environment value the guest places in the jail that bears a credential, for the
-    /// output redactor's literal set (ADR-0045 decision 2): today the phantom alone. A new
-    /// credential-bearing variable is added here in the same change that adds it to
-    /// [`Self::env`]; the unit test fails otherwise.
+    /// output redactor's literal set (ADR-0045 decision 2): the phantom, and under an armed
+    /// tripwire every bait value, in a variable or in a file (ADR-0069: bait a workload prints
+    /// is stripped from what is shipped). A new credential-bearing variable is added here in
+    /// the same change that adds it to [`Self::env`]; the unit test fails otherwise.
     #[must_use]
     pub fn secret_values(&self) -> Vec<String> {
-        vec![self.phantom.expose().to_owned()]
+        let mut secrets = vec![self.phantom.expose().to_owned()];
+        secrets.extend(self.traps.iter().flat_map(|t| t.secrets.iter().cloned()));
+        secrets
     }
 }
 
@@ -214,7 +306,222 @@ mod tests {
             rlimit_as_mib: 8192,
             proxy_port: 3128,
             phantom: phantom(),
+            traps: None,
         }
+    }
+
+    /// A real draw for a claim routed to one API, from the OS's random source.
+    fn drawn() -> crate::draw::Draw {
+        let routes = [mediatore_proto::Route {
+            traps_body: mediatore_proto::trip::TrapsBody::Match,
+            audience: Some("internal-api".into()),
+            endpoint: "api.example.com:443".parse().unwrap(),
+            rules: vec![],
+            ca_pem: None,
+            credential: mediatore_proto::Credential::Token,
+            credential_header: None,
+            inject_port: None,
+            pull_only: false,
+        }];
+        crate::draw::draw(
+            &mut crate::draw::OsEntropy,
+            &crate::draw::DrawInputs {
+                routes: &routes,
+                proxy_port: 3128,
+                pull_port: 18129,
+                reserved_ports: &[3128, 443],
+                reserved_env: &["HOME", PROXY_URL_ENV, PHANTOM_ENV],
+                catalogue: None,
+                metadata: true,
+            },
+        )
+        .unwrap()
+    }
+
+    fn trapped_spec(draw: &crate::draw::Draw) -> JailSpec {
+        let base = spec();
+        JailSpec {
+            traps: Some(
+                JailTraps::new(draw, &base.proxy_url(), "/mnt/sandbox/home".into()).unwrap(),
+            ),
+            ..base
+        }
+    }
+
+    #[test]
+    fn every_bait_variable_is_in_the_jail_and_in_the_redaction_set_and_none_is_in_the_argv() {
+        // ADR-0069 decisions 2 and 12, and the plan's D14: a bait value reaches the jail
+        // through nsjail's environment alone, and whatever of it the workload prints is
+        // stripped from what is shipped. Many draws, so every catalogue entry comes up.
+        for _ in 0..200 {
+            let draw = drawn();
+            let spec = trapped_spec(&draw);
+            let args = spec.to_args();
+            let env = spec.env();
+            let secrets = spec.secret_values();
+            assert!(secrets.contains(&spec.phantom.expose().to_owned()));
+            let named: Vec<&str> = args
+                .windows(2)
+                .filter(|w| w[0] == "--env")
+                .map(|w| w[1].as_str())
+                .collect();
+            for bait in &draw.credentials {
+                for value in &bait.values {
+                    assert!(
+                        secrets.iter().any(|s| s == value.expose()),
+                        "a bait value is not in secret_values()"
+                    );
+                    assert!(
+                        !args.iter().any(|a| a.contains(value.expose())),
+                        "a bait value is on nsjail's argument list"
+                    );
+                }
+                for (name, value) in &bait.env {
+                    assert!(
+                        named.contains(&name.as_str()),
+                        "a bait variable is not named to nsjail"
+                    );
+                    assert!(
+                        env.iter().any(|(n, v)| n == name && v == value.expose()),
+                        "a bait variable's value is not in nsjail's environment"
+                    );
+                    assert!(
+                        !args.iter().any(|a| a.contains(value.expose())),
+                        "a bait variable's value is on nsjail's argument list"
+                    );
+                    // The existing rule of ADR-0045 decision 2, over the bait too: a variable
+                    // that bears a credential by its name has its secret in the redaction set.
+                    if is_credential_key(name) {
+                        assert!(
+                            secrets.iter().any(|s| value.expose().contains(s.as_str())),
+                            "a credential-named bait variable has nothing in secret_values()"
+                        );
+                    }
+                }
+                // A bait file's content is redacted where it holds the value.
+                for (_, content) in &bait.files {
+                    assert!(
+                        secrets
+                            .iter()
+                            .any(|s| content.expose().contains(s.as_str())),
+                        "a bait file holds nothing the redactor knows"
+                    );
+                }
+            }
+            for route in &draw.routes {
+                assert!(named.contains(&route.env.as_str()));
+                assert!(
+                    env.iter().any(|(n, v)| *n == route.env
+                        && *v == format!("http://127.0.0.1:3128/{}/", route.host)),
+                    "a decoy route's variable points at it through the proxy"
+                );
+                assert!(
+                    !args.iter().any(|a| a.contains(&route.host)),
+                    "a decoy route's host is on nsjail's argument list"
+                );
+            }
+            // No `--env NAME=value` beside the three the jail always had.
+            let valued: Vec<&&str> = named.iter().filter(|n| n.contains('=')).collect();
+            assert_eq!(valued.len(), 2, "HOME and the proxy's URL, nothing else");
+        }
+    }
+
+    #[test]
+    fn the_drawn_ports_are_connect_ports_and_under_off_there_is_one() {
+        let ports = |spec: &JailSpec| -> Vec<String> {
+            let a = spec.to_args();
+            let first = a.iter().position(|x| x == "--").unwrap();
+            a[first..]
+                .windows(2)
+                .filter(|w| w[0] == "--connect-port")
+                .map(|w| w[1].clone())
+                .collect()
+        };
+        assert_eq!(
+            ports(&spec()),
+            ["3128"],
+            "under off: the proxy's port alone"
+        );
+        let draw = drawn();
+        let mut expected = vec!["3128".to_owned()];
+        expected.extend(draw.connect_ports().iter().map(ToString::to_string));
+        assert_eq!(ports(&trapped_spec(&draw)), expected);
+        assert!(expected.len() >= 3, "at least two decoy ports are drawn");
+        for decoy in &draw.ports {
+            assert!(expected.contains(&decoy.port.to_string()));
+        }
+        assert_eq!(
+            expected.contains(&"80".to_owned()),
+            draw.metadata_port.is_some(),
+            "port 80 only with the metadata decoy"
+        );
+    }
+
+    #[test]
+    fn under_traps_the_home_is_a_bind_mount_with_the_bait_files_and_never_under_work() {
+        let draw = drawn();
+        let a = trapped_spec(&draw).to_args();
+        let rw: Vec<&str> = a
+            .windows(2)
+            .filter(|w| w[0] == "--bindmount")
+            .map(|w| w[1].as_str())
+            .collect();
+        assert_eq!(
+            rw,
+            ["/mnt/sandbox/work:/work", "/mnt/sandbox/home:/home/sandbox"],
+            "the guest-prepared home, beside the work dir and never inside it"
+        );
+        let tmpfs: Vec<&str> = a
+            .windows(2)
+            .filter(|w| w[0] == "--tmpfsmount")
+            .map(|w| w[1].as_str())
+            .collect();
+        assert_eq!(tmpfs, ["/tmp"], "no tmpfs hides the planted home");
+        assert!(
+            a.windows(2)
+                .any(|w| w[0] == "--writable" && w[1] == "/home/sandbox"),
+            "the home stays writable, as it was"
+        );
+        // And with no tripwire, the tmpfs home and one bind mount.
+        let plain = spec().to_args();
+        assert!(
+            plain
+                .windows(2)
+                .any(|w| w[0] == "--tmpfsmount" && w[1] == "/home/sandbox")
+        );
+        for bait in &draw.credentials {
+            for (path, _) in &bait.files {
+                assert!(
+                    !path.starts_with('/') && !path.split('/').any(|part| part == ".."),
+                    "a bait file is a path inside the home"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_drawn_variable_that_is_not_a_plain_name_or_is_the_guests_own_refuses_the_jail() {
+        for name in [
+            "A=b",
+            "HOME",
+            "MEDIATORE_TOKEN",
+            "MEDIATORE_EGRESS_PROXY",
+            "",
+            "1X",
+        ] {
+            let mut draw = drawn();
+            draw.routes[0].env = name.to_owned();
+            assert!(
+                JailTraps::new(&draw, "http://127.0.0.1:3128", "/mnt/sandbox/home".into()).is_err(),
+                "a variable the jail cannot be given was taken"
+            );
+        }
+        let printed = format!("{:?}", trapped_spec(&drawn()));
+        assert!(printed.contains("JailTraps"));
+        assert!(
+            !printed.contains("/mnt/sandbox/home"),
+            "the traps print nothing of the draw"
+        );
     }
 
     #[test]

@@ -433,6 +433,30 @@ read from is ever logged. Run `shadow` until no audience logs a difference befor
 and switched on: remove `audiences[]` and set `mode: bundles`. That switch is the last rollout an
 audience needs.
 
+## Traps: not yet in the bundle
+
+[ADR-0069](../adr/0069-tripwires-on-the-vm-a-decoy-the-workload-takes-ends-its-sandbox.md) decision 4
+puts a deployment's own catalogue of tripwires (seed ports, host stems and suffixes, variable names
+each with a generator, the counts within the built-in bounds) in a `traps` section of the signed
+policy bundle, with admission refusing an entry that overlaps a grant of the same policy as `P017`.
+**None of that is built.** The bundle's schema is notaio's: its `BundleContent` is a closed type and
+the verifier recomputes the content digest from it, so nothing can be added to a bundle from this
+repository. The same holds for the mark `traps.body: skip` in a `SandboxAudience` bundle.
+
+What a deployment has today:
+
+- A draw made from the public seeds, generated entries and entries derived from the claim's own
+  routes; no deployment catalogue reaches a guest (`GET /v1/me` carries none).
+- `audiences[].traps_body: skip` in the broker's own file, for audiences defined there
+  (`audience_definitions.mode: config`).
+- `policy.traps: enforce` refused at start under `audience_definitions.mode: bundles`, because no
+  bundle-defined audience can be marked `skip`; `shadow` is allowed there.
+- `policy.traps` itself lives in this file's `policy` section, so it needs `trusted_keys` even
+  though no bundle carries a trap.
+
+The work waits on a notaio release that carries the section and the mark. See
+[Tripwires](tripwires.md).
+
 ## What comes next
 
 `policy.audiences` enforces a claim's audiences, rules, endpoints and lifetimes (above), and `policy.sources` decides which namespace may

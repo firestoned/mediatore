@@ -274,11 +274,16 @@ impl ClaimsApi for FakeClaims {
             .get_mut(&key(namespace, name))
             .ok_or_else(|| WatchError::Api(format!("agentsandboxes \"{name}\" not found")))?;
         // A merge patch, as the API server applies it: the reconciler's patch never names the
-        // record (ADR-0034), so the one the store wrote stays.
+        // record (ADR-0034) or the trip summary (ADR-0069 decision 9), so what the store wrote
+        // of each stays.
         let kept = sb.status.as_ref().and_then(|held| held.record.clone());
+        let trips = sb.status.as_ref().and_then(|held| held.tripwires.clone());
         let mut next = status.clone();
         if next.record.is_none() {
             next.record = kept;
+        }
+        if next.tripwires.is_none() {
+            next.tripwires = trips;
         }
         sb.status = Some(next);
         *self.patches.lock().unwrap() += 1;

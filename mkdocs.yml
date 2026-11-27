@@ -148,6 +148,7 @@ nav:
       - Issuers: guides/issuers.md
       - Multi-tenant authorization: guides/multi-tenant-authorization.md
       - The store: guides/the-store.md
+      - Tripwires: guides/tripwires.md
       - The Entra path: guides/the-entra-path.md
       - Enterprise SPIRE topology: guides/enterprise-spire-topology.md
       - Testing tiers: guides/testing.md

@@ -1,0 +1,74 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+
+[Unit]
+Description=mediatore gateway probes, the host table's drop counters read for the authorizer (ADR-0070 decision 4)
+# A oneshot with one capability, and the only thing that capability is for is netfilter: it
+# reads and zeroes the named counters of the host table ("nft reset") and leaves a summary for
+# the authorizer's next batch of decisions. It listens nowhere, dials nowhere, and is not the
+# authorizer: the authorizer keeps no capability and only reads the summary.
+# Started by mediatore-gateway-probes.timer. Requisite, not Requires: with no table loaded
+# there is nothing to read, and this unit must never be what starts or restarts the table.
+Requisite=mediatore-gateway-nft.service
+After=mediatore-gateway-nft.service
+ConditionPathExists=|/run/cos/active_mode
+ConditionPathExists=|/run/cos/passive_mode
+
+[Service]
+Type=oneshot
+# Not root: a user of its own, in no other group, with CAP_NET_ADMIN and nothing else.
+# CAP_NET_ADMIN is what netlink asks of whoever reads and resets nftables objects; it is the
+# whole bounding set and the whole ambient set (ambient, because a user that is not root has
+# no capability unless the unit hands it one, and "nft" is a child of the role). Root with the
+# same one capability would still own most of the file system by its uid; this user owns one
+# directory.
+User=mediatore-probes
+Group=mediatore-probes
+CapabilityBoundingSet=CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN
+NoNewPrivileges=yes
+# The summary's directory: this user's, 2750, group mediatore-gateway. The authorizer's user
+# reads it through its group and cannot write there, and no other user can enter it. Setgid so
+# the summary takes the directory's group without a chown; made here with full privileges
+# because RestrictSUIDSGID=yes below forbids this unit that bit.
+ExecStartPre=+/usr/bin/install -d -m 2750 -o mediatore-probes -g mediatore-gateway /run/mediatore-gateway/probes
+ExecStart=/usr/bin/mediatore gateway-probes --dir /run/mediatore-gateway/probes
+# One read is two short nft processes (about 4 ms each; 122 ms for a full set of sources).
+TimeoutStartSec=30
+# Every half minute: without this the journal would carry "Starting" and "Finished" each time.
+# A warning (what the table dropped, a failed read) still gets through.
+LogLevelMax=notice
+# PrivateNetwork= is not possible: the table lives in the host's network namespace. The
+# network is closed to this unit all the same: netlink is the only socket family it may open,
+# and no packet of its own may leave or arrive.
+RestrictAddressFamilies=AF_NETLINK
+IPAddressDeny=any
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+UMask=0027
+# The agent's socket and the authorizer's sockets are nothing of this unit's (it could not
+# connect to a unix socket anyway: no AF_UNIX).
+InaccessiblePaths=-/run/spire
+# ProtectSystem=strict does not make /run read-only once a unit also sets an option that
+# mounts the API file systems (ProtectKernelTunables=, ProtectProc= and others): seen on the
+# build host with systemd 257, where /run stayed writable under exactly these lines. So /run is
+# named here, and the one directory this unit writes is named after it.
+ReadOnlyPaths=/run
+ReadWritePaths=/run/mediatore-gateway/probes

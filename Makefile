@@ -213,7 +213,7 @@ gateway-image-check: gateway-render-check ## Check the built gateway image carri
 kind-gateway-envoy: ## Render dev/kind/gateway/envoy.yaml from image/gateway/envoy/gateway.yaml.in and the tier's env
 	./image/gateway/render image/gateway/envoy/gateway.yaml.in dev/kind/gateway/envoy.yaml dev/kind/gateway/envoy.env
 
-gateway-render-check: ## Fail when dev/kind/gateway/envoy.yaml drifted from the image's template, or an example env leaves a placeholder unfilled
+gateway-render-check: ## Fail when dev/kind/gateway/envoy.yaml drifted from the image's template, an example env leaves a placeholder unfilled, or the host table's drop counters (ADR-0070) changed a verdict
 	@./image/gateway/render image/gateway/envoy/gateway.yaml.in - dev/kind/gateway/envoy.env | diff -u dev/kind/gateway/envoy.yaml - \
 	  || { echo "dev/kind/gateway/envoy.yaml drifted from image/gateway/envoy/gateway.yaml.in: run make kind-gateway-envoy"; exit 1; }
 	@for t in envoy/gateway.yaml.in envoy/relay.yaml.in envoy/inject.yaml.in nftables.conf.in network.in authorizer.in; do \
@@ -295,15 +295,18 @@ gateway-render-check: ## Fail when dev/kind/gateway/envoy.yaml drifted from the 
 	@# WireServer root's at TCP 80 and 32526 and systemd-networkd's DHCP renewal, its port 53 back to the rows, anything else dropped.
 	@n=$$(./image/gateway/render image/gateway/nftables.conf.in - image/gateway/env.example image/gateway/vm.env.example | grep -v '^[[:space:]]*#'); \
 	  o=$$(printf '%s\n' "$$n" | sed -n '/chain output {/,/^  }/p'); \
-	  i=$$(printf '%s\n' "$$o" | grep -nx '    ip daddr 169.254.169.254 log prefix "mediatore-gateway out imds: " counter drop' | cut -d: -f1); \
+	  i=$$(printf '%s\n' "$$o" | grep -nx '    ip daddr 169.254.169.254 counter name "gateway_output_imds" log prefix "mediatore-gateway out imds: " drop' | cut -d: -f1); \
 	  j=$$(printf '%s\n' "$$o" | grep -nx '    ip daddr 168.63.129.16 jump output_wireserver' | cut -d: -f1); \
 	  k=$$(printf '%s\n' "$$o" | grep -n 'meta skuid' | head -1 | cut -d: -f1); \
 	  w=$$(printf '%s\n' "$$n" | sed -n '/chain output_wireserver {/,/^  }/p' | sed '1d;$$d'); \
 	  test -n "$$i" && test -n "$$j" && test -n "$$k" && test "$$i" -lt "$$k" && test "$$j" -lt "$$k" \
-	  && test "$$w" = "$$(printf '%s\n' '    meta l4proto { tcp, udp } th dport 53 return' '    meta skuid 0 tcp dport { 80, 32526 } accept' '    meta skuid "systemd-network" udp sport 68 udp dport 67 accept' '    log prefix "mediatore-gateway out wireserver: " counter drop')" \
+	  && test "$$w" = "$$(printf '%s\n' '    meta l4proto { tcp, udp } th dport 53 return' '    meta skuid 0 tcp dport { 80, 32526 } accept' '    meta skuid "systemd-network" udp sport 68 udp dport 67 accept' '    counter name "gateway_output_wireserver" log prefix "mediatore-gateway out wireserver: " drop')" \
 	  && test "$$(printf '%s\n' "$$n" | grep -c '168\.63\.129\.16')" = 1 && test "$$(printf '%s\n' "$$n" | grep -c '169\.254\.169\.254')" = 1 \
 	  || { echo "the gateway's output chain must drop IMDS for every user and send WireServer to output_wireserver before any user's row, which admits root at TCP 80 and 32526 and systemd-networkd's DHCP renewal alone (ADR-0068)"; exit 1; }
 	@echo "✓ the kind bootstrap is the image's template, the example env files fill every template, the relay has its three legs, the inject Envoy is off by default and shaped by ADR-0040, the tunnel check is the CHECK socket by default with no loopback exception and the authorizer listens where the data plane dials (ADR-0053), the platform addresses kept to root (ADR-0068)"
+	@# ADR-0070 decision 4: the named counters on the table's dropping rules and the reader's unit. Without the counters the table is
+	@# byte for byte the one before them: no verdict changed, nothing new accepted.
+	@./image/gateway/table-test.sh
 
 crds: ## Render mediatore's CRDs from their Rust types into deploy/base/crds/ (ADR-0008; never hand-edited, a unit test fails on a stale file)
 	cargo run -q -p mediatore-claims --bin crdgen -- --out-dir deploy/base/crds

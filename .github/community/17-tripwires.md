@@ -3,7 +3,7 @@
 
 # 17: Tripwires: a decoy the workload takes ends its sandbox
 
-**Status: not started** (opened 2026-11-26). A sandbox carries decoys that no honest run of its
+**Status: in progress: built 2026-11-27, `off` by default; the live proof on a VM and the homelab soaks remain** (opened 2026-11-26). A sandbox carries decoys that no honest run of its
 task has a reason to use: a loopback port that looks like a service, a route on the egress proxy
 that looks like an internal API, a credential that looks real. Every trap lives on the VM and is
 decided there, before anything leaves it: the gateway never sees a decoy, a bait value or the
@@ -12,7 +12,7 @@ doing what it was asked (a prompt injection, a hijacked agent, a malicious depen
 sandbox is ended: the jail's network is cut and its processes killed on the VM at once, the claim
 is released at the broker, and the VM goes back to banlieue. Decided in
 [ADR-0069](../../docs/adr/0069-tripwires-on-the-vm-a-decoy-the-workload-takes-ends-its-sandbox.md)
-(Proposed): it adds a route to the node surface, a field to the claim's record, a field and a
+(accepted 2026-11-27): it adds a route to the node surface, a field to the claim's record, a field and a
 condition to the `AgentSandbox` status, a section to the policy bundle, and the broker's first
 OpenTelemetry signals. Every trip event, and the host or port it reached for, is recorded in the
 audit line and on the sandbox's status, and exported as spans and metrics.
@@ -191,7 +191,7 @@ sees a service, not a closed port.
 | 10250 | the kubelet |
 | 11211 | memcached |
 | 27017 | MongoDB |
-| `169.254.169.254:80` | a cloud metadata service (the sandbox uid's packets redirected to a drawn loopback listener; ADR-0068's drop holds for every other uid) |
+| `169.254.169.254:80` | a cloud metadata service (the sandbox uid's packets redirected to the claim's one trap listener, as every decoy port is; ADR-0068's drop holds for every other uid) |
 | any other port in 1024 to 65535 | a forgotten dev server; at least one per draw, answering as an HTTP server |
 
 The seed ports above are only more likely than the rest. Under `enforce`, a connection to a
@@ -217,7 +217,7 @@ per service.
 | `ELASTICSEARCH_URL` | `es`, `search`, `logs` | as above |
 | `GRAFANA_URL` | `grafana`, `metrics`, `dashboards` | as above |
 | `METADATA_URL` | `metadata`, `instance-data` | as above |
-| `SENTRY_DSN` | `sentry`, `errors` | as above, with a drawn key in the DSN (also a credential trap) |
+| `SENTRY_DSN` | `sentry`, `errors` | as above (*amended 2026-11-27: no key in the DSN, by the maintainer's decision: an SDK reads this variable on its own, so a well-formed DSN would be used by an honest run*) |
 
 Excluded after the draw: any host that is one of the claim's routes.
 
@@ -261,6 +261,11 @@ Excluded after the draw:
 - **Any name the guest already sets** (the phantom, the proxy's address, the decoy routes'
   variables).
 - **A file the image already has.** The guest does not overwrite a real `~/.npmrc`.
+
+*Amended 2026-11-27, as built (ADR-0069 decision 3, amended): the lookup-order rule is by family. When any variable of
+a tool's lookup family is set by the workload or the guest, no bait of that family is drawn (`GH_TOKEN` set: no
+`GITHUB_TOKEN`; one AWS name set: none of the three). A file the image already has cannot collide: under `shadow` and
+`enforce` the home is a bind mount the guest prepares, which hides the image's own.*
 
 ### Rejected: decoys at the gateway
 
@@ -366,84 +371,179 @@ by default (decision 10); the canaries are not kept or hashed after the claim.
 
 ### Phase 0: design
 
-- [ ] ADR-0069 accepted (drafted 2026-11-26, Proposed).
+- [x] ADR-0069 accepted (drafted 2026-11-26, accepted 2026-11-27 with the amendments of that day).
 - [x] CALM (2026-11-26): `data-asset-trap-draw`, the guest's, the proxy's and the workload's decoy
       relationships, `POST /v1/me/trip`, the record and status writes, `flow-tripwire`;
       `make calm-validate` and `make calm-diagrams` pass.
 - [ ] notaio: the bundle's `traps` section agreed with its schema, if question 2 puts it there.
+      *2026-11-27: not buildable here: the bundle schema is notaio's (ADR-0069 decision 4, amended). The wire type
+      (`TrapCatalogue`) and the draw's use of one are built; no broker serves one, and `P017` waits with it.*
 
 ### Phase 1: containment on the guest
 
-- [ ] A `trip` module in `crates/mediatore-guest`: the drop-all ruleset for the sandbox uid,
+- [x] A `trip` module in `crates/mediatore-guest`: the drop-all ruleset for the sandbox uid,
       rendered as text and pinned by tests as `net.rs` is; the jail stopped after the cut.
+      (2026-11-27: `the_drop_all_ruleset_is_this_text`,
+      `under_enforce_the_cut_comes_before_the_kill_and_both_before_the_report` in `trip.rs`;
+      `a_trip_ends_the_supervision_with_tripped_and_no_restart_whatever_the_policy` in `supervise.rs`.)
 - [ ] Live test in `crates/mediatore/tests/jail_exec_live.rs` on the build host: after a trip a
       connection from the sandbox uid fails, no jail process remains, and the cut takes under the
       bound the ADR sets.
-- [ ] A trip the broker cannot hear about still contains the jail (the broker faked down).
+      *2026-11-27: written and run by hand on the build host in a throwaway namespace, a debug build, with a stand-in
+      proxy and broker: `after_a_trip_nothing_from_the_sandbox_uid_leaves_and_no_jail_process_remains` passed,
+      `containment_ms=54`, every process of the uid gone 242 ms after the verdict (the run on the merged tree, after
+      the fix round). Left open: no bound is set yet, and the figure is not a release build on a VM.*
+- [x] A trip the broker cannot hear about still contains the jail (the broker faked down).
+      (2026-11-27: `containment_does_not_wait_on_a_broker_that_never_answers` in `trip.rs`; live,
+      `containment_holds_with_the_broker_unreachable`, 256 ms, in the namespace run above. The guest waits at most
+      120 s for the report's acknowledgement before its teardown, `the_wait_for_the_report_of_a_trip_is_bounded`; the
+      first trip is cut and reported however full the queue, `a_trip_that_finds_the_queue_full_is_still_cut_reported_and_ends_the_run`;
+      a run that ends during its cut is still the tripped run, `a_run_that_ends_while_its_trip_is_being_cut_is_still_the_tripped_run`.)
 
 ### Phase 2: the broker and the status
 
-- [ ] `POST /v1/me/trip` on the node surface: the node's SVID only, the claim bound to it, the
+- [x] `POST /v1/me/trip` on the node surface: the node's SVID only, the claim bound to it, the
       body validated; `tripped` written by compare-and-set, then the release.
-- [ ] A tripped claim is not restarted (ADR-0033) and its token is refused at `POST /v1/token`.
+      (2026-11-27: `a_trip_under_enforce_writes_tripped_then_releases_in_that_order`,
+      `a_trip_from_a_claim_identity_or_the_authorizer_is_403`,
+      `a_body_that_is_off_in_any_part_is_400_and_nothing_is_recorded` in `crates/mediatore-api/src/trip.rs`. Not
+      run against a real API server. After the fix round: the release before the fold; an exit racing a trip
+      deletes nothing, `an_exit_racing_a_trip_writes_nothing_and_deletes_nothing`; the claim's logs taken from its
+      node for 60 s after the trip, `a_tripped_claims_last_output_reaches_its_owner_when_the_trip_lands_first`.)
+- [x] A tripped claim is not restarted (ADR-0033) and its token is refused at `POST /v1/token`.
+      (2026-11-27: `a_trip_ends_the_supervision_with_tripped_and_no_restart_whatever_the_policy`,
+      `a_tripped_record_gets_no_token_before_its_release_lands`, `the_tripped_claims_token_is_refused` in `e2e_egress.rs`.)
 - [ ] The `Tripped` condition on `AgentSandbox`, the reconciler's no-reclaim rule, the
       acknowledgement annotation, the CLI's view.
-- [ ] Every event recorded (ADR-0069 decision 9): the audit line; `status.tripwires`, bounded to
+      *2026-11-27, partly: the condition, the no-reclaim rule and the CLI's view are built
+      (`a_tripped_record_sets_the_tripped_condition_with_the_kind_as_its_reason`,
+      `a_tripped_sandbox_has_its_claim_deleted_and_is_failed_with_the_reason_and_never_claims_again` in
+      `sandbox.rs`, `trip_lines` in `crates/mediatore-client/src/cli.rs`, and the kind sandbox tier with the status
+      written by hand). The acknowledgement annotation and the three-trips backoff are struck from ADR-0069 decision 9:
+      a sandbox never claims twice. Left open for that.*
+- [x] Every event recorded (ADR-0069 decision 9): the audit line; `status.tripwires`, bounded to
       16 entries, written by compare-and-set apart from the record and ignored by the
       controller's watch filter; its CRD schema in both served versions.
+      (2026-11-27: `the_audit_line_names_the_event_and_never_a_path_a_header_or_a_value` in `trip.rs`;
+      `the_trip_fold_patch_names_status_tripwires_and_the_resource_version_and_nothing_else` in `kubestore.rs`;
+      `an_event_that_differs_only_in_tripwires_does_not_reach_the_reconciler_and_any_other_change_does` in `watch.rs`;
+      `both_served_versions_carry_tripwires_with_its_bounds` in `sandbox.rs`; the schema in kind. The broker's own
+      status patch against a real API server is not proven.)
 - [ ] OpenTelemetry in the broker (ADR-0069 decision 11), once roadmap 15's foundations exist: the
       `mediatore.trip.report` span and its events, the five instruments, the schema additions;
       `drawn` targets exported, `workload` targets as their class only. The cardinality test and
       the bait canary scan over every exported signal.
-- [ ] e2e in `crates/mediatore/tests/e2e_dev.rs`: a trip ends the claim; a trip from a
+      *2026-11-27: not buildable: no exporter, no `mediatore-telemetry`, roadmap 15 not started. Waits there.*
+- [x] e2e in `crates/mediatore/tests/e2e_dev.rs`: a trip ends the claim; a trip from a
       non-node peer, from another claim's node and for a revoked claim are refused or no-ops; a
       second trip is idempotent.
+      (2026-11-27: `a_trip_ends_the_claim_and_the_owner_sees_it`,
+      `a_trip_from_a_non_node_peer_or_another_claims_node_ends_nothing`, `a_trip_for_a_released_claim_is_a_no_op`,
+      `a_repeated_trip_id_is_idempotent`. `dev_mode` has no `AgentSandbox`; the condition is proven in `sandbox.rs`
+      and `e2e_sandbox.rs`.)
 
 ### Phase 3: decoy ports
 
-- [ ] The draw: a `draw` module in `crates/mediatore-guest`, the catalogues, the counts, the
+- [x] The draw: a `draw` module in `crates/mediatore-guest`, the catalogues, the counts, the
       redraw on an exclusion. Unit-tested with a seeded RNG for the rules and a statistical test
       that two draws differ; the real draw seeded from the OS only.
-- [ ] The guest's listeners for the drawn ports, each with its first line, and the jail chain's
+      (2026-11-27: `every_exclusion_redraws_and_never_shortens_the_draw`,
+      `counts_stay_within_the_built_in_bounds_over_ten_thousand_draws`, `two_draws_from_the_os_differ`,
+      `two_draws_from_one_seed_are_equal` in `draw.rs`.)
+- [x] The guest's listeners for the drawn ports, each with its first line, and the jail chain's
       admission of exactly those; the link-local address.
-- [ ] `shadow` and `enforce` behind `policy.traps`, refused at start when anything else.
-- [ ] The generators beside the seeds: port anywhere in range, host names from word lists, variable
+      (2026-11-27, after the fix round: nothing listens on a decoy port; the claim's table redirects the sandbox
+      uid's connections to the decoy ports and the metadata address to one trap listener on a port drawn per claim,
+      which answers as the decoy reached. `the_trap_listener_answers_as_the_decoy_reached_and_notes_a_port_trip`,
+      `a_connection_that_names_no_decoy_is_still_a_use_and_is_answered_nothing` in `decoy.rs`;
+      `the_decoy_ports_are_redirected_to_the_one_trap_listener_for_the_uid_alone`,
+      `the_metadata_redirect_is_keyed_on_the_uid_alone_and_absent_without_the_decoy` in `net.rs`; the kernel's side in
+      the namespace run below, with `the_jail_cannot_list_the_decoys_through_its_own_proc_net`. Not proven beside a
+      pool VM's host table or on Azure.)
+- [x] `shadow` and `enforce` behind `policy.traps`, refused at start when anything else.
+      (2026-11-27: `policy_traps_is_off_by_default_and_takes_shadow_and_enforce`,
+      `any_other_value_of_policy_traps_refuses_the_start` in `crates/mediatore/src/config.rs`. `policy.traps` needs the
+      `policy` section, so a deployment with no signed policy cannot turn it on.)
+- [x] The generators beside the seeds: port anywhere in range, host names from word lists, variable
       names from stem, provider and suffix, decoys derived from the claim's real routes, the
       bundle's additions weighted first.
+      (2026-11-27: `every_draw_has_a_port_outside_the_seeds`,
+      `a_derived_decoy_looks_like_a_second_host_of_a_real_route_and_is_never_that_route`,
+      `the_deployments_entries_outweigh_the_seeds` in `draw.rs`. The bundle's additions are proven against a
+      hand-built catalogue only: no broker can serve one until notaio carries the section.)
 - [ ] Live test: every drawn port trips from the jail; a closed loopback port trips under
       `enforce` and is logged as `would_trip` under `shadow`; nothing is open under `off`.
+      *2026-11-27, run by hand in a throwaway namespace on the build host: `every_drawn_port_trips_from_the_jail` and
+      `nothing_is_open_under_off` passed. A closed loopback port does not trip: Landlock refuses it in the syscall
+      before any table sees it (`a_closed_loopback_port_is_refused_by_landlock_and_trips_nothing`, ADR-0069 decision
+      10, amended). Left open: that half is not what the box asks, and nothing has run on a VM.*
 - [ ] A red-team check: a script that reads this repository's catalogues and avoids every seed
       entry still trips within a bounded number of probes on a sandbox with a deployment
       catalogue, and its result recorded in the ADR.
+      *2026-11-27: a SIMULATION only, recorded in the ADR as one
+      (`a_prober_that_avoids_every_seed_still_trips_within_n_probes_with_a_deployment_catalogue`, 5000 seeded draws:
+      worst 6 probes, mean 1.59 with a hand-built catalogue). The live number needs a deployment catalogue, which needs
+      notaio. A follow-up ADR on chaff ports is owed first (ADR-0069, "What it does not catch").*
 
 ### Phase 4: decoy routes and bait credentials at the proxy
 
-- [ ] Drawn decoy routes (stem and suffix) in the proxy's table, refused and reported; the
+- [x] Drawn decoy routes (stem and suffix) in the proxy's table, refused and reported; the
       advertised variables.
-- [ ] A generator per credential shape (prefix, length, alphabet, checksum), unit-tested so every
+      (2026-11-27: `a_request_naming_a_decoy_route_is_403_trap_under_enforce_and_404_under_shadow_and_nothing_is_dialled`
+      in `egress.rs`, `a_decoy_route_trips_and_is_never_tunnelled` in `e2e_egress.rs`.)
+- [x] A generator per credential shape (prefix, length, alphabet, checksum), unit-tested so every
       value passes the provider's offline check.
-- [ ] The credential draw's exclusions: every routed provider, every variable ahead of a phantom
+      (2026-11-27: `every_generated_credential_passes_its_providers_offline_check` in `draw.rs`. The `ghp_` and `npm_`
+      checksums are the common reading, not confirmed against a public vector; the OpenAI and PyPI shapes come from
+      public scanner rules.)
+- [x] The credential draw's exclusions: every routed provider, every variable ahead of a phantom
       in a routed tool's lookup order, every name the guest sets itself, every file the image
       already has. Unit-tested against claims with a GitHub, an npm and a model-API route.
-- [ ] Planted in the jail's environment and the matching files in the sandbox user's home before
+      (2026-11-27: `a_claim_routed_to_github_npm_and_a_model_api_draws_none_of_their_providers`,
+      `a_set_variable_of_a_lookup_family_excludes_every_bait_of_that_family`,
+      `a_bait_gh_token_is_never_drawn_beside_a_routed_github_phantom` in `draw.rs`. By family, not order; "a file the
+      image already has" cannot occur, the home being a mount.)
+- [x] Planted in the jail's environment and the matching files in the sandbox user's home before
       the jail starts; held by the guest and the proxy only, dropped with the claim.
-- [ ] The proxy's matcher, unit-tested on the three encodings, the Basic pair, the body bound, and
+      (2026-11-27: `every_bait_variable_is_in_the_jail_and_in_the_redaction_set_and_none_is_in_the_argv`,
+      `under_traps_the_home_is_a_bind_mount_with_the_bait_files_and_never_under_work` in `jail.rs`,
+      `the_planted_home_is_the_sandbox_users_0700_with_its_files_0600_and_never_under_work` in `sandboxfs.rs`; the
+      files read from a real jail in the namespace run. The home now persists across restarts within a claim.)
+- [x] The proxy's matcher, unit-tested on the three encodings, the Basic pair, the body bound, and
       the model-API exemption.
-- [ ] The proxy-to-guest socket, peer-credential checked.
+      (2026-11-27: `the_matcher_catches_the_raw_the_percent_encoded_and_each_base64_alignment`,
+      `bait_in_any_header_the_path_or_the_query_is_found_before_any_upstream`, `a_gzip_bomb_stops_at_the_expansion_bound`
+      in `trapmatch.rs`; `on_a_traps_body_skip_route_bait_in_the_body_passes_and_in_authorization_trips` in `egress.rs`.
+      "The body bound" is ADR-0069 decision 6's hold-back, not a 64 KiB limit; latency and memory not measured. After
+      the fix round the method and every header name are matched too,
+      `a_method_and_every_header_name_are_matched_whatever_case_hyper_gave_them`,
+      `bait_as_the_method_or_a_header_name_is_matched_like_any_other_position`, and a hit on a request with no route
+      is told with the target `invalid`, `bait_that_names_no_route_is_never_a_target_nor_a_logged_segment`.)
+- [x] The proxy-to-guest socket, peer-credential checked.
+      (2026-11-27: `the_socket_admits_the_sandbox_uid_and_refuses_any_other_peer`,
+      `the_socket_is_a_path_in_a_root_owned_directory_and_never_abstract` in `trip.rs`. Directory `0711`.)
 - [ ] e2e in `crates/mediatore/tests/e2e_egress.rs`: the canary in a header, in a query and in a
       body each trip; reading the file or running `env` trips nothing; the canary in a request
       body to the model API's route trips nothing, in its `Authorization` it trips; `gh` with a
       routed GitHub phantom never picks up a canary; a legitimate route is unchanged.
+      *2026-11-27, partly: built in `e2e_egress.rs` (`bait_in_a_header_trips_and_never_reaches_the_upstream`,
+      `bait_in_the_query_trips`, `bait_in_a_body_trips_and_the_upstream_sees_an_incomplete_request_without_the_value`,
+      `bait_in_a_gzip_body_trips`, `bait_in_a_model_api_body_trips_nothing_and_in_its_authorization_trips`,
+      `a_legitimate_route_is_unchanged_with_traps_armed`). Two cases are proven another way: reading the file and
+      running `env` by the live jail test (`reading_the_bait_files_and_running_env_trips_nothing`), and `gh` only as
+      the draw's exclusion; `gh` itself has not been run. Left open for that.*
 
 ### Phase 5: docs, threat model, live proof
 
-- [ ] `docs/guides/tripwires.md`: the kinds, the modes, what a requester sees, and how to read a
-      trip.
-- [ ] Threat-model pass: the new route on TB-6, the proxy as a reader of
+- [x] `docs/guides/tripwires.md`: the kinds, the modes, what a requester sees, and how to read a
+      trip. (2026-11-27.)
+- [x] Threat-model pass: the new route on TB-6, the proxy as a reader of
       request bodies for canaries, a trip as a denial of service a third party can cause, the
       transformed-canary gap in §8; stamp bumped.
+      *2026-11-27: the pass is done the same day as the implementation.*
 - [ ] A false-positive soak in `shadow` on the homelab: a run of ordinary Claude Code tasks with no
-      `would_trip`.
+      `would_trip`. *2026-11-27: owed; needs a release with the guest images first.*
 - [ ] Live on the homelab under `enforce`: a Claude Code sandbox given a planted instruction to
       send `~/.aws/credentials` somewhere is ended, its VM is gone, and its `AgentSandbox` shows
-      `Tripped`.
+      `Tripped`. *2026-11-27: owed. Under `audience_definitions.mode: bundles` the homelab cannot run `enforce` until
+      notaio carries the audience mark.*

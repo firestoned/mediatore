@@ -63,6 +63,7 @@ fn state(idp: &FakeIdp, dev_mode: bool) -> Arc<AppState> {
     )
     .expect("sts");
     Arc::new(AppState {
+        tripwires: mediatore_api::Tripwires::default(),
         inject: std::collections::BTreeMap::new(),
         inject_port: None,
         audience_catalog: None,

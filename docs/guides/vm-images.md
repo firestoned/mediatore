@@ -35,6 +35,27 @@ The base is the operating system and nothing of mediatore's. The overlays start
 the base has what they rely on (`systemctl`, `useradd`, `nft`, `tpm2_nvread`, `qemu-ga`, the
 `tss` group, no `sshd`, and `apt-get` for the sandbox overlay) and fails the build if not.
 
+## What the images carry for tripwires
+
+[ADR-0070](../adr/0070-tripwires-beyond-the-sandbox-a-request-no-honest-build-makes.md) counts what the host tables drop
+and no honest machine sends; nothing new is accepted in either image.
+
+- **The gateway** gains a fifth service user, `mediatore-probes`, in no group but its own, and two units:
+  `mediatore-gateway-probes.timer` (`OnBootSec=30s`, `OnUnitActiveSec=30s`, enabled) starts
+  `mediatore-gateway-probes.service`, a oneshot running `mediatore gateway-probes --dir /run/mediatore-gateway/probes`
+  with `CAP_NET_ADMIN` as its whole bounding and ambient set, no address family but `AF_NETLINK`, every address denied,
+  and one writable directory. Its `ExecStartPre` makes that directory `2750`, owned by `mediatore-probes` and group
+  `mediatore-gateway`, so the authorizer reads the summary and cannot change it. The table
+  (`image/gateway/nftables.conf.in`) gains the set `probe_sources` and eleven named counters (`gateway_port`,
+  `gateway_output_*`). `make gateway-image-check` pins the unit's lines and the user;
+  `make gateway-render-check` runs `image/gateway/table-test.sh`, which requires every verdict of the table unchanged.
+- **The sandbox image** gains no unit: the guest, already root and already driving `nft`, reads the pool's host table
+  every 60 s. The table (`image/host-table`, on a pool with gateways) gains the counters `pool_inbound` and `pool_output`
+  and the sets `inbound_sources` and `output_ports`, pinned by `make host-table-test`.
+
+Both report what moved to the broker, which logs it; whatever its `tripwires` section says, a `segment` class records only
+and ends nothing. See [Tripwires](tripwires.md#the-gateways-and-the-pools-probes).
+
 ## Building
 
 ```sh

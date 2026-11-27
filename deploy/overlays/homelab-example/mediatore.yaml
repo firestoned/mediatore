@@ -40,6 +40,10 @@ audiences:
       - { method: GET, path: "/api/**" }
       - { method: POST, path: "/api/ds/query" }
     # ca_file: /etc/mediatore-cas/home.pem
+    # traps_body (optional, ADR-0069): match (the default) or skip. Skip for an audience
+    # whose request bodies carry the agent's own conversation (a model API): the egress
+    # proxy then looks for bait in its headers, path and query only.
+    # traps_body: match
 # The environment's egress gateways (ADR-0028 decision 6): the three gateways' sandbox
 # addresses and data-plane port, addresses not names, in the order every guest receives
 # them on GET /v1/me. With it the egress proxy tunnels every upstream through one of them as
@@ -74,6 +78,33 @@ sandboxes:
 #   trusted_keys:
 #     - { id: "notaio:v1", public_key: "<base64 Ed25519 public key>" }
 #   namespaces: [sandboxes]   # default: sandboxes.namespace
+#   # Tripwires on the VM (ADR-0069): off (the default), shadow or enforce, for the whole
+#   # broker. Off: guests are handed no traps and POST /v1/me/trip answers 501. Shadow: a
+#   # trip is recorded and ends nothing. Enforce: a trip ends its claim; refused at start
+#   # under audience_definitions.mode: bundles. Upgrade the guest images before leaving off.
+#   traps: off
+#   # What each denied class does under enforce: report (the default) or trip.
+#   traps_denied: { loopback_port: report, private_range: report, unknown_host: report }
+# Tripwires past the jail (ADR-0070): what each class of refusal the broker classifies does,
+# report (the default, for every class) or trip. No off: recording arms nothing. Only three
+# classes scoped to a claim (foreign_route, unknown_route, audience_outside_rendered) may be
+# set to trip, each after its soak; trip on any other class (deny_outside_rendered included:
+# the claim it names is the authorizer's word), an unknown class or an unknown value refuses
+# the start. `no_record` is not judged
+# while store.retention_secs is not above the claim SVID's lifetime (900 s).
+# tripwires:
+#   foreign_route: report
+#   unknown_route: report
+#   audience_outside_rendered: report
+#   deny_outside_rendered: report        # report only
+#   identity_shape: report               # report only
+#   no_record: report                    # report only
+#   claim_never_issued: report           # report only
+#   credential_outside_inject: report    # report only
+#   gateway_port: report                 # report only
+#   gateway_output: report               # report only
+#   pool_inbound: report                 # report only
+#   pool_output: report                  # report only
 # A workload's output, redacted in the VM and streamed to its owner (ADR-0045). Off by
 # default: a claim with `workload.logs: true` is refused and the routes answer 501. On, the
 # broker keeps the newest `max_bytes` per claim (default 1 MiB, ceiling 4 MiB) in Secrets

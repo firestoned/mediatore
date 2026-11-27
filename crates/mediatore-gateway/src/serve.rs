@@ -109,6 +109,11 @@ pub struct GatewayArgs {
     /// host name. Attribution, not authentication: every gateway has the one authorizer identity
     #[arg(long, env = "MEDIATORE_GATEWAY_NAME")]
     pub name: Option<String>,
+    /// Where the probes reader (`mediatore gateway-probes`) leaves its summary of what the host
+    /// table dropped, for the next batch of decisions (ADR-0070). Read, never written; absent
+    /// off the gateway image, and then no probe is reported
+    #[arg(long, value_name = "DIR", default_value = crate::probes::PROBES_DIR)]
+    pub probes_dir: PathBuf,
     /// Dev only: send this SPIFFE ID, which must be `spiffe://<td>/gateway/authorizer`, as a
     /// header instead of mTLS (loopback `dev_mode` broker)
     #[cfg(feature = "dev")]
@@ -585,8 +590,12 @@ pub async fn run(args: GatewayArgs) -> anyhow::Result<()> {
     };
     let name = crate::report::gateway_name(args.name.as_deref())?;
     let broker = Arc::new(broker);
-    let (reporter, _reporting) =
-        crate::report::Reporter::spawn(name.clone(), broker.clone(), crate::report::EVERY);
+    let (reporter, _reporting) = crate::report::Reporter::spawn(
+        name.clone(),
+        broker.clone(),
+        crate::report::EVERY,
+        Some(crate::probes::Inbox::open(&args.probes_dir)),
+    );
     let mut authorizer =
         Authorizer::new(&trust_domain, broker.clone(), cfg).with_reporter(reporter);
     tracing::info!(
