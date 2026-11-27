@@ -125,12 +125,15 @@ Added 2026-11-19 ([ADR-0053](../../docs/adr/0053-the-gateways-authorizer-has-an-
 - [x] A connection on the sandbox listener ends at its peer certificate's `notAfter` (2026-11-19)
 - [x] Tests: unit and end to end in `make check`; the kind gateway tiers with two identities on the pod, the listeners' identity refused by the broker and the admission dry runs (2026-11-19)
 - [x] Threat model: full pass; A-28 new, R-20 and R-27 narrowed, R-48 to R-51 new (2026-11-19)
-- [x] The tunnel check on the unix socket by default, which removes the loopback exception (ADR-0053 open question 7; built 2026-11-26, the image check green, a booted gateway still owed)
+- [x] The tunnel check on the unix socket by default, which removes the loopback exception (ADR-0053 open question 7; built 2026-11-26, the image check green; seen on one booted gateway 2026-11-27: the check directory `2750` with the group `envoy`, the socket `0660`, a claim's tunnels decided by the authorizer listening on it)
 - [ ] The output chain's default policy moved to `drop`, once a booted gateway has given the list of users that open a connection (open question 4)
 - [ ] The transition switch removed, the release after the one that ships it
 - [ ] Per-gateway identities and binding a credential ask to the gateway serving the claim: an ADR of its own (decision 8)
 
-Left to a live environment: three gateway VMs booted from the image under the new entries, with the drops per user, the resolver under the chain, the agent's and the relay's upstreams and the migration in each direction observed (ADR-0053, *What was proven, and what was not*; threat model R-48). Until then the output chain is built and not verified.
+- [x] One gateway VM booted from the image under the new entries, behind a broker with the transition switch off, and one claim through a tunnel: the authorizer on its own ID, the output chain loaded with every user resolved, the agent, the relay and the resolver working under it, nothing legitimate dropped (2026-11-27; ADR-0053, *Shown on a booted gateway, 2026-11-27*)
+- [x] The two boot faults that run found, fixed in the image's files and not yet booted: the agent's socket directory optional in `ReadOnlyPaths=` on the authorizer's and the tunnel Envoy's units and no start limit on the authorizer's, asserted by `image/gateway/check.sh`; the inject drop-in written in the example cloud-config's `initramfs` stage (2026-11-27)
+
+Left to a live environment: the rest of ADR-0053's condition. A refused destination attempted as each Envoy's user and the drop seen counted, a name made to resolve into the refused set (`503`), the migration walked in each direction, a claim through the inject listener, three gateways, and which certificate validator Envoy runs (ADR-0053, *What was proven, and what was not*; threat model R-48, R-51). Until then the output chain is shown to load and to pass what a gateway needs on one VM, and its refusals are built and not verified.
 
 Added 2026-11-22 ([ADR-0063](../../docs/adr/0063-the-image-pull-goes-through-the-claims-proxy-and-the-gateway-like-any-egress.md)):
 no workload path goes around the gateway, the image pull included, and each namespace pulls only from the
