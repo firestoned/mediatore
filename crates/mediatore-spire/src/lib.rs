@@ -572,21 +572,21 @@ impl Gated {
 
 #[async_trait]
 impl EntryManager for Gated {
-    async fn ensure_node_entry(&self, ek_hash: &str) -> Result<String, SpireError> {
+    async fn ensure_node_entry(&self, attestation: &NodeAttestation) -> Result<String, SpireError> {
         self.proven_or_refused().await?;
-        self.inner.ensure_node_entry(ek_hash).await
+        self.inner.ensure_node_entry(attestation).await
     }
 
     async fn create_claim_entry(
         &self,
-        ek_hash: &str,
+        node: &NodeIdentity,
         claim_uid: Uuid,
         unix_user: &str,
         claim_ttl: Duration,
     ) -> Result<String, SpireError> {
         self.proven_or_refused().await?;
         self.inner
-            .create_claim_entry(ek_hash, claim_uid, unix_user, claim_ttl)
+            .create_claim_entry(node, claim_uid, unix_user, claim_ttl)
             .await
     }
 
@@ -851,15 +851,15 @@ mod tests {
     async fn a_gate_declares_nothing_while_unproven_and_always_retracts() {
         // ADR-0056 decision 5, open question 7: a broker that knows its bound is gone stops
         // declaring. It never stops retracting, and it releases nothing on its own.
-        let inner = std::sync::Arc::new(MemoryEntries::default());
+        let inner = std::sync::Arc::new(MemoryEntries::in_trust_domain("sandbox.test"));
         let gated = Gated::new(inner.clone());
         assert!(!gated.is_proven(), "unproven until a self-check has passed");
         gated.self_check().await.unwrap();
         assert!(gated.is_proven());
-        let node = gated.ensure_node_entry(EK).await.unwrap();
+        let node = gated.ensure_node_entry(&tpm()).await.unwrap();
         let claim = Uuid::new_v4();
         let entry = gated
-            .create_claim_entry(EK, claim, "sb-0123456789ab", Duration::from_hours(1))
+            .create_claim_entry(&identity(&tpm()), claim, "sb-0123456789ab", Duration::from_hours(1))
             .await
             .unwrap();
 
@@ -869,14 +869,16 @@ mod tests {
         )));
         assert!(gated.self_check().await.is_err());
         assert!(!gated.is_proven());
-        let other = "a".repeat(64);
+        let other = NodeAttestation::Tpm {
+            ek_hash: "a".repeat(64),
+        };
         let refused = gated.ensure_node_entry(&other).await.unwrap_err();
         assert!(matches!(refused, SpireError::Unproven(_)), "{refused:?}");
         assert!(refused.to_string().contains("unproven"), "{refused}");
         assert!(matches!(
             gated
                 .create_claim_entry(
-                    EK,
+                    &identity(&tpm()),
                     Uuid::new_v4(),
                     "sb-0123456789ab",
                     Duration::from_hours(1)
@@ -910,7 +912,7 @@ mod tests {
         inner.answer_self_check_with(Some(SelfCheckError::Unreachable("connect".into())));
         let gated = Gated::new(inner.clone());
         assert!(matches!(
-            gated.ensure_node_entry(EK).await,
+            gated.ensure_node_entry(&tpm()).await,
             Err(SpireError::Unproven(_))
         ));
         assert_eq!(inner.names(), Vec::<String>::new());
