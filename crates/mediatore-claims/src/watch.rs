@@ -68,6 +68,10 @@ pub struct WatcherConfig {
     >,
     /// Issuers mediatore trusts; a sandbox's subject must come from one.
     pub issuers: Vec<String>,
+    /// `sandboxes.max_ttl_seconds` (ADR-0008 decision 9, amended 2026-11-26): the longest
+    /// lifetime a sandbox may ask for, with or without a policy. A `ttlSeconds` above it fails
+    /// the sandbox before any claim exists; a policy's lease only narrows it.
+    pub max_ttl_seconds: u32,
     /// Per audience of `role: registry`, the registries it serves (ADR-0063 decision 2): with gateways, a sandbox
     /// whose image is on a registry none of its audiences in this map serves fails before any claim exists. `None`
     /// without gateways, where nothing is refused by registry.
@@ -236,6 +240,7 @@ impl Default for WatcherConfig {
             audiences: vec![],
             scopes: std::collections::BTreeMap::new(),
             issuers: vec![],
+            max_ttl_seconds: mediatore_proto::DEFAULT_MAX_TTL_SECONDS,
             registry_audiences: None,
             placed_registries: std::collections::BTreeMap::new(),
             retention: Duration::from_hours(1),

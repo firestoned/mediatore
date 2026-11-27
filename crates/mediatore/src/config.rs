@@ -450,7 +450,7 @@ impl Default for WatcherSection {
 }
 
 /// `AgentSandbox` resources the user API creates (ADR-0008 decision 4, ADR-0046).
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SandboxesSection {
     /// Namespace `POST /v1/claims` creates sandboxes in, the single-namespace form. The
@@ -463,6 +463,30 @@ pub struct SandboxesSection {
     /// Exclusive with `namespace`; with it set there is no default namespace.
     #[serde(default)]
     pub namespaces: Option<std::collections::BTreeMap<String, NamespaceEntry>>,
+    /// The longest lifetime a claim may ask for, in seconds, through either front door
+    /// (`ttl_seconds` on `POST /v1/claims`, `spec.ttlSeconds` on an `AgentSandbox`), with or
+    /// without a policy: above it the API answers `400 ttl_exceeds_maximum` and the reconciler
+    /// fails the sandbox, before anything exists (ADR-0008 decision 9, amended 2026-11-26). A
+    /// policy's lease only narrows it. Positive. Default `86400`, one day: the same figure as
+    /// the default of the gateways' tunnel cap (`TUNNEL_MAX_SECS`, `image/gateway/env.example`),
+    /// which no tunnel outlives; raise the two together. Read at creation only: a claim already
+    /// bound is not released when the key is lowered.
+    #[serde(default = "default_max_ttl_seconds")]
+    pub max_ttl_seconds: u32,
+}
+
+impl Default for SandboxesSection {
+    fn default() -> Self {
+        Self {
+            namespace: None,
+            namespaces: None,
+            max_ttl_seconds: default_max_ttl_seconds(),
+        }
+    }
+}
+
+fn default_max_ttl_seconds() -> u32 {
+    mediatore_proto::DEFAULT_MAX_TTL_SECONDS
 }
 
 /// One namespace of `sandboxes.namespaces`. A typo in the field is a start error, never an
@@ -503,8 +527,15 @@ impl SandboxesSection {
         }
     }
 
-    /// ADR-0046 decision 14, each refusal naming the key and the value.
+    /// ADR-0046 decision 14, each refusal naming the key and the value; and the ceiling of
+    /// ADR-0008 decision 9 (amended 2026-11-26), which zero would turn into "no claim at all".
     fn validate(&self) -> anyhow::Result<()> {
+        if self.max_ttl_seconds == 0 {
+            anyhow::bail!(
+                "sandboxes.max_ttl_seconds must be positive: it is the longest lifetime a claim may ask for, in seconds (default {})",
+                default_max_ttl_seconds()
+            );
+        }
         let Some(map) = &self.namespaces else {
             if self.single_namespace().trim().is_empty() {
                 anyhow::bail!("sandboxes.namespace must not be empty");
@@ -1514,6 +1545,10 @@ impl Config {
                 );
             }
         }
+        tracing::info!(
+            max_ttl_seconds = self.sandboxes.max_ttl_seconds,
+            "longest lifetime a claim may ask for (sandboxes.max_ttl_seconds)"
+        );
         self.log_policy_sources();
     }
 
@@ -3375,6 +3410,65 @@ listen: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }
     fn a_top_level_unknown_key_refuses_to_start() {
         let err = refused("unknown_top_level: 1\n");
         assert!(err.contains("unknown_top_level"), "{err}");
+    }
+
+    #[test]
+    fn the_longest_claim_lifetime_defaults_to_one_day_and_must_be_a_positive_number() {
+        // Absent section, and a section that says something else: one day either way.
+        assert_eq!(with("").unwrap().sandboxes.max_ttl_seconds, 86_400);
+        assert_eq!(
+            with("sandboxes: { namespace: agents }\n")
+                .unwrap()
+                .sandboxes
+                .max_ttl_seconds,
+            86_400
+        );
+        assert_eq!(SandboxesSection::default().max_ttl_seconds, 86_400);
+        assert_eq!(mediatore_proto::DEFAULT_MAX_TTL_SECONDS, 86_400);
+        // Written, beside either form of the namespaces.
+        assert_eq!(
+            with("sandboxes: { max_ttl_seconds: 3600 }\n")
+                .unwrap()
+                .sandboxes
+                .max_ttl_seconds,
+            3600
+        );
+        let mapped = with(
+            "sandboxes:\n  max_ttl_seconds: 172800\n  namespaces:\n    team-a: { groups: [G] }\n",
+        )
+        .unwrap();
+        assert_eq!(mapped.sandboxes.max_ttl_seconds, 172_800);
+        // Zero is "no claim at all", refused by name; and so is anything that is not a number
+        // of seconds, a negative one or a misspelt key.
+        let err = refused("sandboxes: { max_ttl_seconds: 0 }\n");
+        assert!(
+            err.contains("sandboxes.max_ttl_seconds must be positive"),
+            "{err}"
+        );
+        let err = refused(
+            "sandboxes:\n  max_ttl_seconds: 0\n  namespaces:\n    team-a: { groups: [G] }\n",
+        );
+        assert!(err.contains("sandboxes.max_ttl_seconds"), "{err}");
+        for bad in ["one-day", "24h", "-1", "1.5", "[86400]", "4294967296"] {
+            assert!(
+                with(&format!("sandboxes: {{ max_ttl_seconds: {bad} }}\n")).is_err(),
+                "{bad} is not a number of seconds"
+            );
+        }
+        let err = refused("sandboxes: { max_ttl_secs: 3600 }\n");
+        assert!(err.contains("max_ttl_secs"), "{err}");
+    }
+
+    #[test]
+    fn startup_logs_the_longest_claim_lifetime() {
+        let logs = startup_log(&two_issuers(""));
+        let line = logs
+            .lines()
+            .find(|l| l.contains("longest lifetime a claim may ask for"))
+            .unwrap_or_else(|| panic!("a line for the ceiling in {logs}"));
+        assert!(line.contains("max_ttl_seconds=86400"), "{line}");
+        let logs = startup_log(&two_issuers("sandboxes: { max_ttl_seconds: 3600 }\n"));
+        assert!(logs.contains("max_ttl_seconds=3600"), "{logs}");
     }
 
     #[test]

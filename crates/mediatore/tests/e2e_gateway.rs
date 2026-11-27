@@ -134,6 +134,7 @@ fn state_in(
         policy_egress,
         sandboxes: None,
         namespaces: Namespaces::Single(namespace.into()),
+        max_ttl_seconds: mediatore_proto::DEFAULT_MAX_TTL_SECONDS,
         sealer: None,
         limiter: Limiter::new(10),
         dev_mode: true,

@@ -985,6 +985,12 @@ pub struct Selection {
     pub strategy: SelectionStrategy,
 }
 
+/// Default of `sandboxes.max_ttl_seconds`: the longest lifetime a claim may ask for, whichever
+/// front door it comes through (ADR-0008 decision 9, amended 2026-11-26). One day, the same
+/// figure as the default of the gateways' tunnel cap (`TUNNEL_MAX_SECS`,
+/// `image/gateway/env.example`), which is documented as the longest lifetime a claim may have.
+pub const DEFAULT_MAX_TTL_SECONDS: u32 = 86_400;
+
 /// `POST /v1/claims` body, sent by a user or agent with an `IdP` bearer token.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClaimRequest {
@@ -1007,7 +1013,9 @@ pub struct ClaimRequest {
     /// `LongestReady`; the broker writes no default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selection: Option<Selection>,
-    /// `spec.ttlSeconds` on the banlieue claim; a deadline counted from bind.
+    /// `spec.ttlSeconds` on the banlieue claim; a deadline counted from bind. Positive, and at
+    /// most the broker's `sandboxes.max_ttl_seconds` ([`DEFAULT_MAX_TTL_SECONDS`] unless
+    /// configured): above it the answer is `400 ttl_exceeds_maximum`.
     pub ttl_seconds: u32,
     /// Downstream audiences the sandbox may request tokens for. Must be a subset of
     /// what mediatore is configured to serve.

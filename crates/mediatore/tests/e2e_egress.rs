@@ -135,14 +135,19 @@ impl TokenSource for DevTokens {
 /// The broker's state for the proxy's proof: three audiences on one trust domain, the
 /// first on a private PKI with rules, the second `via: none`, the third `via: secret` with
 /// the operator's key in `x-api-key` (ADR-0032).
-fn state(idp: &FakeIdp, upstream: &TlsUpstream, keyed_upstream: &TlsUpstream) -> Arc<AppState> {
-    let sts = Sts::new(
+/// The harness's STS: the test key, fifteen minutes at most.
+fn test_sts() -> Sts {
+    Sts::new(
         "https://mediatore.test",
         "e2e-1",
         STS_TEST_KEY.as_bytes(),
         SignedDuration::from_mins(15),
     )
-    .expect("sts");
+    .expect("sts")
+}
+
+fn state(idp: &FakeIdp, upstream: &TlsUpstream, keyed_upstream: &TlsUpstream) -> Arc<AppState> {
+    let sts = test_sts();
     Arc::new(AppState {
         inject: std::collections::BTreeMap::new(),
         inject_port: None,
@@ -238,6 +243,7 @@ fn state(idp: &FakeIdp, upstream: &TlsUpstream, keyed_upstream: &TlsUpstream) ->
         policy_egress: None,
         sandboxes: None,
         namespaces: Namespaces::Single("sandboxes".into()),
+        max_ttl_seconds: mediatore_proto::DEFAULT_MAX_TTL_SECONDS,
         sealer: None,
         limiter: Limiter::new(10),
         dev_mode: true,

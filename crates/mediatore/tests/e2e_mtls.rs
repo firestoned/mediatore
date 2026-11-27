@@ -103,6 +103,7 @@ fn state(idp: &FakeIdp, dev_mode: bool) -> Arc<AppState> {
         policy_egress: None,
         sandboxes: None,
         namespaces: Namespaces::Single("sandboxes".into()),
+        max_ttl_seconds: mediatore_proto::DEFAULT_MAX_TTL_SECONDS,
         sealer: None,
         limiter: Limiter::new(10),
         dev_mode,

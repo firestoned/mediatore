@@ -50,6 +50,16 @@ pub const FINALIZER: &str = "mediatore.io/sandbox";
 /// watcher selects on.
 pub const SANDBOX_UID_LABEL: &str = "mediatore.io/sandbox-uid";
 
+/// Why a sandbox asking for more than `sandboxes.max_ttl_seconds` is refused: the sentence in
+/// `status.reason` (ADR-0008 decision 9, amended 2026-11-26). It names the ceiling, which is
+/// configuration, so the requester knows what would fit.
+#[must_use]
+pub fn ttl_above_maximum(max_ttl_seconds: u32) -> String {
+    format!(
+        "ttlSeconds is above the broker's maximum of {max_ttl_seconds} seconds (sandboxes.max_ttl_seconds)"
+    )
+}
+
 /// The CRD's file name under `deploy/base/crds/` (kubebuilder convention).
 pub const CRD_FILE_NAME: &str = "mediatore.io_agentsandboxes.yaml";
 
@@ -785,8 +795,8 @@ impl Watcher {
     }
 
     /// Why a spec is refused before any claim exists: an audience or an issuer mediatore
-    /// is not configured for (decision 7; fail closed), or a TTL the schema should have
-    /// caught.
+    /// is not configured for (decision 7; fail closed), a TTL the schema should have
+    /// caught, or one above the broker's ceiling (decision 9, amended 2026-11-26).
     fn refuse(&self, spec: &AgentSandboxSpec, namespace: &str) -> Option<String> {
         if spec.ttl_seconds == 0 {
             return Some("ttlSeconds must be positive".into());
@@ -802,6 +812,14 @@ impl Watcher {
         }
         if let Some(reason) = self.refuse_under_policy(spec, namespace) {
             return Some(reason);
+        }
+        // The broker's own ceiling (`sandboxes.max_ttl_seconds`), with or without a policy: the
+        // lease checked just above only narrows it, so the bound is the smaller of the two.
+        // Like every refusal here it is made before a claim exists and only then
+        // (`refuse_before_the_claim`): a sandbox already bound under a higher ceiling is not
+        // released when the key is lowered, it runs to the TTL it was admitted with.
+        if spec.ttl_seconds > self.cfg.max_ttl_seconds {
+            return Some(ttl_above_maximum(self.cfg.max_ttl_seconds));
         }
         if !self.cfg.issuers.iter().any(|i| i == &spec.subject.issuer) {
             return Some(format!("issuer {} is not configured", spec.subject.issuer));
@@ -4835,6 +4853,155 @@ mod tests {
             .unwrap();
         assert_eq!(st.phase, SandboxPhase::Failed);
         assert!(st.reason.unwrap().contains("above the policy's lease"));
+    }
+
+    /// The status a pass leaves on `sb` under `cfg`, and whether a claim or a record exists.
+    async fn reconciled(
+        cfg: WatcherConfig,
+        bundles: Option<Arc<BundleCache>>,
+        sb: &AgentSandbox,
+    ) -> (AgentSandboxStatus, bool) {
+        let namespace = sb.namespace().unwrap();
+        let r = rig_with(cfg, bundles);
+        r.claims.put_sandbox(sb.clone());
+        r.watcher.reconcile_sandbox(sb).await.unwrap();
+        let status = r
+            .claims
+            .sandbox(&namespace, "sb-1")
+            .and_then(|s| s.status)
+            .unwrap_or_default();
+        let anything = r.claims.claim(&namespace, "sb-1").is_some()
+            || !r.store.list_claims().await.unwrap().is_empty();
+        (status, anything)
+    }
+
+    #[test]
+    fn the_watchers_ceiling_defaults_to_one_day() {
+        assert_eq!(WatcherConfig::default().max_ttl_seconds, 86_400);
+        assert_eq!(mediatore_proto::DEFAULT_MAX_TTL_SECONDS, 86_400);
+    }
+
+    /// ADR-0008 decision 9, amended 2026-11-26: a sandbox with no policy is bounded by the
+    /// broker's ceiling. At the ceiling it is admitted; one second above it is `Failed` with
+    /// the reason, and no claim and no record exist.
+    #[tokio::test]
+    async fn a_ttl_at_the_ceiling_is_admitted_and_one_second_above_fails_without_a_claim() {
+        let ceiling = cfg().max_ttl_seconds;
+        assert_eq!(ceiling, 86_400, "the default");
+        let mut sb = sandbox(true, false);
+        sb.spec.ttl_seconds = ceiling;
+        let (status, anything) = reconciled(cfg(), None, &sb).await;
+        assert_ne!(status.phase, SandboxPhase::Failed);
+        assert!(anything, "a claim is created at the ceiling");
+
+        sb.spec.ttl_seconds = ceiling + 1;
+        let (status, anything) = reconciled(cfg(), None, &sb).await;
+        assert_eq!(status.phase, SandboxPhase::Failed);
+        assert_eq!(
+            status.reason.as_deref(),
+            Some(
+                "ttlSeconds is above the broker's maximum of 86400 seconds (sandboxes.max_ttl_seconds)"
+            )
+        );
+        assert!(!anything, "no claim and no record above the ceiling");
+
+        // The key raised: the same request is admitted.
+        let raised = WatcherConfig {
+            max_ttl_seconds: ceiling + 1,
+            ..cfg()
+        };
+        let (status, anything) = reconciled(raised, None, &sb).await;
+        assert_ne!(status.phase, SandboxPhase::Failed);
+        assert!(anything, "a claim is created under the raised ceiling");
+    }
+
+    /// The effective bound is the smaller of the policy's lease and the ceiling, whichever
+    /// that is.
+    #[tokio::test]
+    async fn under_enforce_the_smaller_of_the_lease_and_the_ceiling_bounds_a_sandbox() {
+        let a = admitted_bundle(5).await;
+        let lease = a.payload.content.lease.max_duration_seconds;
+        assert!(lease > 2, "the conformance lease leaves room below it");
+
+        // The ceiling above the lease: the lease still wins.
+        let wide = WatcherConfig {
+            max_ttl_seconds: lease + 10,
+            ..enforcing_cfg()
+        };
+        let mut sb = a.sb.clone();
+        sb.spec.ttl_seconds = lease + 1;
+        let (status, anything) = reconciled(wide, Some(a.cache()), &sb).await;
+        assert_eq!(status.phase, SandboxPhase::Failed);
+        assert_eq!(
+            status.reason.as_deref(),
+            Some("ttlSeconds is above the policy's lease (ADR-0053)")
+        );
+        assert!(!anything, "no claim above the lease");
+
+        // The ceiling below the lease: the ceiling wins, for a TTL the lease would admit.
+        let narrow = WatcherConfig {
+            max_ttl_seconds: lease - 2,
+            ..enforcing_cfg()
+        };
+        sb.spec.ttl_seconds = lease - 1;
+        let (status, anything) = reconciled(narrow.clone(), Some(a.cache()), &sb).await;
+        assert_eq!(status.phase, SandboxPhase::Failed);
+        assert_eq!(
+            status.reason,
+            Some(ttl_above_maximum(lease - 2)),
+            "the ceiling, not the lease"
+        );
+        assert!(!anything, "no claim above the ceiling");
+
+        // Inside both, it is admitted.
+        sb.spec.ttl_seconds = lease - 2;
+        let (status, anything) = reconciled(narrow, Some(a.cache()), &sb).await;
+        assert_ne!(status.phase, SandboxPhase::Failed);
+        assert!(anything, "a claim is created inside both bounds");
+    }
+
+    /// No retroactive release: a sandbox whose claim exists is not judged again when the
+    /// ceiling is lowered under it.
+    #[tokio::test]
+    async fn a_sandbox_already_claimed_is_not_failed_when_the_ceiling_is_lowered() {
+        let r = rig(cfg());
+        let settled = settle(&r, &sandbox(true, false)).await;
+        let claimed = settled
+            .status
+            .as_ref()
+            .is_some_and(|s| s.claim_ref.is_some());
+        assert!(claimed, "the sandbox has its claim");
+        // The same store and API, read by a broker restarted with a ceiling below the TTL.
+        let lowered = Watcher::new(
+            Reconciler {
+                store: r.store.clone(),
+                spire: r.entries.clone(),
+                naming: mediatore_spire::Naming {
+                    trust_domain: "sandbox.test".into(),
+                },
+            },
+            r.claims.clone(),
+            WatcherConfig {
+                max_ttl_seconds: settled.spec.ttl_seconds - 1,
+                ..cfg()
+            },
+        );
+        lowered.reconcile_sandbox(&settled).await.unwrap();
+        let status = r
+            .claims
+            .sandbox("sandboxes", "sb-1")
+            .and_then(|s| s.status)
+            .expect("the status is still there");
+        assert_ne!(status.phase, SandboxPhase::Failed);
+        assert_ne!(
+            status.reason,
+            Some(ttl_above_maximum(settled.spec.ttl_seconds - 1)),
+            "nothing is refused after the fact"
+        );
+        assert!(
+            r.claims.claim("sandboxes", "sb-1").is_some(),
+            "the claim is left alone"
+        );
     }
 
     #[tokio::test]

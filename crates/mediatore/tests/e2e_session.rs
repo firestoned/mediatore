@@ -134,6 +134,7 @@ impl Harness {
             policy_egress: None,
             sandboxes: None,
             namespaces: Namespaces::Single("sandboxes".into()),
+            max_ttl_seconds: mediatore_proto::DEFAULT_MAX_TTL_SECONDS,
             sealer: Some(sealer),
             limiter: Limiter::new(rate_per_minute),
             dev_mode: true,

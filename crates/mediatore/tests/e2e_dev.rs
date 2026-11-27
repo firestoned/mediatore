@@ -270,6 +270,7 @@ impl Harness {
             policy_egress: policy,
             sandboxes: None,
             namespaces,
+            max_ttl_seconds: mediatore_proto::DEFAULT_MAX_TTL_SECONDS,
             sealer: Some(Arc::new(LocalKeySealer::new([9u8; 32]))),
             limiter: Limiter::new(10),
             dev_mode: true,

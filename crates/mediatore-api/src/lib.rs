@@ -124,6 +124,11 @@ pub struct AppState {
     /// Where `POST /v1/claims` may create sandboxes, and who may reach them (ADR-0046); the
     /// pool must live in the resolved namespace.
     pub namespaces: Namespaces,
+    /// `sandboxes.max_ttl_seconds` (ADR-0008 decision 9, amended 2026-11-26): the longest
+    /// lifetime `POST /v1/claims` admits, with or without a policy
+    /// (`mediatore_proto::DEFAULT_MAX_TTL_SECONDS`, one day, unless configured). Above it the
+    /// answer is `400 ttl_exceeds_maximum` and nothing is created or parked.
+    pub max_ttl_seconds: u32,
     /// Seals refresh material before it reaches the store (ADR-0012 decision 3); `None`
     /// until `store.sealing` is configured. Roadmap 04 brings its first caller.
     pub sealer: Option<Arc<dyn Sealer>>,
@@ -276,6 +281,31 @@ fn admit_under_policy(
         ));
     }
     Ok(Some(bundle.content.policy.uid.clone()))
+}
+
+/// The broker's own ceiling on a claim's lifetime (`sandboxes.max_ttl_seconds`; ADR-0008
+/// decision 9, amended 2026-11-26): `400 ttl_exceeds_maximum` for a `ttl_seconds` above it,
+/// whether or not the claim names a policy. A policy's lease ([`admit_under_policy`]) only
+/// narrows it, so the effective bound is the smaller of the two. Asked at creation and only
+/// then: a claim already bound under a higher ceiling is not released when the key is lowered,
+/// it runs to the TTL it was admitted with. The detail names the ceiling, which is
+/// configuration, so the caller knows what would fit.
+fn refuse_above_maximum(
+    st: &AppState,
+    req: &ClaimRequest,
+    namespace: &str,
+) -> Result<(), ApiError> {
+    if req.ttl_seconds <= st.max_ttl_seconds {
+        return Ok(());
+    }
+    tracing::info!(%namespace, ttl_seconds = req.ttl_seconds, max_ttl_seconds = st.max_ttl_seconds, "claim refused: ttl above the broker's maximum (sandboxes.max_ttl_seconds)");
+    Err(ApiError::bad_request(
+        "ttl_exceeds_maximum",
+        format!(
+            "ttl_seconds is above the broker's maximum of {} seconds",
+            st.max_ttl_seconds
+        ),
+    ))
 }
 
 /// What a claim in `namespace` may do with `audience` (ADR-0053 decisions 4, 5 and 11): `None`
@@ -974,6 +1004,9 @@ async fn create_claim(
     }
     // ADR-0053 decision 10: under `policy.audiences: enforce`, a verified bundle that grants it all.
     admit_under_policy(&st, &req, &namespace)?;
+    // The broker's own ceiling, policy or no policy, before a session is built or anything is
+    // parked (ADR-0008 decision 9, amended 2026-11-26).
+    refuse_above_maximum(&st, &req, &namespace)?;
     // The guest would refuse it at bind (ADR-0021); say so now (ADR-0022 decision 4).
     let image = req
         .workload
@@ -3658,6 +3691,7 @@ mod tests {
             policy_egress: None,
             sandboxes: None,
             namespaces: Namespaces::Single("sandboxes".into()),
+            max_ttl_seconds: mediatore_proto::DEFAULT_MAX_TTL_SECONDS,
             sealer: None,
             limiter: Limiter::new(10),
             dev_mode: true,
@@ -6133,6 +6167,144 @@ mod tests {
             "no session or delegation Secret is left behind"
         );
         assert_eq!(b.front.all().len(), 0);
+    }
+
+    // ----- a claim's lifetime has a broker-wide ceiling (ADR-0008 decision 9, amended 2026-11-26) ---------------------
+
+    /// A create of `ttl` seconds as `octocat` in the one namespace, naming `policy` when given.
+    async fn create_for(
+        b: &Broker,
+        ttl: u32,
+        policy: Option<&str>,
+    ) -> (StatusCode, serde_json::Value, String) {
+        let mut body = request(None);
+        body["ttl_seconds"] = serde_json::json!(ttl);
+        if let Some(policy) = policy {
+            body["policy_ref"] = serde_json::json!(policy);
+        }
+        b.user("POST", "/v1/claims", &b.token("octocat", &[]), &[], body)
+            .await
+    }
+
+    #[test]
+    fn the_ceiling_of_a_state_with_nothing_configured_is_one_day() {
+        assert_eq!(base_state().max_ttl_seconds, 86_400);
+        assert_eq!(mediatore_proto::DEFAULT_MAX_TTL_SECONDS, 86_400);
+    }
+
+    #[tokio::test]
+    async fn a_claim_at_the_ceiling_is_created_and_one_second_above_is_400() {
+        let b = broker(Namespaces::Single("sandboxes".into()), false).await;
+        let ceiling = b.st.max_ttl_seconds;
+        let (status, body, text) = create_for(&b, ceiling + 1, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+        assert_eq!(code(&body), "ttl_exceeds_maximum");
+        assert_eq!(
+            body["detail"].as_str(),
+            Some("ttl_seconds is above the broker's maximum of 86400 seconds")
+        );
+        assert_eq!(b.front.all().len(), 0, "no sandbox above the ceiling");
+
+        let (status, _, text) = create_for(&b, ceiling, None).await;
+        assert_eq!(status, StatusCode::CREATED, "{text}");
+        let all = b.front.all();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].spec.ttl_seconds, ceiling);
+
+        // `dev_mode` writes the record itself: the same refusal, and no record.
+        let dev = broker(Namespaces::Single("sandboxes".into()), true).await;
+        let (status, body, text) = create_for(&dev, ceiling + 1, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+        assert_eq!(code(&body), "ttl_exceeds_maximum");
+        assert!(
+            dev.st.store.list_claims().await.unwrap().is_empty(),
+            "no record above the ceiling"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_claim_above_the_ceiling_is_refused_before_its_session_is_built_or_parked() {
+        let mut b = broker(Namespaces::Single("sandboxes".into()), false).await;
+        {
+            let st = Arc::get_mut(&mut b.st).expect("the state is not shared yet");
+            st.sealer = Some(Arc::new(mediatore_store::seal::LocalKeySealer::new(
+                [3; 32],
+            )));
+            // A session issuer, so the create has a refresh token to park were it to get that far.
+            st.validator = Validator::new(vec![IssuerConfig {
+                url: b.idp.issuer.clone(),
+                backend: Backend::Sts,
+                client_id: "mediatore".into(),
+                subject_claim: "preferred_username".into(),
+                required_group: None,
+                required_groups: None,
+                allow_any_authenticated: true,
+                session: Some(mediatore_entra::SessionConfig {
+                    client_id: "mediatore".into(),
+                    client_secret_file: None,
+                }),
+                ca_file: None,
+                entra: None,
+                groups_claim: None,
+            }]);
+        }
+        let mut body = request(None);
+        body["ttl_seconds"] = serde_json::json!(b.st.max_ttl_seconds + 1);
+        body["refresh_token"] = serde_json::json!("refresh-material-placeholder");
+        let (status, resp, text) = b
+            .user("POST", "/v1/claims", &b.token("alice", &[]), &[], body)
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(code(&resp), "ttl_exceeds_maximum");
+        // Compared to a bool first, so a failure prints nothing of the request.
+        let silent = !text.contains("refresh-material-placeholder");
+        assert!(silent, "the refusal carries nothing of the request");
+        let far = Timestamp::now() + SignedDuration::from_hours(48);
+        assert_eq!(
+            b.st.store.sweep_sessions(far).await.unwrap(),
+            0,
+            "no session or delegation Secret is left behind"
+        );
+        assert_eq!(b.front.all().len(), 0);
+    }
+
+    /// The policy's lease still applies on top of the ceiling: the effective bound is the
+    /// smaller of the two, whichever that is.
+    #[tokio::test]
+    async fn the_smaller_of_the_policys_lease_and_the_ceiling_bounds_a_claim() {
+        use mediatore_claims::policy::EgressMode;
+        let conformance = mediatore_testkit::policy::fresh_bundle(Timestamp::now(), 1).payload;
+        let lease = conformance.content.lease.max_duration_seconds;
+        let policy = conformance.content.policy.name.clone();
+        assert!(lease > 2, "the conformance lease leaves room below it");
+        for (ceiling, ttl, refused) in [
+            // The ceiling above the lease: the lease still wins.
+            (lease + 10, lease + 1, Some("ttl_exceeds_policy")),
+            // The ceiling below the lease: it wins, for a TTL the lease would admit.
+            (lease - 2, lease - 1, Some("ttl_exceeds_maximum")),
+            // Inside both.
+            (lease - 2, lease - 2, None),
+        ] {
+            let (pe, _) = bundle_for(&[], EgressMode::Shadow).await;
+            let mut b = broker(Namespaces::Single("sandboxes".into()), false).await;
+            {
+                let st = Arc::get_mut(&mut b.st).expect("the state is not shared yet");
+                st.policy_egress = Some(PolicyEgress {
+                    audiences: EgressMode::Enforce,
+                    ..pe
+                });
+                st.max_ttl_seconds = ceiling;
+            }
+            let (status, body, text) = create_for(&b, ttl, Some(&policy)).await;
+            if let Some(wanted) = refused {
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+                assert_eq!(code(&body), wanted);
+                assert_eq!(b.front.all().len(), 0, "{wanted}: no sandbox is created");
+            } else {
+                assert_eq!(status, StatusCode::CREATED, "{text}");
+                assert_eq!(b.front.all().len(), 1, "inside both bounds");
+            }
+        }
     }
 
     #[tokio::test]
