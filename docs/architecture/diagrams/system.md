@@ -21,8 +21,6 @@ the diagram shows the *target* architecture so contributors and users have
 one canonical picture, and labels such a node with its status. The nodes so
 marked today, if any:
 
-- `service-node-cert` (planned)
-- `data-asset-host-signing-ca-bundle` (planned)
 - `data-asset-trap-draw` (planned)
 
 ```mermaid
@@ -54,7 +52,7 @@ flowchart LR
     system-sandbox-vm["Sandbox VM (pool member)"]
     service-spire-agent["SPIRE Agent (in guest)"]
     service-guest-agent["mediatore guest"]
-    service-node-cert["mediatore node-cert (in guest) (planned)"]
+    service-node-cert["mediatore node-cert (in guest)"]
     service-sandbox-workload["Jailed Workload"]
     service-egress-proxy["mediatore egress-proxy"]
     service-egress-gateway["Egress gateway (Envoy + mediatore gateway, with the control relay beside them)"]
@@ -63,7 +61,7 @@ flowchart LR
     service-envoy-inject["envoy-inject (credential placement Envoy, ADR-0040)"]
     data-asset-os-credential-store["The requester's saved credential (OS credential store)"]
     data-asset-workload-output["Workload output (the Secret ring)"]
-    data-asset-host-signing-ca-bundle["Per-host signing CA bundle (x509pop trust anchors, ADR-0049) (planned)"]
+    data-asset-host-signing-ca-bundle["Per-host signing CA bundle (x509pop trust anchors, ADR-0049)"]
     data-asset-trap-draw["The claim's tripwire draw (ADR-0069) (planned)"]
     subgraph sg_system-mediatore [System Mediatore]
         service-mediatore-user-api

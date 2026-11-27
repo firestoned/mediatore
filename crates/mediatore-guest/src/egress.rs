@@ -1405,6 +1405,13 @@ pub async fn spawn(
 /// # Errors
 /// Anything missing: no routes, gateways or phantom file, no Workload API, the port taken.
 pub async fn run(args: EgressArgs) -> anyhow::Result<()> {
+    // First, before anything is read or bound: this process runs beside the jail as the
+    // sandbox user and parses what the workload sends, and no packet filter sees a socket
+    // that is not inet. It opens unix and inet sockets and no other kind, so every other
+    // family is closed to it for good, as to the workload (ADR-0051). No filter, no proxy.
+    crate::seccomp::restrict_families()
+        .map_err(|e| anyhow::anyhow!("the egress proxy does not start: {e:#}"))?;
+    tracing::info!("address families restricted to unix and inet (seccomp, all threads)");
     let routes: Vec<Route> = serde_json::from_slice(&std::fs::read(&args.routes)?)?;
     let routes = Routes::new(routes)?;
     let gateways: Vec<Endpoint> = serde_json::from_slice(&std::fs::read(&args.gateways)?)?;

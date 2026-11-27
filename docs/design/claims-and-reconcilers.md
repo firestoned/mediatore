@@ -65,8 +65,13 @@ The watcher runs three controllers and two timers (`watch::run`):
 | resync | every `WatcherConfig::resync` (5 minutes by default) | `resync`: release bound records whose claim is gone, sweep orphan entries, sweep ended sandboxes past retention (held by the finalizer until then; an audit line is logged, ADR-0034), collect nodes of gone VMs |
 | envelope sweep | every 15 seconds (`ENVELOPE_SWEEP_SECS`) | `sweep_envelopes`: remove sealed envelopes past their expiry |
 
-**On `Bound`.** The claim carries the certificate banlieue mirrored from the VM. The watcher computes its EK hash,
-finds the node that registered under that hash, declares the claim's registration entry for the sandbox user
+**On `Bound`.** The claim carries the certificate banlieue mirrored from the VM. The watcher computes its EK hash
+(for a machine of a pool listed in `watcher.x509pop_pools` it reads the machine and its Provider instead, and computes
+the key of the `x509pop` agent ID that the host CA's common name and the machine's `attestationSubject` give; ADR-0049.
+With that list set, every `Bound` claim is resolved through the machine its `status.virtualMachineRef` names, whose pool
+label says which attestor applies; the Providers are listed in every namespace once per pass (`ProviderPass`, `watch.rs`),
+and two that assert different host CAs under one common name give neither's machines an entry),
+finds the node that registered under that key, declares the claim's registration entry for the sandbox user
 (`spiffe://<td>/banlieue/claim/<uid>`), waits for the SPIRE Controller Manager to report it set, and records the
 entry in the store. **The order is entry first, then refresh material**, on bind and on release: on release the
 identity is retracted before the record's secrets are revoked.
@@ -88,12 +93,26 @@ outside the Lease, because each replica needs the cache it will verify against (
 
 ## Collecting nodes of VMs that are gone
 
-A node registers once per VM, named by its EK hash. `nodegc.rs` (ADR-0039) decides which `SandboxNode` resources to
-delete, as a pure function so each guard has its own test: a node goes only when no banlieue VM still publishes its EK
-hash, and **never** while it is banned, younger than the grace period (`node_grace`, 10 minutes by default, since a
+A node registers once per VM, named by its node key: the EK hash for a TPM node, the SHA-256 of the agent ID for an
+x509pop node (ADR-0049). `nodegc.rs` (ADR-0039) decides which `SandboxNode` resources to
+delete, as a pure function so each guard has its own test: a node goes only when no banlieue VM still gives its node
+key, and **never** while it is banned, younger than the grace period (`node_grace`, 10 minutes by default, since a
 registration can precede its VM's published certificate), or referenced by a claim that has not ended. A pass deletes
 at most `MAX_DELETIONS_PER_PASS` (20), so a bug, a partial VM list or an operator error costs a bounded number of
 records, which re-register on the guest's next start.
+
+One more guard is the x509pop nodes' alone (`hold_x509pop`): a pass that holds removes no x509pop node and no x509pop
+node entry, and the watcher logs `an x509pop machine gives no key yet; no x509pop node or entry is collected in this
+pass`. `Watcher::live_node_keys` (`watch.rs`) decides it per listed machine. One whose Provider is not found
+(`MachineNode::NoProvider`) holds whatever its age, so a Provider deleted and applied again costs its idle guests
+nothing. One that itself still lacks something (no subject, not placed) holds only while it is young
+(`Watcher::is_young`): its `metadata.creationTimestamp` is less than `node_grace` ago, the grace the node rule above
+already gives a young node, and a machine with no creation timestamp is not young. Past that it holds nothing and is
+logged at info as `an x509pop machine older than the node grace still gives no key; it does not hold the collection`.
+A host CA that is withdrawn, renamed or loosened is not "missing" and still retracts. What has no bound: a machine
+whose published placement names a Provider that does not exist holds the x509pop collection until one of the two
+changes; placement is banlieue's status to write. Two listed machines that give one key share one node entry, kept until both are gone; only
+the first can register, the second being another DMI UUID under a registered key.
 
 ## Rules this part keeps
 

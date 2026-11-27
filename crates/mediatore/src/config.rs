@@ -428,6 +428,64 @@ pub struct WatcherSection {
     /// Lease duration in seconds for leader election; renewed every third (default 15).
     #[serde(default = "default_lease_duration_secs")]
     pub lease_duration_secs: u64,
+    /// The pools whose machines attest with `x509pop` and not with a TPM (ADR-0049
+    /// decision 9), each as `<namespace>/<pool>`: the operator's statement, per pool, of the
+    /// trust extended to its hosts. A machine of a listed pool gets an `x509pop` node entry
+    /// from its `attestationSubject` and its Provider's inline `hostCa`, and never a TPM
+    /// one; every other machine is `tpm`. Empty by default: every machine is `tpm`.
+    #[serde(default)]
+    pub x509pop_pools: Vec<String>,
+    /// Where a machine's `Provider` is read when the machine's own namespace holds none
+    /// (ADR-0049 decision 10): banlieue's `--provider-namespace` (banlieue ADR-0133). Unset
+    /// by default: a Provider is read in the machine's namespace only. Read only for the
+    /// machines of `x509pop_pools`.
+    #[serde(default)]
+    pub provider_namespace: Option<String>,
+}
+
+impl WatcherSection {
+    /// Refuse an `x509pop_pools` entry that is not `<namespace>/<pool>` or is listed twice,
+    /// and a `provider_namespace` that is no namespace. A pool silently not matched would
+    /// leave its machines on the TPM attestor: the opposite of what the operator stated.
+    fn validate(&self) -> anyhow::Result<()> {
+        let mut seen = std::collections::BTreeSet::new();
+        for entry in &self.x509pop_pools {
+            let named = entry.split_once('/').filter(|(namespace, pool)| {
+                mediatore_proto::is_dns_label(namespace) && is_pool_name(pool)
+            });
+            if named.is_none() {
+                anyhow::bail!(
+                    "watcher.x509pop_pools: {entry:?} is not <namespace>/<pool> (a namespace, one slash, a pool name)"
+                );
+            }
+            if !seen.insert(entry.as_str()) {
+                anyhow::bail!("watcher.x509pop_pools lists {entry:?} twice");
+            }
+        }
+        if let Some(namespace) = &self.provider_namespace
+            && !mediatore_proto::is_dns_label(namespace)
+        {
+            anyhow::bail!("watcher.provider_namespace: {namespace:?} is not a namespace name");
+        }
+        Ok(())
+    }
+
+    /// `x509pop_pools` as the watcher reads it.
+    #[must_use]
+    pub fn x509pop_pool_set(&self) -> std::collections::BTreeSet<String> {
+        self.x509pop_pools.iter().cloned().collect()
+    }
+}
+
+/// A `VirtualMachinePool` name as a machine's `banlieue.io/pool` label carries it: at most
+/// 63 of lowercase letters, digits, dashes and dots, beginning and ending with a letter or a
+/// digit (a resource name short enough to be a label value).
+fn is_pool_name(s: &str) -> bool {
+    let edge = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit();
+    (1..=63).contains(&s.len())
+        && s.bytes().all(|b| edge(b) || b == b'-' || b == b'.')
+        && s.bytes().next().is_some_and(edge)
+        && s.bytes().last().is_some_and(edge)
 }
 
 fn default_resync_secs() -> u64 {
@@ -446,6 +504,8 @@ impl Default for WatcherSection {
             resync_secs: default_resync_secs(),
             resolve_timeout_secs: default_resolve_timeout_secs(),
             lease_duration_secs: default_lease_duration_secs(),
+            x509pop_pools: Vec::new(),
+            provider_namespace: None,
         }
     }
 }
@@ -1478,6 +1538,7 @@ impl Config {
                 "watcher.resync_secs and resolve_timeout_secs must be positive and lease_duration_secs at least 3"
             );
         }
+        cfg.watcher.validate()?;
         cfg.sandboxes.validate(&cfg.issuer_urls())?;
         cfg.check_audience_scopes()?;
         if let Some(e) = cfg.spire.as_ref().map(|s| &s.entries) {
@@ -2479,6 +2540,85 @@ listen: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }
         ))
         .unwrap_err();
         assert!(err.to_string().contains("resolve_timeout_secs"), "{err}");
+    }
+
+    #[test]
+    fn x509pop_pools_default_to_none_and_each_is_a_namespace_and_a_pool() {
+        // ADR-0049 decision 9. The default is today's behaviour: no pool is x509pop.
+        let cfg = Config::parse(&format!("{BASE}dev_mode: true\n")).unwrap();
+        assert_eq!(cfg.watcher.x509pop_pools, Vec::<String>::new());
+        assert_eq!(cfg.watcher.provider_namespace, None);
+        assert_eq!(cfg.watcher.x509pop_pool_set().len(), 0);
+
+        let cfg = Config::parse(&format!(
+            "{BASE}dev_mode: true\nwatcher:\n  x509pop_pools: [team-a/firecracker, sandboxes/fc.small-1]\n  provider_namespace: banlieue-providers\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            cfg.watcher.x509pop_pool_set(),
+            ["sandboxes/fc.small-1", "team-a/firecracker"]
+                .map(str::to_owned)
+                .into()
+        );
+        assert_eq!(
+            cfg.watcher.provider_namespace.as_deref(),
+            Some("banlieue-providers")
+        );
+
+        for bad in [
+            "firecracker",
+            "/firecracker",
+            "team-a/",
+            "team-a/firecracker/extra",
+            "Team-A/firecracker",
+            "team-a/Firecracker",
+            "team_a/firecracker",
+            "team-a/-firecracker",
+            "team-a/firecracker.",
+            "team-a/fire cracker",
+            "team-a/*",
+            "*/firecracker",
+            "",
+        ] {
+            let err = Config::parse(&format!(
+                "{BASE}dev_mode: true\nwatcher: {{ x509pop_pools: [{bad:?}] }}\n"
+            ))
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains("watcher.x509pop_pools") && err.contains("<namespace>/<pool>"),
+                "{bad:?}: {err}"
+            );
+        }
+        let long = format!("team-a/{}", "p".repeat(64));
+        assert!(
+            Config::parse(&format!(
+                "{BASE}dev_mode: true\nwatcher: {{ x509pop_pools: [{long}] }}\n"
+            ))
+            .is_err(),
+            "a pool name no label value could carry"
+        );
+        let err = Config::parse(&format!(
+            "{BASE}dev_mode: true\nwatcher: {{ x509pop_pools: [team-a/fc, team-b/fc, team-a/fc] }}\n"
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("twice") && err.contains("team-a/fc"), "{err}");
+        // The same pool name in two namespaces is two pools.
+        assert!(
+            Config::parse(&format!(
+                "{BASE}dev_mode: true\nwatcher: {{ x509pop_pools: [team-a/fc, team-b/fc] }}\n"
+            ))
+            .is_ok()
+        );
+        for bad in ["Banlieue", "a/b", "", "-x"] {
+            let err = Config::parse(&format!(
+                "{BASE}dev_mode: true\nwatcher: {{ provider_namespace: {bad:?} }}\n"
+            ))
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("watcher.provider_namespace"), "{bad:?}: {err}");
+        }
     }
 
     #[test]

@@ -73,6 +73,8 @@ reqwest.workspace = true
 jsonwebtoken.workspace = true
 uuid.workspace = true
 tempfile.workspace = true
+# The basicConstraints of the host CA fixtures the x509pop bundle check is tested on (ADR-0049).
+rcgen.workspace = true
 sandboxpolicy-bundle.workspace = true
 envoy-types.workspace = true
 tonic.workspace = true

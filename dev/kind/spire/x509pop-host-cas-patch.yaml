@@ -1,0 +1,26 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+#
+# The x509pop bundle of the kind tiers (deploy/spire-x509pop, ADR-0049): the component's
+# ConfigMap holds a placeholder that is no certificate, and the server loads the bundle
+# when it starts, so here the data is replaced whole with one that parses. The certificate
+# is a throwaway made for this file, shaped as a host CA must be (EC P-256, CA:TRUE with a
+# path length of zero, keyCertSign, CN=kind-placeholder, a hundred years); its private key
+# was deleted when it was made and nothing was ever signed with it, so no agent can attest
+# under it. `make kind-e2e-x509pop` replaces the ConfigMap with its own host CA for the
+# run (dev/kind/x509pop-e2e.sh).
+- op: replace
+  path: /data
+  value:
+    kind-placeholder.pem: |
+      -----BEGIN CERTIFICATE-----
+      MIIBoDCCAUagAwIBAgIUUrZ9/AWDHt1er7O9hUPeoSS5oocwCgYIKoZIzj0EAwIw
+      GzEZMBcGA1UEAwwQa2luZC1wbGFjZWhvbGRlcjAgFw0yNjExMjcwNjAxMTRaGA8y
+      MTI2MTEwMzA2MDExNFowGzEZMBcGA1UEAwwQa2luZC1wbGFjZWhvbGRlcjBZMBMG
+      ByqGSM49AgEGCCqGSM49AwEHA0IABNcgUdmwNeTEVmzWniL9YO0+srfIMVA4tq/r
+      5WeLhAtwai2Z9zJc8Kreez1MtG6ZGhPUEV2HJcBW69XLHEqsH4ujZjBkMB0GA1Ud
+      DgQWBBTS3EQSyBpbK0MjLQOB4j4QzqOKKDAfBgNVHSMEGDAWgBTS3EQSyBpbK0Mj
+      LQOB4j4QzqOKKDASBgNVHRMBAf8ECDAGAQH/AgEAMA4GA1UdDwEB/wQEAwICBDAK
+      BggqhkjOPQQDAgNIADBFAiAmYFteJPNaXUZnrOivEwjRFWdKYQ4BPRZnp5Nej7NG
+      LgIhAJknKKt0U040WqfORZWZQpAZ3XQZ/QGBm38Bnjqmk/r3
+      -----END CERTIFICATE-----

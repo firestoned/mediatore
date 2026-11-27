@@ -1,0 +1,40 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+#
+# x509pop node attestation on the SPIRE server (ADR-0049), for pool guests that have no
+# vTPM, as a kustomize component the operator's SPIRE kustomization includes beside
+# deploy/spire-tpm:
+#
+#   components:
+#     - ../mediatore/deploy/spire-x509pop  # or a copy with the real host CA certificates
+#
+# x509pop is built into SPIRE: there is no plugin binary and no checksum. What the
+# component adds, to the `spire-server` StatefulSet, is an init container that joins the
+# host CAs from a ConfigMap (one PEM per host, the certificate of that host's attestation
+# CA, whose key signs the short-lived certificate each guest attests with) into the one
+# file the attestor's ca_bundle_path names. server.conf gains the block in
+# server.conf.fragment.hcl; that file is the operator's to merge, since the server's
+# configuration is one key of one ConfigMap.
+#
+# Unlike the TPM attestor, which reads its CA files at each attestation, this attestor
+# loads its bundle when the server starts, and a bundle holding no certificate keeps the
+# server from starting at all (`unable to load trust bundle "/x509pop/ca-bundle.pem": no
+# certificates found in file`, then `Server crashed`: seen in kind with the placeholder of
+# host-cas.yaml alone). So that placeholder is replaced with a real host CA before the
+# component is applied. A key that is no certificate beside one that is does not stop
+# the server: it is skipped without a word, so read the server's log for the attestor
+# (`Plugin loaded ... plugin_name=x509pop`) and check the keys yourself.
+#
+# Nothing here depends on how the SPIRE manifests were produced, as long as the
+# StatefulSet is `spire-server` in namespace `spire-server` with its config at
+# /run/spire/config/server.conf.
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+resources:
+  - host-cas.yaml
+patches:
+  - path: statefulset-patch.yaml
+    target:
+      kind: StatefulSet
+      name: spire-server
+      namespace: spire-server

@@ -14,7 +14,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use mediatore_proto::{Me, NodeRegistered, NodeRegistration, Provider};
+use mediatore_proto::{Attestation, Me, NodeRegistered, NodeRegistration, Provider};
 use reqwest::Method;
 use uuid::Uuid;
 
@@ -43,9 +43,23 @@ pub struct GuestArgs {
         default_value = "/run/spire/sockets/agent.sock"
     )]
     pub workload_api_socket: PathBuf,
-    /// TPM device
+    /// TPM device; read only under `--node-attestation tpm`
     #[arg(long, default_value = "/dev/tpmrm0")]
     pub tpm: PathBuf,
+    /// How this node's SPIRE agent attested (ADR-0049 decision 8): `tpm` on a guest with a
+    /// vTPM, `x509pop` on one without, whose names are read from the certificate
+    /// `mediatore node-cert` wrote. Any other value is refused
+    #[arg(
+        long,
+        env = "MEDIATORE_NODE_ATTESTATION",
+        value_enum,
+        default_value_t = NodeAttestationArg::Tpm
+    )]
+    pub node_attestation: NodeAttestationArg,
+    /// The directory `mediatore node-cert` keeps the node certificate in; read only under
+    /// `--node-attestation x509pop`
+    #[arg(long, env = "MEDIATORE_NODE_CERT_DIR", default_value = crate::nodecert::DEFAULT_DIR)]
+    pub node_cert_dir: PathBuf,
     /// Hypervisor hint for audit; read from the firmware vendor when absent
     #[arg(long, value_enum)]
     pub provider: Option<ProviderArg>,
@@ -136,7 +150,7 @@ pub struct GuestArgs {
     #[cfg(feature = "dev")]
     #[arg(long, env = "MEDIATORE_DEV_SPIFFE_ID", hide = true)]
     pub dev_spiffe_id: Option<String>,
-    /// Dev only: use this EK hash instead of reading the TPM
+    /// Dev only: use this EK hash instead of reading the TPM (`--node-attestation tpm` only)
     #[arg(long, hide = true)]
     pub dev_ek_hash: Option<String>,
     /// Dev only: use this DMI UUID instead of reading sysfs
@@ -248,6 +262,49 @@ impl From<ProviderArg> for Provider {
     }
 }
 
+/// The node attestor, as the command line names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum NodeAttestationArg {
+    /// The TPM attestor: the node is its endorsement key's hash
+    Tpm,
+    /// The x509pop attestor: the node is its certificate's issuer and subject common names
+    X509pop,
+}
+
+/// What this node tells the broker about how it attested: the top-level EK hash and no
+/// attestation for a TPM node (byte for byte what every guest up to v0.4.0 sent, so an older
+/// broker takes it), or the `x509pop` attestation and no EK hash (ADR-0049 decision 8).
+///
+/// Under `x509pop` the TPM is never opened and `--dev-ek-hash` is refused: the names come
+/// from the node certificate or the guest does not start.
+async fn node_attestation(args: &GuestArgs) -> anyhow::Result<(String, Option<Attestation>)> {
+    match args.node_attestation {
+        NodeAttestationArg::Tpm => {
+            let ek_hash = if let Some(h) = &args.dev_ek_hash {
+                h.clone()
+            } else {
+                std::fs::create_dir_all("/run/mediatore-guest")?;
+                identity::ek_hash(&args.tpm).await?
+            };
+            Ok((ek_hash, None))
+        }
+        NodeAttestationArg::X509pop => {
+            anyhow::ensure!(
+                args.dev_ek_hash.is_none(),
+                "--dev-ek-hash is for --node-attestation tpm; an x509pop node has no EK hash"
+            );
+            let names = identity::x509pop_names(&args.node_cert_dir)?;
+            Ok((
+                String::new(),
+                Some(Attestation::X509pop {
+                    issuer_cn: names.issuer_cn,
+                    subject_cn: names.subject_cn,
+                }),
+            ))
+        }
+    }
+}
+
 /// Obtain the transport identity for this node. Fails closed: no Workload API, no client.
 async fn connect(args: &GuestArgs) -> anyhow::Result<SandboxClient> {
     #[cfg(feature = "dev")]
@@ -261,18 +318,46 @@ async fn connect(args: &GuestArgs) -> anyhow::Result<SandboxClient> {
     .await
 }
 
-/// Register this node until mediatore accepts it. A 409 is fatal: it means this EK is
-/// already known under another VM, which is exactly the cloned-TPM case.
+/// Bring an `x509pop` node's registration up to the certificate as it is on disk now.
+/// `mediatore node-cert renew` replaces the file beside a running guest, and a host whose CA
+/// was replaced by one of another name issues a leaf under that name: the agent then
+/// attests under the new names, and a registration that kept sending the old ones would be
+/// refused for as long as it retried. A TPM node's registration never changes.
+///
+/// # Errors
+/// The certificate cannot be read or has no usable names: the same reason not to start.
+fn refresh_attestation(args: &GuestArgs, reg: &mut NodeRegistration) -> anyhow::Result<()> {
+    if args.node_attestation != NodeAttestationArg::X509pop {
+        return Ok(());
+    }
+    let names = identity::x509pop_names(&args.node_cert_dir)?;
+    let now = Some(Attestation::X509pop {
+        issuer_cn: names.issuer_cn,
+        subject_cn: names.subject_cn,
+    });
+    if reg.attestation != now {
+        tracing::info!("the node certificate's names changed; registering under the new ones");
+        reg.attestation = now;
+    }
+    Ok(())
+}
+
+/// Register this node until mediatore accepts it, each attempt with the node certificate's
+/// names as they then are ([`refresh_attestation`]). A 409 is fatal: this node key (the EK,
+/// or the x509pop identity) is already known under another VM, which is exactly the
+/// cloned-TPM case, or under another agent ID.
 async fn register(
     client: &SandboxClient,
-    reg: &NodeRegistration,
+    args: &GuestArgs,
+    mut reg: NodeRegistration,
 ) -> anyhow::Result<NodeRegistered> {
     loop {
-        match client.send(Method::POST, "/v1/nodes", Some(reg)).await {
+        refresh_attestation(args, &mut reg)?;
+        match client.send(Method::POST, "/v1/nodes", Some(&reg)).await {
             Ok(r) if r.status().is_success() => return Ok(r.json().await?),
             Ok(r) if r.status() == reqwest::StatusCode::CONFLICT => {
                 anyhow::bail!(
-                    "EK already registered for another VM: {}",
+                    "node identity (EK or x509pop names) already registered for another VM, or under another agent ID: {}",
                     r.text().await.unwrap_or_default()
                 );
             }
@@ -320,29 +405,35 @@ pub async fn run(args: GuestArgs) -> anyhow::Result<()> {
         !net::bootstrap_gateways(&args.gateways_file)?.is_empty(),
     )?;
     // 1. Who am I, as a node.
-    let ek_hash = if let Some(h) = &args.dev_ek_hash {
-        h.clone()
-    } else {
-        std::fs::create_dir_all("/run/mediatore-guest")?;
-        identity::ek_hash(&args.tpm).await?
-    };
+    let (ek_hash, attestation) = node_attestation(&args).await?;
     let dmi_uuid = match args.dev_dmi_uuid {
         Some(u) => u,
         None => identity::dmi_uuid()?,
     };
     let reg = NodeRegistration {
         ek_hash,
+        attestation,
         dmi_uuid,
         hostname: identity::hostname().unwrap_or_else(|_| "unknown".into()),
         provider: args.provider.map(Into::into).or_else(|| {
             ready::provider_of(&std::fs::read_to_string(ready::DMI_SYS_VENDOR).unwrap_or_default())
         }),
     };
-    tracing::info!(ek_hash = %reg.ek_hash, dmi = %reg.dmi_uuid, "node identity computed");
+    match &reg.attestation {
+        Some(Attestation::X509pop {
+            issuer_cn,
+            subject_cn,
+        }) => {
+            tracing::info!(attestation = "x509pop", %issuer_cn, %subject_cn, dmi = %reg.dmi_uuid, "node identity read from the node certificate");
+        }
+        _ => {
+            tracing::info!(attestation = "tpm", ek_hash = %reg.ek_hash, dmi = %reg.dmi_uuid, "node identity computed");
+        }
+    }
 
     // 2. Talk to mediatore. Fail closed without a transport identity.
     let client = Arc::new(connect(&args).await?);
-    let registered = register(&client, &reg).await?;
+    let registered = register(&client, &args, reg).await?;
     tracing::info!(node_id = %registered.node_id, "node registered");
     // Only now is this member ready for a claim (ADR-0019): attested (the SVID came from
     // the agent) and known to mediatore as a node. Tell the pool, on whatever channel the
@@ -703,6 +794,173 @@ async fn serve_claim(
 
 #[cfg(test)]
 mod tests {
+    /// The guest role's arguments, parsed as the binary parses them.
+    fn guest_args(extra: &[&str]) -> Result<super::GuestArgs, clap::Error> {
+        use clap::Parser as _;
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[command(flatten)]
+            guest: super::GuestArgs,
+        }
+        let mut v = vec!["guest", "--mediatore-url", "https://192.0.2.1:3130"];
+        v.extend_from_slice(extra);
+        Cli::try_parse_from(v).map(|c| c.guest)
+    }
+
+    const EK: &str = "ec00000000000000000000000000000000000000000000000000000000000007";
+
+    #[test]
+    fn the_node_attestation_is_tpm_by_default_and_any_other_word_is_refused_at_start() {
+        use super::NodeAttestationArg;
+        assert_eq!(
+            guest_args(&[]).unwrap().node_attestation,
+            NodeAttestationArg::Tpm
+        );
+        assert_eq!(
+            guest_args(&["--node-attestation", "tpm"])
+                .unwrap()
+                .node_attestation,
+            NodeAttestationArg::Tpm
+        );
+        let x509pop = guest_args(&["--node-attestation", "x509pop"]).unwrap();
+        assert_eq!(x509pop.node_attestation, NodeAttestationArg::X509pop);
+        assert_eq!(
+            x509pop.node_cert_dir,
+            std::path::Path::new(crate::nodecert::DEFAULT_DIR),
+            "where node-cert writes by default"
+        );
+        for refused in ["join_token", "X509POP", "x509", "", "tpm,x509pop"] {
+            assert!(
+                guest_args(&["--node-attestation", refused]).is_err(),
+                "{refused:?} was accepted"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tpm_node_sends_its_ek_hash_at_the_top_level_and_no_attestation() {
+        let args = guest_args(&["--dev-ek-hash", EK]).unwrap();
+        assert_eq!(
+            super::node_attestation(&args).await.unwrap(),
+            (EK.to_owned(), None),
+            "what a v0.4.0 guest sent, so an older broker registers it"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_x509pop_node_sends_its_leafs_names_and_never_opens_the_tpm() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = mediatore_testkit::x509pop::HostCa::new("hv-01");
+        std::fs::write(
+            dir.path().join(crate::nodecert::CERT_FILE),
+            format!("{}{}", ca.leaf_pem("vm-uid-1"), ca.pem()),
+        )
+        .unwrap();
+        // A TPM device that does not exist: reading it would fail the call.
+        let no_tpm = dir.path().join("no-such-tpm");
+        let args = guest_args(&[
+            "--node-attestation",
+            "x509pop",
+            "--node-cert-dir",
+            dir.path().to_str().unwrap(),
+            "--tpm",
+            no_tpm.to_str().unwrap(),
+        ])
+        .unwrap();
+        let (ek_hash, attestation) = super::node_attestation(&args).await.unwrap();
+        assert_eq!(ek_hash, "", "no EK hash beside an x509pop attestation");
+        assert_eq!(
+            attestation,
+            Some(mediatore_proto::Attestation::X509pop {
+                issuer_cn: "hv-01".into(),
+                subject_cn: "vm-uid-1".into()
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn an_x509pop_node_without_a_usable_certificate_does_not_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_arg = dir.path().to_str().unwrap();
+        let args = |extra: &[&str]| {
+            let mut v = vec!["--node-attestation", "x509pop", "--node-cert-dir", dir_arg];
+            v.extend_from_slice(extra);
+            guest_args(&v).unwrap()
+        };
+        // No certificate file: no fallback to the TPM, no registration.
+        let err = super::node_attestation(&args(&[])).await.unwrap_err();
+        assert!(err.to_string().contains("cannot read the node certificate"));
+        // A leaf whose subject is not one path segment.
+        let cert = dir.path().join(crate::nodecert::CERT_FILE);
+        std::fs::write(
+            &cert,
+            mediatore_testkit::x509pop::HostCa::new("hv-01").leaf_pem("a/b"),
+        )
+        .unwrap();
+        let err = super::node_attestation(&args(&[])).await.unwrap_err();
+        assert!(err.to_string().contains("unusable"));
+        // The dev EK hash is the TPM kind's: beside x509pop it is refused, even with a
+        // good certificate on disk.
+        std::fs::write(
+            &cert,
+            mediatore_testkit::x509pop::HostCa::new("hv-01").leaf_pem("vm-uid-1"),
+        )
+        .unwrap();
+        let err = super::node_attestation(&args(&["--dev-ek-hash", EK]))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("--dev-ek-hash"));
+    }
+
+    #[tokio::test]
+    async fn each_registration_attempt_carries_the_names_of_the_certificate_as_it_is_then() {
+        use mediatore_proto::{Attestation, NodeRegistration};
+        use mediatore_testkit::x509pop::HostCa;
+        let dir = tempfile::tempdir().unwrap();
+        let cert = dir.path().join(crate::nodecert::CERT_FILE);
+        std::fs::write(&cert, HostCa::new("hv-01").leaf_pem("vm-uid-1")).unwrap();
+        let args = guest_args(&[
+            "--node-attestation",
+            "x509pop",
+            "--node-cert-dir",
+            dir.path().to_str().unwrap(),
+        ])
+        .unwrap();
+        let (ek_hash, attestation) = super::node_attestation(&args).await.unwrap();
+        let mut reg = NodeRegistration {
+            ek_hash,
+            attestation,
+            dmi_uuid: uuid::Uuid::nil(),
+            hostname: "member".into(),
+            provider: None,
+        };
+        let names = |reg: &NodeRegistration| match &reg.attestation {
+            Some(Attestation::X509pop {
+                issuer_cn,
+                subject_cn,
+            }) => (issuer_cn.clone(), subject_cn.clone()),
+            _ => panic!("not an x509pop registration"),
+        };
+        super::refresh_attestation(&args, &mut reg).unwrap();
+        assert_eq!(names(&reg), ("hv-01".to_owned(), "vm-uid-1".to_owned()));
+        // The host's CA was replaced by one of another name, and node-cert renewed.
+        std::fs::write(&cert, HostCa::new("hv-01-2027").leaf_pem("vm-uid-1")).unwrap();
+        super::refresh_attestation(&args, &mut reg).unwrap();
+        assert_eq!(
+            names(&reg),
+            ("hv-01-2027".to_owned(), "vm-uid-1".to_owned())
+        );
+        assert_eq!(reg.ek_hash, "", "still no EK hash beside it");
+        // The certificate gone or unusable: no attempt is made with stale names.
+        std::fs::remove_file(&cert).unwrap();
+        assert!(super::refresh_attestation(&args, &mut reg).is_err());
+        // A TPM node's registration is left as it is, with no file read at all.
+        let tpm = guest_args(&["--dev-ek-hash", EK]).unwrap();
+        let mut reg = NodeRegistration::tpm(EK.into(), uuid::Uuid::nil(), "member".into());
+        super::refresh_attestation(&tpm, &mut reg).unwrap();
+        assert_eq!((reg.ek_hash.as_str(), &reg.attestation), (EK, &None));
+    }
+
     #[test]
     fn a_pool_with_gateways_refuses_the_settings_that_reach_a_registry_around_them() {
         use clap::Parser as _;

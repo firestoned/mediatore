@@ -15,11 +15,14 @@ one place they are built and parsed.
 | Identity | SPIFFE ID | Held by | Proven by |
 | --- | --- | --- | --- |
 | the broker | `spiffe://<td>/mediatore` | the broker pod | a `ClusterSPIFFEID` for the pod, delivered over the SPIFFE CSI driver's Workload API socket |
-| a node | `spiffe://<td>/banlieue/node/<ek-hash>` | the guest agent on a pool VM, as root | the TPM node attestor, then selectors `unix:uid:0` and `unix:path:/usr/bin/mediatore` |
+| a node | `spiffe://<td>/banlieue/node/<node key>` | the guest agent on a pool VM, as root | the TPM node attestor or, for a guest without a vTPM, the `x509pop` one (ADR-0049), then selectors `unix:uid:0` and `unix:path:/usr/bin/mediatore` |
 | a claim | `spiffe://<td>/banlieue/claim/<uid>` | the egress proxy of a claimed VM, as the sandbox user | the selector `unix:user:<sandbox user>` |
 | a gateway | `spiffe://<td>/gateway` | the gateway VM's processes | one entry per Linux user: the data-plane Envoy, the authorizer, and, where an audience opts in, the inject Envoy |
 
-A node's `<ek-hash>` is the hash of the VM's endorsement key, so the identity is anchored in the vTPM and not in
+A node's `<node key>` is 64 hex characters. For a TPM node it is the hash of the VM's endorsement key, so the identity
+is anchored in the vTPM. For an x509pop node, in a pool the operator listed in `watcher.x509pop_pools`, it is the
+SHA-256 of the agent ID `spiffe://<td>/spire/agent/x509pop/<host CA common name>/<machine UID>`, so it is anchored in
+a certificate the VM's host signed for the guest's own key (ADR-0049). Either way it is not
 anything the VM says about itself. A claim's `<uid>` is the banlieue claim's UID. The gateway is not a claim, so the
 claim identity space never overlaps it: a route that must be answered to the gateway alone can check one exact ID.
 
@@ -29,7 +32,8 @@ mediatore creates exactly two kinds of registration entry, the node's and the cl
 SPIRE admin identity. Instead `KubeEntryManager` writes each as a `ClusterStaticEntry` through the Kubernetes API and
 the **SPIRE Controller Manager** renders it into the server, reporting back when it is set. The two kinds:
 
-- the **node entry**, parented to the VM's TPM agent ID (computable from the EK hash), selecting the guest binary
+- the **node entry**, parented to the VM's agent ID (the TPM one, computable from the EK hash, or the x509pop one,
+  computable from the host CA's common name and the machine's UID), selecting the guest binary
   at its pinned path as uid 0;
 - the **claim entry**, parented to the same agent, selecting the per-claim sandbox user, with a short lifetime
   (`MAX_CLAIM_SVID_TTL`).

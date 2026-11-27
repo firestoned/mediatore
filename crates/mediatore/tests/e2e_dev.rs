@@ -128,6 +128,8 @@ struct Harness {
     idp: FakeIdp,
     user_url: String,
     sandbox_url: String,
+    /// The entries the broker declared, to see what a claim's entry is parented to.
+    entries: Arc<mediatore_spire::MemoryEntries>,
     http: reqwest::Client,
 }
 
@@ -204,6 +206,10 @@ impl Harness {
             SignedDuration::from_mins(15),
         )
         .expect("sts");
+        // Held to the trust domain, as the Kubernetes entry manager holds its entries.
+        let entries = Arc::new(mediatore_spire::MemoryEntries::in_trust_domain(
+            TRUST_DOMAIN,
+        ));
         let state = Arc::new(AppState {
             inject: std::collections::BTreeMap::new(),
             inject_port: None,
@@ -214,7 +220,7 @@ impl Harness {
             accept_plain_gateway_identity: false,
             scopes,
             store: MemoryStore::shared(),
-            spire: Arc::new(mediatore_spire::MemoryEntries::default()),
+            spire: entries.clone(),
             naming: Naming {
                 trust_domain: TRUST_DOMAIN.into(),
             },
@@ -293,6 +299,7 @@ impl Harness {
             idp,
             user_url,
             sandbox_url,
+            entries,
             http: {
                 mediatore_proto::tls::ensure_provider();
                 reqwest::Client::new()
@@ -318,6 +325,7 @@ impl Harness {
             .header(PEER_HEADER, node_svid())
             .json(&NodeRegistration {
                 ek_hash: EK_HASH.into(),
+                attestation: None,
                 dmi_uuid: uuid::Uuid::new_v4(),
                 hostname: "pool-a-7".into(),
                 provider: Some(mediatore_proto::Provider::Libvirt),
@@ -1582,6 +1590,7 @@ async fn a_peer_cannot_register_someone_elses_ek() {
         )
         .json(&NodeRegistration {
             ek_hash: EK_HASH.into(),
+            attestation: None,
             dmi_uuid: uuid::Uuid::new_v4(),
             hostname: "pool-a-7".into(),
             provider: None,
@@ -1607,6 +1616,7 @@ async fn a_malformed_ek_hash_is_refused_at_registration() {
         )
         .json(&NodeRegistration {
             ek_hash: bad,
+            attestation: None,
             dmi_uuid: uuid::Uuid::new_v4(),
             hostname: "pool-a-7".into(),
             provider: None,
@@ -1678,6 +1688,7 @@ async fn duplicate_ek_with_a_different_dmi_uuid_is_a_conflict() {
         .header(PEER_HEADER, node_svid())
         .json(&NodeRegistration {
             ek_hash: EK_HASH.into(),
+            attestation: None,
             dmi_uuid: uuid::Uuid::new_v4(),
             hostname: "pool-a-8".into(),
             provider: None,
@@ -2545,4 +2556,389 @@ async fn a_team_audience_is_claimed_in_its_namespace_and_unknown_from_another() 
     // The file's audiences are gone under bundles.
     let (status, body) = refusal(h.create_naming(&admin, "infra", AUDIENCE).await).await;
     assert_eq!((status, body.error.as_str()), (400, "unknown_audience"));
+}
+
+// ----- an x509pop node's registration (ADR-0049 decision 8) -------------------------------
+
+/// The common name of the host CA and the subject its signer gave the guest.
+const HOST_CA_CN: &str = "hv-01";
+const GUEST_SUBJECT_CN: &str = "3f0c2a1e-7b1d-4e0a-9c55-0a1b2c3d4e5f";
+const DMI: &str = "6b0a3e9c-1f4d-4c2e-9a7b-0d1e2f3a4b5c";
+
+/// The identity an x509pop guest attested under: the node key and the agent ID the watcher
+/// declared its node entry with, from the same functions the broker uses.
+fn x509pop_identity(issuer_cn: &str, subject_cn: &str) -> mediatore_spire::NodeIdentity {
+    mediatore_spire::NodeIdentity::of(
+        &Naming {
+            trust_domain: TRUST_DOMAIN.into(),
+        },
+        &mediatore_spire::NodeAttestation::X509pop {
+            issuer_cn: issuer_cn.into(),
+            subject_cn: subject_cn.into(),
+        },
+    )
+    .expect("an x509pop identity")
+}
+
+/// The node SVID SPIRE issues under that node entry.
+fn x509pop_node_svid(issuer_cn: &str, subject_cn: &str) -> String {
+    format!(
+        "spiffe://{TRUST_DOMAIN}/banlieue/node/{}",
+        x509pop_identity(issuer_cn, subject_cn).key
+    )
+}
+
+fn x509pop_attestation(issuer_cn: &str, subject_cn: &str) -> serde_json::Value {
+    serde_json::json!({ "kind": "x509pop", "issuer_cn": issuer_cn, "subject_cn": subject_cn })
+}
+
+/// A registration body around `extra` (the `ek_hash`, the `attestation`, or both).
+fn registration_body(extra: &serde_json::Value) -> serde_json::Value {
+    let mut body = serde_json::json!({ "dmi_uuid": DMI, "hostname": "pool-fc-1" });
+    for (k, v) in extra.as_object().expect("an object") {
+        body[k] = v.clone();
+    }
+    body
+}
+
+impl Harness {
+    /// `POST /v1/nodes` as `peer`, with a raw JSON body: what a guest of any version sends.
+    async fn post_node(&self, peer: &str, body: &serde_json::Value) -> reqwest::Response {
+        self.http
+            .post(format!("{}/v1/nodes", self.sandbox_url))
+            .header(PEER_HEADER, peer)
+            .json(body)
+            .send()
+            .await
+            .expect("register")
+    }
+
+    /// The status `GET /v1/me` answers `peer` with.
+    async fn me_status(&self, peer: &str) -> reqwest::StatusCode {
+        self.http
+            .get(format!("{}/v1/me", self.sandbox_url))
+            .header(PEER_HEADER, peer)
+            .send()
+            .await
+            .expect("me")
+            .status()
+    }
+}
+
+#[tokio::test]
+async fn an_x509pop_node_registers_is_bound_and_its_claims_entry_is_parented_to_its_x509pop_agent()
+{
+    let h = Harness::start().await;
+    let node = x509pop_identity(HOST_CA_CN, GUEST_SUBJECT_CN);
+    let svid = x509pop_node_svid(HOST_CA_CN, GUEST_SUBJECT_CN);
+    let agent =
+        format!("spiffe://{TRUST_DOMAIN}/spire/agent/x509pop/{HOST_CA_CN}/{GUEST_SUBJECT_CN}");
+    assert_eq!(node.agent_id, agent);
+
+    // The guest sends the names of its leaf, exactly as the typed client serializes them.
+    let reg = NodeRegistration::x509pop(
+        HOST_CA_CN.into(),
+        GUEST_SUBJECT_CN.into(),
+        DMI.parse().expect("dmi"),
+        "pool-fc-1".into(),
+    );
+    let resp = h
+        .post_node(&svid, &serde_json::to_value(&reg).expect("body"))
+        .await;
+    assert_eq!(resp.status(), 200, "the registration was refused");
+    let registered: NodeRegistered = resp.json().await.expect("node body");
+    assert_eq!(
+        registered.node_id, agent,
+        "the stored agent ID is the x509pop one, not spire/agent/tpm/<key>"
+    );
+
+    // A claim binds to it, and the node learns its subject over its own identity.
+    let (status, claim) = h.create_claim(&h.login("octocat")).await;
+    assert_eq!(status, 201);
+    assert_eq!(claim.phase, mediatore_proto::ClaimPhase::Bound);
+    let uid = claim.uid.expect("uid");
+    let me = h
+        .http
+        .get(format!("{}/v1/me", h.sandbox_url))
+        .header(PEER_HEADER, &svid)
+        .send()
+        .await
+        .expect("me");
+    assert_eq!(me.status(), 200);
+    let me: mediatore_proto::Me = me.json().await.expect("me body");
+    assert_eq!(me.claim_uid, uid);
+
+    // The claim's entry hangs off the x509pop agent: the workload's SVID is issued there.
+    assert_eq!(
+        h.entries.parent_of(&mediatore_spire::claim_entry_name(uid)),
+        Some(agent)
+    );
+    // Registering again (a reboot, the same machine) is the same node.
+    let again = h
+        .post_node(&svid, &serde_json::to_value(&reg).expect("body"))
+        .await;
+    assert_eq!(again.status(), 200);
+}
+
+#[tokio::test]
+async fn a_pending_claim_binds_when_an_x509pop_node_registers_later() {
+    let h = Harness::start().await;
+    let (_, claim) = h.create_claim(&h.login("octocat")).await;
+    assert_eq!(claim.phase, mediatore_proto::ClaimPhase::Pending);
+    let svid = x509pop_node_svid(HOST_CA_CN, GUEST_SUBJECT_CN);
+    let body = registration_body(&serde_json::json!({
+        "attestation": x509pop_attestation(HOST_CA_CN, GUEST_SUBJECT_CN)
+    }));
+    assert_eq!(h.post_node(&svid, &body).await.status(), 200);
+    assert_eq!(h.me_status(&svid).await, 200, "bound on registration");
+}
+
+#[tokio::test]
+async fn x509pop_names_that_do_not_hash_to_the_peers_node_id_are_forbidden() {
+    // The peer's SVID is the node entry's, declared for exactly one pair of names. A guest
+    // that sends other names, or a TPM node that sends x509pop names, registers nothing.
+    let h = Harness::start().await;
+    let attested = x509pop_node_svid(HOST_CA_CN, GUEST_SUBJECT_CN);
+    for (peer, issuer, subject) in [
+        // Another guest of the same host, and the same subject under another host.
+        (attested.clone(), HOST_CA_CN, "another-guest"),
+        (attested.clone(), "hv-02", GUEST_SUBJECT_CN),
+        // The names swapped.
+        (attested.clone(), GUEST_SUBJECT_CN, HOST_CA_CN),
+        // A TPM node's identity claiming x509pop names.
+        (node_svid(), HOST_CA_CN, GUEST_SUBJECT_CN),
+    ] {
+        let body = registration_body(&serde_json::json!({
+            "attestation": x509pop_attestation(issuer, subject)
+        }));
+        let (status, code) = refusal(h.post_node(&peer, &body).await).await;
+        assert_eq!(
+            (status, code.error.as_str()),
+            (403, "forbidden"),
+            "{issuer}/{subject}"
+        );
+    }
+    // And an x509pop node's identity claiming an EK.
+    let body = registration_body(&serde_json::json!({ "ek_hash": EK_HASH }));
+    let (status, code) = refusal(h.post_node(&attested, &body).await).await;
+    assert_eq!((status, code.error.as_str()), (403, "forbidden"));
+    // Nothing was registered under either identity.
+    assert_eq!(h.me_status(&attested).await, 403);
+    assert_eq!(h.me_status(&node_svid()).await, 403);
+}
+
+#[tokio::test]
+async fn an_x509pop_attestation_beside_an_ek_hash_is_a_bad_request() {
+    let h = Harness::start().await;
+    let svid = x509pop_node_svid(HOST_CA_CN, GUEST_SUBJECT_CN);
+    let body = registration_body(&serde_json::json!({
+        "ek_hash": EK_HASH,
+        "attestation": x509pop_attestation(HOST_CA_CN, GUEST_SUBJECT_CN)
+    }));
+    // Refused whichever of the two identities sends it.
+    for peer in [svid.clone(), node_svid()] {
+        let (status, code) = refusal(h.post_node(&peer, &body).await).await;
+        assert_eq!((status, code.error.as_str()), (400, "invalid_attestation"));
+    }
+    assert_eq!(h.me_status(&svid).await, 403, "nothing was registered");
+}
+
+#[tokio::test]
+async fn an_unknown_attestation_kind_or_field_is_a_bad_request() {
+    let h = Harness::start().await;
+    let svid = x509pop_node_svid(HOST_CA_CN, GUEST_SUBJECT_CN);
+    for attestation in [
+        serde_json::json!({ "kind": "join_token", "token": "abc" }),
+        serde_json::json!({ "kind": "X509POP", "issuer_cn": HOST_CA_CN, "subject_cn": GUEST_SUBJECT_CN }),
+        serde_json::json!({ "kind": "x509pop", "issuer_cn": HOST_CA_CN, "subject_cn": GUEST_SUBJECT_CN, "fingerprint": "00" }),
+        serde_json::json!({ "kind": "x509pop", "issuer_cn": HOST_CA_CN }),
+        serde_json::json!({ "kind": "tpm", "ek_hash": EK_HASH, "subject_cn": GUEST_SUBJECT_CN }),
+        serde_json::json!({ "issuer_cn": HOST_CA_CN, "subject_cn": GUEST_SUBJECT_CN }),
+        serde_json::json!("x509pop"),
+    ] {
+        // With and without a valid top-level ek_hash beside it: an attestation that cannot
+        // be read is never skipped in favour of the EK.
+        for with_ek in [false, true] {
+            let mut extra = serde_json::json!({ "attestation": attestation });
+            if with_ek {
+                extra["ek_hash"] = serde_json::json!(EK_HASH);
+            }
+            let peer = if with_ek { node_svid() } else { svid.clone() };
+            let (status, code) =
+                refusal(h.post_node(&peer, &registration_body(&extra)).await).await;
+            assert_eq!(
+                (status, code.error.as_str()),
+                (400, "invalid_attestation"),
+                "an unreadable attestation was not refused as one (with_ek={with_ek})"
+            );
+        }
+    }
+    assert_eq!(h.me_status(&svid).await, 403);
+    assert_eq!(h.me_status(&node_svid()).await, 403);
+}
+
+#[tokio::test]
+async fn a_registration_naming_no_attestation_a_disagreeing_one_or_a_bad_name_is_a_bad_request() {
+    let h = Harness::start().await;
+    let svid = x509pop_node_svid(HOST_CA_CN, GUEST_SUBJECT_CN);
+    // Neither an attestation nor an ek_hash: the bad EK hash it always was.
+    for extra in [serde_json::json!({}), serde_json::json!({ "ek_hash": "" })] {
+        let (status, code) =
+            refusal(h.post_node(&node_svid(), &registration_body(&extra)).await).await;
+        assert_eq!((status, code.error.as_str()), (400, "invalid_ek_hash"));
+    }
+    // A tpm attestation that is not the top-level hash, and one whose hash is no hash.
+    let other = "ab".repeat(32);
+    let disagreeing = registration_body(&serde_json::json!({
+        "ek_hash": EK_HASH, "attestation": { "kind": "tpm", "ek_hash": other }
+    }));
+    let (status, code) = refusal(h.post_node(&node_svid(), &disagreeing).await).await;
+    assert_eq!((status, code.error.as_str()), (400, "invalid_attestation"));
+    let malformed = registration_body(&serde_json::json!({
+        "attestation": { "kind": "tpm", "ek_hash": "3f9a" }
+    }));
+    let (status, code) = refusal(h.post_node(&node_svid(), &malformed).await).await;
+    assert_eq!((status, code.error.as_str()), (400, "invalid_ek_hash"));
+    // A common name that cannot be a path segment of the agent ID.
+    for (issuer, subject) in [
+        (HOST_CA_CN, "../hv-02/other"),
+        ("hv 01", GUEST_SUBJECT_CN),
+        ("", GUEST_SUBJECT_CN),
+        (HOST_CA_CN, ".."),
+    ] {
+        let body = registration_body(&serde_json::json!({
+            "attestation": x509pop_attestation(issuer, subject)
+        }));
+        let (status, code) = refusal(h.post_node(&svid, &body).await).await;
+        assert_eq!(
+            (status, code.error.as_str()),
+            (400, "invalid_attestation"),
+            "a name outside the alphabet was not refused as a bad attestation"
+        );
+    }
+    // A body that is not a registration at all stays unprocessable, as before.
+    let no_dmi = serde_json::json!({ "ek_hash": EK_HASH, "hostname": "pool-a-7" });
+    assert_eq!(h.post_node(&node_svid(), &no_dmi).await.status(), 422);
+    assert_eq!(h.me_status(&node_svid()).await, 403, "nothing registered");
+}
+
+#[tokio::test]
+async fn a_v0_4_0_registration_body_still_registers_and_binds() {
+    // Byte for byte what a v0.4.0 guest sends: the top-level ek_hash and no attestation.
+    let h = Harness::start().await;
+    let body = format!(
+        r#"{{"ek_hash":"{EK_HASH}","dmi_uuid":"{DMI}","hostname":"pool-a-7","provider":"libvirt"}}"#
+    );
+    let resp = h
+        .http
+        .post(format!("{}/v1/nodes", h.sandbox_url))
+        .header(PEER_HEADER, node_svid())
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("register");
+    assert_eq!(resp.status(), 200, "the registration was refused");
+    let registered: NodeRegistered = resp.json().await.expect("node body");
+    let agent = format!("spiffe://{TRUST_DOMAIN}/spire/agent/tpm/{EK_HASH}");
+    assert_eq!(registered.node_id, agent);
+    let (_, claim) = h.create_claim(&h.login("octocat")).await;
+    assert_eq!(claim.phase, mediatore_proto::ClaimPhase::Bound);
+    assert_eq!(
+        h.entries
+            .parent_of(&mediatore_spire::claim_entry_name(claim.uid.expect("uid"))),
+        Some(agent)
+    );
+    assert_eq!(h.me_status(&node_svid()).await, 200);
+}
+
+#[tokio::test]
+async fn a_tpm_attestation_that_agrees_with_the_top_level_ek_hash_registers_the_same_node() {
+    let h = Harness::start().await;
+    let tpm = serde_json::json!({ "kind": "tpm", "ek_hash": EK_HASH });
+    for extra in [
+        serde_json::json!({ "attestation": tpm }),
+        serde_json::json!({ "attestation": tpm, "ek_hash": EK_HASH }),
+    ] {
+        let resp = h.post_node(&node_svid(), &registration_body(&extra)).await;
+        assert_eq!(resp.status(), 200);
+        let registered: NodeRegistered = resp.json().await.expect("node body");
+        assert_eq!(
+            registered.node_id,
+            format!("spiffe://{TRUST_DOMAIN}/spire/agent/tpm/{EK_HASH}")
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_key_first_registered_as_an_ek_is_a_conflict_for_its_honest_x509pop_registration() {
+    // The node SVID of an x509pop guest carries a 64 hex key, which is also the shape of an
+    // EK hash: the guest can register it as one, and the broker cannot tell (it is what a
+    // TPM node of that hash would send). What must not follow is a later, honest
+    // registration answered 200 with an agent ID the record does not hold.
+    let h = Harness::start().await;
+    let node = x509pop_identity(HOST_CA_CN, GUEST_SUBJECT_CN);
+    let svid = x509pop_node_svid(HOST_CA_CN, GUEST_SUBJECT_CN);
+    let as_ek = registration_body(&serde_json::json!({ "ek_hash": node.key }));
+    let honest = registration_body(&serde_json::json!({
+        "attestation": x509pop_attestation(HOST_CA_CN, GUEST_SUBJECT_CN)
+    }));
+
+    // Under its own key, as an EK: taken, and stored under the tpm agent ID of that key.
+    let resp = h.post_node(&svid, &as_ek).await;
+    assert_eq!(resp.status(), 200);
+    let registered: NodeRegistered = resp.json().await.expect("node body");
+    let tpm_agent = format!("spiffe://{TRUST_DOMAIN}/spire/agent/tpm/{}", node.key);
+    assert_eq!(registered.node_id, tpm_agent);
+
+    // Honestly, afterwards: refused as a conflict of its own kind, the same machine or
+    // another one, and the record is not rewritten.
+    let (status, body) = refusal(h.post_node(&svid, &honest).await).await;
+    assert_eq!(
+        (status, body.error.as_str()),
+        (409, "node_identity_conflict")
+    );
+    let mut other_machine = honest.clone();
+    other_machine["dmi_uuid"] = serde_json::json!(uuid::Uuid::new_v4().to_string());
+    let (status, body) = refusal(h.post_node(&svid, &other_machine).await).await;
+    assert_eq!(
+        (status, body.error.as_str()),
+        (409, "node_identity_conflict")
+    );
+    // What it registered first still answers as it did.
+    let resp = h.post_node(&svid, &as_ek).await;
+    assert_eq!(resp.status(), 200);
+    let again: NodeRegistered = resp.json().await.expect("node body");
+    assert_eq!(again.node_id, tpm_agent, "the stored agent ID, unchanged");
+
+    // A claim bound to that record hangs off an agent no attestor can produce for this
+    // guest: its entry is parented to the stored tpm ID, never to the x509pop agent.
+    let (_, claim) = h.create_claim(&h.login("octocat")).await;
+    assert_eq!(claim.phase, mediatore_proto::ClaimPhase::Bound);
+    assert_eq!(
+        h.entries
+            .parent_of(&mediatore_spire::claim_entry_name(claim.uid.expect("uid"))),
+        Some(tpm_agent)
+    );
+}
+
+#[tokio::test]
+async fn the_reverse_conflict_a_key_registered_as_x509pop_refuses_a_later_ek_registration() {
+    let h = Harness::start().await;
+    let node = x509pop_identity(HOST_CA_CN, GUEST_SUBJECT_CN);
+    let svid = x509pop_node_svid(HOST_CA_CN, GUEST_SUBJECT_CN);
+    let honest = registration_body(&serde_json::json!({
+        "attestation": x509pop_attestation(HOST_CA_CN, GUEST_SUBJECT_CN)
+    }));
+    assert_eq!(h.post_node(&svid, &honest).await.status(), 200);
+    let as_ek = registration_body(&serde_json::json!({ "ek_hash": node.key }));
+    let (status, body) = refusal(h.post_node(&svid, &as_ek).await).await;
+    assert_eq!(
+        (status, body.error.as_str()),
+        (409, "node_identity_conflict")
+    );
+    let resp = h.post_node(&svid, &honest).await;
+    assert_eq!(resp.status(), 200);
+    let again: NodeRegistered = resp.json().await.expect("node body");
+    assert_eq!(again.node_id, node.agent_id);
 }

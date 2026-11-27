@@ -1,0 +1,42 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+#
+# The host CAs into the server pod as one file (ADR-0049 decision 1). The attestor takes
+# ca_bundle_path, a single PEM file, and the ConfigMap holds one key per host, so an init
+# container joins them into an emptyDir the server mounts read-only (a newline after each,
+# since a key pasted without a trailing one would otherwise run into the next BEGIN line).
+# The file is removed first: the emptyDir outlives a container restart, and the copy is
+# left read-only. The image is the one deploy/spire-tpm already runs for its init
+# container, pinned by the same digest, used here for its shell alone: nothing of the TPM
+# plugin is copied, and this component works without that one.
+# The server loads the bundle when it starts (`Configured plugin ... plugin_name=x509pop
+# reconfigurable=false`), so a new host's certificate takes a rollout restart to be read.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: spire-server
+  namespace: spire-server
+spec:
+  template:
+    spec:
+      initContainers:
+        - name: x509pop-host-cas
+          image: ghcr.io/spiffe/spire-tpm-plugin-tpm-attestor-server:v1.11.3@sha256:2fec80b2db3171af5bb54312c4ad75187e430b635df6adc7ea4116a863ce0084
+          command: ["/bin/sh", "-c", "set -e; rm -f /x509pop/ca-bundle.pem; for f in /cas/*.pem; do cat \"$f\"; echo; done > /x509pop/ca-bundle.pem; chmod 0444 /x509pop/ca-bundle.pem"]
+          volumeMounts:
+            - { name: x509pop-bundle, mountPath: /x509pop }
+            - { name: x509pop-host-cas, mountPath: /cas, readOnly: true }
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+            runAsNonRoot: true
+            seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: spire-server
+          volumeMounts:
+            - { name: x509pop-bundle, mountPath: /x509pop, readOnly: true }
+      volumes:
+        - name: x509pop-bundle
+          emptyDir: {}
+        - name: x509pop-host-cas
+          configMap: { name: spire-x509pop-host-cas }

@@ -271,6 +271,7 @@ impl Harness {
             .post(format!("{}/v1/nodes", self.sandbox_url))
             .json(&NodeRegistration {
                 ek_hash: EK_HASH.into(),
+                attestation: None,
                 dmi_uuid: uuid::Uuid::new_v4(),
                 hostname: "pool-a-7".into(),
                 provider: Some(mediatore_proto::Provider::Libvirt),
@@ -606,6 +607,7 @@ async fn the_dev_header_transport_reaches_a_dev_mode_broker() {
         .header("x-mediatore-peer-spiffe-id", node_svid())
         .json(&NodeRegistration {
             ek_hash: EK_HASH.into(),
+            attestation: None,
             dmi_uuid: uuid::Uuid::new_v4(),
             hostname: "pool-a-7".into(),
             provider: Some(mediatore_proto::Provider::Libvirt),

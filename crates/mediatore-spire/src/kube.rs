@@ -25,11 +25,11 @@ use kube::{Client, CustomResource};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::x509pop::{NodeAttestation, node_entry_spec};
+use crate::x509pop::{NodeAttestation, NodeIdentity, node_entry_spec};
 use crate::{
     CLAIM_UID_LABEL, ENTRIES_POLICY, ENTRIES_POLICY_SENDER_MESSAGE, EntryKind, EntryManager,
     EntryRef, KIND_LABEL, MANAGED_BY, MANAGED_BY_LABEL, Naming, SelfCheckError, SpireError,
-    claim_entry_name, validate_ek_hash, validate_unix_user,
+    claim_entry_name, validate_unix_user,
 };
 
 /// `spec` of `spire.spiffe.io/v1alpha1` `ClusterStaticEntry`, the fields mediatore uses.
@@ -47,7 +47,7 @@ pub struct ClusterStaticEntrySpec {
     /// Full SPIFFE ID of the workload.
     #[serde(rename = "spiffeID")]
     pub spiffe_id: String,
-    /// Full SPIFFE ID of the parent (here always a tpm agent).
+    /// Full SPIFFE ID of the parent (here always a tpm or an x509pop agent).
     #[serde(rename = "parentID")]
     pub parent_id: String,
     /// Workload selectors, `type:value`.
@@ -115,7 +115,7 @@ const SELF_CHECK_CLASS: &str = "mediatore-selfcheck-never-rendered";
 /// The entry [`KubeEntryManager`]'s self-check asks the API server to judge, as a dry run
 /// (ADR-0056 decision 5). The policy claims it three times over (the name, the label, a
 /// path under `/banlieue/`) and its validations refuse it twice: the SPIFFE ID is neither
-/// a node's nor a claim's, and the parent is the SPIRE server, never a TPM agent. It is
+/// a node's nor a claim's, and the parent is the SPIRE server, never a tpm or an x509pop agent. It is
 /// well formed for the CRD's schema, so the schema is not what answers. It is never a
 /// shape the policy admits; a test holds it to that.
 fn self_check_probe(naming: &Naming) -> ClusterStaticEntry {
@@ -382,28 +382,25 @@ type EventStream = BoxStream<'static, Result<Event<ClusterStaticEntry>, watcher:
 
 #[async_trait]
 impl EntryManager for KubeEntryManager {
-    async fn ensure_node_entry(&self, ek_hash: &str) -> Result<String, SpireError> {
-        let attestation = NodeAttestation::Tpm {
-            ek_hash: ek_hash.to_owned(),
-        };
-        let (name, spec) = node_entry_spec(&self.naming, &attestation, &self.cfg.class_name)?;
+    async fn ensure_node_entry(&self, attestation: &NodeAttestation) -> Result<String, SpireError> {
+        let (name, spec) = node_entry_spec(&self.naming, attestation, &self.cfg.class_name)?;
         self.declare(&name, Self::labels(EntryKind::Node, None), spec)
             .await
     }
 
     async fn create_claim_entry(
         &self,
-        ek_hash: &str,
+        node: &NodeIdentity,
         claim_uid: Uuid,
         unix_user: &str,
         claim_ttl: Duration,
     ) -> Result<String, SpireError> {
-        validate_ek_hash(ek_hash)?;
+        node.validate(Some(&self.naming.trust_domain))?;
         validate_unix_user(unix_user)?;
         let name = claim_entry_name(claim_uid);
         let spec = ClusterStaticEntrySpec {
             spiffe_id: self.naming.claim_id(claim_uid),
-            parent_id: self.naming.agent_id(ek_hash),
+            parent_id: node.agent_id.clone(),
             selectors: vec![format!("unix:user:{unix_user}")],
             class_name: Some(self.cfg.class_name.clone()),
             x509_svid_ttl: Some(self.claim_svid_ttl(claim_ttl)),
@@ -492,6 +489,28 @@ mod tests {
 
     const EK: &str = "72c566555391e835a15c522680b51ec3b840561ed70af5605a5ae4835f040ee8";
     const TD: &str = "sandbox.test";
+
+    fn naming() -> Naming {
+        Naming {
+            trust_domain: TD.into(),
+        }
+    }
+
+    fn tpm() -> NodeAttestation {
+        NodeAttestation::Tpm { ek_hash: EK.into() }
+    }
+
+    fn x509pop() -> NodeAttestation {
+        NodeAttestation::X509pop {
+            issuer_cn: "hv-01".into(),
+            subject_cn: "vm-1".into(),
+        }
+    }
+
+    /// The TPM node every claim-entry test binds under.
+    fn node() -> NodeIdentity {
+        NodeIdentity::of(&naming(), &tpm()).unwrap()
+    }
 
     struct Step {
         method: &'static str,
@@ -694,7 +713,7 @@ mod tests {
             ]),
         ]);
         let got = m
-            .create_claim_entry(EK, uid, "sb-0123456789ab", Duration::from_hours(1))
+            .create_claim_entry(&node(), uid, "sb-0123456789ab", Duration::from_hours(1))
             .await
             .unwrap();
         assert_eq!(got, name);
@@ -734,7 +753,7 @@ mod tests {
                 entry_json(&name, Some((true, false, true)), &json!({})),
             )]),
         ]);
-        assert_eq!(m.ensure_node_entry(EK).await.unwrap(), name);
+        assert_eq!(m.ensure_node_entry(&tpm()).await.unwrap(), name);
         finish(m, task).await;
     }
 
@@ -746,7 +765,7 @@ mod tests {
             list(&[entry_json(&name, Some((true, false, false)), &json!({}))]),
             post(409, &status_json(409, "AlreadyExists", "exists")),
         ]);
-        assert_eq!(m.ensure_node_entry(EK).await.unwrap(), name);
+        assert_eq!(m.ensure_node_entry(&tpm()).await.unwrap(), name);
         finish(m, task).await;
     }
 
@@ -761,7 +780,7 @@ mod tests {
                 entry_json(&name, Some((true, false, true)), &json!({})),
             )]),
         ]);
-        assert_eq!(m.ensure_node_entry(EK).await.unwrap(), name);
+        assert_eq!(m.ensure_node_entry(&tpm()).await.unwrap(), name);
         finish(m, task).await;
     }
 
@@ -772,7 +791,7 @@ mod tests {
             list(&[entry_json(&name, Some((true, true, false)), &json!({}))]),
             post(409, &status_json(409, "AlreadyExists", "exists")),
         ]);
-        let err = m.ensure_node_entry(EK).await.unwrap_err();
+        let err = m.ensure_node_entry(&tpm()).await.unwrap_err();
         assert!(matches!(err, SpireError::Masked(n) if n == name));
         finish(m, task).await;
     }
@@ -790,7 +809,7 @@ mod tests {
             )]),
         ]);
         let err = m
-            .create_claim_entry(EK, uid, "sb-0123456789ab", Duration::from_hours(1))
+            .create_claim_entry(&node(), uid, "sb-0123456789ab", Duration::from_hours(1))
             .await
             .unwrap_err();
         assert!(matches!(err, SpireError::Masked(n) if n == name));
@@ -810,7 +829,7 @@ mod tests {
             )]),
         ]);
         let err = m
-            .create_claim_entry(EK, uid, "sb-0123456789ab", Duration::from_hours(1))
+            .create_claim_entry(&node(), uid, "sb-0123456789ab", Duration::from_hours(1))
             .await
             .unwrap_err();
         assert!(matches!(err, SpireError::Invalid(msg) if msg.contains("did not render")));
@@ -855,7 +874,7 @@ mod tests {
                 claim_svid_ttl: Duration::from_mins(15),
             },
         );
-        let err = m.ensure_node_entry(EK).await.unwrap_err();
+        let err = m.ensure_node_entry(&tpm()).await.unwrap_err();
         assert!(matches!(err, SpireError::Timeout(n) if n == node_entry_name(EK)));
         drop(m);
         task.await.unwrap();
@@ -872,7 +891,7 @@ mod tests {
             ),
         ]);
         let err = m
-            .create_claim_entry(EK, uid, "sb-0123456789ab", Duration::from_hours(1))
+            .create_claim_entry(&node(), uid, "sb-0123456789ab", Duration::from_hours(1))
             .await
             .unwrap_err();
         assert!(matches!(err, SpireError::Denied(msg) if msg.contains("never admin")));
@@ -916,7 +935,7 @@ mod tests {
         s
     }
 
-    const SPIFFE_ID_RULE: &str = "spiffeID must be spiffe://<td>/banlieue/node/<ek-hash> or spiffe://<td>/banlieue/claim/<uuid>";
+    const SPIFFE_ID_RULE: &str = "spiffeID must be spiffe://<td>/banlieue/node/<node-key> or spiffe://<td>/banlieue/claim/<uuid>";
 
     #[tokio::test]
     async fn the_self_check_passes_on_the_policys_denial_of_a_dry_run() {
@@ -1107,14 +1126,90 @@ mod tests {
     async fn invalid_input_never_reaches_the_api_server() {
         let (m, task) = manager(vec![]);
         assert!(matches!(
-            m.ensure_node_entry("3f9a").await,
+            m.ensure_node_entry(&NodeAttestation::Tpm {
+                ek_hash: "3f9a".into()
+            })
+            .await,
             Err(SpireError::Invalid(_))
         ));
         assert!(matches!(
-            m.create_claim_entry(EK, Uuid::new_v4(), "root", Duration::from_hours(1))
+            m.create_claim_entry(&node(), Uuid::new_v4(), "root", Duration::from_hours(1))
                 .await,
             Err(SpireError::Invalid(_))
         ));
+        // A parent that is not a tpm or an x509pop agent of this trust domain, or whose
+        // key is not the agent's (ADR-0049 decision 8): refused before any request.
+        let x509 = NodeIdentity::of(&naming(), &x509pop()).unwrap();
+        for bad in [
+            NodeIdentity::stored(EK, "spiffe://sandbox.test/spire/server"),
+            NodeIdentity::stored(EK, &format!("spiffe://other.test/spire/agent/tpm/{EK}")),
+            NodeIdentity::stored(EK, &x509.agent_id),
+            NodeIdentity::stored(&x509.key, &format!("{}/extra", x509.agent_id)),
+            NodeIdentity::stored("ek1", "spiffe://sandbox.test/spire/agent/tpm/ek1"),
+        ] {
+            assert!(matches!(
+                m.create_claim_entry(
+                    &bad,
+                    Uuid::new_v4(),
+                    "sb-0123456789ab",
+                    Duration::from_hours(1)
+                )
+                .await,
+                Err(SpireError::Invalid(_))
+            ));
+        }
+        finish(m, task).await;
+    }
+
+    #[tokio::test]
+    async fn an_x509pop_nodes_entries_are_parented_to_its_x509pop_agent() {
+        // ADR-0049 decisions 7 and 8: the node entry is named and identified by the node
+        // key and parented to the x509pop agent; the claim entry takes the stored agent ID.
+        let identity = NodeIdentity::of(&naming(), &x509pop()).unwrap();
+        let name = node_entry_name(&identity.key);
+        let mut create = post(201, &entry_json(&name, None, &json!({})));
+        create.check = Some(|v: &Value| {
+            let key = NodeIdentity::of(&naming(), &x509pop()).unwrap().key;
+            assert_eq!(
+                v["spec"]["spiffeID"],
+                format!("spiffe://sandbox.test/banlieue/node/{key}")
+            );
+            assert_eq!(
+                v["spec"]["parentID"],
+                "spiffe://sandbox.test/spire/agent/x509pop/hv-01/vm-1"
+            );
+            assert_eq!(v["metadata"]["name"], format!("mediatore-node-{key}"));
+        });
+        let uid = Uuid::new_v4();
+        let claim = claim_entry_name(uid);
+        let mut create_claim = post(201, &entry_json(&claim, None, &json!({})));
+        create_claim.check = Some(|v: &Value| {
+            assert_eq!(
+                v["spec"]["parentID"],
+                "spiffe://sandbox.test/spire/agent/x509pop/hv-01/vm-1"
+            );
+        });
+        let set = |n: &str| {
+            watch(&[(
+                "MODIFIED",
+                entry_json(n, Some((true, false, true)), &json!({})),
+            )])
+        };
+        let (m, task) = manager(vec![
+            list(&[]),
+            create,
+            set(&name),
+            list(&[]),
+            create_claim,
+            set(&claim),
+        ]);
+        assert_eq!(m.ensure_node_entry(&x509pop()).await.unwrap(), name);
+        assert_eq!(
+            m.create_claim_entry(&identity, uid, "sb-0123456789ab", Duration::from_hours(1))
+                .await
+                .unwrap(),
+            claim
+        );
         finish(m, task).await;
     }
 

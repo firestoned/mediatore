@@ -35,8 +35,8 @@ use kube::config::{KubeConfigOptions, Kubeconfig};
 use kube::{Client, Config};
 use mediatore_spire::{
     ClusterStaticEntry, ClusterStaticEntrySpec, ENTRIES_POLICY_SENDER_MESSAGE, EntriesConfig,
-    EntryKind, EntryManager, KubeEntryManager, Naming, SelfCheckError, claim_entry_name,
-    node_entry_name,
+    EntryKind, EntryManager, KubeEntryManager, Naming, NodeAttestation, NodeIdentity,
+    SelfCheckError, claim_entry_name, node_entry_name,
 };
 use uuid::Uuid;
 
@@ -194,7 +194,9 @@ async fn run(
     );
 
     // Node entry: declared, rendered and set by the controller manager.
-    let node = match mgr.ensure_node_entry(EK).await {
+    let tpm = NodeAttestation::Tpm { ek_hash: EK.into() };
+    let identity = NodeIdentity::of(&naming, &tpm).map_err(|e| format!("identity: {e}"))?;
+    let node = match mgr.ensure_node_entry(&tpm).await {
         Ok(name) => name,
         Err(e) => {
             // Show what the controller manager actually wrote, so a timeout is diagnosable.
@@ -218,14 +220,19 @@ async fn run(
 
     // Declaring it again is a no-op, not a 409 surfaced to the caller.
     let again = mgr
-        .ensure_node_entry(EK)
+        .ensure_node_entry(&tpm)
         .await
         .map_err(|e| format!("second ensure_node_entry: {e}"))?;
     assert_eq!(again, node);
 
     // Claim entry.
     let claim = mgr
-        .create_claim_entry(EK, claim_uid, UNIX_USER, std::time::Duration::from_hours(1))
+        .create_claim_entry(
+            &identity,
+            claim_uid,
+            UNIX_USER,
+            std::time::Duration::from_hours(1),
+        )
         .await
         .map_err(|e| format!("create_claim_entry: {e}"))?;
     assert_eq!(claim, claim_entry_name(claim_uid));

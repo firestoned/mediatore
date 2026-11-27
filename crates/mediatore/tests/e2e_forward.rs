@@ -261,6 +261,7 @@ impl Harness {
             .header(PEER_HEADER, node_svid())
             .json(&NodeRegistration {
                 ek_hash: EK_HASH.into(),
+                attestation: None,
                 dmi_uuid: uuid::Uuid::new_v4(),
                 hostname: "pool-a-7".into(),
                 provider: None,

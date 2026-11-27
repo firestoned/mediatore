@@ -4,12 +4,16 @@
 //! SPIRE registration entries, declared rather than pushed (ADR-0006).
 //!
 //! mediatore creates exactly two kinds of registration entry:
-//! * a node bootstrap entry `spiffe://<td>/banlieue/node/<ek-hash>` for the in-guest agent
+//! * a node bootstrap entry `spiffe://<td>/banlieue/node/<node key>` for the in-guest agent
 //!   (selectors `unix:uid:0` + `unix:path:/usr/bin/mediatore`, ADR-0014), and
 //! * a claim entry `spiffe://<td>/banlieue/claim/<uid>` for the jailed workload
 //!   (selector `unix:user:<sandbox user>`).
 //!
-//! Both are parented to the node's tpm agent ID, which is computable from the EK hash.
+//! Both are parented to the node's agent ID: `spire/agent/tpm/<ek-hash>` for a guest with a
+//! vTPM, computable from the EK hash, or `spire/agent/x509pop/<issuer CN>/<subject CN>` for
+//! one without (ADR-0049). The node key is the EK hash for the first and a hash of the agent
+//! ID for the second ([`x509pop::node_key`]); a claim entry takes its parent from the stored
+//! agent ID ([`NodeIdentity`]), never from the key.
 //! [`KubeEntryManager`] writes them as `ClusterStaticEntry` resources through the Kubernetes
 //! API and waits for the SPIRE Controller Manager to report them set; mediatore never holds
 //! a SPIRE admin identity. [`MemoryEntries`] is the fake for `dev_mode` and tests, and it
@@ -29,6 +33,7 @@ use uuid::Uuid;
 pub use crate::kube::{
     ClusterStaticEntry, ClusterStaticEntrySpec, EntriesConfig, KubeEntryManager, MAX_CLAIM_SVID_TTL,
 };
+pub use crate::x509pop::{NodeAttestation, NodeIdentity};
 
 /// Label every mediatore-declared entry carries; the orphan sweep selects on it.
 pub const MANAGED_BY_LABEL: &str = "app.kubernetes.io/managed-by";
@@ -63,19 +68,23 @@ pub struct Naming {
 
 impl Naming {
     /// `spiffe://<td>/spire/agent/tpm/<ek-hash>`: the ID the TPM attestor gives the SPIRE
-    /// agent on the VM, used as the parent of every entry on that node.
+    /// agent on the VM, used as the parent of every entry on that node. A TPM node's only:
+    /// the agent ID of any node is [`x509pop::agent_id_for`] its attestation, and a stored
+    /// node's is on its record.
     #[must_use]
     pub fn agent_id(&self, ek_hash: &str) -> String {
         format!("spiffe://{}/spire/agent/tpm/{ek_hash}", self.trust_domain)
     }
 
-    /// `spiffe://<td>/banlieue/node/<ek-hash>`
+    /// `spiffe://<td>/banlieue/node/<node key>`: the key is a TPM node's EK hash or an
+    /// x509pop node's [`x509pop::node_key`].
     #[must_use]
-    pub fn node_id(&self, ek_hash: &str) -> String {
-        format!("spiffe://{}/banlieue/node/{ek_hash}", self.trust_domain)
+    pub fn node_id(&self, node_key: &str) -> String {
+        format!("spiffe://{}/banlieue/node/{node_key}", self.trust_domain)
     }
 
-    /// Parse the EK hash out of a peer's node SPIFFE ID, if it is one of ours.
+    /// Parse the node key out of a peer's node SPIFFE ID, if it is one of ours. (The name
+    /// is from when every key was an EK hash.)
     #[must_use]
     pub fn node_ek_from(&self, spiffe_id: &str) -> Option<String> {
         let prefix = format!("spiffe://{}/banlieue/node/", self.trust_domain);
@@ -136,10 +145,13 @@ impl Naming {
     }
 }
 
-/// `mediatore-node-<ek-hash>`: deterministic, so "ensure" is a create that tolerates 409.
+/// Name prefix of a node entry; the node key follows it.
+pub const NODE_ENTRY_PREFIX: &str = "mediatore-node-";
+
+/// `mediatore-node-<node key>`: deterministic, so "ensure" is a create that tolerates 409.
 #[must_use]
-pub fn node_entry_name(ek_hash: &str) -> String {
-    format!("mediatore-node-{ek_hash}")
+pub fn node_entry_name(node_key: &str) -> String {
+    format!("{NODE_ENTRY_PREFIX}{node_key}")
 }
 
 /// `mediatore-claim-<uid>`.
@@ -178,8 +190,9 @@ pub struct EntryRef {
     /// The claim a claim entry belongs to.
     pub claim_uid: Option<Uuid>,
     /// The SPIFFE ID the entry is parented to (`spec.parentID`): for a node entry of a TPM
-    /// guest, `spiffe://<td>/spire/agent/tpm/<ek hash>`, the same hash its name carries. What
-    /// tells a TPM node entry from an x509pop one (ADR-0049), whose name is also a hash.
+    /// guest, `spiffe://<td>/spire/agent/tpm/<ek hash>`, the same hash its name carries; for
+    /// one of an x509pop guest (ADR-0049), `.../spire/agent/x509pop/<issuer>/<subject>`, whose
+    /// SHA-256 its name carries.
     pub parent_id: Option<String>,
 }
 
@@ -272,6 +285,18 @@ pub fn validate_ek_hash(ek_hash: &str) -> Result<(), SpireError> {
     }
 }
 
+/// Refuse a node key that is not 64 lowercase hex: the shape of an EK hash, which an
+/// x509pop node's key shares (ADR-0049 decision 7), and what the admission policy takes.
+pub fn validate_node_key(key: &str) -> Result<(), SpireError> {
+    if is_ek_hash(key) {
+        Ok(())
+    } else {
+        Err(SpireError::Invalid(
+            "node key must be 64 lowercase hex characters".into(),
+        ))
+    }
+}
+
 /// Refuse a user that is not `sb-` plus 12 lowercase hex (ADR-0004), as admission would.
 pub fn validate_unix_user(user: &str) -> Result<(), SpireError> {
     let ok = user.strip_prefix("sb-").is_some_and(|h| {
@@ -334,14 +359,17 @@ pub fn parse_go_duration(s: &str) -> Result<Duration, String> {
 /// name; a declaration only succeeds once the entry is set on the SPIRE server.
 #[async_trait]
 pub trait EntryManager: Send + Sync + 'static {
-    /// Declare (or find) the node bootstrap entry for a VM whose EK hash is known.
-    async fn ensure_node_entry(&self, ek_hash: &str) -> Result<String, SpireError>;
-    /// Declare the claim entry under the node's agent. Idempotent on the name. `claim_ttl`
-    /// is the time the claim has left: the entry's SVID TTL never exceeds it (ADR-0027
-    /// decision 7).
+    /// Declare (or find) the node bootstrap entry for a VM whose attestation is known:
+    /// named and identified by the attestation's node key, parented to its agent ID.
+    async fn ensure_node_entry(&self, attestation: &NodeAttestation) -> Result<String, SpireError>;
+    /// Declare the claim entry under the node's agent: `node.agent_id`, as stored, which
+    /// must be a tpm or an x509pop agent of this trust domain whose key is `node.key`
+    /// ([`NodeIdentity::validate`]); anything else is refused and nothing is declared.
+    /// Idempotent on the name. `claim_ttl` is the time the claim has left: the entry's SVID
+    /// TTL never exceeds it (ADR-0027 decision 7).
     async fn create_claim_entry(
         &self,
-        ek_hash: &str,
+        node: &NodeIdentity,
         claim_uid: Uuid,
         unix_user: &str,
         claim_ttl: Duration,
@@ -372,7 +400,15 @@ pub struct MemoryEntries {
     /// What the self-check answers when a test has taken the policy away; `None` is a
     /// server that enforces it.
     self_check_fault: Mutex<Option<SelfCheckError>>,
+    /// The trust domain entries are held to, as [`KubeEntryManager`] holds them to its own.
+    /// `None` (the `Default`): node entries are parented under [`MEMORY_TRUST_DOMAIN`] and a
+    /// claim entry's agent may be of any one trust domain.
+    trust_domain: Option<String>,
 }
+
+/// The trust domain a [`MemoryEntries`] built without one parents its node entries under:
+/// one that cannot be real.
+pub const MEMORY_TRUST_DOMAIN: &str = "memory.invalid";
 
 impl MemoryEntries {
     /// Answer the self-check from now on as an API server would once the policy no longer
@@ -386,6 +422,16 @@ impl MemoryEntries {
         *self.self_check_fault.lock().unwrap() = fault;
     }
 
+    /// Entries held to `trust_domain`, exactly as the Kubernetes manager holds them to the
+    /// broker's: what `dev_mode` runs on.
+    #[must_use]
+    pub fn in_trust_domain(trust_domain: &str) -> Self {
+        Self {
+            trust_domain: Some(trust_domain.to_owned()),
+            ..Self::default()
+        }
+    }
+
     /// Names currently declared, in order.
     ///
     /// # Panics
@@ -394,26 +440,43 @@ impl MemoryEntries {
     pub fn names(&self) -> Vec<String> {
         self.entries.lock().unwrap().keys().cloned().collect()
     }
-}
 
-/// The TPM agent ID the memory fake parents its entries to: the shape the Kubernetes entries
-/// carry, under a trust domain that cannot be a real one.
-fn memory_agent_id(ek_hash: &str) -> String {
-    format!("spiffe://memory.invalid/spire/agent/tpm/{ek_hash}")
+    /// The agent ID a declared entry is parented to.
+    ///
+    /// # Panics
+    /// If the lock is poisoned (a test already failed).
+    #[must_use]
+    pub fn parent_of(&self, name: &str) -> Option<String> {
+        self.entries
+            .lock()
+            .unwrap()
+            .get(name)
+            .and_then(|e| e.parent_id.clone())
+    }
+
+    fn naming(&self) -> Naming {
+        Naming {
+            trust_domain: self
+                .trust_domain
+                .clone()
+                .unwrap_or_else(|| MEMORY_TRUST_DOMAIN.to_owned()),
+        }
+    }
 }
 
 #[async_trait]
 impl EntryManager for MemoryEntries {
-    async fn ensure_node_entry(&self, ek_hash: &str) -> Result<String, SpireError> {
-        validate_ek_hash(ek_hash)?;
-        let name = node_entry_name(ek_hash);
+    async fn ensure_node_entry(&self, attestation: &NodeAttestation) -> Result<String, SpireError> {
+        // The same rendering the Kubernetes manager declares, so the name, the key and the
+        // parent cannot differ between the two.
+        let (name, spec) = x509pop::node_entry_spec(&self.naming(), attestation, "memory")?;
         self.entries.lock().unwrap().insert(
             name.clone(),
             EntryRef {
                 name: name.clone(),
                 kind: EntryKind::Node,
                 claim_uid: None,
-                parent_id: Some(memory_agent_id(ek_hash)),
+                parent_id: Some(spec.parent_id),
             },
         );
         tracing::info!(name, "memory: node entry declared");
@@ -422,12 +485,12 @@ impl EntryManager for MemoryEntries {
 
     async fn create_claim_entry(
         &self,
-        ek_hash: &str,
+        node: &NodeIdentity,
         claim_uid: Uuid,
         unix_user: &str,
         _claim_ttl: Duration,
     ) -> Result<String, SpireError> {
-        validate_ek_hash(ek_hash)?;
+        node.validate(self.trust_domain.as_deref())?;
         validate_unix_user(unix_user)?;
         let name = claim_entry_name(claim_uid);
         self.entries.lock().unwrap().insert(
@@ -436,10 +499,10 @@ impl EntryManager for MemoryEntries {
                 name: name.clone(),
                 kind: EntryKind::Claim,
                 claim_uid: Some(claim_uid),
-                parent_id: Some(memory_agent_id(ek_hash)),
+                parent_id: Some(node.agent_id.clone()),
             },
         );
-        tracing::info!(name, %claim_uid, unix_user, "memory: claim entry declared");
+        tracing::info!(name, %claim_uid, unix_user, parent = %node.agent_id, "memory: claim entry declared");
         Ok(name)
     }
 
@@ -509,21 +572,21 @@ impl Gated {
 
 #[async_trait]
 impl EntryManager for Gated {
-    async fn ensure_node_entry(&self, ek_hash: &str) -> Result<String, SpireError> {
+    async fn ensure_node_entry(&self, attestation: &NodeAttestation) -> Result<String, SpireError> {
         self.proven_or_refused().await?;
-        self.inner.ensure_node_entry(ek_hash).await
+        self.inner.ensure_node_entry(attestation).await
     }
 
     async fn create_claim_entry(
         &self,
-        ek_hash: &str,
+        node: &NodeIdentity,
         claim_uid: Uuid,
         unix_user: &str,
         claim_ttl: Duration,
     ) -> Result<String, SpireError> {
         self.proven_or_refused().await?;
         self.inner
-            .create_claim_entry(ek_hash, claim_uid, unix_user, claim_ttl)
+            .create_claim_entry(node, claim_uid, unix_user, claim_ttl)
             .await
     }
 
@@ -628,23 +691,53 @@ mod tests {
         assert!(validate_ek_hash(EK).is_ok());
         assert!(validate_ek_hash("3f9a").is_err());
         assert!(validate_ek_hash(&EK.to_uppercase()).is_err());
+        assert!(validate_node_key(EK).is_ok());
+        assert!(validate_node_key("3f9a").is_err());
         assert!(validate_unix_user("sb-0123456789ab").is_ok());
         assert!(validate_unix_user("sb-0123456789AB").is_err());
         assert!(validate_unix_user("root").is_err());
         assert!(validate_unix_user("sb-0123").is_err());
     }
 
+    fn naming() -> Naming {
+        Naming {
+            trust_domain: "sandbox.test".into(),
+        }
+    }
+
+    fn tpm() -> NodeAttestation {
+        NodeAttestation::Tpm { ek_hash: EK.into() }
+    }
+
+    fn x509() -> NodeAttestation {
+        NodeAttestation::X509pop {
+            issuer_cn: "hv-01".into(),
+            subject_cn: "vm-1".into(),
+        }
+    }
+
+    fn identity(att: &NodeAttestation) -> NodeIdentity {
+        NodeIdentity::of(&naming(), att).unwrap()
+    }
+
     #[tokio::test]
     async fn memory_fake_declares_and_retracts() {
-        let m = MemoryEntries::default();
+        let m = MemoryEntries::in_trust_domain("sandbox.test");
         let uid = Uuid::new_v4();
-        let node = m.ensure_node_entry(EK).await.unwrap();
+        let node = m.ensure_node_entry(&tpm()).await.unwrap();
         let claim = m
-            .create_claim_entry(EK, uid, "sb-0123456789ab", Duration::from_hours(1))
+            .create_claim_entry(
+                &identity(&tpm()),
+                uid,
+                "sb-0123456789ab",
+                Duration::from_hours(1),
+            )
             .await
             .unwrap();
         assert_eq!(node, node_entry_name(EK));
         assert_eq!(claim, claim_entry_name(uid));
+        assert_eq!(m.parent_of(&node), Some(naming().agent_id(EK)));
+        assert_eq!(m.parent_of(&claim), Some(naming().agent_id(EK)));
         let listed = m.list_entries().await.unwrap();
         assert_eq!(listed.len(), 2);
         assert!(
@@ -658,18 +751,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn memory_fake_parents_an_x509pop_nodes_entries_to_its_x509pop_agent() {
+        let m = MemoryEntries::in_trust_domain("sandbox.test");
+        let node = identity(&x509());
+        let agent = "spiffe://sandbox.test/spire/agent/x509pop/hv-01/vm-1";
+        assert_eq!(node.agent_id, agent);
+        let node_entry = m.ensure_node_entry(&x509()).await.unwrap();
+        assert_eq!(node_entry, node_entry_name(&node.key));
+        assert_eq!(m.parent_of(&node_entry).as_deref(), Some(agent));
+        let uid = Uuid::new_v4();
+        let claim = m
+            .create_claim_entry(&node, uid, "sb-0123456789ab", Duration::from_hours(1))
+            .await
+            .unwrap();
+        assert_eq!(
+            m.parent_of(&claim).as_deref(),
+            Some(agent),
+            "the stored agent ID, never one recomputed from the key"
+        );
+    }
+
+    #[tokio::test]
     async fn memory_fake_is_no_more_permissive_than_the_real_thing() {
-        let m = MemoryEntries::default();
+        let m = MemoryEntries::in_trust_domain("sandbox.test");
+        let hour = Duration::from_hours(1);
+        let bad_tpm = NodeAttestation::Tpm {
+            ek_hash: "3f9a".into(),
+        };
         assert!(matches!(
-            m.ensure_node_entry("3f9a").await,
+            m.ensure_node_entry(&bad_tpm).await,
+            Err(SpireError::Invalid(_))
+        ));
+        let bad_x509 = NodeAttestation::X509pop {
+            issuer_cn: "hv 01".into(),
+            subject_cn: "vm-1".into(),
+        };
+        assert!(matches!(
+            m.ensure_node_entry(&bad_x509).await,
             Err(SpireError::Invalid(_))
         ));
         assert!(matches!(
-            m.create_claim_entry(EK, Uuid::new_v4(), "root", Duration::from_hours(1))
+            m.create_claim_entry(&identity(&tpm()), Uuid::new_v4(), "root", hour)
                 .await,
             Err(SpireError::Invalid(_))
         ));
+        // An agent of another trust domain, a parent that is no agent, a key that is not
+        // the agent's: what the Kubernetes manager refuses before any request.
+        let foreign = NodeIdentity::of(
+            &Naming {
+                trust_domain: "other.test".into(),
+            },
+            &x509(),
+        )
+        .unwrap();
+        let server = NodeIdentity::stored(EK, "spiffe://sandbox.test/spire/server");
+        let wrong_key = NodeIdentity::stored(EK, &identity(&x509()).agent_id);
+        for node in [&foreign, &server, &wrong_key] {
+            assert!(matches!(
+                m.create_claim_entry(node, Uuid::new_v4(), "sb-0123456789ab", hour)
+                    .await,
+                Err(SpireError::Invalid(_))
+            ));
+        }
         assert_eq!(m.names(), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn memory_fake_without_a_trust_domain_still_holds_the_shape_and_the_key() {
+        let m = MemoryEntries::default();
+        let hour = Duration::from_hours(1);
+        m.create_claim_entry(&identity(&x509()), Uuid::new_v4(), "sb-0123456789ab", hour)
+            .await
+            .unwrap();
+        let server = NodeIdentity::stored(EK, "spiffe://sandbox.test/spire/server");
+        assert!(
+            m.create_claim_entry(&server, Uuid::new_v4(), "sb-0123456789ab", hour)
+                .await
+                .is_err()
+        );
+        let node = m.ensure_node_entry(&tpm()).await.unwrap();
+        assert_eq!(
+            m.parent_of(&node),
+            Some(format!(
+                "spiffe://{MEMORY_TRUST_DOMAIN}/spire/agent/tpm/{EK}"
+            ))
+        );
     }
 
     #[tokio::test]
@@ -685,15 +851,15 @@ mod tests {
     async fn a_gate_declares_nothing_while_unproven_and_always_retracts() {
         // ADR-0056 decision 5, open question 7: a broker that knows its bound is gone stops
         // declaring. It never stops retracting, and it releases nothing on its own.
-        let inner = std::sync::Arc::new(MemoryEntries::default());
+        let inner = std::sync::Arc::new(MemoryEntries::in_trust_domain("sandbox.test"));
         let gated = Gated::new(inner.clone());
         assert!(!gated.is_proven(), "unproven until a self-check has passed");
         gated.self_check().await.unwrap();
         assert!(gated.is_proven());
-        let node = gated.ensure_node_entry(EK).await.unwrap();
+        let node = gated.ensure_node_entry(&tpm()).await.unwrap();
         let claim = Uuid::new_v4();
         let entry = gated
-            .create_claim_entry(EK, claim, "sb-0123456789ab", Duration::from_hours(1))
+            .create_claim_entry(&identity(&tpm()), claim, "sb-0123456789ab", Duration::from_hours(1))
             .await
             .unwrap();
 
@@ -703,14 +869,16 @@ mod tests {
         )));
         assert!(gated.self_check().await.is_err());
         assert!(!gated.is_proven());
-        let other = "a".repeat(64);
+        let other = NodeAttestation::Tpm {
+            ek_hash: "a".repeat(64),
+        };
         let refused = gated.ensure_node_entry(&other).await.unwrap_err();
         assert!(matches!(refused, SpireError::Unproven(_)), "{refused:?}");
         assert!(refused.to_string().contains("unproven"), "{refused}");
         assert!(matches!(
             gated
                 .create_claim_entry(
-                    EK,
+                    &identity(&tpm()),
                     Uuid::new_v4(),
                     "sb-0123456789ab",
                     Duration::from_hours(1)
@@ -744,7 +912,7 @@ mod tests {
         inner.answer_self_check_with(Some(SelfCheckError::Unreachable("connect".into())));
         let gated = Gated::new(inner.clone());
         assert!(matches!(
-            gated.ensure_node_entry(EK).await,
+            gated.ensure_node_entry(&tpm()).await,
             Err(SpireError::Unproven(_))
         ));
         assert_eq!(inner.names(), Vec::<String>::new());
@@ -755,13 +923,16 @@ mod tests {
 
     #[async_trait]
     impl EntryManager for NoSelfCheck {
-        async fn ensure_node_entry(&self, _ek_hash: &str) -> Result<String, SpireError> {
+        async fn ensure_node_entry(
+            &self,
+            _attestation: &NodeAttestation,
+        ) -> Result<String, SpireError> {
             Err(SpireError::NotImplemented("ensure_node_entry"))
         }
 
         async fn create_claim_entry(
             &self,
-            _ek_hash: &str,
+            _node: &NodeIdentity,
             _claim_uid: Uuid,
             _unix_user: &str,
             _claim_ttl: Duration,

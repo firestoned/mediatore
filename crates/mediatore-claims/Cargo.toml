@@ -48,6 +48,8 @@ base64.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 mediatore-testkit.workspace = true
+# The basicConstraints of the host CA fixtures (ADR-0049 decision 2).
+rcgen.workspace = true
 # The storage contract's shared cases (ADR-0057 decision 6), run over the Kubernetes store.
 mediatore-store = { workspace = true, features = ["test-support"] }
 sandboxpolicy-bundle.workspace = true
