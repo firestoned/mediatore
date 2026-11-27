@@ -190,7 +190,9 @@ What already exists and shapes the answer:
   listener, but it is new privileged code on the gateway and the threat-model pass must weigh it
   against what `gateway_port` and `gateway_output` are worth.
 - **ADR-0069 and ADR-0062 are amended** (the enums, a node without a claim on the trip route for
-  `segment` alone, the `probes` list), and both are still Proposed. This ADR's claim-scoped
+  `segment` alone, the `probes` list). ADR-0069 is still Proposed; ADR-0062 is accepted, and its
+  R-68 (a report is the word of whoever holds the authorizer's identity) is why
+  `deny_outside_rendered` starts at `report`. This ADR's claim-scoped
   `trip` needs ADR-0069's record, status and condition; its audit lines and metrics need neither.
 - **The threat-model pass is owed** and touches TB-6 (the classes as detection rows beside the
   refusals they classify), TB-13, TB-14 and TB-17 (the gateway's counters and the reader), TB-15

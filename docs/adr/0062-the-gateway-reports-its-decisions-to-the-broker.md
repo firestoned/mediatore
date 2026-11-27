@@ -3,8 +3,11 @@
 
 # ADR-0062: The gateway reports its decisions to the broker
 
-**Status:** Proposed (drafted with an implementation; the threat-model pass is owed before it is
-accepted) · **Date:** 2026-11-22
+**Status:** Accepted 2026-11-26; implemented 2026-11-22 (#157: `crates/mediatore-gateway/src/report.rs`,
+`gateway_decisions` in `crates/mediatore-api/src/lib.rs`, `GatewayDecisions::check` in
+`crates/mediatore-proto/src/lib.rs`), released in v0.4.0; the threat-model pass done 2026-11-26 (A-33,
+R-68, R-69), with the route's test over the real listener added the same day
+(`crates/mediatore/tests/e2e_gateway.rs`); not yet run on a booted gateway · **Date:** 2026-11-22
 
 Roadmap 10 (the gateway). Adds one route to the gateway authorizer's surface at the broker beside
 [ADR-0028](0028-egress-gateway-envoy-with-spiffe-identity.md) decision 4 and

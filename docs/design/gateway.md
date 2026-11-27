@@ -68,7 +68,7 @@ this path carries `x-mediatore-refusal: <code>`, so the guest can tell the gatew
 
 ## What the broker hears of each decision
 
-Each tunnel and inject decision about a claim is also reported to the broker (ADR-0062, Proposed):
+Each tunnel and inject decision about a claim is also reported to the broker (ADR-0062):
 `POST /v1/gateway/decisions`, over the same mutual TLS as the ask, in batches every two seconds or of 256. A decision
 carries the claim, `tunnel` or `inject`, the authority, the audience of a matched inject route, the verdict, the refusal
 code and where the allowlist came from, and the batch carries the gateway's name (`--name`, `MEDIATORE_GATEWAY_NAME`, by

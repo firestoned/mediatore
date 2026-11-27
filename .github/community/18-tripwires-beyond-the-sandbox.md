@@ -31,8 +31,7 @@ deciders are the guest and the proxy, which are what an escape or a root comprom
   `crates/mediatore-api/src/lib.rs`), each a log line.
 - The broker keeps what each guest was handed (`status.record.rendered`) and uses it for
   ADR-0061's follow rule only.
-- The gateway reports its denies (ADR-0062, Proposed, drafted); the broker logs them and keeps
-  nothing.
+- The gateway reports its denies (ADR-0062); the broker logs them and keeps nothing.
 - The host tables drop and count (`image/gateway/nftables.conf.in`, `image/host-table`); the
   counters are read by nobody.
 
