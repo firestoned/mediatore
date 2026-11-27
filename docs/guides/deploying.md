@@ -92,7 +92,18 @@ URL, your CIDRs. Edit:
   before, and says so once at start. `spire.entries.claim_svid_ttl` is at most `15m`
   (the default; [ADR-0027](../adr/0027-control-plane-relay-on-the-egress-gateway.md)
   decision 7: a claim's identity ends within that of its release or of losing the
-  gateways, and never outlives the claim);
+  gateways, and never outlives the claim). `sandboxes.max_ttl_seconds` is the longest
+  lifetime a claim may ask for, `86400` (one day) unless you write another: a request above
+  it is refused (`400 ttl_exceeds_maximum`, or a declarative `AgentSandbox` marked `Failed`
+  with the reason), with or without a policy, and a policy's lease only narrows it. It
+  must be positive, the start log names it (`longest lifetime a claim may ask for`), and
+  its default is the gateways' `TUNNEL_MAX_SECS` default (`image/gateway/env.example`):
+  no tunnel outlives that cap, so raise the two together. Lowering it does not release a
+  claim that is already bound; that claim runs to the TTL it was admitted with
+  ([ADR-0008](../adr/0008-agentsandbox-crd-owned-by-mediatore.md) decision 9, amended
+  2026-11-26). **Upgrading:** before this key existed a claim without a policy could ask
+  for any lifetime, so a caller that asks for more than a day is now refused until the
+  key is raised;
 - `networkpolicy.yaml`: the sandbox segment's CIDR for `:8443`, the control-plane
   addresses for the API server, the node CIDR for the kubelet's probe, and the
   issuer's namespace or addresses;

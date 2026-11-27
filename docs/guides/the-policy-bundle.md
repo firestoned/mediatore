@@ -327,7 +327,9 @@ of the sandbox's policy decides what a claim may use:
 - the policy must resolve to a verified, unexpired bundle: `400 unknown_policy`. Until every watched namespace has been listed once the
   answer is `503 policy_not_synced` and nothing is created, and a declarative sandbox is held rather than failed;
 - every audience must be one the bundle grants, else `400 unknown_audience`, the same answer as an audience that does not exist;
-- `ttl_seconds` must fit the bundle's `lease.maxDurationSeconds`: `400 ttl_exceeds_policy`.
+- `ttl_seconds` must fit the bundle's `lease.maxDurationSeconds`: `400 ttl_exceeds_policy`. The broker's own
+  `sandboxes.max_ttl_seconds` (one day by default) applies as well, with or without a policy, so the bound is the
+  smaller of the two (`400 ttl_exceeds_maximum`).
 
 What the claim then gets is the bundle's grant **bounded by the broker's own configuration**, never wider than either: a bundle rule is
 kept only if the audience's own `rules` in `mediatore.yaml` (its ceiling) cover it, and a grant with no rules reads as the ceiling; a grant

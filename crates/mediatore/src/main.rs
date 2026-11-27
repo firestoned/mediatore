@@ -140,8 +140,6 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
 
     let sts = sts(&cfg)?;
 
-    let registries = registries(&cfg)?;
-
     // The reflector needs the store the state is about to own, and the state needs the
     // reflector's cache (ADR-0030): built first.
     let reflector = bundle_reflector(&cfg, &store, client.is_some())?;
@@ -180,9 +178,10 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
         no_credential: no_credential_audiences(&cfg),
         secrets: audience_secrets(&cfg)?,
         delegated: delegated_audiences(&cfg),
-        registries,
+        registries: registries(&cfg)?,
         sandboxes,
         namespaces: cfg.namespaces(),
+        max_ttl_seconds: cfg.sandboxes.max_ttl_seconds,
         sealer,
         limiter: Limiter::new(cfg.token.rate_per_minute),
         dev_mode: cfg.dev_mode,
@@ -433,6 +432,7 @@ async fn claim_watcher(
                 .collect(),
             scopes: audience_scopes(cfg),
             issuers: cfg.issuers.iter().map(|i| i.url.clone()).collect(),
+            max_ttl_seconds: cfg.sandboxes.max_ttl_seconds,
             registry_audiences: cfg.granted_registries(),
             placed_registries: cfg.placed_registries(),
             retention: std::time::Duration::from_secs(cfg.store.retention_secs),

@@ -3,7 +3,7 @@
 
 # ADR-0008: AgentSandbox is a mediatore CRD, reconciled by mediatore
 
-**Status:** Implemented · **Date:** 2026-10-12 · **Accepted:** 2026-10-14 · **Implemented:** 2026-10-14 (roadmap 08; the implementation notes below) · **Amended:** 2026-11-01 (a new optional, immutable `spec.policyRef`, [ADR-0026](0026-notaio-bundles-verified-in-shadow.md) decision 6); 2026-11-09 (decision 8, `spec.workload.restart`, [ADR-0033](0033-a-one-shot-workload-the-restart-policy-and-the-claim-released-when-it-is-done.md)); 2026-11-09 (decision 12, the store: the claim record is `status.record` on the `AgentSandbox`, sessions are Secrets and nodes are `SandboxNode` resources, no tables, [ADR-0034](0034-the-kubernetes-api-as-the-brokers-store.md)); 2026-11-10 (a delegation per audience on the request and the `DelegationsPending` condition, [ADR-0035](0035-a-requesters-own-session-delegated-at-claim-time.md)); 2026-11-16 (decision 7, `spec.poolRef` optional beside `spec.poolSelector`, exactly one, and `status.poolRef` the pool bound from, [ADR-0044](0044-a-sandbox-selects-its-pool-by-label.md)); 2026-11-17 (the Namespace paragraph, the claim's namespace chosen from the caller's groups, [ADR-0046](0046-who-may-claim-a-list-of-groups-and-a-namespace-to-groups-mapping.md)); 2026-11-18 (decision 7, an optional, immutable `spec.selection`, the strategy banlieue picks the member by, [ADR-0047](0047-a-sandbox-chooses-its-member-by-strategy.md)); 2026-11-18 (decision 1, served as `mediatore.io/v1beta1`, [ADR-0048](0048-agentsandbox-served-as-v1beta1.md)); 2026-11-18 (decision 1, `v1alpha1` served beside `v1beta1`, deprecated, [ADR-0049](0049-agentsandbox-served-as-v1alpha1-and-v1beta1.md))
+**Status:** Implemented · **Date:** 2026-10-12 · **Accepted:** 2026-10-14 · **Implemented:** 2026-10-14 (roadmap 08; the implementation notes below) · **Amended:** 2026-11-01 (a new optional, immutable `spec.policyRef`, [ADR-0026](0026-notaio-bundles-verified-in-shadow.md) decision 6); 2026-11-09 (decision 8, `spec.workload.restart`, [ADR-0033](0033-a-one-shot-workload-the-restart-policy-and-the-claim-released-when-it-is-done.md)); 2026-11-09 (decision 12, the store: the claim record is `status.record` on the `AgentSandbox`, sessions are Secrets and nodes are `SandboxNode` resources, no tables, [ADR-0034](0034-the-kubernetes-api-as-the-brokers-store.md)); 2026-11-10 (a delegation per audience on the request and the `DelegationsPending` condition, [ADR-0035](0035-a-requesters-own-session-delegated-at-claim-time.md)); 2026-11-16 (decision 7, `spec.poolRef` optional beside `spec.poolSelector`, exactly one, and `status.poolRef` the pool bound from, [ADR-0044](0044-a-sandbox-selects-its-pool-by-label.md)); 2026-11-17 (the Namespace paragraph, the claim's namespace chosen from the caller's groups, [ADR-0046](0046-who-may-claim-a-list-of-groups-and-a-namespace-to-groups-mapping.md)); 2026-11-18 (decision 7, an optional, immutable `spec.selection`, the strategy banlieue picks the member by, [ADR-0047](0047-a-sandbox-chooses-its-member-by-strategy.md)); 2026-11-18 (decision 1, served as `mediatore.io/v1beta1`, [ADR-0048](0048-agentsandbox-served-as-v1beta1.md)); 2026-11-18 (decision 1, `v1alpha1` served beside `v1beta1`, deprecated, [ADR-0049](0049-agentsandbox-served-as-v1alpha1-and-v1beta1.md)); 2026-11-26 (decision 9, a broker-wide ceiling on `ttlSeconds`, `sandboxes.max_ttl_seconds`, one day by default)
 
 Supersedes banlieue
 [ADR-0055](https://github.com/firestoned/banlieue/blob/main/docs/adr/0055-agentsandbox.md)
@@ -118,6 +118,28 @@ not the platform's.
 `spec.ttlSeconds` is copied to the claim, and expiry is banlieue's job: only the claim can
 destroy the VM. mediatore observes the claim leaving `Bound` and cuts off issuance then, as
 it already does.
+
+*Amended 2026-11-26:* the TTL has a ceiling the broker sets. Until now the only refusal was
+`ttlSeconds: 0`: a sandbox under a policy was bounded by the bundle's lease
+([ADR-0053](0053-an-audience-scoped-to-namespaces-each-with-its-own-rules.md) decision 10), but
+`policyRef` is optional, and a sandbox without one could ask for any `u32` of seconds, decades.
+`sandboxes.max_ttl_seconds` in `mediatore.yaml` is now the longest lifetime a sandbox may ask
+for, through either front door and with or without a policy. Its default is `86400`, one day,
+the same figure as the default of the gateways' tunnel cap (`TUNNEL_MAX_SECS`,
+`image/gateway/env.example`), which is documented as the longest lifetime a claim may have and
+which nothing made a claim respect; a deployment that raises one raises the other. Zero, a
+value that is not a number of seconds and a misspelt key stop the start, and the start log
+names the value. Above the ceiling `POST /v1/claims` answers `400 ttl_exceeds_maximum` before a
+session is built or anything is parked, and the reconciler marks a declarative sandbox `Failed`
+with `ttlSeconds is above the broker's maximum of <n> seconds (sandboxes.max_ttl_seconds)`
+before any claim exists. A policy's lease still applies on top, so the effective bound is the
+smaller of the two (`ttl_exceeds_policy` when both are exceeded). The ceiling is asked at
+creation and only then, like every refusal of the implementation notes: a sandbox already
+bound under a higher value is not released when the key is lowered, it runs to the TTL it was
+admitted with. The CRD schema is unchanged (`minimum: 1` and no maximum): the ceiling is a
+property of a deployment, not of the type. Enforcement stays where this decision put it: the
+claim destroys the VM at the deadline, and the broker only refuses to ask for one further away
+than the ceiling.
 
 **10. A finalizer holds the `AgentSandbox` until its claim and its entry are gone.**
 Extends ADR-0055 decision 7 with mediatore's own state. On deletion mediatore deletes the

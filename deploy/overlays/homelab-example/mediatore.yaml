@@ -62,6 +62,10 @@ sts:
 sandboxes:
   # Where `POST /v1/claims` creates AgentSandbox resources; the pool must live there.
   namespace: sandboxes
+  # The longest lifetime a claim may ask for, in seconds, with or without a policy (a
+  # policy's lease only narrows it). The default is one day, the gateways' TUNNEL_MAX_SECS
+  # default: raise the two together. Above it: `400 ttl_exceeds_maximum`.
+  # max_ttl_seconds: 86400
 # notaio's signed policy bundles, read and compared with each sandbox in shadow: nothing
 # is refused on their account (ADR-0026). Leave the section out to read none. The key is
 # notaio's OpenBao transit public key, `notaio:v<N>` and its base64; list two versions

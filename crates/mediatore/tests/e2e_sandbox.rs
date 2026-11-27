@@ -73,6 +73,7 @@ impl Harness {
             policy_egress: None,
             sandboxes: front_door.then(|| sandboxes.clone() as _),
             namespaces: Namespaces::Single(NAMESPACE.into()),
+            max_ttl_seconds: mediatore_proto::DEFAULT_MAX_TTL_SECONDS,
             sealer: None,
             limiter: Limiter::new(10),
             dev_mode: false,

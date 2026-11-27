@@ -22,7 +22,7 @@ Every value in the example is a placeholder.
 | `sts` | `issuer`, `kid`, `signing_key_file` | the token service |
 | `registries[]` | `host`, `username`, `password_file`, `reach` (`segment` or `relay`) | the pull ([The guest](guest.md)) |
 | `gateways`, `gateway_inject_port` | each gateway's sandbox address and data-plane port; the inject listener's own port | [The gateway](gateway.md), [Broker API](broker-api.md) |
-| `sandboxes` | `namespace`: where `POST /v1/claims` creates `AgentSandbox` resources; or `namespaces`: a map from a namespace to the groups whose members may claim there (the two are exclusive) | [Claims and reconcilers](claims-and-reconcilers.md) |
+| `sandboxes` | `namespace`: where `POST /v1/claims` creates `AgentSandbox` resources; or `namespaces`: a map from a namespace to the groups whose members may claim there (the two are exclusive); `max_ttl_seconds`: the longest lifetime a claim may ask for (default `86400`, one day; positive) | [Claims and reconcilers](claims-and-reconcilers.md) |
 | `watcher` | `resync_secs`, `resolve_timeout_secs`, `lease_duration_secs` | [Claims and reconcilers](claims-and-reconcilers.md) |
 | `store` | `retention_secs`, `node_grace_secs`, `sealing` (`key_file` or `transit`) | [The store and the sealing](store-and-sealing.md) |
 | `token` | `rate_per_minute`: the per-claim limit on `POST /v1/token` | [Broker API](broker-api.md) |
@@ -133,6 +133,12 @@ sandboxes:
   the issuer gate, exactly as before.
 - Under a map, list `policy.namespaces` explicitly when a `policy` section is present: there is no default namespace to
   fall back to, and the map does not widen it.
+- `sandboxes.max_ttl_seconds` (default `86400`) is the longest lifetime a claim may ask for, with either form of the
+  namespaces and with or without a policy: above it `POST /v1/claims` answers `400 ttl_exceeds_maximum` and a declarative
+  `AgentSandbox` is `Failed` before any claim exists. A policy's lease only narrows it. Zero or a value that is not a
+  number of seconds is a start error. The default is the gateways' `TUNNEL_MAX_SECS` default, and the two are raised
+  together. It is read when a claim is created: lowering it leaves the claims already bound to run to their TTL
+  ([ADR-0008](../adr/0008-agentsandbox-crd-owned-by-mediatore.md) decision 9, amended 2026-11-26).
 
 ## What is refused at start
 

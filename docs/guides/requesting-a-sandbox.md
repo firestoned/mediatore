@@ -33,6 +33,13 @@ curl -sS https://mediatore.sandbox.example/v1/claims \
 # {"name":"sandbox-3f9a1c2e","namespace":"sandboxes","phase":"Pending","ready":false,"addresses":[]}
 ```
 
+`ttl_seconds` is the sandbox's lifetime, counted from bind. It must be positive and at most
+the broker's `sandboxes.max_ttl_seconds`, one day (`86400`) unless the operator set another:
+above it the answer is `400 ttl_exceeds_maximum`, whose detail names the maximum, and a
+declarative `AgentSandbox` with such a `ttlSeconds` is `Failed` with the same sentence in
+`status.reason` and gets no claim. A policy's lease can only make the bound smaller
+(`400 ttl_exceeds_policy`).
+
 `pool_ref` names one `VirtualMachinePool` in that namespace. To let banlieue pick among
 several, send `pool_selector` instead, a Kubernetes label selector over the namespace's pools
 ([ADR-0044](../adr/0044-a-sandbox-selects-its-pool-by-label.md), banlieue ADR-0132): `{}`
@@ -68,7 +75,10 @@ An audience can also want **your user name and a secret**, not an OAuth bearer
 name), and the gateway places it as `Authorization: Basic`, so the pool VM and the sandbox
 never see it. `--delegate <audience>=prompt` asks at the terminal for the user name and then the
 secret with echo off; `env:<NAME>` and `file:<path>` take the same `user:secret` shape for a
-script. There is no flag that carries the secret. A host that refuses passwords for a protocol
+script. If the terminal's echo cannot be switched off (`stty -echo` fails), the CLI does not ask
+for the secret and reads nothing: it stops with an error naming `env:` and `file:`, never a
+prompt that says "not shown" over a secret the terminal would show. There is no flag that
+carries the secret. A host that refuses passwords for a protocol
 (an on-premises git host answers `403 Password authentication is not available for Git
 operations`) needs a personal access token as the secret.
 

@@ -367,6 +367,86 @@ mod tests {
     }
 
     #[test]
+    fn the_prompt_refuses_a_stdin_that_is_not_a_terminal_and_names_the_script_sources() {
+        let e = require_terminal("examplegit", false)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("no terminal to ask on"), "{e}");
+        assert!(
+            e.contains("examplegit=env:<NAME>") && e.contains("file:<path>"),
+            "{e}"
+        );
+        assert!(require_terminal("examplegit", true).is_ok());
+    }
+
+    #[test]
+    fn a_terminal_whose_echo_cannot_be_switched_off_is_refused_and_nothing_is_read() {
+        // Fail closed: the line is still in the input afterwards, and the error says what
+        // failed and what to use, never what was waiting to be read.
+        let mut input = std::io::Cursor::new(b"typed-line-placeholder\n".to_vec());
+        let e = read_unechoed("examplegit", || None::<()>, &mut input)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(input.position(), 0, "nothing is read with the echo on");
+        // Compared to a bool first, so a failure prints neither the line nor the message.
+        let silent = !e.contains("typed-line-placeholder");
+        assert!(silent, "the refusal carries what was waiting to be read");
+        assert!(e.contains("could not be switched off"), "{e}");
+        assert!(e.contains("examplegit=env:<NAME>"), "{e}");
+        // A terminal is not a pipe: the two refusals are told apart.
+        assert!(!e.contains("no terminal to ask on"), "{e}");
+    }
+
+    #[test]
+    fn with_the_echo_off_the_line_is_read_without_its_ending_and_the_guard_is_held_meanwhile() {
+        /// Says when it is dropped, as `EchoOff` switches the echo back on.
+        struct Guard(std::rc::Rc<std::cell::Cell<bool>>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                self.0.set(true);
+            }
+        }
+        /// An input that records whether the echo had been switched back on when it was read.
+        struct Watched {
+            inner: std::io::Cursor<Vec<u8>>,
+            restored: std::rc::Rc<std::cell::Cell<bool>>,
+            restored_at_read: Option<bool>,
+        }
+        impl std::io::Read for Watched {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                std::io::Read::read(&mut self.inner, buf)
+            }
+        }
+        impl std::io::BufRead for Watched {
+            fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+                if self.restored_at_read.is_none() {
+                    self.restored_at_read = Some(self.restored.get());
+                }
+                std::io::BufRead::fill_buf(&mut self.inner)
+            }
+            fn consume(&mut self, amount: usize) {
+                std::io::BufRead::consume(&mut self.inner, amount);
+            }
+        }
+        let restored = std::rc::Rc::new(std::cell::Cell::new(false));
+        let mut input = Watched {
+            inner: std::io::Cursor::new(b"typed-line-placeholder\r\nnext\n".to_vec()),
+            restored: restored.clone(),
+            restored_at_read: None,
+        };
+        let held = restored.clone();
+        let typed = read_unechoed("examplegit", move || Some(Guard(held)), &mut input).unwrap();
+        let exact = typed == "typed-line-placeholder";
+        assert!(exact, "one line, without its line ending");
+        assert_eq!(
+            input.restored_at_read,
+            Some(false),
+            "the echo is still off while the line is read"
+        );
+        assert!(restored.get(), "and back on once it has been");
+    }
+
+    #[test]
     fn a_saved_credential_older_than_six_hours_is_refused_and_a_fresh_one_is_read() {
         let now = Timestamp::now();
         let fresh = stored_json(
@@ -493,30 +573,21 @@ fn lifetime_words(secs: i64) -> String {
 }
 
 /// Type a user name and a secret at the terminal: the question on stderr, the secret with echo off,
-/// nothing when stdin is not a terminal (a script uses `env:` or `file:`). On macOS it then offers to
-/// keep them in the Keychain for the claim's TTL (at most six hours); the default is no.
+/// nothing when stdin is not a terminal (a script uses `env:` or `file:`), and nothing either when
+/// it is a terminal whose echo could not be switched off (fail closed: [`read_unechoed`]). On macOS
+/// it then offers to keep them in the Keychain for the claim's TTL (at most six hours); the default
+/// is no.
 fn prompt_basic(audience: &str, ttl_seconds: u32) -> anyhow::Result<Credential> {
     use std::io::{BufRead, IsTerminal, Write};
-    anyhow::ensure!(
-        std::io::stdin().is_terminal(),
-        "no terminal to ask on: use --delegate {audience}=env:<NAME> or file:<path> (user:secret)"
-    );
+    require_terminal(audience, std::io::stdin().is_terminal())?;
     let mut stdin = std::io::stdin().lock();
     let mut line = String::new();
     eprint!("{audience} user name: ");
     std::io::stderr().flush().ok();
     stdin.read_line(&mut line)?;
     let user = line.trim_end_matches(['\r', '\n']).to_owned();
-    eprint!("{audience} password or token (not shown): ");
-    std::io::stderr().flush().ok();
-    let secret = {
-        let _echo = EchoOff::new();
-        let mut secret = String::new();
-        stdin.read_line(&mut secret)?;
-        eprintln!();
-        secret.trim_end_matches(['\r', '\n']).to_owned()
-    };
-    let token = join_basic(&user, &secret)?;
+    let typed = read_unechoed(audience, EchoOff::off, &mut stdin)?;
+    let token = join_basic(&user, &typed)?;
     if cfg!(target_os = "macos") {
         let keep = i64::from(ttl_seconds).min(STORE_MAX_AGE_SECS);
         eprint!(
@@ -534,28 +605,64 @@ fn prompt_basic(audience: &str, ttl_seconds: u32) -> anyhow::Result<Credential> 
     Ok(basic(token))
 }
 
-/// Switches the terminal's echo off with `stty` and back on when dropped (no `unsafe`, no new crate).
-struct EchoOff(bool);
+/// `prompt` asks a person: with a stdin that is not a terminal (a pipe, a file, a CI job) there is
+/// nobody to ask and no echo to switch off, and the answer is the two sources a script uses.
+fn require_terminal(audience: &str, stdin_is_terminal: bool) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        stdin_is_terminal,
+        "no terminal to ask on: use --delegate {audience}=env:<NAME> or file:<path> (user:secret)"
+    );
+    Ok(())
+}
+
+/// The secret's line from `input`, read only once `echo_off` has switched the terminal's echo off;
+/// what it returns is held until the line is read (dropping it switches the echo back on). Fails
+/// closed: when the echo could not be switched off (`None`), the question is not asked, nothing is
+/// read and the error says why, so the prompt never says "not shown" over a secret the terminal
+/// would show. The caller has already established that stdin is a terminal
+/// ([`require_terminal`]), so a failure here is a terminal `stty` could not set, never a pipe.
+fn read_unechoed<G>(
+    audience: &str,
+    echo_off: impl FnOnce() -> Option<G>,
+    input: &mut impl std::io::BufRead,
+) -> anyhow::Result<String> {
+    use std::io::Write;
+    let Some(_echo) = echo_off() else {
+        anyhow::bail!(
+            "the terminal's echo could not be switched off (`stty -echo` failed), so nothing was asked and nothing was read: what you typed would have been shown. Use --delegate {audience}=env:<NAME> or file:<path> (user:secret)"
+        );
+    };
+    eprint!("{audience} password or token (not shown): ");
+    std::io::stderr().flush().ok();
+    let mut typed = String::new();
+    input.read_line(&mut typed)?;
+    eprintln!();
+    Ok(typed.trim_end_matches(['\r', '\n']).to_owned())
+}
+
+/// The terminal's echo, switched off with `stty` and back on when dropped (no `unsafe`, no new
+/// crate). There is a value only while the echo is off.
+struct EchoOff;
 
 impl EchoOff {
-    fn new() -> Self {
-        let ok = std::process::Command::new("stty")
+    /// `None` when `stty -echo` did not run or did not succeed: the echo is still on, and the
+    /// caller must not read a secret ([`read_unechoed`]).
+    fn off() -> Option<Self> {
+        std::process::Command::new("stty")
             .arg("-echo")
             .stdin(std::process::Stdio::inherit())
             .status()
-            .is_ok_and(|s| s.success());
-        Self(ok)
+            .is_ok_and(|s| s.success())
+            .then_some(Self)
     }
 }
 
 impl Drop for EchoOff {
     fn drop(&mut self) {
-        if self.0 {
-            let _ = std::process::Command::new("stty")
-                .arg("echo")
-                .stdin(std::process::Stdio::inherit())
-                .status();
-        }
+        let _ = std::process::Command::new("stty")
+            .arg("echo")
+            .stdin(std::process::Stdio::inherit())
+            .status();
     }
 }
 
