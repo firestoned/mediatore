@@ -30,6 +30,11 @@ use kube::api::{DeleteParams, ObjectMeta, PostParams};
 use kube::runtime::controller::Action;
 use kube::{Api, Client, CustomResource, CustomResourceExt, Resource, ResourceExt};
 use mediatore_policy::BundlePayload;
+use mediatore_proto::trip::{
+    MAX_SOURCE_ADDRESS_BYTES, MAX_TARGET_ADDRESS_BYTES, MAX_TARGET_HOST_BYTES, MAX_TRAP_NAME_BYTES,
+    MAX_TRIP_COUNT, MAX_TRIP_STATUS_ENTRIES, TripClass, TripEffect, TripEntry, TripKind,
+    TripSource, TripSummary, TripTarget,
+};
 use mediatore_proto::{
     ClaimPhase, PoolChoice, PoolSelector, PoolSelectorOperator, RestartPolicy, Subject, Workload,
 };
@@ -309,6 +314,271 @@ pub struct AgentSandboxStatus {
     /// read yet. Absent without a `policy` section.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conditions: Vec<Condition>,
+    /// The claim's trip summary (ADR-0069 decision 9, ADR-0070 decision 8): what traps were
+    /// used, folded and bounded. The store's, as `record` is: written by `KubeStore` alone in a
+    /// patch that names nothing else, and left out of the reconciler's mirroring, which never
+    /// names it. A value this build cannot read (written by a newer one) reads as absent, so
+    /// that it never makes the sandbox, and the record on it, unreadable.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "tripwires_or_absent"
+    )]
+    pub tripwires: Option<TripwiresStatus>,
+}
+
+/// `status.tripwires` as this build reads it, or absent when it does not.
+fn tripwires_or_absent<'de, D>(deserializer: D) -> Result<Option<TripwiresStatus>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let stored = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(stored.and_then(|v| serde_json::from_value(v).ok()))
+}
+
+/// `status.tripwires`: [`TripSummary`] as the resource spells it (ADR-0069 decision 9). The
+/// words (`would_trip`, `credential`, `unknown_host`) are the wire's and the audit line's; the
+/// field names are the resource's. Never an event's `id`, a path, a header or a bait value.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TripwiresStatus {
+    /// The broker's clock at the last fold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "date_time_schema")]
+    pub updated_at: Option<Timestamp>,
+    /// At most sixteen entries, the latest first, replaced whole by every write.
+    #[serde(default)]
+    #[schemars(schema_with = "entries_schema")]
+    pub entries: Vec<TripwireEntry>,
+    /// The uses of the entries that did not fit.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    #[schemars(schema_with = "overflow_schema")]
+    pub overflow: u64,
+}
+
+// serde's `skip_serializing_if` passes a reference.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+/// One folded entry of [`TripwiresStatus`]: [`TripEntry`] as the resource spells it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TripwireEntry {
+    /// What the events folded here did: `would_trip` under shadow, `reported` for a class at
+    /// `report`, `tripped` when they ended the claim.
+    #[schemars(schema_with = "effect_schema")]
+    pub effect: TripEffect,
+    /// What kind of trap.
+    #[schemars(schema_with = "kind_schema")]
+    pub kind: TripKind,
+    /// The catalogue entry's or the drawn decoy's name, on `port`, `route` and `credential`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "trap_schema")]
+    pub trap: Option<String>,
+    /// The class, on `denied`, `protocol` and `segment`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "class_schema")]
+    pub class: Option<TripClass>,
+    /// What was reached for: exactly one of `host`, `port` and `address`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "target_schema")]
+    pub target: Option<TripTarget>,
+    /// Whose value the target is: `drawn` (the guest's own), `workload` or `peer`.
+    #[schemars(schema_with = "source_schema")]
+    pub source: TripSource,
+    /// The peer's address, on a `segment` entry of an inbound class.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "source_address_schema")]
+    pub source_address: Option<String>,
+    /// Milliseconds from the verdict to the network cut, the first figure reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "containment_schema")]
+    pub containment_ms: Option<u32>,
+    /// How many uses.
+    #[schemars(schema_with = "count_schema")]
+    pub count: u64,
+    /// The earliest event folded here, by the reporter's clock.
+    #[schemars(schema_with = "date_time_schema")]
+    pub first_at: Timestamp,
+    /// The latest.
+    #[schemars(schema_with = "date_time_schema")]
+    pub last_at: Timestamp,
+}
+
+/// Every effect: a variant added to the wire fails to compile here until the schema has it.
+const fn effects(any: TripEffect) -> [TripEffect; 3] {
+    match any {
+        TripEffect::WouldTrip | TripEffect::Reported | TripEffect::Tripped => [
+            TripEffect::WouldTrip,
+            TripEffect::Reported,
+            TripEffect::Tripped,
+        ],
+    }
+}
+
+/// Every kind, as [`effects`].
+const fn kinds(any: TripKind) -> [TripKind; 6] {
+    match any {
+        TripKind::Port
+        | TripKind::Route
+        | TripKind::Credential
+        | TripKind::Denied
+        | TripKind::Protocol
+        | TripKind::Segment => [
+            TripKind::Port,
+            TripKind::Route,
+            TripKind::Credential,
+            TripKind::Denied,
+            TripKind::Protocol,
+            TripKind::Segment,
+        ],
+    }
+}
+
+/// Every source, as [`effects`].
+const fn sources(any: TripSource) -> [TripSource; 3] {
+    match any {
+        TripSource::Drawn | TripSource::Workload | TripSource::Peer => {
+            [TripSource::Drawn, TripSource::Workload, TripSource::Peer]
+        }
+    }
+}
+
+/// A string that is one of `words`.
+fn words_schema(words: &[&'static str]) -> schemars::Schema {
+    schemars::json_schema!({ "type": "string", "enum": words })
+}
+
+fn effect_schema(_g: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    words_schema(&effects(TripEffect::Tripped).map(TripEffect::as_str))
+}
+
+fn kind_schema(_g: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    words_schema(&kinds(TripKind::Port).map(TripKind::as_str))
+}
+
+fn source_schema(_g: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    words_schema(&sources(TripSource::Drawn).map(TripSource::as_str))
+}
+
+fn class_schema(_g: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    let classes: Vec<&'static str> = TripClass::DENIED
+        .iter()
+        .chain(&TripClass::PROTOCOL)
+        .chain(&TripClass::SEGMENT)
+        .map(|c| c.as_str())
+        .collect();
+    words_schema(&classes)
+}
+
+fn trap_schema(_g: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({ "type": "string", "minLength": 1, "maxLength": MAX_TRAP_NAME_BYTES })
+}
+
+fn source_address_schema(_g: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({ "type": "string", "maxLength": MAX_SOURCE_ADDRESS_BYTES })
+}
+
+fn containment_schema(_g: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "integer",
+        "minimum": 0,
+        "maximum": mediatore_proto::trip::MAX_CONTAINMENT_MS,
+    })
+}
+
+fn count_schema(_g: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({ "type": "integer", "minimum": 1, "maximum": MAX_TRIP_COUNT })
+}
+
+fn overflow_schema(_g: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({ "type": "integer", "minimum": 0, "maximum": MAX_TRIP_COUNT })
+}
+
+fn date_time_schema(_g: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({ "type": "string", "format": "date-time" })
+}
+
+/// Exactly one of the three, as [`TripTarget`] serialises.
+fn target_schema(_g: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "object",
+        "minProperties": 1,
+        "maxProperties": 1,
+        "properties": {
+            "host": { "type": "string", "minLength": 1, "maxLength": MAX_TARGET_HOST_BYTES },
+            "port": { "type": "integer", "minimum": 1, "maximum": u16::MAX },
+            "address": { "type": "string", "minLength": 1, "maxLength": MAX_TARGET_ADDRESS_BYTES },
+        },
+    })
+}
+
+/// The entries: bounded, and one value to the API server (a patch replaces the list whole).
+fn entries_schema(g: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "array",
+        "maxItems": MAX_TRIP_STATUS_ENTRIES,
+        "x-kubernetes-list-type": "atomic",
+        "items": g.subschema_for::<TripwireEntry>(),
+    })
+}
+
+impl From<&TripEntry> for TripwireEntry {
+    fn from(e: &TripEntry) -> Self {
+        Self {
+            effect: e.effect,
+            kind: e.kind,
+            trap: e.trap.clone(),
+            class: e.class,
+            target: e.target.clone(),
+            source: e.source,
+            source_address: e.source_address.clone(),
+            containment_ms: e.containment_ms,
+            count: e.count,
+            first_at: e.first_at,
+            last_at: e.last_at,
+        }
+    }
+}
+
+impl From<&TripwireEntry> for TripEntry {
+    fn from(e: &TripwireEntry) -> Self {
+        Self {
+            effect: e.effect,
+            kind: e.kind,
+            trap: e.trap.clone(),
+            class: e.class,
+            target: e.target.clone(),
+            source: e.source,
+            source_address: e.source_address.clone(),
+            containment_ms: e.containment_ms,
+            count: e.count,
+            first_at: e.first_at,
+            last_at: e.last_at,
+        }
+    }
+}
+
+impl From<&TripSummary> for TripwiresStatus {
+    fn from(s: &TripSummary) -> Self {
+        Self {
+            updated_at: s.updated_at,
+            entries: s.entries.iter().map(TripwireEntry::from).collect(),
+            overflow: s.overflow,
+        }
+    }
+}
+
+impl From<&TripwiresStatus> for TripSummary {
+    fn from(s: &TripwiresStatus) -> Self {
+        Self {
+            updated_at: s.updated_at,
+            entries: s.entries.iter().map(TripEntry::from).collect(),
+            overflow: s.overflow,
+        }
+    }
 }
 
 /// The condition type the shadow comparison writes.
@@ -371,6 +641,63 @@ pub fn followed(
         last_transition_time,
     });
     out
+}
+
+/// The condition type of a sandbox whose claim a trap ended (ADR-0069 decision 9, ADR-0070
+/// decision 6).
+pub const TRIPPED: &str = "Tripped";
+
+/// `conditions` with `Tripped=True` set from the record's `tripped` (ADR-0069 decision 9), which
+/// the API writes and this mirrors: the reason is the kind (`port`, `route`, `credential`,
+/// `denied`, `protocol`), the message the trap or the class and the target. Unchanged for a
+/// record no trap ended: the condition is absent before a trip and never removed after one.
+/// `lastTransitionTime` holds while the status does.
+#[must_use]
+pub fn tripped_condition(
+    conditions: Vec<Condition>,
+    record: &ClaimRecord,
+    generation: Option<i64>,
+) -> Vec<Condition> {
+    let Some(tripped) = &record.tripped else {
+        return conditions;
+    };
+    let held = conditions.iter().find(|c| c.type_ == TRIPPED).cloned();
+    let mut out: Vec<Condition> = conditions
+        .into_iter()
+        .filter(|c| c.type_ != TRIPPED)
+        .collect();
+    let what = match (&tripped.trap, tripped.class) {
+        (Some(trap), _) => format!("trap {trap}"),
+        (None, Some(class)) => format!("class {}", class.as_str()),
+        (None, None) => "no trap named".to_owned(),
+    };
+    let message = match &tripped.target {
+        Some(target) => format!("{what}, target {target}"),
+        None => what,
+    };
+    let last_transition_time = held.filter(|c| c.status == "True").map_or_else(
+        || Time(k8s_openapi::jiff::Timestamp::now()),
+        |c| c.last_transition_time,
+    );
+    out.push(Condition {
+        type_: TRIPPED.into(),
+        status: "True".into(),
+        reason: tripped.kind.as_str().into(),
+        message,
+        observed_generation: generation,
+        last_transition_time,
+    });
+    out
+}
+
+/// `status.reason` of a sandbox whose claim a trap ended: `tripped: <kind>`. `None` for a
+/// record no trap ended.
+#[must_use]
+pub fn tripped_reason(record: &ClaimRecord) -> Option<String> {
+    record
+        .tripped
+        .as_ref()
+        .map(|t| format!("tripped: {}", t.kind.as_str()))
 }
 
 /// The reason code of a sandbox failed because its `status.record` names another sandbox
@@ -666,6 +993,7 @@ pub fn record_for(
     bundle: Option<&BundlePayload>,
 ) -> ClaimRecord {
     ClaimRecord {
+        tripped: None,
         rendered: None,
         follow: None,
         uid: claim_uid,
@@ -742,6 +1070,7 @@ pub fn mirror_status(
         observed_generation: sb.metadata.generation,
         conditions: Vec::new(),
         record: None,
+        tripwires: None,
     }
 }
 
@@ -908,11 +1237,14 @@ impl Watcher {
         sb: &AgentSandbox,
         status: AgentSandboxStatus,
     ) -> Result<(), WatchError> {
-        // The record is the store's (ADR-0034): compared and patched without it.
+        // The record is the store's (ADR-0034), and so is the trip summary (ADR-0069
+        // decision 9): compared and patched without either, so the patch names neither.
         let mut status = status;
         status.record = None;
+        status.tripwires = None;
         let current = sb.status.clone().map(|mut s| {
             s.record = None;
+            s.tripwires = None;
             s
         });
         if current.as_ref() == Some(&status) {
@@ -964,23 +1296,7 @@ impl Watcher {
             None if current.claim_ref.is_some() => {
                 // Created once, gone now (expired and destroyed, or failed by the watcher):
                 // a sandbox never gets a second VM.
-                if current.phase != SandboxPhase::Failed {
-                    tracing::info!(sandbox = %name, %namespace, "claim gone; sandbox failed, never recreated");
-                }
-                self.mirror(
-                    sb,
-                    AgentSandboxStatus {
-                        phase: SandboxPhase::Failed,
-                        entry_set: false,
-                        ready: false,
-                        reason: current.reason.clone().or_else(|| Some("claim gone".into())),
-                        observed_generation: sb.metadata.generation,
-                        conditions: self.conditions(sb, &current.conditions),
-                        ..current
-                    },
-                )
-                .await?;
-                return Ok(Action::await_change());
+                return self.fail_gone(sb, current).await;
             }
             None => {
                 let created = self.claims.create_claim(claim_for(sb)?).await?;
@@ -997,6 +1313,9 @@ impl Watcher {
             Recorded::SourcesNotRead => return self.hold_until_read(sb, &current).await,
             Recorded::PolicyNotResolved => return self.refuse_policy(sb, &current).await,
         };
+        if record.tripped.is_some() {
+            return self.fail_tripped(sb, &claim, &record, &current).await;
+        }
         if let Some(refused) = self
             .refuse_without_delegation(sb, &claim, &record, &current)
             .await?
@@ -1503,6 +1822,135 @@ impl Watcher {
         status.conditions = self.conditions(sb, &current.conditions);
         self.mirror(sb, status).await?;
         Ok(Some(Action::await_change()))
+    }
+
+    /// A sandbox whose claim was created once and is gone now: `Failed`, never recreated,
+    /// with the reason it already had or `claim gone`. A claim a trap ended, and that went
+    /// before the pass that would have said so (ADR-0069 decision 9), takes its reason and
+    /// its `Tripped` condition from the record.
+    async fn fail_gone(
+        &self,
+        sb: &AgentSandbox,
+        current: AgentSandboxStatus,
+    ) -> Result<Action, WatchError> {
+        if current.phase != SandboxPhase::Failed {
+            tracing::info!(sandbox = %sb.name_any(), namespace = %sb.namespace().unwrap_or_default(), "claim gone; sandbox failed, never recreated");
+        }
+        let tripped = self.tripped_record_of(sb, &current).await?;
+        let mut conditions = self.conditions(sb, &current.conditions);
+        if let Some(record) = &tripped {
+            conditions = tripped_condition(conditions, record, sb.metadata.generation);
+        }
+        self.mirror(
+            sb,
+            AgentSandboxStatus {
+                phase: SandboxPhase::Failed,
+                entry_set: false,
+                ready: false,
+                reason: tripped
+                    .as_ref()
+                    .and_then(tripped_reason)
+                    .or_else(|| current.reason.clone())
+                    .or_else(|| Some("claim gone".into())),
+                observed_generation: sb.metadata.generation,
+                conditions,
+                ..current
+            },
+        )
+        .await?;
+        Ok(Action::await_change())
+    }
+
+    /// ADR-0069 decision 9 (amended) and ADR-0070 decision 6: a sandbox whose record says a
+    /// trap ended its claim. The record is released (idempotent: the API released it when it
+    /// wrote `tripped`), the owned claim is deleted so that banlieue destroys the VM, and the
+    /// sandbox is `Failed` with `tripped: <kind>` and `Tripped=True`. The `AgentSandbox` itself
+    /// is not deleted here, nor by `POST /v1/me/exit`: it stays, with its status, until the
+    /// store's retention sweep deletes it `store.retention_secs` after the release (ADR-0034
+    /// decision 4, ADR-0069 decision 9 as amended), or its owner deletes it first. It never
+    /// gets a second claim: the next pass finds the claim gone and a claim once named is never
+    /// recreated. The shape of [`Self::refuse_without_delegation`].
+    async fn fail_tripped(
+        &self,
+        sb: &AgentSandbox,
+        claim: &VirtualMachineClaim,
+        record: &ClaimRecord,
+        current: &AgentSandboxStatus,
+    ) -> Result<Action, WatchError> {
+        let name = sb.name_any();
+        let namespace = sb.namespace().unwrap_or_default();
+        let reason = tripped_reason(record);
+        // Said once: the status patch below raises the event of the next pass.
+        if current.reason != reason {
+            tracing::warn!(
+                sandbox = %name,
+                %namespace,
+                claim_uid = %record.uid,
+                kind = record.tripped.as_ref().map_or("-", |t| t.kind.as_str()),
+                "sandbox tripped: its record is released and its claim deleted, never recreated (ADR-0069 decision 9)"
+            );
+        }
+        self.reconciler.release(record.uid).await?;
+        // One held by banlieue's finalizer is already going: deleted once.
+        if claim.metadata.deletion_timestamp.is_none() {
+            self.claims.delete_claim(&namespace, &name).await?;
+        }
+        let mut status = mirror_status(sb, claim, record);
+        status.phase = SandboxPhase::Failed;
+        status.entry_set = false;
+        status.ready = false;
+        status.reason = reason;
+        status.conditions = tripped_condition(
+            followed(
+                self.conditions(sb, &current.conditions),
+                record,
+                sb.metadata.generation,
+            ),
+            record,
+            sb.metadata.generation,
+        );
+        self.mirror(sb, status).await?;
+        Ok(Action::await_change())
+    }
+
+    /// The record of a sandbox whose claim is gone, when a trap ended that claim and the
+    /// status does not say so yet (no `Tripped` condition). `None` otherwise, and for a record
+    /// that is not this sandbox's own or was swept. One read by name, and none once the
+    /// condition is set.
+    async fn tripped_record_of(
+        &self,
+        sb: &AgentSandbox,
+        current: &AgentSandboxStatus,
+    ) -> Result<Option<ClaimRecord>, WatchError> {
+        if current.conditions.iter().any(|c| c.type_ == TRIPPED) {
+            return Ok(None);
+        }
+        let Some(uid) = current
+            .claim_uid
+            .as_deref()
+            .and_then(|u| Uuid::parse_str(u).ok())
+        else {
+            return Ok(None);
+        };
+        let own = sandbox_uid_of(sb);
+        let namespace = crate::kubestore::namespace_of(sb);
+        match self
+            .reconciler
+            .store
+            .get_claim_by_name(&namespace, &sb.name_any())
+            .await
+        {
+            Ok(rec)
+                if rec.uid == uid
+                    && own.is_some()
+                    && rec.sandbox_uid == own
+                    && rec.tripped.is_some() =>
+            {
+                Ok(Some(rec))
+            }
+            Ok(_) | Err(StoreError::NotFound(_)) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// The first audience of the sandbox served from a delegated credential (ADR-0035)
@@ -6017,5 +6465,425 @@ mod tests {
             r.claims.claim(&namespace, "sb-1").is_some(),
             "shadow refuses nothing"
         );
+    }
+
+    // ---------- ADR-0069 decision 9, ADR-0070 decision 6: a trip on the sandbox ----------
+
+    use mediatore_proto::trip::Tripped;
+
+    fn tripped_by_a_credential() -> Tripped {
+        let now = Timestamp::now();
+        Tripped {
+            id: Uuid::new_v4(),
+            at: now,
+            recorded_at: now,
+            kind: TripKind::Credential,
+            trap: Some("aws".into()),
+            class: None,
+            target: Some(TripTarget::Host("git.example".into())),
+            source: TripSource::Workload,
+        }
+    }
+
+    /// What the API does on a trip (`trip::end_claim`): `tripped` on the record by compare
+    /// and set, then the release.
+    async fn trip(r: &Rig, uid: Uuid) {
+        let tripped = tripped_by_a_credential();
+        mediatore_store::modify_claim(r.store.as_ref(), uid, |mut rec| {
+            rec.tripped = Some(tripped.clone());
+            Some(rec)
+        })
+        .await
+        .unwrap();
+        r.watcher.reconciler.release(uid).await.unwrap();
+    }
+
+    /// A sandbox settled, its claim bound by the EK and its entry set: ready.
+    async fn bound(r: &Rig) -> (AgentSandbox, Uuid) {
+        let sb = settle(r, &sandbox(false, false)).await;
+        r.claims.patch_claim_status(
+            "sandboxes",
+            "sb-1",
+            &json!({ "phase": "Bound", "virtualMachineRef": { "name": "member-1" }, "tpmEndorsementCertificates": [RSA_EK_PEM] }),
+        );
+        r.store.put_node(node(RSA_EK_HASH, false)).await.unwrap();
+        let claim = r.claims.claim("sandboxes", "sb-1").unwrap();
+        r.watcher.reconcile_claim(&claim).await.unwrap();
+        r.watcher.reconcile_sandbox(&sb).await.unwrap();
+        let sb = r.claims.sandbox("sandboxes", "sb-1").unwrap();
+        assert!(sb.status.as_ref().is_some_and(|s| s.ready), "bound and set");
+        (sb, claim_uid_of(&claim).unwrap())
+    }
+
+    fn tripped_of(status: &AgentSandboxStatus) -> Vec<&Condition> {
+        status
+            .conditions
+            .iter()
+            .filter(|c| c.type_ == TRIPPED)
+            .collect()
+    }
+
+    #[test]
+    fn a_tripped_record_sets_the_tripped_condition_with_the_kind_as_its_reason() {
+        let other = Condition {
+            type_: POLICY_CONFORMANT.into(),
+            status: "True".into(),
+            reason: "Conformant".into(),
+            message: String::new(),
+            observed_generation: Some(1),
+            last_transition_time: Time(k8s_openapi::jiff::Timestamp::UNIX_EPOCH),
+        };
+        // No trap ended the claim: nothing is added and nothing is taken away.
+        let mut record = test_record_for_followed();
+        let kept = tripped_condition(vec![other.clone()], &record, Some(1));
+        assert_eq!(kept, vec![other.clone()]);
+        assert_eq!(tripped_reason(&record), None);
+
+        record.tripped = Some(tripped_by_a_credential());
+        let set = tripped_condition(vec![other.clone()], &record, Some(3));
+        assert_eq!(set.len(), 2, "the other condition is kept");
+        let c = set.iter().find(|c| c.type_ == TRIPPED).expect("Tripped");
+        assert_eq!(c.status, "True");
+        assert_eq!(c.reason, "credential", "the reason is the kind");
+        assert_eq!(c.message, "trap aws, target git.example");
+        assert_eq!(c.observed_generation, Some(3));
+        assert_eq!(
+            tripped_reason(&record).as_deref(),
+            Some("tripped: credential")
+        );
+        // Set again: one condition still, and the transition time holds.
+        let again = tripped_condition(set.clone(), &record, Some(3));
+        assert_eq!(again.iter().filter(|c| c.type_ == TRIPPED).count(), 1);
+        let held = again.iter().find(|c| c.type_ == TRIPPED).unwrap();
+        assert_eq!(held.last_transition_time, c.last_transition_time);
+
+        // ADR-0070 decision 6: a protocol class names itself where a trap would be.
+        let mut by_protocol = tripped_by_a_credential();
+        by_protocol.kind = TripKind::Protocol;
+        by_protocol.trap = None;
+        by_protocol.class = Some(TripClass::AudienceOutsideRendered);
+        by_protocol.target = None;
+        by_protocol.source = TripSource::Peer;
+        record.tripped = Some(by_protocol);
+        let set = tripped_condition(vec![], &record, None);
+        assert_eq!(set[0].reason, "protocol");
+        assert_eq!(set[0].message, "class audience_outside_rendered");
+    }
+
+    #[tokio::test]
+    async fn a_tripped_sandbox_has_its_claim_deleted_and_is_failed_with_the_reason_and_never_claims_again()
+     {
+        let r = rig(cfg());
+        let (sb, uid) = bound(&r).await;
+        trip(&r, uid).await;
+        assert_eq!(
+            r.watcher.reconcile_sandbox(&sb).await.unwrap(),
+            Action::await_change()
+        );
+        assert_eq!(
+            r.claims.deleted(),
+            vec![("sandboxes".to_owned(), "sb-1".to_owned())],
+            "the claim is deleted, once"
+        );
+        assert!(r.claims.claim("sandboxes", "sb-1").is_none());
+        // The sandbox is not deleted: it stays, failed, with what happened (decision 9, amended).
+        let held = r
+            .claims
+            .sandbox("sandboxes", "sb-1")
+            .expect("the AgentSandbox survives its trip");
+        assert!(held.metadata.deletion_timestamp.is_none());
+        let status = held.status.clone().unwrap();
+        assert_eq!(status.phase, SandboxPhase::Failed);
+        assert_eq!(status.reason.as_deref(), Some("tripped: credential"));
+        assert!(!status.ready && !status.entry_set);
+        let conditions = tripped_of(&status);
+        assert_eq!(conditions.len(), 1);
+        assert_eq!(conditions[0].status, "True");
+        assert_eq!(conditions[0].reason, "credential");
+        assert_eq!(conditions[0].message, "trap aws, target git.example");
+        assert_eq!(
+            status.claim_uid.as_deref(),
+            Some(uid.to_string().as_str()),
+            "the claim it had stays named"
+        );
+        assert_eq!(
+            r.entries.names(),
+            Vec::<String>::new(),
+            "the entry is retracted"
+        );
+        assert!(r.store.get_claim(uid).await.unwrap().revoked_at.is_some());
+
+        // Never claimed again: pass after pass, no second claim, no second deletion, no patch.
+        let patches = r.claims.patches();
+        for _ in 0..3 {
+            let cur = r.claims.sandbox("sandboxes", "sb-1").unwrap();
+            assert_eq!(
+                r.watcher.reconcile_sandbox(&cur).await.unwrap(),
+                Action::await_change()
+            );
+            assert!(
+                r.claims.claim("sandboxes", "sb-1").is_none(),
+                "a tripped sandbox gets no second claim"
+            );
+        }
+        assert_eq!(r.claims.deleted().len(), 1);
+        assert_eq!(
+            r.claims.patches(),
+            patches,
+            "settled: nothing more is written"
+        );
+        let after = r
+            .claims
+            .sandbox("sandboxes", "sb-1")
+            .unwrap()
+            .status
+            .unwrap();
+        assert_eq!(after.reason.as_deref(), Some("tripped: credential"));
+        assert_eq!(tripped_of(&after).len(), 1);
+        assert_eq!(
+            r.store.list_claims().await.unwrap().len(),
+            1,
+            "no second record"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tripped_sandbox_whose_claim_banlieue_still_holds_deletes_it_once() {
+        let r = rig(cfg());
+        let (sb, uid) = bound(&r).await;
+        r.claims.hold_deleted_claims(true);
+        trip(&r, uid).await;
+        r.watcher.reconcile_sandbox(&sb).await.unwrap();
+        // banlieue's finalizer holds the claim while the member is destroyed.
+        let held = r.claims.claim("sandboxes", "sb-1").expect("held, deleting");
+        assert!(held.metadata.deletion_timestamp.is_some());
+        let cur = r.claims.sandbox("sandboxes", "sb-1").unwrap();
+        r.watcher.reconcile_sandbox(&cur).await.unwrap();
+        assert_eq!(
+            r.claims.deleted().len(),
+            1,
+            "a claim already going is not deleted again"
+        );
+        let status = r
+            .claims
+            .sandbox("sandboxes", "sb-1")
+            .unwrap()
+            .status
+            .unwrap();
+        assert_eq!(status.phase, SandboxPhase::Failed);
+        assert_eq!(status.reason.as_deref(), Some("tripped: credential"));
+        assert_eq!(tripped_of(&status).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_claim_that_went_before_the_tripped_pass_still_leaves_the_reason_and_the_condition() {
+        let r = rig(cfg());
+        let (sb, uid) = bound(&r).await;
+        trip(&r, uid).await;
+        // The claim went (its TTL, banlieue) before the pass that would have deleted it.
+        r.claims.remove_claim("sandboxes", "sb-1");
+        r.watcher.reconcile_sandbox(&sb).await.unwrap();
+        let cur = r.claims.sandbox("sandboxes", "sb-1").unwrap();
+        let status = cur.status.clone().unwrap();
+        assert_eq!(status.phase, SandboxPhase::Failed);
+        assert_eq!(status.reason.as_deref(), Some("tripped: credential"));
+        assert_eq!(tripped_of(&status).len(), 1);
+        assert!(
+            r.claims.deleted().is_empty(),
+            "there was no claim to delete"
+        );
+        // And the reason survives the passes after it, with no second claim.
+        let patches = r.claims.patches();
+        r.watcher.reconcile_sandbox(&cur).await.unwrap();
+        assert_eq!(r.claims.patches(), patches);
+        assert!(r.claims.claim("sandboxes", "sb-1").is_none());
+
+        // A claim that went with no trip is "claim gone", as before, and gets no condition.
+        let r = rig(cfg());
+        let (sb, _) = bound(&r).await;
+        r.claims.remove_claim("sandboxes", "sb-1");
+        r.watcher.reconcile_sandbox(&sb).await.unwrap();
+        let status = r
+            .claims
+            .sandbox("sandboxes", "sb-1")
+            .unwrap()
+            .status
+            .unwrap();
+        assert_eq!(status.reason.as_deref(), Some("claim gone"));
+        assert_eq!(tripped_of(&status).len(), 0, "and no Tripped condition");
+    }
+
+    fn summary_of_one(count: u64) -> TripSummary {
+        let at = Timestamp::from_second(1_800_000_000).unwrap();
+        let mut summary = TripSummary::default();
+        summary.fold(
+            &[TripEntry {
+                effect: TripEffect::WouldTrip,
+                kind: TripKind::Denied,
+                trap: None,
+                class: Some(TripClass::UnknownHost),
+                target: Some(TripTarget::Host("mirror.example".into())),
+                source: TripSource::Workload,
+                source_address: None,
+                containment_ms: None,
+                count,
+                first_at: at,
+                last_at: at,
+            }],
+            at,
+        );
+        summary
+    }
+
+    #[tokio::test]
+    async fn the_mirror_never_names_the_trip_summary() {
+        let r = rig(cfg());
+        let sb = settle(&r, &sandbox(false, false)).await;
+        // The store folded a summary onto the sandbox; the pass is handed an older copy.
+        let mut held = sb.clone();
+        held.status.as_mut().unwrap().tripwires = Some(TripwiresStatus::from(&summary_of_one(7)));
+        r.claims.put_sandbox(held.clone());
+        let mut stale = sb.clone();
+        stale.status.as_mut().unwrap().tripwires = Some(TripwiresStatus::from(&summary_of_one(2)));
+        // Nothing else changed: no patch at all.
+        let patches = r.claims.patches();
+        r.watcher.reconcile_sandbox(&stale).await.unwrap();
+        assert_eq!(
+            r.claims.patches(),
+            patches,
+            "a new summary alone is nothing to mirror"
+        );
+        // Something did change: the patch carries it, and never the summary it was handed.
+        r.claims
+            .patch_claim_status("sandboxes", "sb-1", &json!({ "phase": "Bound" }));
+        r.watcher.reconcile_sandbox(&stale).await.unwrap();
+        let after = r
+            .claims
+            .sandbox("sandboxes", "sb-1")
+            .unwrap()
+            .status
+            .unwrap();
+        assert_eq!(after.phase, SandboxPhase::Bound);
+        let written = held.status.unwrap().tripwires;
+        assert_eq!(
+            after.tripwires, written,
+            "the summary the store wrote is still there"
+        );
+        // A pass that builds its status from the copy it was handed (the claim gone) leaves
+        // the summary out of its patch all the same.
+        r.claims.remove_claim("sandboxes", "sb-1");
+        let mut stale = r.claims.sandbox("sandboxes", "sb-1").unwrap();
+        stale.status.as_mut().unwrap().tripwires = Some(TripwiresStatus::from(&summary_of_one(2)));
+        r.watcher.reconcile_sandbox(&stale).await.unwrap();
+        let after = r
+            .claims
+            .sandbox("sandboxes", "sb-1")
+            .unwrap()
+            .status
+            .unwrap();
+        assert_eq!(after.phase, SandboxPhase::Failed);
+        assert_eq!(
+            after.tripwires, written,
+            "a stale copy of the summary is never written back"
+        );
+    }
+
+    #[test]
+    fn the_trip_summary_round_trips_through_the_status_in_the_resources_spelling() {
+        let mut summary = summary_of_one(3);
+        summary.overflow = 9;
+        summary.entries[0].containment_ms = Some(41);
+        summary.entries[0].source_address = Some("192.0.2.7".into());
+        let status = TripwiresStatus::from(&summary);
+        let spelled = serde_json::to_value(&status).unwrap();
+        assert_eq!(
+            spelled,
+            json!({
+                "updatedAt": "2027-01-15T08:00:00Z",
+                "overflow": 9,
+                "entries": [{
+                    "effect": "would_trip", "kind": "denied", "class": "unknown_host",
+                    "target": { "host": "mirror.example" }, "source": "workload",
+                    "sourceAddress": "192.0.2.7", "containmentMs": 41, "count": 3,
+                    "firstAt": "2027-01-15T08:00:00Z", "lastAt": "2027-01-15T08:00:00Z",
+                }],
+            })
+        );
+        let back: TripwiresStatus = serde_json::from_value(spelled).unwrap();
+        assert_eq!(TripSummary::from(&back), summary);
+        // A summary a newer build wrote, with a word this one does not know, reads as absent
+        // and the rest of the status still reads.
+        let status: AgentSandboxStatus = serde_json::from_value(json!({
+            "phase": "Bound",
+            "tripwires": { "entries": [{ "effect": "quarantined" }] },
+        }))
+        .unwrap();
+        assert_eq!(status.phase, SandboxPhase::Bound);
+        assert!(status.tripwires.is_none());
+    }
+
+    #[test]
+    fn both_served_versions_carry_tripwires_with_its_bounds() {
+        let crd = serde_json::to_value(crd()).unwrap();
+        let versions = crd["spec"]["versions"].as_array().unwrap();
+        assert_eq!(versions.len(), 2);
+        for version in versions {
+            let status =
+                &version["schema"]["openAPIV3Schema"]["properties"]["status"]["properties"];
+            let trips = &status["tripwires"]["properties"];
+            assert_eq!(trips["updatedAt"]["format"], "date-time");
+            assert_eq!(trips["overflow"]["minimum"], json!(0.0));
+            let entries = &trips["entries"];
+            assert_eq!(entries["maxItems"], json!(16));
+            assert_eq!(entries["x-kubernetes-list-type"], "atomic");
+            let entry = &entries["items"]["properties"];
+            assert_eq!(entry["trap"]["maxLength"], json!(63));
+            assert_eq!(
+                entry["target"]["properties"]["host"]["maxLength"],
+                json!(253)
+            );
+            assert_eq!(entry["target"]["maxProperties"], json!(1));
+            assert_eq!(entry["count"]["minimum"], json!(1.0));
+            assert_eq!(
+                entry["effect"]["enum"],
+                json!(["would_trip", "reported", "tripped"])
+            );
+            assert_eq!(
+                entry["kind"]["enum"],
+                json!([
+                    "port",
+                    "route",
+                    "credential",
+                    "denied",
+                    "protocol",
+                    "segment"
+                ])
+            );
+            assert_eq!(
+                entry["source"]["enum"],
+                json!(["drawn", "workload", "peer"])
+            );
+            let classes: Vec<&str> = entry["class"]["enum"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|c| c.as_str())
+                .collect();
+            assert_eq!(classes.len(), 15, "every class of both ADRs");
+            assert!(classes.contains(&"unknown_host") && classes.contains(&"pool_inbound"));
+            let required: Vec<&str> = entries["items"]["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|c| c.as_str())
+                .collect();
+            assert_eq!(
+                required,
+                ["count", "effect", "firstAt", "kind", "lastAt", "source"]
+            );
+            // `tripped` is the record's, a free-form object like `exit` beside it.
+            let tripped = &status["record"]["properties"]["tripped"];
+            assert_eq!(tripped["x-kubernetes-preserve-unknown-fields"], json!(true));
+        }
     }
 }

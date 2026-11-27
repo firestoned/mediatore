@@ -172,6 +172,11 @@ What already exists and shapes the answer:
    that drops an event whose object differs from the last one seen only in `status.egress` and
    `metadata.resourceVersion` (and `managedFields`). Whatever else changes still reconciles.
 
+   *Amended 2026-11-27: [ADR-0069](0069-tripwires-on-the-vm-a-decoy-the-workload-takes-ends-its-sandbox.md)
+   decision 9 built a compare-and-set status write and this filter first, for `status.tripwires`
+   (`crates/mediatore-claims/src/kubestore.rs`, `watch.rs`); this ADR reuses both when it is
+   implemented.*
+
 8. **The CRD gains the field, optional, in both served versions, with its bounds in the
    schema.** `status.egress` is added to `AgentSandboxStatus` (`crates/mediatore-claims/src/sandbox.rs`)
    and rendered into `deploy/base/crds/mediatore.io_agentsandboxes.yaml`, which by ADR-0049

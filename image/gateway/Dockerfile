@@ -13,7 +13,10 @@
 # kept out of /run/spire by its unit), envoy-inject (the inject listener, ADR-0040: it
 # originates TLS to a fixed upstream and holds a credential only for one request; its
 # unit is installed and NOT enabled, a deployment turns it on) and mediatore-gateway
-# (the authorizer). Nothing
+# (the authorizer). One more unit runs the same binary: mediatore-gateway-probes, a oneshot
+# under a timer that reads the host table's drop counters for the authorizer's next batch
+# (ADR-0070 decision 4), as a fifth user, mediatore-probes, with CAP_NET_ADMIN alone and no
+# socket but netlink. Nothing
 # deployment-specific (trust domain, upstream addresses, bundle) and nothing per VM (the
 # sandbox address, keys) is here: those are the cloud-config layers
 # (image/gateway/cloud-config.yaml, cloud-config-deployment.example.yaml), the VM's
@@ -85,12 +88,15 @@ RUN command -v systemctl && command -v useradd && command -v nft \
 # The agent in the TPM device group (image/systemd/spire-agent.service); the four service
 # users with no group in common and no login (a socket group is what lets an Envoy reach the
 # authorizer, the data plane's on the check socket by default: ADR-0040 decision 6, ADR-0053
-# open question 7). Only the agent touches the TPM.
+# open question 7). Only the agent touches the TPM. The fifth, mediatore-probes, is the
+# probes reader's (ADR-0070 decision 4): in no group but its own, it holds CAP_NET_ADMIN by
+# its unit and reads the host table's counters, nothing else.
 RUN useradd --system --user-group --home-dir /var/lib/spire --no-create-home --shell /usr/sbin/nologin spire \
     && usermod -aG tss spire \
     && for u in envoy envoy-relay envoy-inject mediatore-gateway; do \
          useradd --system --user-group --home-dir /nonexistent --no-create-home --shell /usr/sbin/nologin "$u"; \
-       done
+       done \
+    && useradd --system --user-group --home-dir /nonexistent --no-create-home --shell /usr/sbin/nologin mediatore-probes
 
 RUN install -d -m 0755 /etc/spire /etc/mediatore-gateway /usr/share/mediatore-gateway/envoy /usr/libexec/mediatore-gateway
 
@@ -112,6 +118,8 @@ COPY image/gateway/systemd/spire-agent.service \
      image/gateway/systemd/envoy-relay.service \
      image/gateway/systemd/envoy-inject.service \
      image/gateway/systemd/mediatore-gateway.service \
+     image/gateway/systemd/mediatore-gateway-probes.service \
+     image/gateway/systemd/mediatore-gateway-probes.timer \
      /etc/systemd/system/
 COPY image/gateway/sysctl/99-mediatore-gateway.conf /etc/sysctl.d/99-mediatore-gateway.conf
 # The guest agent answers the commands banlieue's provider sends and no other: no exec, no
@@ -129,4 +137,5 @@ RUN chmod 0755 /usr/libexec/mediatore-gateway/render /usr/libexec/mediatore-gate
     && grep -q "plugin_checksum = \"${TPM_PLUGIN_AGENT_SHA}\"" /usr/share/mediatore/agent.conf.example \
     && systemctl enable spire-agent.service mediatore-gateway-network.service mediatore-gateway-nft.service \
          envoy-gateway.service envoy-relay.service mediatore-gateway.service qemu-guest-agent.service \
+         mediatore-gateway-probes.timer \
     && systemctl mask ssh.service ssh.socket sshd.service nftables.service

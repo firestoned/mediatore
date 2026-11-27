@@ -21,6 +21,13 @@ hyper.workspace = true
 hyper-util.workspace = true
 http.workspace = true
 http-body-util.workspace = true
+# Tripwires (ADR-0069): the proxy's matcher over a streamed body (decision 6), and the
+# checksum of a generated credential (decision 3).
+http-body.workspace = true
+bytes.workspace = true
+aho-corasick.workspace = true
+percent-encoding.workspace = true
+crc32fast.workspace = true
 tokio-rustls.workspace = true
 rustls.workspace = true
 # The phantom token (ADR-0025 decision 3): 256 bits from the provider the TLS stack runs on.

@@ -21,7 +21,6 @@ the diagram shows the *target* architecture so contributors and users have
 one canonical picture, and labels such a node with its status. The nodes so
 marked today, if any:
 
-- `data-asset-trap-draw` (planned)
 
 ```mermaid
 flowchart LR
@@ -62,7 +61,7 @@ flowchart LR
     data-asset-os-credential-store["The requester's saved credential (OS credential store)"]
     data-asset-workload-output["Workload output (the Secret ring)"]
     data-asset-host-signing-ca-bundle["Per-host signing CA bundle (x509pop trust anchors, ADR-0049)"]
-    data-asset-trap-draw["The claim's tripwire draw (ADR-0069) (planned)"]
+    data-asset-trap-draw["The claim's tripwire draw (ADR-0069)"]
     subgraph sg_system-mediatore [System Mediatore]
         service-mediatore-user-api
         service-mediatore-sandbox-api
@@ -161,6 +160,7 @@ flowchart LR
     service-sandbox-workload -->|TCP| service-guest-agent
     service-guest-agent -->|mTLS| service-mediatore-sandbox-api
     service-mediatore-sandbox-api -->|HTTPS| data-asset-claim-store
+    service-egress-gateway --> service-egress-gateway
 ```
 
 <sub>Source: nodes and relationships in `architecture.json`.</sub>

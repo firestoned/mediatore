@@ -220,6 +220,13 @@ one step, old replicas at zero before the new ones start. A broker from before t
 cannot open an envelope the new one sealed, and if it rewrites the Secret it leaves it
 unopenable, so the two never run side by side.
 
+The start also says what the tripwires are ([ADR-0069](../adr/0069-tripwires-on-the-vm-a-decoy-the-workload-takes-ends-its-sandbox.md),
+[ADR-0070](../adr/0070-tripwires-beyond-the-sandbox-a-request-no-honest-build-makes.md)): `tripwires on the VM are off`
+by default, one line per class set to `trip`, and, at a `store.retention_secs` of 900 or less, that `no_record` is not
+judged. The example overlay lists every key, commented out at its default. An upgrade to a build with tripwires applies
+the CRDs first (the record gains `tripped` and the status `tripwires`), then the broker, and the guest images before
+`policy.traps` leaves `off`: the order and the modes are in [the tripwires guide](tripwires.md#the-modes-and-the-order-to-roll-them-out).
+
 ## 4. Prove the cluster side as the broker's ServiceAccount
 
 Before a single sandbox, run the live admission round trip from your machine, as the

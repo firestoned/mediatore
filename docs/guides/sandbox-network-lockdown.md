@@ -127,6 +127,71 @@ nft list chain inet mediatore_host output   # the imds drop first, then root's W
 journalctl -u mediatore-host-nft            # "... on Azure: IMDS dropped, WireServer for root and the DHCP renewal (ADR-0068)"
 ```
 
+### Tripwires: what the tables gain
+
+[ADR-0069](../adr/0069-tripwires-on-the-vm-a-decoy-the-workload-takes-ends-its-sandbox.md) and
+[ADR-0070](../adr/0070-tripwires-beyond-the-sandbox-a-request-no-honest-build-makes.md) add to two layers above and accept
+nothing new in either. The [tripwires guide](tripwires.md) is the operator's view.
+
+**The claim's table (layer 4), under `policy.traps` `shadow` or `enforce` only.** The guest renders it with the claim's
+draw (`crates/mediatore-guest/src/net.rs`); under `off` it is byte for byte the table from before. What a draw adds:
+
+```
+set decoys  { type inet_service; elements = { <drawn ports> } }
+set denied4 { type ipv4_addr . inet_service; size 1024; flags dynamic,timeout; counter; timeout 1m; }
+set denied6 { type ipv6_addr . inet_service; size 1024; flags dynamic,timeout; counter; timeout 1m; }
+chain output {
+  ...
+  oifname "lo" tcp dport @decoys meta skuid != <uid> ct state new log prefix "mediatore-sandbox decoy other uid: " counter drop
+  oifname "lo" tcp dport <trap port> ct original proto-dst <trap port> log prefix "mediatore-sandbox trap port direct: " counter drop
+  meta skuid <uid> jump sandbox
+}
+chain sandbox {
+  ...                                      # the claim's accepts, 127.0.0.1 . <trap port> among them, no decoy port
+  meta nfproto ipv4 meta l4proto tcp ct state new update @denied4 { ip daddr . tcp dport } log prefix "mediatore-sandbox drop: " counter drop
+  meta nfproto ipv6 meta l4proto tcp ct state new update @denied6 { ip6 daddr . tcp dport } log prefix "mediatore-sandbox drop: " counter drop
+  log prefix "mediatore-sandbox drop: " counter drop
+}
+chain nat_out {
+  type nat hook output priority -100; policy accept;
+  meta skuid <uid> ip daddr 127.0.0.1 tcp dport @decoys dnat ip to 127.0.0.1:<trap port>
+  meta skuid <uid> ip daddr 169.254.169.254 tcp dport 80 dnat ip to 127.0.0.1:<trap port>   # only when the metadata decoy was drawn
+}
+```
+
+- **The decoy ports** have nothing listening on them. The sandbox uid's connection to one is redirected to the trap
+  listener, one loopback listener on a port drawn per claim, which answers as the decoy the connection was made to (it
+  reads the original destination); every other uid's new connection to a decoy port is dropped, logged and counted. A
+  connection made to the trap port itself, by any uid, is dropped, so a connection the trap listener accepts is the
+  sandbox uid's, redirected. Landlock in the jail admits the decoy ports (and 80 with the metadata decoy), not the trap
+  port, at any address: for those ports the table is the only bound. The jail cannot list the decoy ports; its own
+  `/proc/self/net/tcp` shows the one trap listener, so it can tell that traps are armed.
+- **The `denied` sets** keep each new TCP connection the chain's end drops, by destination, for the guest to read every
+  250 ms: loopback is the class `loopback_port`, private and link-local addresses `private_range`, anything else no class.
+  The `update` comes before the log, so with a set full the chain's last rule still drops and logs.
+- **The metadata redirect** sends the sandbox uid's `169.254.169.254:80` to the same trap listener; every other uid
+  still meets ADR-0068's drop. It is drawn only where a route to that address exists (with none, a connect fails before any hook).
+  The chain's priority is the number `-100`: `nft` takes the name `dstnat` on the prerouting hook only.
+- **The hash the guest reports** (`report.sandbox_ruleset_sha256`) is the public one, of the table with everything above
+  left out, so it equals the hash the claim would have under `off` and gives no drawn port away. ADR-0029's comparison
+  does not cover those lines.
+- **The cut.** On a trip under `enforce` the guest replaces the whole table, in one `nft` transaction, with one rule:
+  `meta skuid <uid> counter drop` in an output chain. Nothing of the uid leaves, loopback included; root's own path to
+  the broker is untouched. After a trip the teardown keeps this table and the user.
+
+**The pool VM's host table (layer 1), on a pool with gateways.** Two rules, each in front of its chain's last drop,
+which would have dropped the same packet; their named counters and sets are what the guest reads and reports as
+`segment` events (ADR-0070):
+
+```
+meta nfproto ipv4 meta l4proto tcp ct state new counter name "pool_inbound" update @inbound_sources { ip saddr . tcp dport } log prefix "mediatore-host input: " drop
+meta l4proto tcp ct state new counter name "pool_output" update @output_ports { tcp dport } log prefix "mediatore-host drop: " drop
+```
+
+TCP only, so DHCP and ICMP noise counts nowhere. `pool_output` counts every uid, the sandbox uid included. Every verdict
+of the table is unchanged: `make host-table-test` strips the two added lines and requires the table from before byte for
+byte. The gateway's table gains the same kind of counters (the [gateway design](../design/gateway.md)).
+
 ## Check it
 
 On a VM, as root (the table has no exception for root: since ADR-0063 no registry is reached but through a claim's proxy):

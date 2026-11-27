@@ -14,10 +14,11 @@ a restart.
 
 | What | Where | Found by |
 | --- | --- | --- |
-| The claim record: the SPIRE entry id, the bound node, the bind deadline, the revocation, the policy incarnation and bundle version the claim was created under, the guest's report, the workload's exit | `AgentSandbox.status.record`, written by the store alone (the reconciler's mirroring leaves it out of its patches) | the label `mediatore.io/claim-uid` (the claim's UID, the record's key) and `mediatore.io/node` (a digest of the bound node's SPIFFE ID) |
+| The claim record: the SPIRE entry id, the bound node, the bind deadline, the revocation, the policy incarnation and bundle version the claim was created under, the guest's report, the workload's exit, and `tripped`, the tripwire event that ended the claim ([ADR-0069](../adr/0069-tripwires-on-the-vm-a-decoy-the-workload-takes-ends-its-sandbox.md)) | `AgentSandbox.status.record`, written by the store alone (the reconciler's mirroring leaves it out of its patches) | the label `mediatore.io/claim-uid` (the claim's UID, the record's key) and `mediatore.io/node` (a digest of the bound node's SPIFFE ID) |
 | The sealed session: the delegated refresh token, sealed with the sandbox's UID | Secret `mediatore-session-<sandbox uid>` in the broker's own namespace, owned by the `AgentSandbox` when the sandboxes live there too (an owner reference cannot cross a namespace), deleted by the retention sweep otherwise; parked by `POST /v1/claims`, claimed by the reconciler when it writes the record, rotated in place at every mint, deleted on revocation | its name; the labels `mediatore.io/sandbox-uid` and `mediatore.io/session` (`parked` or `claimed`) |
 | The attested nodes: node key (a TPM node's EK hash, an x509pop node's SHA-256 of its agent ID; the field is still `ekHash`), the agent's SPIFFE ID, DMI UUID, hostname, provider, banned | `SandboxNode` in the broker's namespace, named by the node key | its name; the label `mediatore.io/dmi-uuid` for the clone check |
 | The workload's output, when the requester opted in with `workload.logs` ([ADR-0045](../adr/0045-a-sandbox-workloads-output-streamed-to-its-owner.md)): the redacted stdout and stderr lines, with their sequence numbers, and the gaps where the guest's queue overflowed | Secrets `mediatore-logs-<claim uid>-<segment>` in the broker's own namespace, 64 KiB of text each, sealed per batch ([ADR-0052](../adr/0052-a-sandbox-workloads-stored-output-sealed-per-batch-with-the-transit-key.md)), owned by the `AgentSandbox` when it lives there too, the oldest deleted beyond `logs.max_bytes`; swept `logs.retention_secs` after the claim ended, or with the claim's audit sweep, or at once when the record is gone | the labels `mediatore.io/logs=segment`, `mediatore.io/claim-uid` and `mediatore.io/sandbox-uid` |
+| The claim's trip summary: every tripwire event the broker accepted, folded per effect, kind, trap or class, target and source address, at most 16 entries and an overflow count ([ADR-0069](../adr/0069-tripwires-on-the-vm-a-decoy-the-workload-takes-ends-its-sandbox.md) decision 9, [ADR-0070](../adr/0070-tripwires-beyond-the-sandbox-a-request-no-honest-build-makes.md)) | `AgentSandbox.status.tripwires`, written by the store alone, apart from the record, by compare-and-set on `resourceVersion` in a patch that names nothing else; the mirror never names it and the controller's watch ignores a change there | with the sandbox, like the record |
 | The version floor of each notaio policy ([ADR-0026](../adr/0026-notaio-bundles-verified-in-shadow.md) decision 5) | `PolicyFloor` in the broker's namespace, named `<policy namespace>.<policy name>` | its name; moved by compare-and-set on `resourceVersion`, so two replicas cannot move a floor down |
 
 The request fields (subject, audiences, workload, TTL, policy) are the `AgentSandbox`'s
@@ -84,6 +85,23 @@ What an operator sees of it:
   the new ones, as one step and not as a rolling update: a broker from before the change
   cannot open a session sealed by one after it (the next section), and can leave a Secret the
   claim no longer opens.
+
+### A tripped claim
+
+When a tripwire ends a claim ([Tripwires](tripwires.md)), the broker writes `tripped` on the record by compare-and-set
+before anything else (the first event wins; a second report for the same claim changes only the summary), then releases
+the claim as an exit does, except that the `AgentSandbox` is kept: the reconciler deletes the claim and marks the sandbox
+`Failed` with `Tripped=True`. An exit for a tripped record writes nothing and deletes nothing, and an exit that is
+already written reads the record again before it deletes the sandbox, so an exit racing a trip does not take the
+evidence (a trip written in the milliseconds between that read and the delete is the one case not caught). The owner's
+delete is not refused, and takes `status.tripwires` and the condition with the sandbox. A record with `tripped` is never restarted and its token is refused. A `tripped` this build
+cannot read makes the record unreadable rather than a record with no trip; a `status.tripwires` it cannot read is read as
+absent. Only the broker's ServiceAccount may write the status (`deploy/base/admission/agentsandbox-status.yaml`), with
+`patch` on the subresource and no more: nobody marks a sandbox tripped by hand. The summary's counts are a lower bound,
+not a ledger: the dedupe of a retried report is per replica, and a fold that fails is logged and not retried.
+
+Upgrading to a build with tripwires: apply the CRDs first (`kubectl apply -f deploy/base/crds`), so that the API server
+holds `status.tripwires` and the record's `tripped` in both served versions and prunes neither.
 
 ## RBAC
 
@@ -201,7 +219,8 @@ leader sweeps the sandboxes whose claim ended before that window: one log line p
 sandbox with what an audit row used to hold (the claim UID, name, subject, node, the
 created, bound-until and revoked timestamps, whether a report and an exit were recorded),
 then the resource is deleted if nobody had, and the finalizer released. The envelope is
-never logged. The cluster's log pipeline keeps the lines; there is no audit table and
+never logged. A sandbox a tripwire ended is swept the same way, `retention_secs` after its release, with its
+`status.tripwires` and its `Tripped` condition: after that the trip is in the audit lines alone. The cluster's log pipeline keeps the lines; there is no audit table and
 nothing for mediatore to delete from.
 
 ## Workload output
@@ -255,7 +274,9 @@ restarts and does that within seconds. One log line per removal:
 already holds `delete` on `sandboxnodes`.
 
 `retention_secs: 0` means an ended claim is swept at the next resync, which is how the
-kind tiers run.
+kind tiers run. At a `retention_secs` of 900 or less (the claim SVID's longest lifetime) the `no_record`
+class of [ADR-0070](../adr/0070-tripwires-beyond-the-sandbox-a-request-no-honest-build-makes.md) is not judged: a claim
+released a moment ago would have no record while its SVID is still valid. The start log says so.
 
 ## Health
 

@@ -68,6 +68,8 @@ enum Cmd {
     EgressProxy(mediatore_guest::egress::EgressArgs),
     /// On an egress gateway VM: Envoy's authorizer, answering each tunnel from what the broker says the claim may reach (ADR-0028).
     Gateway(mediatore_gateway::serve::GatewayArgs),
+    /// On an egress gateway VM, a oneshot under a timer: read the host table's drop counters for the authorizer's next batch (ADR-0070).
+    GatewayProbes(mediatore_gateway::probes::ProbeArgs),
     /// The user's tools: `login`, `sandbox create|get|delete`, `session`.
     #[command(flatten)]
     User(mediatore_client::cli::UserCmd),
@@ -154,6 +156,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Token(args) => mediatore_guest::token::run(args).await,
         Cmd::EgressProxy(args) => mediatore_guest::egress::run(args).await,
         Cmd::Gateway(args) => mediatore_gateway::serve::run(args).await,
+        Cmd::GatewayProbes(args) => mediatore_gateway::probes::run(args).await,
         Cmd::JailExec(args) => {
             // Returns only when the workload did not run; on success this process is the workload.
             let err = mediatore_guest::confine::run(&args);
@@ -193,8 +196,6 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
     let sandboxes = sandbox_front(&cfg, client.as_ref())?;
     prove_front_door(&cfg, client.as_ref()).await?;
 
-    let sts = sts(&cfg)?;
-
     // The reflector needs the store the state is about to own, and the state needs the
     // reflector's cache (ADR-0030): built first.
     let reflector = bundle_reflector(&cfg, &store, client.is_some())?;
@@ -203,6 +204,8 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
     let policy_egress = policy_egress(&cfg, reflector.as_deref());
 
     let state = Arc::new(AppState {
+        // Tripwires (ADR-0069, ADR-0070): `policy.traps`, the denied switches and the `tripwires` section.
+        tripwires: cfg.tripwires()?,
         // Gateway-placed audiences (ADR-0040): the exact routes the broker hands the gateway's authorizer, and the port of the
         // gateway's inject listener the guests dial. Empty and `None` unless an audience says `inject: gateway`.
         inject: cfg
@@ -223,7 +226,7 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
         spire,
         naming: naming.clone(),
         validator: validator(&cfg).await?,
-        sts,
+        sts: sts(&cfg)?,
         audiences: cfg.audiences.iter().map(|a| a.name.clone()).collect(),
         obo_audiences: obo_audiences(&cfg),
         egress: per_audience(&cfg, |a| a.egress.clone()),
@@ -245,6 +248,8 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
         policy_egress,
     });
 
+    // The classified refusals of ADR-0070, written as audit lines once a minute.
+    mediatore_api::spawn_flush(state.clone(), mediatore_api::tripwires::FOLD_FLUSH_EVERY);
     let user = tokio::net::TcpListener::bind(&cfg.listen.user).await?;
     let sandbox = tokio::net::TcpListener::bind(&cfg.listen.sandbox).await?;
     tracing::info!(user = %cfg.listen.user, sandbox = %cfg.listen.sandbox, "listening");
@@ -256,12 +261,7 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
         (!cfg.dev_mode).then_some(cfg.spire.as_ref()).flatten(),
         client,
     ) {
-        let configs = broker_identity(
-            &spire.workload_api_socket,
-            &naming,
-            cfg.accept_plain_gateway_identity,
-        )
-        .await?;
+        let configs = broker_identity(&spire.workload_api_socket, &state).await?;
         let s = mediatore_tls::serve(sandbox, configs, sandbox_router, shutdown());
         // One cache: the reflector fills it on this replica, the watcher reads it when it
         // creates a record (ADR-0026 decision 6). Empty, and never filled, without a
@@ -551,12 +551,13 @@ const BROKER_WORKLOAD_API_WAIT: std::time::Duration = std::time::Duration::from_
 /// SVID that is not `spiffe://<td>/mediatore` (a wrong `ClusterSPIFFEID`) and the process
 /// does not start. The listener admits nodes, claims and the gateways' authorizer; the
 /// gateways' listener identity only while `accept_plain_gateway_identity` is on (ADR-0053
-/// decisions 3 and 7).
+/// decisions 3 and 7). A handshake it refuses under a valid SVID of the trust domain is
+/// counted on the state's fold as `identity_shape` (ADR-0070 decision 3).
 async fn broker_identity(
     workload_api_socket: &str,
-    naming: &Naming,
-    accept_plain_gateway_identity: bool,
+    state: &AppState,
 ) -> anyhow::Result<Arc<mediatore_tls::TlsConfigs>> {
+    let naming = &state.naming;
     let source =
         mediatore_tls::WorkloadApiSource::connect(workload_api_socket, BROKER_WORKLOAD_API_WAIT)
             .await?;
@@ -570,7 +571,11 @@ async fn broker_identity(
     tracing::info!(spiffe_id = %own.spiffe_id, "broker identity from the Workload API");
     let configs = mediatore_tls::TlsConfigs::spawn(
         Arc::new(source),
-        mediatore_api::sandbox_authorizer(naming.clone(), accept_plain_gateway_identity),
+        mediatore_api::sandbox_authorizer_classified(
+            naming.clone(),
+            state.accept_plain_gateway_identity,
+            state.tripwires.fold.clone(),
+        ),
     )?;
     Ok(configs)
 }

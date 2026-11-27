@@ -193,6 +193,80 @@ pub fn prepare(root: &Path, uid: u32, gid: u32) -> anyhow::Result<Layout> {
     Ok(layout)
 }
 
+/// The name of the planted home under the sandbox root, beside `work/` and never inside it.
+pub const HOME_DIR: &str = "home";
+
+/// Prepare the jail's home under `root` for an armed tripwire (ADR-0069 decision 2): a fresh
+/// directory `home/`, the sandbox user's, mode 0700, with each of `files` (a path relative to
+/// the home, and its content) written mode 0600 under parent directories of mode 0700, all
+/// the sandbox user's. The jail gets it bound at its home in place of a tmpfs. It is on the
+/// claim's tmpfs, so it goes with the claim; unlike the tmpfs home it lasts across restarts of
+/// the workload within the claim.
+///
+/// Called before anything runs as the sandbox user, so nothing can have put a link in the way.
+///
+/// # Errors
+/// The home already exists (a claim's tmpfs is fresh, so something is wrong), a path that is
+/// absolute, empty or leaves the home, or any filesystem failure: the tripwire is not armed.
+/// No error names a file or a content.
+pub fn plant_home(
+    root: &Path,
+    uid: u32,
+    gid: u32,
+    files: &[(&str, &[u8])],
+) -> anyhow::Result<PathBuf> {
+    use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+    use std::path::Component;
+
+    let home = root.join(HOME_DIR);
+    let own = |path: &Path| std::os::unix::fs::chown(path, Some(uid), Some(gid));
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&home)
+        .context("creating the planted home (ADR-0069 decision 2)")?;
+    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700))?;
+    own(&home)?;
+    for (relative, content) in files {
+        let relative = Path::new(relative);
+        let inside = relative.file_name().is_some()
+            && relative
+                .components()
+                .all(|c| matches!(c, Component::Normal(_)));
+        anyhow::ensure!(
+            inside,
+            "a file to plant is not a path inside the home (ADR-0069 decision 2)"
+        );
+        let mut dir = home.clone();
+        if let Some(parent) = relative.parent() {
+            for part in parent.components() {
+                dir.push(part);
+                match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+                    Ok(()) => {
+                        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+                        own(&dir)?;
+                    }
+                    // A directory two planted files share.
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && dir.is_dir() => {}
+                    Err(_) => anyhow::bail!("a directory of the planted home could not be made"),
+                }
+            }
+        }
+        let path = home.join(relative);
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|_| anyhow::anyhow!("a file of the planted home could not be made"))?;
+        std::io::Write::write_all(&mut file, content)
+            .map_err(|_| anyhow::anyhow!("a file of the planted home could not be written"))?;
+        drop(file);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        own(&path)?;
+    }
+    Ok(home)
+}
+
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::MetadataExt;
@@ -266,6 +340,74 @@ mod tests {
         std::fs::write(l.work.join("kept"), b"x").unwrap();
         prepare(&root, uid, gid).unwrap();
         assert!(l.work.join("kept").exists());
+    }
+
+    #[test]
+    fn the_planted_home_is_the_sandbox_users_0700_with_its_files_0600_and_never_under_work() {
+        // ADR-0069 decision 2 and the plan's D11.
+        let root = mediatore_testkit::tempdir();
+        let me = std::fs::metadata(&root).unwrap();
+        let (uid, gid) = (me.uid(), me.gid());
+        let layout = prepare(&root, uid, gid).unwrap();
+        let home = plant_home(
+            &root,
+            uid,
+            gid,
+            &[
+                (".aws/credentials", b"one".as_slice()),
+                (".aws/config", b"two".as_slice()),
+                (".config/gh/hosts.yml", b"three".as_slice()),
+                (".netrc", b"four".as_slice()),
+            ],
+        )
+        .unwrap();
+        assert_eq!(home, root.join("home"));
+        assert!(!home.starts_with(&layout.work), "never under the work dir");
+        let stat = |p: &Path| {
+            let m = std::fs::metadata(p).unwrap();
+            (m.permissions().mode() & 0o7777, m.uid(), m.gid())
+        };
+        for dir in [
+            home.clone(),
+            home.join(".aws"),
+            home.join(".config"),
+            home.join(".config/gh"),
+        ] {
+            assert_eq!(stat(&dir), (0o700, uid, gid));
+        }
+        for (file, content) in [
+            (".aws/credentials", "one"),
+            (".aws/config", "two"),
+            (".config/gh/hosts.yml", "three"),
+            (".netrc", "four"),
+        ] {
+            assert_eq!(stat(&home.join(file)), (0o600, uid, gid));
+            assert_eq!(std::fs::read_to_string(home.join(file)).unwrap(), content);
+        }
+        // A second claim's home is never laid over a first: the tmpfs is fresh per claim.
+        assert!(plant_home(&root, uid, gid, &[]).is_err());
+    }
+
+    #[test]
+    fn a_file_to_plant_that_leaves_the_home_is_refused_and_named_in_no_error() {
+        for bad in ["/etc/passwd", "../work/x", "a/../../x", "", ".", "a/.."] {
+            let root = mediatore_testkit::tempdir();
+            let me = std::fs::metadata(&root).unwrap();
+            let err = plant_home(
+                &root,
+                me.uid(),
+                me.gid(),
+                &[(bad, b"secret-content".as_slice())],
+            )
+            .unwrap_err();
+            let text = format!("{err:#}");
+            assert!(
+                text.contains("not a path inside the home"),
+                "refused for another reason"
+            );
+            assert!(!text.contains("secret-content"));
+            assert!(!root.join("work").exists() && !root.join("x").exists());
+        }
     }
 
     #[test]

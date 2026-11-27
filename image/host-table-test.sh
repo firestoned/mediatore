@@ -23,6 +23,52 @@ table inet mediatore_host
 delete table inet mediatore_host
 table inet mediatore_host {
   set allow4 { type ipv4_addr . inet_service; elements = { 198.51.100.1 . 8443, 198.51.100.2 . 8443, 198.51.100.3 . 8443, 198.51.100.1 . 3130, 198.51.100.1 . 3129, 198.51.100.1 . 3131 } }
+  set inbound_sources { type ipv4_addr . inet_service; size 4096; flags dynamic,timeout; counter; timeout 5m; }
+  set output_ports { type inet_service; size 1024; flags dynamic,timeout; counter; timeout 5m; }
+  counter pool_inbound { }
+  counter pool_output { }
+  chain input {
+    type filter hook input priority filter; policy drop;
+    iif "lo" accept
+    ct state established,related accept
+    ct state invalid drop
+    meta nfproto ipv4 meta l4proto tcp ct state new counter name "pool_inbound" update @inbound_sources { ip saddr . tcp dport } log prefix "mediatore-host input: " drop
+    log prefix "mediatore-host input: " counter drop
+  }
+  chain forward {
+    type filter hook forward priority filter; policy drop;
+    log prefix "mediatore-host forward: " counter drop
+  }
+  chain output {
+    type filter hook output priority filter; policy drop;
+    oif "lo" accept
+    ct state established,related accept
+    ip daddr . tcp dport @allow4 accept
+    meta l4proto tcp ct state new counter name "pool_output" update @output_ports { tcp dport } log prefix "mediatore-host drop: " drop
+    log prefix "mediatore-host drop: " counter drop
+  }
+}'
+got=$("$here/host-table" --render "$d/gateways" "$d/registries" "$d/env" "$d/agent.conf")
+if [ "$got" != "$want" ]; then
+  echo "host-table: the rendered table drifted:"; diff <(printf '%s\n' "$want") <(printf '%s\n' "$got") || true; exit 1
+fi
+echo "✓ the table renders as pinned, duplicates folded, comments and blanks skipped, a registries file of comments alone accepted"
+
+# ADR-0070 decision 4: what the table drops and no honest machine sends is counted by name, for the guest's segment
+# reader (pool_inbound with its sources, pool_output with its ports). Proven by taking the six added lines away
+# again: what is left is, byte for byte, the table as it was before them, so no verdict changed, no rule moved and
+# nothing new is accepted. The same holds for the Azure render below, which is built from this one.
+added='  set inbound_sources { type ipv4_addr . inet_service; size 4096; flags dynamic,timeout; counter; timeout 5m; }
+  set output_ports { type inet_service; size 1024; flags dynamic,timeout; counter; timeout 5m; }
+  counter pool_inbound { }
+  counter pool_output { }
+    meta nfproto ipv4 meta l4proto tcp ct state new counter name "pool_inbound" update @inbound_sources { ip saddr . tcp dport } log prefix "mediatore-host input: " drop
+    meta l4proto tcp ct state new counter name "pool_output" update @output_ports { tcp dport } log prefix "mediatore-host drop: " drop'
+before='# mediatore host table (ADR-0029, ADR-0063): every uid reaches the gateways'"'"' two planes and nothing else; nothing comes in
+table inet mediatore_host
+delete table inet mediatore_host
+table inet mediatore_host {
+  set allow4 { type ipv4_addr . inet_service; elements = { 198.51.100.1 . 8443, 198.51.100.2 . 8443, 198.51.100.3 . 8443, 198.51.100.1 . 3130, 198.51.100.1 . 3129, 198.51.100.1 . 3131 } }
   chain input {
     type filter hook input priority filter; policy drop;
     iif "lo" accept
@@ -42,11 +88,30 @@ table inet mediatore_host {
     log prefix "mediatore-host drop: " counter drop
   }
 }'
-got=$("$here/host-table" --render "$d/gateways" "$d/registries" "$d/env" "$d/agent.conf")
-if [ "$got" != "$want" ]; then
-  echo "host-table: the rendered table drifted:"; diff <(printf '%s\n' "$want") <(printf '%s\n' "$got") || true; exit 1
+while IFS= read -r line; do
+  [ "$(printf '%s\n' "$got" | grep -cxF -- "$line")" = 1 ] || { echo "✗ the table does not carry, exactly once: $line"; exit 1; }
+done <<< "$added"
+without=$(printf '%s\n' "$got" | grep -vxF -f <(printf '%s\n' "$added"))
+if [ "$without" != "$before" ]; then
+  echo "✗ without the counters of ADR-0070 the table is not the table it was:"; diff <(printf '%s\n' "$before") <(printf '%s\n' "$without") || true; exit 1
 fi
-echo "✓ the table renders as pinned, duplicates folded, comments and blanks skipped, a registries file of comments alone accepted"
+printf '%s\n' "$added" | grep -q 'accept' && { echo "✗ an added line accepts"; exit 1; } || true
+[ "$(printf '%s\n' "$got" | grep -c 'accept$')" = 5 ] || { echo "✗ the table does not accept in exactly the five places it did"; exit 1; }
+bad=$(printf '%s\n' "$got" | grep 'counter name' | grep -v ' drop$' || true)
+[ -z "$bad" ] && [ "$(printf '%s\n' "$got" | grep -c 'counter name')" = 2 ] || { echo "✗ a named counter that is not on one of the two dropping rules: $bad"; exit 1; }
+# Each counted rule sits after every accept of its chain and directly in front of the chain's own last drop, its
+# counter ahead of the set update: a packet the rule does not finish with (the set full) is dropped by the next one,
+# and was counted.
+for pair in 'input:pool_inbound:mediatore-host input: ' 'output:pool_output:mediatore-host drop: '; do
+  chain=${pair%%:*}; rest=${pair#*:}; name=${rest%%:*}; prefix=${rest#*:}
+  c=$(printf '%s\n' "$got" | sed -n "/^  chain $chain {\$/,/^  }\$/p")
+  n=$(printf '%s\n' "$c" | grep -n "counter name \"$name\" update @" | cut -d: -f1)
+  [ -n "$n" ] && [ "$n" -gt "$(printf '%s\n' "$c" | grep -n 'accept$' | tail -1 | cut -d: -f1)" ] \
+    && [ "$(printf '%s\n' "$c" | sed -n "$((n + 1))p")" = "    log prefix \"$prefix\" counter drop" ] \
+    && [ "$(printf '%s\n' "$c" | sed -n "$((n + 2))p")" = '  }' ] \
+    || { echo "✗ the $name rule is not the last but one of the $chain chain, after its accepts, counter first"; exit 1; }
+done
+echo "✓ the two dropping rules are counted by name (pool_inbound, pool_output), each in front of its chain's last drop; without the six added lines the table is the one before, and it accepts in the same five places"
 
 # no registries file: the same table
 cp "$d/registries" "$d/registries-comments"; rm "$d/registries"

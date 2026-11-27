@@ -173,6 +173,7 @@ impl Harness {
         )
         .expect("sts");
         let state = Arc::new(AppState {
+            tripwires: mediatore_api::Tripwires::default(),
             inject: std::collections::BTreeMap::new(),
             inject_port: None,
             audience_catalog: None,

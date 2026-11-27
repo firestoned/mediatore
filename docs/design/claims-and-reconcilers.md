@@ -25,7 +25,7 @@ that claim. Both objects, and the store record keyed by the claim's UID, are han
 | `Pending` | no claim yet, or the claim is waiting for a Ready pool member |
 | `Bound` | the claim is bound to a member; `ready` says whether the registration entry is set as well |
 | `Releasing` | the TTL was reached or the sandbox was deleted; tokens are cut off |
-| `Failed` | terminal: the request was refused, the claim failed, or the claim is gone |
+| `Failed` | terminal: the request was refused, the claim failed, the claim is gone, or a tripwire ended it |
 
 A sandbox is **never given a second VM.** If its claim is gone after it was created (expired and destroyed, or failed
 by the watcher) the sandbox fails and stays failed.
@@ -45,6 +45,16 @@ Once a claim has been created the request was accepted under the configuration o
 does not flap a bound sandbox between `Failed` and its mirrored status. A bound claim whose record lacks a delegation
 that a `delegated` audience requires is refused too (`refuse_without_delegation`), so a claim never runs without
 the credential it was promised.
+
+### A tripped sandbox
+
+When the claim's record carries `tripped` (ADR-0069 decision 9, ADR-0070 decision 6: the API writes it, then releases the
+claim), the reconciler deletes the `VirtualMachineClaim`, marks the sandbox `Failed` with `status.reason`
+`tripped: <kind>` and the condition `Tripped=True` (reason the kind, message the trap or the class and the target), logs
+`sandbox tripped: its record is released and its claim deleted, never recreated (ADR-0069 decision 9)` once, and never
+claims again. It does not delete the sandbox: the store's retention sweep does, `store.retention_secs` after the release,
+as for any ended claim. `status.tripwires` is the store's, written apart from the record by compare-and-set; the mirror
+never names it, and the controller's watch filter drops an event that differs only there, so a fold costs no reconcile.
 
 ### Deletion
 
@@ -125,5 +135,5 @@ the first can register, the second being another DMI UUID under a registered key
 ## Read next
 
 ADR-0008 (the CRD), ADR-0011 (the watcher and the Lease), ADR-0033 (the one-shot workload and the claim released when
-it is done), ADR-0034 (the store), ADR-0039 (node collection). Threat model TB-2 (to the Kubernetes API) and TB-3 (the
+it is done), ADR-0034 (the store), ADR-0039 (node collection), ADR-0069 (a tripped sandbox). Threat model TB-2 (to the Kubernetes API) and TB-3 (the
 entries). Guide: [Requesting a sandbox](../guides/requesting-a-sandbox.md).

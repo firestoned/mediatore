@@ -72,10 +72,12 @@ RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 # cloud-config's boot stage makes it, after systemd has begun starting units), and a path that
 # does not exist failed the start with 226/NAMESPACE on a booted gateway (2026-11-27). With the
 # prefix a missing path is skipped; the health check above then fails until the agent answers,
-# and the unit is retried. Nothing is lost by it: the mount namespace is set up at exec, and
-# ProtectSystem=strict already has all of /run read-only in it but the path below, so a
-# directory that appears afterwards is read-only here as well; and the authorizer only connects
-# to the agent's socket, it never writes there.
+# and the unit is retried. The authorizer only connects to the agent's socket, it never writes
+# there. ProtectSystem=strict does not by itself keep /run read-only here: on systemd 257 /run
+# stays writable once a unit also sets ProtectKernelTunables= or ProtectProc= (seen on the build
+# host, 2026-11-27), and this unit sets the first. What bounds it in /run is its user: it owns
+# nothing there but the path below, so file permissions, not the mount, keep it out of the rest.
+# A ReadOnlyPaths=/run here is not added until a booted gateway proves it.
 ReadOnlyPaths=-/run/spire/sockets
 # The runtime directory holds the check socket's directory; the table's unit made it, root's and 0755, so this user writes only below.
 ReadWritePaths=/run/mediatore-gateway

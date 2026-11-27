@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Jail supervision: run the workload until the claim's deadline, restart it as its
-//! restart policy says (ADR-0033), end the claim when the egress proxy goes (ADR-0025),
-//! tear everything down at the end. Killing `nsjail` is not the end of the workload (it is
+//! restart policy says (ADR-0033), end the claim when the egress proxy goes (ADR-0025) or
+//! when a trap is used (ADR-0069 decision 7), tear everything down at the end. Killing `nsjail` is not the end of the workload (it is
 //! pid 1 of the jail's PID namespace and can clear its parent-death signal), so wherever
 //! the jail is killed every process of the sandbox uid is killed after it, and the
 //! teardown removes the ruleset only once none is left.
@@ -254,6 +254,9 @@ pub enum Outcome {
         /// Restarts before it.
         restarts: u32,
     },
+    /// A trap was used (ADR-0069 decision 7): the jail and every process of the sandbox user
+    /// were killed, the egress proxy with them, and nothing is restarted whatever the policy.
+    Tripped,
 }
 
 /// What ended a round of supervision.
@@ -298,6 +301,18 @@ pub fn cleanup_after(survivors: bool) -> Cleanup {
         Cleanup::KeepRulesetAndUser
     } else {
         Cleanup::Everything
+    }
+}
+
+/// The teardown's decision after a run a trip may have ended (ADR-0069 decision 7): after a
+/// trip the table is the cut, a drop of everything the sandbox uid sends, and deleting it
+/// would remove the cut, so it stays, and the user with it, survivors or none.
+#[must_use]
+pub fn cleanup_for(survivors: bool, tripped: bool) -> Cleanup {
+    if tripped {
+        Cleanup::KeepRulesetAndUser
+    } else {
+        cleanup_after(survivors)
     }
 }
 
@@ -356,6 +371,23 @@ pub fn after_event(event: Event, policy: RestartPolicy) -> Next {
     }
 }
 
+/// Wait for the first trip. Never resolves without a tripwire.
+///
+/// # Errors
+/// The tripwire is gone while the run it guards goes on: every handle to it was dropped.
+async fn tripped(
+    trip: &mut Option<&mut tokio::sync::watch::Receiver<Option<crate::trip::Cause>>>,
+) -> anyhow::Result<()> {
+    match trip {
+        None => std::future::pending().await,
+        Some(rx) => rx
+            .wait_for(Option::is_some)
+            .await
+            .map(|_| ())
+            .map_err(|_| anyhow::anyhow!("the tripwire is gone: the run is no longer guarded")),
+    }
+}
+
 /// Run `nsjail` with the spec's arguments until `expires_at`, restarting on exit as
 /// `policy` says, with the egress proxy `proxy` watched beside it.
 ///
@@ -370,13 +402,50 @@ pub fn after_event(event: Event, policy: RestartPolicy) -> Next {
 /// is flushed) or when the policy ends the claim on an exit. An error spawning the
 /// jail is returned immediately: a sandbox that cannot start must not linger half-built.
 /// The proxy exiting is an error too.
+///
+/// With `trip` (the claim's tripwire, ADR-0069 decision 7) the first cause on it ends the
+/// run with [`Outcome::Tripped`]: the jail is killed, then every process of the sandbox
+/// user, the proxy included, and nothing is restarted whatever the policy. The trip is
+/// looked at before anything else, so a proxy that died with the uid is never read as the
+/// proxy failing. A jail is never started after a trip.
 pub async fn run(
     spec: &JailSpec,
     expires_at: Timestamp,
     proxy: &mut tokio::process::Child,
     policy: RestartPolicy,
     capture: Option<&Arc<Capture>>,
+    trip: Option<&mut tokio::sync::watch::Receiver<Option<crate::trip::Cause>>>,
 ) -> anyhow::Result<Outcome> {
+    supervise(
+        || {
+            let (child, output) = spawn_jail(spec, capture)?;
+            tracing::info!(pid = child.id(), user = %spec.user, logs = capture.is_some(), "jail started");
+            Ok((child, output))
+        },
+        |spare| kill_sandbox_processes(&spec.user, spare),
+        expires_at,
+        proxy,
+        policy,
+        trip,
+    )
+    .await
+}
+
+/// [`run`] over whatever starts the jail (`start`) and whatever kills every process of the
+/// sandbox user but the one spared (`kill_user`).
+async fn supervise<S, K, F>(
+    mut start: S,
+    kill_user: K,
+    expires_at: Timestamp,
+    proxy: &mut tokio::process::Child,
+    policy: RestartPolicy,
+    mut trip: Option<&mut tokio::sync::watch::Receiver<Option<crate::trip::Cause>>>,
+) -> anyhow::Result<Outcome>
+where
+    S: FnMut() -> anyhow::Result<(tokio::process::Child, Output)>,
+    K: Fn(Option<u32>) -> F,
+    F: std::future::Future<Output = bool>,
+{
     let mut restarts: u32 = 0;
     loop {
         let remaining = expires_at.duration_since(Timestamp::now());
@@ -384,30 +453,66 @@ pub async fn run(
             tracing::info!("claim deadline reached");
             return Ok(Outcome::Deadline);
         };
+        // ADR-0069 decision 7: no jail starts after a trip. Whatever of the sandbox user is
+        // still alive (the proxy) is killed here, as the trip arm below does.
+        if trip.as_ref().is_some_and(|rx| rx.borrow().is_some()) {
+            tracing::error!("a trap was used before the jail started; it is not started");
+            kill_user(None).await;
+            return Ok(Outcome::Tripped);
+        }
 
-        let (mut child, output) = spawn_jail(spec, capture)?;
-        tracing::info!(pid = child.id(), user = %spec.user, logs = capture.is_some(), "jail started");
+        let (mut child, output) = start()?;
 
-        let event = tokio::select! {
-            status = child.wait() => Event::JailExited(status?),
-            status = proxy.wait() => {
-                let status = status?;
-                child.start_kill()?;
-                let _ = child.wait().await;
-                // The proxy is reaped: `id()` is `None`, nobody is spared.
-                kill_sandbox_processes(&spec.user, proxy.id()).await;
-                Event::ProxyExited(status)
-            }
-            () = tokio::time::sleep(remaining) => {
-                tracing::info!("claim deadline reached; stopping the jail");
-                child.start_kill()?;
-                let _ = child.wait().await;
-                // Before the drain: a survivor holds the pipes open. The proxy is spared
-                // here and stopped by the caller; the teardown looks again without it.
-                kill_sandbox_processes(&spec.user, proxy.id()).await;
-                output.drain().await;
-                return Ok(Outcome::Deadline);
-            }
+        // One round: the trip (when armed), the jail's exit, the proxy's exit, the deadline.
+        // With a tripwire the trip is looked at first (`biased`); without one the round is the
+        // select it was before ADR-0069, with no fixed order (a NIT of the review: `off` is
+        // what it was).
+        macro_rules! round {
+            ($($biased:tt)*) => {
+                tokio::select! {
+                    $($biased)*
+                    // The trip kills the proxy with the uid, and that exit must not be read as
+                    // the proxy failing (and an exit of the jail in the same instant must not
+                    // restart it).
+                    guarded = tripped(&mut trip) => {
+                        tracing::error!("a trap was used; killing the jail and every process of the sandbox user (ADR-0069 decision 7)");
+                        // An error here is a jail that has already exited: the uid's kill
+                        // follows either way.
+                        let _ = child.start_kill();
+                        let _ = child.wait().await;
+                        // Nobody is spared: the proxy is the workload's way out and goes too.
+                        kill_user(None).await;
+                        output.drain().await;
+                        guarded?;
+                        return Ok(Outcome::Tripped);
+                    }
+                    status = child.wait() => Event::JailExited(status?),
+                    status = proxy.wait() => {
+                        let status = status?;
+                        child.start_kill()?;
+                        let _ = child.wait().await;
+                        // The proxy is reaped: `id()` is `None`, nobody is spared.
+                        kill_user(proxy.id()).await;
+                        Event::ProxyExited(status)
+                    }
+                    () = tokio::time::sleep(remaining) => {
+                        tracing::info!("claim deadline reached; stopping the jail");
+                        child.start_kill()?;
+                        let _ = child.wait().await;
+                        // Before the drain: a survivor holds the pipes open. The proxy is
+                        // spared here and stopped by the caller; the teardown looks again
+                        // without it.
+                        kill_user(proxy.id()).await;
+                        output.drain().await;
+                        return Ok(Outcome::Deadline);
+                    }
+                }
+            };
+        }
+        let event = if trip.is_some() {
+            round!(biased;)
+        } else {
+            round!()
         };
         // The pipes close with the jail; what is left in them is queued (or written to the
         // console) before anything else happens (ADR-0045 decision 8: the end of the output
@@ -431,7 +536,12 @@ pub async fn run(
             (Event::JailExited(status), Next::Restart) => {
                 restarts = restarts.saturating_add(1);
                 tracing::warn!(%status, %policy, restarts, "workload exited before the deadline; restarting");
-                tokio::time::sleep(std::time::Duration::from_secs(RESTART_DELAY_SECS)).await;
+                // A trip during the wait is seen at the top of the loop, before any jail.
+                tokio::select! {
+                    biased;
+                    guarded = tripped(&mut trip) => guarded?,
+                    () = tokio::time::sleep(std::time::Duration::from_secs(RESTART_DELAY_SECS)) => {}
+                }
             }
         }
     }
@@ -444,9 +554,24 @@ pub async fn run(
 /// the unmount is still tried, lazily. Failures are logged, never fatal; the VM is about to
 /// be destroyed anyway.
 pub async fn teardown(sandbox_root: &Path, username: &str) {
-    let cleanup = cleanup_after(kill_sandbox_processes(username, None).await);
+    teardown_after(sandbox_root, username, false).await;
+}
+
+/// [`teardown`] for a run a trip may have ended (ADR-0069 decision 7). With `tripped` the
+/// table stays, whoever is left: it is the cut, and deleting it would give the sandbox uid
+/// its network back ([`cleanup_for`]). The user stays with it, so the uid the cut is keyed
+/// on is not freed for another name. Everything else is torn down as ever.
+pub async fn teardown_after(sandbox_root: &Path, username: &str, tripped: bool) {
+    let survivors = kill_sandbox_processes(username, None).await;
+    let cleanup = cleanup_for(survivors, tripped);
     if cleanup.unloads_ruleset() {
         net::unload().await;
+    } else if tripped {
+        tracing::warn!(
+            user = username,
+            survivors,
+            "the sandbox table stays loaded and the user stays: after a trip the table is the cut (ADR-0069 decision 7)"
+        );
     } else {
         tracing::error!(
             user = username,
@@ -459,7 +584,7 @@ pub async fn teardown(sandbox_root: &Path, username: &str) {
         Err(e) => tracing::warn!(error = %e, "could not read the mount table"),
     }
     if !sandboxfs::is_mounted(sandbox_root).unwrap_or(false) {
-        for name in ["work", "layers", "rootfs", "egress"] {
+        for name in ["work", "layers", "rootfs", "egress", "home"] {
             let dir = sandbox_root.join(name);
             if let Err(e) = tokio::fs::remove_dir_all(&dir).await
                 && e.kind() != std::io::ErrorKind::NotFound
@@ -473,7 +598,7 @@ pub async fn teardown(sandbox_root: &Path, username: &str) {
     {
         tracing::warn!(user = username, error = %e, "could not remove sandbox user");
     }
-    tracing::info!(user = username, ?cleanup, "teardown complete");
+    tracing::info!(user = username, ?cleanup, tripped, "teardown complete");
 }
 
 #[cfg(test)]
@@ -496,6 +621,7 @@ mod tests {
                 "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
             )
             .unwrap(),
+            traps: None,
         };
         let quiet = nsjail_args(&spec, true);
         let flag = quiet.iter().position(|a| a == NSJAIL_QUIET);
@@ -705,6 +831,9 @@ os._exit(0 if os.read(r, 1) == b"x" else 4)
             dns: std::collections::BTreeSet::new(),
             proxy_port: 3128,
             shape: net::Shape::Direct,
+            decoy_ports: std::collections::BTreeSet::new(),
+            metadata: false,
+            trap_port: None,
         }
     }
 
@@ -907,5 +1036,394 @@ os._exit(0 if os.read(r, 1) == b"x" else 4)
             ),
             Next::Stop
         );
+    }
+    /// The spec the argument tests share: what `guest.rs` builds for a claim with no
+    /// tripwire.
+    fn plain_spec() -> JailSpec {
+        JailSpec {
+            user: "sb-abc".into(),
+            rootfs: "/mnt/sandbox/rootfs".into(),
+            work: "/mnt/sandbox/work".into(),
+            agent_binary: "/usr/bin/mediatore".into(),
+            argv: vec!["/bin/sh".into(), "-c".into(), "id".into()],
+            rlimit_as_mib: 8192,
+            proxy_port: 3128,
+            phantom: crate::egress::Phantom::parse(
+                "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+            )
+            .unwrap(),
+            traps: None,
+        }
+    }
+
+    #[test]
+    fn with_no_tripwire_the_nsjail_argv_is_byte_identical_to_before() {
+        // ADR-0069 decision 5: under `off` nothing of the workload's environment changes.
+        // This is the argument list as it was before the ADR, whole: one `--connect-port`
+        // (the proxy's), the three variables, a tmpfs home.
+        let expected = [
+            "--mode",
+            "o",
+            "--user",
+            "sb-abc",
+            "--group",
+            "sb-abc",
+            "--chroot",
+            "/mnt/sandbox/rootfs",
+            "--bindmount_ro",
+            "/usr/bin/mediatore:/usr/bin/mediatore",
+            "--bindmount",
+            "/mnt/sandbox/work:/work",
+            "--tmpfsmount",
+            "/tmp",
+            "--tmpfsmount",
+            "/home/sandbox",
+            "--bindmount_ro",
+            "/dev/null:/dev/null",
+            "--bindmount_ro",
+            "/dev/zero:/dev/zero",
+            "--bindmount_ro",
+            "/dev/urandom:/dev/urandom",
+            "--disable_proc",
+            "--mount",
+            "none:/proc:proc:subset=pid,hidepid=invisible",
+            "--disable_clone_newnet",
+            "--disable_clone_newuser",
+            "--rlimit_as",
+            "8192",
+            "--rlimit_nproc",
+            "512",
+            "--rlimit_fsize",
+            "4096",
+            "--time_limit",
+            "0",
+            "--env",
+            "HOME=/home/sandbox",
+            "--env",
+            "MEDIATORE_EGRESS_PROXY=http://127.0.0.1:3128",
+            "--env",
+            "MEDIATORE_TOKEN",
+            "--",
+            "/usr/bin/mediatore",
+            "jail-exec",
+            "--writable",
+            "/work",
+            "--writable",
+            "/tmp",
+            "--writable",
+            "/home/sandbox",
+            "--writable-file",
+            "/dev/null",
+            "--connect-port",
+            "3128",
+            "--",
+            "/bin/sh",
+            "-c",
+            "id",
+        ];
+        let spec = plain_spec();
+        assert_eq!(nsjail_args(&spec, false), expected);
+        assert_eq!(
+            nsjail_args(&spec, false)
+                .iter()
+                .filter(|a| *a == "--connect-port")
+                .count(),
+            1,
+            "Landlock admits the proxy's port and no other"
+        );
+        // And what nsjail itself is run with: the phantom, nothing else.
+        let env = spec.env();
+        assert_eq!(env.len(), 1);
+        assert_eq!(env[0].0, "MEDIATORE_TOKEN");
+    }
+
+    /// A process that outlives the test unless something kills it.
+    fn sleeper() -> tokio::process::Child {
+        tokio::process::Command::new("sleep")
+            .arg("300")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn sleep")
+    }
+
+    /// A stand-in for the jail: `command`, with its output relayed nowhere a test reads.
+    fn jail_of(program: &str, args: &[&str]) -> anyhow::Result<(tokio::process::Child, Output)> {
+        let mut child = tokio::process::Command::new(program)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()?;
+        let output = Output::relay(&mut child)?;
+        Ok((child, output))
+    }
+
+    fn a_cause() -> crate::trip::Cause {
+        crate::trip::Cause {
+            at: Timestamp::now(),
+            kind: mediatore_proto::trip::TripKind::Port,
+            trap: Some("redis".into()),
+            class: None,
+            target: Some(mediatore_proto::trip::TripTarget::Port(6379)),
+            source: mediatore_proto::trip::TripSource::Drawn,
+        }
+    }
+
+    fn in_an_hour() -> Timestamp {
+        Timestamp::now() + std::time::Duration::from_secs(3600)
+    }
+
+    #[tokio::test]
+    async fn a_trip_ends_the_supervision_with_tripped_and_no_restart_whatever_the_policy() {
+        for policy in [
+            RestartPolicy::Always,
+            RestartPolicy::OnFailure,
+            RestartPolicy::Never,
+        ] {
+            let (tx, mut rx) = tokio::sync::watch::channel(None);
+            let mut proxy = sleeper();
+            let started = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let kills = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let (pids, spared) = (started.clone(), kills.clone());
+            let trip = tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                tx.send(Some(a_cause())).expect("the supervision listens");
+                tx
+            });
+            let outcome = tokio::time::timeout(
+                std::time::Duration::from_secs(20),
+                supervise(
+                    || {
+                        let (child, output) = jail_of("sleep", &["300"])?;
+                        pids.lock().unwrap().push(child.id());
+                        Ok((child, output))
+                    },
+                    |spare| {
+                        spared.lock().unwrap().push(spare);
+                        async { false }
+                    },
+                    in_an_hour(),
+                    &mut proxy,
+                    policy,
+                    Some(&mut rx),
+                ),
+            )
+            .await
+            .expect("the trip ended the run, not the deadline")
+            .expect("a trip is an outcome, not an error");
+            let _tx = trip.await.unwrap();
+            assert_eq!(outcome, Outcome::Tripped, "{policy}");
+            assert_eq!(
+                started.lock().unwrap().len(),
+                1,
+                "{policy}: one jail, never a second"
+            );
+            assert_eq!(
+                *kills.lock().unwrap(),
+                [None],
+                "{policy}: every process of the sandbox user, the proxy included"
+            );
+            // The jail itself was killed and reaped: its pid is nobody's child any more.
+            let pid = started.lock().unwrap()[0].expect("the jail had a pid");
+            assert!(
+                !Path::new(&format!("/proc/{pid}/stat")).exists(),
+                "the jail is gone"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_trip_wins_over_the_proxys_exit_and_over_the_jails() {
+        // ADR-0069 decision 7, plan D26: the trip kills the proxy with the uid. When the
+        // supervision looks, the trip, the proxy's exit and the jail's exit are all there;
+        // it must say `Tripped`, never "egress proxy exited" and never a restart.
+        let (tx, mut rx) = tokio::sync::watch::channel(None);
+        let mut proxy = tokio::process::Command::new("true").spawn().unwrap();
+        let starts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let count = starts.clone();
+        let outcome = supervise(
+            move || {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let jail = jail_of("true", &[]);
+                // By the time the supervision waits, everything has happened.
+                tx.send(Some(a_cause())).expect("the supervision listens");
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                jail
+            },
+            |_| async { false },
+            in_an_hour(),
+            &mut proxy,
+            RestartPolicy::Always,
+            Some(&mut rx),
+        )
+        .await
+        .expect("a trip is an outcome, not the proxy's error");
+        assert_eq!(outcome, Outcome::Tripped);
+        assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn no_jail_starts_after_a_trip_and_a_trip_during_the_restart_wait_ends_the_run() {
+        // Tripped before the first start: nothing is started, the uid is still killed.
+        let (tx, mut rx) = tokio::sync::watch::channel(Some(a_cause()));
+        let mut proxy = sleeper();
+        let kills = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let spared = kills.clone();
+        let outcome = supervise(
+            || anyhow::bail!("a jail was started after a trip"),
+            |spare| {
+                spared.lock().unwrap().push(spare);
+                async { false }
+            },
+            in_an_hour(),
+            &mut proxy,
+            RestartPolicy::Always,
+            Some(&mut rx),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, Outcome::Tripped);
+        assert_eq!(*kills.lock().unwrap(), [None]);
+        drop(tx);
+
+        // The workload exits, the policy says restart, and the trip lands in the wait.
+        let (tx, mut rx) = tokio::sync::watch::channel(None);
+        let starts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let count = starts.clone();
+        let trip = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            tx.send(Some(a_cause())).expect("the supervision listens");
+            tx
+        });
+        let began = std::time::Instant::now();
+        let outcome = supervise(
+            move || {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                jail_of("true", &[])
+            },
+            |_| async { false },
+            in_an_hour(),
+            &mut proxy,
+            RestartPolicy::Always,
+            Some(&mut rx),
+        )
+        .await
+        .unwrap();
+        let _tx = trip.await.unwrap();
+        assert_eq!(outcome, Outcome::Tripped);
+        assert_eq!(
+            starts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the workload that exited is not started again"
+        );
+        assert!(
+            began.elapsed() < std::time::Duration::from_secs(RESTART_DELAY_SECS),
+            "the restart wait did not have to end first"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_a_tripwire_the_supervision_is_what_it_was_and_a_lost_tripwire_ends_the_run() {
+        // No tripwire: the policy decides, as before.
+        let mut proxy = sleeper();
+        let outcome = supervise(
+            || jail_of("true", &[]),
+            |_| async { false },
+            in_an_hour(),
+            &mut proxy,
+            RestartPolicy::Never,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, Outcome::WorkloadDone { restarts: 0, .. }));
+        // The proxy's exit is still the claim's end when no trap was used.
+        let (tx, mut rx) = tokio::sync::watch::channel(None);
+        let mut gone = tokio::process::Command::new("true").spawn().unwrap();
+        let err = supervise(
+            || jail_of("sleep", &["300"]),
+            |_| async { false },
+            in_an_hour(),
+            &mut gone,
+            RestartPolicy::Always,
+            Some(&mut rx),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("egress proxy exited"));
+        // Every handle to the tripwire dropped while the jail runs: the run is not guarded
+        // any more, so it ends, as an error and never as a clean outcome.
+        drop(tx);
+        let err = supervise(
+            || jail_of("sleep", &["300"]),
+            |_| async { false },
+            in_an_hour(),
+            &mut proxy,
+            RestartPolicy::Always,
+            Some(&mut rx),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("no longer guarded"));
+    }
+
+    #[tokio::test]
+    async fn without_a_tripwire_a_jail_and_a_proxy_that_exit_together_are_taken_as_before() {
+        // A NIT of the review: under `off` the supervision is what it was before ADR-0069, so a
+        // jail and a proxy that both exited when it looks are taken in no fixed order (tokio's
+        // random start), not always the jail first as a `biased` select would.
+        let (mut jail_first, mut proxy_first) = (0, 0);
+        for _ in 0..48 {
+            let mut proxy = tokio::process::Command::new("true").spawn().unwrap();
+            let outcome = supervise(
+                || {
+                    let jail = jail_of("true", &[]);
+                    // Both have exited by the time the supervision waits.
+                    std::thread::sleep(std::time::Duration::from_millis(30));
+                    jail
+                },
+                |_| async { false },
+                in_an_hour(),
+                &mut proxy,
+                RestartPolicy::Never,
+                None,
+            )
+            .await;
+            match outcome {
+                Ok(Outcome::WorkloadDone { .. }) => jail_first += 1,
+                Err(e) if e.to_string().contains("egress proxy exited") => proxy_first += 1,
+                other => panic!("an outcome neither exit gives: {}", other.is_ok()),
+            }
+        }
+        assert!(
+            jail_first > 0 && proxy_first > 0,
+            "one exit always wins: {jail_first} jail, {proxy_first} proxy"
+        );
+    }
+
+    #[test]
+    fn after_a_trip_the_teardown_keeps_the_table() {
+        // Nobody left and a trip: the table is the cut, and it stays, the user with it.
+        let kept = cleanup_for(false, true);
+        assert_eq!(kept, Cleanup::KeepRulesetAndUser);
+        assert!(
+            !kept.unloads_ruleset(),
+            "deleting the table would remove the cut"
+        );
+        assert!(
+            !kept.removes_user(),
+            "the uid the cut is keyed on is not freed"
+        );
+        assert_eq!(cleanup_for(true, true), Cleanup::KeepRulesetAndUser);
+        // Without a trip the decision is the one it always was.
+        assert_eq!(cleanup_for(false, false), cleanup_after(false));
+        assert_eq!(cleanup_for(true, false), cleanup_after(true));
+        assert_eq!(cleanup_for(false, false), Cleanup::Everything);
     }
 }

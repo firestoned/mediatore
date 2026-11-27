@@ -36,15 +36,33 @@ never sits behind a TLS-ending proxy: it is exposed as a TLS passthrough so the 
 | `POST /v1/nodes` | a pool VM | register the node: how it attested and its DMI UUID. A TPM node sends the top-level `ek_hash`; an x509pop node sends `attestation: {kind: x509pop, issuer_cn, subject_cn}` (ADR-0049 decision 8). The broker derives the node key from it and answers `403` unless the peer is `banlieue/node/<that key>`; an unknown kind or field, or an `x509pop` attestation beside a non-empty `ek_hash`, is `400 invalid_attestation`, and neither given is `400 invalid_ek_hash`. The first record under a node key stands: the same key under another DMI UUID is `409 duplicate_ek`, and under another agent ID (a key first registered under the other attestor) `409 node_identity_conflict`, with nothing changed and the line `node registration refused: the key is registered under another agent ID` in the broker's log (`NodeRecord::registration_conflict`, `crates/mediatore-store/src/lib.rs`, the one rule of both stores). An operator clears it by deleting the `SandboxNode` named by the key, once no live claim is bound to it |
 | `GET /v1/me` | the guest, as the node | the claim bound to that node: workload, routes, gateways, registry credential. The guest writes the routes to files for the egress proxy, which then needs no route of its own to read them |
 | `POST /v1/me/report` | the guest | what the VM found: the image digest, the ruleset's hash, the host table |
-| `POST /v1/me/exit` | the guest | the workload ended under its restart policy; the broker releases the claim |
-| `POST /v1/me/logs` | the guest, as the node | a batch of the workload's redacted output for a claim that opted in (ADR-0045): `204`, or `400` (malformed, or the claim did not opt in), `413`, `429` with `Retry-After: 1`, `501` unless `logs.enabled`; a node with no live claim is `204` and the batch dropped |
+| `POST /v1/me/exit` | the guest | the workload ended under its restart policy; the broker releases the claim. For a claim a tripwire ended it writes nothing and deletes nothing (`204`), and outside `dev_mode` the `AgentSandbox` is deleted only after the record is read again and found untripped (ADR-0069 decision 9) |
+| `POST /v1/me/logs` | the guest, as the node | a batch of the workload's redacted output for a claim that opted in (ADR-0045): `204`, or `400` (malformed, or the claim did not opt in), `413`, `429` with `Retry-After: 1`, `501` unless `logs.enabled`; a node with no live claim is `204` and the batch dropped, except that a claim a tripwire ended is still taken from the node it was bound to for 60 s after the trip was recorded (`LOGS_AFTER_A_TRIP`, ADR-0069 decision 9) |
+| `POST /v1/me/trip` | the guest, as the node | the use of a tripwire on the VM (ADR-0069 decision 8): `501` under `policy.traps: off`; `403` for a peer that is not a registered node; `400 invalid_trip` for a body off in any part, nothing recorded; `429 too_many_trips` with `Retry-After: 1` past two reports a second per claim; `204`. Each new event is one `trip reported` audit line and an entry of the sandbox's `status.tripwires`; under `enforce` the first that ends the claim writes `tripped` on the record and releases the claim, keeping the `AgentSandbox`. A node with no claim may send `segment` events alone (ADR-0070); a `segment` event is an audit line only and is never put on a claim |
 | `POST /v1/token` | the egress proxy, as the claim | a token for one audience (below) |
 | `GET /v1/gateway/claims/{uid}` | a gateway only | what a claim may reach (the allowlist for tunnels) |
 | `POST /v1/gateway/claims/{uid}/credential` | a gateway only | the credential for a gateway-placed audience (ADR-0040) |
-| `POST /v1/gateway/decisions` | a gateway only | the gateway's tunnel and inject decisions, one `info` line each naming the gateway and the host: `204`, or `400 invalid_decisions` for a batch of the wrong shape, logged not at all (ADR-0062, Proposed) |
+| `POST /v1/gateway/decisions` | a gateway only | the gateway's tunnel and inject decisions, one `info` line each naming the gateway and the host: `204`, or `400 invalid_decisions` for a batch of the wrong shape, logged not at all (ADR-0062, Proposed); since ADR-0070 also `probes`, at most 64, one `gateway probe` line each, stored nowhere; `429 too_many_batches` with `Retry-After: 1` past 20 batches a second for one gateway identity, nothing of the batch logged or judged (`GATEWAY_BATCHES_PER_SECOND`); the denies of at most 4 batches judged at once (`MAX_JUDGING_BATCHES`), a batch beyond that answered as always and its denies not judged |
 
 The gateway routes answer only the gateway authorizer's identity, `spiffe://<td>/gateway/authorizer` (ADR-0053); any
 other peer, the gateway's listeners, a node or a claim included, is refused.
+
+`GET /v1/claims/{name}` also carries `tripped` (the event that ended the claim) and `tripwires` (the latest folded
+events, at most 16) when a tripwire recorded anything (ADR-0069 decision 9); `ready` is false once tripped.
+
+### Refusals classified, answers unchanged (ADR-0070)
+
+Every route of the sandbox router is listed once, with the one role that calls it honestly (`sandbox_routes`, pinned by a
+test that fails when a role gains a call). After a refusal is decided, and without changing a byte of it, the broker
+classifies refusals no honest build earns: `identity_shape` at the handshake, `foreign_route` (an admitted identity on a
+route of another role), `unknown_route` (the router's fallback, which answers the same empty `404`), `no_record`,
+`audience_outside_rendered` on `POST /v1/token`, `claim_never_issued` and `credential_outside_inject` on the gateway
+routes, `deny_outside_rendered` from a decisions batch. Each is a folded `warn` line a minute per class and peer; a
+claim-scoped class set to `trip` in the `tripwires` section (`foreign_route`, `unknown_route`,
+`audience_outside_rendered`; `deny_outside_rendered` records only, being on the authorizer's word) ends its claim after
+the answer is sent. See
+[Tripwires](../guides/tripwires.md#past-the-jail-the-twelve-classes-of-adr-0070). Both routers' request span names the
+method and the matched route template, never the URI (`request{method route}`).
 
 ## Who is the peer
 
@@ -123,7 +141,9 @@ claim must name a policy whose verified bundle lists the audience).
 `AppState` carries what the handlers need and nothing mutable that is not behind a lock: the validator, the store
 (`dyn ClaimStore`), the sealer, the audience maps (`audiences`, `delegated`, `secrets`, `obo_audiences`), the
 registries and `reachable_registries`, the `gateways` and inject port, the sandbox front door, the limiter, the
-`policy_egress` mode, and `dev_mode`. It is built once in `crates/mediatore/src/main.rs` from the
+`policy_egress` mode, `tripwires` (the mode of `policy.traps`, the `denied` switches, what each class does, and the bounded
+tables behind them: the ids seen, the fold of classified refusals, the trip route's limiter, the decisions route's
+limiter and its judging permits), and `dev_mode`. It is built once in `crates/mediatore/src/main.rs` from the
 [configuration](configuration.md).
 
 ## Rules this part keeps
@@ -136,5 +156,5 @@ registries and `reachable_registries`, the `gateways` and inject port, the sandb
 ## Read next
 
 ADR-0008 (the front door), ADR-0013 and ADR-0035 (delegating a session or a credential), ADR-0040 and ADR-0041 (placing
-it at the gateway), ADR-0043 (the registry pull). Threat model TB-1 (user to API), TB-6 (VM to sandbox API), TB-17
+it at the gateway), ADR-0043 (the registry pull), ADR-0069 and ADR-0070 (tripwires). Threat model TB-1 (user to API), TB-6 (VM to sandbox API), TB-17
 (the gateway places a credential). Guide: [Requesting a sandbox](../guides/requesting-a-sandbox.md).

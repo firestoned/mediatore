@@ -89,6 +89,41 @@ loopback listener, the pull port, beside the workload's, **before** it prints it
 The workload cannot reach this port: no jail rule lists it (see [The guest](guest.md)). The command-line options that add
 it (`--pull-listen`, `--pull-host`) are appended by the guest only for such a claim (`pull_args`).
 
+## Tripwires (ADR-0069)
+
+Under `policy.traps` `shadow` or `enforce` the guest starts the proxy with `--trap-socket`. The proxy connects to the
+guest's socket, is handed the claim's decoy routes and bait values once (`GuestToProxy::Arm`), builds its matcher, answers
+`armed`, and only then prints its ready line; a proxy that cannot do all of that is not ready, and the claim does not
+start under `enforce`. With no `--trap-socket` its arguments and behaviour are what they were.
+
+Armed, it checks every request before anything leaves (`check_traps`, `trapmatch.rs`):
+
+- **The head**, before any route is consulted or name resolved: a host that is a decoy route; bait in the method, the
+  path, the query, any header's value (a Basic pair decoded) or any header's name, a trailer's included, as it is,
+  upper-cased and lower-cased.
+- **The body**, on a route whose audience is not `traps_body: skip`, streamed through a matcher that holds back one byte
+  less than the longest pattern, so a complete bait value is never forwarded. A gzip or deflate body is decoded for the
+  matcher within an expansion bound and forwarded as it came.
+
+| Status | Code | When |
+| --- | --- | --- |
+| `403` | `trap` | under `enforce`: a decoy route, bait in the head, bait in a body whose response has not started (otherwise the upstream stream is reset), and every request after a trip, after the guest said it decided one, or after the trap socket closed |
+| `404` | `no_route` | a decoy route under `shadow`, the same bytes an unknown host gets |
+| `415` | `unsupported_encoding` | under `enforce`, a body in an encoding other than identity, gzip and deflate on a matched route; forwarded unscanned under `shadow` |
+| `413` | `body_expansion` | under `enforce`, a compressed body past the expansion bound; forwarded under `shadow`; ends nothing |
+| `400` | `body_undecodable` | under `enforce`, a body that does not decode in its declared encoding; forwarded under `shadow`; ends nothing |
+
+Each use is told to the guest over the socket (kind, trap or class, host; never a value or a path), which decides what
+it does by the mode. A request for a host that is no route is still `404 no_route` and is also told, as the `denied` class
+`unknown_host`. A credential hit on a request that names no route is told and logged with the host `invalid`, never the
+request's first path segment, and any host in which a bait value is found is told as `invalid`. When the guest decides a
+trip of its own (a decoy port, a `denied` class) it writes `{"type":"tripped"}` on the socket before the cut, and the
+proxy answers `403 trap` to everything from then on and stays up for the kill; a body already streaming flows until the
+cut lands. If the socket closes the proxy answers `403 trap` to everything and exits, which ends the claim. The query
+is in no log line, a request a trap matched logs no path, and a line that names a method names one of the nine
+standard methods or `extension`. The response is not scanned, and the pull listener is
+matched against no trap. See [Tripwires](../guides/tripwires.md).
+
 ## Running it
 
 Before it reads or binds anything, `egress::run` closes every socket family but unix and inet to itself
@@ -121,5 +156,5 @@ two destinations), so a deployment moves the port when the broker or an audience
 
 ## Read next
 
-ADR-0025 (the phantom token), ADR-0027 and ADR-0028 (the gateway and the tunnel), ADR-0030, ADR-0040 and ADR-0043. Threat model
+ADR-0025 (the phantom token), ADR-0027 and ADR-0028 (the gateway and the tunnel), ADR-0030, ADR-0040, ADR-0043 and ADR-0069. Threat model
 TB-7 (the proxy to a downstream), TB-12 (the jail to the proxy), TB-13 (the forwarder to the gateway), TB-17. Roadmap 07.

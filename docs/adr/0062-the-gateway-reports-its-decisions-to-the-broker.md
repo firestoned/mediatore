@@ -65,6 +65,11 @@ deployment without the collector has no answer, and the claim's owner never has 
    credential. `served` is absent on an inject decision, `reason` on an allow, `audience` where no
    route matched.
 
+   *Amended 2026-11-27 by [ADR-0070](0070-tripwires-beyond-the-sandbox-a-request-no-honest-build-makes.md)
+   (its decisions 4 and 8): the batch may also carry `probes`, at most 64, what the gateway's host
+   table dropped since the last one, each one `warn` line at the broker and never stored; and a
+   reported deny may be classified `deny_outside_rendered`.*
+
 3. **The gateway's name is its own claim.** `mediatore gateway --name` (`MEDIATORE_GATEWAY_NAME`),
    by default the kernel's host name. Every gateway authenticates as the one authorizer identity,
    so the name is attribution, not authentication: the broker cannot tell one gateway from another
@@ -88,6 +93,14 @@ deployment without the collector has no answer, and the claim's owner never has 
    reason, where the allowlist came from and the gateway's time. The broker does not look the
    claim up: a line about a claim it no longer knows is still a fact about the gateway. Nothing
    is stored.
+
+   *Amended 2026-11-27 by [ADR-0070](0070-tripwires-beyond-the-sandbox-a-request-no-honest-build-makes.md)
+   (its decision 3, amended): the route now takes at most 20 batches a second per gateway
+   identity, a burst of 20, and answers `429 too_many_batches` with `Retry-After: 1` past it,
+   logging nothing of the batch (`GATEWAY_BATCHES_PER_SECOND`,
+   `crates/mediatore-api/src/tripwires.rs`); a batch refused as malformed spends nothing. Every
+   gateway shares the identity, so the bucket is the fleet's: forty gateways at the cadence of
+   decision 4. A gateway's reporter drops a refused batch, as it drops any failed one.*
 
 ## Consequences
 

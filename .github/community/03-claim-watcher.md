@@ -102,7 +102,8 @@ which are ADR-0050's decision 6 taken into ADR-0049, were built on 2026-11-27.
       hold): `make check` green, and after `make kind-delete`,
       `make kind-e2e-ci KIND_E2E_SUITES="kind-e2e-tpm kind-e2e-x509pop kind-e2e-gateway"`
       exit 0: `make kind-e2e-tpm` PASS (the TPM path this touches, attested as
-      `spiffe://sandbox.test/spire/agent/tpm/c963d1106f6744e0e0b2daf17f0e8c9f522c29809b9af2a7abf133ab7f71be03`),
+      `spiffe://sandbox.test/spire/agent/tpm/635102b3e8d66a197f56b6f96a19ac15460e6c60e090619b0eb3aef74014e3fe`
+      on the merged tree, where `make check` passed 1439 tests and `make kind-e2e-sandbox` passed too),
       the new `make kind-e2e-x509pop` PASS (a real SPIRE server and agent under
       `spiffe://sandbox.test/spire/agent/x509pop/kind-host/<machine uid>`, the watcher's
       entry, the real guest registering with `--node-attestation x509pop`, a claim bound

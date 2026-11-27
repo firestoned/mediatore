@@ -30,6 +30,10 @@ anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 serde_json.workspace = true
+# The probes reader (ADR-0070 decision 4): the host table's counters as `nft -j` prints them.
+serde.workspace = true
+# The flags the summary is opened with (`O_NONBLOCK`, `O_NOFOLLOW`): constants only, no unsafe.
+libc.workspace = true
 # The check service on a unix socket: tonic's incoming stream over `tokio::net::UnixListener` (ADR-0040 decision 6).
 tokio-stream = { version = "0.1", features = ["net"] }
 

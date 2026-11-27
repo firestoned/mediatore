@@ -29,7 +29,8 @@ use banlieue_api::banlieue::{
 use futures::{Stream, StreamExt};
 use kube::api::{DeleteParams, ListParams, Patch, PatchParams, PostParams};
 use kube::runtime::controller::{self, Action, Controller};
-use kube::runtime::watcher;
+use kube::runtime::reflector::{self, ObjectRef, Store, reflector};
+use kube::runtime::{WatchStreamExt as _, watcher};
 use kube::{Api, Client, ResourceExt};
 use mediatore_proto::ClaimPhase;
 use mediatore_proto::ek::ek_hash_from_pems;
@@ -1351,6 +1352,101 @@ fn log_stream_error<R: std::error::Error + 'static>(
         tracing::debug!(error = %err, "{controller} controller: routine");
     }
 }
+/// Whether `next` differs from `prev` in `status.tripwires` and in nothing the reconciler
+/// reads (ADR-0069 decision 9): the trip summary is the store's, written apart from the record
+/// and never by a pass, so an event that carries only a new one has nothing to reconcile.
+/// `metadata.resourceVersion` and `metadata.managedFields` move with every write and are not
+/// compared. False when the summary is the same (a re-list hands the same object again, and
+/// that still reconciles) and when anything else changed, the record included.
+#[must_use]
+pub fn differs_only_in_tripwires(prev: &AgentSandbox, next: &AgentSandbox) -> bool {
+    let trips = |sb: &AgentSandbox| sb.status.as_ref().and_then(|s| s.tripwires.clone());
+    trips(prev) != trips(next) && without_tripwires(prev) == without_tripwires(next)
+}
+
+/// `sb` as the reconciler compares it: without the trip summary and the two metadata fields
+/// that every write moves.
+fn without_tripwires(sb: &AgentSandbox) -> AgentSandbox {
+    let mut sb = sb.clone();
+    sb.metadata.resource_version = None;
+    sb.metadata.managed_fields = None;
+    if let Some(status) = sb.status.as_mut() {
+        status.tripwires = None;
+    }
+    sb
+}
+
+/// How many sandboxes [`TripwiresFilter`] may remember beyond those the reflector holds
+/// before it forgets the ones that are gone.
+const FILTER_SLACK: usize = 64;
+
+/// The sandbox controller's watch filter (ADR-0069 decision 9): the last object seen of each
+/// sandbox, so that an event which [`differs_only_in_tripwires`] from it is kept from the
+/// reconciler. Everything else passes, a first sight and an unchanged re-list included.
+#[derive(Default)]
+struct TripwiresFilter {
+    last: HashMap<ObjectRef<AgentSandbox>, AgentSandbox>,
+}
+
+impl TripwiresFilter {
+    /// Whether `sb` reaches the reconciler, remembering it either way: a second summary
+    /// after a first is compared with the first.
+    fn admit(&mut self, sb: &AgentSandbox) -> bool {
+        let key = ObjectRef::from_obj(sb);
+        let only_trips = self
+            .last
+            .get(&key)
+            .is_some_and(|prev| differs_only_in_tripwires(prev, sb));
+        self.last.insert(key, sb.clone());
+        !only_trips
+    }
+
+    /// Forget the sandboxes the reflector no longer holds, once there are more remembered
+    /// than it holds by [`FILTER_SLACK`]: the stream carries no deletion to forget one by.
+    fn prune(&mut self, held: &Store<AgentSandbox>) {
+        if self.last.len() > held.len().saturating_add(FILTER_SLACK) {
+            self.last.retain(|key, _| held.get(key).is_some());
+        }
+    }
+}
+
+/// `objects` without the events that differ only in `status.tripwires` from the last one seen
+/// of the same sandbox. Errors pass: the controller's backoff is driven by them.
+fn without_tripwire_only_events<S>(
+    objects: S,
+    held: Store<AgentSandbox>,
+) -> impl Stream<Item = Result<AgentSandbox, watcher::Error>>
+where
+    S: Stream<Item = Result<AgentSandbox, watcher::Error>>,
+{
+    let mut filter = TripwiresFilter::default();
+    objects.filter(move |event| {
+        let pass = match event {
+            Ok(sb) => {
+                filter.prune(&held);
+                filter.admit(sb)
+            }
+            Err(_) => true,
+        };
+        std::future::ready(pass)
+    })
+}
+
+/// The sandbox controller over every namespace: what [`Controller::new`] builds (a reflector
+/// over the watch, the applied objects as the trigger), with the events that carry only a new
+/// trip summary taken out of the trigger (ADR-0069 decision 9). The reflector's store still
+/// holds every object as last seen, so a pass reads the latest whatever triggered it.
+fn sandbox_controller(client: Client) -> Controller<AgentSandbox> {
+    let writer = reflector::store::Writer::<AgentSandbox>::default();
+    let held = writer.as_reader();
+    let objects = reflector(
+        writer,
+        watcher(Api::<AgentSandbox>::all(client), watcher::Config::default()),
+    )
+    .applied_objects();
+    Controller::for_stream(without_tripwire_only_events(objects, held.clone()), held)
+}
+
 /// After each resync: the nodes of VMs that are gone, then their node entries (ADR-0039,
 /// decisions 1 and 7), each logged and neither stopping the loop.
 async fn collect_gone(watcher: &Watcher) {
@@ -1372,16 +1468,13 @@ async fn collect_gone(watcher: &Watcher) {
 /// the first one ends (they do not end on their own). Run this on the Lease holder only.
 pub async fn run(client: Client, watcher: Arc<Watcher>) -> anyhow::Result<()> {
     let requeue = watcher.config().requeue;
-    let sandboxes = Controller::new(
-        Api::<AgentSandbox>::all(client.clone()),
-        watcher::Config::default(),
-    )
-    // A change to the owned claim (banlieue's status writes, its deletion) reconciles the
-    // sandbox that owns it.
-    .owns(
-        Api::<VirtualMachineClaim>::all(client.clone()),
-        watcher::Config::default().labels(MANAGED_BY_SELECTOR),
-    );
+    let sandboxes = sandbox_controller(client.clone())
+        // A change to the owned claim (banlieue's status writes, its deletion) reconciles the
+        // sandbox that owns it.
+        .owns(
+            Api::<VirtualMachineClaim>::all(client.clone()),
+            watcher::Config::default().labels(MANAGED_BY_SELECTOR),
+        );
     // A change to a policy's bundle reconciles every sandbox naming that policy (ADR-0026
     // decision 7), after the reflector on this replica admitted it, so the comparison never
     // runs against a cache that has not caught up.
@@ -1488,6 +1581,178 @@ mod tests {
 
     type StreamError = controller::Error<WatchError, watcher::Error>;
 
+    // ---------- ADR-0069 decision 9: the sandbox controller's watch filter ----------
+
+    fn watched_sandbox(name: &str, version: &str) -> AgentSandbox {
+        let mut sb = AgentSandbox::new(
+            name,
+            crate::sandbox::AgentSandboxSpec {
+                subject: crate::sandbox::SandboxSubject {
+                    issuer: "https://idp.example".into(),
+                    id: "octocat".into(),
+                    display: None,
+                },
+                pool_ref: Some(banlieue_api::common::LocalObjectReference {
+                    name: "pool".into(),
+                }),
+                pool_selector: None,
+                selection: None,
+                ttl_seconds: 600,
+                audiences: vec![],
+                workload: crate::sandbox::SandboxWorkload {
+                    image: "registry.internal:5000/x:1".into(),
+                    args: vec![],
+                    restart: None,
+                    logs: false,
+                },
+                policy_ref: None,
+            },
+        );
+        sb.metadata.namespace = Some("sandboxes".into());
+        sb.metadata.uid = Some(Uuid::new_v4().to_string());
+        sb.metadata.resource_version = Some(version.into());
+        sb.status = Some(AgentSandboxStatus::default());
+        sb
+    }
+
+    /// `sb` after the store folded `count` uses onto it: a new summary, a new version, and
+    /// the managed fields a status write moves.
+    fn folded(sb: &AgentSandbox, count: u64, version: &str) -> AgentSandbox {
+        use mediatore_proto::trip::{
+            TripEffect, TripEntry, TripKind, TripSource, TripSummary, TripTarget,
+        };
+        let at = jiff::Timestamp::from_second(1_800_000_000).unwrap();
+        let mut summary = TripSummary::default();
+        summary.fold(
+            &[TripEntry {
+                effect: TripEffect::WouldTrip,
+                kind: TripKind::Port,
+                trap: Some("redis".into()),
+                class: None,
+                target: Some(TripTarget::Port(6379)),
+                source: TripSource::Drawn,
+                source_address: None,
+                containment_ms: None,
+                count,
+                first_at: at,
+                last_at: at,
+            }],
+            at,
+        );
+        let mut next = sb.clone();
+        next.metadata.resource_version = Some(version.into());
+        next.metadata.managed_fields = Some(vec![
+            k8s_openapi::apimachinery::pkg::apis::meta::v1::ManagedFieldsEntry {
+                manager: Some(format!("mediatore-{version}")),
+                ..Default::default()
+            },
+        ]);
+        next.status.get_or_insert_default().tripwires =
+            Some(crate::sandbox::TripwiresStatus::from(&summary));
+        next
+    }
+
+    #[tokio::test]
+    async fn an_event_that_differs_only_in_tripwires_does_not_reach_the_reconciler_and_any_other_change_does()
+     {
+        let first = watched_sandbox("sb-1", "1");
+        let fold_1 = folded(&first, 1, "2");
+        let fold_2 = folded(&fold_1, 5, "3");
+        // The record, a mirrored field, a label, the spec's generation, a deletion: each is a
+        // change the reconciler must see, with or without a new summary beside it.
+        let mut recorded = fold_2.clone();
+        recorded.metadata.resource_version = Some("4".into());
+        recorded.status.as_mut().unwrap().reason = Some("tripped: port".into());
+        let mut labelled = recorded.clone();
+        labelled.metadata.resource_version = Some("5".into());
+        labelled.metadata.labels = Some([("a".to_owned(), "b".to_owned())].into());
+        let mut both = folded(&labelled, 9, "6");
+        both.status.as_mut().unwrap().entry_set = true;
+        let mut deleting = both.clone();
+        deleting.metadata.resource_version = Some("7".into());
+        deleting.metadata.deletion_timestamp = Some(
+            k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(jiff::Timestamp::UNIX_EPOCH),
+        );
+        let other = watched_sandbox("sb-2", "1");
+        let other_fold = folded(&other, 1, "2");
+
+        // The pure rule.
+        assert!(differs_only_in_tripwires(&first, &fold_1));
+        assert!(differs_only_in_tripwires(&fold_1, &fold_2));
+        assert!(
+            !differs_only_in_tripwires(&first, &first),
+            "the same object"
+        );
+        assert!(!differs_only_in_tripwires(&fold_2, &recorded));
+        assert!(!differs_only_in_tripwires(&recorded, &labelled));
+        assert!(!differs_only_in_tripwires(&labelled, &both));
+        assert!(!differs_only_in_tripwires(&both, &deleting));
+        let mut moved = first.clone();
+        moved.metadata.resource_version = Some("9".into());
+        assert!(
+            !differs_only_in_tripwires(&first, &moved),
+            "a version alone is no summary: it reconciles, as before"
+        );
+
+        // The stream the controller is triggered by.
+        let events = vec![
+            first.clone(),      // a first sight: reconciled
+            fold_1.clone(),     // a summary alone: kept back
+            other.clone(),      // another sandbox's first sight
+            fold_2.clone(),     // a second summary, compared with the first: kept back
+            fold_2.clone(),     // a re-list hands the same object again: reconciled
+            other_fold.clone(), // the other sandbox's summary: kept back
+            recorded.clone(),
+            labelled.clone(),
+            both.clone(),
+            deleting.clone(),
+        ];
+        let held = reflector::store::Writer::<AgentSandbox>::default().as_reader();
+        let stream = without_tripwire_only_events(
+            futures::stream::iter(events.into_iter().map(Ok)).chain(futures::stream::iter([Err(
+                watcher::Error::NoResourceVersion,
+            )])),
+            held,
+        );
+        let passed: Vec<Result<AgentSandbox, watcher::Error>> = stream.collect().await;
+        let versions: Vec<(String, String)> = passed
+            .iter()
+            .filter_map(|r| r.as_ref().ok())
+            .map(|sb| (sb.name_any(), sb.resource_version().unwrap_or_default()))
+            .collect();
+        let expected: Vec<(String, String)> = [
+            ("sb-1", "1"),
+            ("sb-2", "1"),
+            ("sb-1", "3"),
+            ("sb-1", "4"),
+            ("sb-1", "5"),
+            ("sb-1", "6"),
+            ("sb-1", "7"),
+        ]
+        .iter()
+        .map(|(n, v)| ((*n).to_owned(), (*v).to_owned()))
+        .collect();
+        assert_eq!(versions, expected);
+        assert!(
+            passed.last().is_some_and(Result::is_err),
+            "an error of the watch passes: the backoff is driven by it"
+        );
+    }
+
+    #[test]
+    fn the_filter_forgets_sandboxes_the_reflector_no_longer_holds() {
+        let held = reflector::store::Writer::<AgentSandbox>::default().as_reader();
+        let mut filter = TripwiresFilter::default();
+        for n in 0..=FILTER_SLACK {
+            assert!(filter.admit(&watched_sandbox(&format!("sb-{n}"), "1")));
+            filter.prune(&held);
+        }
+        assert!(
+            filter.last.is_empty(),
+            "past the slack, what the store lacks goes"
+        );
+    }
+
     fn expired_watch(code: u16) -> StreamError {
         controller::Error::QueueError(watcher::Error::WatchError(
             kube::core::Status::failure("too old resource version: 1 (2)", "Expired")
@@ -1526,6 +1791,7 @@ mod tests {
 
     fn record(uid: Uuid) -> ClaimRecord {
         ClaimRecord {
+            tripped: None,
             rendered: None,
             follow: None,
             uid,

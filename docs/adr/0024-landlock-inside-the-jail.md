@@ -89,6 +89,11 @@ of this workspace (ADR-0007, `deny.toml`).
    proxy's port alone (`JailSpec::proxy_port` is what `jail-exec` is handed, and `Plan` in
    `crates/mediatore-guest/src/confine.rs` is built from it).*
 
+   *Amended 2026-11-27 by [ADR-0069](0069-tripwires-on-the-vm-a-decoy-the-workload-takes-ends-its-sandbox.md)
+   (its decision 10): under `policy.traps` `shadow` or `enforce` the set also admits the claim's
+   drawn decoy ports, and port 80 when the metadata decoy is drawn; under `off` it is the proxy's
+   port alone.*
+
 3. **Through the `nono` library, pinned exactly, with the keyring feature off.** Not
    the raw `landlock` crate: nono carries the ABI detection and the hard-requirement
    checks (a kernel that cannot enforce what was asked is an error, never a silently

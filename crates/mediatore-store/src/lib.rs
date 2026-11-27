@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use jiff::Timestamp;
+use mediatore_proto::trip::{TripEntry, TripSummary, Tripped};
 use mediatore_proto::{
     ClaimReport, LogBatch, LogEntry, LogGap, Provider, Subject, Workload, WorkloadExit,
 };
@@ -134,6 +135,11 @@ pub struct ClaimRecord {
     /// decision 2); `None` for a claim that ran to its deadline or was released by hand.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit: Option<WorkloadExit>,
+    /// The event that ended the claim (ADR-0069 decision 9, ADR-0070 decision 6): written
+    /// once, by compare and set, before the release. A record with it set is never restarted
+    /// and issues nothing, even before `revoked_at` lands. `None` for a claim no trap ended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tripped: Option<Tripped>,
     /// What the guest was handed when it rendered (ADR-0061 decision 2), written once at the
     /// first `200` from `GET /v1/me` for a claim under a policy; `None` before, and on a record
     /// written before the ADR.
@@ -407,6 +413,26 @@ pub trait ClaimStore: LogStore {
     async fn revoke_claim(&self, uid: Uuid, at: Timestamp) -> Result<(), StoreError>;
     /// The live claim bound to a node (by the node's SPIRE agent SPIFFE ID).
     async fn get_claim_by_node(&self, node_id: &str) -> Result<ClaimRecord, StoreError>;
+    /// The newest claim ever bound to a node, live or ended, while its record is kept:
+    /// [`get_claim_by_node`](Self::get_claim_by_node) answers live ones only, and a trip
+    /// report can arrive after its claim ended (ADR-0069 decision 9). `NotFound` when the
+    /// node never had one, or every record of one has been swept.
+    async fn last_claim_by_node(&self, node_id: &str) -> Result<ClaimRecord, StoreError>;
+    /// Merge `delta` into the claim's trip summary with [`TripSummary::fold`] (ADR-0069
+    /// decision 9), apart from the record: no field of the record changes (a store may move
+    /// its version), and a record that is released takes a fold all the same. Two folds that
+    /// race both land (a store reads again and merges again). An empty `delta` writes
+    /// nothing. `NotFound` when the claim has no record. The summary goes when the record is
+    /// swept.
+    async fn fold_trips(
+        &self,
+        claim_uid: Uuid,
+        delta: &[TripEntry],
+        now: Timestamp,
+    ) -> Result<(), StoreError>;
+    /// The claim's trip summary; `None` when nothing was ever folded for it, and when the
+    /// claim has no record.
+    async fn trips(&self, claim_uid: Uuid) -> Result<Option<TripSummary>, StoreError>;
     /// All claims.
     async fn list_claims(&self) -> Result<Vec<ClaimRecord>, StoreError>;
 
@@ -542,6 +568,9 @@ pub struct MemoryStore {
     sessions: RwLock<HashMap<(Uuid, Option<String>), SessionRecord>>,
     floors: RwLock<HashMap<(String, String), PolicyFloor>>,
     logs: RwLock<HashMap<Uuid, LogRing>>,
+    /// Each claim's trip summary (ADR-0069 decision 9), apart from its record as
+    /// `status.tripwires` is on the cluster: kept while the record is, bounded by the fold.
+    trips: RwLock<HashMap<Uuid, TripSummary>>,
     /// The last record version handed out (ADR-0057 decision 1): every write of a record
     /// takes the next, so a stored record's version is its own and moves with each write.
     versions: AtomicU64,
@@ -806,6 +835,45 @@ impl ClaimStore for MemoryStore {
             .ok_or_else(|| StoreError::NotFound(node_id.to_owned()))
     }
 
+    async fn last_claim_by_node(&self, node_id: &str) -> Result<ClaimRecord, StoreError> {
+        self.claims
+            .read()
+            .await
+            .values()
+            .filter(|c| c.node_id.as_deref() == Some(node_id))
+            .max_by_key(|c| c.created_at)
+            .cloned()
+            .ok_or_else(|| StoreError::NotFound(node_id.to_owned()))
+    }
+
+    async fn fold_trips(
+        &self,
+        claim_uid: Uuid,
+        delta: &[TripEntry],
+        now: Timestamp,
+    ) -> Result<(), StoreError> {
+        // The claims lock is held across the write, so a sweep cannot remove the record
+        // between the check and the fold (claims before trips, as the sweep takes them).
+        let claims = self.claims.read().await;
+        if !claims.contains_key(&claim_uid) {
+            return Err(StoreError::NotFound(claim_uid.to_string()));
+        }
+        if delta.is_empty() {
+            return Ok(());
+        }
+        self.trips
+            .write()
+            .await
+            .entry(claim_uid)
+            .or_default()
+            .fold(delta, now);
+        Ok(())
+    }
+
+    async fn trips(&self, claim_uid: Uuid) -> Result<Option<TripSummary>, StoreError> {
+        Ok(self.trips.read().await.get(&claim_uid).cloned())
+    }
+
     async fn list_claims(&self) -> Result<Vec<ClaimRecord>, StoreError> {
         Ok(self.claims.read().await.values().cloned().collect())
     }
@@ -869,6 +937,13 @@ impl ClaimStore for MemoryStore {
         for uid in &gone {
             let c = claims.remove(uid).expect("selected above");
             tracing::info!(claim_uid = %c.uid, name = %c.name, subject = %c.subject.id, "claim swept after its retention");
+        }
+        // The summary goes with its record, as `status.tripwires` goes with the sandbox.
+        if !gone.is_empty() {
+            self.trips
+                .write()
+                .await
+                .retain(|uid, _| !gone.contains(uid));
         }
         Ok(gone.len())
     }
@@ -986,5 +1061,43 @@ mod tests {
         use super::*;
 
         crate::shared_suite!(MemoryStore::default());
+    }
+
+    /// The summary is kept while the record is and no longer: the memory store's own half of
+    /// the rule (on the cluster the status goes with the object).
+    #[tokio::test]
+    async fn a_swept_claims_trip_summary_goes_with_its_record() {
+        use mediatore_proto::trip::{TripEffect, TripKind, TripSource, TripTarget};
+        let store = MemoryStore::default();
+        let uid = Uuid::new_v4();
+        store.put_claim(conformance::claim(uid)).await.unwrap();
+        let at = Timestamp::from_second(1_700_000_000).unwrap();
+        let entry = TripEntry {
+            effect: TripEffect::Tripped,
+            kind: TripKind::Port,
+            trap: Some("redis".into()),
+            class: None,
+            target: Some(TripTarget::Port(6379)),
+            source: TripSource::Drawn,
+            source_address: None,
+            containment_ms: Some(41),
+            count: 1,
+            first_at: at,
+            last_at: at,
+        };
+        store.fold_trips(uid, &[entry], at).await.unwrap();
+        store.revoke_claim(uid, at).await.unwrap();
+        assert!(store.trips(uid).await.unwrap().is_some());
+        let later = Timestamp::from_second(1_700_000_100).unwrap();
+        assert_eq!(store.sweep(later).await.unwrap(), 1);
+        assert_eq!(store.trips(uid).await.unwrap(), None);
+    }
+
+    /// ADR-0069 decision 9: the cases of `tripped` and the trip summary, which
+    /// `mediatore-claims` runs over the Kubernetes store too.
+    mod shared_trips_memory {
+        use super::*;
+
+        crate::shared_trip_suite!(MemoryStore::default());
     }
 }

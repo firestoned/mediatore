@@ -29,6 +29,7 @@ use k8s_openapi::api::core::v1::Secret;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference, Time};
 use kube::api::{DeleteParams, ListParams, Patch, PatchParams, PostParams};
 use kube::{Api, Client, CustomResource, Resource, ResourceExt};
+use mediatore_proto::trip::{TripEntry, TripSummary, Tripped};
 use mediatore_proto::{
     ClaimReport, LOG_SEGMENT_BYTES, LogBatch, LogEntry, LogGap, Provider, Subject, Workload,
     WorkloadExit,
@@ -43,7 +44,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::sandbox::{AgentSandbox, FINALIZER, sandbox_uid_of};
+use crate::sandbox::{AgentSandbox, FINALIZER, TripwiresStatus, sandbox_uid_of};
 
 /// The label carrying the claim's UID on an `AgentSandbox` with a record.
 pub const CLAIM_UID_LABEL: &str = "mediatore.io/claim-uid";
@@ -158,6 +159,11 @@ pub struct RecordStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(schema_with = "preserve_arbitrary")]
     pub exit: Option<serde_json::Value>,
+    /// The event that ended the claim (ADR-0069 decision 9, ADR-0070 decision 6), as
+    /// `Tripped` serialises. Written once, before the release; never removed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "preserve_arbitrary")]
+    pub tripped: Option<serde_json::Value>,
     /// What the guest was handed when it rendered (ADR-0061 decision 2), as `Rendered`
     /// serialises.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1147,6 +1153,16 @@ fn carries_claim(sb: &AgentSandbox, uid: Uuid) -> bool {
         && record_status_of(sb).is_some_and(|r| r.claim_uid == uid)
 }
 
+/// The trip summary on `sb` (`status.tripwires`, ADR-0069 decision 9); `None` when nothing
+/// was folded for it. Apart from the record: [`record_from`] never reads it.
+fn trips_of(sb: &AgentSandbox) -> Option<TripSummary> {
+    sb.status
+        .as_ref()?
+        .tripwires
+        .as_ref()
+        .map(TripSummary::from)
+}
+
 /// The record on `sb` as its status alone gives it: no envelope is read, so `refresh` and
 /// `delegations` are empty. For the callers that read neither (the sweeps).
 fn head_of(sb: &AgentSandbox) -> Result<ClaimRecord, StoreError> {
@@ -1695,6 +1711,10 @@ fn record_status_from(rec: &ClaimRecord) -> RecordStatus {
             .as_ref()
             .and_then(|r| serde_json::to_value(r).ok()),
         exit: rec.exit.as_ref().and_then(|x| serde_json::to_value(x).ok()),
+        tripped: rec
+            .tripped
+            .as_ref()
+            .and_then(|t| serde_json::to_value(t).ok()),
         rendered: rec
             .rendered
             .as_ref()
@@ -1719,7 +1739,21 @@ fn record_from(sb: &AgentSandbox, status: &RecordStatus) -> Result<ClaimRecord, 
     let uid = Uuid::parse_str(&status.claim_uid)
         .map_err(|e| StoreError::Backend(format!("status.record.claimUid: {e}")))?;
     let created_at = status.created_at.0;
+    // Fail closed (ADR-0069 decision 9): a `tripped` this build cannot read is never read as
+    // no trip, which would let a claim a trap ended go on issuing until its release lands.
+    let tripped = status
+        .tripped
+        .clone()
+        .map(serde_json::from_value::<Tripped>)
+        .transpose()
+        .map_err(|_| {
+            StoreError::Backend(
+                "status.record.tripped: not a trip this build reads; the record is not served"
+                    .into(),
+            )
+        })?;
     Ok(ClaimRecord {
+        tripped,
         rendered: status
             .rendered
             .clone()
@@ -2307,6 +2341,81 @@ impl ClaimStore for KubeStore {
             .ok_or_else(|| StoreError::NotFound(node_id.to_owned()))
     }
 
+    async fn last_claim_by_node(&self, node_id: &str) -> Result<ClaimRecord, StoreError> {
+        // The list of `get_claim_by_node`, without its test for a live claim: a trip report
+        // can arrive after its claim ended (ADR-0069 decision 9).
+        let list = self
+            .all_sandboxes()
+            .list(&ListParams::default().labels(&format!("{NODE_LABEL}={}", node_label(node_id))))
+            .await
+            .map_err(|e| backend(&e))?;
+        let mut bound: Vec<ClaimRecord> = Vec::new();
+        for sb in &list.items {
+            if let Ok(rec) = self.record_of(sb).await
+                && rec.node_id.as_deref() == Some(node_id)
+            {
+                bound.push(rec);
+            }
+        }
+        bound
+            .into_iter()
+            .max_by_key(|c| c.created_at)
+            .ok_or_else(|| StoreError::NotFound(node_id.to_owned()))
+    }
+
+    async fn fold_trips(
+        &self,
+        claim_uid: Uuid,
+        delta: &[TripEntry],
+        now: Timestamp,
+    ) -> Result<(), StoreError> {
+        // Compare and set, read again and merged again on a conflict (ADR-0069 decision 9):
+        // two replicas folding at once both land, each on what the other wrote. The patch
+        // names `status.tripwires` and the version it was merged at, and nothing else, so no
+        // field of the record moves; a released record takes it all the same.
+        for _ in 0..MODIFY_ATTEMPTS {
+            let sb = self.sandbox_of_claim(claim_uid).await?;
+            if delta.is_empty() {
+                return Ok(());
+            }
+            let name = sb.name_any();
+            let Some(read_at) = sb.metadata.resource_version.as_deref() else {
+                return Err(StoreError::Conflict(format!(
+                    "sandbox {name} was read with no resourceVersion"
+                )));
+            };
+            let mut summary = trips_of(&sb).unwrap_or_default();
+            summary.fold(delta, now);
+            let patch = serde_json::json!({
+                "metadata": { "resourceVersion": read_at },
+                "status": { "tripwires": TripwiresStatus::from(&summary) },
+            });
+            match self
+                .sandboxes_of(&sb)
+                .patch_status(&name, &PatchParams::default(), &Patch::Merge(patch))
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(e) if is_conflict(&e) => {}
+                Err(e) if is_not_found(&e) => {
+                    return Err(StoreError::NotFound(claim_uid.to_string()));
+                }
+                Err(e) => return Err(backend(&e)),
+            }
+        }
+        Err(StoreError::Conflict(format!(
+            "claim {claim_uid}: its sandbox moved under {MODIFY_ATTEMPTS} attempts to fold its trip summary"
+        )))
+    }
+
+    async fn trips(&self, claim_uid: Uuid) -> Result<Option<TripSummary>, StoreError> {
+        match self.sandbox_of_claim(claim_uid).await {
+            Ok(sb) => Ok(trips_of(&sb)),
+            Err(StoreError::NotFound(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     async fn list_claims(&self) -> Result<Vec<ClaimRecord>, StoreError> {
         let mut out = Vec::new();
         for sb in self.sandboxes_with_records().await? {
@@ -2801,6 +2910,10 @@ mod tests {
             /// the object's `resourceVersion` is moved before the patch's own precondition is
             /// checked, as a mirror's patch landing between a read and a write would move it.
             pub moves_before_patch: usize,
+            /// A status another replica writes just before the next sandbox patch is checked:
+            /// merged into the object, whose `resourceVersion` moves, as a fold landing between
+            /// this store's read and its write would (ADR-0069 decision 9). Taken once.
+            pub lands_before_patch: Option<serde_json::Value>,
         }
 
         /// A store over the fake API server, sealing output with a local key.
@@ -3021,6 +3134,10 @@ mod tests {
         ) -> (u16, serde_json::Value) {
             if st.moves_before_patch > 0 {
                 st.moves_before_patch -= 1;
+                move_version(&mut st.sandboxes[i]);
+            }
+            if let Some(status) = st.lands_before_patch.take() {
+                merge(&mut st.sandboxes[i]["status"], &status);
                 move_version(&mut st.sandboxes[i]);
             }
             // A patch that names a `resourceVersion` is conditional on it, through the
@@ -4170,6 +4287,7 @@ mod tests {
             format: FORMAT_BARE_UID,
         };
         let rec = ClaimRecord {
+            tripped: None,
             rendered: None,
             follow: None,
             uid,
@@ -4452,6 +4570,7 @@ mod tests {
     /// A record with the fields the ring reads: its UID, no sandbox yet.
     fn test_record(uid: Uuid) -> ClaimRecord {
         ClaimRecord {
+            tripped: None,
             rendered: None,
             follow: None,
             uid,
@@ -6121,6 +6240,321 @@ mod tests {
         );
     }
 
+    // ---------- ADR-0069 decision 9: `tripped` on the record, `status.tripwires` ----------
+
+    use mediatore_proto::trip::{TripClass, TripEffect, TripKind, TripSource, TripTarget};
+
+    fn second(secs: i64) -> Timestamp {
+        Timestamp::from_second(1_800_000_000 + secs).unwrap()
+    }
+
+    /// One use of a decoy port, as an entry.
+    fn port_entry(effect: TripEffect, port: u16, secs: i64, count: u64) -> TripEntry {
+        TripEntry {
+            effect,
+            kind: TripKind::Port,
+            trap: Some("redis".into()),
+            class: None,
+            target: Some(TripTarget::Port(port)),
+            source: TripSource::Drawn,
+            source_address: None,
+            containment_ms: None,
+            count,
+            first_at: second(secs),
+            last_at: second(secs),
+        }
+    }
+
+    fn a_trip() -> Tripped {
+        Tripped {
+            id: Uuid::new_v4(),
+            at: second(1),
+            recorded_at: second(2),
+            kind: TripKind::Denied,
+            trap: None,
+            class: Some(TripClass::UnknownHost),
+            target: Some(TripTarget::Host("mirror.example".into())),
+            source: TripSource::Workload,
+        }
+    }
+
+    #[tokio::test]
+    async fn the_trip_fold_patch_names_status_tripwires_and_the_resource_version_and_nothing_else()
+    {
+        let (state, claim) = fake::seed(false);
+        let store = fake::store(&state);
+        let record_before = state.lock().unwrap().sandboxes[0]["status"]["record"].clone();
+        store
+            .fold_trips(
+                claim,
+                &[port_entry(TripEffect::WouldTrip, 6379, 0, 2)],
+                second(5),
+            )
+            .await
+            .unwrap();
+        let st = state.lock().unwrap();
+        let sent = fake::sandbox_patches(&st);
+        assert_eq!(sent.len(), 1, "one status patch");
+        assert_eq!(keys(sent[0]), vec!["metadata", "status"]);
+        assert_eq!(keys(&sent[0]["metadata"]), vec!["resourceVersion"]);
+        assert_eq!(
+            sent[0]["metadata"]["resourceVersion"], "1",
+            "it names the version the summary was merged at"
+        );
+        assert_eq!(
+            keys(&sent[0]["status"]),
+            vec!["tripwires"],
+            "and status.tripwires alone: never the record, never a mirrored field"
+        );
+        assert_eq!(
+            fake::writes(&st),
+            vec![(
+                "PATCH",
+                "/apis/mediatore.io/v1beta1/namespaces/team-a/agentsandboxes/sb-1/status"
+            )],
+            "through the status subresource, and no Secret is touched"
+        );
+        let held = &st.sandboxes[0]["status"];
+        assert_eq!(
+            held["record"], record_before,
+            "no field of the record moved"
+        );
+        assert_eq!(held["tripwires"]["entries"][0]["count"], 2);
+        assert_eq!(held["tripwires"]["entries"][0]["effect"], "would_trip");
+        assert_eq!(held["tripwires"]["entries"][0]["target"]["port"], 6379);
+        assert_eq!(held["tripwires"]["updatedAt"], "2027-01-15T08:00:05Z");
+    }
+
+    #[tokio::test]
+    async fn the_record_patch_never_names_tripwires_and_the_mirror_never_names_tripwires() {
+        let (state, claim) = fake::seed(false);
+        let store = fake::store(&state);
+        store
+            .fold_trips(
+                claim,
+                &[port_entry(TripEffect::WouldTrip, 6379, 0, 1)],
+                second(1),
+            )
+            .await
+            .unwrap();
+        let folded = state.lock().unwrap().sandboxes[0]["status"]["tripwires"].clone();
+        // An update of the record, and the release: neither names the summary.
+        let mut rec = store.get_claim(claim).await.unwrap();
+        rec.entry_id = Some("entry-1".into());
+        store.update_claim(rec).await.unwrap();
+        store.revoke_claim(claim, second(9)).await.unwrap();
+        {
+            let st = state.lock().unwrap();
+            let sent = fake::sandbox_patches(&st);
+            assert_eq!(sent.len(), 3, "the fold, the update, the release");
+            for record_patch in &sent[1..] {
+                assert_eq!(keys(&record_patch["status"]), vec!["record"]);
+            }
+            assert_eq!(
+                st.sandboxes[0]["status"]["tripwires"], folded,
+                "the summary is as the fold left it"
+            );
+        }
+        // The mirror (`sandbox::mirror`) clears `tripwires` on the status it sends, whatever
+        // the object it was handed carried: such a status serialises with no `tripwires` key.
+        let handed: crate::sandbox::AgentSandboxStatus =
+            serde_json::from_value(state.lock().unwrap().sandboxes[0]["status"].clone()).unwrap();
+        assert!(handed.tripwires.is_some(), "the object carries the summary");
+        let mirrored = crate::sandbox::AgentSandboxStatus {
+            record: None,
+            tripwires: None,
+            ..handed
+        };
+        let patch = serde_json::json!({ "status": mirrored });
+        assert!(patch["status"].get("tripwires").is_none());
+        assert!(patch["status"].get("record").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_409_on_the_fold_reads_again_and_merges_again_so_two_replicas_add_up() {
+        let (state, claim) = fake::seed(false);
+        let store = fake::store(&state);
+        let first = [port_entry(TripEffect::WouldTrip, 6379, 0, 2)];
+        store.fold_trips(claim, &first, second(1)).await.unwrap();
+        // Another replica folds between this store's read and its patch: three more uses of
+        // the same decoy and a first use of another.
+        let theirs = [
+            port_entry(TripEffect::WouldTrip, 6379, 10, 3),
+            port_entry(TripEffect::WouldTrip, 22, 11, 1),
+        ];
+        let mut after_theirs = TripSummary::default();
+        after_theirs.fold(&first, second(1));
+        after_theirs.fold(&theirs, second(12));
+        state.lock().unwrap().lands_before_patch = Some(serde_json::json!({
+            "tripwires": TripwiresStatus::from(&after_theirs),
+        }));
+        let ours = [port_entry(TripEffect::WouldTrip, 6379, 20, 4)];
+        store.fold_trips(claim, &ours, second(21)).await.unwrap();
+
+        let mut expected = after_theirs.clone();
+        expected.fold(&ours, second(21));
+        let held = store.trips(claim).await.unwrap().expect("a summary");
+        assert!(held == expected, "both replicas' folds are in the summary");
+        let redis = held
+            .entries
+            .iter()
+            .find(|e| e.target == Some(TripTarget::Port(6379)))
+            .expect("the entry both folded");
+        assert_eq!(redis.count, 9, "two, three and four add up");
+        {
+            let st = state.lock().unwrap();
+            let sent = fake::sandbox_patches(&st);
+            assert_eq!(
+                sent.len(),
+                3,
+                "the first fold, the refused one, the merged one"
+            );
+            assert_eq!(sent[1]["metadata"]["resourceVersion"], "2");
+            assert_eq!(
+                sent[1]["status"]["tripwires"]["entries"][0]["count"], 6,
+                "the refused patch was merged on the stale read"
+            );
+            assert_eq!(
+                sent[2]["metadata"]["resourceVersion"], "3",
+                "the second attempt names the version it read again"
+            );
+        }
+
+        // A sandbox that never stops moving: the fold gives up with a conflict, nothing lost
+        // silently.
+        state.lock().unwrap().moves_before_patch = MODIFY_ATTEMPTS;
+        let lost = store.fold_trips(claim, &ours, second(30)).await;
+        assert!(matches!(lost, Err(StoreError::Conflict(_))));
+    }
+
+    #[tokio::test]
+    async fn tripped_round_trips_through_status_record() {
+        let (state, claim) = fake::seed(false);
+        let store = fake::store(&state);
+        let mut rec = store.get_claim(claim).await.unwrap();
+        assert!(rec.tripped.is_none());
+        let tripped = a_trip();
+        rec.tripped = Some(tripped.clone());
+        store.update_claim(rec).await.unwrap();
+        {
+            let st = state.lock().unwrap();
+            let stored = &st.sandboxes[0]["status"]["record"]["tripped"];
+            assert_eq!(stored["kind"], "denied");
+            assert_eq!(stored["class"], "unknown_host");
+            assert_eq!(stored["target"]["host"], "mirror.example");
+            assert_eq!(stored["id"], tripped.id.to_string());
+        }
+        let read = store.get_claim(claim).await.unwrap();
+        assert!(read.tripped.as_ref() == Some(&tripped), "field for field");
+        // A later update of the same record and the release both keep it.
+        let mut again = read;
+        again.entry_id = Some("entry-1".into());
+        store.update_claim(again).await.unwrap();
+        store.revoke_claim(claim, second(9)).await.unwrap();
+        let released = store.get_claim(claim).await.unwrap();
+        assert!(released.revoked_at.is_some() && released.tripped == Some(tripped));
+    }
+
+    #[tokio::test]
+    async fn a_tripped_this_build_cannot_read_is_never_read_as_no_trip() {
+        let (state, claim) = fake::seed(false);
+        let store = fake::store(&state);
+        state.lock().unwrap().sandboxes[0]["status"]["record"]["tripped"] =
+            serde_json::json!({ "kind": "a-kind-of-a-later-build" });
+        let read = store.get_claim(claim).await;
+        assert!(
+            matches!(read, Err(StoreError::Backend(_))),
+            "the record is not served as one no trap ended"
+        );
+        // It can still be released: a release reads no field of the trip.
+        store.revoke_claim(claim, second(9)).await.unwrap();
+        let st = state.lock().unwrap();
+        assert!(st.sandboxes[0]["status"]["record"]["revokedAt"].is_string());
+    }
+
+    #[tokio::test]
+    async fn a_fold_lands_on_a_released_record() {
+        let (state, claim) = fake::seed(true);
+        let store = fake::store(&state);
+        let record_before = state.lock().unwrap().sandboxes[0]["status"]["record"].clone();
+        store
+            .fold_trips(
+                claim,
+                &[port_entry(TripEffect::Tripped, 6379, 0, 1)],
+                second(1),
+            )
+            .await
+            .unwrap();
+        let held = store.trips(claim).await.unwrap().expect("a summary");
+        assert_eq!(held.entries.len(), 1);
+        assert_eq!(held.entries[0].effect, TripEffect::Tripped);
+        let st = state.lock().unwrap();
+        assert_eq!(
+            st.sandboxes[0]["status"]["record"], record_before,
+            "the released record is as it was, revokedAt included"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_record_reader_never_reads_status_tripwires() {
+        let (state, claim) = fake::seed(false);
+        let store = fake::store(&state);
+        let before = store.get_claim(claim).await.unwrap();
+        store
+            .fold_trips(
+                claim,
+                &[port_entry(TripEffect::Tripped, 6379, 0, 1)],
+                second(1),
+            )
+            .await
+            .unwrap();
+        let after = store.get_claim(claim).await.unwrap();
+        assert!(
+            after.tripped.is_none() && after.revoked_at.is_none(),
+            "an entry that says tripped sets nothing on the record"
+        );
+        let mut same = after.clone();
+        same.version.clone_from(&before.version);
+        assert!(
+            serde_json::to_value(&same).unwrap() == serde_json::to_value(&before).unwrap(),
+            "the record is the same but for its version"
+        );
+        assert!(
+            after.version != before.version,
+            "the fold moved the version"
+        );
+        // A summary this build cannot read is no summary, and the record still reads.
+        state.lock().unwrap().sandboxes[0]["status"]["tripwires"] =
+            serde_json::json!({ "entries": [{ "effect": "a-later-builds-word" }] });
+        assert!(store.get_claim(claim).await.is_ok());
+        assert!(store.trips(claim).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn the_last_claim_of_a_node_reads_every_sandbox_labelled_for_it_live_or_not() {
+        let (state, claim) = fake::seed(false);
+        let store = fake::store(&state);
+        let node = "spiffe://sandbox.test/spire/agent/tpm/ek-1";
+        let mut rec = store.get_claim(claim).await.unwrap();
+        rec.node_id = Some(node.into());
+        rec.expires_at = Some(Timestamp::now() + jiff::SignedDuration::from_hours(1));
+        store.update_claim(rec).await.unwrap();
+        assert_eq!(store.get_claim_by_node(node).await.unwrap().uid, claim);
+        store.revoke_claim(claim, Timestamp::now()).await.unwrap();
+        assert!(matches!(
+            store.get_claim_by_node(node).await,
+            Err(StoreError::NotFound(_))
+        ));
+        let last = store.last_claim_by_node(node).await.unwrap();
+        assert!(last.uid == claim && last.revoked_at.is_some());
+        assert!(matches!(
+            store
+                .last_claim_by_node("spiffe://sandbox.test/spire/agent/tpm/ek-2")
+                .await,
+            Err(StoreError::NotFound(_))
+        ));
+    }
+
     #[test]
     fn the_mirrors_patch_never_names_the_record() {
         // The mirror (`sandbox::mirror`) clears `record` on the status it sends and sends
@@ -6178,5 +6612,12 @@ mod tests {
         use super::*;
 
         mediatore_store::shared_suite!(OnFake::new());
+    }
+
+    /// The cases of `tripped` and the trip summary (ADR-0069 decision 9) over this store.
+    mod shared_trips_over_the_fake_api_server {
+        use super::*;
+
+        mediatore_store::shared_trip_suite!(OnFake::new());
     }
 }

@@ -214,6 +214,7 @@ mod tests {
 
     fn record(uid: Uuid) -> ClaimRecord {
         ClaimRecord {
+            tripped: None,
             rendered: None,
             follow: None,
             uid,

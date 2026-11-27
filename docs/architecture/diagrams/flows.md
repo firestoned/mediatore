@@ -22,7 +22,8 @@ transitions in sequence order. The flows modelled today, from the
 - **A private image pulled with the person&#x27;s own credential, which the VM never sees (ADR-0043)** (`flow-registry-pull-placed`)
 - **A one-shot workload&#x27;s output read back by its owner (ADR-0045)** (`flow-workload-output`)
 - **A claim&#x27;s image pulled through its own proxy and a gateway, under its namespace&#x27;s policy (ADR-0063)** (`flow-registry-pull-gateway`)
-- **A bait credential sent by a hijacked workload ends its sandbox (ADR-0069, planned)** (`flow-tripwire`)
+- **A bait credential sent by a hijacked workload ends its sandbox (ADR-0069, accepted and implemented 2026-11-27)** (`flow-tripwire`)
+- **A claim SVID used off-script at the broker ends its claim (ADR-0070, accepted and implemented 2026-11-27)** (`flow-protocol-trip`)
 
 
 ## Claim a sandbox and act as the user
@@ -155,23 +156,40 @@ flowchart TD
 <sub>Source: flow `flow-registry-pull-gateway` in `architecture.json`.</sub>
 
 
-## A bait credential sent by a hijacked workload ends its sandbox (ADR-0069, planned)
+## A bait credential sent by a hijacked workload ends its sandbox (ADR-0069, accepted and implemented 2026-11-27)
 
-Under policy.traps enforce: the draw at boot, a request carrying bait refused on the VM before any byte of the bait leaves, containment on the VM, the report, the record and the release. A decoy port is the same from step 4 on, the guest's listener in place of the proxy (rel-workload-decoy-listeners). The gateway takes no part.
+Under policy.traps enforce: the draw at boot, a request carrying bait refused on the VM before any byte of the bait leaves, containment on the VM, the report, the record and the release. A decoy port is the same from step 4 on, the guest's trap listener in place of the proxy (rel-workload-decoy-listeners). The gateway takes no part.
 
 ```mermaid
 flowchart TD
-    t1["1. GET /v1/me answers with the claim, policy.traps: enforce and the bundle's traps catalogue."]
-    t2["2. The guest draws the claim's traps from the OS CSPRNG, redraws every collision, arms its decoy listeners and the sandbox uid's metadata redirect, plants the bait in the jail's environment and the sandbox user's home, and only then reports ready."]
+    t1["1. GET /v1/me answers with the claim and traps: the mode enforce and what each denied class does. No catalogue yet: the bundle's traps section waits on notaio, so the draw is made from the seeds, the generated and the derived entries."]
+    t2["2. The guest draws the claim's traps from the OS CSPRNG, redraws every collision, arms its trap listener and the sandbox uid's redirect of the decoy ports and the metadata address to it, and plants the bait in the jail's environment and the sandbox user's home. A guest that cannot arm starts no jail."]
     t3["3. The guest hands the proxy the drawn decoy routes and bait values; the jail starts."]
     t4["4. The hijacked workload sends a bait value in a request to one of its routes; the proxy's matcher finds it before the complete value is forwarded, resets the upstream stream and answers 403 trap."]
     t5["5. The proxy forwards nothing more for the claim and tells the guest; the guest drops every packet of the sandbox uid in one nft transaction, kills the jail's process tree and flushes the workload output."]
-    t6["6. POST /v1/me/trip with the event, retried until the broker answers 204."]
-    t7["7. The audit line; tripped on the record by compare-and-set; the event folded into status.tripwires; the Tripped condition; the trip span and counters exported when telemetry is on."]
+    t6["6. POST /v1/me/trip with the event, retried until the broker answers 204, for at most 120 s before the guest's teardown."]
+    t7["7. The audit line; tripped on the record by compare-and-set; the event folded into status.tripwires. No telemetry is exported: the OpenTelemetry part waits on roadmap 15's exporter."]
     t8["8. The release: the ClusterStaticEntry is deleted and the claim SVID stops renewing."]
-    t9["9. The VirtualMachineClaim is deleted and banlieue destroys the member; the AgentSandbox is not claimed again until its spec changes or the trip is acknowledged."]
+    t9["9. The reconciler deletes the VirtualMachineClaim and banlieue destroys the member; the AgentSandbox is marked Failed with the Tripped condition and never claimed again; its record released, the retention sweep deletes it store.retention_secs later."]
     t1 --> t2 --> t3 --> t4 --> t5 --> t6 --> t7 --> t8 --> t9
 ```
 
 <sub>Source: flow `flow-tripwire` in `architecture.json`.</sub>
+
+
+## A claim SVID used off-script at the broker ends its claim (ADR-0070, accepted and implemented 2026-11-27)
+
+A process outside the jail holds the claim SVID and asks the broker for what the egress proxy's code never asks. With the class set to trip in the broker's tripwires section: the classification, the refusal unchanged byte for byte, tripped on the record, the release, the VirtualMachineClaim deleted. At report, the default, the flow stops after step 2 with the audit line and the status entry. No bait, no decoy and no list to avoid: the trap is the request no honest build makes. The guest and the proxy take no part, since they may be what was bypassed.
+
+```mermaid
+flowchart TD
+    t1["1. Under the claim SVID, POST /v1/token names an audience that is in no route of the claim's rendered (or the claim identity calls a node or gateway route, or a path the router does not serve)."]
+    t2["2. The broker answers exactly what the route answers today (unknown_audience, 403 or 404), and after the answer is built classifies the refusal: audience_outside_rendered (foreign_route, unknown_route), folded per class and peer into one audit line a minute. Never a path, a query, a header, a body or a token."]
+    t3["3. Off the response path: tripped on the record by compare-and-set (kind protocol, source peer, the class), an entry folded into status.tripwires, then the release of the claim."]
+    t4["4. The release: the ClusterStaticEntry is deleted and the claim SVID stops renewing; the broker refuses the revoked claim at once, the gateways within fresh_secs."]
+    t5["5. The reconciler deletes the VirtualMachineClaim and banlieue destroys the member; the AgentSandbox is marked Failed with the Tripped condition, reason protocol. There is no containment on the VM to wait for."]
+    t1 --> t2 --> t3 --> t4 --> t5
+```
+
+<sub>Source: flow `flow-protocol-trip` in `architecture.json`.</sub>
 

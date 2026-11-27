@@ -402,9 +402,141 @@ spec:
                       before the ADR, which is read until its claim ends.
                     nullable: true
                     type: string
+                  tripped:
+                    description: |-
+                      The event that ended the claim (ADR-0069 decision 9, ADR-0070 decision 6), as
+                      `Tripped` serialises. Written once, before the release; never removed.
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true
                 required:
                 - claimUid
                 - createdAt
+                type: object
+              tripwires:
+                description: |-
+                  The claim's trip summary (ADR-0069 decision 9, ADR-0070 decision 8): what traps were
+                  used, folded and bounded. The store's, as `record` is: written by `KubeStore` alone in a
+                  patch that names nothing else, and left out of the reconciler's mirroring, which never
+                  names it. A value this build cannot read (written by a newer one) reads as absent, so
+                  that it never makes the sandbox, and the record on it, unreadable.
+                nullable: true
+                properties:
+                  entries:
+                    default: []
+                    description: At most sixteen entries, the latest first, replaced whole by every write.
+                    items:
+                      description: "One folded entry of [`TripwiresStatus`]: [`TripEntry`] as the resource spells it."
+                      properties:
+                        class:
+                          description: The class, on `denied`, `protocol` and `segment`.
+                          enum:
+                          - loopback_port
+                          - private_range
+                          - unknown_host
+                          - identity_shape
+                          - foreign_route
+                          - unknown_route
+                          - no_record
+                          - audience_outside_rendered
+                          - claim_never_issued
+                          - credential_outside_inject
+                          - deny_outside_rendered
+                          - gateway_port
+                          - gateway_output
+                          - pool_inbound
+                          - pool_output
+                          type: string
+                        containmentMs:
+                          description: Milliseconds from the verdict to the network cut, the first figure reported.
+                          maximum: 600000.0
+                          minimum: 0.0
+                          type: integer
+                        count:
+                          description: How many uses.
+                          maximum: 9007199254740991.0
+                          minimum: 1.0
+                          type: integer
+                        effect:
+                          description: |-
+                            What the events folded here did: `would_trip` under shadow, `reported` for a class at
+                            `report`, `tripped` when they ended the claim.
+                          enum:
+                          - would_trip
+                          - reported
+                          - tripped
+                          type: string
+                        firstAt:
+                          description: The earliest event folded here, by the reporter's clock.
+                          format: date-time
+                          type: string
+                        kind:
+                          description: What kind of trap.
+                          enum:
+                          - port
+                          - route
+                          - credential
+                          - denied
+                          - protocol
+                          - segment
+                          type: string
+                        lastAt:
+                          description: The latest.
+                          format: date-time
+                          type: string
+                        source:
+                          description: "Whose value the target is: `drawn` (the guest's own), `workload` or `peer`."
+                          enum:
+                          - drawn
+                          - workload
+                          - peer
+                          type: string
+                        sourceAddress:
+                          description: The peer's address, on a `segment` entry of an inbound class.
+                          maxLength: 45
+                          type: string
+                        target:
+                          description: "What was reached for: exactly one of `host`, `port` and `address`."
+                          maxProperties: 1
+                          minProperties: 1
+                          properties:
+                            address:
+                              maxLength: 53
+                              minLength: 1
+                              type: string
+                            host:
+                              maxLength: 253
+                              minLength: 1
+                              type: string
+                            port:
+                              maximum: 65535.0
+                              minimum: 1.0
+                              type: integer
+                          type: object
+                        trap:
+                          description: The catalogue entry's or the drawn decoy's name, on `port`, `route` and `credential`.
+                          maxLength: 63
+                          minLength: 1
+                          type: string
+                      required:
+                      - count
+                      - effect
+                      - firstAt
+                      - kind
+                      - lastAt
+                      - source
+                      type: object
+                    maxItems: 16
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  overflow:
+                    description: The uses of the entries that did not fit.
+                    maximum: 9007199254740991.0
+                    minimum: 0.0
+                    type: integer
+                  updatedAt:
+                    description: The broker's clock at the last fold.
+                    format: date-time
+                    type: string
                 type: object
               virtualMachineRef:
                 description: The bound member, from the claim.
@@ -806,9 +938,141 @@ spec:
                       before the ADR, which is read until its claim ends.
                     nullable: true
                     type: string
+                  tripped:
+                    description: |-
+                      The event that ended the claim (ADR-0069 decision 9, ADR-0070 decision 6), as
+                      `Tripped` serialises. Written once, before the release; never removed.
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true
                 required:
                 - claimUid
                 - createdAt
+                type: object
+              tripwires:
+                description: |-
+                  The claim's trip summary (ADR-0069 decision 9, ADR-0070 decision 8): what traps were
+                  used, folded and bounded. The store's, as `record` is: written by `KubeStore` alone in a
+                  patch that names nothing else, and left out of the reconciler's mirroring, which never
+                  names it. A value this build cannot read (written by a newer one) reads as absent, so
+                  that it never makes the sandbox, and the record on it, unreadable.
+                nullable: true
+                properties:
+                  entries:
+                    default: []
+                    description: At most sixteen entries, the latest first, replaced whole by every write.
+                    items:
+                      description: "One folded entry of [`TripwiresStatus`]: [`TripEntry`] as the resource spells it."
+                      properties:
+                        class:
+                          description: The class, on `denied`, `protocol` and `segment`.
+                          enum:
+                          - loopback_port
+                          - private_range
+                          - unknown_host
+                          - identity_shape
+                          - foreign_route
+                          - unknown_route
+                          - no_record
+                          - audience_outside_rendered
+                          - claim_never_issued
+                          - credential_outside_inject
+                          - deny_outside_rendered
+                          - gateway_port
+                          - gateway_output
+                          - pool_inbound
+                          - pool_output
+                          type: string
+                        containmentMs:
+                          description: Milliseconds from the verdict to the network cut, the first figure reported.
+                          maximum: 600000.0
+                          minimum: 0.0
+                          type: integer
+                        count:
+                          description: How many uses.
+                          maximum: 9007199254740991.0
+                          minimum: 1.0
+                          type: integer
+                        effect:
+                          description: |-
+                            What the events folded here did: `would_trip` under shadow, `reported` for a class at
+                            `report`, `tripped` when they ended the claim.
+                          enum:
+                          - would_trip
+                          - reported
+                          - tripped
+                          type: string
+                        firstAt:
+                          description: The earliest event folded here, by the reporter's clock.
+                          format: date-time
+                          type: string
+                        kind:
+                          description: What kind of trap.
+                          enum:
+                          - port
+                          - route
+                          - credential
+                          - denied
+                          - protocol
+                          - segment
+                          type: string
+                        lastAt:
+                          description: The latest.
+                          format: date-time
+                          type: string
+                        source:
+                          description: "Whose value the target is: `drawn` (the guest's own), `workload` or `peer`."
+                          enum:
+                          - drawn
+                          - workload
+                          - peer
+                          type: string
+                        sourceAddress:
+                          description: The peer's address, on a `segment` entry of an inbound class.
+                          maxLength: 45
+                          type: string
+                        target:
+                          description: "What was reached for: exactly one of `host`, `port` and `address`."
+                          maxProperties: 1
+                          minProperties: 1
+                          properties:
+                            address:
+                              maxLength: 53
+                              minLength: 1
+                              type: string
+                            host:
+                              maxLength: 253
+                              minLength: 1
+                              type: string
+                            port:
+                              maximum: 65535.0
+                              minimum: 1.0
+                              type: integer
+                          type: object
+                        trap:
+                          description: The catalogue entry's or the drawn decoy's name, on `port`, `route` and `credential`.
+                          maxLength: 63
+                          minLength: 1
+                          type: string
+                      required:
+                      - count
+                      - effect
+                      - firstAt
+                      - kind
+                      - lastAt
+                      - source
+                      type: object
+                    maxItems: 16
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  overflow:
+                    description: The uses of the entries that did not fit.
+                    maximum: 9007199254740991.0
+                    minimum: 0.0
+                    type: integer
+                  updatedAt:
+                    description: The broker's clock at the last fold.
+                    format: date-time
+                    type: string
                 type: object
               virtualMachineRef:
                 description: The bound member, from the claim.

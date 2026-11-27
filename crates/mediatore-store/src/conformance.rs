@@ -126,6 +126,7 @@ pub(crate) fn claim(uid: Uuid) -> ClaimRecord {
         bundle_version: None,
         report: None,
         exit: None,
+        tripped: None,
         delegations: BTreeMap::new(),
         version: None,
     }

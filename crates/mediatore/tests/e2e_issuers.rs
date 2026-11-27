@@ -124,6 +124,7 @@ impl Harness {
         .with_subject_prefixes(prefixes);
         let store = MemoryStore::shared();
         let state = Arc::new(AppState {
+            tripwires: mediatore_api::Tripwires::default(),
             inject: std::collections::BTreeMap::new(),
             inject_port: None,
             audience_catalog: None,
@@ -450,6 +451,7 @@ async fn claim_through_gate(gate: IssuerGate, groups: &[&str]) -> (u16, String) 
         subject_prefix: None,
     }]);
     let state = Arc::new(AppState {
+        tripwires: mediatore_api::Tripwires::default(),
         inject: std::collections::BTreeMap::new(),
         inject_port: None,
         audience_catalog: None,
@@ -678,6 +680,7 @@ impl TwoDirectories {
         .expect("sts")
         .with_subject_prefixes(prefixes);
         let state = Arc::new(AppState {
+            tripwires: mediatore_api::Tripwires::default(),
             inject: std::collections::BTreeMap::new(),
             inject_port: None,
             audience_catalog: None,

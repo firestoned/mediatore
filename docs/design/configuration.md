@@ -18,16 +18,17 @@ Every value in the example is a placeholder.
 | `listen` | `user`, `sandbox`: the two listener addresses | [Broker API](broker-api.md) |
 | `spire` | `workload_api_socket`; `entries.class_name` (the SPIRE Controller Manager's class) | [Identity and mTLS](identity-and-mtls.md) |
 | `issuers[]` | `url`, `backend`, `client_id`, `subject_claim`, `required_group`, `required_groups`, `allow_any_authenticated`, `groups_claim`, `session`, `entra`, `ca_file`, `subject_prefix` | [Issuers and audiences](issuers-and-audiences.md) |
-| `audiences[]` | `name`, `via`, `max_ttl`, `egress`, `rules`, `ca_file`, `secret_file`, `secret_header`, `secret_extra_headers`, `header`, `extra_headers`, `refresh`, `inject`, `credential` | [Issuers and audiences](issuers-and-audiences.md) |
+| `audiences[]` | `name`, `via`, `max_ttl`, `egress`, `rules`, `ca_file`, `secret_file`, `secret_header`, `secret_extra_headers`, `header`, `extra_headers`, `refresh`, `inject`, `credential`, `traps_body` (`match`, the default, or `skip`: ADR-0069) | [Issuers and audiences](issuers-and-audiences.md) |
 | `sts` | `issuer`, `kid`, `signing_key_file` | the token service |
 | `registries[]` | `host`, `username`, `password_file`, `reach` (`segment` or `relay`) | the pull ([The guest](guest.md)) |
 | `gateways`, `gateway_inject_port` | each gateway's sandbox address and data-plane port; the inject listener's own port | [The gateway](gateway.md), [Broker API](broker-api.md) |
 | `sandboxes` | `namespace`: where `POST /v1/claims` creates `AgentSandbox` resources; or `namespaces`: a map from a namespace to the groups whose members may claim there, and the issuers those groups are read from (the two are exclusive); `max_ttl_seconds`: the longest lifetime a claim may ask for (default `86400`, one day; positive); `declarative_issuers`: the issuers an `AgentSandbox` created through the Kubernetes API may name (default the one issuer, or none with two or more) | [Claims and reconcilers](claims-and-reconcilers.md) |
 | `watcher` | `resync_secs`, `resolve_timeout_secs`, `lease_duration_secs`; `x509pop_pools`: the pools, each as `<namespace>/<pool>`, whose machines attest with `x509pop` and never with a TPM (ADR-0049 decision 9; empty by default, every machine is `tpm`; an entry of another shape, or one listed twice, is a start error); `provider_namespace`: where a machine's `Provider` is read when the machine's own namespace holds none (decision 10; unset by default, read only for the machines of `x509pop_pools`). With `x509pop_pools` set, the Providers of every namespace are listed once per pass, two of them asserting different host CAs under one common name give neither's machines an entry, and every `Bound` claim is resolved through the machine its `status.virtualMachineRef` names; with it empty no machine and no Provider is read for a claim. The files of the SPIRE server's host CA bundle are checked with `mediatore x509pop-bundle check <file>...`, a subcommand of the same binary that needs no configuration | [Claims and reconcilers](claims-and-reconcilers.md), [the deploying guide](../guides/deploying.md#pools-whose-guests-have-no-vtpm-x509pop-adr-0049) |
-| `store` | `retention_secs`, `node_grace_secs`, `sealing` (`key_file` or `transit`) | [The store and the sealing](store-and-sealing.md) |
+| `store` | `retention_secs` (at 900 or less the `no_record` class of ADR-0070 is not judged), `node_grace_secs`, `sealing` (`key_file` or `transit`) | [The store and the sealing](store-and-sealing.md) |
 | `token` | `rate_per_minute`: the per-claim limit on `POST /v1/token` | [Broker API](broker-api.md) |
 | `logs` | `enabled` (default `false`), `max_bytes` (the newest output kept per claim, 64 KiB to 4 MiB, default 1 MiB), `retention_secs` (default `store.retention_secs`): the workload output ring of ADR-0045, written only for a sandbox that opted in with `workload.logs` | [The store and the sealing](store-and-sealing.md), [the store guide](../guides/the-store.md#workload-output) |
-| `policy` | `trusted_keys[]`, `namespaces[]`, `egress` (`shadow` or `enforce`) | [Policy](policy.md) |
+| `policy` | `trusted_keys[]`, `namespaces[]`, `egress` (`shadow` or `enforce`); `traps` (`off`, the default, `shadow` or `enforce`) and `traps_denied` (`loopback_port`, `private_range`, `unknown_host`, each `report`, the default, or `trip`): tripwires on the VM, ADR-0069 | [Policy](policy.md), [Tripwires](../guides/tripwires.md) |
+| `tripwires` | the twelve classes of ADR-0070 (`identity_shape`, `foreign_route`, `unknown_route`, `no_record`, `audience_outside_rendered`, `claim_never_issued`, `credential_outside_inject`, `deny_outside_rendered`, `gateway_port`, `gateway_output`, `pool_inbound`, `pool_output`), each `report` (the default) or `trip`; only `foreign_route`, `unknown_route` and `audience_outside_rendered` may be `trip` (`deny_outside_rendered` records only: the claim it names is the authorizer's word) | [Tripwires](../guides/tripwires.md#past-the-jail-the-twelve-classes-of-adr-0070) |
 | `dev_mode` | `true` for a local run only | everywhere a peer identity could be read from a header |
 
 ## An example
@@ -173,12 +174,24 @@ These rules live in `Config::parse` and the section types, so a bad file never r
 - a `sandboxes.declarative_issuers` value that is not an `issuers[].url` byte for byte, or one listed twice (ADR-0072);
 - a key the file spells wrongly at any level of `Config` and its sections, the top level included
   (`deny_unknown_fields`): a misspelt `sandboxes` is not silently the default;
-- an audience field the file spells wrongly (`deny_unknown_fields`): a misspelt `inject` must not fall back to the default.
+- an audience field the file spells wrongly (`deny_unknown_fields`): a misspelt `inject` must not fall back to the default;
+- a value of `policy.traps` other than `off`, `shadow` and `enforce`, an unknown class or value in `policy.traps_denied` or
+  `tripwires`, and `policy.traps: enforce` under `policy.audience_definitions.mode: bundles`, where no audience can be
+  marked `traps_body: skip` (ADR-0069 decision 5);
+- `trip` on a class of `tripwires` that records only: the four `segment` classes, the authorizer's two
+  (`claim_never_issued`, `credential_outside_inject`), `deny_outside_rendered` (a claim named on the authorizer's word)
+  and the two scoped to nothing (`identity_shape`, `no_record`), refused as `tripwires.<class>: trip is refused, this
+  class records only: ...` (ADR-0070 decisions 3, 5 and 6, as amended).
+
+`store.retention_secs` is not refused at any value. At 900 seconds or less (the claim SVID's longest lifetime) the
+`no_record` class is not judged, since an honest claim released a moment ago would read as one, and the start log says
+so. `policy.traps` needs the `policy` section, and so `trusted_keys`: a deployment with no signed policy cannot turn
+tripwires on the VM on.
 
 A broker that starts logs what it understood: each issuer's gate form (`required_groups`, `required_group` or
 `none (explicit)`) with its group values, `single open namespace <ns>` or `map of <n> namespaces` with each namespace's
 group values (configuration, never a token), the sealing mode, the egress mode, each issuer's CA, each audience served
-and how. Read it off the log instead of inferring it from the start succeeding, and run **one claim** after any change
+and how, and the tripwires mode with one line per class set to `trip`. Read it off the log instead of inferring it from the start succeeding, and run **one claim** after any change
 to the file, since a clean start does not show that a claim can be served (a `gateways` list with no audience of
 `role: registry` starts cleanly and then refuses every claim, `registry_not_granted`).
 
@@ -192,4 +205,5 @@ to the file, since a clean start does not show that a claim can be served (a `ga
 ## Read next
 
 ADR-0015 (the transit sealer), ADR-0017 (issuer profiles), ADR-0029 (registries on a routeless segment), ADR-0030 (the
-egress mode), ADR-0040, ADR-0041 and ADR-0043 (placed audiences). Guide: [Deploying](../guides/deploying.md).
+egress mode), ADR-0040, ADR-0041 and ADR-0043 (placed audiences), ADR-0069 and ADR-0070 (tripwires). Guides:
+[Deploying](../guides/deploying.md), [Tripwires](../guides/tripwires.md).

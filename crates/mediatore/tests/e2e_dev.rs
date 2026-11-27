@@ -133,6 +133,10 @@ struct Harness {
     http: reqwest::Client,
 }
 
+/// How often the harness's broker writes its classified refusals (ADR-0070 decision 8): a
+/// minute on a real broker, short here so a test can wait for the line and the status.
+const FLUSH_EVERY: std::time::Duration = std::time::Duration::from_millis(25);
+
 impl Harness {
     async fn start() -> Self {
         Self::start_with(Namespaces::Single("sandboxes".into())).await
@@ -186,7 +190,6 @@ impl Harness {
         .await
     }
 
-    #[allow(clippy::too_many_lines)] // every AppState field, listed in full
     async fn start_all(
         namespaces: Namespaces,
         logs: Option<LogLimits>,
@@ -196,6 +199,51 @@ impl Harness {
         >,
         policy: Option<mediatore_api::PolicyEgress>,
         catalog: Option<mediatore_api::AudienceCatalogSource>,
+    ) -> Self {
+        Self::start_tripwires(
+            namespaces,
+            logs,
+            scopes,
+            policy,
+            catalog,
+            mediatore_api::Tripwires::default(),
+        )
+        .await
+    }
+
+    /// The broker under `policy.traps: mode` (ADR-0069 decision 5), every `denied` class at
+    /// `report` unless `denied` says otherwise.
+    async fn start_traps(
+        mode: mediatore_proto::trip::TrapsMode,
+        denied: mediatore_proto::trip::DeniedSwitches,
+    ) -> Self {
+        let tripwires = mediatore_api::Tripwires {
+            mode,
+            denied,
+            ..mediatore_api::Tripwires::default()
+        };
+        Self::start_tripwires(
+            Namespaces::Single("sandboxes".into()),
+            None,
+            std::collections::BTreeMap::new(),
+            None,
+            None,
+            tripwires,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_lines)] // every AppState field, listed in full
+    async fn start_tripwires(
+        namespaces: Namespaces,
+        logs: Option<LogLimits>,
+        scopes: std::collections::BTreeMap<
+            String,
+            std::collections::BTreeMap<String, Vec<mediatore_proto::EndpointRule>>,
+        >,
+        policy: Option<mediatore_api::PolicyEgress>,
+        catalog: Option<mediatore_api::AudienceCatalogSource>,
+        tripwires: mediatore_api::Tripwires,
     ) -> Self {
         let file = catalog.is_none();
         let idp = FakeIdp::start().await;
@@ -211,6 +259,7 @@ impl Harness {
             TRUST_DOMAIN,
         ));
         let state = Arc::new(AppState {
+            tripwires,
             inject: std::collections::BTreeMap::new(),
             inject_port: None,
             audience_catalog: catalog,
@@ -293,6 +342,8 @@ impl Harness {
         let user_url = format!("http://{}", user.local_addr().expect("addr"));
         let sandbox_url = format!("http://{}", sandbox.local_addr().expect("addr"));
         tokio::spawn(axum::serve(user, mediatore_api::user_router(state.clone())).into_future());
+        // The fold's flush, as `mediatore serve` starts it.
+        mediatore_api::spawn_flush(state.clone(), FLUSH_EVERY);
         tokio::spawn(axum::serve(sandbox, mediatore_api::sandbox_router(state)).into_future());
 
         Self {
@@ -2557,6 +2608,1138 @@ async fn a_team_audience_is_claimed_in_its_namespace_and_unknown_from_another() 
     let (status, body) = refusal(h.create_naming(&admin, "infra", AUDIENCE).await).await;
     assert_eq!((status, body.error.as_str()), (400, "unknown_audience"));
 }
+
+// ---------- ADR-0069 decisions 8 and 9: a trip at the broker ----------
+
+use mediatore_proto::trip::{
+    ClassAction, DeniedSwitches, TrapsMode, TripEffect, TripKind, TripSource, TripTarget,
+};
+
+/// A second pool VM's EK hash, for a second node.
+const OTHER_EK_HASH: &str = "5d0e7c1a9b2f4e6d8c3a1b0f9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b3a291807";
+
+fn node_svid_of(ek_hash: &str) -> String {
+    format!("spiffe://{TRUST_DOMAIN}/banlieue/node/{ek_hash}")
+}
+
+/// One event of a trip report: `fields` over an id and a time.
+fn trip_event(id: uuid::Uuid, fields: &serde_json::Value) -> serde_json::Value {
+    let mut event = serde_json::json!({ "id": id, "at": "2026-11-26T15:02:11.204Z" });
+    for (k, v) in fields.as_object().expect("an object") {
+        event[k] = v.clone();
+    }
+    event
+}
+
+/// A drawn credential seen in a request towards a routed host.
+fn credential_trip(id: uuid::Uuid) -> serde_json::Value {
+    trip_event(
+        id,
+        &serde_json::json!({ "kind": "credential", "trap": "aws", "target": { "host": "git.example" }, "source": "workload" }),
+    )
+}
+
+/// A drawn decoy port the workload connected to.
+fn port_trip(id: uuid::Uuid) -> serde_json::Value {
+    trip_event(
+        id,
+        &serde_json::json!({ "kind": "port", "trap": "redis", "target": { "port": 6379 }, "source": "drawn" }),
+    )
+}
+
+impl Harness {
+    /// Register a node under `ek_hash`, as its own identity.
+    async fn register_node_as(&self, ek_hash: &str) {
+        let resp = self
+            .http
+            .post(format!("{}/v1/nodes", self.sandbox_url))
+            .header(PEER_HEADER, node_svid_of(ek_hash))
+            .json(&NodeRegistration {
+                ek_hash: ek_hash.into(),
+                attestation: None,
+                dmi_uuid: uuid::Uuid::new_v4(),
+                hostname: "pool-a-8".into(),
+                provider: Some(mediatore_proto::Provider::Libvirt),
+            })
+            .send()
+            .await
+            .expect("register");
+        assert_eq!(resp.status(), 200);
+    }
+
+    /// `POST /v1/me/trip` as `peer`: a report under `mode` with `events`.
+    async fn trip(
+        &self,
+        peer: &str,
+        mode: &str,
+        events: &[serde_json::Value],
+    ) -> reqwest::Response {
+        self.http
+            .post(format!("{}/v1/me/trip", self.sandbox_url))
+            .header(PEER_HEADER, peer)
+            .json(&serde_json::json!({ "mode": mode, "events": events }))
+            .send()
+            .await
+            .expect("trip")
+    }
+
+    /// `GET /v1/claims/{name}` as its owner.
+    async fn claim_named(&self, token: &str, name: &str) -> ClaimResponse {
+        self.http
+            .get(format!("{}/v1/claims/{name}", self.user_url))
+            .bearer_auth(token)
+            .send()
+            .await
+            .expect("get claim")
+            .json()
+            .await
+            .expect("claim body")
+    }
+}
+
+#[tokio::test]
+async fn a_trip_ends_the_claim_and_the_owner_sees_it() {
+    let h = Harness::start_traps(TrapsMode::Enforce, DeniedSwitches::default()).await;
+    h.register_node().await;
+    let user = h.login("octocat");
+    let (status, claim) = h.create_claim(&user).await;
+    assert_eq!(status, 201);
+    let uid = claim.uid.expect("uid");
+    assert_eq!(claim.phase, mediatore_proto::ClaimPhase::Bound);
+    assert!(claim.tripped.is_none() && claim.tripwires.is_none());
+
+    // The guest is told the mode with its claim, and the claim's identity gets a token.
+    let me: Me = h
+        .http
+        .get(format!("{}/v1/me", h.sandbox_url))
+        .header(PEER_HEADER, node_svid())
+        .send()
+        .await
+        .expect("me")
+        .json()
+        .await
+        .expect("me body");
+    let traps = me.traps.expect("traps under enforce");
+    assert_eq!(traps.mode, TrapsMode::Enforce);
+    assert_eq!(traps.denied, DeniedSwitches::default());
+    assert!(traps.catalogue.is_none(), "no bundle carries a catalogue");
+    assert_eq!(h.token_for(&claim_svid(&uid), AUDIENCE).await.status(), 200);
+
+    // The guest has cut the network and killed the jail; it reports over its node SVID.
+    let id = uuid::Uuid::new_v4();
+    let mut bait = credential_trip(id);
+    bait["containment_ms"] = 41.into();
+    let resp = h.trip(&node_svid(), "enforce", &[bait]).await;
+    assert_eq!(resp.status(), 204);
+
+    // The owner sees what ended the claim, and the folded events.
+    let ended = h.claim_named(&user, &claim.name).await;
+    assert_ne!(ended.phase, mediatore_proto::ClaimPhase::Bound, "released");
+    assert!(!ended.ready);
+    let tripped = ended.tripped.expect("tripped is shown to the owner");
+    assert_eq!(tripped.id, id);
+    assert_eq!(tripped.kind, TripKind::Credential);
+    assert_eq!(tripped.trap.as_deref(), Some("aws"));
+    assert_eq!(tripped.target, Some(TripTarget::Host("git.example".into())));
+    assert_eq!(tripped.source, TripSource::Workload);
+    assert!(tripped.recorded_at <= jiff::Timestamp::now());
+    let summary = ended.tripwires.expect("the folded events");
+    assert_eq!(summary.entries.len(), 1);
+    assert_eq!(summary.entries[0].effect, TripEffect::Tripped);
+    assert_eq!(summary.entries[0].kind, TripKind::Credential);
+    assert_eq!(summary.entries[0].count, 1);
+    assert_eq!(summary.entries[0].containment_ms, Some(41));
+    assert!(ended.exit.is_none(), "a trip is not an exit");
+
+    // The tripped claim's token is refused, the gateway is told the claim is gone, and the
+    // guest is handed no claim to start the workload again.
+    let resp = h.token_for(&claim_svid(&uid), AUDIENCE).await;
+    assert_eq!(resp.status(), 403, "no token for a tripped claim");
+    let resp = h
+        .http
+        .get(format!("{}/v1/gateway/claims/{uid}", h.sandbox_url))
+        .header(PEER_HEADER, authorizer_svid())
+        .send()
+        .await
+        .expect("gateway claim");
+    assert_eq!(resp.status(), 404, "the gateway drops what it cached");
+    assert_eq!(
+        h.me_status(&node_svid()).await,
+        404,
+        "a tripped claim is not restarted: its node has no claim to run"
+    );
+    // And the record is never live again: a later exit ends nothing and changes nothing.
+    let resp = h
+        .http
+        .post(format!("{}/v1/me/exit", h.sandbox_url))
+        .header(PEER_HEADER, node_svid())
+        .json(&mediatore_proto::GuestExit {
+            code: Some(137),
+            signal: None,
+            restarts: 0,
+        })
+        .send()
+        .await
+        .expect("exit");
+    assert_eq!(resp.status(), 204);
+    let after = h.claim_named(&user, &claim.name).await;
+    assert!(after.exit.is_none());
+    assert_eq!(after.tripped.map(|t| t.id), Some(id));
+}
+
+/// ADR-0069 decision 7 step 4 (amended 2026-11-27): the trip report lands first and ends the
+/// claim at once; the guest's final line naming the trap, and what the workload wrote last,
+/// are shipped after it and still reach the owner.
+#[tokio::test]
+async fn a_tripped_claims_last_output_reaches_its_owner_after_the_report() {
+    let tripwires = mediatore_api::Tripwires {
+        mode: TrapsMode::Enforce,
+        ..mediatore_api::Tripwires::default()
+    };
+    let h = Harness::start_tripwires(
+        Namespaces::Single("sandboxes".into()),
+        Some(LogLimits {
+            max_bytes: mediatore_proto::DEFAULT_LOG_MAX_BYTES,
+        }),
+        std::collections::BTreeMap::new(),
+        None,
+        None,
+        tripwires,
+    )
+    .await;
+    h.register_node().await;
+    let user = h.login("octocat");
+    let resp = h.create_claim_logs(&user, true).await;
+    assert_eq!(resp.status(), 201);
+    let claim: ClaimResponse = resp.json().await.expect("claim body");
+    assert_eq!(h.me_status(&node_svid()).await, 200);
+
+    let resp = h
+        .trip(&node_svid(), "enforce", &[port_trip(uuid::Uuid::new_v4())])
+        .await;
+    assert_eq!(resp.status(), 204);
+    let ended = h.claim_named(&user, &claim.name).await;
+    assert!(ended.tripped.is_some());
+    assert_eq!(h.me_status(&node_svid()).await, 404, "no claim to run");
+
+    let last = batch(vec![
+        record(1, LogStream::Stdout, "the workload's last line"),
+        record(2, LogStream::Stderr, "mediatore: a trap ended this run"),
+    ]);
+    assert_eq!(h.post_logs(&node_svid(), &last).await.status(), 204);
+    let (status, lines) = h.read_logs(&user, &claim.name, "").await;
+    assert_eq!(status, 200);
+    assert_eq!(seqs(&lines), vec![1, 2], "the owner reads the last output");
+    // Another node's output is never taken for it.
+    h.register_node_as(OTHER_EK_HASH).await;
+    let other = batch(vec![record(3, LogStream::Stdout, "not this claim's")]);
+    assert_eq!(
+        h.post_logs(&node_svid_of(OTHER_EK_HASH), &other)
+            .await
+            .status(),
+        204
+    );
+    let (_, lines) = h.read_logs(&user, &claim.name, "").await;
+    assert_eq!(seqs(&lines), vec![1, 2]);
+}
+
+#[tokio::test]
+async fn a_trip_from_a_non_node_peer_or_another_claims_node_ends_nothing() {
+    let h = Harness::start_traps(TrapsMode::Enforce, DeniedSwitches::default()).await;
+    h.register_node().await;
+    let user = h.login("octocat");
+    let (_, first) = h.create_claim(&user).await;
+    let first_uid = first.uid.expect("uid");
+    // A second node, bound to a second claim.
+    h.register_node_as(OTHER_EK_HASH).await;
+    let (_, second) = h.create_claim(&user).await;
+    assert_eq!(second.phase, mediatore_proto::ClaimPhase::Bound);
+    let other_node = node_svid_of(OTHER_EK_HASH);
+
+    // The claim's own identity, the gateway's authorizer, the gateway's listeners, a node
+    // that never registered, and no identity at all: refused, and nothing ends.
+    let events = [port_trip(uuid::Uuid::new_v4())];
+    for (peer, expected) in [
+        (claim_svid(&first_uid), 403),
+        (authorizer_svid(), 403),
+        (gateway_svid(), 403),
+        (node_svid_of(&"e".repeat(64)), 403),
+    ] {
+        let resp = h.trip(&peer, "enforce", &events).await;
+        assert_eq!(resp.status(), expected);
+    }
+    let resp = h
+        .http
+        .post(format!("{}/v1/me/trip", h.sandbox_url))
+        .json(&serde_json::json!({ "mode": "enforce", "events": events }))
+        .send()
+        .await
+        .expect("trip with no identity");
+    assert_eq!(resp.status(), 401);
+    for name in [&first.name, &second.name] {
+        let held = h.claim_named(&user, name).await;
+        assert_eq!(held.phase, mediatore_proto::ClaimPhase::Bound);
+        assert!(held.tripped.is_none() && held.tripwires.is_none());
+    }
+
+    // The other claim's node reports a trip: its own claim ends, and this one does not. A
+    // report names no claim, so a node can end none but the one bound to it.
+    let resp = h.trip(&other_node, "enforce", &events).await;
+    assert_eq!(resp.status(), 204);
+    let untouched = h.claim_named(&user, &first.name).await;
+    assert_eq!(untouched.phase, mediatore_proto::ClaimPhase::Bound);
+    assert!(untouched.tripped.is_none() && untouched.tripwires.is_none());
+    assert_eq!(
+        h.token_for(&claim_svid(&first_uid), AUDIENCE)
+            .await
+            .status(),
+        200,
+        "the first claim still gets its token"
+    );
+    let ended = h.claim_named(&user, &second.name).await;
+    assert!(
+        ended.tripped.is_some(),
+        "the reporting node's own claim ended"
+    );
+}
+
+#[tokio::test]
+async fn a_repeated_trip_id_is_idempotent() {
+    let h = Harness::start_traps(TrapsMode::Enforce, DeniedSwitches::default()).await;
+    h.register_node().await;
+    let user = h.login("octocat");
+    let (_, claim) = h.create_claim(&user).await;
+    let id = uuid::Uuid::new_v4();
+    let events = [port_trip(id)];
+    // The guest retries until it reads 204: the same report, twice.
+    for _ in 0..2 {
+        let resp = h.trip(&node_svid(), "enforce", &events).await;
+        assert_eq!(resp.status(), 204);
+    }
+    let ended = h.claim_named(&user, &claim.name).await;
+    assert_eq!(ended.tripped.map(|t| t.id), Some(id));
+    let summary = ended.tripwires.expect("the folded events");
+    assert_eq!(summary.entries.len(), 1);
+    assert_eq!(
+        summary.entries[0].count, 1,
+        "the retry is not counted again"
+    );
+}
+
+#[tokio::test]
+async fn a_trip_for_a_released_claim_is_a_no_op() {
+    let h = Harness::start_traps(TrapsMode::Enforce, DeniedSwitches::default()).await;
+    h.register_node().await;
+    let user = h.login("octocat");
+    let (_, claim) = h.create_claim(&user).await;
+    // Its owner releases it; the guest's report arrives after.
+    let resp = h
+        .http
+        .delete(format!("{}/v1/claims/{}", h.user_url, claim.name))
+        .bearer_auth(&user)
+        .send()
+        .await
+        .expect("delete");
+    assert_eq!(resp.status(), 204);
+    let resp = h
+        .trip(&node_svid(), "enforce", &[port_trip(uuid::Uuid::new_v4())])
+        .await;
+    assert_eq!(resp.status(), 204, "no error for the guest");
+    let after = h.claim_named(&user, &claim.name).await;
+    assert!(
+        after.tripped.is_none(),
+        "a claim that ended for another reason is not tripped after the fact"
+    );
+    // What the guest saw is still recorded, as reported: the event ended nothing.
+    let summary = after.tripwires.expect("the folded events");
+    assert_eq!(summary.entries[0].effect, TripEffect::Reported);
+}
+
+#[tokio::test]
+async fn under_shadow_a_trip_is_recorded_and_the_claim_lives() {
+    let h = Harness::start_traps(TrapsMode::Shadow, DeniedSwitches::default()).await;
+    h.register_node().await;
+    let user = h.login("octocat");
+    let (_, claim) = h.create_claim(&user).await;
+    let uid = claim.uid.expect("uid");
+    let mut probed = port_trip(uuid::Uuid::new_v4());
+    probed["count"] = 4.into();
+    let denied = trip_event(
+        uuid::Uuid::new_v4(),
+        &serde_json::json!({ "kind": "denied", "class": "unknown_host", "target": { "host": "mirror.example" }, "source": "workload" }),
+    );
+    let resp = h.trip(&node_svid(), "shadow", &[probed, denied]).await;
+    assert_eq!(resp.status(), 204);
+    let held = h.claim_named(&user, &claim.name).await;
+    assert_eq!(
+        held.phase,
+        mediatore_proto::ClaimPhase::Bound,
+        "nothing ended"
+    );
+    assert!(held.ready && held.tripped.is_none());
+    let summary = held.tripwires.expect("the folded events");
+    assert_eq!(summary.entries.len(), 2);
+    let port = summary
+        .entries
+        .iter()
+        .find(|e| e.kind == TripKind::Port)
+        .expect("the port entry");
+    assert_eq!((port.effect, port.count), (TripEffect::WouldTrip, 4));
+    assert_eq!(port.target, Some(TripTarget::Port(6379)));
+    let host = summary
+        .entries
+        .iter()
+        .find(|e| e.kind == TripKind::Denied)
+        .expect("the denied entry");
+    assert_eq!(host.effect, TripEffect::Reported, "a class at report");
+    assert_eq!(h.token_for(&claim_svid(&uid), AUDIENCE).await.status(), 200);
+    assert_eq!(h.me_status(&node_svid()).await, 200);
+}
+
+#[tokio::test]
+async fn a_denied_class_moved_to_trip_ends_the_claim_under_enforce() {
+    let h = Harness::start_traps(
+        TrapsMode::Enforce,
+        DeniedSwitches {
+            unknown_host: ClassAction::Trip,
+            ..DeniedSwitches::default()
+        },
+    )
+    .await;
+    h.register_node().await;
+    let user = h.login("octocat");
+    let (_, claim) = h.create_claim(&user).await;
+    let id = uuid::Uuid::new_v4();
+    let denied = trip_event(
+        id,
+        &serde_json::json!({ "kind": "denied", "class": "unknown_host", "target": { "host": "mirror.example" }, "source": "workload" }),
+    );
+    let resp = h.trip(&node_svid(), "enforce", &[denied]).await;
+    assert_eq!(resp.status(), 204);
+    let ended = h.claim_named(&user, &claim.name).await;
+    let tripped = ended.tripped.expect("a class at trip ends the claim");
+    assert_eq!(tripped.id, id);
+    assert_eq!(tripped.kind, TripKind::Denied);
+    assert_eq!(
+        tripped.class,
+        Some(mediatore_proto::trip::TripClass::UnknownHost)
+    );
+}
+
+#[tokio::test]
+async fn with_traps_off_the_route_is_501_and_me_carries_no_traps() {
+    // The harness every other test here uses: `policy.traps` is off unless set.
+    let h = Harness::start().await;
+    h.register_node().await;
+    let user = h.login("octocat");
+    let (_, claim) = h.create_claim(&user).await;
+    let resp = h
+        .trip(&node_svid(), "enforce", &[port_trip(uuid::Uuid::new_v4())])
+        .await;
+    assert_eq!(resp.status(), 501);
+    let body: ErrorBody = resp.json().await.expect("error body");
+    assert_eq!(body.error, "not_implemented");
+    let text = h
+        .http
+        .get(format!("{}/v1/me", h.sandbox_url))
+        .header(PEER_HEADER, node_svid())
+        .send()
+        .await
+        .expect("me")
+        .text()
+        .await
+        .expect("me body");
+    assert!(
+        !text.contains("traps"),
+        "an off broker says nothing of traps"
+    );
+    let me: Me = serde_json::from_str(&text).expect("me");
+    assert!(me.traps.is_none());
+    let held = h.claim_named(&user, &claim.name).await;
+    assert_eq!(held.phase, mediatore_proto::ClaimPhase::Bound);
+    assert!(held.tripped.is_none() && held.tripwires.is_none());
+}
+
+// ---------- ADR-0070: a request no honest build makes, classified at the broker ----------
+
+use mediatore_proto::trip::TripClass;
+
+/// The log lines of the tests that ask for them, one buffer a test thread. One process-wide
+/// subscriber, installed by the first test that captures, and a filter that lets an event
+/// through only on a thread that is capturing: every other test of this binary logs nothing,
+/// as before. A `#[tokio::test]` runs its broker on its own thread, so the buffer holds what
+/// that test's broker logged and nothing of another's.
+pub(crate) mod logs {
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::{Layer as _, Registry};
+
+    thread_local! {
+        static CAPTURING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        static LINES: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    struct ThreadLines;
+
+    impl std::io::Write for ThreadLines {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            LINES.with(|l| l.borrow_mut().extend_from_slice(buf));
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Capture this thread's log lines, at every level, from nothing.
+    pub(crate) fn capture() {
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            let lines = tracing_subscriber::fmt::layer()
+                .with_writer(|| ThreadLines)
+                .with_ansi(false)
+                .with_filter(tracing_subscriber::filter::dynamic_filter_fn(|_, _| {
+                    CAPTURING.with(std::cell::Cell::get)
+                }));
+            tracing::subscriber::set_global_default(Registry::default().with(lines))
+                .expect("the one subscriber of this test binary");
+        });
+        CAPTURING.with(|c| c.set(true));
+        LINES.with(|l| l.borrow_mut().clear());
+    }
+
+    /// What this thread has logged since [`capture`].
+    pub(crate) fn captured() -> String {
+        LINES.with(|l| String::from_utf8_lossy(&l.borrow()).into_owned())
+    }
+}
+
+/// The message of the audit line of a classified refusal.
+const CLASSIFIED: &str = "a refusal no honest build earns";
+
+impl Harness {
+    /// A broker with each of `tripping` at `trip` and every other class at `report`, under
+    /// `policy`: with one, what a guest is handed is recorded (`rendered`), which two of the
+    /// classes are judged against.
+    async fn start_classes(
+        tripping: &[TripClass],
+        policy: Option<mediatore_api::PolicyEgress>,
+    ) -> Self {
+        let mut tripwires = mediatore_api::Tripwires::default();
+        for class in tripping {
+            tripwires
+                .classes
+                .set(*class, ClassAction::Trip)
+                .expect("a class that may trip");
+        }
+        Self::start_tripwires(
+            Namespaces::Single("sandboxes".into()),
+            None,
+            std::collections::BTreeMap::new(),
+            policy,
+            None,
+            tripwires,
+        )
+        .await
+    }
+
+    /// A claim bound to the standard node. Under a policy the claim names it, and the guest
+    /// has fetched `GET /v1/me` once, so what it was handed is on the record.
+    async fn bound(&self, user: &str, policy: Option<&str>) -> ClaimResponse {
+        self.register_node().await;
+        let resp = self
+            .create_body(user, claim_body(AUDIENCE, policy, 3600))
+            .await;
+        assert_eq!(resp.status(), 201);
+        let claim: ClaimResponse = resp.json().await.expect("claim body");
+        assert_eq!(claim.phase, mediatore_proto::ClaimPhase::Bound);
+        assert_eq!(self.me_status(&node_svid()).await, 200);
+        claim
+    }
+
+    /// One request on the sandbox listener as `peer`: the status and the body.
+    async fn sandbox(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        peer: &str,
+        body: Option<serde_json::Value>,
+    ) -> (u16, String) {
+        let mut req = self
+            .http
+            .request(method, format!("{}{path}", self.sandbox_url))
+            .header(PEER_HEADER, peer);
+        if let Some(body) = body {
+            req = req.json(&body);
+        }
+        let resp = req.send().await.expect("sandbox request");
+        let status = resp.status().as_u16();
+        (status, resp.text().await.expect("body"))
+    }
+
+    /// A gateway's report of one denied tunnel for `uid` towards `authority`.
+    async fn report_deny(&self, uid: uuid::Uuid, authority: &str, reason: &str) -> u16 {
+        let batch = serde_json::json!({
+            "gateway": "gateway-02",
+            "decisions": [{
+                "at": "2026-11-27T10:00:00Z", "claim_uid": uid, "kind": "tunnel",
+                "authority": authority, "verdict": "deny", "reason": reason,
+            }],
+        });
+        self.sandbox(
+            reqwest::Method::POST,
+            "/v1/gateway/decisions",
+            &authorizer_svid(),
+            Some(batch),
+        )
+        .await
+        .0
+    }
+
+    /// The claim as its owner reads it, once `settled` says so, or as it is after two seconds.
+    async fn claim_when(
+        &self,
+        user: &str,
+        name: &str,
+        settled: impl Fn(&ClaimResponse) -> bool,
+    ) -> ClaimResponse {
+        for _ in 0..200 {
+            let claim = self.claim_named(user, name).await;
+            if settled(&claim) {
+                return claim;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        self.claim_named(user, name).await
+    }
+
+    /// The claim after the broker has flushed several times with nothing more to say.
+    async fn claim_after_flushes(&self, user: &str, name: &str) -> ClaimResponse {
+        tokio::time::sleep(FLUSH_EVERY * 8).await;
+        self.claim_named(user, name).await
+    }
+}
+
+/// The one `protocol` entry a claim's summary is expected to hold: its effect and its target.
+fn protocol_entry(claim: &ClaimResponse, class: TripClass) -> (TripEffect, Option<TripTarget>) {
+    let summary = claim.tripwires.as_ref().expect("a summary");
+    assert_eq!(summary.entries.len(), 1, "one entry");
+    let entry = &summary.entries[0];
+    assert_eq!(entry.kind, TripKind::Protocol);
+    assert_eq!(entry.class, Some(class));
+    assert_eq!(entry.source, TripSource::Peer);
+    assert_eq!(entry.trap, None, "the class is its own field");
+    (entry.effect, entry.target.clone())
+}
+
+/// What every claim-scoped class is proven to do under both values (ADR-0070 decision 6):
+/// `offend` makes the request that no honest build makes and returns its answer. At `report`
+/// the claim lives and its summary gains a `reported` entry; at `trip` the same answer comes
+/// back, and the claim is ended as ADR-0069 decision 9 ends one, with `tripped` saying why.
+async fn ends_under_trip_and_only_records_under_report<F>(
+    class: TripClass,
+    with_policy: bool,
+    target: Option<TripTarget>,
+    offend: F,
+) where
+    F: AsyncFn(&Harness, uuid::Uuid) -> (u16, String),
+{
+    let mut answers = Vec::new();
+    for tripping in [false, true] {
+        let (policy, name) = if with_policy {
+            let (pe, name) =
+                bundle_policy(mediatore_claims::policy::EgressMode::Enforce, true).await;
+            (Some(pe), Some(name))
+        } else {
+            (None, None)
+        };
+        let classes = if tripping { vec![class] } else { vec![] };
+        let h = Harness::start_classes(&classes, policy).await;
+        let user = h.login("octocat");
+        let claim = h.bound(&user, name.as_deref()).await;
+        let uid = claim.uid.expect("uid");
+        assert_eq!(h.token_for(&claim_svid(&uid), AUDIENCE).await.status(), 200);
+
+        answers.push(offend(&h, uid).await);
+
+        if tripping {
+            let ended = h
+                .claim_when(&user, &claim.name, |c| {
+                    c.tripped.is_some() && c.tripwires.is_some()
+                })
+                .await;
+            let tripped = ended.tripped.clone().expect("the claim is tripped");
+            assert_eq!(tripped.kind, TripKind::Protocol);
+            assert_eq!(tripped.class, Some(class));
+            assert_eq!(tripped.source, TripSource::Peer);
+            assert_eq!(tripped.trap, None);
+            assert_eq!(tripped.target, target);
+            assert!(!ended.ready);
+            assert_ne!(ended.phase, mediatore_proto::ClaimPhase::Bound, "released");
+            assert_eq!(
+                protocol_entry(&ended, class),
+                (TripEffect::Tripped, target.clone())
+            );
+            // Ended as a trap on the VM ends one: no token, nothing for a gateway, no claim
+            // for the guest to run.
+            assert_eq!(h.token_for(&claim_svid(&uid), AUDIENCE).await.status(), 403);
+            let (status, _) = h
+                .sandbox(
+                    reqwest::Method::GET,
+                    &format!("/v1/gateway/claims/{uid}"),
+                    &authorizer_svid(),
+                    None,
+                )
+                .await;
+            assert_eq!(status, 404);
+            assert_eq!(h.me_status(&node_svid()).await, 404);
+        } else {
+            let held = h
+                .claim_when(&user, &claim.name, |c| c.tripwires.is_some())
+                .await;
+            assert_eq!(
+                protocol_entry(&held, class),
+                (TripEffect::Reported, target.clone())
+            );
+            assert!(held.tripped.is_none(), "at report nothing is ended");
+            assert_eq!(held.phase, mediatore_proto::ClaimPhase::Bound);
+            assert_eq!(h.token_for(&claim_svid(&uid), AUDIENCE).await.status(), 200);
+            assert_eq!(h.me_status(&node_svid()).await, 200);
+        }
+    }
+    assert_eq!(
+        answers[0], answers[1],
+        "the request is answered the same at report and at trip"
+    );
+}
+
+#[tokio::test]
+async fn a_claim_identity_on_a_node_route_ends_the_claim_under_trip_and_only_records_under_report()
+{
+    ends_under_trip_and_only_records_under_report(
+        TripClass::ForeignRoute,
+        false,
+        None,
+        async |h: &Harness, uid| {
+            let answer = h
+                .sandbox(reqwest::Method::GET, "/v1/me", &claim_svid(&uid), None)
+                .await;
+            assert_eq!(answer.0, 403);
+            answer
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_path_the_broker_does_not_serve_ends_the_claim_under_trip_and_only_records_under_report()
+{
+    ends_under_trip_and_only_records_under_report(
+        TripClass::UnknownRoute,
+        false,
+        None,
+        async |h: &Harness, uid| {
+            let answer = h
+                .sandbox(
+                    reqwest::Method::GET,
+                    "/v1/me/routes",
+                    &claim_svid(&uid),
+                    None,
+                )
+                .await;
+            assert_eq!(answer, (404, String::new()), "the router's own empty 404");
+            answer
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn an_audience_outside_rendered_ends_the_claim_under_trip_and_only_records_under_report() {
+    ends_under_trip_and_only_records_under_report(
+        TripClass::AudienceOutsideRendered,
+        true,
+        None,
+        async |h: &Harness, uid| {
+            let resp = h.token_for(&claim_svid(&uid), "nonexistent.test").await;
+            let status = resp.status().as_u16();
+            assert_eq!(status, 400);
+            let text = resp.text().await.expect("body");
+            assert!(text.contains("unknown_audience"));
+            (status, text)
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_reported_deny_outside_rendered_only_records_and_trip_is_refused() {
+    // ADR-0070 decision 6 (amended 2026-11-27): the claim a deny names is the word of whoever
+    // holds the authorizer's shared identity, so `trip` is refused for the class and a deny
+    // for an authority never handed only records, with every class that may trip at trip.
+    let mut refused = mediatore_api::Tripwires::default();
+    assert!(
+        refused
+            .classes
+            .set(TripClass::DenyOutsideRendered, ClassAction::Trip)
+            .is_err()
+    );
+    let tripping: Vec<TripClass> = TripClass::PROTOCOL
+        .into_iter()
+        .filter(|c| c.may_trip())
+        .collect();
+    assert!(!tripping.contains(&TripClass::DenyOutsideRendered));
+    let (pe, policy) = bundle_policy(mediatore_claims::policy::EgressMode::Enforce, true).await;
+    let h = Harness::start_classes(&tripping, Some(pe)).await;
+    let user = h.login("octocat");
+    let claim = h.bound(&user, Some(&policy)).await;
+    let uid = claim.uid.expect("uid");
+    assert_eq!(
+        h.report_deny(uid, "elsewhere.example:443", "not_allowed")
+            .await,
+        204
+    );
+    let held = h
+        .claim_when(&user, &claim.name, |c| c.tripwires.is_some())
+        .await;
+    assert_eq!(
+        protocol_entry(&held, TripClass::DenyOutsideRendered),
+        (
+            TripEffect::Reported,
+            Some(TripTarget::Host("elsewhere.example".into()))
+        )
+    );
+    assert!(held.tripped.is_none(), "a reported deny ends nothing");
+    assert_eq!(held.phase, mediatore_proto::ClaimPhase::Bound);
+    assert_eq!(h.token_for(&claim_svid(&uid), AUDIENCE).await.status(), 200);
+    assert_eq!(h.me_status(&node_svid()).await, 200);
+}
+
+#[tokio::test]
+async fn the_same_deny_for_a_route_rendered_and_since_narrowed_ends_nothing() {
+    // The two classes judged against `rendered`, `audience_outside_rendered` at trip and
+    // `deny_outside_rendered` at report (it records only, ADR-0070 decision 6 amended), where
+    // a judged deny would still put an entry on the summary. A deny for an authority the
+    // guest was handed is what a newer, narrower bundle produces at a gateway for an honest
+    // proxy: the broker compares with what it recorded at the first `GET /v1/me`, so the
+    // deny is inside it whatever the bundle says now.
+    let classes = [TripClass::AudienceOutsideRendered];
+    let (pe, policy) = bundle_policy(mediatore_claims::policy::EgressMode::Enforce, true).await;
+    let h = Harness::start_classes(&classes, Some(pe)).await;
+    let user = h.login("octocat");
+    let claim = h.bound(&user, Some(&policy)).await;
+    let uid = claim.uid.expect("uid");
+    for authority in [
+        "api.home.example:443",
+        "192.0.2.10:8443",
+        "API.home.example",
+    ] {
+        assert_eq!(h.report_deny(uid, authority, "not_allowed").await, 204);
+    }
+    // A release racing a request: the gateway's own word for it, whatever the authority.
+    assert_eq!(
+        h.report_deny(uid, "elsewhere.example:443", "claim_gone")
+            .await,
+        204
+    );
+    let held = h.claim_after_flushes(&user, &claim.name).await;
+    assert_eq!(held.phase, mediatore_proto::ClaimPhase::Bound);
+    assert!(held.tripped.is_none() && held.tripwires.is_none());
+    assert_eq!(h.token_for(&claim_svid(&uid), AUDIENCE).await.status(), 200);
+
+    // And a claim under no policy has nothing rendered: neither class judges it, at trip.
+    let h = Harness::start_classes(&classes, None).await;
+    let user = h.login("octocat");
+    let claim = h.bound(&user, None).await;
+    let uid = claim.uid.expect("uid");
+    assert_eq!(
+        h.report_deny(uid, "elsewhere.example:443", "not_allowed")
+            .await,
+        204
+    );
+    let resp = h.token_for(&claim_svid(&uid), "nonexistent.test").await;
+    assert_eq!(resp.status(), 400);
+    let held = h.claim_after_flushes(&user, &claim.name).await;
+    assert_eq!(held.phase, mediatore_proto::ClaimPhase::Bound);
+    assert!(held.tripped.is_none() && held.tripwires.is_none());
+}
+
+#[tokio::test]
+async fn the_authorizers_classes_never_end_a_claim() {
+    logs::capture();
+    // Every class that may be set to trip is at trip; the authorizer's two cannot be.
+    let tripping: Vec<TripClass> = TripClass::PROTOCOL
+        .into_iter()
+        .filter(|c| c.may_trip())
+        .collect();
+    let mut refused = mediatore_api::Tripwires::default();
+    for class in [
+        TripClass::ClaimNeverIssued,
+        TripClass::CredentialOutsideInject,
+        TripClass::DenyOutsideRendered,
+        TripClass::NoRecord,
+        TripClass::IdentityShape,
+    ] {
+        assert!(refused.classes.set(class, ClassAction::Trip).is_err());
+    }
+    let (pe, policy) = bundle_policy(mediatore_claims::policy::EgressMode::Enforce, true).await;
+    let h = Harness::start_classes(&tripping, Some(pe)).await;
+    let user = h.login("octocat");
+    let claim = h.bound(&user, Some(&policy)).await;
+    let uid = claim.uid.expect("uid");
+    let ghost = uuid::Uuid::new_v4();
+    let audience = |a: &str| Some(serde_json::json!({ "audience": a }));
+    let get = reqwest::Method::GET;
+    let post = reqwest::Method::POST;
+    for (method, path, body, status) in [
+        // `claim_never_issued`: a uid the store holds no record of.
+        (
+            get.clone(),
+            format!("/v1/gateway/claims/{ghost}"),
+            None,
+            404,
+        ),
+        (
+            post.clone(),
+            format!("/v1/gateway/claims/{ghost}/credential"),
+            audience(AUDIENCE),
+            404,
+        ),
+        // `credential_outside_inject`: an audience placed in the proxy, and one that is not
+        // the claim's.
+        (
+            post.clone(),
+            format!("/v1/gateway/claims/{uid}/credential"),
+            audience(AUDIENCE),
+            403,
+        ),
+        (
+            post.clone(),
+            format!("/v1/gateway/claims/{uid}/credential"),
+            audience("nonexistent.test"),
+            400,
+        ),
+        // `foreign_route` and `unknown_route` under the authorizer's identity: classes that
+        // end a claim when a claim makes them, and nothing when the authorizer does.
+        (get.clone(), "/v1/me".to_owned(), None, 403),
+        (
+            post.clone(),
+            "/v1/token".to_owned(),
+            audience(AUDIENCE),
+            403,
+        ),
+        (get, "/v1/gateway/routes".to_owned(), None, 404),
+    ] {
+        let (got, _) = h
+            .sandbox(method.clone(), &path, &authorizer_svid(), body)
+            .await;
+        assert_eq!(got, status, "{method} {path}");
+    }
+    let held = h.claim_after_flushes(&user, &claim.name).await;
+    assert_eq!(held.phase, mediatore_proto::ClaimPhase::Bound);
+    assert!(held.tripped.is_none() && held.tripwires.is_none());
+    assert_eq!(h.token_for(&claim_svid(&uid), AUDIENCE).await.status(), 200);
+    // Each was recorded all the same: one line a class, naming the authorizer.
+    let lines = logs::captured();
+    for class in [
+        "claim_never_issued",
+        "credential_outside_inject",
+        "foreign_route",
+        "unknown_route",
+    ] {
+        let line = lines
+            .lines()
+            .find(|l| l.contains(CLASSIFIED) && l.contains(&format!("class=\"{class}\"")))
+            .unwrap_or_else(|| panic!("a line for {class}"));
+        assert!(line.contains("scope=\"authorizer\""), "{class}");
+        assert!(line.contains(&authorizer_svid()), "{class}");
+    }
+    assert!(!lines.contains("claim ended by a trip"));
+}
+
+const CANARY_PATH: &str = "canary-path-3e71";
+const CANARY_QUERY: &str = "canary-query-a6c2";
+const CANARY_HEADER: &str = "canary-header-d94b";
+const CANARY_TOKEN: &str = "canary-token-58f0";
+
+/// A request of each class of ADR-0070 about claim `uid`, each with a canary where a peer
+/// can put one: the method, the path, the peer and the body.
+fn canary_requests(uid: uuid::Uuid) -> Vec<(reqwest::Method, String, String, serde_json::Value)> {
+    let ghost = uuid::Uuid::new_v4();
+    let odd_audience = format!("aud/{CANARY_TOKEN}?");
+    let deny = serde_json::json!({
+        "gateway": "gateway-02",
+        "decisions": [{
+            "at": "2026-11-27T10:00:00Z", "claim_uid": uid, "kind": "inject",
+            "authority": "elsewhere.example", "verdict": "deny", "reason": "not_allowed",
+        }],
+    });
+    vec![
+        // The authorizer's classes, and a deny outside what the claim was handed.
+        (
+            reqwest::Method::GET,
+            format!("/v1/gateway/claims/{ghost}"),
+            authorizer_svid(),
+            serde_json::Value::Null,
+        ),
+        (
+            reqwest::Method::GET,
+            format!("/v1/gateway/claims/{CANARY_PATH}"),
+            authorizer_svid(),
+            serde_json::Value::Null,
+        ),
+        (
+            reqwest::Method::POST,
+            format!("/v1/gateway/claims/{uid}/credential"),
+            authorizer_svid(),
+            serde_json::json!({ "audience": odd_audience }),
+        ),
+        (
+            reqwest::Method::POST,
+            format!("/v1/gateway/claims/{uid}/credential"),
+            authorizer_svid(),
+            serde_json::json!({ "audience": AUDIENCE }),
+        ),
+        (
+            reqwest::Method::POST,
+            "/v1/gateway/decisions".into(),
+            authorizer_svid(),
+            deny,
+        ),
+        // A claim and a node with no record.
+        (
+            reqwest::Method::POST,
+            "/v1/token".into(),
+            claim_svid(&ghost),
+            serde_json::json!({ "audience": odd_audience }),
+        ),
+        (
+            reqwest::Method::GET,
+            "/v1/me".into(),
+            node_svid_of(OTHER_EK_HASH),
+            serde_json::Value::Null,
+        ),
+        // The claim's own: an audience it was never handed, a node route, a gateway
+        // route, paths the broker does not serve.
+        (
+            reqwest::Method::POST,
+            "/v1/token".into(),
+            claim_svid(&uid),
+            serde_json::json!({ "audience": odd_audience }),
+        ),
+        (
+            reqwest::Method::GET,
+            "/v1/me".into(),
+            claim_svid(&uid),
+            serde_json::Value::Null,
+        ),
+        (
+            reqwest::Method::POST,
+            "/v1/me/exit".into(),
+            claim_svid(&uid),
+            serde_json::json!({ "restarts": 0 }),
+        ),
+        (
+            reqwest::Method::GET,
+            format!("/v1/gateway/claims/{CANARY_PATH}"),
+            claim_svid(&uid),
+            serde_json::Value::Null,
+        ),
+        (
+            reqwest::Method::GET,
+            format!("/v1/{CANARY_PATH}"),
+            claim_svid(&uid),
+            serde_json::Value::Null,
+        ),
+        (
+            reqwest::Method::POST,
+            format!("/{CANARY_PATH}/v1/token"),
+            node_svid(),
+            serde_json::json!({ "audience": CANARY_TOKEN }),
+        ),
+        (
+            reqwest::Method::POST,
+            "/v1/token".into(),
+            node_svid(),
+            serde_json::json!({ "audience": CANARY_TOKEN }),
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn the_canary_scan_finds_nothing_the_peer_sent() {
+    // ADR-0070 decision 9, over the real listener: a token, a path, a query and headers
+    // planted on every classified route, and every line the broker wrote, at every level.
+    logs::capture();
+    let tripping: Vec<TripClass> = TripClass::PROTOCOL
+        .into_iter()
+        .filter(|c| c.may_trip())
+        .collect();
+    let mut kept = String::new();
+    for tripping in [vec![], tripping] {
+        let (pe, policy) = bundle_policy(mediatore_claims::policy::EgressMode::Enforce, true).await;
+        let h = Harness::start_classes(&tripping, Some(pe)).await;
+        let user = h.login("octocat");
+        let claim = h.bound(&user, Some(&policy)).await;
+        let uid = claim.uid.expect("uid");
+        let query = format!("?token={CANARY_TOKEN}&q={CANARY_QUERY}");
+        let requests = canary_requests(uid);
+        for (method, path, peer, body) in requests {
+            let mut req = h
+                .http
+                .request(method, format!("{}{path}{query}", h.sandbox_url))
+                .header(PEER_HEADER, peer)
+                .header("authorization", format!("Bearer {CANARY_TOKEN}"))
+                .header("x-api-key", CANARY_TOKEN)
+                .header("cookie", format!("session={CANARY_HEADER}"))
+                .header("x-canary", CANARY_HEADER);
+            if !body.is_null() {
+                req = req.json(&body);
+            }
+            req.send().await.expect("planted request");
+        }
+        let held = h.claim_after_flushes(&user, &claim.name).await;
+        assert_eq!(held.tripped.is_some(), !tripping.is_empty());
+        kept.push_str(&serde_json::to_string(&held).expect("json"));
+    }
+    let lines = logs::captured();
+    // The capture is live down to the request span, and every class fired in it.
+    assert!(lines.contains("request{method=\"POST\" route=\"/v1/token\"}"));
+    for class in [
+        "foreign_route",
+        "unknown_route",
+        "no_record",
+        "audience_outside_rendered",
+        "claim_never_issued",
+        "credential_outside_inject",
+        "deny_outside_rendered",
+    ] {
+        let fired = lines
+            .lines()
+            .any(|l| l.contains(CLASSIFIED) && l.contains(&format!("class=\"{class}\"")));
+        assert!(fired, "{class} fired in this run");
+    }
+    assert!(lines.contains("claim ended by a trip"));
+    // What the broker wrote: every line but the test's own HTTP client's, which runs in this
+    // process and names the URLs it was told to ask for.
+    let broker: Vec<&str> = lines
+        .lines()
+        .filter(|l| !CLIENT_TARGETS.iter().any(|t| l.contains(t)))
+        .collect();
+    assert!(broker.len() > 50, "the broker's lines are in the capture");
+    for canary in [CANARY_PATH, CANARY_QUERY, CANARY_HEADER, CANARY_TOKEN] {
+        assert!(
+            !broker.iter().any(|l| l.contains(canary)),
+            "a value the peer planted is in a line of the broker"
+        );
+        assert!(
+            !kept.contains(canary),
+            "a value the peer planted is shown to the owner"
+        );
+    }
+}
+
+/// The log targets of the HTTP client these tests send with.
+const CLIENT_TARGETS: [&str; 3] = [" reqwest::", " hyper_util::client::", " hyper::client::"];
 
 // ----- an x509pop node's registration (ADR-0049 decision 8) -------------------------------
 

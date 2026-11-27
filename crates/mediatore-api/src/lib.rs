@@ -57,8 +57,29 @@ use mediatore_tls::PeerSpiffeId;
 use uuid::Uuid;
 
 mod audiences;
+mod classify;
 mod follow;
+mod trip;
+pub mod tripwires;
 pub use audiences::{AudienceCatalogSource, AudienceView, CatalogView};
+pub use classify::{flush as flush_classified, sandbox_authorizer_classified, spawn_flush};
+pub use tripwires::Tripwires;
+
+/// The routes of the sandbox listener, each as its method and its template: what an audit
+/// line names a route by (ADR-0070 decision 8), never the path of a request.
+mod route {
+    pub(crate) const HEALTHZ: &str = "GET /healthz";
+    pub(crate) const NODES: &str = "POST /v1/nodes";
+    pub(crate) const ME: &str = "GET /v1/me";
+    pub(crate) const ME_REPORT: &str = "POST /v1/me/report";
+    pub(crate) const ME_EXIT: &str = "POST /v1/me/exit";
+    pub(crate) const ME_TRIP: &str = "POST /v1/me/trip";
+    pub(crate) const ME_LOGS: &str = "POST /v1/me/logs";
+    pub(crate) const TOKEN: &str = "POST /v1/token";
+    pub(crate) const GATEWAY_CLAIM: &str = "GET /v1/gateway/claims/{uid}";
+    pub(crate) const GATEWAY_DECISIONS: &str = "POST /v1/gateway/decisions";
+    pub(crate) const GATEWAY_CREDENTIAL: &str = "POST /v1/gateway/claims/{uid}/credential";
+}
 
 /// Hex characters of the claim UID used in the generated object name.
 const CLAIM_NAME_SUFFIX_LEN: usize = 8;
@@ -171,6 +192,10 @@ pub struct AppState {
     /// ask a `warn` line. `false` everywhere but an environment in the middle of moving its
     /// gateways' entries; with it on, the compartment of ADR-0053 is not in force.
     pub accept_plain_gateway_identity: bool,
+    /// Tripwires (ADR-0069, ADR-0070): the mode, what each class does, the limiter of
+    /// `POST /v1/me/trip` and the two bounded tables. [`Tripwires::default`] is `off` with
+    /// every class at `report`: the trip route answers `501` and `GET /v1/me` carries no traps.
+    pub tripwires: Tripwires,
 }
 
 impl AppState {
@@ -910,9 +935,10 @@ pub fn sandbox_authorizer(
 /// included, is `403 forbidden`, and the caller runs this before it parses or looks up the
 /// claim, so a refusal says nothing about whether a claim exists. With
 /// `accept_plain_gateway_identity` on (decision 7) the listeners' ID is answered too, and
-/// every such ask is a `warn` line naming the peer, the route and the claim UID as asked.
+/// every such ask is a `warn` line naming the peer, the route and the claim UID asked about,
+/// when the path named one.
 fn require_gateway_authorizer(
-    st: &AppState,
+    st: &Shared,
     peer: &str,
     route: &'static str,
     claim_uid: &str,
@@ -921,6 +947,11 @@ fn require_gateway_authorizer(
         return Ok(());
     }
     if st.accept_plain_gateway_identity && st.naming.is_gateway(peer) {
+        // The uid is a segment of the request's path: named only when it is one (ADR-0069
+        // decision 12, no line carries what a peer put in a path).
+        let claim_uid = Uuid::parse_str(claim_uid)
+            .map(|u| u.to_string())
+            .unwrap_or_default();
         tracing::warn!(
             %peer,
             route,
@@ -929,6 +960,8 @@ fn require_gateway_authorizer(
         );
         return Ok(());
     }
+    // ADR-0070: a node or a claim on a gateway route. The answer below is the same either way.
+    classify::foreign_route(st, peer, route);
     Err(ApiError::forbidden(
         "peer is not the gateway authorizer's identity",
     ))
@@ -1257,6 +1290,7 @@ async fn dev_claim(
     }
     st.store
         .put_claim(ClaimRecord {
+            tripped: None,
             rendered: None,
             follow: None,
             uid,
@@ -1305,6 +1339,8 @@ async fn dev_claim(
 /// no pool binds a member there; the report and the exit as the record holds them.
 fn record_response(rec: &ClaimRecord) -> ClaimResponse {
     ClaimResponse {
+        tripped: None,
+        tripwires: None,
         name: rec.name.clone(),
         uid: Some(rec.uid),
         phase: phase_of(rec),
@@ -1658,6 +1694,8 @@ async fn park_session(
 fn response_of(sb: &AgentSandbox) -> ClaimResponse {
     let st = sb.status.clone().unwrap_or_default();
     ClaimResponse {
+        tripped: None,
+        tripwires: None,
         name: sb.metadata.name.clone().unwrap_or_default(),
         uid: st
             .claim_uid
@@ -1756,13 +1794,16 @@ async fn get_claim(
         // The guest's report lives on the record (ADR-0029 decision 5), not on the
         // resource; a record not yet written is simply no report.
         if let Ok(rec) = st.store.get_claim_by_name(&namespace, &name).await {
+            trip::shown(&st, &rec, &mut resp).await;
             resp.report = rec.report;
             resp.exit = rec.exit;
         }
         return Ok(Json(resp));
     }
     let rec = owned_claim(&st, &headers, q.namespace.as_deref(), &name).await?;
-    Ok(Json(record_response(&rec)))
+    let mut resp = record_response(&rec);
+    trip::shown(&st, &rec, &mut resp).await;
+    Ok(Json(resp))
 }
 
 async fn delete_claim(
@@ -1800,8 +1841,24 @@ pub fn user_router(state: Shared) -> Router {
         .route("/v1/claims", post(create_claim))
         .route("/v1/claims/{name}", get(get_claim).delete(delete_claim))
         .route("/v1/claims/{name}/logs", get(read_logs))
-        .layer(tower_http::trace::TraceLayer::new_for_http())
+        .layer(request_trace())
         .with_state(state)
+}
+
+/// The trace layer of both routers, with the span of [`classify::request_span`].
+type RequestTrace = tower_http::trace::TraceLayer<
+    tower_http::classify::SharedClassifier<tower_http::classify::ServerErrorsAsFailures>,
+    fn(&axum::http::Request<axum::body::Body>) -> tracing::Span,
+>;
+
+/// The trace layer of both routers: tower-http's, with a span that names the method and the
+/// matched route's template and never the URI ([`classify::request_span`]). Its default span
+/// carries the path and the query of every request.
+pub(crate) fn request_trace() -> RequestTrace {
+    tower_http::trace::TraceLayer::new_for_http().make_span_with(
+        classify::request_span::<axum::body::Body>
+            as fn(&axum::http::Request<axum::body::Body>) -> tracing::Span,
+    )
 }
 
 // ---------- the workload's output (ADR-0045) ----------
@@ -2131,12 +2188,31 @@ async fn follow_logs(
     }
 }
 
+/// The claim a node's output batch is for: its live claim, or the claim a trap ended on it
+/// while [`tripwires::LOGS_AFTER_A_TRIP`] has not passed since `tripped.recorded_at`, so that
+/// the final line naming the trap and the workload's last output reach the owner (ADR-0069
+/// decision 7 step 4, amended 2026-11-27). Only the node's own claim, the live one or else
+/// the last it was bound to; `None` for anything else, a store that fails included.
+async fn logs_claim_of(st: &AppState, node: &NodeRecord) -> Option<ClaimRecord> {
+    let rec = match st.store.get_claim_by_node(&node.node_id).await {
+        Ok(rec) if rec.tripped.is_none() => return Some(rec),
+        Ok(rec) => rec,
+        // No live claim: only one a trap ended is still taken.
+        Err(_) => st.store.last_claim_by_node(&node.node_id).await.ok()?,
+    };
+    let tripped = rec.tripped.as_ref()?;
+    let grace = SignedDuration::try_from(tripwires::LOGS_AFTER_A_TRIP).ok()?;
+    let within = Timestamp::now().duration_since(tripped.recorded_at) <= grace;
+    (within && rec.node_id.as_deref() == Some(node.node_id.as_str())).then_some(rec)
+}
+
 /// `POST /v1/me/logs` (ADR-0045 decisions 4, 8 and 9): the claim's node, over the node SVID,
 /// ships a batch of the workload's output, redacted in the VM. The broker re-validates the
 /// shape and the sizes and does not redact again: it cannot know which secrets the jail was
 /// given, so redaction is the guest's, before the output left the VM. A node with no live
 /// claim (the guest flushing after the claim ended) is `204` and the batch is dropped, as a
-/// late exit is. `501` when the broker stores no output; `400 logs_not_requested` for a claim
+/// late exit is, but for a claim a trap ended, whose node may ship for a grace after the trip
+/// ([`logs_claim_of`]). `501` when the broker stores no output; `400 logs_not_requested` for a claim
 /// that did not opt in; `413` over [`MAX_LOG_BATCH_BYTES`]; `429` with `Retry-After` beyond two
 /// batches a second. A batch is stored before it is acknowledged, and once it is stored the
 /// claim's followers on this replica are woken ([`LogWakes`]). The text is never logged, only
@@ -2152,13 +2228,11 @@ async fn ingest_logs(
             "logs are not enabled on this broker",
         ));
     };
-    let rec = match claim_of_node_peer(&st, &headers, peer.as_ref().map(|e| &e.0)).await {
-        Ok(rec) => rec,
-        Err(e) if e.status == StatusCode::NOT_FOUND => {
-            tracing::debug!("a node shipped output with no live claim bound; dropped");
-            return Ok(StatusCode::NO_CONTENT.into_response());
-        }
-        Err(e) => return Err(e),
+    let peer = peer.as_ref().map(|e| &e.0);
+    let node = node_of_peer(&st, &headers, peer, route::ME_LOGS).await?;
+    let Some(rec) = logs_claim_of(&st, &node).await else {
+        tracing::debug!("a node shipped output with no live claim bound; dropped");
+        return Ok(StatusCode::NO_CONTENT.into_response());
     };
     if !rec.workload.logs {
         return Err(ApiError::bad_request(
@@ -2281,6 +2355,9 @@ async fn register_node(
     // must be the names attested under.
     let expected = st.naming.node_id(&node.key);
     if peer != expected {
+        // ADR-0070: a claim or the authorizer registering a node. A node registering another
+        // node's EK is not a class.
+        classify::foreign_route(&st, &peer, route::NODES);
         return Err(ApiError::forbidden(format!(
             "peer {peer} may not register {expected}"
         )));
@@ -2341,34 +2418,62 @@ async fn register_node(
     }))
 }
 
-/// The live claim bound to the node the peer is: the node identity, registered, with a
-/// claim (`GET /v1/me` and `POST /v1/me/report` share it).
-async fn claim_of_node_peer(
-    st: &AppState,
+/// The registered node the peer is: a node identity of this trust domain whose node key (a TPM
+/// node's EK hash, an x509pop node's hash of its agent ID) is in the register. Every route of the node surface starts here; `POST /v1/me/trip` stops here,
+/// since a trip report can come from a node whose claim has ended, or that has none
+/// (ADR-0069 decision 9, ADR-0070 decision 8).
+///
+/// `route` is the template of the route asking, for the audit line of a refusal ADR-0070
+/// classifies: a claim or the authorizer here is `foreign_route`, and a node the register does
+/// not hold is `no_record`. Neither changes the refusal.
+async fn node_of_peer(
+    st: &Shared,
     headers: &HeaderMap,
     peer: Option<&PeerSpiffeId>,
-) -> Result<ClaimRecord, ApiError> {
+    route: &'static str,
+) -> Result<NodeRecord, ApiError> {
     let peer = peer_spiffe_id(st, peer, headers)?;
     // The node key: a TPM node's EK hash, an x509pop node's hash of its agent ID.
-    let node_key = st
-        .naming
-        .node_ek_from(&peer)
-        .ok_or_else(|| ApiError::forbidden("peer is not a node identity"))?;
-    let node = st
+    let Some(node_key) = st.naming.node_ek_from(&peer) else {
+        classify::foreign_route(st, &peer, route);
+        return Err(ApiError::forbidden("peer is not a node identity"));
+    };
+    st.store.get_node(&node_key).await.map_err(|e| {
+        // Only a node the register does not hold: a store that failed says nothing of it.
+        if matches!(e, StoreError::NotFound(_)) {
+            classify::no_record(st, &peer, route);
+        }
+        ApiError::forbidden("node not registered")
+    })
+}
+
+/// The live claim bound to the node the peer is: the node identity, registered, with a
+/// claim (`GET /v1/me` and `POST /v1/me/report` share it). A claim a trap ended is no claim
+/// here from the moment `tripped` is on its record, before its release lands (ADR-0069
+/// decision 9): its guest is handed nothing to start or restart a workload with.
+async fn claim_of_node_peer(
+    st: &Shared,
+    headers: &HeaderMap,
+    peer: Option<&PeerSpiffeId>,
+    route: &'static str,
+) -> Result<ClaimRecord, ApiError> {
+    let node = node_of_peer(st, headers, peer, route).await?;
+    let no_claim = || {
+        ApiError::new(
+            StatusCode::NOT_FOUND,
+            "no_claim",
+            Some("no live claim bound to this node".into()),
+        )
+    };
+    let rec = st
         .store
-        .get_node(&node_key)
-        .await
-        .map_err(|_| ApiError::forbidden("node not registered"))?;
-    st.store
         .get_claim_by_node(&node.node_id)
         .await
-        .map_err(|_| {
-            ApiError::new(
-                StatusCode::NOT_FOUND,
-                "no_claim",
-                Some("no live claim bound to this node".into()),
-            )
-        })
+        .map_err(|_| no_claim())?;
+    if rec.tripped.is_some() {
+        return Err(no_claim());
+    }
+    Ok(rec)
 }
 
 /// The per-claim limit on what a node writes to its claim's record with `POST /v1/me/report`:
@@ -2392,13 +2497,20 @@ fn node_report_allowed(st: &AppState, claim_uid: Uuid) -> Result<(), ApiError> {
 /// the audit line with it), and the claim is released as `DELETE /v1/claims/{name}` releases
 /// it: through the `AgentSandbox` with a cluster, directly in `dev_mode`. A node with no
 /// live claim (the guest late, the claim already released) is `204` all the same.
+///
+/// A claim a trap ended is not released here, whenever its `tripped` lands (ADR-0069 decision
+/// 9, amended 2026-11-27): an exit that finds it on the record writes nothing and deletes
+/// nothing, and one whose write landed first reads the record again before the delete and
+/// stops there if `tripped` is on it by then. The trip releases the claim itself, and its
+/// `AgentSandbox`, with the status that says why it ended, goes only with the retention sweep.
 async fn exit(
     State(st): State<Shared>,
     headers: HeaderMap,
     peer: Option<Extension<PeerSpiffeId>>,
     Json(body): Json<GuestExit>,
 ) -> Result<StatusCode, ApiError> {
-    let rec = match claim_of_node_peer(&st, &headers, peer.as_ref().map(|e| &e.0)).await {
+    let peer = peer.as_ref().map(|e| &e.0);
+    let rec = match claim_of_node_peer(&st, &headers, peer, route::ME_EXIT).await {
         Ok(rec) => rec,
         Err(e) if e.status == StatusCode::NOT_FOUND => {
             tracing::debug!("a node reported an exit with no live claim bound; nothing to end");
@@ -2420,13 +2532,22 @@ async fn exit(
         exit: body,
     };
     // The exit is put on the record as it is when it is written (ADR-0057 decision 5), and
-    // nothing else of the copy read above is carried over.
+    // nothing else of the copy read above is carried over; never on a record a trap ended.
+    let mut tripped = false;
     let written = modify_claim(st.store.as_ref(), rec.uid, |mut fresh| {
+        tripped = fresh.tripped.is_some();
+        if tripped {
+            return None;
+        }
         fresh.exit = Some(exited.clone());
         Some(fresh)
     })
     .await;
     match written {
+        Ok(Modified::Unchanged) if tripped => {
+            tracing::info!(claim_uid = %rec.uid, "exit for a claim a trap ended: nothing written, nothing deleted (ADR-0069 decision 9)");
+            return Ok(StatusCode::NO_CONTENT);
+        }
         Ok(Modified::Written | Modified::Unchanged) => {}
         Ok(Modified::Released) | Err(StoreError::NotFound(_)) => {
             // Ended already: the exit is in the line above and not on the record.
@@ -2446,13 +2567,33 @@ async fn exit(
             .await
             .map_err(|e| ApiError::internal(e.to_string()))?;
     } else {
-        st.sandboxes
+        let front = st
+            .sandboxes
             .as_ref()
-            .ok_or_else(|| ApiError::not_implemented("claim release via the kubernetes api"))?
-            .delete(&rec.namespace, &rec.name)
-            .await?;
+            .ok_or_else(|| ApiError::not_implemented("claim release via the kubernetes api"))?;
+        if tripped_since(&st, rec.uid).await? {
+            tracing::info!(claim_uid = %rec.uid, "a trap ended the claim while its exit was written: its sandbox is not deleted (ADR-0069 decision 9)");
+            return Ok(StatusCode::NO_CONTENT);
+        }
+        front.delete(&rec.namespace, &rec.name).await?;
     }
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Whether claim `uid`'s record carries `tripped` now: read again just before an exit deletes
+/// the claim's `AgentSandbox`. A record that is gone has nothing to keep. One that cannot be
+/// read is not deleted on a guess (a `tripped` this build cannot read makes the record
+/// unreadable): the exit fails, the guest may send it again, and the deadline ends the claim
+/// otherwise.
+async fn tripped_since(st: &AppState, uid: Uuid) -> Result<bool, ApiError> {
+    match st.store.get_claim(uid).await {
+        Ok(rec) => Ok(rec.tripped.is_some()),
+        Err(StoreError::NotFound(_)) => Ok(false),
+        Err(e) => {
+            tracing::warn!(claim_uid = %uid, error = %e, "the record could not be read again before an exit's release; the sandbox is not deleted");
+            Err(store_error(e))
+        }
+    }
 }
 
 /// `POST /v1/me/report` (ADR-0029 decision 5): the guest, over the node SVID, says what it
@@ -2465,7 +2606,8 @@ async fn report(
     peer: Option<Extension<PeerSpiffeId>>,
     Json(body): Json<GuestReport>,
 ) -> Result<StatusCode, ApiError> {
-    let rec = claim_of_node_peer(&st, &headers, peer.as_ref().map(|e| &e.0)).await?;
+    let peer = peer.as_ref().map(|e| &e.0);
+    let rec = claim_of_node_peer(&st, &headers, peer, route::ME_REPORT).await?;
     node_report_allowed(&st, rec.uid)?;
     body.validate()
         .map_err(|e| ApiError::bad_request("invalid_report", e))?;
@@ -2541,6 +2683,9 @@ fn handed(st: &AppState, rec: &ClaimRecord) -> (Vec<Endpoint>, Vec<Route>) {
             eff.egress.into_iter().map(move |e| (a, e, rules.clone()))
         })
         .map(|(a, e, rules)| Route {
+            // ADR-0069 decision 6: an audience that carries the agent's own conversation is
+            // marked, and the proxy then matches bait in its headers, path and query only.
+            traps_body: st.tripwires.traps_body(a),
             audience: Some(a.clone()),
             endpoint: e,
             rules,
@@ -2571,6 +2716,7 @@ fn handed(st: &AppState, rec: &ClaimRecord) -> (Vec<Endpoint>, Vec<Route>) {
             pull_only: is_registry(st, a),
         })
         .chain(direct.into_iter().map(|e| Route {
+            traps_body: mediatore_proto::trip::TrapsBody::Match,
             audience: None,
             endpoint: e,
             rules: vec![],
@@ -2595,7 +2741,8 @@ async fn me(
     headers: HeaderMap,
     peer: Option<Extension<PeerSpiffeId>>,
 ) -> Result<Json<Me>, ApiError> {
-    let rec = claim_of_node_peer(&st, &headers, peer.as_ref().map(|e| &e.0)).await?;
+    let peer = peer.as_ref().map(|e| &e.0);
+    let rec = claim_of_node_peer(&st, &headers, peer, route::ME).await?;
     audiences_ready(&st, &rec.namespace)?;
     let expires_at = rec
         .expires_at
@@ -2617,6 +2764,7 @@ async fn me(
         tracing::debug!(claim_uid = %rec.uid, registry = %c.host, "registry credential attached");
     }
     Ok(Json(Me {
+        traps: st.tripwires.policy(),
         claim_uid: rec.uid,
         subject: rec.subject,
         expires_at,
@@ -2843,16 +2991,25 @@ async fn claim_egress(
     Path(uid): Path<String>,
 ) -> Result<Json<ClaimEgress>, ApiError> {
     let peer = peer_spiffe_id(&st, peer.as_ref().map(|e| &e.0), &headers)?;
-    require_gateway_authorizer(&st, &peer, "GET /v1/gateway/claims/{uid}", &uid)?;
+    require_gateway_authorizer(&st, &peer, route::GATEWAY_CLAIM, &uid)?;
     let uid = Uuid::parse_str(&uid)
         .map_err(|_| ApiError::bad_request("invalid_claim_uid", "claim uid must be a UUID"))?;
     let unknown = || ApiError::not_found("no live claim with this uid");
     let rec = st.store.get_claim(uid).await.map_err(|e| match e {
-        StoreError::NotFound(_) => unknown(),
+        StoreError::NotFound(_) => {
+            // ADR-0070: a uid the store holds no record of, live or ended.
+            classify::claim_never_issued(&st, &peer, route::GATEWAY_CLAIM);
+            unknown()
+        }
         other => ApiError::internal(other.to_string()),
     })?;
     let now = Timestamp::now();
-    let Some(expires_at) = rec.expires_at.filter(|_| rec.is_live(now)) else {
+    // A claim a trap ended is not live from the moment `tripped` is on its record (ADR-0069
+    // decision 9): the gateway drops what it cached, as for a released claim.
+    let Some(expires_at) = rec
+        .expires_at
+        .filter(|_| rec.tripped.is_none() && rec.is_live(now))
+    else {
         tracing::debug!(claim_uid = %uid, "gateway asked about a claim that is not live");
         return Err(unknown());
     };
@@ -2872,21 +3029,51 @@ async fn claim_egress(
     }))
 }
 
+/// The limiter's key for a gateway identity on `POST /v1/gateway/decisions`: the route admits
+/// two, the authorizer's and (where it is accepted) the listeners', and each has a bucket.
+/// Nothing the batch says picks the bucket, so no peer can make the table grow.
+fn gateway_key(st: &AppState, peer: &str) -> Uuid {
+    Uuid::from_u128(u128::from(st.naming.is_gateway_authorizer(peer)))
+}
+
 /// `POST /v1/gateway/decisions`: one gateway's tunnel and inject decisions, each written as one
 /// `info` line naming the gateway and the host (ADR-0062). The peer must be the gateway
 /// authorizer's identity, as on the other gateway routes. A batch whose shape is off is refused
-/// whole, before any of it is logged; nothing is stored and no claim is looked up.
+/// whole, before any of it is logged; nothing is stored and no claim is looked up. Past
+/// [`tripwires::GATEWAY_BATCHES_PER_SECOND`] batches a second from one gateway identity,
+/// `429 too_many_batches` with `Retry-After` and nothing of the batch is logged or judged; a
+/// refused batch spends nothing.
 async fn gateway_decisions(
     State(st): State<Shared>,
     headers: HeaderMap,
     peer: Option<Extension<PeerSpiffeId>>,
     Json(batch): Json<GatewayDecisions>,
-) -> Result<StatusCode, ApiError> {
+) -> Result<Response, ApiError> {
     let peer = peer_spiffe_id(&st, peer.as_ref().map(|e| &e.0), &headers)?;
-    require_gateway_authorizer(&st, &peer, "POST /v1/gateway/decisions", "")?;
+    require_gateway_authorizer(&st, &peer, route::GATEWAY_DECISIONS, "")?;
     batch
         .check()
         .map_err(|why| ApiError::bad_request("invalid_decisions", why))?;
+    if !st.tripwires.decisions.allow(gateway_key(&st, &peer)) {
+        tracing::info!(
+            gateway = %batch.gateway,
+            decisions = batch.decisions.len(),
+            probes = batch.probes.len(),
+            per_second = tripwires::GATEWAY_BATCHES_PER_SECOND,
+            "gateway decisions rate-limited: the batch is neither logged nor judged"
+        );
+        return Ok((
+            StatusCode::TOO_MANY_REQUESTS,
+            [(header::RETRY_AFTER, "1")],
+            Json(ErrorBody {
+                error: "too_many_batches".into(),
+                detail: Some(
+                    "too many batches of decisions per second for this gateway identity".into(),
+                ),
+            }),
+        )
+            .into_response());
+    }
     for d in &batch.decisions {
         let kind = match d.kind {
             mediatore_proto::DecisionKind::Tunnel => "tunnel",
@@ -2909,7 +3096,26 @@ async fn gateway_decisions(
             "gateway decision"
         );
     }
-    Ok(StatusCode::NO_CONTENT)
+    // ADR-0070 decisions 4, 5 and 8: what the gateway's host table dropped, one line a probe,
+    // the word of whoever holds the authorizer's identity. Recorded unattributed, folded
+    // nowhere, and no class here ends anything whatever the configuration says.
+    for p in &batch.probes {
+        tracing::warn!(
+            kind = "segment",
+            class = p.class.as_str(),
+            gateway = %batch.gateway,
+            count = p.count,
+            port = %p.port.map(|port| port.to_string()).unwrap_or_default(),
+            source_address = p.source_address.as_deref().unwrap_or_default(),
+            user = p.user.as_deref().unwrap_or_default(),
+            at = %p.at,
+            "gateway probe"
+        );
+    }
+    // The answer is decided: what the denies say of their claims is judged after it
+    // (ADR-0070 decision 2).
+    classify::reported_denies(&st, &peer, &batch);
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 /// The claim's gateway-placed routes (ADR-0040 decision 2): one per exact upstream authority
@@ -3374,28 +3580,35 @@ async fn issue_token_capped(
 /// live, it names the audience, the audience is served with a credential, and the claim
 /// is under its rate limit.
 async fn token_claim(
-    st: &AppState,
+    st: &Shared,
     peer: Option<&PeerSpiffeId>,
     headers: &HeaderMap,
     audience: &str,
 ) -> Result<(String, Uuid, ClaimRecord), ApiError> {
     let peer = peer_spiffe_id(st, peer, headers)?;
-    let claim_uid = st
-        .naming
-        .claim_uid_from(&peer)
-        .ok_or_else(|| ApiError::forbidden("peer is not a claim identity"))?;
-    let rec = st
-        .store
-        .get_claim(claim_uid)
-        .await
-        .map_err(|_| ApiError::forbidden("unknown claim"))?;
-    if !rec.is_live(Timestamp::now()) {
+    let Some(claim_uid) = st.naming.claim_uid_from(&peer) else {
+        // ADR-0070: a node or the authorizer asking for a token.
+        classify::foreign_route(st, &peer, route::TOKEN);
+        return Err(ApiError::forbidden("peer is not a claim identity"));
+    };
+    let rec = st.store.get_claim(claim_uid).await.map_err(|e| {
+        // ADR-0070: a claim identity with no record at all; a store that failed says nothing.
+        if matches!(e, StoreError::NotFound(_)) {
+            classify::no_record(st, &peer, route::TOKEN);
+        }
+        ApiError::forbidden("unknown claim")
+    })?;
+    // A claim a trap ended issues nothing from the moment `tripped` is on its record, before
+    // its release lands (ADR-0069 decision 9): the answer a released claim gets.
+    if rec.tripped.is_some() || !rec.is_live(Timestamp::now()) {
         return Err(ApiError::forbidden("claim revoked or expired"));
     }
     audiences_ready(st, &rec.namespace)?;
     // ADR-0061: a running claim no longer inside its policy's current bundle mints nothing.
     follow::gate(st, &rec, false).await?;
     if !claim_audiences(st, &rec).any(|a| a == audience) {
+        // ADR-0070: an audience in no route the claim's guest was handed.
+        classify::audience_refused(st, &peer, &rec, audience);
         return Err(ApiError::bad_request(
             "unknown_audience",
             audience.to_owned(),
@@ -3569,15 +3782,19 @@ async fn gateway_credential(
     Json(req): Json<GatewayCredentialRequest>,
 ) -> Result<Json<GatewayCredential>, ApiError> {
     let peer = peer_spiffe_id(&st, peer.as_ref().map(|e| &e.0), &headers)?;
-    require_gateway_authorizer(&st, &peer, "POST /v1/gateway/claims/{uid}/credential", &uid)?;
+    require_gateway_authorizer(&st, &peer, route::GATEWAY_CREDENTIAL, &uid)?;
     let claim_uid = Uuid::parse_str(&uid)
         .map_err(|_| ApiError::bad_request("invalid_claim_uid", "claim uid must be a UUID"))?;
     let unknown = || ApiError::not_found("no live claim with this uid");
     let rec = st.store.get_claim(claim_uid).await.map_err(|e| match e {
-        StoreError::NotFound(_) => unknown(),
+        StoreError::NotFound(_) => {
+            // ADR-0070: a uid the store holds no record of, live or ended.
+            classify::claim_never_issued(&st, &peer, route::GATEWAY_CREDENTIAL);
+            unknown()
+        }
         other => ApiError::internal(other.to_string()),
     })?;
-    if rec.expires_at.is_none() || !rec.is_live(Timestamp::now()) {
+    if rec.expires_at.is_none() || rec.tripped.is_some() || !rec.is_live(Timestamp::now()) {
         tracing::debug!(%claim_uid, "gateway asked for a credential of a claim that is not live");
         return Err(unknown());
     }
@@ -3587,10 +3804,13 @@ async fn gateway_credential(
     }
     let audience = req.audience;
     if !claim_audiences(&st, &rec).any(|a| a == &audience) {
+        // ADR-0070: an audience that is not gateway-placed for this claim.
+        classify::credential_outside_inject(&st, &peer);
         return Err(ApiError::bad_request("unknown_audience", audience));
     }
     let view = st.view(&rec.namespace);
     if view.inject(&audience).is_none() {
+        classify::credential_outside_inject(&st, &peer);
         return Err(ApiError::new(
             StatusCode::FORBIDDEN,
             error_code::NOT_PLACED_AT_GATEWAY,
@@ -3613,23 +3833,91 @@ async fn gateway_credential(
     Ok(Json(credential))
 }
 
-/// Router for attested VMs and their jailed workloads.
-pub fn sandbox_router(state: Shared) -> Router {
-    Router::new()
-        .route("/healthz", get(healthz))
-        .route("/v1/nodes", post(register_node))
-        .route("/v1/me", get(me))
-        .route("/v1/me/report", post(report))
-        .route("/v1/me/exit", post(exit))
-        .route("/v1/me/logs", post(ingest_logs))
-        .route("/v1/token", post(token))
-        .route("/v1/gateway/claims/{uid}", get(claim_egress))
-        .route("/v1/gateway/decisions", post(gateway_decisions))
-        .route(
-            "/v1/gateway/claims/{uid}/credential",
+/// One route of the sandbox listener: who it is for, its method and template, its handler.
+pub(crate) struct Served {
+    /// The role whose honest request set the route is in (ADR-0070).
+    pub(crate) role: classify::Role,
+    /// `METHOD /template`, one of [`route`].
+    pub(crate) route: &'static str,
+    handler: axum::routing::MethodRouter<Shared>,
+}
+
+impl Served {
+    /// The route's path template.
+    pub(crate) fn path(&self) -> &'static str {
+        self.route.split_once(' ').map_or(self.route, |(_, p)| p)
+    }
+}
+
+/// Every route the sandbox listener serves, each in the honest request set of exactly one
+/// role (ADR-0070, roadmap 18 phase 0): [`sandbox_router`] is built from this list and from
+/// nothing else, so a route cannot be served without a role here, and a request for anything
+/// that is not here is `unknown_route`. A new route is a new line and a decision: which role
+/// sends it, and so which identities are `foreign_route` on it.
+pub(crate) fn sandbox_routes() -> Vec<Served> {
+    use classify::Role::{Any, Authorizer, Claim, Node};
+    let served = |role, route, handler| Served {
+        role,
+        route,
+        handler,
+    };
+    vec![
+        served(Any, route::HEALTHZ, get(healthz)),
+        served(Node, route::NODES, post(register_node)),
+        served(Node, route::ME, get(me)),
+        served(Node, route::ME_REPORT, post(report)),
+        served(Node, route::ME_EXIT, post(exit)),
+        served(Node, route::ME_TRIP, post(trip::trip)),
+        served(Node, route::ME_LOGS, post(ingest_logs)),
+        served(Claim, route::TOKEN, post(token)),
+        served(Authorizer, route::GATEWAY_CLAIM, get(claim_egress)),
+        served(
+            Authorizer,
+            route::GATEWAY_DECISIONS,
+            post(gateway_decisions),
+        ),
+        served(
+            Authorizer,
+            route::GATEWAY_CREDENTIAL,
             post(gateway_credential),
-        )
-        .layer(tower_http::trace::TraceLayer::new_for_http())
+        ),
+    ]
+}
+
+/// The role each route of [`sandbox_routes`] is for, by its `METHOD /template`: what decides
+/// which identities are `foreign_route` on it. Read from the list the router is built from,
+/// once.
+pub(crate) fn honest_role(route: &str) -> Option<classify::Role> {
+    static HONEST: std::sync::LazyLock<Vec<(&'static str, classify::Role)>> =
+        std::sync::LazyLock::new(|| {
+            sandbox_routes()
+                .into_iter()
+                .map(|served| (served.route, served.role))
+                .collect()
+        });
+    HONEST
+        .iter()
+        .find(|(served, _)| *served == route)
+        .map(|(_, role)| *role)
+}
+
+/// Router for attested VMs and their jailed workloads: the routes of [`sandbox_routes`], and a
+/// fallback that answers a path none of them serves with the router's own empty `404` and
+/// counts it as `unknown_route` (ADR-0070 decision 3). A known path under another method is
+/// still the router's `405`, and no class.
+pub fn sandbox_router(state: Shared) -> Router {
+    sandbox_routes()
+        .into_iter()
+        .fold(Router::new(), |router, served| {
+            router.route(served.path(), served.handler)
+        })
+        // As a service, not as a handler: the router sets `content-length` on a handler's
+        // answer and not on its own `404`, and this one must be the router's own, byte for byte.
+        .fallback_service(axum::handler::Handler::with_state(
+            classify::unknown_route,
+            state.clone(),
+        ))
+        .layer(request_trace())
         .with_state(state)
 }
 
@@ -3781,8 +4069,9 @@ mod tests {
     }
 
     /// A state with nothing configured; `dev_mode` so the tests name the peer in a header.
-    fn base_state() -> AppState {
+    pub(super) fn base_state() -> AppState {
         AppState {
+            tripwires: crate::Tripwires::default(),
             store: mediatore_store::MemoryStore::shared(),
             spire: Arc::new(mediatore_spire::MemoryEntries::default()),
             naming: naming(),
@@ -3821,7 +4110,7 @@ mod tests {
     /// `x-api-key`) and `claude` (delegated, `authorization`) placed at the gateway, `sts-gw`
     /// (minted) placed at the gateway, and `grafana` (secret) and `grafana-sts` placed in the
     /// proxy as before.
-    fn placed_state() -> AppState {
+    pub(super) fn placed_state() -> AppState {
         let mut st = base_state();
         st.audiences = ["anthropic", "claude", "sts-gw", "grafana", "grafana-sts"]
             .map(String::from)
@@ -3928,9 +4217,10 @@ mod tests {
         }
     }
 
-    fn claim(audiences: &[&str], node_id: Option<String>) -> ClaimRecord {
+    pub(super) fn claim(audiences: &[&str], node_id: Option<String>) -> ClaimRecord {
         let uid = Uuid::new_v4();
         ClaimRecord {
+            tripped: None,
             rendered: None,
             follow: None,
             uid,
@@ -3956,13 +4246,13 @@ mod tests {
         }
     }
 
-    async fn stored(st: &Shared, rec: ClaimRecord) -> ClaimRecord {
+    pub(super) async fn stored(st: &Shared, rec: ClaimRecord) -> ClaimRecord {
         st.store.put_claim(rec.clone()).await.expect("put claim");
         rec
     }
 
     /// One request through the sandbox router; the body as JSON (null when it is not) and as text.
-    async fn call(
+    pub(super) async fn call(
         st: &Shared,
         method: &str,
         uri: &str,
@@ -3993,7 +4283,7 @@ mod tests {
     }
 
     /// The one peer of the gateway routes: the authorizer's identity (ADR-0053 decision 3).
-    fn gateway_peer() -> String {
+    pub(super) fn gateway_peer() -> String {
         naming().gateway_authorizer_id()
     }
 
@@ -4017,7 +4307,7 @@ mod tests {
         .await
     }
 
-    fn code(body: &serde_json::Value) -> &str {
+    pub(super) fn code(body: &serde_json::Value) -> &str {
         body["error"].as_str().unwrap_or_default()
     }
 
@@ -5763,7 +6053,7 @@ mod tests {
     }
 
     /// Start capturing this thread's log lines from nothing.
-    fn capture_logs() {
+    pub(super) fn capture_logs() {
         static INSTALL: std::sync::Once = std::sync::Once::new();
         INSTALL.call_once(|| {
             let _ = tracing::subscriber::set_global_default(
@@ -5778,7 +6068,7 @@ mod tests {
     }
 
     /// What this thread has logged since [`capture_logs`].
-    fn captured() -> String {
+    pub(super) fn captured() -> String {
         LOGS.with(|l| String::from_utf8_lossy(&l.borrow()).into_owned())
     }
 
@@ -7822,6 +8112,23 @@ mod tests {
             }
             async fn get_claim_by_node(&self, node_id: &str) -> Result<ClaimRecord, StoreError> {
                 self.inner.get_claim_by_node(node_id).await
+            }
+            async fn last_claim_by_node(&self, node_id: &str) -> Result<ClaimRecord, StoreError> {
+                self.inner.last_claim_by_node(node_id).await
+            }
+            async fn fold_trips(
+                &self,
+                claim_uid: Uuid,
+                delta: &[mediatore_proto::trip::TripEntry],
+                now: Timestamp,
+            ) -> Result<(), StoreError> {
+                self.inner.fold_trips(claim_uid, delta, now).await
+            }
+            async fn trips(
+                &self,
+                claim_uid: Uuid,
+            ) -> Result<Option<mediatore_proto::trip::TripSummary>, StoreError> {
+                self.inner.trips(claim_uid).await
             }
             async fn list_claims(&self) -> Result<Vec<ClaimRecord>, StoreError> {
                 self.inner.list_claims().await
