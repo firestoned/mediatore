@@ -518,6 +518,72 @@ async fn an_authorizer_holding_the_listeners_identity_is_refused_and_denies_ever
     );
 }
 
+/// ADR-0062 over the real listener: the authorizer's batch of decisions is taken (`204`),
+/// the same batch from a claim or a node is `403`, the listeners' identity does not complete
+/// a handshake, and a batch whose shape is off is refused whole (`400`), a line break in an
+/// authority included.
+#[tokio::test]
+async fn decisions_are_taken_from_the_authorizer_alone_and_a_bad_batch_is_refused_whole() {
+    let h = Harness::start(&authorizer_svid(), CacheConfig::default(), None).await;
+    let (_, claim) = h.bound_claim().await;
+    let uid = claim.uid.expect("uid");
+    let url = format!("{}/v1/gateway/decisions", h.sandbox_url);
+    let batch = |authority: &str| {
+        serde_json::json!({
+            "gateway": "gateway-02",
+            "decisions": [
+                { "at": "2026-11-22T14:41:58Z", "claim_uid": uid, "kind": "tunnel",
+                  "authority": authority, "verdict": "allow", "served": "cache" },
+                { "at": "2026-11-22T14:41:59Z", "claim_uid": uid, "kind": "inject",
+                  "authority": "api.home.example", "audience": AUDIENCE,
+                  "verdict": "deny", "reason": "not_allowed" }
+            ]
+        })
+    };
+    let post = |client: reqwest::Client, body: serde_json::Value| {
+        let url = url.clone();
+        async move { client.post(url).json(&body).send().await }
+    };
+
+    let authorizer = h.mtls_as(&authorizer_svid());
+    let taken = post(authorizer.clone(), batch(ALLOWED[0]))
+        .await
+        .expect("report");
+    assert_eq!(taken.status(), 204);
+
+    for peer in [claim_svid(&uid), node_svid()] {
+        let refused = post(h.mtls_as(&peer), batch(ALLOWED[0]))
+            .await
+            .expect("report");
+        assert_eq!(refused.status(), 403, "{peer}");
+    }
+    assert!(
+        post(h.mtls_as(&gateway_svid()), batch(ALLOWED[0]))
+            .await
+            .is_err(),
+        "the listeners' identity does not complete a handshake"
+    );
+
+    let mut too_many = batch(ALLOWED[0]);
+    let one = too_many["decisions"][0].clone();
+    too_many["decisions"] = serde_json::Value::Array(vec![one; 257]);
+    let mut bad_name = batch(ALLOWED[0]);
+    bad_name["gateway"] = "Gateway 02".into();
+    for (why, body) in [
+        (
+            "a line break in an authority",
+            batch("pypi.org:443\nforged"),
+        ),
+        ("more than 256 decisions", too_many),
+        ("a gateway name outside the grammar", bad_name),
+    ] {
+        let refused = post(authorizer.clone(), body).await.expect("report");
+        assert_eq!(refused.status(), 400, "{why}");
+        let body: serde_json::Value = refused.json().await.expect("error body");
+        assert_eq!(body["error"], "invalid_decisions", "{why}: {body}");
+    }
+}
+
 /// The dev transport: the gateway identity as a header against a loopback `dev_mode`
 /// broker, which is what the dev loop runs.
 #[cfg(feature = "dev")]

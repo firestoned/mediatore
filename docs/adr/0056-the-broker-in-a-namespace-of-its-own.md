@@ -3,7 +3,7 @@
 
 # ADR-0056: The broker in a namespace of its own, and admission policies that do not depend on its name
 
-**Status:** Proposed · **Date:** 2026-11-19 · decisions 4 and 5 implemented 2026-11-26, ahead of the move (the notes under each); the rest not built
+**Status:** Accepted in part: decisions 4 and 5 accepted and implemented 2026-11-26 (#179), ahead of the move, released in v0.4.0 (the notes under each; the threat model's TB-3 rows of that day). Decisions 1 to 3, 6 and 7, the namespace move itself, are Proposed and not built; the eight open questions are theirs · **Date:** 2026-11-19
 
 Roadmap 02 (SPIRE on the cluster: the deployment and its overlay) and roadmap 05 (the store,
 whose Secrets are what moves). This is the *Revisit when* of accepted risk R-45
