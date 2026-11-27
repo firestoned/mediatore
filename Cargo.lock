@@ -2202,7 +2202,7 @@ dependencies = [
  "jiff",
  "mediatore-store",
  "sandboxpolicy-bundle",
- "sandboxpolicy-types",
+ "sandboxpolicy-types 0.5.2",
  "serde",
  "thiserror",
  "tokio",
@@ -2313,7 +2313,7 @@ dependencies = [
  "reqwest",
  "rustls",
  "sandboxpolicy-bundle",
- "sandboxpolicy-types",
+ "sandboxpolicy-types 0.5.2",
  "serde_json",
  "sha2",
  "tar",
@@ -3127,11 +3127,20 @@ dependencies = [
  "base64 0.23.1",
  "ed25519-dalek",
  "jiff",
- "sandboxpolicy-types",
+ "sandboxpolicy-types 0.8.0",
  "serde",
  "serde_json",
  "sha2",
  "thiserror",
+]
+
+[[package]]
+name = "sandboxpolicy-types"
+version = "0.5.2"
+source = "git+https://github.com/firestoned/notaio?tag=v0.6.0#296c5695f18623a29cbfc7e815de766c1c968226"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -3285,7 +3294,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "969cde0349344dbbf58b5f9badbfb8f806db13969364eb8007c057ef687007d9"
 dependencies = [
  "annotate-snippets",
- "base64 0.23.1",
+ "base64 0.22.1",
  "encoding_rs_io",
  "granit-parser",
  "nohash-hasher",
