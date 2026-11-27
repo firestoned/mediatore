@@ -12,7 +12,7 @@ the admission policy, `make kind-e2e-mtls`) · **Amended:** 2026-10-15 by
 signs the EKs); 2026-10-27 by [ADR-0023](0023-sandbox-vm-image-kairos-derivative.md)
 decision 2 (the pinned path is `/usr/bin/mediatore`); 2026-10-30 by
 [ADR-0027](0027-control-plane-relay-on-the-egress-gateway.md) decision 7 (the claim
-entry's `x509SVIDTTL` is at most 15 minutes, never more than the claim has left)
+entry's `x509SVIDTTL` is at most 15 minutes, never more than the claim has left) · **Amended:** 2026-11-26 and 2026-11-27 by [ADR-0056](0056-the-broker-in-a-namespace-of-its-own.md) (decision 6: the entries policy claims an entry by what it is as well as by its sender, names its one sender, and reads the broker's username, now `system:serviceaccount:mediatore-system:mediatore`, from a parameter)
 
 Amends [ADR-0005](0005-spire-topology.md) (the entry transport only; the topology stands).
 Companion: [ADR-0007](0007-broker-identity-and-spiffe-mtls.md) (how mediatore gets its own

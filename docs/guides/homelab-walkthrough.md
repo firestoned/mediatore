@@ -231,7 +231,7 @@ kubectl -n banlieue-system get configmap banlieue-claim-subject-policy -o yaml
 ```yaml
 data:
   brokers: |
-    system:serviceaccount:banlieue-system:mediatore
+    system:serviceaccount:mediatore-system:mediatore
   issuers: |
     https://dex.<tailnet>
     https://accounts.google.com
@@ -246,18 +246,23 @@ data:
 
 ## 5. mediatore's cluster-side objects
 
-From this repository, with nothing yours in them: the CRDs (`AgentSandbox`, `PolicyFloor`,
-`SandboxNode`), the broker's
-ServiceAccount and RBAC, its `ClusterSPIFFEID`, and the two admission policies (what
-the ServiceAccount may declare as an entry; who may name which subject on a sandbox).
+From this repository, with nothing yours in them: the broker's own namespace
+(`mediatore-system`, Pod Security `restricted`,
+[ADR-0056](../adr/0056-the-broker-in-a-namespace-of-its-own.md)), the CRDs (`AgentSandbox`,
+`PolicyFloor`, `SandboxNode`), the broker's
+ServiceAccount and RBAC, its `ClusterSPIFFEID`, and the admission policies (what
+may be declared as one of the broker's entries and by whom; who may name which subject on a
+sandbox; who writes a sandbox's status), which read the broker's username from one ConfigMap.
 These are what `make kind-deploy` applies in kind, and what the live admission test
 needs on a real cluster.
 
 ```sh
-kubectl apply -n banlieue-system -f deploy/base/crds -f deploy/base/serviceaccount.yaml \
+kubectl apply -f deploy/base/namespace.yaml
+kubectl apply -n mediatore-system -f deploy/base/crds -f deploy/base/serviceaccount.yaml \
   -f deploy/base/rbac.yaml -f deploy/base/clusterspiffeid.yaml \
-  -f deploy/base/admission/clusterstaticentry-mediatore.yaml \
   -f deploy/base/admission/agentsandbox-subject.yaml \
+  -f deploy/base/admission/clusterstaticentry-mediatore.yaml \
+  -f deploy/base/admission/clusterstaticentry-gateway.yaml \
   -f deploy/base/admission/agentsandbox-status.yaml
 MEDIATORE_LIVE_KUBECONFIG=~/.kube/core.yaml \
 MEDIATORE_LIVE_TRUST_DOMAIN=sandbox.home.example \
@@ -276,12 +281,12 @@ forbids, and retracts everything.
 ```sh
 cp -r deploy/overlays/homelab-example ~/.config/mediatore/core   # then edit every placeholder
 openssl ecparam -name prime256v1 -genkey -noout | openssl pkcs8 -topk8 -nocrypt -out sts.pem
-kubectl -n banlieue-system create secret generic mediatore-sts --from-file=sts.pem
+kubectl -n mediatore-system create secret generic mediatore-sts --from-file=sts.pem
 openssl rand -hex 32 > sealing.key
-kubectl -n banlieue-system create secret generic mediatore-sealing --from-file=key=sealing.key
+kubectl -n mediatore-system create secret generic mediatore-sealing --from-file=key=sealing.key
 kubectl apply -k ~/.config/mediatore/core
-kubectl -n banlieue-system rollout status deploy/mediatore
-kubectl -n banlieue-system logs deploy/mediatore | head -40
+kubectl -n mediatore-system rollout status deploy/mediatore
+kubectl -n mediatore-system logs deploy/mediatore | head -40
 ```
 
 The overlay's `mediatore.yaml` names the Dex of step 3 as the one issuer (`backend:

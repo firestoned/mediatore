@@ -12,7 +12,9 @@
 # the ClusterSPIFFEID in deploy/base renders to spiffe://<td>/mediatore for the broker
 # pod; the CSI inline volume delivers the Workload API under PSS restricted; the k8s
 # workload attestor's SVIDs chain to the bundle the broker got from the same agent;
-# X25519MLKEM768 and AES-256-GCM-SHA384 are what two agent-issued SVIDs negotiate.
+# X25519MLKEM768 and AES-256-GCM-SHA384 are what two agent-issued SVIDs negotiate;
+# the broker's ID is issued in the broker's own namespace and to no lookalike elsewhere
+# (ADR-0056 decision 2).
 # The identities are fixtures in dev/kind/mtls/clients.yaml.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
@@ -20,7 +22,7 @@ cd "$(dirname "$0")/../.."
 KUBECONFIG_PATH=${1:?kubeconfig}
 TD=${2:-sandbox.test}
 K=(kubectl --kubeconfig "$KUBECONFIG_PATH")
-BROKER_NS=banlieue-system
+BROKER_NS=mediatore-system
 NS=mediatore-e2e
 CLIENTS=dev/kind/mtls/clients.yaml
 CLAIM_UID=6b0a3e9c-1f4d-4c2e-9a7b-0d1e2f3a4b5c
@@ -46,7 +48,7 @@ pod_phase()   { "${K[@]}" -n "$NS" get pod "$1" -o jsonpath='{.status.phase}' 2>
 dump() {
   printf '\n--- broker (last 40 lines)\n'; broker_logs | tail -40
   printf '\n--- %s pods\n' "$NS"; "${K[@]}" -n "$NS" get pods -o wide 2>/dev/null || true
-  for p in claim node intruder impersonator; do
+  for p in claim node intruder impersonator lookalike; do
     printf '\n--- %s (last 20 lines)\n' "$p"; pod_logs "$p" | tail -20
   done
 }
@@ -104,6 +106,26 @@ say "the broker's own ID as a client: refused in the handshake"
 wait_for_end impersonator
 pod_logs impersonator | grep -qF "mediatore: " && fail "the impersonator received an HTTP answer"
 echo "no HTTP answer"
+
+say "a pod with the broker's label, ServiceAccount name and container name in another namespace: no SVID"
+# Last of the client pods on purpose: the four above were issued theirs by the same agent
+# in the meantime, so a pod still waiting is one the agent has no entry for.
+# What the server holds is the proof: every pod the controller manager rendered an entry for
+# is named in it by its UID. The claim pod's UID is there (so the question can be answered),
+# and the lookalike's is in no entry at all, under the broker's ID or any other.
+entries_for() { # <pod name>: how many server entries select that pod
+  local uid; uid=$("${K[@]}" -n "$NS" get pod "$1" -o jsonpath='{.metadata.uid}')
+  [ -n "$uid" ] || fail "no pod $1"
+  "${K[@]}" -n spire-server exec spire-server-0 -c spire-server -- spire-server entry show -output json \
+    | jq --arg uid "pod-uid:$uid" '[.entries[] | select(any(.selectors[]; .value == $uid))] | length'
+}
+[ "$(entries_for claim)" -ge 1 ] || fail "the server shows no entry for the claim pod: the check cannot see entries"
+[ "$(entries_for lookalike)" -eq 0 ] || fail "the server holds an entry for the lookalike pod"
+[ "$("${K[@]}" get clusterspiffeid mediatore -o jsonpath='{.status.stats.namespacesSelected}')" = "1" ] \
+  || fail "the broker's ClusterSPIFFEID selects more than one namespace"
+[ "$(pod_phase lookalike)" = "Running" ] || fail "the lookalike is $(pod_phase lookalike), not waiting on the Workload API"
+pod_logs lookalike | grep -qF "mediatore: " && fail "the lookalike received an HTTP answer: it was issued an SVID"
+echo "no server entry selects the lookalike in $NS (the claim pod has one); it still waits on the Workload API, with no answer"
 
 say "broker log: who got in, over what, and who did not"
 LOGS=$(broker_logs)

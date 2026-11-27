@@ -358,7 +358,7 @@ audiences:
   carries the admission policy's own message. Reproduce it without creating anything: a
   server-side dry-run as the broker's ServiceAccount shows which check fails.
   ```sh
-  kubectl --as=system:serviceaccount:banlieue-system:mediatore create --dry-run=server -f claim.yaml
+  kubectl --as=system:serviceaccount:mediatore-system:mediatore create --dry-run=server -f claim.yaml
   ```
 - **Kubernetes RBAC.** `kubectl auth can-i create agentsandboxes -n team-a --as <user>` tells you
   whether a declarative requester may apply one there.

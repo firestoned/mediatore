@@ -20,7 +20,7 @@ that id, beside node and claim identities; it reaches its own route and nothing 
 **Amended:** 2026-11-19 by
 [ADR-0053](0053-the-gateways-authorizer-has-an-identity-of-its-own.md) decision 3
 (decision 2: the gateway peer the listener admits is `spiffe://<td>/gateway/authorizer`, not
-the listeners' ID; a connection ends at the peer certificate's `notAfter`)
+the listeners' ID; a connection ends at the peer certificate's `notAfter`) · **Amended:** 2026-11-27 by [ADR-0056](0056-the-broker-in-a-namespace-of-its-own.md) (where mediatore runs: `mediatore-system`, a namespace of its own, and the `ClusterSPIFFEID` selects it; where this text says `banlieue-system` for the broker, read `mediatore-system`)
 
 Companion: [ADR-0006](0006-registration-entries-as-clusterstaticentry.md) (registration
 entries). Together they are roadmap 01 and delete threat-model accepted risk **R-1**.

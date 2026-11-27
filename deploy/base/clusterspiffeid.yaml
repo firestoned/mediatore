@@ -6,7 +6,11 @@
 # registration entries are ClusterStaticEntry resources). The selector set binds
 # the ID to the namespace, the pod label, the ServiceAccount and the container
 # name, all attested by the SPIRE agent through a kubelet whose serving
-# certificate it verifies.
+# certificate it verifies. The namespace is the broker's own (ADR-0056,
+# namespace.yaml): a pod created in banlieue's namespace, or a tenant's, with
+# the same label and ServiceAccount name is outside the selector. An overlay's
+# `namespace:` does not rewrite a label selector's value: an overlay that moves
+# the broker patches `namespaceSelector` too.
 #
 # `className` must match the SPIRE Controller Manager's configured class: the
 # hardened chart runs with `watchClassless: false`, so a classless resource is
@@ -22,7 +26,7 @@ spec:
   podSelector:
     matchLabels: { app.kubernetes.io/name: mediatore }
   namespaceSelector:
-    matchLabels: { kubernetes.io/metadata.name: banlieue-system }
+    matchLabels: { kubernetes.io/metadata.name: mediatore-system }
   workloadSelectorTemplates:
     - "k8s:sa:mediatore"
     - "k8s:container-name:mediatore"

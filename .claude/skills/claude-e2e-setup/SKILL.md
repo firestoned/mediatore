@@ -36,7 +36,7 @@ Check: the server runs, the broker's pod holds `spiffe://<td>/mediatore`, VMs at
 
 ```sh
 kubectl -n spire-server exec spire-server-0 -c spire-server -- spire-server agent list
-kubectl -n banlieue-system logs deploy/mediatore | grep 'broker identity from the Workload API'
+kubectl -n mediatore-system logs deploy/mediatore | grep 'broker identity from the Workload API'
 kubectl get clusterstaticentries | grep -E 'banlieue/(node|claim)|gateway'
 kubectl -n spire-server logs -l app.kubernetes.io/name=server -c spire-server --since=10m | grep 'could not verify cert'
 # nothing: every VM's EK chains to a CA in ConfigMap spire-tpm-ek-cas (one PEM per swtpm local CA:
@@ -59,9 +59,9 @@ kubectl -n notaio-system rollout status deploy/notaio
 kubectl -n sandboxes get role notaio-bundles mediatore-policy-bundles
 kubectl -n sandboxes get sbpolicy,exposureceilings
 kubectl -n sandboxes get configmap claude-agent-bundle -o jsonpath='{.metadata.annotations.sandbox\.firestoned\.io/bundle-version}'
-kubectl -n banlieue-system logs deploy/mediatore | grep 'policy bundle admitted'
-kubectl -n banlieue-system get policyfloors
-kubectl -n banlieue-system logs deploy/mediatore | grep -E 'policy sources:|no policy source'
+kubectl -n mediatore-system logs deploy/mediatore | grep 'policy bundle admitted'
+kubectl -n mediatore-system get policyfloors
+kubectl -n mediatore-system logs deploy/mediatore | grep -E 'policy sources:|no policy source'
 # namespace=banlieue-system sources=sandboxes, and no "no policy source" warning
 ```
 
@@ -82,11 +82,23 @@ same rules and endpoints), the Secrets exist, the start-up log names each backen
 listener is reachable from the segment with the client's source intact.
 
 ```sh
-kubectl -n banlieue-system get secret mediatore-sts mediatore-sealing mediatore-audience-secrets
+kubectl get ns mediatore-system -o jsonpath='{.metadata.labels.pod-security\.kubernetes\.io/enforce}'   # restricted
+kubectl -n mediatore-system get configmap mediatore-agentsandbox-subject-policy -o jsonpath='{.data.broker}'
+# system:serviceaccount:mediatore-system:mediatore: the one name the three admission policies know the broker by
+kubectl -n mediatore-system get secret mediatore-sts mediatore-sealing mediatore-audience-secrets
 kubectl diff -k <overlay>; kubectl apply -k <overlay>
-kubectl -n banlieue-system logs deploy/mediatore | grep -E 'store:|audience served|policy.egress|listening'
-kubectl -n banlieue-system get svc mediatore-sandbox -o jsonpath='{.spec.externalTrafficPolicy}'   # Local
+kubectl -n mediatore-system logs deploy/mediatore | grep -E 'store:|audience served|policy.egress|listening'
+kubectl -n mediatore-system get svc mediatore-sandbox -o jsonpath='{.spec.externalTrafficPolicy}'   # Local
 ```
+
+The broker lives in `mediatore-system`, a namespace of its own (ADR-0056): its keys, the
+session Secrets, `SandboxNode`s, `PolicyFloor`s and the Lease are there, and the pools,
+claims and sandboxes are not. A broker that stops at start with `the entries admission
+self-check failed` says which fault it found: `does not name this identity as the broker`
+(the `broker` value above), `cannot be evaluated` (the ConfigMap or its key is missing, or
+a binding's `paramRef.namespace` points elsewhere), `is not in force` (the policy or its
+binding is absent). An environment still in `banlieue-system` is moved with the procedure
+in `docs/guides/deploying.md`, never by applying the new base over it.
 
 A `503`/refused listener from the segment with the pod on another node than the one
 announcing the address is the traffic policy, not the broker.
@@ -98,10 +110,10 @@ registered, the mirror reachable from the segment.
 
 ```sh
 kubectl -n banlieue-system get virtualmachines
-kubectl -n banlieue-system get sandboxnodes            # PROVIDER filled, BANNED false
-kubectl -n banlieue-system logs deploy/mediatore | grep 'node registered'
+kubectl -n mediatore-system get sandboxnodes            # PROVIDER filled, BANNED false
+kubectl -n mediatore-system logs deploy/mediatore | grep 'node registered'
 kubectl -n banlieue-system get configmap banlieue-claim-subject-policy -o jsonpath='{.data.brokers}{.data.issuers}'
-# system:serviceaccount:banlieue-system:mediatore and the issuer URL: without them every claim is forbidden
+# system:serviceaccount:mediatore-system:mediatore and the issuer URL: without them every claim is forbidden
 ```
 
 A sandbox that stays `Pending` while the broker logs `virtualmachineclaims ... is forbidden:
@@ -140,12 +152,12 @@ Check: the Secret has the `anthropic` key, the broker started on it, a hello cla
 an answer. Never read the key's value; its length is enough to know it is there.
 
 ```sh
-kubectl -n banlieue-system get secret mediatore-audience-secrets -o jsonpath='{.data.anthropic}' | base64 -d | wc -c
+kubectl -n mediatore-system get secret mediatore-audience-secrets -o jsonpath='{.data.anthropic}' | base64 -d | wc -c
 mediatore sandbox create --mediatore https://mediatore.<tailnet> --pool sandbox-pool \
   --audience anthropic --policy claude-agent --ttl 900 --restart never \
   --image <mirror>/firestoned/research-agent@sha256:<digest> \
   --arg /usr/local/bin/python3 --arg /usr/local/bin/research-agent --arg=--hello
-kubectl -n banlieue-system logs deploy/mediatore | grep -E 'token issued|workload exited|claim released'
+kubectl -n mediatore-system logs deploy/mediatore | grep -E 'token issued|workload exited|claim released'
 ```
 
 `400 … credit balance is too low` is the workspace's cap, not the path.

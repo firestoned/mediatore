@@ -60,7 +60,7 @@ POLICY_STATE=${7:-}
 AUDIENCES=${8:-}
 K=(kubectl --kubeconfig "$ADMIN_KUBECONFIG")
 KSA=(kubectl --kubeconfig "$SA_KUBECONFIG")
-BROKER_NS=banlieue-system
+BROKER_NS=mediatore-system
 NS=mediatore-e2e-gateway
 ISSUER=https://issuer.example.com
 TIMEOUT=${MEDIATORE_KIND_TIMEOUT:-180}
@@ -231,7 +231,7 @@ spec:
         - --listen
         - 127.0.0.1:3128
         - --mediatore-url
-        - https://mediatore-sandbox.banlieue-system.svc
+        - https://mediatore-sandbox.mediatore-system.svc
         - --routes
         - /etc/forward/routes.json
         - --gateways
@@ -440,7 +440,7 @@ spec:
       imagePullPolicy: Never
       command: ["/usr/bin/mediatore", "token", "--audience", "e2e-egress"]
       env:
-        - { name: MEDIATORE_URL, value: "https://mediatore-sandbox.banlieue-system.svc" }
+        - { name: MEDIATORE_URL, value: "https://mediatore-sandbox.mediatore-system.svc" }
         - { name: SPIFFE_ENDPOINT_SOCKET, value: "unix:///run/spire/sockets/spire-agent.sock" }
       volumeMounts:
         - { name: spire-agent-socket, mountPath: /run/spire/sockets, readOnly: true }
@@ -665,7 +665,7 @@ spec:
         - 1d2c3b4a-5f6e-4d7c-8b9a-0f1e2d3c4b5a
         - --dev-skip-setup
       env:
-        - { name: MEDIATORE_URL, value: "https://mediatore-sandbox.banlieue-system.svc" }
+        - { name: MEDIATORE_URL, value: "https://mediatore-sandbox.mediatore-system.svc" }
         - { name: SPIFFE_ENDPOINT_SOCKET, value: "unix:///run/spire/sockets/spire-agent.sock" }
       volumeMounts:
         - { name: spire-agent-socket, mountPath: /run/spire/sockets, readOnly: true }

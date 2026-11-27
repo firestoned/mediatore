@@ -92,7 +92,7 @@ data:
           {
             "vault": {
               "plugin_data": {
-                "vault_addr": "https://mediatore-openbao.banlieue-system.svc:8200",
+                "vault_addr": "https://mediatore-openbao.mediatore-system.svc:8200",
                 "pki_mount_point": "spire",
                 "ca_cert_path": "/upstream/ca/ca.pem",
                 "k8s_auth": {

@@ -17,6 +17,17 @@
 #   ClusterSPIFFEID or ClusterFederatedTrustDomain. The shape of what this
 #   ServiceAccount may declare is further restricted at admission by
 #   deploy/base/admission/clusterstaticentry-mediatore.yaml.
+#
+# The ClusterRole holds no verb on the core group (no Secret, no ConfigMap) and
+# none on the store's two namespaced kinds: SandboxNode and PolicyFloor are used
+# in the broker's own namespace only and are granted there, by the
+# mediatore-store Role below (ADR-0056 decision 3 and open question 5). The
+# ClusterRole's rules are pinned by a unit test
+# (the_brokers_cluster_role_is_pinned, crates/mediatore-claims/src/sandbox.rs).
+#
+# Every namespaced grant below is in mediatore-system, the broker's own
+# namespace (ADR-0056 decision 1, namespace.yaml). The broker holds nothing
+# scoped to banlieue's namespace.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -31,10 +42,6 @@ rules:
   - apiGroups: ["mediatore.io"]
     resources: ["agentsandboxes/finalizers"]
     verbs: ["update"]
-  # The store resources (ADR-0034 decision 3): attested nodes and the policy version floors.
-  - apiGroups: ["mediatore.io"]
-    resources: ["sandboxnodes", "policyfloors"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   - apiGroups: ["banlieue.io"]
     resources: ["virtualmachineclaims"]
     verbs: ["get", "list", "watch", "create", "delete"]
@@ -59,7 +66,7 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: mediatore
-    namespace: banlieue-system
+    namespace: mediatore-system
 ---
 # Leader election for the claim watcher (ADR-0011 decision 6): one Lease, in the broker's
 # own namespace. A Role rather than a ClusterRole rule because `create` cannot be bounded
@@ -68,6 +75,7 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
   name: mediatore-watcher-lease
+  namespace: mediatore-system
 rules:
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
@@ -81,6 +89,7 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
   name: mediatore-watcher-lease
+  namespace: mediatore-system
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
@@ -88,18 +97,21 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: mediatore
-    namespace: banlieue-system
+    namespace: mediatore-system
 ---
 # The sealed sessions (ADR-0034 decision 2): one Secret per sandbox in the broker's own
 # namespace, created by the API, claimed and rotated by the reconciler and the token
 # endpoint, garbage-collected with the AgentSandbox that owns it when the sandboxes live
 # here too, deleted by the retention sweep otherwise. Namespace-scoped on purpose: the
-# broker reads no Secret elsewhere.
+# broker reads no Secret elsewhere. A Role cannot name Secrets that do not exist yet, so
+# the namespace is the bound: mediatore-system holds the broker's Secrets and nothing of
+# banlieue's or a tenant's (ADR-0056 decision 1). The rules are pinned by a unit test
+# (the_secrets_role_is_namespaced_and_its_rules_are_pinned).
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
   name: mediatore-sessions
-  namespace: banlieue-system
+  namespace: mediatore-system
 rules:
   - apiGroups: [""]
     resources: ["secrets"]
@@ -109,7 +121,7 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
   name: mediatore-sessions
-  namespace: banlieue-system
+  namespace: mediatore-system
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
@@ -117,4 +129,32 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: mediatore
-    namespace: banlieue-system
+    namespace: mediatore-system
+---
+# The store's two namespaced kinds (ADR-0034 decision 3): attested nodes and the policy
+# version floors, read and written in the broker's own namespace only. A Role here, not a
+# ClusterRole rule (ADR-0056 open question 5): the grant covers the namespace the code
+# uses and no other.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: mediatore-store
+  namespace: mediatore-system
+rules:
+  - apiGroups: ["mediatore.io"]
+    resources: ["sandboxnodes", "policyfloors"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: mediatore-store
+  namespace: mediatore-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: mediatore-store
+subjects:
+  - kind: ServiceAccount
+    name: mediatore
+    namespace: mediatore-system

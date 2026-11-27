@@ -201,6 +201,12 @@ pub enum SpireError {
     /// Input that would never pass admission; refused before any request.
     #[error("invalid input: {0}")]
     Invalid(String),
+    /// The entries admission self-check last failed, so nothing is declared until one
+    /// passes (ADR-0056 decision 5). Refused before any request.
+    #[error(
+        "no entry is declared while the entries admission policy is unproven (ADR-0056 decision 5): {0}"
+    )]
+    Unproven(String),
     /// Not wired yet.
     #[error("not implemented: {0}")]
     NotImplemented(&'static str),
@@ -220,9 +226,16 @@ pub enum SelfCheckError {
     /// The policy refused the probe by its sender validation: it is in force, and it does
     /// not take this identity for the broker, so it would refuse every real entry too.
     #[error(
-        "the entries admission policy is in force but does not name this identity as the broker: every entry the broker declares would be refused. Patch the ServiceAccount username in deploy/base/admission/clusterstaticentry-mediatore.yaml to the one the broker runs as. The API server said: {0}"
+        "the entries admission policy is in force but does not name this identity as the broker: every entry the broker declares would be refused. Set the key `broker` of the ConfigMap mediatore-agentsandbox-subject-policy (deploy/base/admission/agentsandbox-subject.yaml) to the username the broker runs as. The API server said: {0}"
     )]
     NotTheBroker(String),
+    /// The policy is bound and could not be evaluated: its parameter (the `ConfigMap` that
+    /// names the broker) is absent, or lacks the key the expressions read. Nothing was
+    /// judged, so nothing is proven, and every real entry would be refused the same way.
+    #[error(
+        "the entries admission policy is bound but cannot be evaluated: its parameter is missing or incomplete, so every entry the broker declares would be refused. Restore the ConfigMap mediatore-agentsandbox-subject-policy with its key `broker` in the namespace the bindings' paramRef names (deploy/base/admission/agentsandbox-subject.yaml). The API server said: {0}"
+    )]
+    Parameter(String),
     /// Authorization refused the create before admission judged it. That proves nothing
     /// about the policy, and a broker without the verb is a different fault.
     #[error(
@@ -356,9 +369,23 @@ pub trait EntryManager: Send + Sync + 'static {
 #[derive(Debug, Default)]
 pub struct MemoryEntries {
     entries: Mutex<BTreeMap<String, EntryRef>>,
+    /// What the self-check answers when a test has taken the policy away; `None` is a
+    /// server that enforces it.
+    self_check_fault: Mutex<Option<SelfCheckError>>,
 }
 
 impl MemoryEntries {
+    /// Answer the self-check from now on as an API server would once the policy no longer
+    /// binds the broker (`Some`), or as one that enforces it again (`None`). It changes the
+    /// answer to the probe only: the fake still declares nothing but the two shapes, so it
+    /// is never more permissive than the real thing, only less trusted.
+    ///
+    /// # Panics
+    /// If the lock is poisoned (a test already failed).
+    pub fn answer_self_check_with(&self, fault: Option<SelfCheckError>) {
+        *self.self_check_fault.lock().unwrap() = fault;
+    }
+
     /// Names currently declared, in order.
     ///
     /// # Panics
@@ -430,8 +457,89 @@ impl EntryManager for MemoryEntries {
     /// the check passes. This fake only ever declares the two shapes, through validation
     /// that refuses what admission would, and it cannot be told to admit anything else.
     async fn self_check(&self) -> Result<(), SelfCheckError> {
+        if let Some(fault) = self.self_check_fault.lock().unwrap().clone() {
+            return Err(fault);
+        }
         tracing::debug!("memory: entries admission self-check answered as the policy would");
         Ok(())
+    }
+}
+
+/// An entry manager that declares nothing it has not proven it may: the gate behind which
+/// the broker keeps its manager (ADR-0056 decision 5 and open question 7).
+///
+/// It starts unproven. [`EntryManager::self_check`] asks the inner manager and remembers
+/// the answer; while the last answer was a failure, `ensure_node_entry` and
+/// `create_claim_entry` ask once more before each declaration and refuse with
+/// [`SpireError::Unproven`] unless that passes, so a broker that knows its bound is gone
+/// stops declaring, and starts again as soon as the policy answers, without waiting for
+/// the next resync. Retracting and listing are never gated: releasing a claim removes an
+/// entry, and that must work whatever the policy's state. Nothing here releases anything.
+pub struct Gated {
+    inner: std::sync::Arc<dyn EntryManager>,
+    proven: std::sync::atomic::AtomicBool,
+}
+
+impl Gated {
+    /// Over `inner`, unproven until a self-check passes.
+    #[must_use]
+    pub fn new(inner: std::sync::Arc<dyn EntryManager>) -> Self {
+        Self {
+            inner,
+            proven: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Whether the last self-check passed.
+    #[must_use]
+    pub fn is_proven(&self) -> bool {
+        self.proven.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Pass when proven; otherwise ask again, and refuse unless the policy answers now.
+    async fn proven_or_refused(&self) -> Result<(), SpireError> {
+        if self.is_proven() {
+            return Ok(());
+        }
+        self.self_check()
+            .await
+            .map_err(|e| SpireError::Unproven(e.to_string()))
+    }
+}
+
+#[async_trait]
+impl EntryManager for Gated {
+    async fn ensure_node_entry(&self, ek_hash: &str) -> Result<String, SpireError> {
+        self.proven_or_refused().await?;
+        self.inner.ensure_node_entry(ek_hash).await
+    }
+
+    async fn create_claim_entry(
+        &self,
+        ek_hash: &str,
+        claim_uid: Uuid,
+        unix_user: &str,
+        claim_ttl: Duration,
+    ) -> Result<String, SpireError> {
+        self.proven_or_refused().await?;
+        self.inner
+            .create_claim_entry(ek_hash, claim_uid, unix_user, claim_ttl)
+            .await
+    }
+
+    async fn delete_entry(&self, name: &str) -> Result<(), SpireError> {
+        self.inner.delete_entry(name).await
+    }
+
+    async fn list_entries(&self) -> Result<Vec<EntryRef>, SpireError> {
+        self.inner.list_entries().await
+    }
+
+    async fn self_check(&self) -> Result<(), SelfCheckError> {
+        let answer = self.inner.self_check().await;
+        self.proven
+            .store(answer.is_ok(), std::sync::atomic::Ordering::SeqCst);
+        answer
     }
 }
 
@@ -573,6 +681,75 @@ mod tests {
         assert_eq!(m.names(), Vec::<String>::new());
     }
 
+    #[tokio::test]
+    async fn a_gate_declares_nothing_while_unproven_and_always_retracts() {
+        // ADR-0056 decision 5, open question 7: a broker that knows its bound is gone stops
+        // declaring. It never stops retracting, and it releases nothing on its own.
+        let inner = std::sync::Arc::new(MemoryEntries::default());
+        let gated = Gated::new(inner.clone());
+        assert!(!gated.is_proven(), "unproven until a self-check has passed");
+        gated.self_check().await.unwrap();
+        assert!(gated.is_proven());
+        let node = gated.ensure_node_entry(EK).await.unwrap();
+        let claim = Uuid::new_v4();
+        let entry = gated
+            .create_claim_entry(EK, claim, "sb-0123456789ab", Duration::from_hours(1))
+            .await
+            .unwrap();
+
+        // The policy stops answering for this identity.
+        inner.answer_self_check_with(Some(SelfCheckError::Admitted(
+            "mediatore-selfcheck-0".into(),
+        )));
+        assert!(gated.self_check().await.is_err());
+        assert!(!gated.is_proven());
+        let other = "a".repeat(64);
+        let refused = gated.ensure_node_entry(&other).await.unwrap_err();
+        assert!(matches!(refused, SpireError::Unproven(_)), "{refused:?}");
+        assert!(refused.to_string().contains("unproven"), "{refused}");
+        assert!(matches!(
+            gated
+                .create_claim_entry(
+                    EK,
+                    Uuid::new_v4(),
+                    "sb-0123456789ab",
+                    Duration::from_hours(1)
+                )
+                .await,
+            Err(SpireError::Unproven(_))
+        ));
+        assert_eq!(
+            inner.names(),
+            vec![entry.clone(), node.clone()],
+            "what was declared stays declared: the gate releases nothing"
+        );
+        // Listing and retracting are not declarations.
+        assert_eq!(gated.list_entries().await.unwrap().len(), 2);
+        gated.delete_entry(&entry).await.unwrap();
+        assert_eq!(inner.names(), vec![node.clone()]);
+
+        // The policy answers again: the next declaration asks, passes and goes through,
+        // without waiting for anyone else to run the check.
+        inner.answer_self_check_with(None);
+        gated.ensure_node_entry(&other).await.unwrap();
+        assert!(gated.is_proven());
+        assert_eq!(inner.names().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_gate_never_checked_asks_before_its_first_declaration() {
+        // Fail closed from construction: no declaration reaches the inner manager before
+        // the policy has been proven once.
+        let inner = std::sync::Arc::new(MemoryEntries::default());
+        inner.answer_self_check_with(Some(SelfCheckError::Unreachable("connect".into())));
+        let gated = Gated::new(inner.clone());
+        assert!(matches!(
+            gated.ensure_node_entry(EK).await,
+            Err(SpireError::Unproven(_))
+        ));
+        assert_eq!(inner.names(), Vec::<String>::new());
+    }
+
     /// A manager that implements only what the trait requires.
     struct NoSelfCheck;
 
@@ -625,6 +802,20 @@ mod tests {
         );
         let renamed = SelfCheckError::NotTheBroker("denied".into()).to_string();
         assert!(renamed.contains("does not name this identity"), "{renamed}");
+        assert!(renamed.contains("key `broker`"), "{renamed}");
+        let unparameterised = SelfCheckError::Parameter("no params found".into()).to_string();
+        assert!(
+            unparameterised.contains("cannot be evaluated"),
+            "{unparameterised}"
+        );
+        assert!(
+            unparameterised.contains("mediatore-agentsandbox-subject-policy"),
+            "{unparameterised}"
+        );
+        assert!(
+            !unparameterised.contains("not in force"),
+            "{unparameterised}"
+        );
         let rbac = SelfCheckError::Rbac("cannot create".into()).to_string();
         assert!(rbac.contains("RBAC"), "{rbac}");
         assert!(!rbac.contains("not in force"), "{rbac}");

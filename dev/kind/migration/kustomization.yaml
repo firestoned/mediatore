@@ -1,0 +1,57 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+#
+# The broker as it stood before ADR-0056's move, for the migration rehearsal only
+# (`make kind-rehearse-migration`, dev/kind/migration-rehearsal.sh): the kind broker
+# (dev/kind/broker, so deploy/base as shipped) put back in banlieue's namespace. This is
+# step 1 of the migration (ADR-0056 decision 7): the build and base that carry the
+# fail-closed policies, in the old namespace, the parameter's `broker` still the old
+# username.
+#
+# It is also the worked example of what an overlay that moves the broker must patch,
+# because a kustomize `namespace:` rewrites object metadata and nothing else: the
+# `broker` value, the three bindings' `paramRef.namespace`, the ClusterSPIFFEID's
+# `namespaceSelector`, and the `subjects[].namespace` of the ClusterRoleBinding and the
+# three RoleBindings (a subject that names its namespace is left as it is). The Namespace object the base ships is dropped: banlieue's
+# namespace is not the broker's to create or to label.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: banlieue-system
+resources:
+  - ../broker
+patches:
+  - patch: |-
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: mediatore-system
+      $patch: delete
+  - patch: |-
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: mediatore-agentsandbox-subject-policy
+        namespace: mediatore-system
+      data:
+        broker: system:serviceaccount:banlieue-system:mediatore
+  - target:
+      kind: ValidatingAdmissionPolicyBinding
+      name: mediatore-(agentsandbox-subject|agentsandbox-status|clusterstaticentry)
+    patch: |-
+      - op: replace
+        path: /spec/paramRef/namespace
+        value: banlieue-system
+  - target:
+      kind: ClusterSPIFFEID
+      name: mediatore
+    patch: |-
+      - op: replace
+        path: /spec/namespaceSelector/matchLabels/kubernetes.io~1metadata.name
+        value: banlieue-system
+  - target:
+      kind: (ClusterRoleBinding|RoleBinding)
+      name: mediatore(-sessions|-store|-watcher-lease)?
+    patch: |-
+      - op: replace
+        path: /subjects/0/namespace
+        value: banlieue-system

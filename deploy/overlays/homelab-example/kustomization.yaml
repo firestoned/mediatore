@@ -11,7 +11,7 @@
 # to exist (mediatore-sts, mediatore-sealing) and never generates.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
-namespace: banlieue-system
+namespace: mediatore-system
 resources:
   - ../../base
   - ingress.yaml

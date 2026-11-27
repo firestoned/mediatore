@@ -769,7 +769,20 @@ impl Watcher {
     /// then sweep orphan entries, then sweep the rows of claims that ended before the
     /// retention window, the audit line logged (ADR-0034). Returns (records released,
     /// entries swept, rows archived).
+    ///
+    /// First, the entries admission self-check again (ADR-0056 decision 5): a policy removed,
+    /// unbound or renamed under a running broker is noticed here, on the replica holding
+    /// the Lease, and not only at the next start. A failure is logged as an error and
+    /// stops new entries from being declared (the gate is the entry manager's,
+    /// `mediatore_spire::Gated`); it releases nothing that is bound, and the rest of the
+    /// pass, which only retracts and sweeps, goes on.
     pub async fn resync(&self) -> Result<(usize, usize, usize), WatchError> {
+        if let Err(e) = self.reconciler.spire.self_check().await {
+            tracing::error!(
+                error = %e,
+                "the entries admission self-check failed at resync: no new entry is declared until it passes, and nothing bound is released on its account (ADR-0056 decision 5)"
+            );
+        }
         let existing = self.claims.list_claim_uids().await?;
         let mut released = 0;
         for rec in self.reconciler.store.list_claims().await? {
@@ -1473,6 +1486,81 @@ mod tests {
             "never-bound records are not the resync's call"
         );
         assert_eq!(r.entries.names(), vec![claim_entry_name(kept)]);
+    }
+
+    /// ADR-0056 decision 5 and open question 7: the Lease holder repeats the self-check at
+    /// each resync. When it fails, no new entry is declared (a claim that would bind does
+    /// not, a pool member gets no node entry), what is bound stays bound with its entry,
+    /// and declaring resumes once the policy answers again.
+    #[tokio::test]
+    async fn a_failed_self_check_at_resync_stops_new_entries_and_releases_nothing() {
+        let store = Arc::new(mediatore_store::MemoryStore::default());
+        let entries = Arc::new(mediatore_spire::MemoryEntries::default());
+        let gated = Arc::new(mediatore_spire::Gated::new(entries.clone()));
+        let claims = Arc::new(crate::fakes::FakeClaims::default());
+        let watcher = Watcher::new(
+            Reconciler {
+                store: store.clone(),
+                spire: gated.clone(),
+                naming: mediatore_spire::Naming {
+                    trust_domain: "sandbox.test".into(),
+                },
+            },
+            claims.clone(),
+            WatcherConfig::default(),
+        );
+        // As at start: proven before anything is declared.
+        gated.self_check().await.unwrap();
+
+        let bound = uid();
+        let waiting = Uuid::new_v4();
+        for u in [bound, waiting] {
+            store.put_claim(record(u)).await.unwrap();
+            claims.mark_existing(u);
+        }
+        store.put_node(node(RSA_EK_HASH, false)).await.unwrap();
+        watcher
+            .reconcile_claim(&claim("Bound", &[RSA_EK_PEM], false))
+            .await
+            .unwrap();
+        assert_eq!(entries.names(), vec![claim_entry_name(bound)]);
+
+        // The policy no longer binds the broker; the resync notices and goes on.
+        entries.answer_self_check_with(Some(mediatore_spire::SelfCheckError::Admitted(
+            "mediatore-selfcheck-0".into(),
+        )));
+        let (released, swept, _) = watcher.resync().await.unwrap();
+        assert_eq!((released, swept), (0, 0), "nothing is released or swept");
+        assert!(!gated.is_proven());
+        let kept = store.get_claim(bound).await.unwrap();
+        assert!(
+            kept.revoked_at.is_none() && kept.entry_id.is_some(),
+            "what is bound stays bound"
+        );
+
+        // A claim that would bind now does not, and a pool member gets no node entry.
+        let mut second = claim("Bound", &[RSA_EK_PEM], false);
+        second.metadata.uid = Some(waiting.to_string());
+        let refused = watcher.reconcile_claim(&second).await.unwrap_err();
+        assert!(refused.to_string().contains("unproven"), "{refused}");
+        let refused = watcher
+            .reconcile_machine(&machine(&[RSA_EK_PEM]))
+            .await
+            .unwrap_err();
+        assert!(refused.to_string().contains("unproven"), "{refused}");
+        assert_eq!(
+            entries.names(),
+            vec![claim_entry_name(bound)],
+            "no new entry, and the bound claim's entry is still declared"
+        );
+        assert!(store.get_claim(waiting).await.unwrap().entry_id.is_none());
+
+        // The policy binds the broker again: the next resync proves it and binding resumes.
+        entries.answer_self_check_with(None);
+        watcher.resync().await.unwrap();
+        assert!(gated.is_proven());
+        watcher.reconcile_claim(&second).await.unwrap();
+        assert!(store.get_claim(waiting).await.unwrap().entry_id.is_some());
     }
 
     #[tokio::test]

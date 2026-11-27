@@ -40,11 +40,32 @@
 # Requires Kubernetes 1.30+ (ValidatingAdmissionPolicy GA) and CEL variables.
 # The ConfigMap comes first: the binding sets parameterNotFoundAction: Deny,
 # so it must exist or every AgentSandbox is rejected.
+#
+# The ConfigMap is also where the three policies that name the broker read its
+# username (ADR-0056 decision 4): this one, agentsandbox-status.yaml and
+# clusterstaticentry-mediatore.yaml are each bound to it, with
+# parameterNotFoundAction: Deny, and each reads the key `broker`. One value, in
+# place of a literal in three files. Without the ConfigMap, or without the key,
+# all three refuse: no AgentSandbox, no status write and no ClusterStaticEntry
+# (the gateway's included) is admitted until it is back.
+#
+# AN OVERLAY THAT RENAMES THE ServiceAccount OR MOVES THE BROKER TO ANOTHER
+# NAMESPACE patches what a kustomize `namespace:` does not rewrite:
+#
+#   1. the value of `broker` below (a string, not object metadata);
+#   2. `paramRef.namespace` in the three bindings (this file, the status policy
+#      and the entries policy), which must be the namespace this ConfigMap is in;
+#   3. `namespaceSelector` in clusterspiffeid.yaml.
+#
+# Forgetting 1 or 2 fails closed and loudly: the broker's entries and status
+# writes are refused, and the broker says so when it starts (its self-check,
+# crates/mediatore-spire/src/kube.rs) instead of serving. Forgetting 3 leaves
+# the broker without an SVID, which also stops it at start.
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: mediatore-agentsandbox-subject-policy
-  namespace: banlieue-system
+  namespace: mediatore-system
   labels:
     app.kubernetes.io/name: mediatore
     app.kubernetes.io/component: admission
@@ -71,6 +92,15 @@ data:
   # `system:serviceaccount:<namespace>:<name>`). mediatore's own ServiceAccount
   # is exempt without being listed. Deliberately empty.
   brokers: |
+
+  # The broker's own username, exactly as the API server spells it:
+  # `system:serviceaccount:<namespace>:<ServiceAccount>`. Read by this policy (the
+  # exemption for the broker's own creates), by agentsandbox-status.yaml (the one
+  # writer of a status) and by clusterstaticentry-mediatore.yaml (the one sender
+  # of the broker's SPIRE entries). Whoever can edit this value can name another
+  # account as the broker: audit changes to this ConfigMap, and keep `update` on
+  # ConfigMaps in this namespace to whoever deploys the broker.
+  broker: system:serviceaccount:mediatore-system:mediatore
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
@@ -96,7 +126,7 @@ spec:
         resources: ["agentsandboxes"]
   variables:
     - name: isMediatore
-      expression: "request.userInfo.username == 'system:serviceaccount:banlieue-system:mediatore'"
+      expression: "request.userInfo.username == params.data.broker.trim()"
     # Split on newlines and drop blanks, so a trailing newline or an empty
     # list never yields a phantom "" entry.
     - name: brokers
@@ -164,6 +194,6 @@ spec:
   validationActions: ["Deny"]
   paramRef:
     name: mediatore-agentsandbox-subject-policy
-    namespace: banlieue-system
+    namespace: mediatore-system
     # Fail closed: no policy object, no sandboxes.
     parameterNotFoundAction: Deny

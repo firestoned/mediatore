@@ -31,7 +31,7 @@ EK_PEM=${4:?ek pem}
 EK_HASH=$(tr -d '\n' < "${5:?ek hash file}")
 K=(kubectl --kubeconfig "$ADMIN_KUBECONFIG")
 KSA=(kubectl --kubeconfig "$SA_KUBECONFIG")
-BROKER_NS=banlieue-system
+BROKER_NS=mediatore-system
 NS=mediatore-e2e-sandbox
 ISSUER=https://issuer.example.com
 TIMEOUT=${MEDIATORE_KIND_TIMEOUT:-120}
@@ -170,7 +170,7 @@ spec:
         - 1d2c3b4a-5f6e-4d7c-8b9a-0f1e2d3c4b5a
         - --dev-skip-setup
       env:
-        - { name: MEDIATORE_URL, value: "https://mediatore-sandbox.banlieue-system.svc" }
+        - { name: MEDIATORE_URL, value: "https://mediatore-sandbox.mediatore-system.svc" }
         - { name: SPIFFE_ENDPOINT_SOCKET, value: "unix:///run/spire/sockets/spire-agent.sock" }
       volumeMounts:
         - { name: spire-agent-socket, mountPath: /run/spire/sockets, readOnly: true }

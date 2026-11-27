@@ -21,7 +21,7 @@ set -euo pipefail
 KUBECONFIG_PATH=${1:?kubeconfig}
 STATE=${2:?state dir}
 TD=${3:-sandbox.test}
-NS=banlieue-system
+NS=mediatore-system
 K=(kubectl --kubeconfig "$KUBECONFIG_PATH" -n "$NS")
 bao() { "${K[@]}" exec deploy/mediatore-openbao -- bao "$@"; }
 

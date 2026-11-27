@@ -288,7 +288,7 @@ The audience's `max_ttl`, `egress` and `rules` must agree with the policy audien
 `ttlSeconds`, `endpoints` and `rules`, or the shadow comparison reports the gap (`P002` for
 TTL, `P003` for an endpoint, `P004` for a rule) and `PolicyConformant` goes `False`.
 
-Secrets in `banlieue-system`, each a file read once at start:
+Secrets in `mediatore-system`, each a file read once at start:
 
 | Secret | Key | Made by |
 | --- | --- | --- |
@@ -313,7 +313,7 @@ pod to a node since ADR-0034.
 | Gateway env | `TRUST_DOMAIN`, `SANDBOX_IF`, `DATA_PORT=8443`, `RELAY_SPIRE_PORT=3129`, `RELAY_BROKER_PORT=3130`, `RELAY_BUNDLE_PORT=3131`, `SPIRE_BUNDLE_ADDRESS:PORT` (the bundle endpoint, 8443), `SPIRE_SERVER_ADDRESS:PORT` (the LoadBalancer, 8081), `BROKER_ADDRESS:PORT` (the sandbox listener, 443), `MEDIATORE_URL` for the authorizer |
 | What a gateway allows | a tunnel only for a claim SVID of the trust domain, to an endpoint the broker lists for that claim (`GET /v1/gateway/claims/{uid}`): the audiences' `egress` plus, under `enforce`, the bundle's direct egress |
 | Gateway attestation | each gateway's agent attests with its vTPM against the EK CAs of section B; `envoy-gateway.service` requires the agent, so an agent the server refuses (`Nodeattestor(tpm): could not verify cert`) takes the data plane down with it every few seconds: `8443` open for about 27 s, refused for about 16 s, the relay ports steady. The CA that issued the gateway's EK is missing from the ConfigMap, or the gateway was recreated and its entries name the old agent |
-| Admission | banlieue's `ValidatingAdmissionPolicy` on `VirtualMachineClaim` lets a claim name a subject other than its creator only for a listed broker: ConfigMap `banlieue-claim-subject-policy` in banlieue's namespace carries `brokers:` with `system:serviceaccount:banlieue-system:mediatore` and `issuers:` with the Dex issuer URL. Without both, every claim the broker creates is forbidden and the sandbox retries every five seconds, never binding |
+| Admission | banlieue's `ValidatingAdmissionPolicy` on `VirtualMachineClaim` lets a claim name a subject other than its creator only for a listed broker: ConfigMap `banlieue-claim-subject-policy` in banlieue's namespace carries `brokers:` with `system:serviceaccount:mediatore-system:mediatore` and `issuers:` with the Dex issuer URL. Without both, every claim the broker creates is forbidden and the sandbox retries every five seconds, never binding |
 | Pool | `VirtualMachinePool` `sandbox-pool`: `readiness: GuestReady`, `recycleOnImageChange: true`, one warm member, `VMClass` with one NIC on the segment, addresses from the pool's `addressing` and a `userData` stage writing the static network file |
 | Pool image | `VMImage` `mediatore-guest` on the ISO built from `ghcr.io/firestoned/mediatore-guest` at the release's digest (`auroraboot`), three cloud-config layers: the image's base, banlieue's EK layer, the deployment layer (section B's `agent.conf`, `/etc/mediatore-guest/env` with `MEDIATORE_URL=https://<gateway sandbox address>:3130` and the `SPIRE_BUNDLE_*` lines, `/etc/mediatore/bundle-ca.pem` for the bundle endpoint's CA, `/etc/mediatore/gateways`; no registry setting since ADR-0063) |
 | Mirror | `registry:2` in proxy mode to `ghcr.io`, reachable from the gateways' egress side; on the broker an audience of `role: registry` the claim names (ADR-0063). Before ADR-0063 it listened on the segment and was declared with `reach: segment` and in `/etc/mediatore/registries`, both now refused |

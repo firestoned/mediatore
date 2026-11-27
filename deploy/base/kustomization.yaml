@@ -3,8 +3,9 @@
 
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
-namespace: banlieue-system
+namespace: mediatore-system
 resources:
+  - namespace.yaml
   - crds/mediatore.io_agentsandboxes.yaml
   - crds/mediatore.io_sandboxnodes.yaml
   - crds/mediatore.io_policyfloors.yaml

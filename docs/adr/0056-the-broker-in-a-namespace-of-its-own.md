@@ -3,7 +3,7 @@
 
 # ADR-0056: The broker in a namespace of its own, and admission policies that do not depend on its name
 
-**Status:** Accepted in part: decisions 4 and 5 accepted and implemented 2026-11-26 (#179), ahead of the move, released in v0.4.0 (the notes under each; the threat model's TB-3 rows of that day). Decisions 1 to 3, 6 and 7, the namespace move itself, are Proposed and not built; the eight open questions are theirs · **Date:** 2026-11-19
+**Status:** Accepted and implemented. Decisions 4 and 5 were built first, 2026-11-26 (#179), and released in v0.4.0; decisions 1 to 3, 6 and 7 and what was left of 4 and 5 were built 2026-11-27 (the notes under each decision say what was built and where it differs from the text). The eight open questions were answered 2026-11-27 by taking each recommendation. The procedure of decision 7 is written and rehearsed in kind; the migration of a running environment is its operator's to run and was not run by this change · **Date:** 2026-11-19
 
 Roadmap 02 (SPIRE on the cluster: the deployment and its overlay) and roadmap 05 (the store,
 whose Secrets are what moves). This is the *Revisit when* of accepted risk R-45
@@ -73,6 +73,17 @@ the cluster's administrators are trusted. Its revisit condition is this move.
    what the comment in `rbac.yaml` already claims ("the broker reads no Secret elsewhere") and
    will then be true of the grant and not only of the code.
 
+   *Built 2026-11-27, as written.* `deploy/base/kustomization.yaml` sets the namespace and
+   lists `namespace.yaml` first; the `Role`'s rules are unchanged. One correction to the
+   sentence above: "the broker reads no Secret elsewhere" was already untrue of the grants
+   in one respect and still is, since ADR-0055 lets a team bind the broker to `get` on
+   Secrets it names one by one in its own namespace (`deploy/audience-credentials`). That
+   grant is the team's, by name, and not the base's. Controls:
+   `the_base_deploys_into_mediatore_system_and_ships_the_namespace` and
+   `the_secrets_role_is_namespaced_and_its_rules_are_pinned`
+   (`crates/mediatore-claims/src/sandbox.rs`); `scripts/check_release_assets.py` holds the
+   release manifest to one `Namespace` and to no object outside it.
+
 2. **What moves with it.** Every namespaced object the base ships and everything that names
    the namespace:
    - `deploy/base/serviceaccount.yaml`, `deployment.yaml`, `service.yaml`,
@@ -111,6 +122,31 @@ the cluster's administrators are trusted. Its revisit condition is this move.
      `.claude/skills/claude-e2e-setup/SKILL.md`, the CALM node's description and the threat
      model's component table.
 
+   *Built 2026-11-27.* Everything in the list moved, with these differences from it:
+   - **kustomize rewrites less than the list assumed.** A `namespace:` in an overlay does not
+     rewrite a `RoleBinding` or `ClusterRoleBinding` subject that names its namespace, so
+     the four subjects of `deploy/base/rbac.yaml` join the things an overlay that moves the
+     broker patches by hand, with the parameter's `broker`, the three bindings'
+     `paramRef.namespace` and the `ClusterSPIFFEID`'s `namespaceSelector`. Found when the
+     rehearsal's overlay (`dev/kind/migration`) rendered the old subjects; the table is in
+     `docs/guides/deploying.md`, and every omission fails closed.
+   - `deploy/audience-credentials/rbac.yaml` (ADR-0055, after this ADR was written) binds
+     the broker's `ServiceAccount` too and moved with `deploy/policy-bundles/rbac.yaml`.
+   - `deploy/gateway/kustomization.yaml` keeps `namespace: banlieue-system`: its objects
+     are banlieue's kinds and stay with the pools (decision 3).
+   - The kind fixtures (Dex, glauth, OpenBao) moved into `mediatore-system` with the
+     broker, as listed; all three already ran under Pod Security `restricted`, which the
+     namespace now enforces.
+   - In the guides, a sandbox namespace that happens to be `banlieue-system` (the worked
+     example of `claude-end-to-end.md`, the skill, `the-policy-bundle.md`) stays: that is
+     where that environment's pool lives. The dated transcripts in `docs/guides/testing.md`
+     are left as they were taken, under a note.
+   - Controls: `no_base_manifest_names_banlieues_namespace`,
+     `the_cluster_spiffe_id_selects_the_brokers_namespace`
+     (`crates/mediatore-claims/src/sandbox.rs`), and the kind mTLS tier's `lookalike` pod (the
+     broker's label, `ServiceAccount` name and container name in another namespace, issued
+     nothing).
+
    Three things outside the repository name the same username and move in the same change
    window, listed so the migration does not find them by failing: the `brokers:` line of
    banlieue's `banlieue-claim-subject-policy` ConfigMap, the OpenBao Kubernetes auth role of
@@ -143,6 +179,18 @@ the cluster's administrators are trusted. Its revisit condition is this move.
    kind that is scoped to banlieue's namespace, unless that namespace is also a policy
    namespace. Control: `deploy/base/rbac.yaml`, pinned by `the_brokers_cluster_role_is_pinned`
    and a new test on the two `Role`s.
+
+   *Built 2026-11-27, with one change to the table* (open question 5, answered yes): the
+   row `mediatore.io` `sandboxnodes`, `policyfloors` left the `ClusterRole` for a third
+   `Role` in the home namespace, `mediatore-store`, with the same seven verbs. The store
+   addresses both kinds in its home only (`KubeStore::nodes`, `KubeStore::floors`), so
+   nothing else changed. The pinned literal of `the_brokers_cluster_role_is_pinned` lost
+   that rule; `the_brokers_cluster_role_holds_no_verb_on_the_core_group` also refuses a
+   wildcard and either store kind there, and
+   `the_secrets_role_is_namespaced_and_its_rules_are_pinned` pins all three `Role`s (not
+   two), their namespace, their bindings and the `ClusterRoleBinding`'s subject. "Its only
+   Secret grant is the `mediatore-sessions` `Role`" is true of the base; the by-name grant
+   of `deploy/audience-credentials` is the exception noted under decision 1.
 
 4. **The entries policy applies to what is declared, not only to who declares it, and none of
    the three can fail open on a name.** In `deploy/base/admission/clusterstaticentry-mediatore.yaml`:
@@ -187,6 +235,35 @@ the cluster's administrators are trusted. Its revisit condition is this move.
    (`crates/mediatore-claims/src/sandbox.rs`), and the dry runs of the kind gateway tier
    (`dev/kind/gateway-e2e.sh`), which are what prove the CEL.
 
+   *Built 2026-11-27: the parameter* (open question 3, answered: the parameter, confirmed on
+   an API server before it was taken). The three policies declare `paramKind: ConfigMap` and
+   read `params.data.broker.trim()`: the subject policy in its `isMediatore` variable, the
+   status policy in its one validation, the entries policy in its match condition and its
+   sender validation. No file carries a `ServiceAccount` username any more; the ConfigMap's
+   `broker` is `system:serviceaccount:mediatore-system:mediatore`, and each binding names the
+   ConfigMap and its namespace with `parameterNotFoundAction: Deny`. What differs from the
+   text, and what the confirmation showed:
+   - **A missing parameter refuses more than the broker's entries.** The parameter is
+     resolved before the match condition is evaluated, so with the ConfigMap absent every
+     create and update of a `ClusterStaticEntry` is refused, the gateway's entries
+     included; with the ConfigMap present and the key absent the same, because a
+     disjunction with an erroring term and no true one is an error under
+     `failurePolicy: Fail`. That is the fail-closed side and the files say it in capitals.
+   - **The self-check tells that case apart.** A refusal that names the policy because the
+     policy could not be evaluated proves nothing, so it is a start error of its own
+     (`SelfCheckError::Parameter`), beside `NotTheBroker` for a parameter that names
+     another account.
+   - **"An overlay patches one value" is not so**, for the reason under decision 2: one
+     value and `paramRef.namespace` in three bindings, and the subjects and the selector.
+   - The value is trimmed, so a `broker: |` block with its trailing newline works as the
+     other keys of that ConfigMap do.
+   - Controls: `the_three_policies_read_the_broker_from_one_parameter_and_deny_without_it`
+     and `the_status_policy_admits_the_broker_alone_and_denies`, rewritten for the
+     parameter (`crates/mediatore-claims/src/sandbox.rs`); live, the second test of
+     `crates/mediatore-spire/tests/live_kube.rs` (an account of the broker's name in
+     another namespace, with every RBAC verb, is refused a permitted node entry by the
+     sender validation), run by `make kind-e2e-entries`.
+
 5. **A startup self-check: the broker proves the entries policy binds it, or does not start.**
    Outside `dev_mode`, before either listener serves and before the watcher asks for the Lease,
    the broker sends a server-side dry-run create (`dryRun=All`, nothing is persisted) of a
@@ -221,6 +298,30 @@ the cluster's administrators are trusted. Its revisit condition is this move.
    broker is not noticed until the next start. It runs in `dev_mode` too, where
    `MemoryEntries` answers as a server that enforces the policy does.
 
+   *Built 2026-11-27: the check at resync* (open question 7, answered: stop declaring).
+   `Watcher::resync` (`crates/mediatore-claims/src/watch.rs`) runs the self-check first, on
+   the replica holding the Lease, and logs a failure as an error. What stops the
+   declarations is not in the watcher, and that is the difference from the text: the
+   broker's entry manager is wrapped in `mediatore_spire::Gated`
+   (`crates/mediatore-spire/src/lib.rs`, in `proven_entries`), which remembers the last
+   answer and, while it was a failure, asks once more before each `ensure_node_entry` and
+   `create_claim_entry` and refuses with `SpireError::Unproven` unless that passes. The gate
+   covers every path that declares on that replica, the API's bind at node registration as
+   well as the watcher's, and declaring resumes as soon as the policy answers, without
+   waiting a resync. Retracting and listing are never gated, and nothing bound is released.
+   Limits, stated in the threat model too: a replica that does not hold the Lease checks at
+   its start only; between a policy's removal and the Lease holder's next resync
+   (`watcher.resync_secs`) entries are unjudged. `MemoryEntries` can be told to answer the
+   check as a server whose policy is gone (`answer_self_check_with`), which makes the fake
+   less trusted and no more permissive. There is still no second dry run of a permitted
+   shape, for the reason of the first note. Controls:
+   `a_gate_declares_nothing_while_unproven_and_always_retracts`,
+   `a_gate_never_checked_asks_before_its_first_declaration`,
+   `a_policy_that_could_not_read_its_parameter_is_not_proof` (`crates/mediatore-spire`),
+   `a_failed_self_check_at_resync_stops_new_entries_and_releases_nothing`
+   (`crates/mediatore-claims/src/watch.rs`), and the first test of `live_kube.rs`, which now
+   runs the self-check as the broker's `ServiceAccount` against the real API server.
+
 6. **The home namespace is always the pod's own; it is not configuration.** The store, the
    Lease and the session Secrets stay on `client.default_namespace()`. No `store.namespace` key
    is added: it would be a second source for one fact, and an edit of `mediatore.yaml` could
@@ -231,6 +332,14 @@ the cluster's administrators are trusted. Its revisit condition is this move.
    warns, one line, when a claimable namespace (`sandboxes.namespace`, or a key of
    `sandboxes.namespaces`) is its home, since sandboxes there put tenants' objects back beside
    the keys. Control: `crates/mediatore/src/main.rs`.
+
+   *Built 2026-11-27, as written* (open question 6, answered: warned, not refused; the
+   refusal one release later is not built and has no date). `check_home_namespace` runs in
+   `kube_client`, as soon as there is a client and before the self-check, the store or a
+   listener. A broker run outside a cluster through `spire.entries.kubeconfig` must name
+   its namespace in that kubeconfig's context, or it is refused as `default`; the error
+   says so. Controls: `a_home_namespace_of_default_refuses_to_start`,
+   `a_claimable_namespace_equal_to_home_is_warned`.
 
 7. **Migration of a running environment: the release that carries decisions 4 and 5 first, in
    place; then the move, with the old broker stopped before the new one starts.** The order,
@@ -280,28 +389,50 @@ the cluster's administrators are trusted. Its revisit condition is this move.
    are ephemeral, the cutover is at a release boundary, no migration tool); step 6 is for an
    environment that cannot drain. Control: the procedure in `docs/guides/deploying.md`.
 
+   *Written and rehearsed 2026-11-27; not run on any real environment* (open question 8,
+   answered: drain recommended, the copy path documented and rehearsed once). The eight
+   steps are in `docs/guides/deploying.md` with their commands, and
+   `make kind-rehearse-migration` (`dev/kind/migration-rehearsal.sh`) runs them by the copy
+   path: the kind broker put back in `banlieue-system` under an overlay with the patches of
+   decision 2, a claim bound there with its session sealed at the OpenBao transit engine,
+   the move, and the same claim's token issued by the broker in `mediatore-system` from the
+   copied session. The transcript is in `docs/guides/testing.md`. What the rehearsal does
+   not cover: banlieue's `brokers` line and an Entra federated credential (neither exists
+   in kind; the OpenBao role is the one outside binding it exercises), a `LoadBalancer`
+   address handed from the old Service to the new (the kind pods dial the Service by its
+   new name), and a `PolicyFloor` in the copy (the Dex tier reads no bundle; the command
+   runs over an empty list). Step 1 has one more case than the text: on a base that
+   carries the parameter, "the old username" is the parameter's `broker` in an overlay that
+   keeps the broker in the old namespace, which is what the rehearsal's overlay is. Unit:
+   `a_session_secret_without_an_owner_reference_in_a_new_home_opens_for_its_sandbox`
+   (`crates/mediatore-claims/src/kubestore.rs`).
+
 ## Security analysis
 
 STRIDE for the boundaries this ADR changes (TB-2, TB-3, TB-8, TB-9). "Control" names what the
-implementation must provide. **None of it is built**; the threat model records a control only
-once the code and the manifests exist (`.claude/rules/threat-modeling.md`).
+implementation must provide. Written while none of it was built; **all of it is built as of
+2026-11-27**, and the threat model's pass of that day (`docs/security/threat-model.md`, TB-2,
+TB-3, TB-4, TB-8, TB-9, R-45) is where each control is cited as it exists. Three rows are a
+procedure in a guide and not a mechanism (the two brokers, the copied session's owner
+reference, the floors), and the threat model says so; "an API-server audit rule" is the
+deployment's and is not shipped.
 
 | Threat | STRIDE | Control |
 | --- | --- | --- |
-| A compromised broker reads or rewrites Secrets that are not its own | I/T | The `mediatore-sessions` `Role` in a namespace that holds only the broker's, `deploy/base/rbac.yaml` and `deploy/base/kustomization.yaml` (not yet built) |
-| A principal granted Secret reads for banlieue's sake reads the STS key, the sealing key or an audience credential | I | The key Secrets in `mediatore-system`, `deploy/base/namespace.yaml` and the guide's step 2 (not yet built) |
-| A pod created in banlieue's namespace is issued the broker's SVID | S/E | `namespaceSelector` on `mediatore-system` in `deploy/base/clusterspiffeid.yaml` (not yet built); the pod label, `ServiceAccount` and container selectors exist |
-| The broker runs under a name the entries policy does not match, and declares an entry outside the two shapes | E | Match on what is declared, `deploy/base/admission/clusterstaticentry-mediatore.yaml` (not yet built) |
-| Another principal declares an entry that looks like the broker's | S | The added validation on the sender, same file (not yet built); RBAC on `clusterstaticentries` for everyone else (deployment, exists) |
-| The policy is absent, unbound or edited to `Warn`, and nothing notices | T/E | `KubeEntryManager::self_check`, `crates/mediatore-spire/src/kube.rs`, at start and at each resync (not yet built) |
-| Three literals drift apart across the policies | T | One `broker` key in the parameter ConfigMap, `deploy/base/admission/agentsandbox-subject.yaml`, and a test that the three bindings read it, `crates/mediatore-claims/src/sandbox.rs` (not yet built) |
+| A compromised broker reads or rewrites Secrets that are not its own | I/T | The `mediatore-sessions` `Role` in a namespace that holds only the broker's, `deploy/base/rbac.yaml` and `deploy/base/kustomization.yaml` |
+| A principal granted Secret reads for banlieue's sake reads the STS key, the sealing key or an audience credential | I | The key Secrets in `mediatore-system`, `deploy/base/namespace.yaml` and the guide's step 2 |
+| A pod created in banlieue's namespace is issued the broker's SVID | S/E | `namespaceSelector` on `mediatore-system` in `deploy/base/clusterspiffeid.yaml`; the pod label, `ServiceAccount` and container selectors exist |
+| The broker runs under a name the entries policy does not match, and declares an entry outside the two shapes | E | Match on what is declared, `deploy/base/admission/clusterstaticentry-mediatore.yaml` |
+| Another principal declares an entry that looks like the broker's | S | The added validation on the sender, same file; RBAC on `clusterstaticentries` for everyone else (deployment, exists) |
+| The policy is absent, unbound or edited to `Warn`, and nothing notices | T/E | `KubeEntryManager::self_check`, `crates/mediatore-spire/src/kube.rs`, at start and at each resync |
+| Three literals drift apart across the policies | T | One `broker` key in the parameter ConfigMap, `deploy/base/admission/agentsandbox-subject.yaml`, and a test that the three bindings read it, `crates/mediatore-claims/src/sandbox.rs` |
 | The parameter ConfigMap is edited to name another account | S/E | It is in `mediatore-system`, written by whoever deploys the broker; an API-server audit rule on it (deployment). It is an A-9 asset already and gains this key |
-| A configuration edit points the store at another namespace | T | No such key exists (decision 6); the refusal of `default` as home, `crates/mediatore/src/main.rs` (not yet built) |
-| Two brokers hold a Lease each during the move and both bind | T/D | The order of decision 7 (old to zero first), `docs/guides/deploying.md` (not yet built); `bind` is idempotent and entry creation tolerates a conflict (exists) |
-| A copied session Secret is collected for an owner in another namespace, mid-claim | D | Copies carry no owner reference, decision 7 step 6, `docs/guides/deploying.md` (not yet built) |
-| The replay floor is lost in the move and an older bundle is admitted | T | `PolicyFloor`s copied before the new broker starts, decision 7 step 5, `docs/guides/deploying.md` (not yet built) |
+| A configuration edit points the store at another namespace | T | No such key exists (decision 6); the refusal of `default` as home, `crates/mediatore/src/main.rs` |
+| Two brokers hold a Lease each during the move and both bind | T/D | The order of decision 7 (old to zero first), `docs/guides/deploying.md`; `bind` is idempotent and entry creation tolerates a conflict (exists) |
+| A copied session Secret is collected for an owner in another namespace, mid-claim | D | Copies carry no owner reference, decision 7 step 6, `docs/guides/deploying.md` |
+| The replay floor is lost in the move and an older bundle is admitted | T | `PolicyFloor`s copied before the new broker starts, decision 7 step 5, `docs/guides/deploying.md` |
 | An envelope copied to the new namespace opens for another sandbox | I | The binding is the sandbox UID and the purpose, `crates/mediatore-store/src/seal.rs` (exists, unchanged) |
-| The self-check's dry run is itself a way to write an entry | E | `dryRun=All` persists nothing; the shape is one the policy refuses; the name is `mediatore-selfcheck-*`, never a node's or a claim's, `crates/mediatore-spire/src/kube.rs` (not yet built) |
+| The self-check's dry run is itself a way to write an entry | E | `dryRun=All` persists nothing; the shape is one the policy refuses; the name is `mediatore-selfcheck-*`, never a node's or a claim's, `crates/mediatore-spire/src/kube.rs` |
 
 ## Consequences
 
@@ -328,6 +459,9 @@ once the code and the manifests exist (`.claude/rules/threat-modeling.md`).
   more dependency at start, on a server the store already needs for everything.
 - **The `ClusterRole` is unchanged**, so the pinned test stays, and so is every token, SPIFFE
   ID, CRD and the store's contract. banlieue changes one line of one ConfigMap.
+  *As built 2026-11-27:* the `ClusterRole` changed once, by open question 5 (the store's two
+  kinds left it for a `Role`), and its pinned test changed with it; the rest of the
+  sentence stands.
 - **CALM** (`docs/architecture/calm/architecture.json`): the broker node's deployment detail
   and the admission controls on its relationship to the Kubernetes API; `make calm-validate`
   and `make calm-diagrams` before implementation.
@@ -425,35 +559,73 @@ Kind tiers, all through `make kind-broker` in `mediatore-system`, on the build h
 `make check`, `make manifests`, `make calm-validate` and `make calm-diagrams` green before the
 commit.
 
+*As built.* The tests of 2026-11-27 carry the names above. Those of decisions 4 and 5 that
+#179 wrote first keep the names it gave them, and are these:
+
+| Name above | The test that holds it |
+| --- | --- |
+| `the_entries_policy_matches_by_name_prefix_label_and_spiffe_path_as_well_as_by_sender`, `the_entries_policy_refuses_a_matched_object_from_any_other_sender` | `the_entries_policy_claims_an_entry_by_what_it_is_and_names_its_one_sender` |
+| `the_gateway_entries_are_not_matched_by_the_entries_policy` | `the_shipped_gateway_entries_carry_none_of_the_signs_of_a_brokers_entry` |
+| `the_self_check_passes_when_the_policy_denies_the_forbidden_shape`, `the_self_check_sends_dry_run_and_persists_nothing` | `the_self_check_passes_on_the_policys_denial_of_a_dry_run` (the scripted API server asserts `dryRun=All` on the one request) |
+| `an_admitted_forbidden_shape_fails_the_self_check` | `the_self_check_fails_when_the_forbidden_entry_is_admitted` |
+| `a_refusal_that_is_not_the_policys_fails_the_self_check` | `a_refusal_that_is_not_the_entries_policys_is_not_proof`, `an_rbac_403_is_not_proof_and_is_reported_as_rbac` |
+| `a_refused_permitted_shape_fails_the_self_check` | none: there is no second dry run (decision 5's notes); `the_policys_sender_refusal_is_a_broker_the_policy_does_not_name` and `a_policy_that_could_not_read_its_parameter_is_not_proof` hold what it was for |
+| `a_failed_self_check_refuses_to_start` | `the_broker_refuses_to_start_when_the_forbidden_entry_is_admitted`, `every_other_self_check_fault_stops_the_start_under_its_own_name` |
+| `dev_mode_runs_no_self_check` | none: the check runs in `dev_mode` and `MemoryEntries` answers it (`the_start_goes_on_when_admission_refuses_the_forbidden_entry`) |
+
+The manifest tests were written after the manifests, against the order above, because a
+second change was being made in the same tree and the Rust had to wait for it; they were
+then run against the manifests as they stood before the change and nine failed, which is
+the red this section asks for. The kind tiers, the TPM tier and the rehearsal were run on
+the build host on 2026-11-27; their results are in the pull request.
+
 ## Open questions
+
+**All eight were answered 2026-11-27 by taking the recommendation of each.** The questions stay
+as they were asked; the answer follows each.
 
 1. **The name: `mediatore-system`?** Recommendation: yes. It mirrors `banlieue-system` and
    `spire-server`, and `mediatore` alone reads as a tenant's namespace.
+   *Answered 2026-11-27: yes, `mediatore-system`.*
+
 2. **Does the base ship the `Namespace` object?** Recommendation: yes, with the Pod Security
    label, so `kubectl apply -k` works on an empty cluster and the label is not left to memory.
    An operator whose namespaces are created elsewhere deletes it in the overlay.
+   *Answered 2026-11-27: yes, `deploy/base/namespace.yaml`, with the label.*
+
 3. **One parameter for the broker's username, or three literals rewritten (decision 4)?**
    Recommendation: the parameter. It needs confirming on the supported Kubernetes floor (1.30)
    that `matchConditions` may read `params` and that a namespaced parameter is resolved for a
    cluster-scoped `ClusterStaticEntry` request through `paramRef.namespace`; if either fails,
    fall back to literals plus the fail-closed validation, which is the part that matters.
+   *Answered 2026-11-27: the parameter.* Both points were confirmed on API servers before it was taken, on kind clusters of the build host at Kubernetes 1.30.13 (the floor) and 1.36.4 (the tiers' version): a policy whose only match condition is `request.userInfo.username == params.data.broker.trim()` matched the broker's request and no other, so `matchConditions` read `params`; and the namespaced ConfigMap was resolved for dry-run creates of the cluster-scoped `ClusterStaticEntry` through `paramRef.namespace` (the broker's permitted entry admitted, its forbidden one refused by a shape validation, another sender's refused by the sender validation, a gateway entry from another sender not claimed). With the key removed, and with the ConfigMap deleted, every create was refused on both versions. One run on a reused 1.30 cluster, right after every policy and the namespace had been deleted under it, admitted creates with the parameter missing; it did not reproduce on a fresh cluster of the same version, twice, and is recorded here because it was seen.
+
 4. **Is the added validation on the sender wanted (decision 4), given that it forbids an
    operator from declaring a `/banlieue/` entry by hand?** Recommendation: yes. ADR-0006
    decision 7 already makes that an operating rule, and the validation is what turns a wrong
    name from silent to loud. Deletion by hand is not affected (the policy is on `CREATE` and
    `UPDATE`).
+   *Answered 2026-11-26 by the build of decision 4: yes.*
+
 5. **Do `sandboxnodes` and `policyfloors` leave the `ClusterRole` for a `Role` in the home
    namespace?** They are namespaced kinds used in the home namespace only, and the
    `ClusterRole` grants them everywhere. Recommendation: yes, in this ADR, as its one change
    to the pinned `ClusterRole`; it is the same argument as the Secrets. If the maintainer
    wants the `ClusterRole` untouched here, it becomes a follow-up of its own.
+   *Answered 2026-11-27: yes, the `mediatore-store` `Role`; the pinned test changed with it.*
+
 6. **Sandboxes in the broker's home namespace: warned, or refused (decision 6)?**
    Recommendation: warned in the release that moves, refused one release later, so a homelab
    that keeps everything in one namespace is told before it is stopped.
+   *Answered 2026-11-27: warned at start, not refused. The refusal is not built.*
+
 7. **The self-check at resync (decision 5): stop declaring entries, or only log?**
    Recommendation: stop declaring. A broker that knows its bound is gone and keeps writing
    entries is the permissive default the repository's rules refuse.
+   *Answered 2026-11-27: stop declaring, release nothing (the gate of decision 5's second note).*
+
 8. **Drain or copy (decision 7)?** Recommendation: drain for the maintainer's environment
    (claims are hours long at most), and keep step 6 documented and rehearsed for one that
    cannot. What banlieue itself keeps in its namespace was not verified in the review and does
    not change the decision.
+   *Answered 2026-11-27: drain is the recommended path; the copy path is documented and was rehearsed once in kind.* The maintainer's environment was not migrated by this change.

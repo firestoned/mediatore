@@ -124,3 +124,36 @@ installed beyond a `ServiceAccount` a live test left behind.
       do not ship it). What it found: the EK is signed by the local CA's issuing
       certificate (`issuercert.pem`), not its root, and the plugin takes no intermediates,
       so the bundle must carry the issuing certificate; the docs and `ek-cas.yaml` fixed
+
+## ADR-0056: the broker in a namespace of its own (2026-11-27)
+
+[ADR-0056](../../docs/adr/0056-the-broker-in-a-namespace-of-its-own.md), the *Revisit when*
+of the threat model's R-45. Decisions 4 and 5 were built first (2026-11-26, v0.4.0); the
+rest on 2026-11-27.
+
+- [x] The base deploys into `mediatore-system` and ships the `Namespace` with Pod Security
+      `restricted`; the Secret grant, the store's two kinds (out of the `ClusterRole`) and
+      the Lease are three `Role`s there; the `ClusterSPIFFEID` selects the namespace
+      (`deploy/base`, pinned by the unit tests in `crates/mediatore-claims/src/sandbox.rs`,
+      `scripts/check_release_assets.py`)
+- [x] One parameter names the broker to the subject, status and entries policies (the key
+      `broker` of `mediatore-agentsandbox-subject-policy`, `parameterNotFoundAction: Deny`),
+      confirmed on API servers at Kubernetes 1.30.13 and 1.36.4 before it was taken
+- [x] The self-check repeated at each resync on the Lease holder; a failure stops new
+      entries from being declared (`mediatore_spire::Gated`) and releases nothing
+- [x] The home namespace is the pod's own: `default` refused at start, a claimable
+      namespace equal to the home warned about
+- [x] Every kind tier with the broker and its fixtures in `mediatore-system` and the pools
+      where they were; the mTLS tier's `lookalike` pod (the broker's label, ServiceAccount
+      name and container name in another namespace) issued nothing
+- [x] The migration procedure written (`docs/guides/deploying.md`) and rehearsed once in
+      kind by the copy path (`make kind-rehearse-migration`): a claim bound with the broker
+      in `banlieue-system`, its token issued by the broker in `mediatore-system`; transcript
+      in `docs/guides/testing.md`
+- [ ] The running cluster migrated, by the drain path: banlieue's `brokers` line and the
+      OpenBao role given the new subject beside the old, the old broker to zero, the
+      `PolicyFloor`s and banned `SandboxNode`s copied, the base applied in
+      `mediatore-system` with the sandbox Service keeping its address, the old namespace
+      cleaned. Until then R-45 stands for that cluster as first written
+- [ ] Sandboxes in the broker's home namespace refused, one release after the warning
+      (ADR-0056 open question 6); not built, no date

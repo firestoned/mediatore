@@ -2263,8 +2263,6 @@ mod tests {
              "verbs": ["patch"]},
             {"apiGroups": ["mediatore.io"], "resources": ["agentsandboxes/finalizers"],
              "verbs": ["update"]},
-            {"apiGroups": ["mediatore.io"], "resources": ["sandboxnodes", "policyfloors"],
-             "verbs": ["get", "list", "watch", "create", "update", "patch", "delete"]},
             {"apiGroups": ["banlieue.io"], "resources": ["virtualmachineclaims"],
              "verbs": ["get", "list", "watch", "create", "delete"]},
             {"apiGroups": ["banlieue.io"], "resources": ["virtualmachineclaims/status"],
@@ -2278,6 +2276,223 @@ mod tests {
             roles[0]["rules"], expected,
             "deploy/base/rbac.yaml's ClusterRole changed: that is a trust-boundary change \
              (ADR-0046 decision 10); write the ADR and do the threat-model pass first"
+        );
+    }
+
+    /// The documents of a file under `deploy/`, by its path from there.
+    fn deploy_docs(file: &str) -> Vec<serde_json::Value> {
+        let path = format!("{}/../../deploy/{file}", env!("CARGO_MANIFEST_DIR"));
+        serde_saphyr::from_multiple(&std::fs::read_to_string(&path).unwrap()).unwrap()
+    }
+
+    /// The broker's own namespace (ADR-0056 decision 1), as every test below spells it.
+    const HOME: &str = "mediatore-system";
+    /// The broker's username there, as the API server spells a `ServiceAccount`.
+    const BROKER_USERNAME: &str = "system:serviceaccount:mediatore-system:mediatore";
+
+    /// ADR-0056 decisions 1 and 2: the base deploys into the broker's own namespace and
+    /// ships that `Namespace`, labelled for Pod Security `restricted`, listed first so it
+    /// exists before what goes in it.
+    #[test]
+    fn the_base_deploys_into_mediatore_system_and_ships_the_namespace() {
+        let kustomization = &deploy_docs("base/kustomization.yaml")[0];
+        assert_eq!(kustomization["namespace"], HOME);
+        assert_eq!(
+            kustomization["resources"][0], "namespace.yaml",
+            "the Namespace is the first resource"
+        );
+        let docs = deploy_docs("base/namespace.yaml");
+        assert_eq!(docs.len(), 1);
+        let namespace = &docs[0];
+        assert_eq!(namespace["kind"], "Namespace");
+        assert_eq!(namespace["metadata"]["name"], HOME);
+        assert_eq!(
+            namespace["metadata"]["labels"]["pod-security.kubernetes.io/enforce"], "restricted",
+            "the broker's pod is written for restricted (ADR-0007); the label is not left to memory"
+        );
+    }
+
+    /// Every file under `dir`, recursively, as (path, text).
+    fn files_under(dir: &std::path::Path, into: &mut Vec<(String, String)>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                files_under(&path, into);
+            } else if let Ok(text) = std::fs::read_to_string(&path) {
+                into.push((path.display().to_string(), text));
+            }
+        }
+    }
+
+    /// ADR-0056 decision 2: nothing the base ships names banlieue's namespace, in metadata,
+    /// in a subject, in a selector or inside a CEL expression (which no overlay's
+    /// `namespace:` would rewrite). The two per-namespace RBAC directories bind the broker's
+    /// `ServiceAccount` where it now lives.
+    #[test]
+    fn no_base_manifest_names_banlieues_namespace() {
+        let root = format!("{}/../../deploy", env!("CARGO_MANIFEST_DIR"));
+        let mut files = Vec::new();
+        files_under(std::path::Path::new(&format!("{root}/base")), &mut files);
+        assert!(files.len() > 10, "deploy/base was not read");
+        for (path, text) in &files {
+            for (n, line) in text.lines().enumerate() {
+                // A comment may say where the broker used to be, or where banlieue is.
+                let code = line.split(" #").next().unwrap_or(line);
+                assert!(
+                    line.trim_start().starts_with('#') || !code.contains("banlieue-system"),
+                    "{path}:{}: {line}",
+                    n + 1
+                );
+            }
+        }
+        for file in ["policy-bundles/rbac.yaml", "audience-credentials/rbac.yaml"] {
+            let docs = deploy_docs(file);
+            let binding = docs
+                .iter()
+                .find(|d| d["kind"] == "RoleBinding")
+                .expect("the binding");
+            assert_eq!(
+                binding["subjects"],
+                json!([{"kind": "ServiceAccount", "name": "mediatore", "namespace": HOME}]),
+                "{file}"
+            );
+        }
+    }
+
+    /// The `Role`s of `deploy/base/rbac.yaml` and their bindings, by name.
+    fn base_roles() -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
+        let docs = deploy_docs("base/rbac.yaml");
+        let of = |kind: &str| -> Vec<serde_json::Value> {
+            docs.iter().filter(|d| d["kind"] == kind).cloned().collect()
+        };
+        (of("Role"), of("RoleBinding"))
+    }
+
+    /// ADR-0056 decisions 1 and 3: everything the broker holds that is not in its
+    /// `ClusterRole` is a `Role` in its own namespace, bound to its own `ServiceAccount`
+    /// there, and there are exactly three: the session Secrets, the watcher's Lease and the
+    /// store's two kinds (open question 5). The Secret grant cannot be narrowed by name (a
+    /// Secret per sandbox, made at run time), so the namespace is its bound; a fourth
+    /// `Role`, a wider rule or a `Role` elsewhere is a trust-boundary change (TB-2, TB-9).
+    #[test]
+    fn the_secrets_role_is_namespaced_and_its_rules_are_pinned() {
+        let (roles, bindings) = base_roles();
+        let mut pinned = std::collections::BTreeMap::new();
+        pinned.insert(
+            "mediatore-sessions",
+            json!([
+                {"apiGroups": [""], "resources": ["secrets"],
+                 "verbs": ["get", "list", "create", "update", "patch", "delete"]},
+            ]),
+        );
+        pinned.insert(
+            "mediatore-watcher-lease",
+            json!([
+                {"apiGroups": ["coordination.k8s.io"], "resources": ["leases"],
+                 "verbs": ["create"]},
+                {"apiGroups": ["coordination.k8s.io"], "resources": ["leases"],
+                 "resourceNames": ["mediatore-watcher"], "verbs": ["get", "update"]},
+            ]),
+        );
+        pinned.insert(
+            "mediatore-store",
+            json!([
+                {"apiGroups": ["mediatore.io"], "resources": ["sandboxnodes", "policyfloors"],
+                 "verbs": ["get", "list", "watch", "create", "update", "patch", "delete"]},
+            ]),
+        );
+        let names: std::collections::BTreeSet<&str> = roles
+            .iter()
+            .filter_map(|r| r["metadata"]["name"].as_str())
+            .collect();
+        assert_eq!(
+            names,
+            pinned.keys().copied().collect(),
+            "the base's Roles changed: a trust-boundary change (ADR-0056 decision 3)"
+        );
+        for role in &roles {
+            let name = role["metadata"]["name"].as_str().unwrap();
+            assert_eq!(role["metadata"]["namespace"], HOME, "{name}");
+            assert_eq!(role["rules"], pinned[name], "{name}");
+        }
+        assert_eq!(bindings.len(), roles.len());
+        for binding in &bindings {
+            let name = binding["metadata"]["name"].as_str().unwrap();
+            assert_eq!(binding["metadata"]["namespace"], HOME, "{name}");
+            assert_eq!(
+                binding["roleRef"],
+                json!({"apiGroup": "rbac.authorization.k8s.io", "kind": "Role", "name": name}),
+            );
+            assert_eq!(
+                binding["subjects"],
+                json!([{"kind": "ServiceAccount", "name": "mediatore", "namespace": HOME}]),
+                "{name}"
+            );
+        }
+        let cluster_binding = deploy_docs("base/rbac.yaml")
+            .into_iter()
+            .find(|d| d["kind"] == "ClusterRoleBinding")
+            .expect("the ClusterRoleBinding");
+        assert_eq!(
+            cluster_binding["subjects"],
+            json!([{"kind": "ServiceAccount", "name": "mediatore", "namespace": HOME}]),
+        );
+    }
+
+    /// ADR-0056 decision 3: the `ClusterRole` reaches banlieue's objects and the entries
+    /// cluster-wide and holds nothing on the core group (no Secret, no `ConfigMap`, in any
+    /// namespace), no wildcard, and neither of the store's namespaced kinds.
+    #[test]
+    fn the_brokers_cluster_role_holds_no_verb_on_the_core_group() {
+        let role = deploy_docs("base/rbac.yaml")
+            .into_iter()
+            .find(|d| d["kind"] == "ClusterRole")
+            .expect("the ClusterRole");
+        let rules = role["rules"].as_array().unwrap();
+        assert!(rules.len() > 1, "the ClusterRole was not read");
+        for rule in rules {
+            let strings = |key: &str| -> Vec<&str> {
+                rule[key]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|v| v.as_str())
+                    .collect()
+            };
+            let (groups, resources, verbs) =
+                (strings("apiGroups"), strings("resources"), strings("verbs"));
+            assert!(!groups.contains(&""), "the core group: {rule}");
+            for list in [&groups, &resources, &verbs] {
+                assert!(!list.contains(&"*"), "a wildcard: {rule}");
+            }
+            for kind in ["secrets", "configmaps", "sandboxnodes", "policyfloors"] {
+                assert!(!resources.contains(&kind), "{kind}: {rule}");
+            }
+        }
+    }
+
+    /// ADR-0056 decision 2: the broker's SVID is issued to pods in the broker's own
+    /// namespace, and the other three halves of the selector are as they were.
+    #[test]
+    fn the_cluster_spiffe_id_selects_the_brokers_namespace() {
+        let docs = deploy_docs("base/clusterspiffeid.yaml");
+        assert_eq!(docs.len(), 1);
+        let spec = &docs[0]["spec"];
+        assert_eq!(
+            spec["namespaceSelector"],
+            json!({"matchLabels": {"kubernetes.io/metadata.name": HOME}}),
+        );
+        assert_eq!(
+            spec["podSelector"],
+            json!({"matchLabels": {"app.kubernetes.io/name": "mediatore"}}),
+        );
+        assert_eq!(
+            spec["workloadSelectorTemplates"],
+            json!(["k8s:sa:mediatore", "k8s:container-name:mediatore"]),
+        );
+        assert_eq!(
+            spec["spiffeIDTemplate"],
+            "spiffe://{{ .TrustDomain }}/mediatore"
         );
     }
 
@@ -2380,10 +2595,14 @@ mod tests {
         }
     }
 
+    /// How the three policies that name the broker spell "the request is from the broker":
+    /// the key `broker` of their one parameter, never a literal (ADR-0056 decision 4).
+    const FROM_THE_BROKER: &str = "request.userInfo.username == params.data.broker.trim()";
+
     /// The status carries the claim record (ADR-0034), so the status subresource is the
     /// broker's alone whatever a namespace Role grants: one policy, failing closed, on
-    /// every write of `agentsandboxes/status`, admitting the broker's `ServiceAccount` as
-    /// the other policies spell it, and bound with `Deny`.
+    /// every write of `agentsandboxes/status`, admitting the one username its parameter
+    /// names, and bound with `Deny`.
     #[test]
     fn the_status_policy_admits_the_broker_alone_and_denies() {
         let docs = admission_docs("agentsandbox-status.yaml");
@@ -2403,26 +2622,9 @@ mod tests {
         let validations = policy["spec"]["validations"].as_array().unwrap();
         assert_eq!(validations.len(), 1);
         assert_eq!(
-            validations[0]["expression"],
-            "request.userInfo.username == 'system:serviceaccount:banlieue-system:mediatore'"
+            validations[0]["expression"], FROM_THE_BROKER,
+            "the broker, as the parameter names it, and nobody else"
         );
-        // The same spelling as the policy on the broker's entries, which carries it as
-        // the first way an entry is claimed and in its sender validation (ADR-0056
-        // decision 4): one name to change, in every place.
-        let spelling = validations[0]["expression"].as_str().unwrap();
-        let entries = admission_docs("clusterstaticentry-mediatore.yaml");
-        for carried in [
-            &entries[0]["spec"]["matchConditions"][0]["expression"],
-            &entries[0]["spec"]["validations"][0]["expression"],
-        ] {
-            assert!(
-                carried
-                    .as_str()
-                    .unwrap()
-                    .starts_with(&format!("{spelling} || ")),
-                "{carried}"
-            );
-        }
         let binding = docs
             .iter()
             .find(|d| d["kind"] == "ValidatingAdmissionPolicyBinding")
@@ -2433,6 +2635,96 @@ mod tests {
             binding["spec"]["matchResources"].is_null(),
             "bound everywhere: a namespace left out would be ungoverned"
         );
+    }
+
+    /// ADR-0056 decision 4 and open question 3: the subject, status and entries policies
+    /// read the broker's username from one place, the key `broker` of the `ConfigMap`
+    /// `mediatore-agentsandbox-subject-policy` in the broker's namespace, and none carries
+    /// a `ServiceAccount` username of its own. Each is bound to that one object, by name
+    /// and namespace, with `parameterNotFoundAction: Deny`, and fails closed
+    /// (`failurePolicy: Fail`): without the parameter, or without the key, nothing is
+    /// admitted. That an API server evaluates it so (a match condition reading `params`, a
+    /// namespaced parameter for a cluster-scoped request) is what the kind tiers prove.
+    #[test]
+    fn the_three_policies_read_the_broker_from_one_parameter_and_deny_without_it() {
+        let subject = admission_docs("agentsandbox-subject.yaml");
+        let parameter = subject
+            .iter()
+            .find(|d| d["kind"] == "ConfigMap")
+            .expect("the parameter");
+        assert_eq!(
+            parameter["metadata"]["name"],
+            "mediatore-agentsandbox-subject-policy"
+        );
+        assert_eq!(parameter["metadata"]["namespace"], HOME);
+        assert_eq!(
+            parameter["data"]["broker"], BROKER_USERNAME,
+            "the ServiceAccount of deploy/base/serviceaccount.yaml in the base's namespace"
+        );
+        let account = &deploy_docs("base/serviceaccount.yaml")[0];
+        assert_eq!(
+            format!(
+                "system:serviceaccount:{HOME}:{}",
+                account["metadata"]["name"].as_str().unwrap()
+            ),
+            BROKER_USERNAME
+        );
+
+        for file in [
+            "agentsandbox-subject.yaml",
+            "agentsandbox-status.yaml",
+            "clusterstaticentry-mediatore.yaml",
+        ] {
+            let docs = admission_docs(file);
+            let policy = docs
+                .iter()
+                .find(|d| d["kind"] == "ValidatingAdmissionPolicy")
+                .expect("the policy");
+            assert_eq!(policy["spec"]["failurePolicy"], "Fail", "{file}");
+            assert_eq!(
+                policy["spec"]["paramKind"],
+                json!({"apiVersion": "v1", "kind": "ConfigMap"}),
+                "{file}"
+            );
+            let binding = docs
+                .iter()
+                .find(|d| d["kind"] == "ValidatingAdmissionPolicyBinding")
+                .expect("the binding");
+            assert_eq!(
+                binding["spec"]["paramRef"],
+                json!({
+                    "name": "mediatore-agentsandbox-subject-policy",
+                    "namespace": HOME,
+                    "parameterNotFoundAction": "Deny",
+                }),
+                "{file}"
+            );
+            assert_eq!(
+                binding["spec"]["validationActions"],
+                json!(["Deny"]),
+                "{file}"
+            );
+            // No expression spells a ServiceAccount: the parameter is the only place.
+            let expressions = serde_json::to_string(&policy["spec"]).unwrap();
+            assert!(
+                !expressions.contains("system:serviceaccount:"),
+                "{file} carries a literal username"
+            );
+            assert!(expressions.contains(FROM_THE_BROKER), "{file}");
+        }
+        // Where each reads it: the subject policy's exemption, and (the status policy's one
+        // validation and the entries policy's two uses are held by their own tests).
+        let subject_policy = subject
+            .iter()
+            .find(|d| d["kind"] == "ValidatingAdmissionPolicy")
+            .expect("the policy");
+        let exemption = subject_policy["spec"]["variables"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["name"] == "isMediatore")
+            .expect("the broker's exemption");
+        assert_eq!(exemption["expression"], FROM_THE_BROKER);
     }
 
     /// The messages of the validations the entries policy carried before it claimed an entry
@@ -2463,8 +2755,7 @@ mod tests {
     /// reads, every earlier validation still present, and bound with `Deny`.
     #[test]
     fn the_entries_policy_claims_an_entry_by_what_it_is_and_names_its_one_sender() {
-        const BROKER: &str =
-            "request.userInfo.username == 'system:serviceaccount:banlieue-system:mediatore'";
+        const BROKER: &str = FROM_THE_BROKER;
         let docs = admission_docs("clusterstaticentry-mediatore.yaml");
         let policy = docs
             .iter()
@@ -2534,26 +2825,15 @@ mod tests {
         }
         assert_eq!(validations.len(), 16);
 
-        // The literal is the one string the two AgentSandbox policies carry.
-        for file in ["agentsandbox-subject.yaml", "agentsandbox-status.yaml"] {
-            let text = std::fs::read_to_string(format!(
-                "{}/../../deploy/base/admission/{file}",
-                env!("CARGO_MANIFEST_DIR")
-            ))
-            .unwrap();
-            assert!(text.contains(BROKER), "{file} spells the broker otherwise");
-        }
-
         let binding = docs
             .iter()
             .find(|d| d["kind"] == "ValidatingAdmissionPolicyBinding")
             .expect("the binding");
         assert_eq!(binding["spec"]["policyName"], policy["metadata"]["name"]);
         assert_eq!(binding["spec"]["validationActions"], json!(["Deny"]));
-        assert!(
-            binding["spec"]["matchResources"].is_null() && binding["spec"]["paramRef"].is_null(),
-            "bound everywhere, with no parameter that could be missing"
-        );
+        // Bound everywhere. Its parameter, and what a missing one does, is held by
+        // `the_three_policies_read_the_broker_from_one_parameter_and_deny_without_it`.
+        assert!(binding["spec"]["matchResources"].is_null());
     }
 
     /// The gateway's entries are the platform team's and stay the gateway policy's alone:

@@ -88,11 +88,17 @@ What an operator sees of it:
 ## RBAC
 
 The broker's ServiceAccount patches `agentsandboxes/status` and the resource's labels and
-finalizers (as before), has every verb on `sandboxnodes` and `policyfloors` (a
-ClusterRole), and `get`, `list`, `create`, `update`, `patch` and `delete` on Secrets in
-its own namespace alone (a Role): `deploy/base/rbac.yaml`. The broker reads no Secret
-elsewhere. The broker's namespace is the client's default, the ServiceAccount's in a
-pod, so nothing names it in the configuration. The sandboxes may live anywhere the
+finalizers (as before), and holds two Roles in its own namespace alone: every verb on
+`sandboxnodes` and `policyfloors` (`mediatore-store`), and `get`, `list`, `create`,
+`update`, `patch` and `delete` on Secrets (`mediatore-sessions`): `deploy/base/rbac.yaml`.
+Its ClusterRole holds neither. That namespace is `mediatore-system`, the broker's own
+([ADR-0056](../adr/0056-the-broker-in-a-namespace-of-its-own.md)): it holds the broker's
+Secrets and nothing of banlieue's or a tenant's, so the grant on Secrets, which cannot be
+narrowed by name, is bounded by the namespace. The broker reads no Secret
+elsewhere, but for the audience credentials a team grants it by name
+(`deploy/audience-credentials`). The broker's namespace is the client's default, the
+ServiceAccount's in a pod, so nothing names it in the configuration, and the broker
+refuses to start when it is `default`. The sandboxes may live anywhere the
 controller watches: `sandboxes.namespace` is where `POST /v1/claims` creates them (or, since
 v0.3.0, the namespace the request names, one of `sandboxes.namespaces`,
 [ADR-0046](../adr/0046-who-may-claim-a-list-of-groups-and-a-namespace-to-groups-mapping.md)),

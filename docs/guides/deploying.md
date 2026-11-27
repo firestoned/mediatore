@@ -46,7 +46,7 @@ gh attestation verify mediatore-<version>.yaml --repo firestoned/mediatore \
 | SPIRE server, agents and the SPIFFE CSI driver | SPIRE's distribution rendered once into manifests ([the walkthrough](homelab-walkthrough.md), step 2), `watchClassless: false`, class name `<namespace>-<release name>` | the broker's SVID over the CSI socket (ADR-0007); entries as `ClusterStaticEntry` (ADR-0006) |
 | SPIRE Controller Manager | the same manifests | renders the entries the broker declares |
 | banlieue with `VirtualMachinePool` and `VirtualMachineClaim` | banlieue's release | the claims mediatore creates (ADR-0008, ADR-0011) |
-| banlieue's claim subject policy listing mediatore as a broker | ConfigMap `banlieue-claim-subject-policy`, `brokers:` line `system:serviceaccount:banlieue-system:mediatore`, `issuers:` listing yours | every claim mediatore creates names someone else's subject ([requesting a sandbox](requesting-a-sandbox.md)) |
+| banlieue's claim subject policy listing mediatore as a broker | ConfigMap `banlieue-claim-subject-policy`, `brokers:` line `system:serviceaccount:mediatore-system:mediatore`, `issuers:` listing yours | every claim mediatore creates names someone else's subject ([requesting a sandbox](requesting-a-sandbox.md)) |
 | An issuer with a public client for mediatore | Dex, Google, Auth0 or Entra ([issuers](issuers.md)) | `mediatore login` and the refresh before every issue |
 | An ingress for the user API, a LoadBalancer for the sandbox listener | the Tailscale operator's ingress class and MetalLB in the example | `:8080` to people; `:443` on the LoadBalancer (the pod's 8443) to pool VMs, so `MEDIATORE_URL` in the members' env file names the address alone |
 
@@ -115,19 +115,65 @@ URL, your CIDRs. Edit:
 
 `kubectl kustomize ~/.config/mediatore/core` renders the whole thing; read it once.
 
+### The broker's own namespace
+
+The base deploys into `mediatore-system` and ships that `Namespace`, labelled
+`pod-security.kubernetes.io/enforce: restricted`
+([ADR-0056](../adr/0056-the-broker-in-a-namespace-of-its-own.md)). It holds the broker and
+what is the broker's and nothing else: its `ServiceAccount`, its keys, the session, delegation
+and log Secrets the store writes, the `SandboxNode` and `PolicyFloor` resources, the watcher's
+Lease, and the ConfigMap that names the broker to the admission policies. The broker's `Role`
+on Secrets cannot be narrowed by name (the store makes one Secret per sandbox), so the
+namespace is its bound: keep it to the broker.
+
+- **Pools, claims and sandboxes live somewhere else**: banlieue's namespace, `sandboxes`, a
+  team's. The broker reaches them through its `ClusterRole`, which holds no verb on Secrets
+  or ConfigMaps anywhere. A claimable namespace (`sandboxes.namespace`, or a key of
+  `sandboxes.namespaces`) that is the broker's own is warned about at start, one line, and
+  still works.
+- **The home namespace is not configuration.** It is the namespace of the pod's
+  `ServiceAccount`; the start-up line `store: the Kubernetes API (ADR-0034)
+  namespace=<home>` states it. The broker refuses to start when it is `default`, which is
+  what a client outside a pod falls back to: a broker run outside the cluster names its
+  namespace in the context of the kubeconfig `spire.entries.kubeconfig` points at.
+- **An operator whose namespaces are created elsewhere** deletes the `Namespace` object in
+  the overlay (`$patch: delete`) and carries the Pod Security label where the namespace is
+  made.
+- **An overlay that renames the namespace or the `ServiceAccount`** sets `namespace:` and
+  then patches what kustomize does not rewrite, because none of it is object metadata:
+
+  | What | Where | Unpatched |
+  | --- | --- | --- |
+  | the value of `broker`, `system:serviceaccount:<namespace>:<name>` | ConfigMap `mediatore-agentsandbox-subject-policy` (`deploy/base/admission/agentsandbox-subject.yaml`) | the broker's entries and status writes are refused; it stops at start saying the policy does not name it |
+  | `paramRef.namespace` | the three bindings `mediatore-agentsandbox-subject`, `mediatore-agentsandbox-status`, `mediatore-clusterstaticentry` | no parameter is found: every `AgentSandbox`, status write and `ClusterStaticEntry` is refused, and the broker stops at start saying the policy cannot be evaluated |
+  | `subjects[0].namespace` | the `ClusterRoleBinding` `mediatore` and the three `RoleBinding`s in `deploy/base/rbac.yaml` (a subject that names its namespace is left as it is) | the broker has no verb: it stops at start on RBAC |
+  | `namespaceSelector` | the `ClusterSPIFFEID` `mediatore` (`deploy/base/clusterspiffeid.yaml`) | the broker is issued no SVID and does not start |
+  | the subject's namespace | the `RoleBinding`s of `deploy/policy-bundles` and `deploy/audience-credentials` in each namespace that has one | bundles and credentials there are not read |
+
+  Every row fails closed. `dev/kind/migration/kustomization.yaml` is a worked overlay with
+  the first four patches (it is what the migration rehearsal runs the broker under).
+
+One parameter names the broker to three admission policies: the key `broker` of that
+ConfigMap, read by the subject policy (the broker's exemption), the status policy (the one
+writer) and the entries policy (the one sender of the broker's SPIRE entries). Whoever may
+edit the ConfigMap can name another account as the broker, so keep `update` on ConfigMaps in
+`mediatore-system` to whoever deploys the broker, and audit changes to it. Without the
+ConfigMap, or without the key, all three policies refuse everything they govern, the
+gateways' `ClusterStaticEntry` resources included: restore it before declaring anything.
+
 ## 2. Create the Secrets the overlay expects
 
-The overlay generates no secret. Two Secrets in `banlieue-system`, each a file the
+The overlay generates no secret. Two Secrets in `mediatore-system`, each a file the
 broker reads at startup (the store needs none: it is the cluster's API, [the store](the-store.md)):
 
 ```sh
 # The STS signing key (ES256), whose public half becomes the broker's JWKS.
 openssl ecparam -name prime256v1 -genkey -noout | openssl pkcs8 -topk8 -nocrypt -out sts.pem
-kubectl -n banlieue-system create secret generic mediatore-sts --from-file=sts.pem
+kubectl -n mediatore-system create secret generic mediatore-sts --from-file=sts.pem
 
 # The sealing key for refresh material (ADR-0012 decision 3), the local sealer.
 openssl rand -hex 32 > sealing.key
-kubectl -n banlieue-system create secret generic mediatore-sealing --from-file=key=sealing.key
+kubectl -n mediatore-system create secret generic mediatore-sealing --from-file=key=sealing.key
 ```
 
 Delete the local files afterwards. With the transit sealer ([the store](the-store.md))
@@ -141,7 +187,7 @@ more Secret, one key per file, mounted read-only where `audiences[].secret_file`
 
 ```sh
 # Paste the key when prompted, so it is in neither your shell history nor a file.
-read -rs ANTHROPIC_KEY && kubectl -n banlieue-system create secret generic mediatore-audience-secrets \
+read -rs ANTHROPIC_KEY && kubectl -n mediatore-system create secret generic mediatore-audience-secrets \
   --from-literal=anthropic="$ANTHROPIC_KEY" && unset ANTHROPIC_KEY
 ```
 
@@ -153,8 +199,8 @@ proxy holds the old value for at most that audience's `max_ttl`.
 
 ```sh
 kubectl apply -k ~/.config/mediatore/core
-kubectl -n banlieue-system rollout status deploy/mediatore
-kubectl -n banlieue-system logs deploy/mediatore | head -40
+kubectl -n mediatore-system rollout status deploy/mediatore
+kubectl -n mediatore-system logs deploy/mediatore | head -40
 ```
 
 The broker fails the start on anything it cannot use, and says which: a key file that
@@ -196,14 +242,26 @@ the kind tier waits on (it needs a kubeconfig for the broker's ServiceAccount, w
 skips when a variable is missing. [Testing tiers](testing.md) has the rest of the
 suites.
 
-The broker makes the same proof for itself at every start
+The broker makes the same proof for itself at every start, and the replica that holds the
+Lease repeats it at every resync
 ([ADR-0056](../adr/0056-the-broker-in-a-namespace-of-its-own.md) decision 5): a dry-run create
 of an entry the policy must refuse, and it does not serve unless the refusal is the policy's.
-An overlay that renames the broker's ServiceAccount or moves it to another namespace must
-patch the username `system:serviceaccount:banlieue-system:mediatore` in the three files under
-`deploy/base/admission/` (twice in `clusterstaticentry-mediatore.yaml`); with the entries
-policy left unpatched the broker's entries are refused, not left unjudged, and the broker
-stops at start with an error that says which of the two it found.
+What it says when it is not:
+
+| The start error says | What it found | What to do |
+| --- | --- | --- |
+| `is not in force for this identity` | the forbidden entry was admitted: the policy or its binding is absent, or was edited to `Warn` | apply `deploy/base/admission/clusterstaticentry-mediatore.yaml` |
+| `does not name this identity as the broker` | the policy refused the broker by its sender validation | set `broker` in `mediatore-agentsandbox-subject-policy` to the username the broker runs as |
+| `cannot be evaluated` | the bindings found no parameter, or the parameter has no `broker` key | restore the ConfigMap in the namespace the bindings' `paramRef` names |
+| `may not create clusterstaticentries` | RBAC refused before admission was asked | the `ClusterRoleBinding`'s subject |
+| `not by the entries admission policy`, `did not answer` | another refusal, or no answer | the message carries the API server's own |
+
+A failure at a resync does not stop the broker. It logs an error (`the entries admission
+self-check failed at resync`) and declares no new entry until the check passes again: a claim
+that would bind waits, a new pool member gets no node entry, and nothing that is bound is
+released on its account. The check is asked again before each declaration, so binding
+resumes as soon as the policy answers. A replica that does not hold the Lease runs the
+check at its start only.
 
 ## 5. Log in and request a sandbox
 
@@ -479,7 +537,7 @@ registries:
 ```
 
 ```sh
-kubectl -n banlieue-system create secret generic mediatore-registry --from-file=ghcr=./ghcr-pull-token
+kubectl -n mediatore-system create secret generic mediatore-registry --from-file=ghcr=./ghcr-pull-token
 ```
 
 and in the overlay's Deployment patch, beside the STS volume:
@@ -885,6 +943,150 @@ audiences:
 **Sealing.** A delegated credential is kept only as ciphertext in a Secret of the broker's namespace while the claim lives, sealed under the OpenBao transit key (`store.sealing.transit`, a derived key per claim), so the broker survives a restart. It is deleted when the claim ends and at the credential's expiry, and never outlives the claim's TTL: the watcher sweeps expired envelopes every 15 seconds. Do not set a longer TTL on the CLI's side expecting a longer life; the broker caps it.
 
 **Rollout.** As for ADR-0040: broker and authorizer first, then the gateways (the authorizer needs `--socket-dir-mode 2750` and, from v0.2.9, a unit with `RestrictSUIDSGID=yes` is fine because the directory mode is changed only when it differs), then the pool image, then the audience. On a first boot, make sure the `envoy-inject` group exists before the step that installs files with that group.
+
+## Moving a running broker from `banlieue-system` to `mediatore-system`
+
+Until v0.4.0 the base put the broker in banlieue's namespace. The base now deploys into
+`mediatore-system` ([ADR-0056](../adr/0056-the-broker-in-a-namespace-of-its-own.md)), and
+**applying it over a running environment without this procedure gets you a second, empty
+broker beside the first**: its own Lease, none of the keys, and the admission parameter
+pointing at it, so the first one is refused its entries. Read the whole section first. The
+move has one outage, between steps 4 and 7: no token is issued and no claim binds; running
+sandboxes keep their SVIDs and the tokens their proxies hold.
+
+Two brokers must never run at once. The Lease is per namespace, so two namespaces would mean
+two leaders.
+
+**Drain or copy.** The recommended path is the drain: let the claims end (they are hours
+long at most), then move with nothing in the store but what step 5 copies. Step 6 is for an
+environment that cannot drain, and is the path the rehearsal in
+[the testing guide](testing.md#the-move-to-mediatore-system-rehearsed) proves: a claim
+bound before the move, its token issued after.
+
+The commands use `OLD=banlieue-system` and `NEW=mediatore-system`, and this filter, which
+re-creates an object in another namespace with the same name, labels and data and none of
+what belonged to the object it was:
+
+```sh
+OLD=banlieue-system NEW=mediatore-system
+copied() {   # a kubectl JSON list on stdin, the copies for $1 on stdout
+  jq --arg ns "$1" '.items[] |= (del(.metadata.ownerReferences, .metadata.uid,
+      .metadata.resourceVersion, .metadata.creationTimestamp, .metadata.managedFields,
+      .metadata.annotations["kubectl.kubernetes.io/last-applied-configuration"], .status)
+    | .metadata.namespace = $ns)' | jq '.items[]'
+}
+```
+
+1. **Upgrade in place first**, in the old namespace, to the release whose policies fail
+   closed and whose broker checks itself at start (v0.4.0 or later), with the old username
+   still the one the policies name. On v0.4.0 that username is a literal in the three files
+   under `deploy/base/admission/`; on a later base it is the parameter, and your overlay
+   keeps the broker in `banlieue-system` with the patches of
+   [the table above](#the-brokers-own-namespace) until step 7. From here no rename can leave
+   the broker's entries unjudged.
+
+2. **Create the namespace and copy what you created** in the old one: the STS key (the same
+   key, so the `kid` and the JWKS do not change and no verifier notices), the sealing key
+   with the local sealer (nothing with transit), the audience and registry Secrets, any CA
+   bundle, and the config if your overlay does not generate it.
+
+   ```sh
+   kubectl apply -f deploy/base/namespace.yaml
+   for s in mediatore-sts mediatore-sealing mediatore-audience-secrets mediatore-registry; do
+     kubectl -n $OLD get secret $s --ignore-not-found -o json | jq '{items: [.]}' | copied $NEW | kubectl apply -f -
+   done
+   ```
+
+3. **Where something outside this repository names the broker's username, add the new one
+   beside the old.** There are three, and the move finds them by failing if you do not:
+   - banlieue's claim subject policy: a second line under `brokers:` in the ConfigMap
+     `banlieue-claim-subject-policy`, `system:serviceaccount:mediatore-system:mediatore`;
+   - with the transit sealer, the OpenBao Kubernetes auth role
+     ([the store](the-store.md)): `bound_service_account_namespaces=banlieue-system,mediatore-system`;
+   - with Entra's keyless form ([the Entra path](the-entra-path.md)), a second federated
+     credential whose subject is the new username.
+
+   In each policy namespace and each namespace with audience credentials, add the new
+   subject to the `RoleBinding` (`mediatore-policy-bundles`, `mediatore-audience-credentials`):
+
+   ```sh
+   kubectl -n <namespace> patch rolebinding mediatore-policy-bundles --type=json \
+     -p '[{"op":"add","path":"/subjects/-","value":{"kind":"ServiceAccount","name":"mediatore","namespace":"mediatore-system"}}]'
+   ```
+
+4. **Let the claims end, or accept step 6. Scale the old broker to zero**, and wait for its
+   pods to be gone. The outage starts here.
+
+   ```sh
+   kubectl -n $OLD scale deploy/mediatore --replicas=0
+   kubectl -n $OLD wait --for=delete pod -l app.kubernetes.io/name=mediatore --timeout=120s
+   ```
+
+5. **Copy what must survive**: every `PolicyFloor` (the replay floor; without it an older
+   signed bundle would be admitted again) and every banned `SandboxNode` (a ban is a security
+   record). Unbanned nodes need no copy after a drain: an idle guest is refused once,
+   restarts and registers again.
+
+   ```sh
+   kubectl -n $OLD get policyfloors -o json | copied $NEW | kubectl apply -f -
+   kubectl -n $OLD get sandboxnodes -o json | jq '.items |= map(select(.spec.banned == true))' | copied $NEW | kubectl apply -f -
+   ```
+
+6. **Only if claims were not drained**: copy their session and delegation Secrets, their
+   stored output, and the `SandboxNode`s they are bound to (copying every node is simplest).
+
+   ```sh
+   kubectl -n $OLD get secrets -l mediatore.io/sandbox-uid -o json | copied $NEW | kubectl apply -f -
+   kubectl -n $OLD get secrets -l mediatore.io/logs -o json | copied $NEW | kubectl apply -f -
+   kubectl -n $OLD get sandboxnodes -o json | copied $NEW | kubectl apply -f -
+   ```
+
+   **The copies carry no `ownerReferences`, no `uid` and no `resourceVersion`**, which is
+   what the filter removes. An owner reference cannot cross a namespace, and the garbage
+   collector deletes an object whose owner it cannot find in the object's own namespace: a
+   session copied with its owner reference is collected in the middle of a claim. The
+   broker writes none for a sandbox outside its home, and release and the sweep remove the
+   copies as they remove any other. A copied envelope opens because it is sealed to the
+   sandbox's UID and its purpose and to nothing else: neither the namespace nor the
+   Secret's name is in the binding, and the sandbox did not move.
+
+7. **Apply the base in `mediatore-system`**, your overlay now with `namespace:
+   mediatore-system` and none of step 1's patches: the `ServiceAccount`, the `Role`s and
+   bindings, the `ClusterRoleBinding`'s subject, the `ClusterSPIFFEID`'s selector, the
+   parameter's `broker` and the bindings' `paramRef.namespace` all move with it. Give the
+   new `mediatore-sandbox` Service the address the old one had (release it from the old
+   Service first), since the pool's members and the gateways' relay dial it; the user API
+   keeps its host.
+
+   ```sh
+   kubectl -n $OLD delete service mediatore-sandbox     # frees the LoadBalancer address
+   kubectl apply -k ~/.config/mediatore/core
+   kubectl -n $NEW rollout status deploy/mediatore
+   kubectl -n $NEW logs deploy/mediatore | grep -E 'store:|claim watcher running'
+   # store: the Kubernetes API (ADR-0034) namespace="mediatore-system"
+   ```
+
+   The new broker starts only if its self-check passes, rebuilds its records from the
+   `AgentSandbox` resources where they are, and opens the copied envelopes.
+
+8. **Verify, then clean the old namespace.** A login, a claim, a token; for a copied claim,
+   a token from its running workload. Then remove what the broker left in `banlieue-system`,
+   the key Secrets last, and the old subject from the bindings of step 3.
+
+   ```sh
+   kubectl -n $OLD delete deployment/mediatore service/mediatore configmap/mediatore-config \
+     rolebinding/mediatore-sessions rolebinding/mediatore-store rolebinding/mediatore-watcher-lease \
+     role/mediatore-sessions role/mediatore-store role/mediatore-watcher-lease serviceaccount/mediatore \
+     lease/mediatore-watcher configmap/mediatore-agentsandbox-subject-policy \
+     networkpolicy/mediatore --ignore-not-found
+   kubectl -n $OLD delete secrets -l mediatore.io/sandbox-uid
+   kubectl -n $OLD delete secrets -l mediatore.io/logs
+   kubectl -n $OLD delete sandboxnodes,policyfloors --all
+   kubectl -n $OLD delete secret mediatore-sts mediatore-sealing mediatore-audience-secrets mediatore-registry --ignore-not-found
+   ```
+
+   Leave banlieue's own objects alone: its controller, its Secrets and ConfigMaps (the claim
+   subject policy among them), the pools and the gateways' objects stay where they are.
 
 ## What the NetworkPolicy allows
 

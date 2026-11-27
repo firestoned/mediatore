@@ -222,12 +222,15 @@ whoever creates the resource. A GitHub login `octocat` through Dex with
 `--oidc-username-prefix=github:` is the Kubernetes user `github:octocat`; the resource
 stores `octocat`, which is what a token carries, and the policy adds the prefix from the
 `usernamePrefix` (or per-issuer `issuerPrefixes`) key of ConfigMap
-`mediatore-agentsandbox-subject-policy` in `banlieue-system`.
+`mediatore-agentsandbox-subject-policy` in `mediatore-system`.
 
 Two principals may name somebody else:
 
 - mediatore's own ServiceAccount, always: it creates sandboxes for the subjects it has
-  validated bearer tokens for, and that validation is the control;
+  validated bearer tokens for, and that validation is the control. The policy knows it by
+  the key `broker` of the same ConfigMap,
+  `system:serviceaccount:mediatore-system:mediatore` as shipped
+  ([ADR-0056](../adr/0056-the-broker-in-a-namespace-of-its-own.md) decision 4);
 - the usernames listed under `brokers` in that ConfigMap, which ships empty. A listed
   broker can attribute a sandbox, and the tokens it mints, to anyone, so list one only
   when something really does hand sandboxes to other people, and audit changes to the
@@ -255,7 +258,7 @@ that runs banlieue:
 
 ```yaml
 brokers: |
-  system:serviceaccount:banlieue-system:mediatore
+  system:serviceaccount:mediatore-system:mediatore
 issuers: |
   https://dex.home.example
 ```

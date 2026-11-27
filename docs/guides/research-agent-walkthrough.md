@@ -246,7 +246,7 @@ sandboxes:
 
 ```sh
 # The pull token: a GitHub fine-grained token or robot account with read:packages only.
-kubectl -n banlieue-system create secret generic mediatore-registry --from-file=ghcr=./ghcr-read-token
+kubectl -n mediatore-system create secret generic mediatore-registry --from-file=ghcr=./ghcr-read-token
 ```
 
 `git.home.example` validates the `sts` tokens against the broker's JWKS
