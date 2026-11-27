@@ -86,7 +86,7 @@ hyper-util   = { version = "0.1", features = ["server-auto", "server-graceful", 
 # library crate, pinned exactly (it decides what the workload may touch; bump by hand). The
 # keyring feature is off: no secret store in the guest. nono-proxy and nono-cli are not used
 # (they pull ring).
-nono         = { version = "=0.81.0", default-features = false }
+nono         = { version = "=0.82.0", default-features = false }
 # The jail's third layer (ADR-0051): a seccomp-bpf denylist compiled and loaded in `jail-exec`.
 seccompiler  = { version = "0.5", default-features = false }
 libc         = "0.2"
@@ -106,7 +106,7 @@ futures      = "0.3"
 serde          = { version = "1", features = ["derive"] }
 serde_json     = "1"
 # safe-Rust YAML; serde_yaml_ng pulled the unmaintained unsafe-libyaml (RUSTSEC-2024-0449)
-serde-saphyr   = "2.1"
+serde-saphyr   = "2.2"
 
 # identity + crypto
 # aws_lc_rs backend: jsonwebtoken 10+ requires exactly one crypto provider, and

@@ -219,15 +219,28 @@ nav:
       - "ADR-0046: Who may claim: a list of groups, and a mapping from namespaces to groups": adr/0046-who-may-claim-a-list-of-groups-and-a-namespace-to-groups-mapping.md
       - "ADR-0047: A sandbox chooses its member by strategy": adr/0047-a-sandbox-chooses-its-member-by-strategy.md
       - "ADR-0048: AgentSandbox is served as v1beta1": adr/0048-agentsandbox-served-as-v1beta1.md
+      - "ADR-0049: A guest without a vTPM attests with x509pop, using a certificate its host signs for the guest's own key": adr/0049-a-guest-without-a-vtpm-attests-with-x509pop-and-a-certificate-its-host-signs.md
       - "ADR-0049: AgentSandbox is served as v1alpha1 and v1beta1": adr/0049-agentsandbox-served-as-v1alpha1-and-v1beta1.md
+      - "ADR-0050: Host trust anchors at scale: roots in the bundle, a short-lived intermediate per host, enrolled by hardware attestation": adr/0050-host-trust-anchors-roots-in-the-bundle-and-a-short-lived-intermediate-per-host.md
+      - "ADR-0051: Socket families and io_uring denied to the workload by a seccomp filter": adr/0051-socket-families-and-io-uring-denied-to-the-workload-by-seccomp.md
+      - "ADR-0052: A sandbox workload's stored output is sealed per batch with the transit key": adr/0052-a-sandbox-workloads-stored-output-sealed-per-batch-with-the-transit-key.md
+      - "ADR-0053: An audience scoped to namespaces, each with its own rules": adr/0053-an-audience-scoped-to-namespaces-each-with-its-own-rules.md
       - "ADR-0053: The gateway's authorizer has an identity of its own": adr/0053-the-gateways-authorizer-has-an-identity-of-its-own.md
       - "ADR-0054: Which policies a namespace may name": adr/0054-which-policies-a-namespace-may-name.md
       - "ADR-0055: Audiences from signed SandboxAudience bundles, platform or team, read live": adr/0055-audiences-from-signed-sandboxaudience-bundles.md
       - "ADR-0056: The broker in a namespace of its own, and admission policies that do not depend on its name": adr/0056-the-broker-in-a-namespace-of-its-own.md
       - "ADR-0057: A claim's record written by compare-and-set and bound to its sandbox": adr/0057-a-claims-record-written-by-compare-and-set-and-bound-to-its-sandbox.md
       - "ADR-0059: Which pools' members become nodes": adr/0059-which-pools-members-become-nodes.md
+      - "ADR-0061: A running claim follows a new bundle version only while it is still inside it": adr/0061-a-running-claim-follows-a-new-bundle-only-while-it-is-still-inside-it.md
       - "ADR-0062: The gateway reports its decisions to the broker": adr/0062-the-gateway-reports-its-decisions-to-the-broker.md
+      - "ADR-0063: The image pull goes through the claim's proxy and the gateway, like any egress": adr/0063-the-image-pull-goes-through-the-claims-proxy-and-the-gateway-like-any-egress.md
+      - "ADR-0064: A claim's egress, summarised on its sandbox's status": adr/0064-a-claims-egress-summarised-on-its-sandboxs-status.md
+      - "ADR-0065: A sandbox under several policies, the first named wins": adr/0065-a-sandbox-under-several-policies-the-first-named-wins.md
+      - "ADR-0066: Eligibility by group, from the signed policy bundle": adr/0066-eligibility-by-group-from-the-signed-bundle.md
+      - "ADR-0067: The VM images are overlays on a replaceable base": adr/0067-the-vm-images-are-overlays-on-a-replaceable-base.md
       - "ADR-0068: The cloud platform's host addresses: WireServer root's alone on Azure, the metadata service nobody's": adr/0068-the-cloud-platforms-host-addresses-root-alone-on-azure-the-metadata-service-for-nobody.md
+      - "ADR-0069: Tripwires on the VM: a decoy the workload takes ends its sandbox": adr/0069-tripwires-on-the-vm-a-decoy-the-workload-takes-ends-its-sandbox.md
+      - "ADR-0070: Tripwires beyond the sandbox: a request no honest build makes": adr/0070-tripwires-beyond-the-sandbox-a-request-no-honest-build-makes.md
   - Security:
       - Threat model: security/threat-model.md
       - NIST AI 800-1 crosswalk: security/nist-ai-800-1.md
