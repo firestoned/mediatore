@@ -32,6 +32,11 @@ updates:
       # this workspace's pre-1.0 crates as individual PRs.
       cargo:
         patterns: ["*"]
+    ignore:
+      # jiff's major follows notaio's sandboxpolicy-bundle, whose API carries its Timestamp
+      # (Cargo.toml). #173 moved jiff alone to 1.0 and main stopped compiling.
+      - dependency-name: "jiff"
+        update-types: ["version-update:semver-major"]
 
   # Container base images (Dockerfile FROM lines): the server image, the VM base image
   # (the Kairos pin, ADR-0067) and its two overlays, the sandbox and gateway VM images.

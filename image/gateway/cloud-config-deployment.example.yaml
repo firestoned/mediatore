@@ -130,19 +130,23 @@ stages:
     # TURN THE INJECT ENVOY ON (ADR-0040): off by default. The unit is in the image and not enabled. To enable it, (1) in the env above, replace
     # INJECT_PORT_ELEMENT with the line of image/gateway/env.inject.example, set INJECT_HOST, INJECT_DOMAIN and INJECT_UPSTREAM_PORT to the upstream, keep
     # INJECT_PORT equal to the broker's gateway_inject_port, and leave AUTHORIZER_ENDPOINT and CHECK_TCP_ELEMENTS as above: the data plane is on the CHECK
-    # socket already, the image's default, and inject is not for a gateway that keeps the check on loopback TCP; (2) add the step below, which gives the
-    # authorizer its second socket, the INJECT socket, in a directory of its own beside the check socket's (the data plane's group reaches the check socket
-    # only, envoy-inject's group the inject socket only; the setgid directories give each socket its group, and the image's unit already makes the check
-    # socket's) and enables and starts the unit (enable alone never starts it here:
+    # socket already, the image's default, and inject is not for a gateway that keeps the check on loopback TCP; (2) add the two steps below. The first
+    # gives the authorizer its second socket, the INJECT socket, in a directory of its own beside the check socket's (the data plane's group reaches the
+    # check socket only, envoy-inject's group the inject socket only; the setgid directories give each socket its group). It is a drop-in for the
+    # authorizer's unit and belongs in the `initramfs` stage, beside the env file: there it is in place before systemd starts the unit. Written in a
+    # `boot` stage it arrives after the unit has started, so the authorizer starts once on the check socket alone and has to be restarted (seen on a
+    # booted gateway, 2026-11-27). The second step enables and starts the unit, and that one is a `boot` stage's (enable alone never starts it here:
     # /etc is rebuilt at every boot and this stage runs after systemd has planned the boot, so 3133 would stay closed); (3) register `unix:user:envoy-inject` on the
     # listeners' SPIFFE ID, spiffe://<td>/gateway (the third entry of each VM in deploy/gateway/clusterstaticentries.yaml; the authorizer's
     # user holds spiffe://<td>/gateway/authorizer and nothing else, ADR-0053); (4) open the gateways' path to the upstream. The authorizer's
     # listen flags are those of the release that serves the two sockets (ADR-0040 stage C): check them with `mediatore gateway --help`. The drop-in
-    # replaces the unit's ExecStart, so it names both sockets; its check directory line and its ReadWritePaths repeat what the image's unit now
-    # does itself, so the same drop-in serves an image from before the check socket was the default.
+    # replaces the unit's ExecStart, so it names both sockets; it adds the inject socket's directory and nothing else, because the image's unit
+    # makes the check socket's directory and has ReadWritePaths=/run/mediatore-gateway itself. (An image from before the check socket was the
+    # default, 2026-11-26, has neither: there the drop-in also needs the check directory's `install -d` line, with the group envoy, and that
+    # ReadWritePaths line.)
     #
     # stages:
-    #   boot:
+    #   initramfs:
     #     - name: mediatore-gateway-inject
     #       files:
     #         - path: /etc/systemd/system/mediatore-gateway.service.d/10-inject.conf
@@ -153,12 +157,10 @@ stages:
     #             [Service]
     #             ExecStart=
     #             ExecStart=/usr/bin/mediatore gateway --check-socket /run/mediatore-gateway/check/check.sock --inject-socket /run/mediatore-gateway/inject/inject.sock --socket-dir-mode 2750
-    #             ExecStartPre=+/usr/bin/install -d -m 2750 -o mediatore-gateway -g envoy /run/mediatore-gateway/check
     #             ExecStartPre=+/usr/bin/install -d -m 2750 -o mediatore-gateway -g envoy-inject /run/mediatore-gateway/inject
-    #             ReadWritePaths=/run/mediatore-gateway
+    #   boot:
+    #     - name: mediatore-gateway-inject-start
     #       commands:
-    #         - systemctl daemon-reload
-    #         - systemctl restart mediatore-gateway
     #         # --no-block: the boot stage must not wait on a unit that waits on the agent.
     #         - systemctl start --no-block envoy-inject
     #       systemctl:
