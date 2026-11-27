@@ -1607,28 +1607,14 @@ version = "0.2.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "175dc66334db3b9ab9985bf8b61cfed50dc16d20964bb47f9e479adcae984a7f"
 dependencies = [
- "jiff-core 0.1.8",
- "jiff-static 0.2.46",
+ "jiff-core",
+ "jiff-static",
  "jiff-tzdb-platform",
  "log",
  "portable-atomic",
  "portable-atomic-util",
  "serde_core",
  "windows-link",
-]
-
-[[package]]
-name = "jiff"
-version = "1.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "107f2e89536b6818514025f6787b0d94d819e54fe3b40365275fc753de485b3f"
-dependencies = [
- "jiff-core 1.0.2",
- "jiff-static 1.0.3",
- "log",
- "portable-atomic",
- "portable-atomic-util",
- "serde_core",
 ]
 
 [[package]]
@@ -1641,36 +1627,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "jiff-core"
-version = "1.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d44c923edf2bf456a982253f1a9ee1f6e89e421dffd0065d9b9a581da0def58f"
-dependencies = [
- "log",
-]
-
-[[package]]
 name = "jiff-static"
 version = "0.2.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c7b1af7547d47354bc438d797e3854601bde8f8d185780c5ba4ab27afa54f1ba"
 dependencies = [
- "jiff-core 0.1.8",
+ "jiff-core",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
-]
-
-[[package]]
-name = "jiff-static"
-version = "1.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4996f71e569e3a3e32b925c28ef8f0027dc30bb1d594b33eeda409eea185f5c8"
-dependencies = [
- "jiff-core 1.0.2",
- "proc-macro2",
- "quote",
- "syn 3.0.10",
 ]
 
 [[package]]
@@ -1818,7 +1783,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ab0d13801242174b1f3966907c3f32039f2d6b36c7ce82c61225d66ed5d1eb70"
 dependencies = [
  "base64 0.22.1",
- "jiff 0.2.46",
+ "jiff",
  "schemars 1.2.3",
  "serde",
  "serde_json",
@@ -1854,7 +1819,7 @@ dependencies = [
  "hyper-rustls",
  "hyper-timeout",
  "hyper-util",
- "jiff 0.2.46",
+ "jiff",
  "jsonpath-rust",
  "k8s-openapi",
  "kube-core",
@@ -1883,7 +1848,7 @@ dependencies = [
  "derive_more",
  "form_urlencoded",
  "http",
- "jiff 0.2.46",
+ "jiff",
  "json-patch",
  "k8s-openapi",
  "schemars 1.2.3",
@@ -2010,7 +1975,7 @@ dependencies = [
  "base64 0.23.1",
  "clap",
  "envoy-types",
- "jiff 1.0.3",
+ "jiff",
  "jsonwebtoken",
  "k8s-openapi",
  "kube",
@@ -2052,7 +2017,7 @@ dependencies = [
  "banlieue-api",
  "base64 0.23.1",
  "futures",
- "jiff 1.0.3",
+ "jiff",
  "mediatore-claims",
  "mediatore-entra",
  "mediatore-policy",
@@ -2085,7 +2050,7 @@ dependencies = [
  "hex",
  "http",
  "http-body-util",
- "jiff 1.0.3",
+ "jiff",
  "k8s-openapi",
  "kube",
  "mediatore-openbao",
@@ -2116,7 +2081,7 @@ dependencies = [
  "aws-lc-rs",
  "base64 0.23.1",
  "clap",
- "jiff 1.0.3",
+ "jiff",
  "mediatore-proto",
  "mediatore-testkit",
  "reqwest",
@@ -2133,7 +2098,7 @@ name = "mediatore-entra"
 version = "0.4.0"
 dependencies = [
  "base64 0.23.1",
- "jiff 1.0.3",
+ "jiff",
  "jsonwebtoken",
  "mediatore-openbao",
  "mediatore-proto",
@@ -2157,7 +2122,7 @@ dependencies = [
  "envoy-types",
  "futures",
  "hyper-util",
- "jiff 1.0.3",
+ "jiff",
  "mediatore-proto",
  "mediatore-spire",
  "mediatore-testkit",
@@ -2189,7 +2154,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
- "jiff 1.0.3",
+ "jiff",
  "libc",
  "mediatore-proto",
  "mediatore-testkit",
@@ -2234,7 +2199,7 @@ name = "mediatore-policy"
 version = "0.4.0"
 dependencies = [
  "base64 0.23.1",
- "jiff 1.0.3",
+ "jiff",
  "mediatore-store",
  "sandboxpolicy-bundle",
  "sandboxpolicy-types",
@@ -2249,7 +2214,7 @@ version = "0.4.0"
 dependencies = [
  "base64 0.23.1",
  "hex",
- "jiff 1.0.3",
+ "jiff",
  "rcgen",
  "rustls",
  "serde",
@@ -2293,7 +2258,7 @@ dependencies = [
  "aws-lc-rs",
  "base64 0.23.1",
  "hex",
- "jiff 1.0.3",
+ "jiff",
  "mediatore-openbao",
  "mediatore-proto",
  "serde",
@@ -2310,7 +2275,7 @@ name = "mediatore-sts"
 version = "0.4.0"
 dependencies = [
  "base64 0.23.1",
- "jiff 1.0.3",
+ "jiff",
  "jsonwebtoken",
  "mediatore-proto",
  "p256",
@@ -2336,7 +2301,7 @@ dependencies = [
  "hex",
  "hyper",
  "hyper-util",
- "jiff 1.0.3",
+ "jiff",
  "jsonwebtoken",
  "k8s-openapi",
  "kube",
@@ -3161,7 +3126,7 @@ source = "git+https://github.com/firestoned/notaio?tag=v0.8.0#93a863adc5beee551a
 dependencies = [
  "base64 0.23.1",
  "ed25519-dalek",
- "jiff 0.2.46",
+ "jiff",
  "sandboxpolicy-types",
  "serde",
  "serde_json",
@@ -3505,7 +3470,7 @@ version = "0.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "442bc4f672eef040397e65d4ae34ca1b1dc8140b1a35b1246e0b219ce5f4e571"
 dependencies = [
- "jiff 0.2.46",
+ "jiff",
  "sigstore-types",
  "thiserror",
 ]
@@ -3519,7 +3484,7 @@ dependencies = [
  "const-oid 0.9.6",
  "der 0.7.10",
  "futures-io",
- "jiff 0.2.46",
+ "jiff",
  "rustls-pki-types",
  "sigstore-types",
  "spki 0.7.3",
@@ -3546,7 +3511,7 @@ checksum = "a46ca1954e5e92b8a35eeefb745f55a1eff2d82c6b80f946e733671b33508540"
 dependencies = [
  "base64 0.23.1",
  "hex",
- "jiff 0.2.46",
+ "jiff",
  "serde",
  "serde_json",
  "sigstore-merkle",
@@ -3560,7 +3525,7 @@ version = "0.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d9a49e390a5f52e0b05f1a17820be5ac747a3890bb9f54156d8a1147508420a7"
 dependencies = [
- "jiff 0.2.46",
+ "jiff",
  "serde",
  "serde_json",
  "sigstore-crypto",
@@ -3578,7 +3543,7 @@ dependencies = [
  "const-oid 0.9.6",
  "der 0.7.10",
  "hex",
- "jiff 0.2.46",
+ "jiff",
  "rustls-pki-types",
  "rustls-webpki",
  "sigstore-crypto",
@@ -3596,7 +3561,7 @@ checksum = "eec330f1cdb4c7ec6628ef43165c42978480d4213af70567e67e2891ec9072d8"
 dependencies = [
  "base64 0.23.1",
  "hex",
- "jiff 0.2.46",
+ "jiff",
  "pem",
  "serde",
  "serde_json",
@@ -3613,7 +3578,7 @@ dependencies = [
  "const-oid 0.9.6",
  "futures-io",
  "hex",
- "jiff 0.2.46",
+ "jiff",
  "rustls-pki-types",
  "rustls-webpki",
  "serde",
