@@ -54,6 +54,8 @@ macro_rules! suite {
                 revoke_of_an_unknown_claim_is_not_found,
                 claim_by_node_finds_only_the_newest_live_claim,
                 a_node_round_trips_and_registers_once,
+                an_x509pop_keyed_node_round_trips_beside_a_tpm_one,
+                a_node_key_under_another_agent_id_is_a_conflict_and_the_first_record_stands,
                 duplicate_ek_with_another_dmi_is_a_conflict,
                 ban_marks_the_node_and_needs_an_existing_row,
                 delete_node_removes_the_row_and_is_idempotent,
@@ -449,6 +451,77 @@ pub(crate) async fn a_node_round_trips_and_registers_once(s: &dyn ClaimStore) {
         s.get_node_by_dmi(Uuid::new_v4()).await,
         Err(StoreError::NotFound(_))
     ));
+}
+
+/// ADR-0049 decisions 7 and 8: an x509pop node is keyed by its node key (a hash of its agent
+/// ID, the shape of an EK hash) and stores the x509pop agent ID. The store treats it as any
+/// node: it round-trips whole, is found by key and by DMI UUID, registers once, and a second
+/// machine under the same key is the same conflict, named as a node key.
+pub(crate) async fn an_x509pop_keyed_node_round_trips_beside_a_tpm_one(s: &dyn ClaimStore) {
+    let agent = "spiffe://sandbox.test/spire/agent/x509pop/hv-01/3f0c2a1e-vm";
+    let key = "5d".repeat(32);
+    let dmi = Uuid::new_v4();
+    let mut x509pop = node(&key, dmi);
+    x509pop.node_id = agent.into();
+    x509pop.provider = Some(Provider::CloudHypervisor);
+    s.put_node(x509pop.clone()).await.unwrap();
+    s.put_node(node("ek1", Uuid::new_v4())).await.unwrap();
+    for got in [
+        s.get_node(&key).await.unwrap(),
+        s.get_node_by_dmi(dmi).await.unwrap(),
+    ] {
+        assert_eq!(got.ek_hash, key);
+        assert_eq!(got.node_id, agent);
+        assert_eq!(got.dmi_uuid, dmi);
+        assert_eq!(got.provider, Some(Provider::CloudHypervisor));
+    }
+    assert_eq!(s.list_nodes().await.unwrap().len(), 2);
+    // A reboot registers again and changes nothing.
+    s.put_node(x509pop.clone()).await.unwrap();
+    assert_eq!(s.list_nodes().await.unwrap().len(), 2);
+    // Another machine presenting the same identity.
+    let mut other = x509pop;
+    other.dmi_uuid = Uuid::new_v4();
+    let err = s.put_node(other).await.unwrap_err();
+    let refused = matches!(&err, StoreError::Conflict(why) if why.contains("node key"));
+    assert!(refused, "a conflict that speaks of the node key");
+    s.delete_node(&key).await.unwrap();
+    assert!(matches!(
+        s.get_node(&key).await,
+        Err(StoreError::NotFound(_))
+    ));
+    assert!(s.get_node("ek1").await.is_ok());
+}
+
+/// ADR-0049 decision 8: the stored agent ID is what a node's entries are parented to. A
+/// registration under a known key that derived another agent ID (the key first presented as
+/// an EK hash, then as an x509pop identity, or the reverse) is refused, the same machine or
+/// not, and what is stored is never changed by it. Deleting the record clears it.
+pub(crate) async fn a_node_key_under_another_agent_id_is_a_conflict_and_the_first_record_stands(
+    s: &dyn ClaimStore,
+) {
+    let key = "5d".repeat(32);
+    let dmi = Uuid::new_v4();
+    let as_tpm = node(&key, dmi);
+    let mut as_x509pop = node(&key, dmi);
+    as_x509pop.node_id = "spiffe://sandbox.test/spire/agent/x509pop/hv-01/vm-1".into();
+    s.put_node(as_tpm.clone()).await.unwrap();
+    let err = s.put_node(as_x509pop.clone()).await.unwrap_err();
+    let refused = matches!(&err, StoreError::Conflict(why) if why.contains("another agent ID"));
+    assert!(refused, "a conflict that says it is the agent ID");
+    assert_eq!(s.get_node(&key).await.unwrap().node_id, as_tpm.node_id);
+    // The first registration again is still the same node.
+    s.put_node(as_tpm).await.unwrap();
+    // Another machine under the key is the DMI conflict, whatever agent ID it brings.
+    let mut elsewhere = as_x509pop.clone();
+    elsewhere.dmi_uuid = Uuid::new_v4();
+    let err = s.put_node(elsewhere).await.unwrap_err();
+    let refused = matches!(&err, StoreError::Conflict(why) if why.contains("for dmi"));
+    assert!(refused, "a conflict that says it is the DMI UUID");
+    // Cleared by removing the record: the honest registration then lands.
+    s.delete_node(&key).await.unwrap();
+    s.put_node(as_x509pop.clone()).await.unwrap();
+    assert_eq!(s.get_node(&key).await.unwrap().node_id, as_x509pop.node_id);
 }
 
 pub(crate) async fn duplicate_ek_with_another_dmi_is_a_conflict(s: &dyn ClaimStore) {

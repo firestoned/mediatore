@@ -431,7 +431,7 @@ pub fn crd_yamls() -> Result<Vec<(&'static str, String)>, serde_saphyr::ser::Err
             crate::kubestore::NODE_CRD_FILE_NAME,
             render_crd(
                 crate::kubestore::SandboxNode::crd(),
-                "SandboxNode is one attested node mediatore knows (ADR-0034 decision 3): named by its EK hash, with its SPIRE agent identity, DMI UUID, hostname and whether it is banned.",
+                "SandboxNode is one attested node mediatore knows (ADR-0034 decision 3): named by its node key (a TPM node's EK hash, an x509pop node's hash of its agent ID), with its SPIRE agent identity, DMI UUID, hostname and whether it is banned.",
             )?,
         ),
         (
@@ -2458,6 +2458,10 @@ mod tests {
              "verbs": ["get"]},
             {"apiGroups": ["banlieue.io"], "resources": ["virtualmachines"],
              "verbs": ["get", "list", "watch"]},
+            // ADR-0049 decision 10: the host CA each Provider asserts inline, by one listing
+            // per pass, and nothing more (no get: no path reads one Provider by name).
+            {"apiGroups": ["banlieue.io"], "resources": ["providers"],
+             "verbs": ["list"]},
             {"apiGroups": ["spire.spiffe.io"], "resources": ["clusterstaticentries"],
              "verbs": ["get", "list", "watch", "create", "delete"]},
         ]);
@@ -3177,11 +3181,13 @@ mod tests {
     }
 
     /// The messages of the validations the entries policy carried before it claimed an entry
-    /// by what it is: every one must still be there.
+    /// by what it is: every one must still be there. Two were reworded when the policy took
+    /// a second parent shape (ADR-0049 decision 11): the node's key is no longer always an
+    /// EK hash, and the parent may be an x509pop agent.
     const KEPT_ENTRY_VALIDATIONS: [&str; 15] = [
         "mediatore may only declare entries named mediatore-*",
-        "spiffeID must be spiffe://<td>/banlieue/node/<ek-hash> or spiffe://<td>/banlieue/claim/<uuid>",
-        "parentID must be a tpm agent ID: spiffe://<td>/spire/agent/tpm/<ek-hash>",
+        "spiffeID must be spiffe://<td>/banlieue/node/<node-key> or spiffe://<td>/banlieue/claim/<uuid>",
+        "parentID must be a tpm agent ID, spiffe://<td>/spire/agent/tpm/<ek-hash>, or an x509pop agent ID, spiffe://<td>/spire/agent/x509pop/<issuer-cn>/<subject-cn>",
         "spiffeID and parentID must be in the same trust domain",
         "a node entry's EK hash must equal its parent agent's EK hash",
         "selectors must be unix workload selectors",
@@ -3283,6 +3289,80 @@ mod tests {
         // Bound everywhere. Its parameter, and what a missing one does, is held by
         // `the_three_policies_read_the_broker_from_one_parameter_and_deny_without_it`.
         assert!(binding["spec"]["matchResources"].is_null());
+    }
+
+    /// ADR-0049 decision 11: the entries policy takes two parent shapes and no third, and
+    /// holds a node entry to its parent's key only where it can. The CEL is proven by an API
+    /// server (the kind gateway tier's dry runs); what is held here is that the file says it:
+    /// the tpm shape as it always was, the x509pop shape as exactly two segments of the
+    /// common-name alphabet with the dot segments refused, the parent validation their
+    /// disjunction, and the equal-key rule word for word, skipped only for a parent that is
+    /// not a tpm agent.
+    #[test]
+    fn the_entries_policy_admits_a_tpm_or_an_x509pop_parent_and_no_third() {
+        let docs = admission_docs("clusterstaticentry-mediatore.yaml");
+        let policy = docs
+            .iter()
+            .find(|d| d["kind"] == "ValidatingAdmissionPolicy")
+            .expect("the policy");
+        let variable = |name: &str| {
+            policy["spec"]["variables"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|v| v["name"] == name)
+                .unwrap_or_else(|| panic!("no variable {name}"))["expression"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        assert_eq!(variable("hex64"), "'[0-9a-f]{64}'");
+        assert_eq!(
+            variable("seg"),
+            format!(
+                "'[A-Za-z0-9._-]{{1,{}}}'",
+                mediatore_spire::x509pop::MAX_COMMON_NAME_LEN
+            ),
+            "the alphabet and length validate_common_name holds a common name to"
+        );
+        assert_eq!(
+            variable("tpmParent"),
+            "object.spec.parentID.matches(variables.td + '/spire/agent/tpm/' + variables.hex64 + '$')"
+        );
+        assert_eq!(
+            variable("x509popParent"),
+            "object.spec.parentID.matches(variables.td + '/spire/agent/x509pop/' + variables.seg + '/' + variables.seg + '$') && !object.spec.parentID.matches('/[.]{1,2}(/|$)')",
+            "exactly two segments, anchored, and neither . nor .."
+        );
+        let validations = policy["spec"]["validations"].as_array().unwrap();
+        let by_message = |starts: &str| {
+            validations
+                .iter()
+                .find(|v| v["message"].as_str().is_some_and(|m| m.starts_with(starts)))
+                .unwrap_or_else(|| panic!("no validation saying {starts}"))["expression"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        assert_eq!(
+            by_message("parentID must be a tpm agent ID"),
+            "variables.tpmParent || variables.x509popParent"
+        );
+        assert_eq!(
+            by_message("a node entry's EK hash must equal"),
+            "!variables.isNode || !variables.tpmParent || object.spec.spiffeID.split('/banlieue/node/')[1] == object.spec.parentID.split('/spire/agent/tpm/')[1]",
+            "the equal-key rule, kept for a tpm parent and skipped for no other reason"
+        );
+        // No validation names a parent shape besides these two.
+        let parents = validations
+            .iter()
+            .filter(|v| {
+                v["expression"]
+                    .as_str()
+                    .is_some_and(|e| e.contains("Parent"))
+            })
+            .count();
+        assert_eq!(parents, 2);
     }
 
     /// The gateway's entries are the platform team's and stay the gateway policy's alone:

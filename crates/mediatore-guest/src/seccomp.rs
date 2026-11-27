@@ -171,6 +171,20 @@ pub fn filters() -> [Filter; 2] {
     ]
 }
 
+/// The family filter alone: `socket` and `socketpair` on a family outside
+/// [`ALLOWED_FAMILIES`] fail `EAFNOSUPPORT`, and nothing else is refused. For a process of
+/// mediatore's own that runs beside the jail as the sandbox user and reads what the workload
+/// sends (the egress proxy): it needs unix sockets (the Workload API) and inet ones of both
+/// types (TCP, and UDP for a resolver on a pool without gateways), so the jail's type and
+/// protocol rules do not fit it, and the families nftables and Landlock cannot name
+/// (`AF_VSOCK` to the hypervisor's host, `AF_NETLINK`, `AF_PACKET`) are closed to it exactly
+/// as they are to the workload.
+#[must_use]
+pub fn family_filter() -> Filter {
+    let [family, _] = filters();
+    family
+}
+
 /// What the combined policy answers for a call: the first filter's errno, else the second's.
 #[must_use]
 pub fn verdict(syscall: &str, args: [u64; 6]) -> Option<i32> {
@@ -281,6 +295,50 @@ pub fn apply() -> anyhow::Result<usize> {
 /// Always.
 #[cfg(not(target_os = "linux"))]
 pub fn apply() -> anyhow::Result<usize> {
+    anyhow::bail!("seccomp needs Linux, not {}", std::env::consts::OS)
+}
+
+/// Install [`family_filter`] on every thread of this process (irreversible, inherited by
+/// anything it starts), then prove it is in force by asking for two sockets it must refuse:
+/// a filter that loaded and does not answer is not one to run behind. Sets `no_new_privs`.
+///
+/// # Errors
+///
+/// The architecture is unsupported, the kernel refused the filter, or a socket of a closed
+/// family was not refused with `EAFNOSUPPORT`. The caller does not start.
+#[cfg(target_os = "linux")]
+pub fn restrict_families() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
+    let program = compile(&family_filter())?;
+    seccompiler::apply_filter_all_threads(&program)
+        .context("loading the address-family seccomp filter")?;
+    // A netlink socket is one every kernel gives an unconfined process, so its refusal is
+    // the filter's and not a missing module's; the vsock one is the family that matters.
+    for (name, domain, ty) in [
+        ("AF_NETLINK", libc::AF_NETLINK, socket2::Type::RAW),
+        ("AF_VSOCK", libc::AF_VSOCK, socket2::Type::STREAM),
+    ] {
+        match socket2::Socket::new(socket2::Domain::from(domain), ty, None) {
+            Err(e) if e.raw_os_error() == Some(EAFNOSUPPORT) => {}
+            Err(e) => anyhow::bail!(
+                "the address-family filter is not in force: an {name} socket failed with {e}, not EAFNOSUPPORT"
+            ),
+            Ok(_) => anyhow::bail!(
+                "the address-family filter is not in force: an {name} socket was opened"
+            ),
+        }
+    }
+    Ok(())
+}
+
+/// Not Linux: no seccomp, no substitute.
+///
+/// # Errors
+///
+/// Always.
+#[cfg(not(target_os = "linux"))]
+pub fn restrict_families() -> anyhow::Result<()> {
     anyhow::bail!("seccomp needs Linux, not {}", std::env::consts::OS)
 }
 
@@ -471,5 +529,44 @@ mod tests {
     #[test]
     fn without_linux_applying_the_policy_is_an_error() {
         assert!(apply().is_err());
+    }
+
+    #[test]
+    fn the_family_filter_alone_closes_every_other_family_and_nothing_of_the_three_allowed() {
+        // What the egress proxy runs behind: the families, and none of the jail's other
+        // rules, since the proxy resolves names (UDP) on a pool without gateways.
+        let f = family_filter();
+        let socket = |domain: u64, ty: u64, protocol: u64| {
+            f.verdict("socket", [domain, ty, protocol, 0, 0, 0])
+        };
+        for domain in [AF_VSOCK, AF_NETLINK, AF_PACKET, 0, 3, 38, 44, 45, 255] {
+            for ty in [
+                SOCK_STREAM,
+                SOCK_DGRAM,
+                SOCK_RAW,
+                SOCK_STREAM | SOCK_CLOEXEC,
+            ] {
+                assert_eq!(socket(domain, ty, 0), Some(EAFNOSUPPORT));
+                assert_eq!(
+                    f.verdict("socketpair", [domain, ty, 0, 0, 0, 0]),
+                    Some(EAFNOSUPPORT)
+                );
+            }
+        }
+        for domain in [AF_UNIX, AF_INET, AF_INET6] {
+            for ty in [SOCK_STREAM, SOCK_DGRAM, SOCK_STREAM | SOCK_NONBLOCK] {
+                assert_eq!(socket(domain, ty, 0), None);
+            }
+        }
+        // Nothing but the two socket calls is this filter's.
+        for syscall in DENIED_SYSCALLS {
+            assert_eq!(f.verdict(syscall, [0; 6]), None);
+        }
+        assert!(
+            f.rules
+                .iter()
+                .all(|r| r.syscall == "socket" || r.syscall == "socketpair")
+        );
+        assert_eq!(f.errno, EAFNOSUPPORT);
     }
 }

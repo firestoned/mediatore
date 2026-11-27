@@ -10,8 +10,9 @@
 # two libraries it links, curl for the bundle fetch, the spire user, the units, the sysctl
 # and the datasource stage. Nothing deployment-specific (trust bundle, trust domain, server
 # address) and nothing per VM (keys) is here; those are the cloud-config layers
-# (image/cloud-config.yaml and image/cloud-config-deployment.example.yaml) and the
-# member's sealed partition.
+# (image/cloud-config.yaml and image/cloud-config-deployment.example.yaml, or
+# image/cloud-config-deployment-x509pop.example.yaml for a pool with no vTPM, ADR-0049) and
+# the member's sealed partition.
 #
 # BINARY_FROM: `image` (the default) copies /usr/bin/mediatore out of the mediatore
 # container image MEDIATORE_IMG, the published server image, so a site's build needs no
@@ -116,7 +117,8 @@ RUN chmod 0755 /usr/bin/mediatore /usr/bin/spire-agent /usr/lib/spire/tpm_attest
 
 COPY image/systemd/spire-agent.service image/systemd/mediatore-guest.service image/systemd/mediatore-host-nft.service image/systemd/spire-bundle-fetch.service /etc/systemd/system/
 # The x509pop node certificate for a guest with no vTPM (ADR-0049): installed, never enabled.
-# Only the drop-in a no-vTPM pool's cloud-config writes (the example below) pulls them in.
+# Only the drop-in a no-vTPM pool's cloud-config writes pulls them in; the drop-in, the agent
+# configuration and that pool's whole layer are the three x509pop examples copied below.
 COPY image/systemd/mediatore-node-cert.service image/systemd/mediatore-node-cert-renew.service /etc/systemd/system/
 # Yama's ptrace scope raised to 1: the second line behind the jail's PID namespace between
 # the workload and the egress proxy, both the sandbox uid (ADR-0025, roadmap 06).
@@ -127,6 +129,7 @@ COPY image/qemu-ga.conf /etc/qemu/qemu-ga.conf
 COPY image/spire/agent.conf /usr/share/mediatore/agent.conf.example
 COPY image/spire/agent-x509pop.conf /usr/share/mediatore/agent-x509pop.conf.example
 COPY image/systemd/spire-agent-x509pop.conf /usr/share/mediatore/spire-agent-x509pop.conf.example
+COPY image/cloud-config-deployment-x509pop.example.yaml /usr/share/mediatore/cloud-config-deployment-x509pop.example.yaml
 RUN grep -q "plugin_checksum = \"${TPM_PLUGIN_AGENT_SHA}\"" /usr/share/mediatore/agent.conf.example \
     && systemctl enable spire-agent.service mediatore-guest.service mediatore-host-nft.service spire-bundle-fetch.service qemu-guest-agent.service \
     && systemctl mask ssh.service ssh.socket sshd.service nftables.service

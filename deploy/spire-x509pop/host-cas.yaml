@@ -1,0 +1,35 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+#
+# The x509pop trust bundle (ADR-0049 decisions 1, 2 and 4): one PEM per host that runs
+# guests without a vTPM, the certificate of that host's attestation CA, created once when
+# the host was installed. It is the same certificate the administrator puts on the host's
+# Provider (spec.attestation.hostCa.inline), which is where the broker reads the name the
+# node entry is declared under; the two must be the same file.
+#
+# Three rules carry the design, and the server checks none of them for you:
+#   - one certificate per key, one key per host;
+#   - a common name of its own, unique in this ConfigMap (letters, digits, dots, dashes
+#     and underscores, at most 64): an agent's ID is
+#     spiffe://<td>/spire/agent/x509pop/<this CN>/<the machine's UID>, so two CAs sharing a
+#     name could each mint the other's guests' identities;
+#   - basicConstraints CA:TRUE with a path length of zero, so a host cannot sign a further
+#     CA carrying another host's name. The broker declares no node entry under a host CA
+#     without it.
+# A host missing here has guests that never become agents. Removing a host's key and
+# restarting the servers revokes every identity that CA signed, at the agents' next
+# re-attestation. Placeholders: replace the key name with your host and the body with its
+# certificate before applying, since a server whose bundle holds no certificate does not
+# start (kustomization.yaml); the init container joins the files at start, so a change
+# takes a restart.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spire-x509pop-host-cas
+  namespace: spire-server
+  labels: { app.kubernetes.io/name: spire-server, app.kubernetes.io/component: x509pop-attestor }
+data:
+  hv-01.home.example.pem: |
+    -----BEGIN CERTIFICATE-----
+    MIIB...the host's attestation CA certificate, CN unique, pathlen 0...
+    -----END CERTIFICATE-----

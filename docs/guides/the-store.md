@@ -16,7 +16,7 @@ a restart.
 | --- | --- | --- |
 | The claim record: the SPIRE entry id, the bound node, the bind deadline, the revocation, the policy incarnation and bundle version the claim was created under, the guest's report, the workload's exit | `AgentSandbox.status.record`, written by the store alone (the reconciler's mirroring leaves it out of its patches) | the label `mediatore.io/claim-uid` (the claim's UID, the record's key) and `mediatore.io/node` (a digest of the bound node's SPIFFE ID) |
 | The sealed session: the delegated refresh token, sealed with the sandbox's UID | Secret `mediatore-session-<sandbox uid>` in the broker's own namespace, owned by the `AgentSandbox` when the sandboxes live there too (an owner reference cannot cross a namespace), deleted by the retention sweep otherwise; parked by `POST /v1/claims`, claimed by the reconciler when it writes the record, rotated in place at every mint, deleted on revocation | its name; the labels `mediatore.io/sandbox-uid` and `mediatore.io/session` (`parked` or `claimed`) |
-| The attested nodes: EK hash, the agent's SPIFFE ID, DMI UUID, hostname, provider, banned | `SandboxNode` in the broker's namespace, named by the EK hash | its name; the label `mediatore.io/dmi-uuid` for the clone check |
+| The attested nodes: node key (a TPM node's EK hash, an x509pop node's SHA-256 of its agent ID; the field is still `ekHash`), the agent's SPIFFE ID, DMI UUID, hostname, provider, banned | `SandboxNode` in the broker's namespace, named by the node key | its name; the label `mediatore.io/dmi-uuid` for the clone check |
 | The workload's output, when the requester opted in with `workload.logs` ([ADR-0045](../adr/0045-a-sandbox-workloads-output-streamed-to-its-owner.md)): the redacted stdout and stderr lines, with their sequence numbers, and the gaps where the guest's queue overflowed | Secrets `mediatore-logs-<claim uid>-<segment>` in the broker's own namespace, 64 KiB of text each, sealed per batch ([ADR-0052](../adr/0052-a-sandbox-workloads-stored-output-sealed-per-batch-with-the-transit-key.md)), owned by the `AgentSandbox` when it lives there too, the oldest deleted beyond `logs.max_bytes`; swept `logs.retention_secs` after the claim ended, or with the claim's audit sweep, or at once when the record is gone | the labels `mediatore.io/logs=segment`, `mediatore.io/claim-uid` and `mediatore.io/sandbox-uid` |
 | The version floor of each notaio policy ([ADR-0026](../adr/0026-notaio-bundles-verified-in-shadow.md) decision 5) | `PolicyFloor` in the broker's namespace, named `<policy namespace>.<policy name>` | its name; moved by compare-and-set on `resourceVersion`, so two replicas cannot move a floor down |
 
@@ -240,11 +240,12 @@ the same ring with the same cap and sweep rules (it is memory, not a store at re
 
 ## Nodes
 
-A node registers once, when its guest starts, as a `SandboxNode` named by the EK hash. Since
+A node registers once, when its guest starts, as a `SandboxNode` named by its node key (the EK
+hash, or for an x509pop node the SHA-256 of its agent ID, ADR-0049). Since
 [ADR-0039](../adr/0039-a-node-leaves-the-register-when-its-vm-is-gone.md) the leader
 removes it when its VM is gone: at each resync it lists the pool member `VirtualMachine`s,
-computes the EK hash each publishes the way the claim binding does, and deletes a
-`SandboxNode` no VM publishes. It never deletes a banned node (an operator removes a ban),
+computes the node key each gives the way the claim binding does, and deletes a
+`SandboxNode` whose key no VM gives. It never deletes a banned node (an operator removes a ban),
 a node younger than `store.node_grace_secs` (default 600; zero is refused), a node a claim
 that has not ended is bound to, or more than twenty in one pass, and it removes nothing when
 the VM list cannot be read or is empty while a node is young or a claim is active. A node

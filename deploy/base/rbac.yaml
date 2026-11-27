@@ -12,6 +12,14 @@
 # - VirtualMachineClaim: create/delete/watch (ADR-0002); status read for binding.
 # - VirtualMachine: read-only, for node resolution and the EK certificate
 #   (banlieue ADR-0045) the node entry is derived from.
+# - Provider: list, nothing else, for the one public certificate a host's
+#   administrator asserts inline (spec.attestation.hostCa), whose common name
+#   names the x509pop agents of that host's guests (ADR-0049 decision 10).
+#   Listed in every namespace, once per pass, and only while
+#   watcher.x509pop_pools lists a pool: every Provider is read, not the
+#   machine's alone, because two that assert different CAs under one common
+#   name are refused both. No ConfigMap and no Secret is read for it: a hostCa
+#   given as a reference is refused, not resolved.
 # - ClusterStaticEntry: declare and retract the two entry shapes (ADR-0006).
 #   No update/patch (entries are replaced, never edited) and nothing on
 #   ClusterSPIFFEID or ClusterFederatedTrustDomain. The shape of what this
@@ -51,6 +59,9 @@ rules:
   - apiGroups: ["banlieue.io"]
     resources: ["virtualmachines"]
     verbs: ["get", "list", "watch"]
+  - apiGroups: ["banlieue.io"]
+    resources: ["providers"]
+    verbs: ["list"]
   - apiGroups: ["spire.spiffe.io"]
     resources: ["clusterstaticentries"]
     verbs: ["get", "list", "watch", "create", "delete"]

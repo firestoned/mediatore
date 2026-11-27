@@ -118,7 +118,8 @@ from `dev/kind/spire` (SPIRE's distribution, the same hardened charts and versio
 homelab runs, rendered once by `make kind-spire-render` into tracked manifests from
 `dev/kind/spire/values.yaml`, release name `spire` in namespace `spire-server` so the
 controller manager's class is `spire-server-spire`; no Helm release, kustomize only)
-together with the TPM node attestor component `deploy/spire-tpm` (ADR-0018), whose
+together with the TPM node attestor component `deploy/spire-tpm` (ADR-0018) and the
+x509pop one, `deploy/spire-x509pop` (ADR-0049), whose
 loading `make kind-spire` asserts from the server's log, applies the broker's own
 namespace (`mediatore-system`, `deploy/base/namespace.yaml`, Pod Security `restricted`),
 its ServiceAccount, RBAC and admission policies from `deploy/base`, and mints a one-hour
@@ -147,6 +148,7 @@ Suites today:
 | `make kind-e2e-gateway` | 0028 | the real egress proxy tunnelling a claim's requests through a real Envoy on the gateway SVID to its one destination and nothing else, the authorizer's cache through a broker outage, the cut-off on release, below |
 | `make kind-e2e-gateway-policy` | 0030 | the gateway tier under a notaio bundle: a direct egress entry refused under `policy.egress: shadow` and opened at the real Envoy under `enforce`, an entry with rules never served, below |
 | `make kind-e2e-gateway-audience` | 0055 | the gateway-policy tier, then notaio's audience bundles serving under `policy.audience_definitions.mode: bundles`: a team `SandboxAudience`'s Secret reaching the claim's destination through the real Envoy and rotated with no broker restart (the destination logs a fingerprint of the credential, never the value), a platform audience read from OpenBao KV, the team audience refused from another namespace; replaces `kind-e2e-gateway-policy` in `make kind-e2e`, below |
+| `make kind-e2e-x509pop` | 0049 | an agent attesting with `x509pop` on `image/spire/agent-x509pop.conf` under a host CA made for the run, refused while the server's bundle lacks that CA and when its certificate was signed by another key under the CA's name, listed as `x509pop/<host CA CN>/<machine UID>`; the node entry declared from the `Provider`'s inline host CA and the machine's subject for a pool in `watcher.x509pop_pools`, nothing for a listed machine without a subject or under a CA with no path length of zero; the guest registering with `--node-attestation x509pop` and only then announcing `GuestReady`; a fresh pod re-attesting as the same agent; a pool that is not listed still getting its `tpm` entry; `mediatore x509pop-bundle check` passing the server's bundle and refusing a shared name and a loose CA; a sandbox's claim bound under the x509pop node, its entry parented to that agent; needs nothing of the host, so part of `make kind-e2e` and of CI, below |
 | `make kind-e2e-tpm` | 0018 | an agent attesting with a vTPM behind the kind node through the `tpm` plugin, on `image/spire/agent.conf`, refused under a CA that never signed its EK and listed under the EK's hash under the right one, the member's certificate becoming the node entry under that agent, the guest registering over the SVID it issues and only then announcing `GuestReady` (ADR-0019), a fresh pod re-attesting as the same agent; since ADR-0031 the agent's bundle is the OpenBao PKI root alone and the server's `bundle show` is asserted to be that root and nothing self-signed of its own; not part of `make kind-e2e` and not in CI (it needs `sudo`, swtpm and the kernel's vtpm proxy on the host), below |
 
 ### The store: the Kubernetes API, proven by every tier
@@ -420,7 +422,10 @@ own ID, that a client holding the listeners' identity is refused by the broker i
 handshake, and, by server-side dry runs that create nothing, what the gateway entries'
 admission policy does: the listeners' two shapes and the authorizer's are admitted, and
 swapped selectors, two selectors, another path under `/gateway`, `admin`, a long TTL, DNS
-names and either gateway ID as the broker's ServiceAccount are refused. The tier's gateway is a
+names and either gateway ID as the broker's ServiceAccount are refused. Since ADR-0049 decision
+12 every proxy the tier starts must also log `address families restricted to unix and inet
+(seccomp, all threads)`, the line it writes once its seccomp family filter is loaded and proven
+(`seccomp::restrict_families`); a proxy without it fails the tier. The tier's gateway is a
 pod: it has no `unix:user` selector, no host table and no systemd unit, so the output chain
 and the entries of a gateway VM are not what it proves. The checks are listed in the script; a
 mismatch names the authority, the status and what was expected.
@@ -475,7 +480,11 @@ Run them on the build host whenever `sandboxfs.rs` or `image.rs` changes.
 The sandbox VM image ([ADR-0023](../adr/0023-sandbox-vm-image-kairos-derivative.md)) is a
 Kairos derivative that CI builds on every pull request and checks with `image/check.sh`:
 the binaries at the paths the units and `agent.conf` name, the plugin's checksum, the
-packages, the `spire` user, the four units enabled, the host table script rendering
+packages, the `spire` user, the four units enabled, the x509pop node-cert units
+installed and not enabled with the no-vTPM pool's example layer beside them (a
+cloud-config `kairos-agent validate` accepts, its `agent.conf` one `spire-agent validate`
+accepts and naming the `x509pop` attestor, its drop-in the image's own, the guest told
+`MEDIATORE_NODE_ATTESTATION=x509pop`; ADR-0049), the host table script rendering
 from a pool's files and refusing a name with the agent and the guest requiring its unit
 (ADR-0029), the sysctl that raises Yama's `ptrace_scope`, no `sshd` and no other listener,
 the distribution's `nftables` unit masked, no private key. The same on the build host:
@@ -684,12 +693,66 @@ kernels have it; the build host runs it by hand before a change to the attestati
 merges (`make kind-e2e-ci KIND_E2E_SUITES=kind-e2e-tpm` is the CI shape, cluster deleted
 after). `make kind-vtpm` says so and stops when the module is missing.
 
+### x509pop attestation for a guest with no vTPM
+
+`make kind-e2e-x509pop` (`dev/kind/x509pop-e2e.sh`) runs the path a pool guest without a
+vTPM takes ([ADR-0049](../adr/0049-a-guest-without-a-vtpm-attests-with-x509pop-and-a-certificate-its-host-signs.md)),
+against the same server as every tier: `make kind-spire` applies `deploy/spire-x509pop`
+beside the TPM component and asserts `Plugin loaded ... plugin_name=x509pop` from the
+server's log. The component's ConfigMap ships a placeholder that is no certificate, and a
+server whose x509pop bundle holds none does not start, so `dev/kind/spire` replaces it
+with a throwaway CA whose key was deleted when it was made
+(`x509pop-host-cas-patch.yaml`); the tier puts its own in for the run.
+
+There is no vsock in a pod, so the host's signer is not in this tier: the script is the
+host. It makes a host CA (EC P-256, CA:TRUE with a path length of zero, `keyCertSign`,
+`CN=kind-host`) and the certificate that CA's signer would issue the guest (CA:FALSE,
+`digitalSignature`, the common name a machine UID drawn for the run, no SAN) with
+`openssl`, under `.kind/x509pop`. The CA keys stay there and are deleted when the script
+ends; the leaf and its key go into a Secret of the tier's namespace, standing in for the
+files `mediatore node-cert` writes under `/run/spire/x509pop`. The guest's half of the
+real exchange was proven on the build host against banlieue's signer (#168). A Deployment
+plays the member: the SPIRE agent on `image/spire/agent-x509pop.conf` (its two
+placeholders replaced, the trust bundle the OpenBao root as in the TPM tier), root with
+`CAP_SYS_PTRACE` alone and no device, and beside it the guest with `--node-attestation
+x509pop`, reading the certificate and never the key. The broker runs the overlay's
+configuration plus `watcher.x509pop_pools: ["mediatore-e2e-x509pop/x509pop"]` for the
+run, and the overlay's is restored after. No banlieue controller runs: the script creates
+the `Provider`s and patches the machines' statuses.
+
+| Step | Expected |
+| --- | --- |
+| the broker's ServiceAccount, asked with `kubectl auth can-i` | `list` on `providers.banlieue.io`, and none of `get`, `watch`, `create`, `update`, `patch`, `delete` (decision 10) |
+| ConfigMap `spire-x509pop-host-cas` replaced with another host's CA, the server restarted, the agent started | the agent logs `certificate signed by unknown authority` and never `Node attestation was successful`; its ID is not in `spire-server agent list` |
+| the ConfigMap replaced with the host CA, the server restarted, an agent started whose certificate was signed by another key under the same common name | refused the same way: the name is not the trust |
+| `mediatore x509pop-bundle check` run in a pod on the files of the server's own ConfigMap, then on two bundles made for the run: the host CA beside another CA of the same common name, and beside a CA with no path length | the server's bundle passes, `ok: 1 host CA(s), ...` naming `kind-host`; the other two pods end `Failed`, the first naming the shared common name, the second `loose-host` and `path length constraint must be 0` (decision 2; the command an operator runs before applying the ConfigMap) |
+| the member's agent started, its certificate signed by the host CA | `Node attestation was successful`; the server lists `spiffe://<td>/spire/agent/x509pop/kind-host/<machine UID>` once, the ID the script computed before the pod existed: the server's `agent_path_template` and mediatore agree |
+| a `Provider` with the host CA in `spec.attestation.hostCa.inline`; `VirtualMachine` `member-1` in the listed pool patched with `status.scheduled.providerName` and `status.attestationSubject` | `ClusterStaticEntry` `mediatore-node-<key>` with `spiffeID` `spiffe://<td>/banlieue/node/<key>` and `parentID` the attested agent, where `<key>` is the SHA-256 of the agent ID as the script computes it with `openssl dgst` (decision 7) |
+| `member-nosubject`, listed, with an EK certificate and no subject; `member-loose`, listed, whose Provider's CA is CA:TRUE with no path length | no entry for either after two resyncs, and no entry with a `tpm` parent (no fallback to the EK, decision 9); the broker's log names `loose-host` and `path length constraint must be 0` |
+| the guest's log | `SVID from the Workload API` for `spiffe://<td>/banlieue/node/<key>`, `node registered`, then `GuestReady announced` with `file=announced`, in that order (ADR-0019); one `SandboxNode` whose `nodeId` is the x509pop agent ID, and none carrying a `tpm` ID made from that key (decision 8) |
+| the Deployment restarted (a new pod, empty agent state, the same key and certificate) | the new agent re-attests as the same ID, listed once; the new guest registers and announces again, no clone reported |
+| `elsewhere-1` in pool `e2e`, which is not listed, with the same subject, the same Provider and the fixture EK certificate | `mediatore-node-<EK hash>` under `spiffe://<td>/spire/agent/tpm/<EK hash>`, as in the watcher tier; still exactly one `x509pop` entry: the TPM path is untouched |
+| an `AgentSandbox` `sb-x509pop` created as the broker's ServiceAccount for the listed pool; its claim patched `Bound` with `virtualMachineRef` `member-1`, the subject and, as banlieue would mirror it, the EK certificate too | `ClusterStaticEntry` `mediatore-claim-<claim UID>` whose `parentID` is the x509pop agent, never a `tpm` one (the EK counts for nothing in a listed pool); the sandbox `Bound`, entry set, `Ready`; the guest logs `subject fetched` with the claim's UID over its node SVID; the entry retracted when the sandbox is deleted |
+
+What the tier does not do: the vsock exchange with the host's signer, a renewal, an
+expired certificate, a workload run under the bound claim (the claim is bound and fetched by
+the guest, no more), a registration conflict (`409 node_identity_conflict`, in `make check`:
+`crates/mediatore/tests/e2e_dev.rs`), two Providers under one name and the collection's hold
+(the watcher's unit tests), and a booted
+image, whose `image/cloud-config-deployment-x509pop.example.yaml` is checked for shape
+only (`image/check.sh`).
+
+It needs no vTPM, no `sudo` and no kernel module, only `openssl` and `jq` beside what the
+other tiers use, so unlike the TPM tier it is part of `make kind-e2e` and of CI's core
+shard. A rerun needs no `make kind-delete`: the machine UID is new at each run, so the
+agent a previous run attested is another ID.
+
 Pins live at the top of the `Makefile`: kind, the node image by digest (same
 Kubernetes minor as the homelab), the versions of SPIRE's distribution, the placeholder
 trust domain `sandbox.test`. Dependabot does not see them; bump them when the homelab
 moves, and after a SPIRE bump run `make kind-spire-render` and read the diff of
 `dev/kind/spire`: the rendered manifests are what the tier applies, never edited by
-hand, the `server.conf` patch generated from the component's fragment.
+hand, the `server.conf` patch generated from the three components' fragments.
 
 Runtimes: kind needs Docker or rootless Podman (`KIND_EXPERIMENTAL_PROVIDER=podman`
 and `CONTAINER_CLI=podman` for the image builds) and `kubectl` (`helm` and `jq` only

@@ -189,7 +189,8 @@ fn preserve_arbitrary(_g: &mut schemars::SchemaGenerator) -> schemars::Schema {
     })
 }
 
-/// An attested node mediatore knows (ADR-0034 decision 3), named by its EK hash.
+/// An attested node mediatore knows (ADR-0034 decision 3), named by its node key: a TPM
+/// node's EK hash, an x509pop node's hash of its agent ID (ADR-0049 decision 7).
 #[derive(CustomResource, Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[kube(
     group = "mediatore.io",
@@ -206,9 +207,12 @@ fn preserve_arbitrary(_g: &mut schemars::SchemaGenerator) -> schemars::Schema {
 )]
 #[serde(rename_all = "camelCase")]
 pub struct SandboxNodeSpec {
-    /// The EK public-key hash, also the resource's name.
+    /// The node key, also the resource's name: 64 lowercase hex. A TPM node's EK public-key
+    /// hash; an x509pop node's SHA-256 of its agent ID (ADR-0049 decision 7). The field keeps
+    /// the name it had when every node had an EK.
     pub ek_hash: String,
-    /// The SPIRE agent's SPIFFE ID.
+    /// The SPIRE agent's SPIFFE ID: `spire/agent/tpm/<ek hash>` or
+    /// `spire/agent/x509pop/<issuer CN>/<subject CN>`.
     pub node_id: String,
     /// The guest's DMI UUID, matched against banlieue's `providerID`; also a label.
     pub dmi_uuid: String,
@@ -2314,15 +2318,17 @@ impl ClaimStore for KubeStore {
     }
 
     async fn put_node(&self, rec: NodeRecord) -> Result<(), StoreError> {
+        // The rule is the store crate's (`NodeRecord::registration_conflict`), applied to
+        // the stored object read back as a record, so this store refuses exactly what the
+        // in-memory one does.
+        let judged = |existing: &SandboxNode| {
+            node_record_of(existing)?
+                .registration_conflict(&rec)
+                .map_or(Ok(()), |why| Err(StoreError::Conflict(why)))
+        };
         let api = self.nodes();
         if let Some(existing) = api.get_opt(&rec.ek_hash).await.map_err(|e| backend(&e))? {
-            if existing.spec.dmi_uuid != rec.dmi_uuid.to_string() {
-                return Err(StoreError::Conflict(format!(
-                    "ek_hash {} already registered for dmi {}",
-                    rec.ek_hash, existing.spec.dmi_uuid
-                )));
-            }
-            return Ok(());
+            return judged(&existing);
         }
         match api
             .create(&PostParams::default(), &sandbox_node_of(&rec))
@@ -2330,16 +2336,9 @@ impl ClaimStore for KubeStore {
         {
             Ok(_) => Ok(()),
             Err(e) if is_conflict(&e) => {
-                // Registered by another replica between the get and the create: same check.
+                // Registered by another replica between the get and the create: same rule.
                 let existing = api.get(&rec.ek_hash).await.map_err(|e| backend(&e))?;
-                if existing.spec.dmi_uuid == rec.dmi_uuid.to_string() {
-                    Ok(())
-                } else {
-                    Err(StoreError::Conflict(format!(
-                        "ek_hash {} already registered for dmi {}",
-                        rec.ek_hash, existing.spec.dmi_uuid
-                    )))
-                }
+                judged(&existing)
             }
             Err(e) => Err(backend(&e)),
         }
@@ -4287,6 +4286,37 @@ mod tests {
         let res = PolicyFloor::new(&floor_name("sandboxes", "agents"), spec);
         assert_eq!(res.metadata.name.as_deref(), Some("sandboxes.agents"));
         assert_eq!(floor_of(&res).unwrap(), floor);
+    }
+
+    #[test]
+    fn an_x509pop_node_is_a_resource_named_by_its_node_key_carrying_its_agent_id() {
+        // ADR-0049 decisions 7 and 8: nothing of the resource changes shape. The name is the
+        // node key (64 hex, a valid resource name whatever the common names are) and
+        // `nodeId` is the x509pop agent ID, whole.
+        let agent = format!(
+            "spiffe://sandbox.test/spire/agent/x509pop/{}/{}",
+            "H".repeat(64),
+            "v_1.".repeat(16)
+        );
+        let node = NodeRecord {
+            ek_hash: "5d".repeat(32),
+            node_id: agent.clone(),
+            dmi_uuid: Uuid::new_v4(),
+            hostname: "member-02".into(),
+            provider: Some(Provider::CloudHypervisor),
+            banned: false,
+            registered_at: Timestamp::from_second(1_700_000_000).unwrap(),
+        };
+        let res = sandbox_node_of(&node);
+        assert_eq!(res.metadata.name.as_deref(), Some(node.ek_hash.as_str()));
+        assert_eq!(res.spec.ek_hash, node.ek_hash);
+        assert_eq!(res.spec.node_id, agent);
+        let back = node_record_of(&res).unwrap();
+        assert_eq!(back.ek_hash, node.ek_hash);
+        assert_eq!(back.node_id, agent);
+        assert_eq!(back.dmi_uuid, node.dmi_uuid);
+        // The label a claim is found by is bounded whatever the ID's length.
+        assert_eq!(node_label(&agent).len(), 32);
     }
 
     #[test]

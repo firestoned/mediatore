@@ -95,7 +95,7 @@ pub struct ClaimRecord {
     pub subject: Subject,
     /// SPIRE registration entry id, once created.
     pub entry_id: Option<String>,
-    /// SPIRE node SPIFFE ID of the bound VM, once known.
+    /// SPIRE agent SPIFFE ID of the bound VM's node ([`NodeRecord::node_id`]), once known.
     pub node_id: Option<String>,
     /// Audiences the sandbox may request.
     pub audiences: Vec<String>,
@@ -188,9 +188,13 @@ impl ClaimRecord {
 /// One attested VM known to mediatore.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeRecord {
-    /// EK public-key hash; primary key.
+    /// The node key; primary key. A TPM node's EK public-key hash, an x509pop node's hash of
+    /// its agent ID (ADR-0049 decision 7): 64 lowercase hex either way. The field keeps the
+    /// name it had when every node had an EK, because the served `SandboxNode` schema does.
     pub ek_hash: String,
-    /// SPIRE node SPIFFE ID.
+    /// The SPIRE agent's SPIFFE ID (`spire/agent/tpm/...` or `spire/agent/x509pop/...`), as
+    /// derived from the attestation at registration: what parents the node's entries and what
+    /// a claim's `node_id` is matched against. Never recomputed from the key.
     pub node_id: String,
     /// Guest DMI UUID, matched against banlieue `providerID`.
     pub dmi_uuid: Uuid,
@@ -202,6 +206,37 @@ pub struct NodeRecord {
     pub banned: bool,
     /// First registration time.
     pub registered_at: Timestamp,
+}
+
+impl NodeRecord {
+    /// Why `new` may not be registered while this record stands under the same node key,
+    /// or `None` when it is the same node registering again (a reboot), which changes
+    /// nothing. The one rule both stores apply in `put_node`:
+    ///
+    /// * another DMI UUID: the same node key on another VM (cloned TPM state, or one
+    ///   x509pop identity presented by two machines);
+    /// * another agent ID: the key was registered under one attestor's agent ID and is now
+    ///   presented under another's (ADR-0049 decision 8). The stored agent ID parents the
+    ///   node's entries, so it is never silently kept beside a registration that derived a
+    ///   different one, and never silently replaced.
+    ///
+    /// Neither message carries more than the key, the DMI UUID and the agent ID.
+    #[must_use]
+    pub fn registration_conflict(&self, new: &NodeRecord) -> Option<String> {
+        if self.dmi_uuid != new.dmi_uuid {
+            return Some(format!(
+                "node key {} already registered for dmi {}",
+                new.ek_hash, self.dmi_uuid
+            ));
+        }
+        if self.node_id != new.node_id {
+            return Some(format!(
+                "node key {} already registered under another agent ID ({}); an operator deletes the node's record to let it register again",
+                new.ek_hash, self.node_id
+            ));
+        }
+        None
+    }
 }
 
 /// A delegated upstream session between the API call that received it and the record
@@ -375,17 +410,19 @@ pub trait ClaimStore: LogStore {
     /// All claims.
     async fn list_claims(&self) -> Result<Vec<ClaimRecord>, StoreError>;
 
-    /// Register a node. Fails with `Conflict` if the EK hash is known with a different DMI UUID.
+    /// Register a node. Fails with `Conflict` if the node key is known with a different DMI
+    /// UUID or under a different agent ID ([`NodeRecord::registration_conflict`]); the same
+    /// node again is success and keeps the first record.
     async fn put_node(&self, rec: NodeRecord) -> Result<(), StoreError>;
-    /// Fetch by EK hash.
+    /// Fetch by node key ([`NodeRecord::ek_hash`]).
     async fn get_node(&self, ek_hash: &str) -> Result<NodeRecord, StoreError>;
     /// Fetch by DMI UUID.
     async fn get_node_by_dmi(&self, dmi_uuid: Uuid) -> Result<NodeRecord, StoreError>;
-    /// Ban a node.
+    /// Ban a node, by node key.
     async fn ban_node(&self, ek_hash: &str) -> Result<(), StoreError>;
     /// All registered nodes.
     async fn list_nodes(&self) -> Result<Vec<NodeRecord>, StoreError>;
-    /// Remove a node by EK hash (ADR-0039: its VM is gone). A node that is not there is
+    /// Remove a node by node key (ADR-0039: its VM is gone). A node that is not there is
     /// success, so a retried or racing collection is harmless; no other row is touched.
     async fn delete_node(&self, ek_hash: &str) -> Result<(), StoreError>;
 
@@ -776,14 +813,10 @@ impl ClaimStore for MemoryStore {
     async fn put_node(&self, rec: NodeRecord) -> Result<(), StoreError> {
         let mut m = self.nodes.write().await;
         if let Some(existing) = m.get(&rec.ek_hash) {
-            if existing.dmi_uuid != rec.dmi_uuid {
-                // Same TPM, different VM: cloned TPM state. Refuse loudly.
-                return Err(StoreError::Conflict(format!(
-                    "ek_hash {} already registered for dmi {}",
-                    rec.ek_hash, existing.dmi_uuid
-                )));
-            }
-            return Ok(());
+            // Refused loudly, or the same node again: the first record is kept either way.
+            return existing
+                .registration_conflict(&rec)
+                .map_or(Ok(()), |why| Err(StoreError::Conflict(why)));
         }
         m.insert(rec.ek_hash.clone(), rec);
         Ok(())

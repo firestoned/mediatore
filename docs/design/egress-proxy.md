@@ -91,7 +91,17 @@ it (`--pull-listen`, `--pull-host`) are appended by the guest only for such a cl
 
 ## Running it
 
-`egress::run` reads the routes, the gateways and the phantom, refuses a listen address that is not loopback, obtains the
+Before it reads or binds anything, `egress::run` closes every socket family but unix and inet to itself
+(`seccomp::restrict_families`, `crates/mediatore-guest/src/seccomp.rs`; ADR-0049 decision 12): the family half of the
+jail's seccomp policy ([ADR-0051](../adr/0051-socket-families-and-io-uring-denied-to-the-workload-by-seccomp.md)),
+installed on every thread, irreversible, and proven on the spot by asking for a netlink and a vsock socket, which must
+both fail with `EAFNOSUPPORT`. The proxy runs beside the jail as the sandbox user and parses what the workload sends, and
+on a guest without a vTPM the host's signer answers whatever asks on the guest's vsock, so vsock is not a family this
+process may hold. Only the family rule is taken, not the jail's type and protocol rules: on a pool without gateways the
+proxy resolves names over UDP. It logs `address families restricted to unix and inet (seccomp, all threads)`; a filter
+that does not load, or does not refuse, means no proxy and so no claim.
+
+`egress::run` then reads the routes, the gateways and the phantom, refuses a listen address that is not loopback, obtains the
 claim SVID from the Workload API (one source for the broker client and the gateway tunnels), builds the dialer, binds, and
 prints one line, `ready <addr>`, on standard output. The guest starts the jail when it reads it. A failure at any step
 exits before that line, which ends the claim before the workload runs.
@@ -107,6 +117,7 @@ two destinations), so a deployment moves the port when the broker or an audience
 - A request leaves only after the route, the rules and the credential check pass.
 - A route the gateway places is never tunnelled, and never given a token instead.
 - The proxy listens on loopback only.
+- The proxy opens unix and inet sockets and no other kind, and does not start otherwise.
 
 ## Read next
 

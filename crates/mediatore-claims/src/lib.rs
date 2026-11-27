@@ -5,9 +5,10 @@
 //! `VirtualMachineClaim` (ADR-0011).
 //!
 //! An `AgentSandbox` ([`sandbox`]) is the request: its reconciler creates and owns one claim
-//! and the store record keyed by the claim's UID. On `Bound`: resolve the node by the EK
-//! hash of the certificate banlieue mirrored onto the claim, declare the claim's
-//! registration entry (ADR-0006) and record it. On `Releasing`/`Failed`/deletion: retract
+//! and the store record keyed by the claim's UID. On `Bound`: resolve the node by its node
+//! key (the EK hash of the certificate banlieue mirrored onto the claim, or for a machine of
+//! an `x509pop` pool the key of its agent ID, ADR-0049), declare the claim's registration
+//! entry (ADR-0006) under that node's stored agent ID and record it. On `Releasing`/`Failed`/deletion: retract
 //! the entry and revoke the record. Order: entry first, then refresh material. The state
 //! machine and the [`Reconciler`] are here; the typed watches over `banlieue-api` are
 //! [`watch`], and [`lease`] elects the replica that runs them.
@@ -16,7 +17,7 @@ use std::sync::Arc;
 
 use jiff::Timestamp;
 use mediatore_proto::ClaimPhase;
-use mediatore_spire::{EntryKind, EntryManager, Naming};
+use mediatore_spire::{EntryKind, EntryManager, Naming, NodeIdentity};
 use mediatore_store::{ClaimStore, Modified, StoreError, modify_claim};
 use uuid::Uuid;
 
@@ -72,8 +73,9 @@ pub struct Reconciler {
 }
 
 impl Reconciler {
-    /// Handle a bind: declare the entry for `claim_uid` under the agent of the node whose
-    /// EK hash is `ek_hash`, and start the claim's TTL clock. Returns only once the entry
+    /// Handle a bind: declare the entry for `claim_uid` under the agent of `node` (its
+    /// stored agent ID, never one recomputed from its key: ADR-0049 decision 8), record that
+    /// agent ID as the claim's node, and start the claim's TTL clock. Returns only once the entry
     /// is set on the SPIRE server; a masked or refused entry is an error and the claim
     /// stays unbound.
     ///
@@ -82,7 +84,7 @@ impl Reconciler {
     /// and nothing is written; otherwise the entry id and the node are set, and the deadline
     /// only if none is set. A claim released (or gone) under the bind gets the entry it has
     /// just been given retracted before this returns, and the bind is an error.
-    pub async fn bind(&self, claim_uid: Uuid, ek_hash: &str) -> anyhow::Result<()> {
+    pub async fn bind(&self, claim_uid: Uuid, node: &NodeIdentity) -> anyhow::Result<()> {
         let rec = self.store.get_claim(claim_uid).await?;
         if rec.entry_id.is_some() {
             return Ok(()); // idempotent on restart
@@ -95,9 +97,9 @@ impl Reconciler {
         let claim_ttl = std::time::Duration::from_secs(u64::from(rec.ttl_seconds));
         let entry = self
             .spire
-            .create_claim_entry(ek_hash, claim_uid, &user, claim_ttl)
+            .create_claim_entry(node, claim_uid, &user, claim_ttl)
             .await?;
-        let node_id = self.naming.agent_id(ek_hash);
+        let node_id = node.agent_id.clone();
         let outcome = modify_claim(self.store.as_ref(), claim_uid, |mut fresh| {
             if fresh.entry_id.is_some() {
                 return None;
@@ -115,14 +117,14 @@ impl Reconciler {
         .await;
         match outcome {
             Ok(Modified::Written | Modified::Unchanged) => {
-                tracing::info!(%claim_uid, ek_hash, "claim bound: entry set");
+                tracing::info!(%claim_uid, node_key = %node.key, agent_id = %node.agent_id, "claim bound: entry set");
                 Ok(())
             }
             Ok(Modified::Released) | Err(StoreError::NotFound(_)) => {
                 // Released under the bind: nothing was written, and the entry declared a
                 // moment ago must not outlive the release that did not see it.
                 self.spire.delete_entry(&entry).await?;
-                tracing::warn!(%claim_uid, ek_hash, "claim released while it was being bound; its entry is retracted");
+                tracing::warn!(%claim_uid, node_key = %node.key, "claim released while it was being bound; its entry is retracted");
                 anyhow::bail!("claim {claim_uid} was released while it was being bound")
             }
             // Every attempt lost to another write, or the store failed: the claim stays
@@ -178,7 +180,7 @@ impl Reconciler {
 mod tests {
     use jiff::Timestamp;
     use mediatore_proto::{Subject, Workload};
-    use mediatore_spire::{EntryRef, MemoryEntries, SpireError, claim_entry_name};
+    use mediatore_spire::{EntryRef, MemoryEntries, NodeAttestation, SpireError, claim_entry_name};
     use mediatore_store::{ClaimRecord, MemoryStore};
 
     use super::*;
@@ -241,8 +243,27 @@ mod tests {
         }
     }
 
+    fn naming() -> Naming {
+        Naming {
+            trust_domain: "sandbox.test".into(),
+        }
+    }
+
+    /// The TPM node the binds here go under.
+    fn node() -> NodeIdentity {
+        NodeIdentity::of(&naming(), &NodeAttestation::Tpm { ek_hash: EK.into() }).unwrap()
+    }
+
+    fn x509pop_node() -> NodeIdentity {
+        let att = NodeAttestation::X509pop {
+            issuer_cn: "hv-01".into(),
+            subject_cn: "vm-1".into(),
+        };
+        NodeIdentity::of(&naming(), &att).unwrap()
+    }
+
     fn reconciler() -> (Reconciler, Arc<MemoryEntries>, Arc<MemoryStore>) {
-        let entries = Arc::new(MemoryEntries::default());
+        let entries = Arc::new(MemoryEntries::in_trust_domain("sandbox.test"));
         let store = MemoryStore::shared();
         let r = Reconciler {
             store: store.clone(),
@@ -259,7 +280,7 @@ mod tests {
         let (r, entries, store) = reconciler();
         let uid = Uuid::new_v4();
         store.put_claim(record(uid)).await.unwrap();
-        r.bind(uid, EK).await.unwrap();
+        r.bind(uid, &node()).await.unwrap();
         let rec = store.get_claim(uid).await.unwrap();
         assert_eq!(
             rec.entry_id.as_deref(),
@@ -272,7 +293,7 @@ mod tests {
         assert!(rec.expires_at.is_some());
         assert_eq!(entries.names(), vec![claim_entry_name(uid)]);
         // Idempotent: a second bind declares nothing new.
-        r.bind(uid, EK).await.unwrap();
+        r.bind(uid, &node()).await.unwrap();
         assert_eq!(entries.names().len(), 1);
     }
 
@@ -295,20 +316,23 @@ mod tests {
 
     #[async_trait::async_trait]
     impl EntryManager for Interleaved {
-        async fn ensure_node_entry(&self, ek_hash: &str) -> Result<String, SpireError> {
-            self.inner.ensure_node_entry(ek_hash).await
+        async fn ensure_node_entry(
+            &self,
+            attestation: &NodeAttestation,
+        ) -> Result<String, SpireError> {
+            self.inner.ensure_node_entry(attestation).await
         }
 
         async fn create_claim_entry(
             &self,
-            ek_hash: &str,
+            node: &NodeIdentity,
             claim_uid: Uuid,
             unix_user: &str,
             claim_ttl: std::time::Duration,
         ) -> Result<String, SpireError> {
             let entry = self
                 .inner
-                .create_claim_entry(ek_hash, claim_uid, unix_user, claim_ttl)
+                .create_claim_entry(node, claim_uid, unix_user, claim_ttl)
                 .await?;
             match self.meanwhile {
                 Meanwhile::Released => {
@@ -336,7 +360,7 @@ mod tests {
     }
 
     fn interleaved(meanwhile: Meanwhile) -> (Reconciler, Arc<MemoryEntries>, Arc<MemoryStore>) {
-        let entries = Arc::new(MemoryEntries::default());
+        let entries = Arc::new(MemoryEntries::in_trust_domain("sandbox.test"));
         let store = MemoryStore::shared();
         let r = Reconciler {
             store: store.clone(),
@@ -358,7 +382,7 @@ mod tests {
         let uid = Uuid::new_v4();
         store.put_claim(record(uid)).await.unwrap();
         assert!(
-            r.bind(uid, EK).await.is_err(),
+            r.bind(uid, &node()).await.is_err(),
             "a bind that lost to a release is an error"
         );
         assert!(
@@ -370,7 +394,7 @@ mod tests {
         assert!(unbound, "nothing of the bind is on the record");
         assert!(rec.revoked_at.is_some(), "and the release stands");
         // A bind of a claim already released declares nothing at all.
-        assert!(r.bind(uid, EK).await.is_err());
+        assert!(r.bind(uid, &node()).await.is_err());
         assert!(entries.names().is_empty(), "no entry for a released claim");
     }
 
@@ -383,7 +407,7 @@ mod tests {
         let (r, entries, store) = interleaved(Meanwhile::Deadline(deadline));
         let uid = Uuid::new_v4();
         store.put_claim(record(uid)).await.unwrap();
-        r.bind(uid, EK).await.unwrap();
+        r.bind(uid, &node()).await.unwrap();
         let rec = store.get_claim(uid).await.unwrap();
         let bound = rec.entry_id.as_deref() == Some(claim_entry_name(uid).as_str())
             && rec.node_id.is_some();
@@ -392,7 +416,7 @@ mod tests {
         assert_eq!(entries.names().len(), 1);
         // A second bind finds the entry id and writes nothing.
         let before = rec.version;
-        r.bind(uid, EK).await.unwrap();
+        r.bind(uid, &node()).await.unwrap();
         assert_eq!(entries.names().len(), 1, "bound once");
         let again = store.get_claim(uid).await.unwrap();
         assert!(
@@ -403,13 +427,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bind_with_a_bad_ek_hash_leaves_the_claim_unbound() {
+    async fn bind_under_an_agent_that_is_no_agent_of_this_trust_domain_leaves_the_claim_unbound() {
         let (r, entries, store) = reconciler();
         let uid = Uuid::new_v4();
         store.put_claim(record(uid)).await.unwrap();
-        assert!(r.bind(uid, "3f9a").await.is_err());
-        assert!(store.get_claim(uid).await.unwrap().entry_id.is_none());
-        assert_eq!(entries.names(), Vec::<String>::new());
+        let x509pop = x509pop_node();
+        for bad in [
+            // A key that is no key.
+            NodeIdentity::stored("3f9a", "spiffe://sandbox.test/spire/agent/tpm/3f9a"),
+            // A stored agent ID of another trust domain, and one that is no agent's.
+            NodeIdentity::stored(EK, &format!("spiffe://other.test/spire/agent/tpm/{EK}")),
+            NodeIdentity::stored(EK, "spiffe://sandbox.test/spire/server"),
+            // A key that is not the agent's: a TPM key over an x509pop agent, and an
+            // x509pop agent's key over another x509pop agent.
+            NodeIdentity::stored(EK, &x509pop.agent_id),
+            NodeIdentity::stored(
+                &x509pop.key,
+                "spiffe://sandbox.test/spire/agent/x509pop/hv-02/vm-1",
+            ),
+        ] {
+            assert!(r.bind(uid, &bad).await.is_err());
+            let rec = store.get_claim(uid).await.unwrap();
+            assert!(rec.entry_id.is_none() && rec.node_id.is_none());
+            assert_eq!(entries.names(), Vec::<String>::new());
+        }
+    }
+
+    #[tokio::test]
+    async fn bind_under_an_x509pop_node_parents_the_entry_to_its_stored_agent_id() {
+        // ADR-0049 decision 8: the claim's entry is parented to the stored agent ID and
+        // the record carries it, never `spire/agent/tpm/<key>` recomputed from the key.
+        let (r, entries, store) = reconciler();
+        let uid = Uuid::new_v4();
+        store.put_claim(record(uid)).await.unwrap();
+        let node = x509pop_node();
+        r.bind(uid, &node).await.unwrap();
+        let agent = "spiffe://sandbox.test/spire/agent/x509pop/hv-01/vm-1";
+        let rec = store.get_claim(uid).await.unwrap();
+        assert_eq!(rec.node_id.as_deref(), Some(agent));
+        assert_eq!(
+            entries.parent_of(&claim_entry_name(uid)).as_deref(),
+            Some(agent)
+        );
+        assert_eq!(store.get_claim_by_node(agent).await.unwrap().uid, uid);
+        assert!(
+            store
+                .get_claim_by_node(&r.naming.agent_id(&node.key))
+                .await
+                .is_err(),
+            "nothing is recorded under a tpm agent ID made from the key"
+        );
     }
 
     #[tokio::test]
@@ -417,7 +484,7 @@ mod tests {
         let (r, entries, store) = reconciler();
         let uid = Uuid::new_v4();
         store.put_claim(record(uid)).await.unwrap();
-        r.bind(uid, EK).await.unwrap();
+        r.bind(uid, &node()).await.unwrap();
         r.release(uid).await.unwrap();
         assert_eq!(entries.names(), Vec::<String>::new());
         assert!(store.get_claim(uid).await.unwrap().revoked_at.is_some());
@@ -433,20 +500,23 @@ mod tests {
         let unknown = Uuid::new_v4();
         store.put_claim(record(live)).await.unwrap();
         store.put_claim(record(revoked)).await.unwrap();
-        r.bind(live, EK).await.unwrap();
-        r.bind(revoked, EK).await.unwrap();
+        r.bind(live, &node()).await.unwrap();
+        r.bind(revoked, &node()).await.unwrap();
         store.revoke_claim(revoked, Timestamp::now()).await.unwrap();
         // An entry declared by a previous broker instance for a claim this store never saw.
         entries
             .create_claim_entry(
-                EK,
+                &node(),
                 unknown,
                 "sb-0123456789ab",
                 std::time::Duration::from_hours(1),
             )
             .await
             .unwrap();
-        entries.ensure_node_entry(EK).await.unwrap();
+        entries
+            .ensure_node_entry(&NodeAttestation::Tpm { ek_hash: EK.into() })
+            .await
+            .unwrap();
 
         assert_eq!(r.sweep_orphans().await.unwrap(), 2);
         let mut left = entries.names();

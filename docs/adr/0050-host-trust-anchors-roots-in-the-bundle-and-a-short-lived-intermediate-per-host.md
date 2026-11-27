@@ -3,7 +3,7 @@
 
 # ADR-0050: Host trust anchors at scale: roots in the bundle, a short-lived intermediate per host, enrolled by hardware attestation
 
-**Status:** Proposed (the chain behaviour is proven in a prototype; three items remain, listed under "Not proven") · **Date:** 2026-11-19
+**Status:** Proposed (the chain behaviour is proven in a prototype; three items remain, listed under "Not proven"). Decision 6 alone was built under [ADR-0049](0049-a-guest-without-a-vtpm-attests-with-x509pop-and-a-certificate-its-host-signs.md) on 2026-11-27, as its decisions 8 to 11, where the wire shape is; the rest is unchanged and Proposed · **Date:** 2026-11-19
 
 Amends [ADR-0049](0049-a-guest-without-a-vtpm-attests-with-x509pop-and-a-certificate-its-host-signs.md)
 decisions 1, 2 and 4 (what is in the server's bundle, and where a host's signing key comes
@@ -119,6 +119,9 @@ host gets its intermediate, and how that stays at least as confined as the per-h
    against what the watcher derived from banlieue's published values. The wire shape is fixed
    by unit tests at implementation. The contract: a new attestor adds a variant, never a
    second registration path.
+
+   *Built 2026-11-27 under ADR-0049, as its decisions 8 to 11: this decision depends on
+   nothing else here, and the wire shape is recorded there (ADR-0049 decision 8).*
 
 7. **Algorithms and lifetimes are configuration, in one profile.** Intermediate and leaf
    key types, validity and the renewal fraction live in one certificate profile

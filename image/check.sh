@@ -14,6 +14,19 @@ PLUGIN_SHA=$(sed -n 's/.*plugin_checksum = "\([0-9a-f]*\)".*/\1/p' "$(dirname "$
 
 run() { "$CLI" run --rm --entrypoint sh "$IMAGE" -c "$1"; }
 
+# file_of <cloud-config> <path>: the content of one `files` entry of a cloud-config layer,
+# as the member would find it at <path>. For the checks that read an example's embedded files.
+FILE_OF=$(cat <<'SH'
+file_of() {
+  awk -v p="$2" '
+    $1 == "-" && $2 == "path:" { want = ($3 == p); body = 0; next }
+    want && $1 == "content:" { body = 1; match($0, /^ */); indent = RLENGTH; next }
+    body { match($0, /^ */); if (NF && RLENGTH <= indent) { body = 0; want = 0; next } print substr($0, indent + 3) }
+  ' "$1"
+}
+SH
+)
+
 fail=0
 check() { # <what> <shell>
   if run "$2" >/dev/null 2>&1; then echo "✓ $1"; else echo "✗ $1"; fail=1; fi
@@ -60,6 +73,24 @@ check "the agent unit: a private /tmp for the attestor plugin, CAP_SYS_PTRACE fo
   'grep -q "^PrivateTmp=yes" /etc/systemd/system/spire-agent.service && grep -q "^AmbientCapabilities=CAP_SYS_PTRACE" /etc/systemd/system/spire-agent.service && grep -q "^RuntimeDirectory=spire" /etc/systemd/system/spire-agent.service'
 check "the x509pop node-cert units installed but not enabled, and their examples (ADR-0049)" \
   'u=/etc/systemd/system && grep -q "^ExecStart=/usr/bin/mediatore node-cert fetch" $u/mediatore-node-cert.service && grep -q "^Before=spire-agent.service" $u/mediatore-node-cert.service && grep -q "^User=spire" $u/mediatore-node-cert.service && grep -q "^ExecStart=/usr/bin/mediatore node-cert renew" $u/mediatore-node-cert-renew.service && ! test -e $u/multi-user.target.wants/mediatore-node-cert.service && grep -q "^Requires=mediatore-node-cert.service" /usr/share/mediatore/spire-agent-x509pop.conf.example && grep -q "NodeAttestor \"x509pop\"" /usr/share/mediatore/agent-x509pop.conf.example && ! grep -q "^ *intermediates_path" /usr/share/mediatore/agent-x509pop.conf.example && /usr/bin/mediatore node-cert --help >/dev/null'
+# A member with no vTPM cannot seal its disk, so its agent writes nothing of its identity to
+# one (ADR-0049, amended 2026-11-27): the key manager is the memory one and the data
+# directory is on tmpfs, in the shipped configuration and in the pool's example alike, and
+# the drop-in makes that directory with a binary the image has.
+check "the x509pop agent keeps its SVID key in memory and its data on tmpfs, nothing under /var/lib (ADR-0049)" \
+  "$FILE_OF"'
+  f=/usr/share/mediatore/cloud-config-deployment-x509pop.example.yaml && d=$(mktemp -d) && file_of $f /etc/spire/agent.conf > $d/agent.conf \
+  && for c in /usr/share/mediatore/agent-x509pop.conf.example $d/agent.conf; do test "$(grep -c "^ *KeyManager " $c)" = 1 && grep -q "^ *KeyManager \"memory\" {" $c && grep -qx " *data_dir = \"/run/spire/agent\"" $c && ! grep -v "^ *#" $c | grep -q "/var/lib" || exit 1; done \
+  && grep -qx "ExecStartPre=/usr/bin/install -d -m 0700 /run/spire/agent" /usr/share/mediatore/spire-agent-x509pop.conf.example && test -x /usr/bin/install \
+  && grep -q "^RuntimeDirectory=spire$" /etc/systemd/system/spire-agent.service && grep -q "^RuntimeDirectoryPreserve=yes" /etc/systemd/system/spire-agent.service && grep -q "^ReadWritePaths=.*/run/spire" /etc/systemd/system/spire-agent.service'
+check "the x509pop pool's cloud-config example (ADR-0049): a cloud-config kairos-agent accepts, its agent.conf one spire-agent accepts, naming the x509pop attestor over node-cert's two files and nothing of the TPM plugin, no intermediates_path, its drop-in the image's own, the guest told MEDIATORE_NODE_ATTESTATION=x509pop" \
+  "$FILE_OF"'
+  f=/usr/share/mediatore/cloud-config-deployment-x509pop.example.yaml && d=$(mktemp -d) && test "$(head -n 1 $f)" = "#cloud-config" && kairos-agent validate $f \
+  && file_of $f /etc/spire/agent.conf > $d/agent.conf && /usr/bin/spire-agent validate -config $d/agent.conf \
+  && grep -q "NodeAttestor \"x509pop\"" $d/agent.conf && ! grep -Eq "NodeAttestor \"tpm\"|plugin_cmd|plugin_checksum" $d/agent.conf && ! grep -q "intermediates_path *=" $f \
+  && for k in private_key_path certificate_path; do test "$(grep -c "^ *$k = " $d/agent.conf)" = 1 && test "$(grep "^ *$k = " $d/agent.conf | tr -d " ")" = "$(grep "^ *$k = " /usr/share/mediatore/agent-x509pop.conf.example | tr -d " ")" || exit 1; done \
+  && file_of $f /etc/systemd/system/spire-agent.service.d/x509pop.conf > $d/dropin && test -s $d/dropin && test "$(cat $d/dropin)" = "$(grep -v "^#" /usr/share/mediatore/spire-agent-x509pop.conf.example | grep .)" \
+  && file_of $f /etc/mediatore-guest/env > $d/env && test "$(grep -c "^MEDIATORE_NODE_ATTESTATION=" $d/env)" = 1 && grep -qx "MEDIATORE_NODE_ATTESTATION=x509pop" $d/env && ! grep -v "^#" $d/env | grep -q "[[:space:]]#"'
 check "no sshd, ssh and the distribution's nftables unit masked (ADR-0010: nothing inbound; ADR-0029: one owner of the table)" \
   '! command -v sshd && for u in ssh.service ssh.socket nftables.service; do test "$(readlink /etc/systemd/system/$u)" = /dev/null || exit 1; done'
 check "no other listener the base shipped (snmpd, lldpd, rpcbind)" \
