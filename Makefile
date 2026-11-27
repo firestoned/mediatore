@@ -8,7 +8,7 @@
         kind-install kind-create kind-delete kind-down kind-spire kind-deploy kind-up \
         kind-images kind-dex kind-openbao kind-broker kind-banlieue-crds kind-e2e-entries kind-e2e-mtls kind-e2e-watcher kind-e2e-sandbox \
         kind-e2e-dex kind-e2e kind-e2e-ci kind-e2e-logs \
-        kind-spire-render kind-vtpm kind-e2e-tpm kind-rehearse-migration calm-validate calm-diagrams docs docs-serve docs-clean clean manifests dist-tpm-plugin
+        kind-spire-render kind-vtpm kind-e2e-tpm kind-e2e-x509pop kind-rehearse-migration calm-validate calm-diagrams docs docs-serve docs-clean clean manifests dist-tpm-plugin
 
 # kind: a throwaway cluster with SPIRE for the live tests (docs/guides/testing.md).
 KIND_VERSION       ?= 0.33.0
@@ -35,7 +35,7 @@ KIND_KUBECTL       := kubectl --kubeconfig $(KIND_KUBECONFIG)
 # SPIRE in kind comes from manifests rendered once (`make kind-spire-render`, the only
 # target that runs helm) from the same distribution and versions as the homelab, into
 # dev/kind/spire, applied with kustomize together with the TPM attestor component
-# (ADR-0018). Release name `spire` in namespace `spire-server` gives the controller
+# (ADR-0018) and the x509pop one (ADR-0049). Release name `spire` in namespace `spire-server` gives the controller
 # manager the className `spire-server-spire`. Bump a version here, re-render, read the
 # diff. SPIRE_TRUST_DOMAIN must agree with dev/kind/spire/values.yaml.
 SPIRE_CHART_REPO    ?= https://spiffe.github.io/helm-charts-hardened/
@@ -494,11 +494,11 @@ kind-spire-render: ## Render SPIRE's distribution (hardened charts, pinned versi
 	  -n $(SPIRE_NAMESPACE) --kube-version $(KIND_K8S_VERSION) --no-hooks --skip-tests \
 	  -f $(SPIRE_KUSTOMIZATION)/values.yaml > $(SPIRE_KUSTOMIZATION)/spire.yaml
 	./$(SPIRE_KUSTOMIZATION)/render-server-conf-patch.sh $(SPIRE_KUSTOMIZATION)/spire.yaml deploy/spire-tpm/server.conf.fragment.hcl \
-	  deploy/spire-upstream/server.conf.fragment.hcl $(KIND_OPENBAO_ADDR) > $(SPIRE_KUSTOMIZATION)/server-conf-patch.yaml
+	  deploy/spire-x509pop/server.conf.fragment.hcl deploy/spire-upstream/server.conf.fragment.hcl $(KIND_OPENBAO_ADDR) > $(SPIRE_KUSTOMIZATION)/server-conf-patch.yaml
 	@kubectl kustomize $(SPIRE_KUSTOMIZATION) >/dev/null
 	@echo "✓ rendered spire-crds $(SPIRE_CRDS_VERSION) and spire $(SPIRE_CHART_VERSION) into $(SPIRE_KUSTOMIZATION)"
 
-kind-spire: kind-create kind-openbao ## Apply SPIRE (server, controller manager, agent, CSI driver), the TPM attestor and the OpenBao upstream authority components from the rendered manifests
+kind-spire: kind-create kind-openbao ## Apply SPIRE (server, controller manager, agent, CSI driver), the TPM attestor, the x509pop attestor and the OpenBao upstream authority components from the rendered manifests
 	@$(KIND_KUBECTL) get ns $(SPIRE_NAMESPACE) >/dev/null 2>&1 || $(KIND_KUBECTL) create ns $(SPIRE_NAMESPACE)
 	@$(KIND_KUBECTL) get ns spire-system >/dev/null 2>&1 || $(KIND_KUBECTL) create ns spire-system
 	@# The server signs its CA at OpenBao before it serves anything (ADR-0031), so OpenBao's CA is in place first.
@@ -514,7 +514,9 @@ kind-spire: kind-create kind-openbao ## Apply SPIRE (server, controller manager,
 	  -p '{"webhooks":[{"name":"vclusterfederatedtrustdomain.kb.io","failurePolicy":"Fail"},{"name":"vclusterspiffeid.kb.io","failurePolicy":"Fail"}]}' >/dev/null
 	@$(KIND_KUBECTL) -n $(SPIRE_NAMESPACE) logs statefulset/spire-server -c spire-server | grep -Eq 'Plugin loaded.*plugin_name=tpm' \
 	  || { echo "ERROR: the tpm node attestor (deploy/spire-tpm) did not load"; $(KIND_KUBECTL) -n $(SPIRE_NAMESPACE) logs statefulset/spire-server -c spire-server --tail=60; exit 1; }
-	@echo "✓ SPIRE $(SPIRE_CHART_VERSION) up from $(SPIRE_KUSTOMIZATION); controller manager className $(SPIRE_CLASS_NAME); tpm node attestor loaded"
+	@$(KIND_KUBECTL) -n $(SPIRE_NAMESPACE) logs statefulset/spire-server -c spire-server | grep -Eq 'Plugin loaded.*plugin_name=x509pop' \
+	  || { echo "ERROR: the x509pop node attestor (deploy/spire-x509pop) did not load"; $(KIND_KUBECTL) -n $(SPIRE_NAMESPACE) logs statefulset/spire-server -c spire-server --tail=60; exit 1; }
+	@echo "✓ SPIRE $(SPIRE_CHART_VERSION) up from $(SPIRE_KUSTOMIZATION); controller manager className $(SPIRE_CLASS_NAME); tpm and x509pop node attestors loaded"
 
 kind-deploy: kind-create ## Apply the broker's CRD, ServiceAccount, RBAC and admission policies; mint its kubeconfig
 	@# The base's own Namespace (Pod Security restricted, ADR-0056), not a bare `create ns`.
@@ -638,7 +640,13 @@ kind-rehearse-migration: kind-banlieue-crds kind-broker ## ADR-0056 decision 7 r
 	$(KIND_KUBECTL) -n mediatore-system rollout status deploy/mediatore --timeout=300s
 	./dev/kind/migration-rehearsal.sh $(KIND_KUBECONFIG) $(SPIRE_TRUST_DOMAIN) $(KIND_DIR)/ek.pem $(KIND_DIR)/ek.hash $(KIND_DIR)
 
-kind-e2e: kind-e2e-entries kind-e2e-mtls kind-e2e-watcher kind-e2e-sandbox kind-e2e-dex kind-e2e-policy kind-e2e-gateway kind-e2e-gateway-audience ## Every live suite against kind that needs nothing of the host (grows with the roadmap); kind-e2e-tpm needs a vTPM
+# No vTPM, no sudo, no kernel module: openssl is the host here, so the tier runs wherever the
+# others do and is part of kind-e2e and of CI's core shard. It restarts the SPIRE server twice
+# (the bundle) and the broker twice (watcher.x509pop_pools for the run, the overlay's after).
+kind-e2e-x509pop: kind-banlieue-crds kind-broker ## ADR-0049 live: an agent attesting with x509pop on the image's agent-x509pop.conf under a host CA made for the run, refused without it in the bundle and under its name on another key, the node entry from the Provider's host CA and the machine's subject for a listed pool, the guest registering with --node-attestation x509pop, re-attestation, an unlisted pool still tpm
+	UPSTREAM_ROOT=$(KIND_DIR)/openbao/upstream-root.pem ./dev/kind/x509pop-e2e.sh $(KIND_KUBECONFIG) $(SPIRE_TRUST_DOMAIN) $(KIND_DIR)/x509pop $(KIND_DIR)/ek.pem $(KIND_DIR)/ek.hash
+
+kind-e2e: kind-e2e-entries kind-e2e-mtls kind-e2e-watcher kind-e2e-sandbox kind-e2e-dex kind-e2e-policy kind-e2e-x509pop kind-e2e-gateway kind-e2e-gateway-audience ## Every live suite against kind that needs nothing of the host (grows with the roadmap); kind-e2e-tpm needs a vTPM
 
 kind-e2e-ci: ## CI shape: $(KIND_E2E_SUITES), cluster state on failure, cluster deleted after
 	@$(MAKE) $(KIND_E2E_SUITES) || { $(MAKE) kind-e2e-logs; $(MAKE) kind-delete; exit 1; }
@@ -669,6 +677,10 @@ kind-e2e-logs: ## What a failing live suite needs: entries, policy, broker and c
 	-$(KIND_KUBECTL) -n mediatore-e2e-tpm get pods -o wide
 	-$(KIND_KUBECTL) -n mediatore-e2e-tpm logs deploy/member -c spire-agent --tail=80
 	-$(KIND_KUBECTL) -n mediatore-e2e-tpm logs deploy/member -c guest --tail=40
+	-$(KIND_KUBECTL) -n mediatore-e2e-x509pop get pods,virtualmachines,providers -o wide
+	-$(KIND_KUBECTL) -n mediatore-e2e-x509pop logs deploy/member -c spire-agent --tail=80
+	-$(KIND_KUBECTL) -n mediatore-e2e-x509pop logs deploy/member -c guest --tail=40
+	-$(KIND_KUBECTL) get sandboxnodes -A
 	-$(KIND_KUBECTL) -n $(SPIRE_NAMESPACE) exec spire-server-0 -c spire-server -- spire-server agent list
 	-$(KIND_KUBECTL) get validatingadmissionpolicy mediatore-clusterstaticentry mediatore-agentsandbox-subject mediatore-agentsandbox-status -o yaml
 	-$(KIND_KUBECTL) -n $(SPIRE_NAMESPACE) logs statefulset/spire-server -c spire-controller-manager --tail=200

@@ -35,7 +35,7 @@ The store is the Kubernetes API (ADR-0034); there is no database.
 | the claim record | `status.record` on the `AgentSandbox` | written in `kubestore.rs` and nowhere else; an ended claim stays for `store.retention_secs` (3600 by default), then the sweep releases it with an audit line |
 | the issuer's session (the login's refresh token), sealed | a `Secret` named `mediatore-session-<sandbox uid>` | |
 | each delegated credential, sealed | a `Secret` named `mediatore-session-<sandbox uid>-<16 hex of a hash of the audience>` | one per audience |
-| an attested pool member | a `SandboxNode` resource named by its EK hash | `kubestore.rs`, `nodegc.rs` |
+| an attested pool member | a `SandboxNode` resource named by its node key (a TPM node's EK hash, or an x509pop node's SHA-256 of its agent ID, ADR-0049) | `kubestore.rs`, `nodegc.rs` |
 | a policy's version floor | a `PolicyFloor` resource | moved only upward, by compare and set |
 
 A session Secret holds `key_id`, `nonce` and `ciphertext` (the sealed envelope) beside `subject`, `issuer`, `created_at`

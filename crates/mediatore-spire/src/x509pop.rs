@@ -5,20 +5,19 @@
 
 use std::collections::BTreeSet;
 
+use mediatore_proto::x509pop::{CommonNameError, single_common_name};
 use sha2::{Digest, Sha256};
 use x509_cert::Certificate;
-use x509_cert::der::asn1::{PrintableStringRef, Utf8StringRef};
-use x509_cert::der::oid::ObjectIdentifier;
+use x509_cert::der::Encode as _;
 use x509_cert::ext::pkix::BasicConstraints;
 
 use crate::kube::ClusterStaticEntrySpec;
-use crate::{GUEST_AGENT_PATH, Naming, SpireError, node_entry_name, validate_ek_hash};
-
-/// `id-at-commonName` (2.5.4.3).
-const COMMON_NAME_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.4.3");
+use crate::{
+    GUEST_AGENT_PATH, Naming, SpireError, node_entry_name, validate_ek_hash, validate_node_key,
+};
 
 /// Longest common name accepted (X.509 `ub-common-name`).
-pub const MAX_COMMON_NAME_LEN: usize = 64;
+pub use mediatore_proto::x509pop::MAX_COMMON_NAME_LEN;
 
 /// How a node's agent attests, chosen explicitly by the caller, never guessed from which
 /// data happens to be present (ADR-0049).
@@ -39,6 +38,26 @@ pub enum NodeAttestation {
     },
 }
 
+impl From<&mediatore_proto::Attestation> for NodeAttestation {
+    /// What a node's registration says (ADR-0049 decision 8), as the attestation the watcher
+    /// also builds: the two then derive the key and the agent ID with the same functions.
+    /// Nothing is validated here; [`node_key`] and [`agent_id_for`] do that.
+    fn from(wire: &mediatore_proto::Attestation) -> Self {
+        match wire {
+            mediatore_proto::Attestation::Tpm { ek_hash } => Self::Tpm {
+                ek_hash: ek_hash.clone(),
+            },
+            mediatore_proto::Attestation::X509pop {
+                issuer_cn,
+                subject_cn,
+            } => Self::X509pop {
+                issuer_cn: issuer_cn.clone(),
+                subject_cn: subject_cn.clone(),
+            },
+        }
+    }
+}
+
 /// What banlieue publishes for an x509pop guest: the administrator-asserted host CA
 /// (`Provider.spec.attestation.hostCa`) and the machine's `status.attestationSubject`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,27 +71,17 @@ pub struct X509popInput {
 /// Path prefix the x509pop attestor gives its agents under the trust domain.
 const X509POP_AGENT_PREFIX: &str = "spire/agent/x509pop";
 
+/// Path prefix the tpm attestor gives its agents under the trust domain.
+const TPM_AGENT_PREFIX: &str = "spire/agent/tpm";
+
 /// Refuse a common name that is not a SPIFFE path segment: non-empty, at most
 /// [`MAX_COMMON_NAME_LEN`] bytes, letters, digits, dots, dashes and underscores only, and
-/// neither `.` nor `..` (SPIFFE forbids those segments).
+/// neither `.` nor `..` (SPIFFE forbids those segments). The rule itself is
+/// [`mediatore_proto::x509pop::validate_common_name`], which the guest applies to its own
+/// leaf, so the two sides cannot drift.
 pub fn validate_common_name(cn: &str) -> Result<(), SpireError> {
-    if cn.is_empty() || cn.len() > MAX_COMMON_NAME_LEN {
-        return Err(SpireError::Invalid(format!(
-            "common name must be 1 to {MAX_COMMON_NAME_LEN} characters"
-        )));
-    }
-    if cn == "." || cn == ".." {
-        return Err(SpireError::Invalid(
-            "common name must not be . or ..".into(),
-        ));
-    }
-    let allowed = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_');
-    if !cn.bytes().all(allowed) {
-        return Err(SpireError::Invalid(
-            "common name may hold only letters, digits, dots, dashes and underscores".into(),
-        ));
-    }
-    Ok(())
+    mediatore_proto::x509pop::validate_common_name(cn)
+        .map_err(|e| SpireError::Invalid(e.to_string()))
 }
 
 /// `spiffe://<td>/spire/agent/x509pop/<issuer CN>/<subject CN>`: the ID the SPIRE server's
@@ -92,30 +101,12 @@ pub fn x509pop_agent_id(td: &str, issuer: &str, subject: &str) -> Result<String,
 /// The one common name of a certificate's subject; zero or several is refused, because
 /// the server's template reads one and a second would make the ID ambiguous.
 fn common_name_of(cert: &Certificate) -> Result<String, SpireError> {
-    let mut found = Vec::new();
-    for atv in cert.tbs_certificate().subject().iter() {
-        if atv.oid != COMMON_NAME_OID {
-            continue;
-        }
-        let text = atv
-            .value
-            .decode_as::<Utf8StringRef<'_>>()
-            .map(|v| v.as_str().to_owned())
-            .or_else(|_| {
-                atv.value
-                    .decode_as::<PrintableStringRef<'_>>()
-                    .map(|v| v.as_str().to_owned())
-            })
-            .map_err(|e| SpireError::Invalid(format!("common name is not text: {e}")))?;
-        found.push(text);
-    }
-    match <[String; 1]>::try_from(found) {
-        Ok([cn]) => Ok(cn),
-        Err(all) => Err(SpireError::Invalid(format!(
-            "a CA certificate must have exactly one common name, found {}",
-            all.len()
-        ))),
-    }
+    single_common_name(cert.tbs_certificate().subject()).map_err(|e| match e {
+        CommonNameError::Count(n) => SpireError::Invalid(format!(
+            "a CA certificate must have exactly one common name, found {n}"
+        )),
+        other => SpireError::Invalid(other.to_string()),
+    })
 }
 
 /// Refuse a certificate that is not a host CA in the sense ADR-0049 decision 2 needs:
@@ -224,8 +215,12 @@ pub fn agent_id_for(naming: &Naming, att: &NodeAttestation) -> Result<String, Sp
 /// shapes and the admission policy stay as they are. A TPM node's is its EK hash. An x509pop
 /// node has no EK: its key is the hex SHA-256 of its agent ID.
 ///
-/// ADR-0049 Decision 7 records this rule. Not verified: what the broker's node registration
-/// compares for an x509pop node. This function is the one place to change it.
+/// ADR-0049 decision 7 records this rule, and decision 8 what rests on it: the broker's node
+/// registration derives the key from the attestation the guest sends with this function and
+/// requires the peer's SPIFFE ID to be `banlieue/node/<that key>`, so the names a guest sends
+/// must hash to the ID SPIRE issued it under the entry the watcher declared, with this same
+/// function, for exactly those names. One function on both sides; a different rule is a
+/// change here and nowhere else.
 pub fn node_key(naming: &Naming, att: &NodeAttestation) -> Result<String, SpireError> {
     match att {
         NodeAttestation::Tpm { ek_hash } => {
@@ -237,6 +232,155 @@ pub fn node_key(naming: &Naming, att: &NodeAttestation) -> Result<String, SpireE
             Ok(hex::encode(Sha256::digest(id.as_bytes())))
         }
     }
+}
+
+/// A node as an entry is parented to it: its key (what names its record, its node entry and
+/// its SPIFFE ID) and the agent ID SPIRE gave its agent. Built from an attestation
+/// ([`Self::of`]) or from a stored record ([`Self::stored`]); the agent ID is never
+/// recomputed from the key, because only a TPM node's can be (ADR-0049 decision 8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeIdentity {
+    /// The node key: 64 lowercase hex. A TPM node's EK hash, an x509pop node's
+    /// [`node_key`].
+    pub key: String,
+    /// The SPIRE agent's SPIFFE ID, the parent of every entry on the node.
+    pub agent_id: String,
+}
+
+impl NodeIdentity {
+    /// The identity an attestation gives, with the one pair of functions the watcher and
+    /// the broker share.
+    ///
+    /// # Errors
+    /// The attestation is invalid: nothing is derived from it.
+    pub fn of(naming: &Naming, att: &NodeAttestation) -> Result<Self, SpireError> {
+        Ok(Self {
+            key: node_key(naming, att)?,
+            agent_id: agent_id_for(naming, att)?,
+        })
+    }
+
+    /// The identity a stored node record carries (`NodeRecord.ek_hash` is the key,
+    /// `NodeRecord.node_id` the agent ID). Not validated here: [`Self::validate`] is, by
+    /// every entry manager, before anything is declared under it.
+    #[must_use]
+    pub fn stored(key: &str, agent_id: &str) -> Self {
+        Self {
+            key: key.to_owned(),
+            agent_id: agent_id.to_owned(),
+        }
+    }
+
+    /// Refuse an identity an entry must not be parented to. The agent ID must be, in
+    /// `trust_domain`, `spire/agent/tpm/<64 hex>` or `spire/agent/x509pop/<cn>/<cn>` and
+    /// nothing else (no third segment, no other attestor, no other trust domain), and the
+    /// key must be the one that agent ID gives: the hash itself for a TPM agent, the
+    /// SHA-256 of the ID for an x509pop one. `trust_domain` of `None` accepts any single
+    /// trust domain (the in-memory fake built without one).
+    ///
+    /// # Errors
+    /// [`SpireError::Invalid`], naming the rule broken and never the whole identity.
+    pub fn validate(&self, trust_domain: Option<&str>) -> Result<(), SpireError> {
+        validate_node_key(&self.key)?;
+        let invalid = |why: &str| SpireError::Invalid(format!("agent ID: {why}"));
+        let rest = self
+            .agent_id
+            .strip_prefix("spiffe://")
+            .ok_or_else(|| invalid("not a SPIFFE ID"))?;
+        let (td, path) = rest
+            .split_once('/')
+            .ok_or_else(|| invalid("no path after the trust domain"))?;
+        if td.is_empty() || trust_domain.is_some_and(|want| want != td) {
+            return Err(invalid("not in this trust domain"));
+        }
+        if let Some(hash) = path
+            .strip_prefix(TPM_AGENT_PREFIX)
+            .and_then(|p| p.strip_prefix('/'))
+        {
+            validate_ek_hash(hash)?;
+            if hash != self.key {
+                return Err(invalid("a tpm agent's hash is not the node key"));
+            }
+            return Ok(());
+        }
+        let Some(names) = path
+            .strip_prefix(X509POP_AGENT_PREFIX)
+            .and_then(|p| p.strip_prefix('/'))
+        else {
+            return Err(invalid(
+                "neither spire/agent/tpm/<hash> nor spire/agent/x509pop/<issuer>/<subject>",
+            ));
+        };
+        let mut segments = names.split('/');
+        let (Some(issuer), Some(subject), None) =
+            (segments.next(), segments.next(), segments.next())
+        else {
+            return Err(invalid(
+                "an x509pop agent ID has exactly an issuer and a subject segment",
+            ));
+        };
+        validate_common_name(issuer)?;
+        validate_common_name(subject)?;
+        if hex::encode(Sha256::digest(self.agent_id.as_bytes())) != self.key {
+            return Err(invalid(
+                "the node key is not the SHA-256 of this x509pop agent ID",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Whether a SPIFFE ID is under the x509pop attestor's agent path (in any trust domain).
+/// Only the path is read: a pass that must leave every x509pop node alone asks this, and
+/// errs towards leaving one alone.
+#[must_use]
+pub fn is_x509pop_agent_id(agent_id: &str) -> bool {
+    agent_id
+        .strip_prefix("spiffe://")
+        .and_then(|rest| rest.split_once('/'))
+        .is_some_and(|(_, path)| path.starts_with(&format!("{X509POP_AGENT_PREFIX}/")))
+}
+
+/// Every certificate of a PEM as its one common name and the hex SHA-256 of its DER: what
+/// tells two assertions of one host CA (the same certificate twice) from two CAs under one
+/// name. Nothing about the certificates is checked beyond their having one common name.
+///
+/// # Errors
+/// The PEM holds no certificate, one does not parse, or one has no single common name.
+pub fn certificate_identities(pem: &str) -> Result<Vec<(String, String)>, SpireError> {
+    parse_certs(pem)?
+        .iter()
+        .map(|cert| {
+            let der = cert
+                .to_der()
+                .map_err(|e| SpireError::Invalid(format!("certificate: {e}")))?;
+            Ok((common_name_of(cert)?, hex::encode(Sha256::digest(der))))
+        })
+        .collect()
+}
+
+/// The node key of the node whose agent has this SPIFFE ID, when the ID is one of the two
+/// agent shapes (in any one trust domain): the hash a tpm agent's ID ends with, or the
+/// SHA-256 of an x509pop agent's whole ID. `None` for anything else. The inverse of
+/// [`agent_id_for`] as far as [`node_key`] needs it: what lets a pass that holds only agent
+/// IDs (a claim's `node_id`, an entry's parent) name the nodes they belong to.
+#[must_use]
+pub fn node_key_of_agent_id(agent_id: &str) -> Option<String> {
+    let (_, path) = agent_id.strip_prefix("spiffe://")?.split_once('/')?;
+    let tpm_hash = path
+        .strip_prefix(TPM_AGENT_PREFIX)
+        .and_then(|p| p.strip_prefix('/'));
+    let key = match tpm_hash {
+        Some(hash) => hash.to_owned(),
+        None if path.starts_with(X509POP_AGENT_PREFIX) => {
+            hex::encode(Sha256::digest(agent_id.as_bytes()))
+        }
+        None => return None,
+    };
+    NodeIdentity::stored(&key, agent_id)
+        .validate(None)
+        .is_ok()
+        .then_some(key)
 }
 
 /// The node bootstrap entry for an attestation, in the ADR-0006 shape: its resource name and
@@ -513,5 +657,175 @@ mod tests {
         };
         assert!(node_entry_spec(&naming(), &bad_x, "c").is_err());
         assert!(agent_id_for(&naming(), &bad_x).is_err());
+    }
+
+    #[test]
+    fn a_wire_attestation_becomes_the_same_attestation_the_watcher_builds() {
+        let wire = mediatore_proto::Attestation::X509pop {
+            issuer_cn: "host-a".into(),
+            subject_cn: "uid-1".into(),
+        };
+        assert_eq!(NodeAttestation::from(&wire), x509());
+        let wire = mediatore_proto::Attestation::Tpm { ek_hash: EK.into() };
+        assert_eq!(
+            NodeAttestation::from(&wire),
+            NodeAttestation::Tpm { ek_hash: EK.into() }
+        );
+    }
+
+    #[test]
+    fn an_identity_from_an_attestation_validates_and_carries_both_derivations() {
+        let tpm =
+            NodeIdentity::of(&naming(), &NodeAttestation::Tpm { ek_hash: EK.into() }).unwrap();
+        assert_eq!(tpm.key, EK);
+        assert_eq!(tpm.agent_id, naming().agent_id(EK));
+        assert!(!is_x509pop_agent_id(&tpm.agent_id));
+        tpm.validate(Some(TD)).unwrap();
+        tpm.validate(None).unwrap();
+        let x = NodeIdentity::of(&naming(), &x509()).unwrap();
+        assert_eq!(x.key, node_key(&naming(), &x509()).unwrap());
+        assert_eq!(
+            x.agent_id,
+            "spiffe://sandbox.test/spire/agent/x509pop/host-a/uid-1"
+        );
+        assert!(is_x509pop_agent_id(&x.agent_id));
+        x.validate(Some(TD)).unwrap();
+        x.validate(None).unwrap();
+        assert!(
+            NodeIdentity::of(
+                &naming(),
+                &NodeAttestation::Tpm {
+                    ek_hash: "3f9a".into()
+                }
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn an_identity_whose_agent_id_is_not_one_of_the_two_shapes_is_refused() {
+        let x = NodeIdentity::of(&naming(), &x509()).unwrap();
+        let key_of = |id: &str| hex::encode(Sha256::digest(id.as_bytes()));
+        let refused = |key: &str, agent_id: &str| {
+            NodeIdentity::stored(key, agent_id)
+                .validate(Some(TD))
+                .is_err()
+        };
+        // Another trust domain, for both shapes.
+        assert!(refused(
+            EK,
+            &format!("spiffe://other.test/spire/agent/tpm/{EK}")
+        ));
+        let foreign = "spiffe://other.test/spire/agent/x509pop/host-a/uid-1";
+        assert!(refused(&key_of(foreign), foreign));
+        // A tpm agent whose hash is not the key, or not a hash.
+        assert!(refused(&"ab".repeat(32), &naming().agent_id(EK)));
+        assert!(refused(EK, "spiffe://sandbox.test/spire/agent/tpm/3f9a"));
+        // An x509pop agent with one segment, three, an empty one, a bad character.
+        for path in [
+            "host-a",
+            "host-a/uid-1/extra",
+            "host-a/",
+            "/uid-1",
+            "host a/uid-1",
+            "host-a/uid:1",
+            "../uid-1",
+        ] {
+            let id = format!("spiffe://sandbox.test/spire/agent/x509pop/{path}");
+            assert!(
+                refused(&key_of(&id), &id),
+                "a malformed x509pop path was accepted"
+            );
+        }
+        // The key is not the hash of the agent ID.
+        assert!(refused(EK, &x.agent_id));
+        // Another attestor, the server, a node ID, not a SPIFFE ID, and a key that is no key.
+        for id in [
+            "spiffe://sandbox.test/spire/agent/join_token/abc",
+            "spiffe://sandbox.test/spire/server",
+            "spiffe://sandbox.test/spire/agent/tpm",
+            "spiffe://sandbox.test",
+            "https://sandbox.test/spire/agent/x509pop/host-a/uid-1",
+            "",
+        ] {
+            assert!(
+                refused(&key_of(id), id),
+                "an ID that is no agent's was accepted"
+            );
+            assert!(refused(EK, id), "an ID that is no agent's was accepted");
+        }
+        assert!(refused(&naming().node_id(EK), &naming().node_id(EK)));
+        assert!(refused("ek1", &naming().agent_id("ek1")));
+        // Without a trust domain to hold it to, the shape and the key still decide.
+        assert!(
+            NodeIdentity::stored(&key_of(foreign), foreign)
+                .validate(None)
+                .is_ok()
+        );
+        assert!(
+            NodeIdentity::stored(EK, &x.agent_id)
+                .validate(None)
+                .is_err()
+        );
+        assert!(
+            NodeIdentity::stored(EK, "spiffe:///spire/agent/tpm/x")
+                .validate(None)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn the_node_key_of_an_agent_id_is_the_one_its_attestation_gives() {
+        for att in [NodeAttestation::Tpm { ek_hash: EK.into() }, x509()] {
+            let id = NodeIdentity::of(&naming(), &att).unwrap();
+            assert_eq!(node_key_of_agent_id(&id.agent_id), Some(id.key));
+        }
+        for not_an_agent in [
+            "spiffe://sandbox.test/spire/agent/tpm/3f9a",
+            "spiffe://sandbox.test/spire/agent/x509pop/host-a",
+            "spiffe://sandbox.test/spire/agent/x509pop/host-a/uid-1/extra",
+            "spiffe://sandbox.test/spire/agent/join_token/abc",
+            "spiffe://sandbox.test/spire/server",
+            "spiffe://sandbox.test/banlieue/node/abc",
+            "node-a",
+            "",
+        ] {
+            assert_eq!(node_key_of_agent_id(not_an_agent), None);
+        }
+    }
+
+    #[test]
+    fn a_certificate_is_told_from_another_of_the_same_name_by_its_fingerprint() {
+        let a = ca_pem("host-a");
+        let again = ca_pem("host-a");
+        let ids = certificate_identities(&format!("{a}{again}{a}")).unwrap();
+        assert_eq!(ids.len(), 3);
+        assert!(ids.iter().all(|(cn, _)| cn == "host-a"));
+        assert_eq!(
+            ids[0].1, ids[2].1,
+            "the same certificate, the same fingerprint"
+        );
+        assert_ne!(
+            ids[0].1, ids[1].1,
+            "another key under the name, another one"
+        );
+        assert!(certificate_identities("").is_err());
+        assert!(certificate_identities("not a pem").is_err());
+    }
+
+    #[test]
+    fn only_an_id_under_the_x509pop_agent_path_is_an_x509pop_agents() {
+        assert!(is_x509pop_agent_id(
+            "spiffe://sandbox.test/spire/agent/x509pop/host-a/uid-1"
+        ));
+        for other in [
+            "spiffe://sandbox.test/spire/agent/tpm/abc",
+            "spiffe://sandbox.test/spire/agent/x509pop",
+            "spiffe://sandbox.test/banlieue/node/x509pop/a/b",
+            "spire/agent/x509pop/a/b",
+            "",
+        ] {
+            assert!(!is_x509pop_agent_id(other));
+        }
     }
 }

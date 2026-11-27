@@ -550,18 +550,273 @@ volumes:
     secret: { secretName: mediatore-registry, defaultMode: 0440 }
 ```
 
+### Pools whose guests have no vTPM (x509pop, ADR-0049)
+
+A guest with no vTPM (banlieue's `firecracker` class, or a Cloud Hypervisor host that opted
+in to its attestation CA) has no EK to attest with. Its agent attests with SPIRE's built-in
+`x509pop` attestor instead ([ADR-0049](../adr/0049-a-guest-without-a-vtpm-attests-with-x509pop-and-a-certificate-its-host-signs.md)):
+the guest makes a key at each boot, its host signs a short-lived certificate for that key
+over vsock, and the agent proves possession of it to the server. The agent ID is
+`spiffe://<td>/spire/agent/x509pop/<host CA common name>/<machine UID>`, two things the
+control plane knows before the guest boots, so the node entry is declared in advance as it
+is for an EK. Nothing changes for a pool with a vTPM, and one cluster runs both.
+
+Such a member cannot seal its disk, so its agent keeps nothing of its identity on one: the
+shipped configuration (`image/spire/agent-x509pop.conf`, and the pool's example layer)
+uses SPIRE's `memory` key manager and a data directory on `tmpfs`, `/run/spire/agent`,
+which the agent unit's drop-in makes before the agent starts. An agent that restarts
+attests again under the same ID. Keep both settings if you write your own layer:
+`make guest-image-check` fails on a `disk` key manager or a path under `/var/lib` there.
+
+What you trust, per host, is that host's attestation CA: a host that holds its key can
+mint an identity for any guest *under its own name*, and for no other host's. Three rules
+make that true, and the SPIRE server checks none of them. `mediatore x509pop-bundle check`
+(below) checks the first two on the files you are about to apply; nothing runs it against
+the bundle a server already holds, so run it every time the ConfigMap changes:
+
+- **one CA per host, with a common name of its own**, unique among the CAs the server
+  trusts (letters, digits, dots, dashes and underscores, at most 64). Two CAs sharing a
+  name could each attest as the other's guests;
+- **`basicConstraints` CA:TRUE with a path length of zero**, so a host cannot sign a
+  further CA carrying another host's name. The broker declares no node entry under a CA
+  without it;
+- **the same certificate in two places**: the server's bundle, and inline on the host's
+  `Provider`, where the broker reads the name.
+
+**Upgrading a broker that predates this.** In this order: apply the release's
+`deploy/base/admission/clusterstaticentry-mediatore.yaml` and `deploy/base/rbac.yaml`
+on their own first (`kubectl apply -f`), then the rest, which rolls the broker. The policy
+gains the second parent shape (`spire/agent/x509pop/<segment>/<segment>`), and under the
+older policy an entry with such a parent is refused at admission; the ClusterRole gains
+`list` on `providers`, and nothing else on them (the broker lists them in every namespace
+once per pass and never reads one by name). A role you maintain yourself
+needs the same rule.
+
+Nothing enforces that order: the broker's check at start passes under the older policy
+too. A broker of this release under the older policy starts and serves TPM pools as
+before, but every `x509pop` node entry is refused at admission (the broker's log has the
+refusal), so those machines' guests never register and their claims are failed at
+`watcher.resolve_timeout_secs`, until the policy is applied. Under an older ClusterRole
+the read of a Provider is an error in the log, and nothing is declared or bound for a
+listed pool, nor is any gone node collected, until the rule is there. With
+`watcher.x509pop_pools` empty neither matters: no Provider is read and no such entry is
+declared.
+
+**The server.** `deploy/spire-x509pop` is a kustomize component beside `deploy/spire-tpm`:
+a ConfigMap with one PEM per host, an init container that joins them into the one file
+the attestor reads, and the block of `server.conf.fragment.hcl` for your `server.conf`.
+Its `agent_path_template` is the decision, not a preference: copy it as it is. There is no
+plugin binary and no checksum.
+
+```sh
+cp -r deploy/spire-x509pop ~/.config/mediatore/spire-x509pop
+# One certificate per host: the attestation CA banlieue's host install created
+# (`banlieue host cloud-hypervisor install --attestation-ca-name hv-01`), public.
+ssh hv-01 sudo cat /var/lib/banlieue/attestation-ca/ca.crt > hv-01.pem
+openssl x509 -in hv-01.pem -noout -subject -ext basicConstraints   # CN=hv-01; CA:TRUE, pathlen:0
+# The whole bundle, every host's file at once, before anything is applied. It exits non-zero
+# and names the certificate when two CAs share a common name, a name cannot be a segment of
+# an agent ID, or a certificate is not a CA with a path length of zero; otherwise it prints
+# `ok: <n> host CA(s), ...` and the names. Stop here on a refusal:
+mediatore x509pop-bundle check *.pem
+# Put it under data: of ~/.config/mediatore/spire-x509pop/host-cas.yaml in place of the
+# placeholder (one key per host), add the component to your SPIRE kustomization and the
+# fragment's block to your rendered server.conf, then:
+kubectl apply -k ~/.config/mediatore/spire
+kubectl -n spire-server rollout restart statefulset/spire-server   # the bundle is read at start
+kubectl -n spire-server rollout status statefulset/spire-server
+kubectl -n spire-server logs spire-server-0 -c spire-server | grep 'plugin_name=x509pop'
+```
+
+Replace the placeholder before you apply: the attestor loads its bundle when the server
+starts, and with no certificate in it the server does not start at all (`unable to load
+trust bundle "/x509pop/ca-bundle.pem": no certificates found in file`, then `Server
+crashed`; seen in kind with the placeholder alone). The rollout stops at that replica,
+and with a single server nothing attests until it is fixed, the TPM pools included. A key that is no
+certificate beside one that is gets skipped without a word, so a host whose PEM was
+pasted badly is simply not trusted: its guests are refused with `certificate signed by
+unknown authority`, as are those of a host you never added.
+
+**The host, on its Provider.** The same file, inline, on the `Provider` banlieue schedules
+that host's machines on. The broker reads `spec.attestation.hostCa.inline` and nothing
+else: a `configMapRef` or `secretRef` there is refused with a message naming the
+Provider, since following one would need read access to ConfigMaps or Secrets wherever a
+Provider lives.
+
+```yaml
+apiVersion: banlieue.io/v1alpha1
+kind: Provider
+metadata: { name: hv-01, namespace: sandboxes }
+spec:
+  # ...the provider's class, connection and capabilities, as before...
+  attestation:
+    hostCa:
+      inline: |
+        -----BEGIN CERTIFICATE-----
+        ...hv-01.pem, the one certificate, no key...
+        -----END CERTIFICATE-----
+```
+
+The broker looks for a machine's Provider (`status.scheduled.providerName`) in the
+machine's own namespace, and, when that namespace has none, in `watcher.provider_namespace`
+if you set it (banlieue's fallback for Providers kept in one platform namespace). To apply
+that rule it lists the Providers of every namespace, once per pass (the ClusterRole's
+`list` on `providers`), and the list is also how it sees a rival: when two Providers,
+in any namespaces, assert *different* certificates under one common name, no machine of
+either gets a node entry and their claims are failed, naming both, until one of them is
+corrected. The same certificate on two Providers is one CA and is fine. The check sees
+Providers only, not the server's bundle, which is what `x509pop-bundle check` is for.
+
+**The broker.** Which pools attest this way is your statement, in `mediatore.yaml`, never
+a label a pool's owner could set and never guessed from what a machine publishes:
+
+```yaml
+watcher:
+  x509pop_pools: ["sandboxes/microvm"]   # <namespace>/<the machines' banlieue.io/pool label>
+  # provider_namespace: banlieue-system  # only when the Providers are not in the pools' namespaces
+```
+
+A machine of a listed pool gets an `x509pop` node entry and never a TPM one, even when it
+also publishes an EK certificate; every other machine is `tpm`, as before. The node's key,
+which names its entry (`mediatore-node-<key>`), its SPIFFE ID and its `SandboxNode`, is the
+SHA-256 of the agent ID, so it does not show the host or the machine; `kubectl get
+clusterstaticentries -l app.kubernetes.io/managed-by=mediatore -o
+custom-columns=NAME:.metadata.name,PARENT:.spec.parentID` shows which is whose.
+
+**The pool's image layer.** The VM image is the same; the deployment layer is
+`image/cloud-config-deployment-x509pop.example.yaml` in place of the other example. It
+differs in three things: `/etc/spire/agent.conf` is `image/spire/agent-x509pop.conf` (the
+`x509pop` attestor over `/run/spire/x509pop/key.pem` and `cert.pem`, no
+`intermediates_path`); a drop-in, `/etc/systemd/system/spire-agent.service.d/x509pop.conf`,
+makes the agent require `mediatore-node-cert.service`, which fetches the certificate from
+the host before the agent starts and keeps it renewed (no certificate, no agent); and
+`MEDIATORE_NODE_ATTESTATION=x509pop` in `/etc/mediatore-guest/env` tells the guest to read
+its names from that certificate and leave the TPM alone. The three go together with the
+pool's line in `watcher.x509pop_pools`: a guest that attests one way while the broker
+expects the other gets no SVID and never registers. banlieue's EK-certificate layer has no
+use on such a pool. The agent's unit keeps its two TPM device lines; systemd starts a unit
+whose allowed device does not exist (checked with `systemd-run` on Debian 13's systemd
+257). No member has booted from this layer yet: the server's side, the agent's
+configuration and the registration run in kind (`make kind-e2e-x509pop`, [testing
+tiers](testing.md)), and the certificate fetch was proven against banlieue's signer on its
+own.
+
+**When nothing is declared.** A listed machine gets no node entry at all while something
+its entry is made from is missing or refused, and the broker's log names the machine and
+the reason. It never falls back to the machine's EK. The reasons, as the log gives them:
+
+- missing, which may pass, so the watcher looks again: `machine <ns>/<name> is of an
+  x509pop pool and publishes no attestationSubject`; `... is not placed on a Provider
+  yet`; `... its Provider <name> was not found`;
+- refused, which waiting does not cure: `Provider <ns>/<name> asserts no
+  spec.attestation.hostCa, so its guests have no x509pop identity`; `...
+  spec.attestation.hostCa must be inline; a configMapRef or secretRef is not read`; `...
+  spec.attestation.hostCa.inline is not set`; `... the host CA or machine <ns>/<name>'s
+  attestationSubject is unusable: <the rule>` (for a CA that may sign further CAs, `its
+  path length constraint must be 0`); `two Providers assert host CAs named "<cn>" with
+  different certificates (<ns/a> and <ns/b>); a host CA's common name must be unique`.
+
+With `watcher.x509pop_pools` set, every `Bound` claim, of a TPM pool too, is resolved
+through the machine its `status.virtualMachineRef` names, since the machine's pool label
+says which attestor applies (banlieue v0.6.0 writes the reference with the `Bound` phase).
+With the list empty nothing is read that was not read before.
+
+A claim bound to such a machine is **failed**, not left unbound: the broker revokes its
+record and deletes the `VirtualMachineClaim`, which makes banlieue destroy the member,
+and logs `claim failed: record revoked, claim deleted` with the reason. For a refused
+cause that happens at the first pass. For a missing one it happens after
+`watcher.resolve_timeout_secs` (60 by default), as it does when the claim names no
+machine yet, when its machine does not exist, and when everything was declared but the
+guest has not registered (`no node registered for the machine's x509pop identity`). A
+banned node, and a node registered under another agent ID than its machine attests as,
+fail the claim at once. A Provider the broker cannot read at all is an error in the log
+and not a verdict: nothing is declared, bound or collected until it can be read.
+
+**A node key registered under another agent ID.** The first registration under a node
+key stands. A guest that registers the same key under another agent ID (a machine first
+registered under one attestor and now, honestly, under the other) is answered
+`409 node_identity_conflict`, stops, and the broker logs `node registration refused: the
+key is registered under another agent ID` with the key and both IDs; nothing is changed.
+To let it register again, delete the record, after checking that no live sandbox is bound
+to it. The record is a `SandboxNode` in the broker's own namespace (`mediatore-system`
+here), named by the node key; a sandbox bound to a node carries the label
+`mediatore.io/node`, the first 32 hex characters of the SHA-256 of that node's agent ID,
+and the agent ID itself in `status.record.nodeId`:
+
+```sh
+KEY=<the node key from the log line, its node_key field>
+# The agent ID the key is registered under (stored_agent_id in the log line):
+NODE_ID=$(kubectl -n mediatore-system get sandboxnode "$KEY" -o jsonpath='{.spec.nodeId}')
+echo "$NODE_ID"
+# No live sandbox may name that agent ID as its node (live: not revoked, not past its deadline):
+LABEL=$(printf '%s' "$NODE_ID" | openssl dgst -sha256 -r | cut -c1-32)
+kubectl get agentsandboxes -A -l "mediatore.io/node=$LABEL" -o json \
+  | jq -r --arg id "$NODE_ID" --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      '.items[] | select(.status.record.nodeId == $id and .status.record.revokedAt == null
+         and (.status.record.expiresAt == null or .status.record.expiresAt > $now))
+       | "\(.metadata.namespace)/\(.metadata.name)"'
+kubectl -n mediatore-system delete sandboxnode "$KEY"   # only when the command above printed nothing
+```
+
+Then restart the guest (its unit exited on the `409`); it registers under the agent ID it
+attests as now.
+
+On the guest the agent may well attest, since the server only needs the CA in its
+bundle, but no entry is parented to it: the guest waits for an SVID, never registers,
+and never announces `GuestReady`. `spire-server
+agent list` showing an `x509pop` agent with no `mediatore-node-` entry under it is this
+case: compare the agent's ID with the Provider's certificate (`openssl x509 -noout
+-subject`) and the machine's `status.attestationSubject`.
+
+**Retiring a host, or rotating its CA.** Remove the host's key from the bundle ConfigMap
+and restart the servers: every identity that CA signed is refused at its agents' next
+re-attestation, about half an SVID lifetime away, so drain the host's machines first.
+Then remove `hostCa` from the Provider, which makes the broker retract that host's node
+entries at the next resync. Remove the field and keep the Provider while any of its
+machines exists: a Provider that is gone reads as "not found", which is one of the
+missing causes and the one with no time limit, so nothing of that host is retracted and
+the x509pop collection of every listed pool is held
+(see [Nodes of VMs that are gone](#nodes-of-vms-that-are-gone)) until its machines are
+deleted too. A rotation is a new CA under a
+*new* name (banlieue refuses to reuse one for another key): add the new certificate to the
+bundle, restart the servers, put it on the Provider, and keep the old certificate in the
+bundle until the certificates it signed have expired (the host's
+`--attestation-certificate-ttl`, an hour by default). The node keys of that host's
+machines change with the name, so their entries are declared afresh under new names, and
+a machine running across the change loses the identity it registered with: ADR-0049
+leaves open how a host changes its CA without orphaning live guests, so drain the host
+before a rotation as before a retirement.
+
 ### Nodes of VMs that are gone
 
 Every VM that registers leaves a `SandboxNode`, and a pool that recycles its members (one-shot
 claims end their VM) would add one per VM for ever. The broker removes the node of a VM that no
 longer exists ([ADR-0039](../adr/0039-a-node-leaves-the-register-when-its-vm-is-gone.md)): at
 each resync, on the replica holding the watcher's Lease, when no pool member `VirtualMachine`
-publishes its EK hash. Two settings matter. `watcher.resync_secs` (five minutes) is how often it
+gives its node key (its EK hash, or for a pool listed as `x509pop` the key of its agent ID). Two settings matter. `watcher.resync_secs` (five minutes) is how often it
 looks; `store.node_grace_secs` (ten minutes, zero refused) is how old a registration must be
 before it can go, so a registration that precedes its VM's published certificate is never
 collected. The ClusterRole in `deploy/base/rbac.yaml` already grants `delete` on `sandboxnodes`
 and `list` on `virtualmachines`; check a role you maintain yourself has both. A banned node stays
-until you delete it. `kubectl get sandboxnodes` should settle at
+until you delete it. For the pools listed as `x509pop` there is one more hold: a pass that holds
+removes no x509pop node and no x509pop node entry, in any listed pool, and logs `an x509pop
+machine gives no key yet; no x509pop node or entry is collected in this pass` for the machine that
+holds it. Two things hold a pass:
+
+- a listed machine whose Provider is not found, whatever the machine's age, so a Provider deleted
+  and applied again costs its idle guests nothing. This hold has no bound: a machine placed on a
+  Provider that does not exist holds the collection until the Provider is applied or the machine
+  is deleted, so if the line repeats at every resync with `its Provider <name> was not found`,
+  find the machine it names and do one or the other;
+- a listed machine that still has no `attestationSubject` or is not placed, while it is young:
+  its `metadata.creationTimestamp` is less than `store.node_grace_secs` ago, the same grace a
+  young node gets. Past that it holds nothing, and the log says so at each pass (`an x509pop
+  machine older than the node grace still gives no key; it does not hold the collection`): a
+  machine that never gets its subject delays the collection by the grace at most, and is worth
+  fixing or deleting for its own sake.
+
+A host CA you withdraw, rename or loosen is not "missing",
+and its entries are still retracted. `kubectl get sandboxnodes` should settle at
 about the size of the pool plus the grace's worth of churn.
 
 ## 7. The egress gateways

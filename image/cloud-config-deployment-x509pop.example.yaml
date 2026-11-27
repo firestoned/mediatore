@@ -1,0 +1,146 @@
+#cloud-config
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+
+# The deployment's layer for a pool whose guests have no vTPM (ADR-0049): what
+# image/cloud-config-deployment.example.yaml is for a pool that has one, with the three
+# things that differ. The agent's configuration is image/spire/agent-x509pop.conf (the
+# x509pop attestor over the key and certificate `mediatore node-cert` fetches from the host,
+# no plugin binary); a drop-in makes the agent's unit require that fetch, so no
+# certificate means no agent; and the guest is told the attestor, since it names the node
+# it registers. Copy it outside the repository, replace the placeholders, and store it as
+# the pool's deployment layer in place of the other example. Public material only: the
+# guest's key is generated at each boot under /run/spire/x509pop and never appears here.
+#
+# The pool must also be listed in the broker's watcher.x509pop_pools, the host's CA be in
+# the SPIRE server's bundle (deploy/spire-x509pop) and on the host's Provider; the
+# deploying guide has the order. banlieue's EK-certificate layer has no use on such a pool.
+#
+# Written for a Kairos guest on a host that issues attestation certificates over vsock
+# (banlieue ADR-0146). Its shape is checked in the built image (image/check.sh) and its
+# agent configuration attests in kind (`make kind-e2e-x509pop`); no member has booted from
+# this layer yet.
+install:
+  auto: true
+  device: auto
+  reboot: true
+  poweroff: false
+  # No encrypted_partitions: the other example seals COS_PERSISTENT to the member's vTPM,
+  # and this guest has none. So the agent keeps nothing of its identity on that disk: its
+  # SVID's key is in memory (KeyManager "memory") and its data directory on tmpfs
+  # (/run/spire/agent, made by the drop-in below), both gone with the agent or the boot.
+  # Nothing needs them to last: the attestation key is new at each boot, on tmpfs, the
+  # agent's ID is the host CA's name and the machine's UID (ADR-0049 decisions 2 and 5),
+  # and an agent that starts with no key attests again under that ID.
+# Console break-glass only: the image has no sshd (ADR-0010). A hashed password, or
+# `install.nousers: true` for a member nobody can log in to.
+users:
+  - name: kairos-admin
+    groups: ["admin"]
+    passwd: "$6$replace-me$with-a-hash-from-mkpasswd"
+stages:
+  initramfs:
+    # /etc is an ephemeral overlay on Kairos: written at every boot, from this layer.
+    - name: spire-agent-x509pop-unit
+      # The drop-in's directory with a directory's mode, before the file below.
+      directories:
+        - path: /etc/systemd/system/spire-agent.service.d
+          permissions: 0755
+          owner: 0
+          group: 0
+    - name: spire-agent-config
+      files:
+        # No bundle file, as in the other example: the agent's first-contact bundle is
+        # fetched at every boot through the gateway's bundle leg (ADR-0037; the
+        # SPIRE_BUNDLE_* lines of /etc/mediatore-guest/env below).
+        - path: /etc/spire/agent.conf
+          permissions: 0644
+          owner: 0
+          group: 0
+          # image/spire/agent-x509pop.conf with the two placeholders replaced: the trust
+          # domain and the server's address (with egress gateways a gateway's sandbox
+          # address and the control relay's SPIRE port, as in the other example). The two
+          # paths are where mediatore node-cert writes; there is no intermediates_path,
+          # which SPIRE refuses when the host CA is self-signed and the file empty.
+          content: |
+            agent {
+              trust_domain = "sandbox.home.example"
+              server_address = "198.51.100.1"
+              server_port = "3129"
+              trust_bundle_path = "/run/spire/bundle.json"
+              trust_bundle_format = "spiffe"
+              socket_path = "/run/spire/sockets/agent.sock"
+              data_dir = "/run/spire/agent"
+              log_level = "INFO"
+            }
+            plugins {
+              NodeAttestor "x509pop" {
+                plugin_data {
+                  private_key_path = "/run/spire/x509pop/key.pem"
+                  certificate_path = "/run/spire/x509pop/cert.pem"
+                }
+              }
+              KeyManager "memory" {
+                plugin_data {}
+              }
+              WorkloadAttestor "unix" {
+                plugin_data {
+                  discover_workload_path = true
+                }
+              }
+            }
+        - path: /etc/systemd/system/spire-agent.service.d/x509pop.conf
+          permissions: 0644
+          owner: 0
+          group: 0
+          # image/systemd/spire-agent-x509pop.conf, as it is: the agent requires the
+          # certificate fetch (mediatore-node-cert.service, installed in the image and
+          # enabled by nothing else) and wants the renewal beside it, and its data
+          # directory is made on tmpfs before it starts. The unit's TPM device lines stay:
+          # systemd starts a unit whose allowed device does not exist.
+          content: |
+            [Unit]
+            Requires=mediatore-node-cert.service
+            After=mediatore-node-cert.service
+            Wants=mediatore-node-cert-renew.service
+            [Service]
+            ExecStartPre=/usr/bin/install -d -m 0700 /run/spire/agent
+    - name: mediatore-guest-env
+      files:
+        - path: /etc/mediatore-guest/env
+          permissions: 0644
+          owner: 0
+          group: 0
+          # image/env.example, as in the other example, plus the attestor: under x509pop
+          # the guest reads the host CA's name and its own from the certificate node-cert
+          # wrote and never opens a TPM (ADR-0049 decision 8). Whole-line comments only:
+          # systemd's EnvironmentFile keeps an inline comment as part of the value.
+          content: |
+            MEDIATORE_URL=https://198.51.100.1:3130
+            SPIFFE_ENDPOINT_SOCKET=/run/spire/sockets/agent.sock
+            MEDIATORE_NODE_ATTESTATION=x509pop
+            SPIRE_BUNDLE_HOST=spire.sandbox.example
+            SPIRE_BUNDLE_PORT=3131
+            SPIRE_BUNDLE_GATEWAY=198.51.100.1
+            SPIRE_BUNDLE_CA=/etc/mediatore/bundle-ca.pem
+            RUST_LOG=info
+    - name: mediatore-gateways
+      files:
+        # The pool's bootstrap list of egress gateways and the bundle endpoint's roots,
+        # exactly as in the other example (ADR-0027 decision 4, ADR-0037).
+        - path: /etc/mediatore/gateways
+          permissions: 0644
+          owner: 0
+          group: 0
+          content: |
+            198.51.100.1:8443
+            198.51.100.2:8443
+            198.51.100.3:8443
+        - path: /etc/mediatore/bundle-ca.pem
+          permissions: 0644
+          owner: 0
+          group: 0
+          content: |
+            -----BEGIN CERTIFICATE-----
+            ...the CA the bundle endpoint's certificate chains to...
+            -----END CERTIFICATE-----

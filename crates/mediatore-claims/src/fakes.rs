@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use banlieue_api::banlieue::{VirtualMachine, VirtualMachineClaim};
+use banlieue_api::banlieue::{Provider, VirtualMachine, VirtualMachineClaim};
 use jiff::Timestamp;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use kube::ResourceExt;
@@ -41,6 +41,15 @@ pub(crate) struct FakeClaims {
     machines: Mutex<Vec<VirtualMachine>>,
     /// Make `list_machines` fail, as an unreachable API server does.
     fail_machines: Mutex<bool>,
+    /// The `Provider`s that exist, by namespace and name.
+    providers: Mutex<HashMap<Key, Provider>>,
+    /// Make every read of a `Provider` fail, as an unreachable API server (or a role
+    /// without the verb) does.
+    fail_providers: Mutex<bool>,
+    /// How many times the `Provider`s were listed.
+    provider_reads: Mutex<usize>,
+    /// How many times one machine was fetched.
+    machine_reads: Mutex<usize>,
 }
 
 fn key(namespace: &str, name: &str) -> Key {
@@ -62,6 +71,48 @@ impl FakeClaims {
 
     pub(crate) fn fail_machine_listing(&self, fail: bool) {
         *self.fail_machines.lock().unwrap() = fail;
+    }
+
+    /// Replace the pool member VMs that exist.
+    pub(crate) fn set_machines(&self, vms: Vec<VirtualMachine>) {
+        *self.machines.lock().unwrap() = vms;
+    }
+
+    /// Create or replace a `Provider`.
+    pub(crate) fn put_provider(&self, provider: Provider) {
+        let k = key(
+            &provider.namespace().unwrap_or_default(),
+            &provider.name_any(),
+        );
+        self.providers.lock().unwrap().insert(k, provider);
+    }
+
+    pub(crate) fn remove_provider(&self, namespace: &str, name: &str) {
+        self.providers.lock().unwrap().remove(&key(namespace, name));
+    }
+
+    pub(crate) fn fail_provider_reads(&self, fail: bool) {
+        *self.fail_providers.lock().unwrap() = fail;
+    }
+
+    /// How many times a `Provider` was read.
+    pub(crate) fn provider_reads(&self) -> usize {
+        *self.provider_reads.lock().unwrap()
+    }
+
+    /// How many times one machine was fetched.
+    pub(crate) fn machine_reads(&self) -> usize {
+        *self.machine_reads.lock().unwrap()
+    }
+
+    fn read_provider(&self) -> Result<(), WatchError> {
+        *self.provider_reads.lock().unwrap() += 1;
+        if *self.fail_providers.lock().unwrap() {
+            return Err(WatchError::Api(
+                "providers.banlieue.io is forbidden or unreachable".into(),
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn put_sandbox(&self, sb: AgentSandbox) {
@@ -149,6 +200,29 @@ impl ClaimsApi for FakeClaims {
             return Err(WatchError::Api("the API server is unreachable".into()));
         }
         Ok(self.machines.lock().unwrap().clone())
+    }
+
+    async fn get_machine(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> Result<Option<VirtualMachine>, WatchError> {
+        *self.machine_reads.lock().unwrap() += 1;
+        if *self.fail_machines.lock().unwrap() {
+            return Err(WatchError::Api("the API server is unreachable".into()));
+        }
+        Ok(self
+            .machines
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|vm| vm.namespace().as_deref() == Some(namespace) && vm.name_any() == name)
+            .cloned())
+    }
+
+    async fn list_providers(&self) -> Result<Vec<Provider>, WatchError> {
+        self.read_provider()?;
+        Ok(self.providers.lock().unwrap().values().cloned().collect())
     }
 
     async fn list_claim_uids(&self) -> Result<HashSet<Uuid>, WatchError> {
@@ -251,7 +325,7 @@ pub(crate) fn rig(cfg: WatcherConfig) -> Rig {
 /// A rig whose watcher reads `bundles`, the cache a reflector fills.
 pub(crate) fn rig_with(cfg: WatcherConfig, bundles: Option<Arc<BundleCache>>) -> Rig {
     let store = Arc::new(MemoryStore::default());
-    let entries = Arc::new(MemoryEntries::default());
+    let entries = Arc::new(MemoryEntries::in_trust_domain("sandbox.test"));
     let claims = Arc::new(FakeClaims::default());
     let reconciler = Reconciler {
         store: store.clone(),
@@ -272,6 +346,7 @@ pub(crate) fn rig_with(cfg: WatcherConfig, bundles: Option<Arc<BundleCache>>) ->
     }
 }
 
+/// A registered TPM node: keyed by its EK hash, with the agent ID that hash gives.
 pub(crate) fn node(ek_hash: &str, banned: bool) -> NodeRecord {
     NodeRecord {
         ek_hash: ek_hash.into(),

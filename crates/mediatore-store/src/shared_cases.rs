@@ -72,6 +72,7 @@ macro_rules! shared_suite {
             modify_claim_decides_again_on_the_fresh_record_and_stops_at_a_released_one,
             modify_claim_gives_up_after_its_attempts_with_a_conflict,
             what_the_guest_rendered_and_the_follow_verdict_survive_a_write,
+            a_claim_is_found_by_the_x509pop_agent_id_of_its_node,
         );
     };
 }
@@ -243,6 +244,41 @@ pub async fn a_record_read_twice_carries_a_version_and_a_write_moves_it(f: &dyn 
         fourth.version.is_some() && fourth.version != third.version,
         "a release moves the version"
     );
+}
+
+/// ADR-0049 decision 8: a claim bound to an x509pop node carries that node's agent ID, and the
+/// lookup by node finds it by exactly that ID: not by another guest of the same host, not by
+/// another host's guest of the same name, not by a longer or shorter ID. The names are at the
+/// length limit, so a store that keys the lookup on something bounded (a label) is held to it.
+pub async fn a_claim_is_found_by_the_x509pop_agent_id_of_its_node(f: &dyn Fixture) {
+    let s = f.store();
+    let issuer = "h".repeat(64);
+    let subject = "v".repeat(64);
+    let agent = format!("spiffe://sandbox.test/spire/agent/x509pop/{issuer}/{subject}");
+    let (uid, _) = stored(f, record(Uuid::new_v4())).await;
+    let mut bound = s.get_claim(uid).await.unwrap();
+    bound.node_id = Some(agent.clone());
+    bound.expires_at = Some(Timestamp::now() + SignedDuration::from_hours(1));
+    s.update_claim(bound).await.unwrap();
+    let found = s.get_claim_by_node(&agent).await.unwrap();
+    assert!(found.uid == uid, "found by its node's x509pop agent ID");
+    assert!(
+        found.node_id.as_deref() == Some(agent.as_str()),
+        "and the ID is stored whole"
+    );
+    for other in [
+        format!("spiffe://sandbox.test/spire/agent/x509pop/{issuer}/other"),
+        format!("spiffe://sandbox.test/spire/agent/x509pop/other/{subject}"),
+        format!("spiffe://sandbox.test/spire/agent/x509pop/{issuer}"),
+        format!("{agent}/extra"),
+        format!("spiffe://other.test/spire/agent/x509pop/{issuer}/{subject}"),
+    ] {
+        let missed = matches!(
+            s.get_claim_by_node(&other).await,
+            Err(StoreError::NotFound(_))
+        );
+        assert!(missed, "another agent's ID finds nothing");
+    }
 }
 
 /// Decision 2: a copy read before another write landed is refused, and nothing of it lands.

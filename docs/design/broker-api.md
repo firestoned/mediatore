@@ -33,7 +33,7 @@ never sits behind a TLS-ending proxy: it is exposed as a TLS passthrough so the 
 | Route | Called by | Does |
 | --- | --- | --- |
 | `GET /healthz` | anyone on the listener | liveness |
-| `POST /v1/nodes` | a pool VM | register the node: its EK hash and DMI UUID |
+| `POST /v1/nodes` | a pool VM | register the node: how it attested and its DMI UUID. A TPM node sends the top-level `ek_hash`; an x509pop node sends `attestation: {kind: x509pop, issuer_cn, subject_cn}` (ADR-0049 decision 8). The broker derives the node key from it and answers `403` unless the peer is `banlieue/node/<that key>`; an unknown kind or field, or an `x509pop` attestation beside a non-empty `ek_hash`, is `400 invalid_attestation`, and neither given is `400 invalid_ek_hash`. The first record under a node key stands: the same key under another DMI UUID is `409 duplicate_ek`, and under another agent ID (a key first registered under the other attestor) `409 node_identity_conflict`, with nothing changed and the line `node registration refused: the key is registered under another agent ID` in the broker's log (`NodeRecord::registration_conflict`, `crates/mediatore-store/src/lib.rs`, the one rule of both stores). An operator clears it by deleting the `SandboxNode` named by the key, once no live claim is bound to it |
 | `GET /v1/me` | the guest, as the node | the claim bound to that node: workload, routes, gateways, registry credential. The guest writes the routes to files for the egress proxy, which then needs no route of its own to read them |
 | `POST /v1/me/report` | the guest | what the VM found: the image digest, the ruleset's hash, the host table |
 | `POST /v1/me/exit` | the guest | the workload ended under its restart policy; the broker releases the claim |
@@ -52,7 +52,7 @@ On the sandbox listener `mediatore-tls` verifies the client certificate and atta
 extension; the handlers read the identity from that and from nothing the client sent. Only a server started with
 `dev_mode`, on a plain loopback listener, reads it from the `x-mediatore-peer-spiffe-id` header instead. A route that
 needs a claim identity checks the SPIFFE ID's shape (`/banlieue/claim/<uid>`), and a route that needs a node checks
-`/banlieue/node/<ek-hash>`. See [Identity and mTLS](identity-and-mtls.md).
+`/banlieue/node/<node key>`. See [Identity and mTLS](identity-and-mtls.md).
 
 ## `POST /v1/claims`: what a request goes through
 

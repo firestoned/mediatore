@@ -3,10 +3,13 @@
 #
 # What may be declared as one of the broker's SPIRE registration entries, and by
 # whom (ADR-0006 decision 6, ADR-0056 decision 4). mediatore creates exactly two
-# shapes (ADR-0004):
+# shapes (ADR-0004), each under one of two kinds of agent (ADR-0049 decision 11):
 #
-#   node   spiffe://<td>/banlieue/node/<ek>   parent spiffe://<td>/spire/agent/tpm/<ek>
-#   claim  spiffe://<td>/banlieue/claim/<uid> parent spiffe://<td>/spire/agent/tpm/<ek>
+#   node   spiffe://<td>/banlieue/node/<key>   parent <agent>
+#   claim  spiffe://<td>/banlieue/claim/<uid>  parent <agent>
+#
+#   <agent>  spiffe://<td>/spire/agent/tpm/<ek>                          a guest with a vTPM
+#            spiffe://<td>/spire/agent/x509pop/<issuer CN>/<subject CN>  a guest without one
 #
 # Everything else is refused at admission, in the API server, by CEL (no
 # webhook), so the restriction holds even if mediatore's own code is wrong.
@@ -14,7 +17,26 @@
 # Requires Kubernetes 1.30+ (ValidatingAdmissionPolicy GA).
 #
 # <ek> is the hex SHA-256 of the EK's DER SubjectPublicKeyInfo (64 hex chars),
-# the same value the tpm node attestor puts in the agent ID.
+# the same value the tpm node attestor puts in the agent ID. <key>, the node key,
+# is <ek> for a tpm agent's node, and the policy holds a node entry to that: the
+# same hash on both sides. For an x509pop agent's node, <key> is the hex SHA-256
+# of the agent ID itself (ADR-0049 decision 7): still 64 hex, so the spiffeID
+# rule holds it to the shape, BUT THE POLICY CANNOT CHECK THAT IT IS THE HASH OF
+# ITS PARENT. CEL has no hash function. So under an x509pop parent the broker's
+# ServiceAccount, misused, could declare a node ID that is not that agent's own.
+# It may already parent any claim's entry to any agent of the trust domain,
+# which is its job; the difference is recorded as an accepted risk in the threat
+# model (revisit when CEL gains a hash, or when an x509pop node's ID carries its
+# names). The broker's own code cannot produce such an entry: a node entry's key
+# is never an input, it is derived from the attestation together with the parent
+# (node_entry_spec, crates/mediatore-spire/src/x509pop.rs). What that file's
+# NodeIdentity::validate guards is the other shape, a claim entry, whose parent
+# must be the agent its node key belongs to.
+#
+# The two segments of an x509pop agent ID are the common names of the host's CA
+# and of the guest's certificate: 1 to 64 of letters, digits, dot, dash and
+# underscore each, and neither "." nor ".." (ADR-0049 decision 2). Exactly two:
+# a third segment, or a character outside the alphabet, is refused.
 #
 # The policy judges an entry by what it is, not only by who sends it. It claims
 # every CREATE and UPDATE that the broker's ServiceAccount sends, and from any
@@ -95,12 +117,24 @@ spec:
       expression: "'^spiffe://[a-z0-9.-]+'"
     - name: hex64
       expression: "'[0-9a-f]{64}'"
+    # One segment of an x509pop agent ID: a certificate's common name (ADR-0049 decision 2).
+    - name: seg
+      expression: "'[A-Za-z0-9._-]{1,64}'"
     - name: uuid
       expression: "'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'"
     - name: isNode
       expression: "object.spec.spiffeID.contains('/banlieue/node/')"
     - name: isClaim
       expression: "object.spec.spiffeID.contains('/banlieue/claim/')"
+    # The parent is the agent of a guest with a vTPM.
+    - name: tpmParent
+      expression: "object.spec.parentID.matches(variables.td + '/spire/agent/tpm/' + variables.hex64 + '$')"
+    # The parent is the agent of a guest without one: exactly an issuer and a subject
+    # segment, neither of them "." or "..".
+    - name: x509popParent
+      expression: >-
+        object.spec.parentID.matches(variables.td + '/spire/agent/x509pop/' + variables.seg + '/' + variables.seg + '$') &&
+        !object.spec.parentID.matches('/[.]{1,2}(/|$)')
   validations:
     # Who: first, so that a broker this policy does not name is told exactly that,
     # whatever else is wrong with what was sent. The message is read by the broker's
@@ -116,18 +150,20 @@ spec:
       reason: Forbidden
     - expression: >-
         object.spec.spiffeID.matches(variables.td + '/banlieue/(node/' + variables.hex64 + '|claim/' + variables.uuid + ')$')
-      message: "spiffeID must be spiffe://<td>/banlieue/node/<ek-hash> or spiffe://<td>/banlieue/claim/<uuid>"
+      message: "spiffeID must be spiffe://<td>/banlieue/node/<node-key> or spiffe://<td>/banlieue/claim/<uuid>"
       reason: Forbidden
-    - expression: >-
-        object.spec.parentID.matches(variables.td + '/spire/agent/tpm/' + variables.hex64 + '$')
-      message: "parentID must be a tpm agent ID: spiffe://<td>/spire/agent/tpm/<ek-hash>"
+    - expression: "variables.tpmParent || variables.x509popParent"
+      message: "parentID must be a tpm agent ID, spiffe://<td>/spire/agent/tpm/<ek-hash>, or an x509pop agent ID, spiffe://<td>/spire/agent/x509pop/<issuer-cn>/<subject-cn>"
       reason: Forbidden
     - expression: "object.spec.spiffeID.split('/')[2] == object.spec.parentID.split('/')[2]"
       message: "spiffeID and parentID must be in the same trust domain"
       reason: Forbidden
-    # A node entry may only be parented to its own agent: same EK hash on both sides.
+    # A node entry may only be parented to its own agent. Under a tpm agent: the same EK
+    # hash on both sides. Under an x509pop agent the node key is a SHA-256 of the parent,
+    # which CEL cannot compute, so the rule is skipped there (see the header). A parent
+    # that is neither is refused by the validation above, and is not judged here.
     - expression: >-
-        !variables.isNode ||
+        !variables.isNode || !variables.tpmParent ||
         object.spec.spiffeID.split('/banlieue/node/')[1] == object.spec.parentID.split('/spire/agent/tpm/')[1]
       message: "a node entry's EK hash must equal its parent agent's EK hash"
       reason: Forbidden

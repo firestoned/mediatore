@@ -276,6 +276,11 @@ YAML
   # not the one under test (dev/kind/spire/fallback-patch.yaml).
   proxy_logs "$name" | grep -F "SVID from the Workload API" | grep -qF "spiffe_id=spiffe://$TD/banlieue/${role%%-*}/" \
     || fail "$name: the proxy did not start on a ${role%%-*} SVID ($(proxy_logs "$name" | grep -F "SVID from the Workload API" | grep -o 'spiffe_id=[^ ]*' || echo 'none logged'))"
+  # The proxy runs beside the jail as the sandbox user: it starts only behind its
+  # address-family filter (crates/mediatore-guest/src/seccomp.rs, restrict_families, which
+  # proves the filter by asking for a socket it must refuse), and says so first.
+  proxy_logs "$name" | grep -qF "address families restricted to unix and inet" \
+    || fail "$name: the proxy did not report its address-family filter"
   [ "$(pod_phase "$name")" = Succeeded ] || fail "$name did not end as expected"
 }
 
@@ -575,6 +580,50 @@ own_admitted broker mediatore-own-probe-claim "$OWN" "$CLAIM_ID" "$AGENT" "$CLAI
 own_admitted broker mediatore-own-probe-node "$OWN" "/banlieue/node/$ZEROS" "$AGENT" "$NODE_SELECTORS"
 own_refused "named mediatore-*" broker own-probe-i "$OWN" "$CLAIM_ID" "$AGENT" "$CLAIM_SELECTORS"
 own_refused "parentID must be a tpm agent ID" broker mediatore-own-probe-j "$OWN" "$CLAIM_ID" /spire/server "$CLAIM_SELECTORS"
+# ADR-0049 decision 11: a second parent shape, the x509pop agent of a guest with no vTPM,
+# exactly spire/agent/x509pop/<issuer CN>/<subject CN>. A node entry under one is admitted
+# whatever its 64 hex key (CEL has no hash to hold it to its parent with), and so is a claim
+# entry; a third segment, a character outside the alphabet and a dot segment are refused.
+# Under a tpm parent the node's key must still be its parent's.
+X509POP_AGENT=/spire/agent/x509pop/hv-01/3f0c2a1e-7b1d-4e0a-9c55-0a1b2c3d4e5f
+ONES=1111111111111111111111111111111111111111111111111111111111111111
+PARENT_RULE="parentID must be a tpm agent ID, spiffe://<td>/spire/agent/tpm/<ek-hash>, or an x509pop agent ID"
+own_admitted broker mediatore-own-probe-x509pop-node "$OWN" "/banlieue/node/$ONES" "$X509POP_AGENT" "$NODE_SELECTORS"
+own_admitted broker mediatore-own-probe-x509pop-claim "$OWN" "$CLAIM_ID" "$X509POP_AGENT" "$CLAIM_SELECTORS"
+own_refused "$PARENT_RULE" broker mediatore-own-probe-k "$OWN" "/banlieue/node/$ONES" "$X509POP_AGENT/extra" "$NODE_SELECTORS"
+own_refused "$PARENT_RULE" broker mediatore-own-probe-l "$OWN" "/banlieue/node/$ONES" "/spire/agent/x509pop/hv-01/vm:1" "$NODE_SELECTORS"
+own_refused "$PARENT_RULE" broker mediatore-own-probe-m "$OWN" "/banlieue/node/$ONES" /spire/agent/x509pop/hv-01 "$NODE_SELECTORS"
+own_refused "$PARENT_RULE" broker mediatore-own-probe-n "$OWN" "/banlieue/node/$ONES" /spire/agent/x509pop/../hv-01 "$NODE_SELECTORS"
+own_refused "$PARENT_RULE" broker mediatore-own-probe-o "$OWN" "$CLAIM_ID" /spire/agent/join_token/abc "$CLAIM_SELECTORS"
+own_refused "a node entry's EK hash must equal its parent agent's EK hash" broker mediatore-own-probe-p "$OWN" "/banlieue/node/$ONES" "$AGENT" "$NODE_SELECTORS"
+own_refused "$NOT_THE_BROKER" admin own-probe-q '{}' "/banlieue/node/$ONES" "$X509POP_AGENT" "$NODE_SELECTORS"
+# The edges of the segment rule: a dot segment last, a segment of 65 characters (64 is the
+# most a common name holds), an empty segment, and a parent of another trust domain than
+# the entry's own.
+SEG64=$(printf 'a%.0s' $(seq 1 64))
+own_admitted broker mediatore-own-probe-x509pop-64 "$OWN" "/banlieue/node/$ONES" "/spire/agent/x509pop/hv-01/$SEG64" "$NODE_SELECTORS"
+own_refused "$PARENT_RULE" broker mediatore-own-probe-r "$OWN" "/banlieue/node/$ONES" "/spire/agent/x509pop/hv-01/${SEG64}a" "$NODE_SELECTORS"
+own_refused "$PARENT_RULE" broker mediatore-own-probe-s "$OWN" "/banlieue/node/$ONES" "/spire/agent/x509pop/${SEG64}a/vm-1" "$NODE_SELECTORS"
+own_refused "$PARENT_RULE" broker mediatore-own-probe-t "$OWN" "/banlieue/node/$ONES" /spire/agent/x509pop/hv-01/.. "$NODE_SELECTORS"
+own_refused "$PARENT_RULE" broker mediatore-own-probe-u "$OWN" "/banlieue/node/$ONES" /spire/agent/x509pop/hv-01/. "$NODE_SELECTORS"
+own_refused "$PARENT_RULE" broker mediatore-own-probe-v "$OWN" "/banlieue/node/$ONES" /spire/agent/x509pop//vm-1 "$NODE_SELECTORS"
+own_refused "$PARENT_RULE" broker mediatore-own-probe-w "$OWN" "/banlieue/node/$ONES" /spire/agent/x509pop/hv-01/ "$NODE_SELECTORS"
+# dry_own writes both IDs under the tier's trust domain; this one names its parent in another trust domain.
+other_td=$("${KSA[@]}" create --dry-run=server -o name -f - 2>&1 <<YAML || true
+apiVersion: spire.spiffe.io/v1alpha1
+kind: ClusterStaticEntry
+metadata:
+  name: mediatore-own-probe-x
+  labels: $OWN
+spec:
+  className: spire-server-spire
+  spiffeID: spiffe://$TD/banlieue/node/$ONES
+  parentID: spiffe://other.test$X509POP_AGENT
+  selectors: $NODE_SELECTORS
+YAML
+)
+grep -qF "clusterstaticentry.spire.spiffe.io/mediatore-own-probe-x" <<<"$other_td" && fail "an x509pop parent of another trust domain than the entry's was admitted"
+grep -qF -- "$ENTRIES_POLICY_DENIAL: spiffeID and parentID must be in the same trust domain" <<<"$other_td" || fail "an x509pop parent of another trust domain was refused, but not by the trust-domain rule: $other_td"
 # The broker's start self-check, word for word (crates/mediatore-spire/src/kube.rs,
 # self_check_probe): the answer it requires is this denial, Forbidden, naming the policy.
 selfcheck=$(dry_own broker mediatore-selfcheck-e2e "$OWN" /banlieue/selfcheck/refused /spire/server '["unix:user:mediatore-selfcheck"]' mediatore-selfcheck-never-rendered)
@@ -599,7 +648,7 @@ YAML
 relabel=$("${K[@]}" label clusterstaticentry own-probe-update app.kubernetes.io/managed-by=mediatore --dry-run=server 2>&1 || true)
 "${K[@]}" delete clusterstaticentry own-probe-update --ignore-not-found --wait=false >/dev/null 2>&1 || true
 grep -qF -- "$ENTRIES_POLICY_DENIAL: mediatore may only declare entries named mediatore-*" <<<"$relabel" || fail "a relabel that leaves spec as it was should pass the sender validation and be refused for the name: $relabel"
-echo "refused from an administrator: an entry that is the broker's by its name, its label or its path, in a permitted shape or not, a gateway ID among them; admitted from the broker's ServiceAccount: its claim and node shapes; refused from it: another name, a parent that is no TPM agent, the self-check's entry (Forbidden, the policy named); an update that leaves spec alone is judged on the shape, not the sender"
+echo "refused from an administrator: an entry that is the broker's by its name, its label or its path, in a permitted shape or not, a gateway ID among them; admitted from the broker's ServiceAccount: its claim and node shapes, under a tpm agent and under an x509pop one; refused from it: another name, a parent that is neither (the server, another attestor, an x509pop ID with one segment, three, a bad character, a dot segment in either place, an empty segment or one of 65 characters; an x509pop parent of another trust domain), a tpm node entry whose key is not its parent's, the self-check's entry (Forbidden, the policy named); an update that leaves spec alone is judged on the shape, not the sender"
 
 say "fixtures: a clean slate, then the node pod registering the fixture EK, a sandbox bound to it"
 cleanup

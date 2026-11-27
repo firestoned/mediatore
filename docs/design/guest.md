@@ -14,9 +14,15 @@ claim, and then back into nothing. The jail and the egress proxy have their own 
 down: there is no partial-trust mode.
 
 1. **Who am I, as a node.** The EK hash (from the vTPM, `identity.rs`) and the DMI UUID. Together they identify the VM
-   to the broker and anchor its SPIFFE identity in the hardware.
-2. **Register.** `POST /v1/nodes` over SPIFFE mutual TLS, retried until accepted. A `409` is **fatal**: that EK is
-   already registered for another VM, which is exactly the cloned-TPM case.
+   to the broker and anchor its SPIFFE identity in the hardware. On a pool without a vTPM the guest runs with
+   `--node-attestation x509pop` (ADR-0049): it never opens a TPM and reads the issuer and subject common names from
+   the certificate `mediatore node-cert` fetched from its host (`/run/spire/x509pop/cert.pem`), or does not start.
+2. **Register.** `POST /v1/nodes` over SPIFFE mutual TLS, retried until accepted. A `409` is **fatal**: that node
+   identity (the EK, or the x509pop names) is already registered for another VM, which is exactly the cloned-TPM case
+   (`duplicate_ek`), or the node key is registered under another agent ID (`node_identity_conflict`, cleared by an
+   operator deleting the `SandboxNode`). An x509pop guest reads its certificate's names again before every attempt
+   (`refresh_attestation`, `guest.rs`), so a certificate renewed under other names while it retries is registered
+   under those, with the line `the node certificate's names changed; registering under the new ones`.
 3. **Announce `GuestReady`** (`ready.rs`) on whatever channel the hypervisor reads (a marker under `/run`, guestinfo or
    vsock), only after the VM is attested and registered, so the pool never hands out a member that is not.
 4. **Wait for a claim.** Poll `GET /v1/me` (a `404` means none yet) until one is bound to this node. The answer carries
@@ -38,7 +44,7 @@ down: there is no partial-trust mode.
 | the ruleset | `net.rs` | one `nftables` table per claim whose output hook sends the **sandbox uid's** packets to a chain admitting a short list of TCP destinations: with gateways, the broker as the relay has it, the gateways' sandbox addresses and the proxy on loopback, every one an address and nothing on port 53 (`Shape::Gateways`); without, the resolved broker and egress addresses, the proxy, and DNS to the VM's resolvers (`Shape::Direct`); everything else from that uid is dropped |
 | the proxy's files | `egress.rs` | the routes, the gateways and a fresh phantom token, written as read-only files of the sandbox user |
 | load the ruleset | `net.rs` | `nft` loads the table and its hash is recorded |
-| start the egress proxy | `egress.rs` | a second process as the sandbox user, outside the jail, waited on until it says it is ready |
+| start the egress proxy | `egress.rs` | a second process as the sandbox user, outside the jail, waited on until it says it is ready; its first act is a seccomp filter that leaves it unix and inet sockets and no other family (ADR-0049 decision 12, [The egress proxy](egress-proxy.md#running-it)) |
 | report | `report.rs` | tell the broker what ran: the image digest, the ruleset's hash, the host table as `nft` lists it (the record, not a gate) |
 | the jail | `jail.rs`, `confine.rs` | `nsjail` as the outer layer, then `jail-exec` as the inner layer, applying Landlock to itself and exec-ing the workload |
 | supervise | `supervise.rs` | run the workload until the claim's deadline, restart it as its restart policy says, end the claim when the proxy goes, and post the exit when the workload is done by its policy (`POST /v1/me/exit`). With the opt-in (`workload.logs`, ADR-0045) the jail's stdout and stderr are pipes the guest reads |

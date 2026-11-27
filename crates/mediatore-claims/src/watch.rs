@@ -12,7 +12,10 @@
 //!
 //! What binds a claim: its `metadata.uid` is the claim UID, and the node is the one that
 //! registered under the EK hash of the certificate banlieue mirrored onto the claim.
-//! Nothing else is consulted (decision 2). Unresolved for longer than
+//! Nothing else is consulted (decision 2). A machine of a pool the operator listed in
+//! `watcher.x509pop_pools` has no EK to go by (ADR-0049 decisions 9 and 10): its node is the
+//! one registered under the key of the `x509pop` agent ID its host's CA and its
+//! `attestationSubject` give, and its EK is never consulted, whatever it publishes. Unresolved for longer than
 //! `resolve_timeout` fails the claim: record revoked, claim deleted (decision 3).
 
 use std::collections::{HashMap, HashSet};
@@ -21,7 +24,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use banlieue_api::banlieue::{
-    ClaimPhase as BanlieuePhase, LABEL_POOL, VirtualMachine, VirtualMachineClaim,
+    ClaimPhase as BanlieuePhase, LABEL_POOL, Provider, VirtualMachine, VirtualMachineClaim,
 };
 use futures::{Stream, StreamExt};
 use kube::api::{DeleteParams, ListParams, Patch, PatchParams, PostParams};
@@ -30,7 +33,8 @@ use kube::runtime::watcher;
 use kube::{Api, Client, ResourceExt};
 use mediatore_proto::ClaimPhase;
 use mediatore_proto::ek::ek_hash_from_pems;
-use mediatore_spire::SpireError;
+use mediatore_spire::x509pop::{X509popInput, agent_id_for, certificate_identities, node_key};
+use mediatore_spire::{NODE_ENTRY_PREFIX, NodeAttestation, NodeIdentity, SpireError};
 use mediatore_store::StoreError;
 use tokio::sync::broadcast;
 use uuid::Uuid;
@@ -114,6 +118,14 @@ pub struct WatcherConfig {
     /// then answers every audience question here in place of `audiences`, `scopes` and
     /// `delegated_audiences` (empty in that mode). `None`: the file answers.
     pub catalog: Option<std::sync::Arc<crate::audience::LiveCatalog>>,
+    /// `watcher.x509pop_pools` (ADR-0049 decision 9): the pools, as `<namespace>/<pool>`,
+    /// whose machines attest with `x509pop`. A machine is of the pool its `banlieue.io/pool`
+    /// label names, in its own namespace. Every other machine is `tpm`. Empty by default:
+    /// then nothing here reads a Provider or a machine's subject.
+    pub x509pop_pools: std::collections::BTreeSet<String>,
+    /// `watcher.provider_namespace` (ADR-0049 decision 10, banlieue ADR-0133): where a
+    /// machine's Provider is looked for when the machine's own namespace holds none.
+    pub provider_namespace: Option<String>,
 }
 
 impl WatcherConfig {
@@ -258,6 +270,8 @@ impl Default for WatcherConfig {
             node_grace: Duration::from_mins(10),
             logs_enabled: false,
             logs_retention: Duration::from_hours(1),
+            x509pop_pools: std::collections::BTreeSet::new(),
+            provider_namespace: None,
         }
     }
 }
@@ -273,6 +287,18 @@ pub trait ClaimsApi: Send + Sync + 'static {
     /// Every pool member VM that exists, for collecting the nodes of those that do not
     /// (ADR-0039). A failed listing is an error, never an empty list.
     async fn list_machines(&self) -> Result<Vec<VirtualMachine>, WatchError>;
+    /// One pool member VM, if it exists: the machine a `Bound` claim names, read to learn
+    /// its pool and, for an `x509pop` pool, what its node entry was declared from.
+    async fn get_machine(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> Result<Option<VirtualMachine>, WatchError>;
+    /// Every `Provider` in the cluster, for the host CA each asserts (ADR-0049 decision
+    /// 10): the one a machine was placed on, and every other one, since two that assert
+    /// different CAs under one common name are refused both. A failed listing is an error,
+    /// never an empty list.
+    async fn list_providers(&self) -> Result<Vec<Provider>, WatchError>;
     /// One claim, if it exists.
     async fn get_claim(
         &self,
@@ -335,6 +361,25 @@ impl ClaimsApi for KubeClaimsApi {
     async fn list_machines(&self) -> Result<Vec<VirtualMachine>, WatchError> {
         Api::<VirtualMachine>::all(self.client.clone())
             .list(&ListParams::default().labels(LABEL_POOL))
+            .await
+            .map(|list| list.items)
+            .map_err(|e| WatchError::Api(e.to_string()))
+    }
+
+    async fn get_machine(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> Result<Option<VirtualMachine>, WatchError> {
+        Api::<VirtualMachine>::namespaced(self.client.clone(), namespace)
+            .get_opt(name)
+            .await
+            .map_err(|e| WatchError::Api(e.to_string()))
+    }
+
+    async fn list_providers(&self) -> Result<Vec<Provider>, WatchError> {
+        Api::<Provider>::all(self.client.clone())
+            .list(&ListParams::default())
             .await
             .map(|list| list.items)
             .map_err(|e| WatchError::Api(e.to_string()))
@@ -443,12 +488,111 @@ impl From<anyhow::Error> for WatchError {
 /// Where a `Bound` claim stands with respect to a node.
 #[derive(Debug, PartialEq, Eq)]
 enum Resolution {
-    /// A registered, unbanned node with this EK.
-    Node(String),
+    /// A registered, unbanned node: its key and its stored agent ID.
+    Node(NodeIdentity),
     /// Not resolvable yet; may become so (no certificate, node not registered).
-    NotYet(&'static str),
+    NotYet(String),
     /// Never resolvable: fail now.
     Refused(String),
+}
+
+/// How a pool member attests, as far as what it publishes says. Which of the two attestors
+/// applies is never read from here: it is the pool list's statement (ADR-0049 decision 9),
+/// and this is what that attestor's data gives.
+#[derive(Debug, PartialEq, Eq)]
+enum MachineNode {
+    /// The attestation its node entry is declared from.
+    Known(NodeAttestation),
+    /// Nothing to go by yet; the cause, which may pass and is the machine's own to bring (no
+    /// certificate, no subject, no placement): a machine still being provisioned.
+    NotYet(String),
+    /// Nothing to go by yet because the machine's Provider is not found: the cause, which
+    /// may pass and is the administrators' (a Provider deleted and applied again).
+    NoProvider(String),
+    /// What is published cannot give a node; the cause, which does not pass by waiting.
+    Unusable(String),
+}
+
+/// The `Provider`s as one pass reads them: listed once, on first need, and kept for the
+/// pass (a machine reconcile, a claim resolution, one collection), however many machines of
+/// an `x509pop` pool it looks at.
+#[derive(Default)]
+struct ProviderPass {
+    all: Option<Vec<Provider>>,
+}
+
+/// What a listed pool's machines give a collection pass.
+struct LiveKeys {
+    /// The node key of every machine that gives one, of both kinds.
+    keys: HashSet<String>,
+    /// Some machine of an `x509pop` pool gave none because something is only missing (its
+    /// subject, its placement, its Provider): the x509pop keys are not all there.
+    x509pop_incomplete: bool,
+}
+
+/// A machine's Provider among `all`, with the namespace it was found in: the one of that
+/// name in the machine's namespace when that namespace holds any Provider at all, and only
+/// when it holds none, the one in `shared` (`watcher.provider_namespace`) if that is set
+/// (banlieue ADR-0133 decision 1, which the controller that placed the machine follows).
+fn provider_of<'p>(
+    all: &'p [Provider],
+    namespace: &str,
+    shared: Option<&str>,
+    name: &str,
+) -> Option<(String, &'p Provider)> {
+    let within = |ns: &str| {
+        let ns = ns.to_owned();
+        all.iter()
+            .filter(move |p| p.namespace().as_deref() == Some(ns.as_str()))
+    };
+    let from = if within(namespace).next().is_some() {
+        namespace
+    } else {
+        shared.filter(|shared| *shared != namespace)?
+    };
+    within(from)
+        .find(|p| p.name_any() == name)
+        .map(|p| (from.to_owned(), p))
+}
+
+/// Another Provider than `own` that asserts, inline, a *different* certificate under the
+/// common name `cn`: `<namespace>/<name>` of the first in name order. The same certificate
+/// on two Providers is one CA said twice and is no rival. The agent ID is issuer-qualified
+/// by name (ADR-0049 decision 2), so two CAs under one name could each mint the other
+/// host's guests' identities: neither is given a node entry.
+fn rival_host_ca(
+    all: &[Provider],
+    own: (&str, &str),
+    cn: &str,
+    fingerprint: &str,
+) -> Option<String> {
+    let mut rivals: Vec<String> = all
+        .iter()
+        .filter(|p| {
+            (
+                p.namespace().unwrap_or_default().as_str(),
+                p.name_any().as_str(),
+            ) != own
+        })
+        .filter(|p| {
+            p.spec
+                .attestation
+                .as_ref()
+                .and_then(|a| a.host_ca.as_ref())
+                .and_then(|ca| ca.inline.as_deref())
+                .and_then(|pem| certificate_identities(pem).ok())
+                .is_some_and(|ids| ids.iter().any(|(n, f)| n == cn && f != fingerprint))
+        })
+        .map(|p| format!("{}/{}", p.namespace().unwrap_or_default(), p.name_any()))
+        .collect();
+    rivals.sort();
+    rivals.into_iter().next()
+}
+
+/// `<namespace>/<pool>` of a pool member: the pool its `banlieue.io/pool` label names.
+fn pool_key(vm: &VirtualMachine) -> Option<String> {
+    let pool = vm.labels().get(LABEL_POOL)?;
+    Some(format!("{}/{pool}", vm.namespace().unwrap_or_default()))
 }
 
 /// The reconciler, the claims API and the per-claim wait clock.
@@ -527,8 +671,8 @@ impl Watcher {
                 Ok(Action::await_change())
             }
             Intent::Bind => match self.resolve(claim).await? {
-                Resolution::Node(ek_hash) => {
-                    self.reconciler.bind(uid, &ek_hash).await?;
+                Resolution::Node(node) => {
+                    self.reconciler.bind(uid, &node).await?;
                     self.forget(uid);
                     Ok(Action::await_change())
                 }
@@ -536,7 +680,7 @@ impl Watcher {
                 Resolution::NotYet(reason) => {
                     let waited = self.waited(uid);
                     if waited >= self.cfg.resolve_timeout {
-                        self.fail(claim, uid, reason).await
+                        self.fail(claim, uid, &reason).await
                     } else {
                         tracing::info!(%uid, %name, %namespace, reason, waited_secs = waited.as_secs(), "claim bound but unresolved; retrying");
                         Ok(Action::requeue(self.cfg.requeue))
@@ -546,30 +690,276 @@ impl Watcher {
         }
     }
 
-    /// The node for a `Bound` claim: the registered node whose EK hash is that of the
-    /// certificate banlieue mirrored onto the claim.
+    /// Whether the operator listed this machine's pool as `x509pop` (ADR-0049 decision 9).
+    /// The one question that chooses the attestor; nothing a machine publishes does.
+    fn is_x509pop(&self, vm: &VirtualMachine) -> bool {
+        !self.cfg.x509pop_pools.is_empty()
+            && pool_key(vm).is_some_and(|key| self.cfg.x509pop_pools.contains(&key))
+    }
+
+    /// The node for a `Bound` claim: the registered node whose key is that of the
+    /// attestation the claim's machine gives. With no `x509pop` pool configured that is the
+    /// EK hash of the certificate banlieue mirrored onto the claim, and nothing else is read.
+    /// With some, the claim's machine is read first and its pool decides: a machine of a
+    /// listed pool resolves by its `x509pop` attestation alone (ADR-0049 decision 9), any
+    /// other by the claim's certificate as before.
     async fn resolve(&self, claim: &VirtualMachineClaim) -> Result<Resolution, WatchError> {
-        let certs = claim
-            .status
-            .as_ref()
-            .map_or(&[][..], |s| s.tpm_endorsement_certificates.as_slice());
-        if certs.is_empty() {
-            return Ok(Resolution::NotYet(
-                "no endorsement certificate on the claim",
-            ));
-        }
-        let ek_hash = match ek_hash_from_pems(certs) {
-            Ok(h) => h,
-            Err(e) => return Ok(Resolution::Refused(format!("endorsement certificate: {e}"))),
-        };
-        match self.reconciler.store.get_node(&ek_hash).await {
-            Ok(node) if node.banned => Ok(Resolution::Refused(format!("node {ek_hash} is banned"))),
-            Ok(_) => Ok(Resolution::Node(ek_hash)),
-            Err(StoreError::NotFound(_)) => {
-                Ok(Resolution::NotYet("no node registered for the claim's EK"))
+        let attestation = match self.claim_node(claim).await? {
+            MachineNode::Known(att) => att,
+            MachineNode::NotYet(reason) | MachineNode::NoProvider(reason) => {
+                return Ok(Resolution::NotYet(reason));
             }
+            MachineNode::Unusable(reason) => return Ok(Resolution::Refused(reason)),
+        };
+        // The pair of functions the broker's node registration uses (decision 8).
+        let naming = &self.reconciler.naming;
+        let (key, agent_id) = match (
+            node_key(naming, &attestation),
+            agent_id_for(naming, &attestation),
+        ) {
+            (Ok(key), Ok(agent_id)) => (key, agent_id),
+            (Err(e), _) | (_, Err(e)) => return Ok(Resolution::Refused(e.to_string())),
+        };
+        match self.reconciler.store.get_node(&key).await {
+            Ok(node) if node.banned => Ok(Resolution::Refused(format!("node {key} is banned"))),
+            // The entry is parented to the stored agent ID, which must be the one this
+            // machine attests under: a record that says otherwise is not this machine's.
+            Ok(node) if node.node_id != agent_id => Ok(Resolution::Refused(format!(
+                "node {key} is registered under another agent ID than its machine attests as"
+            ))),
+            Ok(node) => Ok(Resolution::Node(NodeIdentity::stored(
+                &node.ek_hash,
+                &node.node_id,
+            ))),
+            Err(StoreError::NotFound(_)) => Ok(Resolution::NotYet(match attestation {
+                NodeAttestation::Tpm { .. } => "no node registered for the claim's EK".into(),
+                NodeAttestation::X509pop { .. } => {
+                    "no node registered for the machine's x509pop identity".into()
+                }
+            })),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// What a `Bound` claim's node is resolved from. See [`Self::resolve`].
+    async fn claim_node(&self, claim: &VirtualMachineClaim) -> Result<MachineNode, WatchError> {
+        if self.cfg.x509pop_pools.is_empty() {
+            return Ok(Self::tpm_node(claim_certificates(claim), "claim"));
+        }
+        let namespace = claim.namespace().unwrap_or_default();
+        let Some(machine) = claim
+            .status
+            .as_ref()
+            .and_then(|s| s.virtual_machine_ref.as_ref())
+            .map(|r| r.name.as_str())
+        else {
+            return Ok(MachineNode::NotYet("the claim names no machine yet".into()));
+        };
+        let Some(vm) = self.claims.get_machine(&namespace, machine).await? else {
+            return Ok(MachineNode::NotYet(format!(
+                "the claim's machine {namespace}/{machine} does not exist"
+            )));
+        };
+        if self.is_x509pop(&vm) {
+            self.x509pop_node(&vm).await
+        } else {
+            Ok(Self::tpm_node(claim_certificates(claim), "claim"))
+        }
+    }
+
+    /// The TPM attestation a set of endorsement certificates gives (ADR-0011 decision 2);
+    /// `on` says where they were read, for the reason.
+    fn tpm_node(certs: &[String], on: &str) -> MachineNode {
+        if certs.is_empty() {
+            return MachineNode::NotYet(format!("no endorsement certificate on the {on}"));
+        }
+        match ek_hash_from_pems(certs) {
+            Ok(ek_hash) => MachineNode::Known(NodeAttestation::Tpm { ek_hash }),
+            Err(e) => MachineNode::Unusable(format!("endorsement certificate: {e}")),
+        }
+    }
+
+    /// The `x509pop` attestation of a machine of a listed pool (ADR-0049 decisions 9 and
+    /// 10): its `status.attestationSubject` under the common name of the host CA its
+    /// Provider asserts inline. Every cause for there being none is named, and none of them
+    /// falls back to the machine's EK.
+    ///
+    /// # Errors
+    /// A Provider could not be read. That is not a verdict on the machine.
+    async fn x509pop_node(&self, vm: &VirtualMachine) -> Result<MachineNode, WatchError> {
+        self.x509pop_node_in(&mut ProviderPass::default(), vm).await
+    }
+
+    /// [`Self::x509pop_node`] within a pass that looks at several machines: the Providers
+    /// are listed once for all of them.
+    async fn x509pop_node_in(
+        &self,
+        pass: &mut ProviderPass,
+        vm: &VirtualMachine,
+    ) -> Result<MachineNode, WatchError> {
+        let namespace = vm.namespace().unwrap_or_default();
+        let name = vm.name_any();
+        let status = vm.status.as_ref();
+        let Some(subject) = status.and_then(|s| s.attestation_subject.clone()) else {
+            return Ok(MachineNode::NotYet(format!(
+                "machine {namespace}/{name} is of an x509pop pool and publishes no attestationSubject"
+            )));
+        };
+        let Some(provider_name) = status
+            .and_then(|s| s.scheduled.as_ref())
+            .map(|p| p.provider_name.as_str())
+        else {
+            return Ok(MachineNode::NotYet(format!(
+                "machine {namespace}/{name} is of an x509pop pool and is not placed on a Provider yet"
+            )));
+        };
+        if pass.all.is_none() {
+            pass.all = Some(self.claims.list_providers().await?);
+        }
+        let all = pass.all.as_deref().unwrap_or_default();
+        let shared = self.cfg.provider_namespace.as_deref();
+        let Some((provider_namespace, provider)) =
+            provider_of(all, &namespace, shared, provider_name)
+        else {
+            return Ok(MachineNode::NoProvider(format!(
+                "machine {namespace}/{name} is of an x509pop pool and its Provider {provider_name} was not found"
+            )));
+        };
+        let whose = format!("Provider {provider_namespace}/{provider_name}");
+        let Some(host_ca) = provider
+            .spec
+            .attestation
+            .as_ref()
+            .and_then(|a| a.host_ca.as_ref())
+        else {
+            return Ok(MachineNode::Unusable(format!(
+                "{whose} asserts no spec.attestation.hostCa, so its guests have no x509pop identity"
+            )));
+        };
+        if host_ca.config_map_ref.is_some() || host_ca.secret_ref.is_some() {
+            return Ok(MachineNode::Unusable(format!(
+                "{whose}: spec.attestation.hostCa must be inline; a configMapRef or secretRef is not read (ADR-0049 decision 10)"
+            )));
+        }
+        let Some(host_ca_pem) = host_ca.inline.clone() else {
+            return Ok(MachineNode::Unusable(format!(
+                "{whose}: spec.attestation.hostCa.inline is not set"
+            )));
+        };
+        let input = X509popInput {
+            host_ca_pem,
+            attestation_subject: subject,
+        };
+        let attestation = match input.attestation() {
+            Ok(att) => att,
+            // The message names the rule broken and the certificate's common name at most,
+            // never the certificate.
+            Err(e) => {
+                return Ok(MachineNode::Unusable(format!(
+                    "{whose}: the host CA or machine {namespace}/{name}'s attestationSubject is unusable: {e}"
+                )));
+            }
+        };
+        // Two Providers that assert different CAs under this one's common name: the name
+        // is what confines a host to its own guests (decision 2), so neither gets an entry.
+        if let NodeAttestation::X509pop { issuer_cn, .. } = &attestation
+            && let Some((_, fingerprint)) = certificate_identities(&input.host_ca_pem)
+                .ok()
+                .and_then(|ids| ids.into_iter().next())
+            && let Some(rival) = rival_host_ca(
+                all,
+                (&provider_namespace, provider_name),
+                issuer_cn,
+                &fingerprint,
+            )
+        {
+            return Ok(MachineNode::Unusable(format!(
+                "two Providers assert host CAs named {issuer_cn:?} with different certificates ({provider_namespace}/{provider_name} and {rival}); a host CA's common name must be unique"
+            )));
+        }
+        Ok(MachineNode::Known(attestation))
+    }
+
+    /// Whether a machine was created less than the node grace ago (`store.node_grace_secs`,
+    /// the grace a young node gets). One with no creation timestamp is not young.
+    fn is_young(&self, vm: &VirtualMachine) -> bool {
+        let grace = jiff::SignedDuration::try_from(self.cfg.node_grace)
+            .unwrap_or(jiff::SignedDuration::MAX);
+        vm.metadata
+            .creation_timestamp
+            .as_ref()
+            .is_some_and(|created| jiff::Timestamp::now().duration_since(created.0) < grace)
+    }
+
+    /// What a pool member's node entry is declared from: by the pool list, the machine's
+    /// `x509pop` attestation or the TPM one of its endorsement certificates.
+    async fn machine_node(&self, vm: &VirtualMachine) -> Result<MachineNode, WatchError> {
+        if self.is_x509pop(vm) {
+            self.x509pop_node(vm).await
+        } else {
+            let certs = vm
+                .status
+                .as_ref()
+                .map_or(&[][..], |s| s.tpm_endorsement_certificates.as_slice());
+            Ok(Self::tpm_node(certs, "machine"))
+        }
+    }
+
+    /// The node key every pool member VM gives, of both kinds, computed with the functions
+    /// that declare the node entries: what keeps a node and its entry from collection.
+    ///
+    /// A listed machine whose host CA is unusable (withdrawn from its Provider, renamed, no
+    /// longer a CA with a path length of zero, a rival under its name) protects nothing:
+    /// that is an administrator's act, and the entries under the old name are meant to go.
+    /// One for which something is only *missing* protects nothing either, but may mark the
+    /// set incomplete, and a pass with an incomplete set removes no x509pop node or entry.
+    /// Its Provider not found always does: a Provider deleted and applied again must not
+    /// cost every idle guest of its host its identity. Its own subject or placement missing
+    /// does only while the machine is young ([`Self::is_young`]): a machine still being
+    /// provisioned, not one that never will be, which would otherwise stop the collection
+    /// of every x509pop pool for as long as it existed.
+    ///
+    /// # Errors
+    /// The Providers could not be listed: no set, so nothing is collected on a guess.
+    async fn live_node_keys(&self, machines: &[VirtualMachine]) -> Result<LiveKeys, WatchError> {
+        let (listed, unlisted): (Vec<&VirtualMachine>, Vec<&VirtualMachine>) =
+            machines.iter().partition(|vm| self.is_x509pop(vm));
+        let mut live = LiveKeys {
+            keys: ek_hashes_of(unlisted),
+            x509pop_incomplete: false,
+        };
+        let mut pass = ProviderPass::default();
+        for vm in listed {
+            match self.x509pop_node_in(&mut pass, vm).await? {
+                MachineNode::Known(att) => match node_key(&self.reconciler.naming, &att) {
+                    Ok(key) => {
+                        live.keys.insert(key);
+                    }
+                    Err(e) => {
+                        tracing::warn!(vm = %vm.name_any(), error = %e, "x509pop attestation unusable; it protects no node");
+                    }
+                },
+                // The administrators' object is missing: held whatever the machine's age.
+                MachineNode::NoProvider(reason) => {
+                    tracing::info!(vm = %vm.name_any(), %reason, "an x509pop machine gives no key yet; no x509pop node or entry is collected in this pass");
+                    live.x509pop_incomplete = true;
+                }
+                // The machine's own data is missing: held while it is young, the grace a
+                // young node gets. Past that it is a machine that never got there (or one
+                // only labelled into the pool), and it holds nothing.
+                MachineNode::NotYet(reason) if self.is_young(vm) => {
+                    tracing::info!(vm = %vm.name_any(), %reason, "an x509pop machine gives no key yet; no x509pop node or entry is collected in this pass");
+                    live.x509pop_incomplete = true;
+                }
+                MachineNode::NotYet(reason) => {
+                    tracing::info!(vm = %vm.name_any(), %reason, "an x509pop machine older than the node grace still gives no key; it does not hold the collection");
+                }
+                MachineNode::Unusable(reason) => {
+                    tracing::debug!(vm = %vm.name_any(), %reason, "no x509pop identity; it protects no node");
+                }
+            }
+        }
+        Ok(live)
     }
 
     /// Decision 3: the record is revoked (no entry was ever created for it) and the claim
@@ -607,79 +997,117 @@ impl Watcher {
 
     /// One pass over a pool member: a published endorsement certificate gets a node entry
     /// (ADR-0011 decision 5). No certificate, no entry. Declared once per resync.
+    ///
+    /// A member of an `x509pop` pool (ADR-0049 decision 9) gets the `x509pop` node entry of
+    /// its subject under its host's CA and never a TPM one; with no subject, no Provider or
+    /// no usable host CA it gets none at all, the cause is logged, and the pass comes back
+    /// at the resync interval, because what is missing is on another object (the Provider)
+    /// whose change raises no event here. The same interval picks up a host CA whose common
+    /// name changed: the new key's entry is declared, and the old one is retracted by
+    /// [`Self::collect_node_entries`].
     pub async fn reconcile_machine(&self, vm: &VirtualMachine) -> Result<Action, WatchError> {
         let name = vm.name_any();
-        let certs = vm
-            .status
-            .as_ref()
-            .map_or(&[][..], |s| s.tpm_endorsement_certificates.as_slice());
-        if certs.is_empty() {
-            tracing::debug!(vm = %name, "no endorsement certificate yet; no node entry");
-            return Ok(Action::await_change());
-        }
-        let ek_hash = match ek_hash_from_pems(certs) {
-            Ok(h) => h,
+        let x509pop = self.is_x509pop(vm);
+        let after = if x509pop {
+            Action::requeue(self.cfg.resync)
+        } else {
+            Action::await_change()
+        };
+        let attestation = match self.machine_node(vm).await? {
+            MachineNode::Known(att) => att,
+            MachineNode::NotYet(reason) | MachineNode::NoProvider(reason) => {
+                if x509pop {
+                    tracing::info!(vm = %name, %reason, "no node entry yet");
+                } else {
+                    tracing::debug!(vm = %name, %reason, "no node entry yet");
+                }
+                return Ok(after);
+            }
+            MachineNode::Unusable(reason) => {
+                tracing::warn!(vm = %name, %reason, "no node entry");
+                return Ok(after);
+            }
+        };
+        let key = match node_key(&self.reconciler.naming, &attestation) {
+            Ok(key) => key,
             Err(e) => {
-                tracing::warn!(vm = %name, error = %e, "endorsement certificate unusable; no node entry");
-                return Ok(Action::await_change());
+                tracing::warn!(vm = %name, error = %e, "attestation unusable; no node entry");
+                return Ok(after);
             }
         };
         if self
             .declared
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains(&ek_hash)
+            .contains(&key)
         {
-            return Ok(Action::await_change());
+            return Ok(after);
         }
-        let entry = self.reconciler.spire.ensure_node_entry(&ek_hash).await?;
+        let entry = self
+            .reconciler
+            .spire
+            .ensure_node_entry(&attestation)
+            .await?;
         self.declared
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(ek_hash.clone());
-        tracing::info!(vm = %name, %ek_hash, %entry, "node entry declared");
-        Ok(Action::await_change())
+            .insert(key.clone());
+        match &attestation {
+            NodeAttestation::Tpm { .. } => {
+                tracing::info!(vm = %name, ek_hash = %key, %entry, "node entry declared");
+            }
+            NodeAttestation::X509pop {
+                issuer_cn,
+                subject_cn,
+            } => {
+                tracing::info!(vm = %name, node_key = %key, %issuer_cn, %subject_cn, %entry, "x509pop node entry declared");
+            }
+        }
+        Ok(after)
     }
 
     /// Remove the nodes whose VM no longer exists in banlieue (ADR-0039), returning how
-    /// many. The decision is [`nodegc::nodes_to_delete`]; this gathers its inputs and acts
+    /// many. A node is its VM's by its node key, of either kind ([`Self::live_node_keys`]). The decision is [`nodegc::nodes_to_delete`]; this gathers its inputs and acts
     /// on it, on the replica holding the Lease. A failed listing of the nodes, the VMs or
     /// the claims removes nothing (the error is the caller's to log); one failed deletion
     /// is logged and the pass goes on, the next pass retries it.
     ///
     /// # Errors
-    /// The nodes, the VMs or the claims could not be listed.
+    /// The nodes, the VMs or the claims could not be listed, or a Provider not read.
     pub async fn collect_nodes(&self) -> Result<usize, WatchError> {
         let store = &self.reconciler.store;
         let nodes = store.list_nodes().await?;
         if nodes.is_empty() {
             return Ok(0);
         }
-        let live = ek_hashes_of(&self.claims.list_machines().await?);
+        let live = self
+            .live_node_keys(&self.claims.list_machines().await?)
+            .await?;
         let now = jiff::Timestamp::now();
         let busy = self.busy_node_ids(now).await?;
         let doomed = nodegc::nodes_to_delete(&nodegc::Inputs {
             nodes: &nodes,
-            live_ek_hashes: &live,
+            live_node_keys: &live.keys,
             busy_node_ids: &busy,
             now,
             grace: jiff::SignedDuration::try_from(self.config().node_grace)
                 .unwrap_or(jiff::SignedDuration::MAX),
             cap: MAX_DELETIONS_PER_PASS,
+            hold_x509pop: live.x509pop_incomplete,
         });
         let mut removed = 0;
-        for ek_hash in doomed {
-            match store.delete_node(&ek_hash).await {
+        for key in doomed {
+            match store.delete_node(&key).await {
                 Ok(()) => {
                     let hostname = nodes
                         .iter()
-                        .find(|n| n.ek_hash == ek_hash)
+                        .find(|n| n.ek_hash == key)
                         .map_or("", |n| n.hostname.as_str());
-                    tracing::info!(%ek_hash, %hostname, "node removed: its VM is gone");
+                    tracing::info!(node_key = %key, %hostname, "node removed: its VM is gone");
                     removed += 1;
                 }
                 Err(e) => {
-                    tracing::warn!(%ek_hash, error = %e, "node not removed; the next pass retries");
+                    tracing::warn!(node_key = %key, error = %e, "node not removed; the next pass retries");
                 }
             }
         }
@@ -699,48 +1127,52 @@ impl Watcher {
             .collect())
     }
 
-    /// Retract the TPM node entries whose VM is gone (ADR-0039 decision 7), returning how
-    /// many. A node entry is declared from a VM's endorsement certificate and nothing else
-    /// removed it, so one was left per VM ever created. The decision is
+    /// Retract the node entries whose VM is gone (ADR-0039 decision 7), returning how
+    /// many. A node entry is declared from a VM's endorsement certificate, or for a machine
+    /// of an `x509pop` pool from its subject and its host's CA (ADR-0049 decision 9), and
+    /// nothing else removed it, so one was left per VM ever created. An `x509pop` entry also
+    /// goes when its machine's key changed (its host CA's common name did) or its machine no
+    /// longer has a usable host CA. The decision is
     /// [`nodegc::node_entries_to_delete`]; on the replica holding the Lease, like the node
     /// collection. A failed listing retracts nothing; one failed retraction is logged and the
     /// pass goes on.
     ///
     /// # Errors
-    /// The entries, the VMs, the nodes or the claims could not be listed.
+    /// The entries, the VMs, the nodes or the claims could not be listed, or a Provider not
+    /// read.
     pub async fn collect_node_entries(&self) -> Result<usize, WatchError> {
         let entries = self.reconciler.spire.list_entries().await?;
-        if !entries
-            .iter()
-            .any(|e| nodegc::tpm_node_entry_ek(e).is_some())
-        {
+        if !entries.iter().any(|e| nodegc::node_entry_key(e).is_some()) {
             return Ok(0);
         }
-        let live = ek_hashes_of(&self.claims.list_machines().await?);
+        let live = self
+            .live_node_keys(&self.claims.list_machines().await?)
+            .await?;
         let nodes = self.reconciler.store.list_nodes().await?;
         let now = jiff::Timestamp::now();
         let busy = self.busy_node_ids(now).await?;
         let doomed = nodegc::node_entries_to_delete(&nodegc::EntryInputs {
             entries: &entries,
-            live_ek_hashes: &live,
+            live_node_keys: &live.keys,
             busy_node_ids: &busy,
             nodes: &nodes,
             now,
             grace: jiff::SignedDuration::try_from(self.config().node_grace)
                 .unwrap_or(jiff::SignedDuration::MAX),
             cap: MAX_DELETIONS_PER_PASS,
+            hold_x509pop: live.x509pop_incomplete,
         });
         let mut retracted = 0;
         for name in doomed {
             match self.reconciler.spire.delete_entry(&name).await {
                 Ok(()) => {
-                    let ek_hash = name.trim_start_matches("mediatore-node-");
-                    // Declared again should a VM publish this hash once more.
+                    let key = name.strip_prefix(NODE_ENTRY_PREFIX).unwrap_or(&name);
+                    // Declared again should a VM give this key once more.
                     self.declared
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .remove(ek_hash);
-                    tracing::info!(%ek_hash, entry = %name, "node entry retracted: its VM is gone");
+                        .remove(key);
+                    tracing::info!(node_key = %key, entry = %name, "node entry retracted: no VM gives its key");
                     retracted += 1;
                 }
                 Err(e) => {
@@ -835,6 +1267,14 @@ const SESSION_GRACE_SECS: i64 = 3600;
 /// stored longer than its claim's TTL). A timer of its own, because the resync's interval is minutes, and a secret
 /// stored past its expiry until the next resync would be stored longer than the rule allows.
 pub const ENVELOPE_SWEEP_SECS: u64 = 15;
+
+/// The endorsement certificates banlieue mirrored onto a claim.
+fn claim_certificates(claim: &VirtualMachineClaim) -> &[String] {
+    claim
+        .status
+        .as_ref()
+        .map_or(&[][..], |s| s.tpm_endorsement_certificates.as_slice())
+}
 
 /// The claim UID (ADR-0011 decision 1): the object's `metadata.uid`.
 #[must_use]
@@ -1039,6 +1479,8 @@ mod tests {
     use mediatore_spire::{EntryManager, claim_entry_name, node_entry_name};
     use mediatore_store::{ClaimRecord, ClaimStore};
     use mediatore_testkit::ek::{RSA_EK_HASH, RSA_EK_PEM};
+    use mediatore_testkit::x509pop::HostCa;
+    use rcgen::{BasicConstraints, IsCa};
     use serde_json::json;
 
     use super::*;
@@ -1470,7 +1912,7 @@ mod tests {
         // an entry nobody's record knows about
         r.entries
             .create_claim_entry(
-                RSA_EK_HASH,
+                &NodeIdentity::stored(RSA_EK_HASH, &node(RSA_EK_HASH, false).node_id),
                 Uuid::new_v4(),
                 "sb-0123456789ab",
                 std::time::Duration::from_hours(1),
@@ -1691,8 +2133,12 @@ mod tests {
     async fn a_node_entry_whose_vm_is_gone_is_retracted_and_one_whose_vm_exists_is_kept() {
         let r = rig(WatcherConfig::default());
         let gone: String = std::iter::repeat_n('a', 64).collect();
-        r.entries.ensure_node_entry(RSA_EK_HASH).await.unwrap();
-        r.entries.ensure_node_entry(&gone).await.unwrap();
+        for ek_hash in [RSA_EK_HASH.to_owned(), gone] {
+            r.entries
+                .ensure_node_entry(&NodeAttestation::Tpm { ek_hash })
+                .await
+                .unwrap();
+        }
         r.claims.put_machine(machine(&[RSA_EK_PEM]));
         assert_eq!(r.watcher.collect_node_entries().await.unwrap(), 1);
         assert_eq!(r.entries.names(), vec![node_entry_name(RSA_EK_HASH)]);
@@ -1724,7 +2170,12 @@ mod tests {
     #[tokio::test]
     async fn a_failed_vm_listing_retracts_no_node_entry() {
         let r = rig(WatcherConfig::default());
-        r.entries.ensure_node_entry(RSA_EK_HASH).await.unwrap();
+        r.entries
+            .ensure_node_entry(&NodeAttestation::Tpm {
+                ek_hash: RSA_EK_HASH.into(),
+            })
+            .await
+            .unwrap();
         r.claims.fail_machine_listing(true);
         assert!(r.watcher.collect_node_entries().await.is_err());
         assert_eq!(
@@ -1746,6 +2197,971 @@ mod tests {
         let r = rig(WatcherConfig::default());
         r.claims.fail_machine_listing(true);
         assert_eq!(r.watcher.collect_nodes().await.unwrap(), 0);
+    }
+
+    // ----- machines of an x509pop pool (ADR-0049 decisions 9 and 10) ---------------------------------------------------
+
+    const X509POP_POOL: &str = "fc";
+    const HOST: &str = "hv-01";
+    const SUBJECT: &str = "3f0c2a1e-7b1d-4e0a-9c55-0a1b2c3d4e5f";
+
+    /// `watcher.x509pop_pools: [sandboxes/fc]`.
+    fn listed() -> WatcherConfig {
+        WatcherConfig {
+            x509pop_pools: [format!("sandboxes/{X509POP_POOL}")].into(),
+            ..WatcherConfig::default()
+        }
+    }
+
+    /// A member of `pool` in `sandboxes` that publishes **both** an endorsement certificate
+    /// and (when given) an attestation subject, placed (when given) on a Provider: what a
+    /// Cloud Hypervisor guest with a vTPM and a signer looks like (banlieue ADR-0146).
+    fn member(pool: &str, subject: Option<&str>, provider: Option<&str>) -> VirtualMachine {
+        let mut status = json!({ "tpmEndorsementCertificates": [RSA_EK_PEM] });
+        if let Some(subject) = subject {
+            status["attestationSubject"] = json!(subject);
+        }
+        if let Some(provider) = provider {
+            status["scheduled"] = json!({
+                "providerName": provider, "providerClass": "cloud-hypervisor", "failureDomain": "fd-1"
+            });
+        }
+        serde_json::from_value(json!({
+            "metadata": { "name": "member-1", "namespace": "sandboxes", "uid": Uuid::new_v4().to_string(), "labels": { "banlieue.io/pool": pool } },
+            "spec": { "classRef": { "name": "small" }, "imageRef": { "name": "sandbox" } },
+            "status": status
+        }))
+        .unwrap()
+    }
+
+    /// A listed machine with everything its node entry needs.
+    fn x509pop_member() -> VirtualMachine {
+        member(X509POP_POOL, Some(SUBJECT), Some(HOST))
+    }
+
+    /// A `Provider` whose `spec.attestation` is `attestation` (`null` for none).
+    fn provider(namespace: &str, name: &str, attestation: &serde_json::Value) -> Provider {
+        let mut spec = json!({
+            "providerClassRef": { "name": "cloud-hypervisor" },
+            "connection": { "endpoint": "https://hv-01.home.example:8443" }
+        });
+        if !attestation.is_null() {
+            spec["attestation"] = attestation.clone();
+        }
+        serde_json::from_value(json!({
+            "apiVersion": "banlieue.io/v1alpha1", "kind": "Provider",
+            "metadata": { "name": name, "namespace": namespace },
+            "spec": spec
+        }))
+        .unwrap()
+    }
+
+    /// The Provider `hv-01` in `sandboxes` asserting `ca` inline.
+    fn provider_with(ca: &HostCa) -> Provider {
+        provider(
+            "sandboxes",
+            HOST,
+            &json!({ "hostCa": { "inline": ca.pem() } }),
+        )
+    }
+
+    /// A `Bound` claim on `member-1`, carrying the machine's endorsement certificate as
+    /// banlieue mirrors it.
+    fn claim_on_member() -> VirtualMachineClaim {
+        let mut c = claim("Bound", &[RSA_EK_PEM], false);
+        let status = c.status.as_mut().unwrap();
+        status.virtual_machine_ref =
+            Some(serde_json::from_value(json!({ "name": "member-1" })).unwrap());
+        status.attestation_subject = Some(SUBJECT.into());
+        c
+    }
+
+    fn naming() -> mediatore_spire::Naming {
+        mediatore_spire::Naming {
+            trust_domain: "sandbox.test".into(),
+        }
+    }
+
+    /// The identity `subject` has under a host CA named `issuer`.
+    fn x509pop_identity(issuer: &str, subject: &str) -> NodeIdentity {
+        NodeIdentity::of(
+            &naming(),
+            &NodeAttestation::X509pop {
+                issuer_cn: issuer.into(),
+                subject_cn: subject.into(),
+            },
+        )
+        .unwrap()
+    }
+
+    /// The node an x509pop guest registered as.
+    fn x509pop_node_record(id: &NodeIdentity) -> mediatore_store::NodeRecord {
+        let mut n = node(&id.key, false);
+        n.node_id.clone_from(&id.agent_id);
+        n
+    }
+
+    #[tokio::test]
+    async fn a_machine_of_a_listed_pool_gets_an_x509pop_node_entry_and_never_a_tpm_one() {
+        let r = rig(listed());
+        r.claims.put_provider(provider_with(&HostCa::new(HOST)));
+        let action = r
+            .watcher
+            .reconcile_machine(&x509pop_member())
+            .await
+            .unwrap();
+        // Polled: a change to the Provider raises no event on the machine.
+        assert_eq!(action, Action::requeue(WatcherConfig::default().resync));
+        let id = x509pop_identity(HOST, SUBJECT);
+        assert_eq!(
+            r.entries.names(),
+            vec![node_entry_name(&id.key)],
+            "one entry, named by the x509pop node key, and none for the EK it also publishes"
+        );
+        assert_eq!(
+            r.entries.parent_of(&node_entry_name(&id.key)),
+            Some(format!(
+                "spiffe://sandbox.test/spire/agent/x509pop/{HOST}/{SUBJECT}"
+            ))
+        );
+        // Declared once.
+        r.watcher
+            .reconcile_machine(&x509pop_member())
+            .await
+            .unwrap();
+        assert_eq!(r.entries.names().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_unlisted_machine_is_tpm_exactly_as_before_even_when_it_has_an_attestation_subject()
+    {
+        // The choice is the pool list's, never which data is present (decision 9). Not
+        // listed: no list at all, another pool of the namespace, the same pool name in
+        // another namespace.
+        for pools in [
+            vec![],
+            vec![format!("sandboxes/{X509POP_POOL}")],
+            vec!["elsewhere/pool".to_owned()],
+        ] {
+            let r = rig(WatcherConfig {
+                x509pop_pools: pools.into_iter().collect(),
+                ..WatcherConfig::default()
+            });
+            r.claims.put_provider(provider_with(&HostCa::new(HOST)));
+            let vm = member("pool", Some(SUBJECT), Some(HOST));
+            assert_eq!(
+                r.watcher.reconcile_machine(&vm).await.unwrap(),
+                Action::await_change()
+            );
+            assert_eq!(r.entries.names(), vec![node_entry_name(RSA_EK_HASH)]);
+            assert_eq!(
+                r.entries.parent_of(&node_entry_name(RSA_EK_HASH)),
+                Some(node(RSA_EK_HASH, false).node_id)
+            );
+            assert_eq!(r.claims.provider_reads(), 0, "no Provider is read for it");
+            // And its claim binds by the EK on the claim.
+            r.claims.put_machine(vm);
+            r.store.put_claim(record(uid())).await.unwrap();
+            r.store.put_node(node(RSA_EK_HASH, false)).await.unwrap();
+            r.watcher.reconcile_claim(&claim_on_member()).await.unwrap();
+            let rec = r.store.get_claim(uid()).await.unwrap();
+            assert_eq!(
+                rec.node_id.as_deref(),
+                Some(node(RSA_EK_HASH, false).node_id.as_str())
+            );
+            assert_eq!(r.claims.provider_reads(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn with_no_x509pop_pool_configured_no_machine_and_no_provider_is_ever_read() {
+        // The default is today's behaviour exactly: the claim's own status is all a bind
+        // reads, and the collections read the VM list alone.
+        let r = rig(WatcherConfig::default());
+        r.claims.fail_provider_reads(true);
+        r.store.put_claim(record(uid())).await.unwrap();
+        r.store.put_node(old_node(RSA_EK_HASH)).await.unwrap();
+        // A claim that names no machine binds, as it always has.
+        r.watcher
+            .reconcile_claim(&claim("Bound", &[RSA_EK_PEM], false))
+            .await
+            .unwrap();
+        assert!(r.store.get_claim(uid()).await.unwrap().entry_id.is_some());
+        let vm = member(X509POP_POOL, Some(SUBJECT), Some(HOST));
+        r.watcher.reconcile_machine(&vm).await.unwrap();
+        r.claims.put_machine(vm);
+        r.watcher.collect_nodes().await.unwrap();
+        r.watcher.collect_node_entries().await.unwrap();
+        assert_eq!(r.claims.machine_reads(), 0);
+        assert_eq!(r.claims.provider_reads(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_bound_claim_of_a_listed_pool_is_bound_under_its_x509pop_node() {
+        let r = rig(listed());
+        r.claims.put_provider(provider_with(&HostCa::new(HOST)));
+        r.claims.put_machine(x509pop_member());
+        let id = x509pop_identity(HOST, SUBJECT);
+        r.store.put_claim(record(uid())).await.unwrap();
+        r.store.put_node(x509pop_node_record(&id)).await.unwrap();
+        let action = r.watcher.reconcile_claim(&claim_on_member()).await.unwrap();
+        assert_eq!(action, Action::await_change());
+        let rec = r.store.get_claim(uid()).await.unwrap();
+        assert_eq!(rec.node_id.as_deref(), Some(id.agent_id.as_str()));
+        assert_eq!(
+            r.entries.parent_of(&claim_entry_name(uid())),
+            Some(id.agent_id.clone()),
+            "the claim's entry is parented to the x509pop agent"
+        );
+        assert_eq!(r.claims.deleted(), Vec::<(String, String)>::new());
+    }
+
+    #[tokio::test]
+    async fn a_claim_of_a_listed_pool_never_binds_to_the_tpm_node_of_its_machines_ek() {
+        // The machine publishes an EK, the claim mirrors it, and a node is registered under
+        // that EK: everything a TPM bind needs. The pool is listed, so none of it counts.
+        let r = rig(WatcherConfig {
+            requeue: Duration::from_millis(5),
+            ..listed()
+        });
+        r.claims.put_provider(provider_with(&HostCa::new(HOST)));
+        r.claims.put_machine(x509pop_member());
+        r.store.put_claim(record(uid())).await.unwrap();
+        r.store.put_node(node(RSA_EK_HASH, false)).await.unwrap();
+        let action = r.watcher.reconcile_claim(&claim_on_member()).await.unwrap();
+        assert_eq!(action, Action::requeue(Duration::from_millis(5)));
+        assert_eq!(
+            r.watcher.resolve(&claim_on_member()).await.unwrap(),
+            Resolution::NotYet("no node registered for the machine's x509pop identity".into())
+        );
+        let rec = r.store.get_claim(uid()).await.unwrap();
+        assert!(rec.entry_id.is_none() && rec.node_id.is_none());
+        assert_eq!(r.entries.names(), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn a_node_registered_under_another_agent_id_than_its_machine_attests_as_is_refused() {
+        // The record under the machine's key carries a tpm agent ID made from that key: what
+        // a broker before ADR-0049 decision 8 would have stored. Nothing is parented to it.
+        let r = rig(listed());
+        r.claims.put_provider(provider_with(&HostCa::new(HOST)));
+        r.claims.put_machine(x509pop_member());
+        let id = x509pop_identity(HOST, SUBJECT);
+        r.store.put_claim(record(uid())).await.unwrap();
+        r.store.put_node(node(&id.key, false)).await.unwrap();
+        let resolved = r.watcher.resolve(&claim_on_member()).await.unwrap();
+        assert!(
+            matches!(&resolved, Resolution::Refused(why) if why.contains("another agent ID")),
+            "refused, and for that reason"
+        );
+        r.watcher.reconcile_claim(&claim_on_member()).await.unwrap();
+        assert!(r.store.get_claim(uid()).await.unwrap().revoked_at.is_some());
+        assert_eq!(r.entries.names(), Vec::<String>::new());
+    }
+
+    /// What a listed machine with something missing must come to, whatever is missing: no
+    /// node entry of either kind, and its claim not bound, although the machine publishes an
+    /// EK, the claim mirrors it and a node is registered under that EK. `wait` says whether
+    /// the cause may pass (the claim is retried until the resolve timeout) or not (it fails
+    /// at once). The reason names the cause.
+    async fn refused_with(r: &crate::fakes::Rig, vm: VirtualMachine, wait: bool, names: &[&str]) {
+        let found = r.watcher.x509pop_node(&vm).await.unwrap();
+        let ((MachineNode::NotYet(reason) | MachineNode::NoProvider(reason), true)
+        | (MachineNode::Unusable(reason), false)) = (&found, wait)
+        else {
+            panic!("the machine was not judged as expected (wait={wait})")
+        };
+        for word in names {
+            assert!(reason.contains(word), "the reason does not name {word:?}");
+        }
+        r.watcher.reconcile_machine(&vm).await.unwrap();
+        assert_eq!(
+            r.entries.names(),
+            Vec::<String>::new(),
+            "no node entry, and no TPM one in its place"
+        );
+        r.claims.set_machines(vec![vm]);
+        r.store.put_claim(record(uid())).await.unwrap();
+        r.store.put_node(node(RSA_EK_HASH, false)).await.unwrap();
+        let action = r.watcher.reconcile_claim(&claim_on_member()).await.unwrap();
+        let rec = r.store.get_claim(uid()).await.unwrap();
+        assert!(rec.entry_id.is_none() && rec.node_id.is_none(), "unbound");
+        assert_eq!(r.entries.names(), Vec::<String>::new());
+        if wait {
+            assert_eq!(action, Action::requeue(r.watcher.config().requeue));
+            assert!(rec.revoked_at.is_none(), "left unbound, retried");
+            tokio::time::sleep(r.watcher.config().resolve_timeout + Duration::from_millis(10))
+                .await;
+            r.watcher.reconcile_claim(&claim_on_member()).await.unwrap();
+        }
+        let rec = r.store.get_claim(uid()).await.unwrap();
+        assert!(rec.revoked_at.is_some(), "the claim is failed");
+        assert!(rec.entry_id.is_none());
+        assert_eq!(r.claims.deleted().len(), 1);
+        assert_eq!(r.entries.names(), Vec::<String>::new());
+    }
+
+    /// A rig with the pool listed and short timings, so a cause that may pass times out.
+    fn listed_rig() -> crate::fakes::Rig {
+        rig(WatcherConfig {
+            resolve_timeout: Duration::from_millis(40),
+            requeue: Duration::from_millis(5),
+            ..listed()
+        })
+    }
+
+    #[tokio::test]
+    async fn a_listed_machine_with_no_attestation_subject_gets_no_entry_and_its_claim_is_not_bound()
+    {
+        let r = listed_rig();
+        r.claims.put_provider(provider_with(&HostCa::new(HOST)));
+        let vm = member(X509POP_POOL, None, Some(HOST));
+        refused_with(&r, vm, true, &["attestationSubject", "member-1"]).await;
+    }
+
+    #[tokio::test]
+    async fn a_listed_machine_not_placed_on_a_provider_gets_no_entry_and_its_claim_is_not_bound() {
+        let r = listed_rig();
+        r.claims.put_provider(provider_with(&HostCa::new(HOST)));
+        let vm = member(X509POP_POOL, Some(SUBJECT), None);
+        refused_with(&r, vm, true, &["not placed on a Provider", "member-1"]).await;
+    }
+
+    #[tokio::test]
+    async fn a_listed_machine_whose_provider_does_not_exist_gets_no_entry_and_its_claim_is_not_bound()
+     {
+        let r = listed_rig();
+        refused_with(&r, x509pop_member(), true, &["Provider hv-01", "not found"]).await;
+    }
+
+    #[tokio::test]
+    async fn a_listed_machine_whose_provider_asserts_no_host_ca_gets_no_entry_and_its_claim_fails()
+    {
+        // No attestation block at all, and one that anchors only the TPM path.
+        for attestation in [
+            serde_json::Value::Null,
+            json!({ "ekTrustBundle": { "inline": HostCa::new(HOST).pem() } }),
+        ] {
+            let r = listed_rig();
+            r.claims
+                .put_provider(provider("sandboxes", HOST, &attestation));
+            refused_with(
+                &r,
+                x509pop_member(),
+                false,
+                &["Provider sandboxes/hv-01", "no spec.attestation.hostCa"],
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_listed_machine_whose_host_ca_is_a_reference_gets_no_entry_and_its_claim_fails() {
+        // Decision 10: inline only. A reference is refused by name, never resolved, and an
+        // inline value beside one does not rescue it.
+        let ca = HostCa::new(HOST);
+        for host_ca in [
+            json!({ "configMapRef": { "name": "host-ca" } }),
+            json!({ "secretRef": { "name": "host-ca", "key": "ca.crt" } }),
+            json!({ "inline": ca.pem(), "configMapRef": { "name": "host-ca" } }),
+        ] {
+            let r = listed_rig();
+            r.claims
+                .put_provider(provider("sandboxes", HOST, &json!({ "hostCa": host_ca })));
+            refused_with(
+                &r,
+                x509pop_member(),
+                false,
+                &[
+                    "Provider sandboxes/hv-01",
+                    "must be inline",
+                    "configMapRef or secretRef",
+                ],
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_listed_machine_whose_host_ca_is_refused_gets_no_entry_and_its_claim_fails() {
+        // What `host_ca_common_name` refuses (decision 2): a CA that may sign further CAs, a
+        // certificate that is no CA, two certificates, a name outside the alphabet, garbage.
+        let two = format!("{}{}", HostCa::new(HOST).pem(), HostCa::new("hv-02").pem());
+        for pem in [
+            HostCa::with_constraints(HOST, IsCa::Ca(BasicConstraints::Unconstrained))
+                .pem()
+                .to_owned(),
+            HostCa::with_constraints(HOST, IsCa::Ca(BasicConstraints::Constrained(1)))
+                .pem()
+                .to_owned(),
+            HostCa::with_constraints(HOST, IsCa::ExplicitNoCa)
+                .pem()
+                .to_owned(),
+            two,
+            HostCa::new("hv 01").pem().to_owned(),
+            "not a certificate".to_owned(),
+            String::new(),
+        ] {
+            let r = listed_rig();
+            r.claims.put_provider(provider(
+                "sandboxes",
+                HOST,
+                &json!({ "hostCa": { "inline": pem } }),
+            ));
+            refused_with(
+                &r,
+                x509pop_member(),
+                false,
+                &["Provider sandboxes/hv-01", "unusable"],
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_listed_machine_whose_subject_cannot_be_a_path_segment_gets_no_entry_and_its_claim_fails()
+     {
+        let r = listed_rig();
+        r.claims.put_provider(provider_with(&HostCa::new(HOST)));
+        let vm = member(X509POP_POOL, Some("../other-host/vm"), Some(HOST));
+        refused_with(&r, vm, false, &["attestationSubject", "unusable"]).await;
+    }
+
+    #[tokio::test]
+    async fn a_claim_of_a_listed_configuration_that_names_no_machine_or_a_missing_one_waits() {
+        let r = listed_rig();
+        r.store.put_claim(record(uid())).await.unwrap();
+        r.store.put_node(node(RSA_EK_HASH, false)).await.unwrap();
+        // No virtualMachineRef: the pool cannot be known, so the EK is not consulted either.
+        let unnamed = claim("Bound", &[RSA_EK_PEM], false);
+        assert_eq!(
+            r.watcher.resolve(&unnamed).await.unwrap(),
+            Resolution::NotYet("the claim names no machine yet".into())
+        );
+        // A machine that does not exist.
+        let resolved = r.watcher.resolve(&claim_on_member()).await.unwrap();
+        assert!(
+            matches!(&resolved, Resolution::NotYet(why) if why.contains("sandboxes/member-1") && why.contains("does not exist")),
+            "waits, naming the machine"
+        );
+        assert_eq!(r.entries.names(), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn the_provider_is_its_own_namespaces_and_the_provider_namespaces_only_when_that_holds_none()
+     {
+        // banlieue ADR-0133 decision 1, which placed the machine: a namespace holding any
+        // Provider is the whole candidate set.
+        let shared = |ca: &HostCa| {
+            provider(
+                "banlieue-providers",
+                HOST,
+                &json!({ "hostCa": { "inline": ca.pem() } }),
+            )
+        };
+        let with_fallback = || {
+            rig(WatcherConfig {
+                provider_namespace: Some("banlieue-providers".into()),
+                ..listed()
+            })
+        };
+        let known = |issuer: &str| {
+            MachineNode::Known(NodeAttestation::X509pop {
+                issuer_cn: issuer.into(),
+                subject_cn: SUBJECT.into(),
+            })
+        };
+        // None in its own namespace, no provider namespace configured: not found.
+        let r = rig(listed());
+        r.claims.put_provider(shared(&HostCa::new("shared-ca")));
+        assert!(matches!(
+            r.watcher.x509pop_node(&x509pop_member()).await.unwrap(),
+            MachineNode::NoProvider(_)
+        ));
+        // None in its own namespace, a provider namespace configured: found there.
+        let r = with_fallback();
+        r.claims.put_provider(shared(&HostCa::new("shared-ca")));
+        assert_eq!(
+            r.watcher.x509pop_node(&x509pop_member()).await.unwrap(),
+            known("shared-ca")
+        );
+        // Its own namespace holds the Provider: that one, not the shared one of the name.
+        r.claims.put_provider(provider_with(&HostCa::new("own-ca")));
+        assert_eq!(
+            r.watcher.x509pop_node(&x509pop_member()).await.unwrap(),
+            known("own-ca")
+        );
+        // Its own namespace holds another Provider only: no fallback to the shared one.
+        let r = with_fallback();
+        r.claims.put_provider(shared(&HostCa::new("shared-ca")));
+        r.claims.put_provider(provider(
+            "sandboxes",
+            "another",
+            &json!({ "hostCa": { "inline": HostCa::new("another-ca").pem() } }),
+        ));
+        assert!(matches!(
+            r.watcher.x509pop_node(&x509pop_member()).await.unwrap(),
+            MachineNode::NoProvider(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_provider_that_cannot_be_read_is_an_error_and_nothing_is_declared_bound_or_collected()
+    {
+        let r = rig(listed());
+        r.claims.put_provider(provider_with(&HostCa::new(HOST)));
+        let id = x509pop_identity(HOST, SUBJECT);
+        // A node and its entry, both an hour old, and the machine that gives their key.
+        let mut registered = x509pop_node_record(&id);
+        registered.registered_at = Timestamp::now() - jiff::SignedDuration::from_hours(1);
+        r.store.put_node(registered).await.unwrap();
+        r.watcher
+            .reconcile_machine(&x509pop_member())
+            .await
+            .unwrap();
+        r.claims.put_machine(x509pop_member());
+        r.store.put_claim(record(uid())).await.unwrap();
+
+        r.claims.fail_provider_reads(true);
+        assert!(
+            r.watcher
+                .reconcile_machine(&x509pop_member())
+                .await
+                .is_err()
+        );
+        assert!(r.watcher.reconcile_claim(&claim_on_member()).await.is_err());
+        assert!(r.watcher.collect_nodes().await.is_err());
+        assert!(r.watcher.collect_node_entries().await.is_err());
+        assert!(
+            r.store.get_node(&id.key).await.is_ok(),
+            "no read, no deletion"
+        );
+        assert_eq!(r.entries.names(), vec![node_entry_name(&id.key)]);
+        let rec = r.store.get_claim(uid()).await.unwrap();
+        assert!(rec.entry_id.is_none() && rec.revoked_at.is_none());
+        assert_eq!(r.claims.deleted(), Vec::<(String, String)>::new());
+    }
+
+    #[tokio::test]
+    async fn an_x509pop_node_and_its_entry_live_as_long_as_their_machine_gives_their_key() {
+        let r = rig(listed());
+        r.claims.put_provider(provider_with(&HostCa::new(HOST)));
+        let id = x509pop_identity(HOST, SUBJECT);
+        let mut registered = x509pop_node_record(&id);
+        registered.registered_at = Timestamp::now() - jiff::SignedDuration::from_hours(1);
+        r.store.put_node(registered).await.unwrap();
+        r.watcher
+            .reconcile_machine(&x509pop_member())
+            .await
+            .unwrap();
+        // A TPM machine beside it, so the VM list is never empty.
+        let tpm = machine(&[RSA_EK_PEM]);
+        r.claims.set_machines(vec![x509pop_member(), tpm.clone()]);
+        for _ in 0..3 {
+            assert_eq!(r.watcher.collect_nodes().await.unwrap(), 0);
+            assert_eq!(r.watcher.collect_node_entries().await.unwrap(), 0);
+        }
+        assert!(r.store.get_node(&id.key).await.is_ok());
+        assert_eq!(r.entries.names(), vec![node_entry_name(&id.key)]);
+        // The machine is gone: its EK was never what kept anything.
+        r.claims.set_machines(vec![tpm]);
+        assert_eq!(r.watcher.collect_nodes().await.unwrap(), 1);
+        assert_eq!(r.watcher.collect_node_entries().await.unwrap(), 1);
+        assert!(matches!(
+            r.store.get_node(&id.key).await,
+            Err(StoreError::NotFound(_))
+        ));
+        assert_eq!(r.entries.names(), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn an_ek_a_listed_machine_publishes_keeps_no_tpm_node_or_entry_alive() {
+        // The live set is computed by the pool list too: a listed machine's EK is no key.
+        let r = rig(listed());
+        r.claims.put_provider(provider_with(&HostCa::new(HOST)));
+        r.store.put_node(old_node(RSA_EK_HASH)).await.unwrap();
+        r.entries
+            .ensure_node_entry(&NodeAttestation::Tpm {
+                ek_hash: RSA_EK_HASH.into(),
+            })
+            .await
+            .unwrap();
+        r.claims.put_machine(x509pop_member());
+        assert_eq!(r.watcher.collect_nodes().await.unwrap(), 1);
+        assert_eq!(r.watcher.collect_node_entries().await.unwrap(), 1);
+        assert_eq!(r.entries.names(), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn a_host_ca_under_a_new_common_name_moves_the_node_entry_to_the_new_key() {
+        let r = rig(listed());
+        r.claims.put_provider(provider_with(&HostCa::new(HOST)));
+        r.claims.put_machine(x509pop_member());
+        r.watcher
+            .reconcile_machine(&x509pop_member())
+            .await
+            .unwrap();
+        let old = x509pop_identity(HOST, SUBJECT);
+        assert_eq!(r.entries.names(), vec![node_entry_name(&old.key)]);
+        // The administrator replaces the host's CA with one of another name.
+        r.claims
+            .put_provider(provider_with(&HostCa::new("hv-01-2027")));
+        let new = x509pop_identity("hv-01-2027", SUBJECT);
+        assert_ne!(old.key, new.key);
+        // The old entry is no machine's: retracted, with nothing else live.
+        assert_eq!(r.watcher.collect_node_entries().await.unwrap(), 1);
+        assert_eq!(r.entries.names(), Vec::<String>::new());
+        // The machine's next pass declares the entry under the new key.
+        r.watcher
+            .reconcile_machine(&x509pop_member())
+            .await
+            .unwrap();
+        assert_eq!(r.entries.names(), vec![node_entry_name(&new.key)]);
+        assert_eq!(
+            r.entries.parent_of(&node_entry_name(&new.key)),
+            Some(new.agent_id)
+        );
+        assert_eq!(r.watcher.collect_node_entries().await.unwrap(), 0);
+        // The host CA withdrawn from the Provider (banlieue's revocation): a deliberate act,
+        // the machine gives no key at all and its entry goes.
+        r.claims
+            .put_provider(provider("sandboxes", HOST, &serde_json::Value::Null));
+        assert_eq!(r.watcher.collect_node_entries().await.unwrap(), 1);
+        assert_eq!(r.entries.names(), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn a_provider_gone_for_a_pass_and_back_costs_no_x509pop_node_or_entry() {
+        // A Provider deleted and applied again (a GitOps sync): for a pass its machines
+        // give no key because something is missing, not because anything was withdrawn.
+        // Nothing x509pop is collected on that; a TPM node whose VM is gone still is.
+        let r = rig(listed());
+        let ca = HostCa::new(HOST);
+        r.claims.put_provider(provider_with(&ca));
+        let id = x509pop_identity(HOST, SUBJECT);
+        let mut registered = x509pop_node_record(&id);
+        registered.registered_at = Timestamp::now() - jiff::SignedDuration::from_hours(1);
+        r.store.put_node(registered).await.unwrap();
+        r.store.put_node(old_node("gone-ek")).await.unwrap();
+        r.watcher
+            .reconcile_machine(&x509pop_member())
+            .await
+            .unwrap();
+        // Another host's machine of the pool, its Provider untouched throughout.
+        let other_ca = HostCa::new("hv-02");
+        r.claims.put_provider(provider(
+            "sandboxes",
+            "hv-02",
+            &json!({ "hostCa": { "inline": other_ca.pem() } }),
+        ));
+        let mut other = member(X509POP_POOL, Some("other-subject"), Some("hv-02"));
+        other.metadata.name = Some("member-2".into());
+        r.watcher.reconcile_machine(&other).await.unwrap();
+        r.claims.set_machines(vec![x509pop_member(), other.clone()]);
+        let both = r.entries.names();
+        assert_eq!(both.len(), 2);
+
+        r.claims.remove_provider("sandboxes", HOST);
+        assert_eq!(
+            r.watcher.collect_nodes().await.unwrap(),
+            1,
+            "the TPM node whose VM is gone, and no x509pop one"
+        );
+        assert_eq!(r.watcher.collect_node_entries().await.unwrap(), 0);
+        assert!(r.store.get_node(&id.key).await.is_ok());
+        assert_eq!(r.entries.names(), both, "no entry retracted");
+        // The machine's own pass declares nothing and forgets nothing meanwhile.
+        r.watcher
+            .reconcile_machine(&x509pop_member())
+            .await
+            .unwrap();
+        assert_eq!(r.entries.names(), both);
+
+        // Back, the same certificate: nothing to collect, and nothing to declare again.
+        r.claims.put_provider(provider_with(&ca));
+        assert_eq!(r.watcher.collect_nodes().await.unwrap(), 0);
+        assert_eq!(r.watcher.collect_node_entries().await.unwrap(), 0);
+        r.watcher
+            .reconcile_machine(&x509pop_member())
+            .await
+            .unwrap();
+        assert_eq!(r.entries.names(), both);
+        let still_declared = r.watcher.declared.lock().unwrap().contains(&id.key);
+        assert!(still_declared, "the entry was never taken for retracted");
+    }
+
+    /// `vm` as created `ago` before now; `None` leaves it with no creation timestamp.
+    fn created(mut vm: VirtualMachine, ago: Option<jiff::SignedDuration>) -> VirtualMachine {
+        vm.metadata.creation_timestamp = ago.map(|ago| {
+            k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(Timestamp::now() - ago)
+        });
+        vm
+    }
+
+    /// A rig with the pool listed, the host's Provider in place, a live listed machine, and
+    /// the hour-old node of an x509pop machine that is gone: what a collection would take.
+    async fn rig_with_a_dead_x509pop_node() -> crate::fakes::Rig {
+        let r = rig(listed());
+        r.claims.put_provider(provider_with(&HostCa::new(HOST)));
+        let gone = x509pop_identity(HOST, "gone-subject");
+        let mut registered = x509pop_node_record(&gone);
+        registered.registered_at = Timestamp::now() - jiff::SignedDuration::from_hours(1);
+        r.store.put_node(registered).await.unwrap();
+        r
+    }
+
+    #[tokio::test]
+    async fn a_young_listed_machine_still_being_provisioned_holds_the_x509pop_collection_and_an_old_one_does_not()
+     {
+        // No subject yet, or not placed yet: a machine on its way. It holds the collection
+        // of x509pop nodes while it is younger than the node grace (ten minutes by default),
+        // and not a moment longer: a machine that never gets there, or one labelled into a
+        // listed pool by whoever may label machines, must not stop the collection for good.
+        // A machine with no creation timestamp is not young.
+        let unprovisioned = || {
+            let mut no_subject = member(X509POP_POOL, None, Some(HOST));
+            no_subject.metadata.name = Some("member-2".into());
+            let mut not_placed = member(X509POP_POOL, Some("another-subject"), None);
+            not_placed.metadata.name = Some("member-3".into());
+            [no_subject, not_placed]
+        };
+        for pending in unprovisioned() {
+            let r = rig_with_a_dead_x509pop_node().await;
+            let young = created(pending.clone(), Some(jiff::SignedDuration::from_mins(9)));
+            r.claims.set_machines(vec![x509pop_member(), young]);
+            assert_eq!(r.watcher.collect_nodes().await.unwrap(), 0, "held");
+            // Provisioned: the set is whole, and the node whose machine is gone goes.
+            r.claims.set_machines(vec![x509pop_member()]);
+            assert_eq!(r.watcher.collect_nodes().await.unwrap(), 1);
+        }
+        for age in [Some(jiff::SignedDuration::from_mins(11)), None] {
+            for pending in unprovisioned() {
+                let r = rig_with_a_dead_x509pop_node().await;
+                r.claims
+                    .set_machines(vec![x509pop_member(), created(pending, age)]);
+                assert_eq!(
+                    r.watcher.collect_nodes().await.unwrap(),
+                    1,
+                    "past the grace it holds nothing: the dead node is collected"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_grace_a_machine_being_provisioned_holds_for_is_the_node_grace() {
+        let r = rig(WatcherConfig {
+            node_grace: Duration::from_hours(2),
+            ..listed()
+        });
+        r.claims.put_provider(provider_with(&HostCa::new(HOST)));
+        let gone = x509pop_identity(HOST, "gone-subject");
+        let mut registered = x509pop_node_record(&gone);
+        registered.registered_at = Timestamp::now() - jiff::SignedDuration::from_hours(3);
+        r.store.put_node(registered).await.unwrap();
+        let mut pending = member(X509POP_POOL, None, Some(HOST));
+        pending.metadata.name = Some("member-2".into());
+        let hour_old = created(pending.clone(), Some(jiff::SignedDuration::from_hours(1)));
+        r.claims.set_machines(vec![x509pop_member(), hour_old]);
+        assert_eq!(
+            r.watcher.collect_nodes().await.unwrap(),
+            0,
+            "inside two hours"
+        );
+        let older = created(pending, Some(jiff::SignedDuration::from_hours(3)));
+        r.claims.set_machines(vec![x509pop_member(), older]);
+        assert_eq!(r.watcher.collect_nodes().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_missing_provider_holds_the_x509pop_collection_whatever_the_machines_age() {
+        // The Provider is the administrators': one deleted and applied again must cost no
+        // guest its identity, however long its machines have existed.
+        for age in [
+            Some(jiff::SignedDuration::from_mins(1)),
+            Some(jiff::SignedDuration::from_hours(24 * 30)),
+            None,
+        ] {
+            let r = rig_with_a_dead_x509pop_node().await;
+            let mut orphan = member(X509POP_POOL, Some("another-subject"), Some("hv-gone"));
+            orphan.metadata.name = Some("member-2".into());
+            r.claims
+                .set_machines(vec![x509pop_member(), created(orphan, age)]);
+            for _ in 0..3 {
+                assert_eq!(r.watcher.collect_nodes().await.unwrap(), 0, "held");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn two_providers_asserting_different_cas_under_one_name_get_no_entry_either() {
+        // Decision 2: the issuer's common name is what confines a host to its own guests.
+        // Two CAs under one name, on Providers of two namespaces: neither host's machines
+        // get an entry, and the reason names the name and both Providers.
+        let r = listed_rig();
+        r.claims.put_provider(provider_with(&HostCa::new(HOST)));
+        r.claims.put_provider(provider(
+            "team-b",
+            "hv-elsewhere",
+            &json!({ "hostCa": { "inline": HostCa::new(HOST).pem() } }),
+        ));
+        refused_with(
+            &r,
+            x509pop_member(),
+            false,
+            &[
+                "two Providers assert host CAs named \"hv-01\"",
+                "sandboxes/hv-01",
+                "team-b/hv-elsewhere",
+            ],
+        )
+        .await;
+        // The other Provider's own machine is refused the same way.
+        let r = rig(WatcherConfig {
+            x509pop_pools: ["team-b/fc".to_owned()].into(),
+            ..WatcherConfig::default()
+        });
+        r.claims.put_provider(provider_with(&HostCa::new(HOST)));
+        r.claims.put_provider(provider(
+            "team-b",
+            "hv-elsewhere",
+            &json!({ "hostCa": { "inline": HostCa::new(HOST).pem() } }),
+        ));
+        let mut theirs = member(X509POP_POOL, Some(SUBJECT), Some("hv-elsewhere"));
+        theirs.metadata.namespace = Some("team-b".into());
+        let found = r.watcher.x509pop_node(&theirs).await.unwrap();
+        assert!(
+            matches!(&found, MachineNode::Unusable(why) if why.contains("two Providers assert")),
+            "refused from the other side too"
+        );
+        r.watcher.reconcile_machine(&theirs).await.unwrap();
+        assert_eq!(r.entries.names(), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn the_same_host_ca_on_two_providers_is_one_ca_and_a_rival_that_goes_frees_the_name() {
+        let r = rig(listed());
+        let ca = HostCa::new(HOST);
+        r.claims.put_provider(provider_with(&ca));
+        // The same certificate asserted again (a host serving two namespaces), and beside
+        // it CAs of other names and a Provider with nothing to say.
+        r.claims.put_provider(provider(
+            "team-b",
+            HOST,
+            &json!({ "hostCa": { "inline": ca.pem() } }),
+        ));
+        r.claims.put_provider(provider(
+            "team-b",
+            "hv-02",
+            &json!({ "hostCa": { "inline": HostCa::new("hv-02").pem() } }),
+        ));
+        r.claims
+            .put_provider(provider("team-b", "plain", &serde_json::Value::Null));
+        r.watcher
+            .reconcile_machine(&x509pop_member())
+            .await
+            .unwrap();
+        let id = x509pop_identity(HOST, SUBJECT);
+        assert_eq!(r.entries.names(), vec![node_entry_name(&id.key)]);
+        // A rival appears: the entry is retracted at the next collection (a withdrawal of
+        // trust, not something missing), and declared again once the rival is gone.
+        r.claims.put_machine(x509pop_member());
+        r.claims.put_provider(provider(
+            "team-c",
+            "impostor",
+            &json!({ "hostCa": { "inline": HostCa::new(HOST).pem() } }),
+        ));
+        assert_eq!(r.watcher.collect_node_entries().await.unwrap(), 1);
+        r.watcher
+            .reconcile_machine(&x509pop_member())
+            .await
+            .unwrap();
+        assert_eq!(r.entries.names(), Vec::<String>::new());
+        r.claims.remove_provider("team-c", "impostor");
+        r.watcher
+            .reconcile_machine(&x509pop_member())
+            .await
+            .unwrap();
+        assert_eq!(r.entries.names(), vec![node_entry_name(&id.key)]);
+    }
+
+    #[tokio::test]
+    async fn the_providers_are_listed_once_for_a_whole_pass_however_many_machines_it_reads() {
+        let r = rig(listed());
+        r.claims.put_provider(provider_with(&HostCa::new(HOST)));
+        let machines: Vec<VirtualMachine> = (0..5)
+            .map(|i| {
+                let mut vm = member(X509POP_POOL, Some(&format!("subject-{i}")), Some(HOST));
+                vm.metadata.name = Some(format!("member-{i}"));
+                vm
+            })
+            .collect();
+        r.store.put_node(old_node("gone-ek")).await.unwrap();
+        r.claims.set_machines(machines.clone());
+        assert_eq!(r.watcher.collect_nodes().await.unwrap(), 1);
+        assert_eq!(
+            r.claims.provider_reads(),
+            1,
+            "one listing for five machines"
+        );
+        r.watcher.reconcile_machine(&machines[0]).await.unwrap();
+        assert_eq!(
+            r.claims.provider_reads(),
+            2,
+            "and one for a machine's own pass"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_listed_machines_that_give_one_key_share_one_node_entry_until_both_are_gone() {
+        // banlieue gives every machine its own subject (its UID). Two machines publishing
+        // one subject under one host CA are one x509pop identity as far as SPIRE can tell:
+        // one node entry, declared once, kept while either machine exists. What stops the
+        // second machine from *being* the node is the registration: a second DMI UUID under
+        // a registered node key is a 409 (the store's conformance cases).
+        let r = rig(listed());
+        r.claims.put_provider(provider_with(&HostCa::new(HOST)));
+        let first = x509pop_member();
+        let mut second = x509pop_member();
+        second.metadata.name = Some("member-2".into());
+        r.watcher.reconcile_machine(&first).await.unwrap();
+        r.watcher.reconcile_machine(&second).await.unwrap();
+        let id = x509pop_identity(HOST, SUBJECT);
+        assert_eq!(r.entries.names(), vec![node_entry_name(&id.key)]);
+        // A TPM machine beside them, so the VM list is never empty.
+        let tpm = machine(&[RSA_EK_PEM]);
+        r.claims
+            .set_machines(vec![first, second.clone(), tpm.clone()]);
+        assert_eq!(r.watcher.collect_node_entries().await.unwrap(), 0);
+        r.claims.set_machines(vec![second, tpm.clone()]);
+        assert_eq!(
+            r.watcher.collect_node_entries().await.unwrap(),
+            0,
+            "one of the two still gives the key"
+        );
+        r.claims.set_machines(vec![tpm]);
+        assert_eq!(r.watcher.collect_node_entries().await.unwrap(), 1);
+        assert_eq!(r.entries.names(), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn an_x509pop_node_entry_under_a_live_claim_is_kept_when_its_machine_is_gone() {
+        let r = rig(listed());
+        r.claims.put_provider(provider_with(&HostCa::new(HOST)));
+        let id = x509pop_identity(HOST, SUBJECT);
+        r.watcher
+            .reconcile_machine(&x509pop_member())
+            .await
+            .unwrap();
+        let mut rec = record(uid());
+        rec.node_id = Some(id.agent_id.clone());
+        rec.entry_id = Some("entry".into());
+        rec.expires_at = Some(Timestamp::now() + jiff::SignedDuration::from_mins(10));
+        r.store.put_claim(rec).await.unwrap();
+        // Another VM is live, so the list is believed and only the guards decide.
+        r.claims.put_machine(machine(&[RSA_EK_PEM]));
+        assert_eq!(r.watcher.collect_node_entries().await.unwrap(), 0);
+        assert_eq!(r.entries.names(), vec![node_entry_name(&id.key)]);
     }
 
     // ADR-0055: under `bundles` the watcher reads the audience catalog, not the file.

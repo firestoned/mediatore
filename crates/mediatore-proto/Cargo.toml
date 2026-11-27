@@ -25,7 +25,7 @@ webpki-roots.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
-rcgen.workspace = true
+rcgen = { workspace = true, features = ["pem"] }   # PEM output for the x509pop leaf fixtures
 base64.workspace = true
 
 [lints]

@@ -24,6 +24,7 @@ pub mod registry;
 pub mod sandboxes;
 pub mod svid;
 pub mod transit;
+pub mod x509pop;
 
 pub use entra::tempdir;
 pub use gateway::{StandInGateway, dead_endpoint};

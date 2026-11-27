@@ -228,6 +228,7 @@ impl Harness {
             .post(format!("{}/v1/nodes", self.sandbox_url))
             .json(&NodeRegistration {
                 ek_hash: EK_HASH.into(),
+                attestation: None,
                 dmi_uuid: uuid::Uuid::new_v4(),
                 hostname: "pool-a-7".into(),
                 provider: Some(mediatore_proto::Provider::Libvirt),
@@ -666,4 +667,73 @@ async fn rotated_material_is_used_by_new_handshakes() {
         "the old root is gone on both sides"
     );
     drop(old_client);
+}
+
+/// ADR-0049 decision 8 over the real transport: the peer identity is the certificate, and an
+/// x509pop node registers only the names whose key its SVID carries.
+#[tokio::test]
+async fn an_x509pop_node_registers_over_mtls_under_the_key_its_svid_names_and_no_other() {
+    let h = Harness::start().await;
+    let identity = |issuer: &str, subject: &str| {
+        mediatore_spire::NodeIdentity::of(
+            &Naming {
+                trust_domain: TRUST_DOMAIN.into(),
+            },
+            &mediatore_spire::NodeAttestation::X509pop {
+                issuer_cn: issuer.into(),
+                subject_cn: subject.into(),
+            },
+        )
+        .expect("an x509pop identity")
+    };
+    let svid_of = |id: &mediatore_spire::NodeIdentity| {
+        format!("spiffe://{TRUST_DOMAIN}/banlieue/node/{}", id.key)
+    };
+    let register = |client: reqwest::Client, issuer: &'static str, subject: &'static str| {
+        let url = format!("{}/v1/nodes", h.sandbox_url);
+        async move {
+            client
+                .post(url)
+                .json(&NodeRegistration::x509pop(
+                    issuer.into(),
+                    subject.into(),
+                    uuid::Uuid::new_v4(),
+                    "pool-fc-1".into(),
+                ))
+                .send()
+                .await
+                .expect("register")
+        }
+    };
+    let node = identity("hv-01", "vm-uid-1");
+
+    // Another host's guest of the same subject, and a TPM node, each with a valid SVID of
+    // this trust domain: neither may register the names.
+    let other_host = h.mtls_as(&svid_of(&identity("hv-02", "vm-uid-1")));
+    assert_eq!(
+        register(other_host, "hv-01", "vm-uid-1").await.status(),
+        403
+    );
+    let tpm_node = h.mtls_as(&node_svid());
+    assert_eq!(register(tpm_node, "hv-01", "vm-uid-1").await.status(), 403);
+
+    // The guest itself.
+    let client = h.mtls_as(&svid_of(&node));
+    let resp = register(client.clone(), "hv-01", "vm-uid-1").await;
+    assert_eq!(resp.status(), 200, "the registration was refused");
+    let registered: NodeRegistered = resp.json().await.expect("node body");
+    assert_eq!(
+        registered.node_id,
+        format!("spiffe://{TRUST_DOMAIN}/spire/agent/x509pop/hv-01/vm-uid-1")
+    );
+    let claim = h.create_claim(&h.login("octocat")).await;
+    assert_eq!(claim.phase, mediatore_proto::ClaimPhase::Bound);
+    let me = client
+        .get(format!("{}/v1/me", h.sandbox_url))
+        .send()
+        .await
+        .expect("me");
+    assert_eq!(me.status(), 200);
+    let me: Me = me.json().await.expect("me body");
+    assert_eq!(me.claim_uid, claim.uid.expect("uid"));
 }

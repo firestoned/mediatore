@@ -11,6 +11,7 @@ pub mod cert;
 pub mod ek;
 pub mod image;
 pub mod tls;
+pub mod x509pop;
 
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
@@ -41,11 +42,54 @@ pub enum Provider {
     Libvirt,
 }
 
+/// How a node says it attested (ADR-0049 decision 8), tagged by `kind`. An unknown kind, or
+/// an unknown field inside, does not parse: a new attestor is a new variant, never a guess.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
+pub enum Attestation {
+    /// A guest with a vTPM (ADR-0018).
+    Tpm {
+        /// SHA-256 of the TPM endorsement public key, as the SPIRE TPM attestor computes it.
+        ek_hash: String,
+    },
+    /// A guest without one (ADR-0049): the two common names of the leaf its host signed.
+    X509pop {
+        /// Common name of the leaf's issuer, the host's signing CA.
+        issuer_cn: String,
+        /// Common name of the leaf's subject, which the host's signer set.
+        subject_cn: String,
+    },
+}
+
+/// Why a registration names no single attestation (ADR-0049 decision 8). Each is a `400`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum AttestationError {
+    /// Neither an `attestation` nor a top-level `ek_hash`.
+    #[error("the registration carries neither an attestation nor an ek_hash")]
+    Missing,
+    /// A `tpm` attestation whose hash is not the top-level `ek_hash` sent beside it.
+    #[error("the tpm attestation's ek_hash is not the registration's top-level ek_hash")]
+    Disagree,
+    /// An `x509pop` attestation beside a non-empty top-level `ek_hash`.
+    #[error("an x509pop attestation may not be sent beside an ek_hash")]
+    EkHashBesideX509pop,
+}
+
 /// `POST /v1/nodes`, sent by the in-guest agent at boot over the node SVID.
+///
+/// A TPM guest sends the top-level `ek_hash` and no `attestation`, which is byte for byte
+/// what every guest up to v0.4.0 sent, so it registers at an older broker too. An `x509pop`
+/// guest sends `attestation` and no `ek_hash`. [`Self::resolve`] is the one rule that reads
+/// the two.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeRegistration {
     /// SHA-256 of the TPM endorsement public key, as the SPIRE TPM attestor computes it.
+    /// Empty, and then left off the wire, when the node is not a TPM node.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub ek_hash: String,
+    /// How the node attested. Absent means `tpm`, read from `ek_hash`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attestation: Option<Attestation>,
     /// `/sys/class/dmi/id/product_uuid` inside the guest.
     pub dmi_uuid: Uuid,
     /// Guest hostname, informational.
@@ -55,10 +99,69 @@ pub struct NodeRegistration {
     pub provider: Option<Provider>,
 }
 
+impl NodeRegistration {
+    /// A TPM node's registration, in the shape every guest up to v0.4.0 sent.
+    #[must_use]
+    pub fn tpm(ek_hash: String, dmi_uuid: Uuid, hostname: String) -> Self {
+        Self {
+            ek_hash,
+            attestation: None,
+            dmi_uuid,
+            hostname,
+            provider: None,
+        }
+    }
+
+    /// An `x509pop` node's registration: the attestation and no `ek_hash`.
+    #[must_use]
+    pub fn x509pop(
+        issuer_cn: String,
+        subject_cn: String,
+        dmi_uuid: Uuid,
+        hostname: String,
+    ) -> Self {
+        Self {
+            ek_hash: String::new(),
+            attestation: Some(Attestation::X509pop {
+                issuer_cn,
+                subject_cn,
+            }),
+            dmi_uuid,
+            hostname,
+            provider: None,
+        }
+    }
+
+    /// The one attestation this registration names (ADR-0049 decision 8): absent means
+    /// `tpm` from the top-level `ek_hash`; a `tpm` attestation beside an `ek_hash` must
+    /// carry the same hash; an `x509pop` attestation beside a non-empty `ek_hash` is
+    /// refused; neither is refused. The values themselves (the hash's shape, the names'
+    /// alphabet) are the broker's to check.
+    ///
+    /// # Errors
+    /// [`AttestationError`].
+    pub fn resolve(&self) -> Result<Attestation, AttestationError> {
+        match (&self.attestation, self.ek_hash.is_empty()) {
+            (None, true) => Err(AttestationError::Missing),
+            (None, false) => Ok(Attestation::Tpm {
+                ek_hash: self.ek_hash.clone(),
+            }),
+            (Some(Attestation::Tpm { ek_hash }), false) if *ek_hash != self.ek_hash => {
+                Err(AttestationError::Disagree)
+            }
+            (Some(Attestation::X509pop { .. }), false) => {
+                Err(AttestationError::EkHashBesideX509pop)
+            }
+            (Some(att), _) => Ok(att.clone()),
+        }
+    }
+}
+
 /// Response to a node registration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeRegistered {
-    /// The node's SPIFFE ID as SPIRE reports it.
+    /// The SPIFFE ID of the node's SPIRE agent, as the broker derived it from the attestation
+    /// and stored it: `spire/agent/tpm/<ek hash>` or `spire/agent/x509pop/<issuer>/<subject>`.
     pub node_id: String,
 }
 
@@ -1281,6 +1384,19 @@ pub mod error_code {
     pub const NAMESPACE_REQUIRED: &str = "namespace_required";
     /// A namespace that is not an RFC 1123 label (`400`, ADR-0046 decision 4).
     pub const INVALID_NAMESPACE: &str = "invalid_namespace";
+    /// `POST /v1/nodes` with an EK hash that is not 64 lowercase hex, or with neither an
+    /// attestation nor an `ek_hash` (`400`). The code every broker has answered a bad TPM
+    /// registration with.
+    pub const INVALID_EK_HASH: &str = "invalid_ek_hash";
+    /// `POST /v1/nodes` with an attestation that cannot be read as one (`400`, ADR-0049
+    /// decision 8): an unknown kind, an unknown field, a `tpm` attestation that disagrees
+    /// with the top-level `ek_hash`, an `x509pop` one beside an `ek_hash`, or a common name
+    /// outside the path-segment alphabet.
+    pub const INVALID_ATTESTATION: &str = "invalid_attestation";
+    /// `POST /v1/nodes` for a node key already registered under another agent ID than this
+    /// registration derives (`409`, ADR-0049 decision 8): the key was first presented under
+    /// another attestor. Nothing is changed; an operator deletes the node's record.
+    pub const NODE_IDENTITY_CONFLICT: &str = "node_identity_conflict";
 }
 
 /// An RFC 1123 label, which is what a namespace name must be (ADR-0046 decision 4). The
@@ -2693,5 +2809,147 @@ mod tests {
             .is_err(),
             "a timestamp with no offset is refused"
         );
+    }
+
+    // ----- node registration (ADR-0049 decision 8) --------------------------------------
+
+    const EK: &str = "72c566555391e835a15c522680b51ec3b840561ed70af5605a5ae4835f040ee8";
+    const DMI: &str = "6b0a3e9c-1f4d-4c2e-9a7b-0d1e2f3a4b5c";
+
+    fn registration(body: &serde_json::Value) -> Result<NodeRegistration, serde_json::Error> {
+        serde_json::from_value(body.clone())
+    }
+
+    #[test]
+    fn a_tpm_guest_serializes_exactly_what_a_v0_4_0_guest_did() {
+        // An older broker parses this body: the top-level ek_hash, and no attestation key.
+        let mut reg = NodeRegistration::tpm(EK.into(), DMI.parse().unwrap(), "member-1".into());
+        assert_eq!(
+            serde_json::to_string(&reg).unwrap(),
+            format!(r#"{{"ek_hash":"{EK}","dmi_uuid":"{DMI}","hostname":"member-1"}}"#)
+        );
+        reg.provider = Some(Provider::CloudHypervisor);
+        assert_eq!(
+            serde_json::to_string(&reg).unwrap(),
+            format!(
+                r#"{{"ek_hash":"{EK}","dmi_uuid":"{DMI}","hostname":"member-1","provider":"cloud-hypervisor"}}"#
+            )
+        );
+    }
+
+    #[test]
+    fn a_v0_4_0_body_parses_and_means_tpm() {
+        let body = format!(
+            r#"{{"ek_hash":"{EK}","dmi_uuid":"{DMI}","hostname":"member-1","provider":"libvirt"}}"#
+        );
+        let reg: NodeRegistration = serde_json::from_str(&body).unwrap();
+        assert_eq!(reg.attestation, None);
+        assert_eq!(reg.resolve(), Ok(Attestation::Tpm { ek_hash: EK.into() }));
+    }
+
+    #[test]
+    fn an_x509pop_guest_sends_the_attestation_and_no_ek_hash() {
+        let reg = NodeRegistration::x509pop(
+            "hv-01".into(),
+            "3f0c".into(),
+            DMI.parse().unwrap(),
+            "member-1".into(),
+        );
+        assert_eq!(
+            serde_json::to_string(&reg).unwrap(),
+            format!(
+                r#"{{"attestation":{{"kind":"x509pop","issuer_cn":"hv-01","subject_cn":"3f0c"}},"dmi_uuid":"{DMI}","hostname":"member-1"}}"#
+            )
+        );
+        let back: NodeRegistration =
+            serde_json::from_str(&serde_json::to_string(&reg).unwrap()).unwrap();
+        assert_eq!(
+            back.resolve(),
+            Ok(Attestation::X509pop {
+                issuer_cn: "hv-01".into(),
+                subject_cn: "3f0c".into()
+            })
+        );
+    }
+
+    #[test]
+    fn every_branch_of_the_resolution_rule() {
+        let base = serde_json::json!({ "dmi_uuid": DMI, "hostname": "member-1" });
+        let with = |extra: serde_json::Value| {
+            let mut body = base.clone();
+            for (k, v) in extra.as_object().unwrap() {
+                body[k] = v.clone();
+            }
+            registration(&body).unwrap().resolve()
+        };
+        let tpm = Attestation::Tpm { ek_hash: EK.into() };
+        let other = "ab".repeat(32);
+        // Neither.
+        assert_eq!(with(serde_json::json!({})), Err(AttestationError::Missing));
+        assert_eq!(
+            with(serde_json::json!({ "ek_hash": "" })),
+            Err(AttestationError::Missing)
+        );
+        // Absent means tpm.
+        assert_eq!(with(serde_json::json!({ "ek_hash": EK })), Ok(tpm.clone()));
+        // A tpm attestation alone, and beside the same hash.
+        let att = serde_json::json!({ "kind": "tpm", "ek_hash": EK });
+        assert_eq!(
+            with(serde_json::json!({ "attestation": att })),
+            Ok(tpm.clone())
+        );
+        assert_eq!(
+            with(serde_json::json!({ "attestation": att, "ek_hash": EK })),
+            Ok(tpm)
+        );
+        // Beside another hash.
+        assert_eq!(
+            with(serde_json::json!({ "attestation": att, "ek_hash": other })),
+            Err(AttestationError::Disagree)
+        );
+        // x509pop alone, and beside a hash.
+        let x =
+            serde_json::json!({ "kind": "x509pop", "issuer_cn": "hv-01", "subject_cn": "vm-1" });
+        assert_eq!(
+            with(serde_json::json!({ "attestation": x })),
+            Ok(Attestation::X509pop {
+                issuer_cn: "hv-01".into(),
+                subject_cn: "vm-1".into()
+            })
+        );
+        assert_eq!(
+            with(serde_json::json!({ "attestation": x, "ek_hash": "" })),
+            Ok(Attestation::X509pop {
+                issuer_cn: "hv-01".into(),
+                subject_cn: "vm-1".into()
+            })
+        );
+        assert_eq!(
+            with(serde_json::json!({ "attestation": x, "ek_hash": EK })),
+            Err(AttestationError::EkHashBesideX509pop)
+        );
+    }
+
+    #[test]
+    fn an_unknown_kind_an_unknown_field_and_a_missing_one_do_not_parse() {
+        for bad in [
+            serde_json::json!({ "kind": "join_token", "token": "x" }),
+            serde_json::json!({ "kind": "x509pop", "issuer_cn": "a", "subject_cn": "b", "sha1": "c" }),
+            serde_json::json!({ "kind": "tpm", "ek_hash": EK, "issuer_cn": "a" }),
+            serde_json::json!({ "kind": "x509pop", "issuer_cn": "a" }),
+            serde_json::json!({ "kind": "X509POP", "issuer_cn": "a", "subject_cn": "b" }),
+            serde_json::json!({ "issuer_cn": "a", "subject_cn": "b" }),
+            serde_json::json!("x509pop"),
+        ] {
+            assert!(
+                serde_json::from_value::<Attestation>(bad.clone()).is_err(),
+                "{bad} parsed"
+            );
+            let body = serde_json::json!({ "attestation": bad, "dmi_uuid": DMI, "hostname": "m" });
+            assert!(
+                registration(&body).is_err(),
+                "{bad} parsed in a registration"
+            );
+        }
     }
 }

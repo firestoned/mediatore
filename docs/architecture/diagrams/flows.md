@@ -74,7 +74,7 @@ flowchart TD
     t2["2. The watcher computes sha256(DER SubjectPublicKeyInfo) of the EK, which is the tpm attestor's agent ID hash, and declares mediatore-node-<ek-hash> parented to that agent."]
     t3["3. The controller manager renders the node entry; it waits in the server until the agent attests."]
     t4["4. The VM's agent attests with the EK; on sync it receives the node entry and issues the node SVID to the guest role (unix:uid:0 and the path of the one mediatore binary)."]
-    t5["5. mediatore guest registers the node over mTLS with that SVID; the broker checks the SVID's EK hash equals the registered one and refuses a cloned EK with 409."]
+    t5["5. mediatore guest registers the node over mTLS with that SVID; the broker checks the SVID's node key equals the one the registration's attestation gives (the EK hash, or the hash of an x509pop agent ID) and refuses a cloned node with 409."]
     t6["6. The guest announces GuestReady on the hypervisor's channel; only now does the pool count the member (ADR-0019)."]
     t1 --> t2 --> t3 --> t4 --> t5 --> t6
 ```

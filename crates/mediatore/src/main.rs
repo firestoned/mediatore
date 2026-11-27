@@ -54,6 +54,12 @@ enum Cmd {
     Guest(mediatore_guest::guest::GuestArgs),
     /// On a guest with no vTPM: the x509pop certificate from the host, `fetch` before the SPIRE agent, `renew` beside it (ADR-0049).
     NodeCert(mediatore_guest::nodecert::NodeCertArgs),
+    /// For the operator, before a host CA goes into the SPIRE server's x509pop bundle: `check` refuses a bundle in which two CAs share a common name or one may sign further CAs (ADR-0049 decision 2).
+    X509popBundle {
+        /// What to do.
+        #[command(subcommand)]
+        mode: X509popBundleCmd,
+    },
     /// Inside the jail: trade the claim SVID for one audience-scoped token.
     Token(mediatore_guest::token::TokenArgs),
     /// Inside the jail, before the workload: apply Landlock to this process, then exec the argv (ADR-0024).
@@ -76,6 +82,46 @@ enum Cmd {
     },
 }
 
+/// `mediatore x509pop-bundle`.
+#[derive(Subcommand, Debug)]
+enum X509popBundleCmd {
+    /// Read the PEM files as one bundle, the way the server's init container joins them, and exit non-zero unless every certificate is a CA with a path length of zero under a common name of its own.
+    Check {
+        /// The host CA certificates: one file per host, or one file holding several
+        #[arg(required = true)]
+        files: Vec<PathBuf>,
+    },
+}
+
+/// The common names of the CAs in `files`, read as one x509pop bundle, in order (ADR-0049
+/// decision 2): what `mediatore x509pop-bundle check` prints. The agent ID is
+/// issuer-qualified by name, so the bundle is refused when two CAs share a common name,
+/// when a name cannot be a segment of an agent ID, and when a member is not a CA with a path
+/// length of zero.
+///
+/// # Errors
+/// A file cannot be read, holds no certificate, or the bundle is refused; the message names
+/// the file or the certificate's common name, never a certificate body.
+fn check_x509pop_bundle(files: &[PathBuf]) -> anyhow::Result<Vec<String>> {
+    use anyhow::Context as _;
+    use mediatore_spire::x509pop::{ca_bundle_common_names, refuse_duplicate_common_names};
+    let mut bundle = String::new();
+    for file in files {
+        let pem = std::fs::read_to_string(file)
+            .with_context(|| format!("x509pop bundle: cannot read {}", file.display()))?;
+        // Each file alone first, so the refusal of an empty or broken one names it.
+        ca_bundle_common_names(&pem)
+            .map_err(|e| anyhow::anyhow!("x509pop bundle: {}: {e}", file.display()))?;
+        bundle.push_str(&pem);
+        if !pem.ends_with('\n') {
+            bundle.push('\n');
+        }
+    }
+    refuse_duplicate_common_names(&bundle)
+        .map_err(|e| anyhow::anyhow!("x509pop bundle refused: {e}"))?;
+    ca_bundle_common_names(&bundle).map_err(|e| anyhow::anyhow!("x509pop bundle: {e}"))
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     mediatore_proto::tls::ensure_provider();
@@ -94,6 +140,17 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Serve { config } => serve(&config).await,
         Cmd::Guest(args) => mediatore_guest::guest::run(args).await,
         Cmd::NodeCert(args) => Ok(mediatore_guest::nodecert::run(args).await?),
+        Cmd::X509popBundle {
+            mode: X509popBundleCmd::Check { files },
+        } => {
+            let names = check_x509pop_bundle(&files)?;
+            println!(
+                "ok: {} host CA(s), each a CA with a path length of zero under a common name of its own: {}",
+                names.len(),
+                names.join(", ")
+            );
+            Ok(())
+        }
         Cmd::Token(args) => mediatore_guest::token::run(args).await,
         Cmd::EgressProxy(args) => mediatore_guest::egress::run(args).await,
         Cmd::Gateway(args) => mediatore_gateway::serve::run(args).await,
@@ -449,6 +506,10 @@ async fn claim_watcher(
                 .collect(),
             // ADR-0055: under `bundles`, the catalog the API reads, answering for the watcher too.
             catalog: state.audience_catalog.as_ref().map(|c| c.live.clone()),
+            // ADR-0049 decisions 9 and 10: which pools attest with x509pop, and where a
+            // shared Provider lives.
+            x509pop_pools: cfg.watcher.x509pop_pool_set(),
+            provider_namespace: cfg.watcher.provider_namespace.clone(),
             ..WatcherConfig::default()
         },
     );
@@ -456,6 +517,13 @@ async fn claim_watcher(
         watcher = watcher.with_bundles(bundles);
     }
     let watcher = Arc::new(watcher);
+    if !cfg.watcher.x509pop_pools.is_empty() {
+        tracing::info!(
+            pools = ?cfg.watcher.x509pop_pools,
+            provider_namespace = cfg.watcher.provider_namespace.as_deref().unwrap_or("(none)"),
+            "watcher: these pools' machines attest with x509pop, never with a TPM (ADR-0049)"
+        );
+    }
     let lease = LeaseConfig {
         namespace: client.default_namespace().to_owned(),
         name: "mediatore-watcher".into(),
@@ -795,7 +863,7 @@ fn entry_manager(
         (!cfg.dev_mode).then_some(cfg.spire.as_ref()).flatten(),
         client,
     ) else {
-        return Arc::new(MemoryEntries::default());
+        return Arc::new(MemoryEntries::in_trust_domain(&naming.trust_domain));
     };
     tracing::info!(
         class_name = %spire.entries.class_name,
@@ -976,6 +1044,87 @@ mod tests {
     #[test]
     fn the_command_tree_is_consistent() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn the_x509pop_bundle_check_takes_its_files_and_refuses_none() {
+        let parsed = parse(&["mediatore", "x509pop-bundle", "check", "a.pem", "b.pem"]);
+        assert!(
+            matches!(
+                parsed,
+                Ok(Cmd::X509popBundle { mode: X509popBundleCmd::Check { ref files } }) if files.len() == 2
+            ),
+            "two files"
+        );
+        assert!(parse(&["mediatore", "x509pop-bundle", "check"]).is_err());
+        assert!(parse(&["mediatore", "x509pop-bundle"]).is_err());
+    }
+
+    #[test]
+    fn a_bundle_of_host_cas_under_names_of_their_own_passes_and_lists_them() {
+        use mediatore_testkit::x509pop::HostCa;
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, pem: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, pem).unwrap();
+            path
+        };
+        let a = write("hv-01.pem", HostCa::new("hv-01").pem());
+        let b = write("hv-02.pem", HostCa::new("hv-02").pem());
+        // One file per host, and one file holding two; a file without a final newline.
+        assert_eq!(
+            check_x509pop_bundle(&[a.clone(), b.clone()]).unwrap(),
+            ["hv-01", "hv-02"]
+        );
+        let joined = write(
+            "both.pem",
+            &format!(
+                "{}{}",
+                HostCa::new("hv-03").pem(),
+                HostCa::new("hv-04").pem().trim_end()
+            ),
+        );
+        assert_eq!(
+            check_x509pop_bundle(&[joined, a]).unwrap(),
+            ["hv-03", "hv-04", "hv-01"]
+        );
+    }
+
+    #[test]
+    fn a_bundle_with_a_shared_name_a_loose_ca_or_an_unreadable_file_is_refused_by_name() {
+        use mediatore_testkit::x509pop::HostCa;
+        use rcgen::{BasicConstraints, IsCa};
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, pem: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, pem).unwrap();
+            path
+        };
+        let refused = |files: &[PathBuf]| check_x509pop_bundle(files).unwrap_err().to_string();
+        let good = write("hv-01.pem", HostCa::new("hv-01").pem());
+        // Two CAs of one common name, across two files: another key under a host's name.
+        let twin = write("twin.pem", HostCa::new("hv-01").pem());
+        let err = refused(&[good.clone(), twin]);
+        assert!(err.contains("share the common name") && err.contains("hv-01"));
+        // A CA with no path length of zero, and a certificate that is no CA.
+        let loose =
+            HostCa::with_constraints("loose-host", IsCa::Ca(BasicConstraints::Unconstrained));
+        let err = refused(&[good.clone(), write("loose.pem", loose.pem())]);
+        assert!(err.contains("loose-host") && err.contains("path length constraint must be 0"));
+        let leaf = HostCa::with_constraints("not-a-ca", IsCa::ExplicitNoCa);
+        let err = refused(&[write("leaf.pem", leaf.pem())]);
+        assert!(err.contains("not-a-ca") && err.contains("is not a CA"));
+        // A name that cannot be a path segment.
+        let err = refused(&[write("spaced.pem", HostCa::new("hv 01").pem())]);
+        assert!(err.contains("common name"));
+        // A file that is missing, empty, or no PEM: named, and never skipped.
+        let missing = dir.path().join("missing.pem");
+        let err = refused(&[good.clone(), missing]);
+        assert!(err.contains("cannot read") && err.contains("missing.pem"));
+        for (name, body) in [("empty.pem", ""), ("garbage.pem", "not a certificate")] {
+            let err = refused(&[good.clone(), write(name, body)]);
+            assert!(err.contains(name), "the refusal names the file");
+        }
     }
 
     #[test]
@@ -1306,7 +1455,7 @@ mod tests {
     impl EntryManager for ToldEntries {
         async fn ensure_node_entry(
             &self,
-            _ek_hash: &str,
+            _attestation: &mediatore_spire::NodeAttestation,
         ) -> Result<String, mediatore_spire::SpireError> {
             Err(mediatore_spire::SpireError::NotImplemented(
                 "ensure_node_entry",
@@ -1315,7 +1464,7 @@ mod tests {
 
         async fn create_claim_entry(
             &self,
-            _ek_hash: &str,
+            _node: &mediatore_spire::NodeIdentity,
             _claim_uid: uuid::Uuid,
             _unix_user: &str,
             _claim_ttl: std::time::Duration,

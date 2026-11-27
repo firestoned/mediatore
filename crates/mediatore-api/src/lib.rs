@@ -46,7 +46,7 @@ use mediatore_proto::{
     RegistryCredential, Route, Secret, Subject, TokenRequest, TokenResponse, WorkloadExit,
     error_code,
 };
-use mediatore_spire::{EntryManager, Naming};
+use mediatore_spire::{EntryManager, Naming, NodeAttestation, NodeIdentity};
 use mediatore_store::seal::{FORMAT_BARE_UID, SealError, Sealed, Sealer, Slot};
 use mediatore_store::{
     ClaimRecord, ClaimStore, DelegatedSession, LogLimits, Modified, NodeRecord, SessionRecord,
@@ -1288,7 +1288,7 @@ async fn dev_claim(
     // node is "Ready pool member"; binding is immediate.
     if let Some(node) = free_node(st).await? {
         reconciler(st)
-            .bind(uid, &node.ek_hash)
+            .bind(uid, &NodeIdentity::stored(&node.ek_hash, &node.node_id))
             .await
             .map_err(|e| ApiError::internal(e.to_string()))?;
     }
@@ -2216,31 +2216,100 @@ async fn ingest_logs(
 
 // ---------- sandbox-facing ----------
 
+/// The body of `POST /v1/nodes`, read in two steps so that what is wrong with an
+/// attestation is said as that (ADR-0049 decision 8): an `attestation` that is not one of
+/// the known kinds, or carries a field its kind does not have, is `400 invalid_attestation`
+/// and never ignored. Anything else that does not fit the registration is `422`, as the
+/// body extractor answered before there was an attestation to read.
+fn node_registration(body: serde_json::Value) -> Result<NodeRegistration, ApiError> {
+    if let Some(attestation) = body.get("attestation").filter(|a| !a.is_null())
+        && let Err(e) = serde_json::from_value::<mediatore_proto::Attestation>(attestation.clone())
+    {
+        return Err(ApiError::bad_request(
+            error_code::INVALID_ATTESTATION,
+            format!("attestation: {e}"),
+        ));
+    }
+    serde_json::from_value(body).map_err(|e| {
+        ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_registration",
+            Some(e.to_string()),
+        )
+    })
+}
+
+/// The node a registration is for: its key and its agent ID, derived from the attestation
+/// it names with the one pair of functions the watcher declares node entries with
+/// (ADR-0049 decision 8). Every refusal is a `400`; nothing is derived from a registration
+/// that names no single attestation or an invalid one.
+fn registered_identity(naming: &Naming, reg: &NodeRegistration) -> Result<NodeIdentity, ApiError> {
+    let invalid_ek_hash = || {
+        ApiError::bad_request(
+            error_code::INVALID_EK_HASH,
+            "ek_hash must be 64 lowercase hex characters",
+        )
+    };
+    let attestation = reg.resolve().map_err(|e| match e {
+        // Absent means tpm, read from the top-level ek_hash: an empty one is the bad hash
+        // it always was.
+        mediatore_proto::AttestationError::Missing => invalid_ek_hash(),
+        other => ApiError::bad_request(error_code::INVALID_ATTESTATION, other.to_string()),
+    })?;
+    if let mediatore_proto::Attestation::Tpm { ek_hash } = &attestation
+        && !is_ek_hash(ek_hash)
+    {
+        return Err(invalid_ek_hash());
+    }
+    // What is left to refuse is an x509pop name outside the path-segment alphabet.
+    NodeIdentity::of(naming, &NodeAttestation::from(&attestation))
+        .map_err(|e| ApiError::bad_request(error_code::INVALID_ATTESTATION, e.to_string()))
+}
+
 async fn register_node(
     State(st): State<Shared>,
     headers: HeaderMap,
     peer: Option<Extension<PeerSpiffeId>>,
-    Json(reg): Json<NodeRegistration>,
+    Json(body): Json<serde_json::Value>,
 ) -> Result<Json<NodeRegistered>, ApiError> {
     let peer = peer_spiffe_id(&st, peer.as_ref().map(|e| &e.0), &headers)?;
-    if !is_ek_hash(&reg.ek_hash) {
-        return Err(ApiError::bad_request(
-            "invalid_ek_hash",
-            "ek_hash must be 64 lowercase hex characters",
-        ));
-    }
-    let expected = st.naming.node_id(&reg.ek_hash);
+    let reg = node_registration(body)?;
+    let node = registered_identity(&st.naming, &reg)?;
+    // The peer's SVID is the node entry's, and the node entry was declared by the watcher
+    // for exactly one attestation: a guest can register only the attestation whose key SPIRE
+    // issued it. For an x509pop node the key is a hash of the agent ID, so the names sent
+    // must be the names attested under.
+    let expected = st.naming.node_id(&node.key);
     if peer != expected {
         return Err(ApiError::forbidden(format!(
             "peer {peer} may not register {expected}"
         )));
     }
-    // The node's SPIRE *agent* ID is what parents its entries and keys claim lookups.
-    let agent_id = st.naming.agent_id(&reg.ek_hash);
+    // A key already registered under another agent ID (first presented under the other
+    // attestor): answering 200 with the ID derived here would tell the guest something the
+    // record does not say, and its claims would be parented to the stored one. Refused, and
+    // nothing changes; the store refuses the same on its own (a race, another replica).
+    match st.store.get_node(&node.key).await {
+        Ok(existing) if existing.node_id != node.agent_id => {
+            tracing::warn!(node_key = %node.key, stored_agent_id = %existing.node_id, agent_id = %node.agent_id, "node registration refused: the key is registered under another agent ID");
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                error_code::NODE_IDENTITY_CONFLICT,
+                Some(format!(
+                    "node key {} is registered under another agent ID; an operator deletes the SandboxNode of that name to let it register again",
+                    node.key
+                )),
+            ));
+        }
+        Ok(_) | Err(StoreError::NotFound(_)) => {}
+        Err(e) => return Err(ApiError::internal(e.to_string())),
+    }
+    // The node's SPIRE *agent* ID is what parents its entries and keys claim lookups. It is
+    // stored as derived here and never recomputed from the key.
     st.store
         .put_node(NodeRecord {
-            ek_hash: reg.ek_hash.clone(),
-            node_id: agent_id.clone(),
+            ek_hash: node.key.clone(),
+            node_id: node.agent_id.clone(),
             dmi_uuid: reg.dmi_uuid,
             hostname: reg.hostname,
             provider: reg.provider,
@@ -2252,21 +2321,24 @@ async fn register_node(
             StoreError::Conflict(d) => ApiError::new(StatusCode::CONFLICT, "duplicate_ek", Some(d)),
             other => ApiError::internal(other.to_string()),
         })?;
+    tracing::info!(node_key = %node.key, agent_id = %node.agent_id, dmi = %reg.dmi_uuid, "node registered");
 
     // Dev binder, other direction: a pending claim may have been waiting for a node.
     if st.dev_mode
-        && st.store.get_claim_by_node(&agent_id).await.is_err()
+        && st.store.get_claim_by_node(&node.agent_id).await.is_err()
         && let Ok(claims) = st.store.list_claims().await
         && let Some(pending) = claims
             .iter()
             .filter(|c| c.entry_id.is_none() && c.revoked_at.is_none())
             .min_by_key(|c| c.created_at)
-        && let Err(e) = reconciler(&st).bind(pending.uid, &reg.ek_hash).await
+        && let Err(e) = reconciler(&st).bind(pending.uid, &node).await
     {
         tracing::warn!(uid = %pending.uid, error = %e, "dev bind on registration failed");
     }
 
-    Ok(Json(NodeRegistered { node_id: agent_id }))
+    Ok(Json(NodeRegistered {
+        node_id: node.agent_id,
+    }))
 }
 
 /// The live claim bound to the node the peer is: the node identity, registered, with a
@@ -2277,13 +2349,14 @@ async fn claim_of_node_peer(
     peer: Option<&PeerSpiffeId>,
 ) -> Result<ClaimRecord, ApiError> {
     let peer = peer_spiffe_id(st, peer, headers)?;
-    let ek_hash = st
+    // The node key: a TPM node's EK hash, an x509pop node's hash of its agent ID.
+    let node_key = st
         .naming
         .node_ek_from(&peer)
         .ok_or_else(|| ApiError::forbidden("peer is not a node identity"))?;
     let node = st
         .store
-        .get_node(&ek_hash)
+        .get_node(&node_key)
         .await
         .map_err(|_| ApiError::forbidden("node not registered"))?;
     st.store
@@ -4633,7 +4706,7 @@ mod tests {
         st.store
             .put_node(NodeRecord {
                 ek_hash: "ek1".into(),
-                node_id: node.clone(),
+                node_id: st.naming.agent_id("ek1"),
                 dmi_uuid: Uuid::new_v4(),
                 hostname: "pool-1".into(),
                 provider: None,
@@ -4642,7 +4715,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let rec = stored(&st, claim(&["grafana"], Some(node.clone()))).await;
+        let rec = stored(&st, claim(&["grafana"], Some(st.naming.agent_id("ek1")))).await;
         let report = serde_json::to_value(GuestReport {
             image_digest: format!("sha256:{}", "a".repeat(64)),
             sandbox_ruleset_sha256: "b".repeat(64),
@@ -5136,11 +5209,10 @@ mod tests {
     #[tokio::test]
     async fn me_routes_carry_the_rules_of_the_claims_namespace() {
         let st = Arc::new(scoped_state());
-        let node = st.naming.node_id("ek1");
         st.store
             .put_node(NodeRecord {
                 ek_hash: "ek1".into(),
-                node_id: node.clone(),
+                node_id: st.naming.agent_id("ek1"),
                 dmi_uuid: Uuid::new_v4(),
                 hostname: "pool-1".into(),
                 provider: None,
@@ -5150,7 +5222,11 @@ mod tests {
             .await
             .unwrap();
         let st: Shared = st;
-        stored(&st, claim_in("team-b", &["anthropic"], Some(node))).await;
+        stored(
+            &st,
+            claim_in("team-b", &["anthropic"], Some(st.naming.agent_id("ek1"))),
+        )
+        .await;
         let (status, body, _) = call(
             &st,
             "GET",
@@ -5449,11 +5525,10 @@ mod tests {
     #[tokio::test]
     async fn me_carries_credential_gateway_and_the_inject_port_on_a_placed_audiences_routes_only() {
         let st = Arc::new(placed_state());
-        let node = st.naming.node_id("ek1");
         st.store
             .put_node(NodeRecord {
                 ek_hash: "ek1".into(),
-                node_id: node.clone(),
+                node_id: st.naming.agent_id("ek1"),
                 dmi_uuid: Uuid::new_v4(),
                 hostname: "pool-1".into(),
                 provider: None,
@@ -5463,7 +5538,11 @@ mod tests {
             .await
             .unwrap();
         let st: Shared = st;
-        let rec = stored(&st, claim(&["anthropic", "grafana"], Some(node))).await;
+        let rec = stored(
+            &st,
+            claim(&["anthropic", "grafana"], Some(st.naming.agent_id("ek1"))),
+        )
+        .await;
         let (status, body, _) = call(
             &st,
             "GET",
@@ -5510,11 +5589,10 @@ mod tests {
             .collect(),
         );
         let st = Arc::new(st);
-        let node = st.naming.node_id("ek1");
         st.store
             .put_node(NodeRecord {
                 ek_hash: "ek1".into(),
-                node_id: node.clone(),
+                node_id: st.naming.agent_id("ek1"),
                 dmi_uuid: Uuid::new_v4(),
                 hostname: "pool-1".into(),
                 provider: None,
@@ -5524,7 +5602,11 @@ mod tests {
             .await
             .unwrap();
         let st: Shared = st;
-        let rec = stored(&st, claim(&["grafana", "grafana-sts"], Some(node))).await;
+        let rec = stored(
+            &st,
+            claim(&["grafana", "grafana-sts"], Some(st.naming.agent_id("ek1"))),
+        )
+        .await;
         let (status, body, _) = call(
             &st,
             "GET",
@@ -6905,7 +6987,7 @@ mod tests {
         b.st.store
             .put_node(NodeRecord {
                 ek_hash: ek.clone(),
-                node_id: b.st.naming.node_id(&ek),
+                node_id: b.st.naming.agent_id(&ek),
                 dmi_uuid: Uuid::new_v4(),
                 hostname: "vm".into(),
                 provider: None,
@@ -6923,7 +7005,7 @@ mod tests {
             .create(sandbox_in("infra", "sandbox-x"))
             .await
             .unwrap();
-        let mut rec = claim(&[], Some(b.st.naming.node_id(&ek)));
+        let mut rec = claim(&[], Some(b.st.naming.agent_id(&ek)));
         rec.name = "sandbox-x".into();
         rec.namespace = "team-a".into();
         stored(&b.st, rec).await;
@@ -7827,7 +7909,7 @@ mod tests {
         st.store
             .put_node(NodeRecord {
                 ek_hash: "ek1".into(),
-                node_id: node.clone(),
+                node_id: st.naming.agent_id("ek1"),
                 dmi_uuid: Uuid::new_v4(),
                 hostname: "pool-1".into(),
                 provider: None,
@@ -7836,7 +7918,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let rec = stored(&st, claim(&["grafana"], Some(node.clone()))).await;
+        let rec = stored(&st, claim(&["grafana"], Some(st.naming.agent_id("ek1")))).await;
         (st, inner, node, rec)
     }
 
@@ -8703,11 +8785,10 @@ mod tests {
 
         /// A claim under the policy at version 2, bound to node `ek`.
         async fn running(st: &Shared, p: &Policy, ek: &str) -> ClaimRecord {
-            let node = st.naming.node_id(ek);
             st.store
                 .put_node(NodeRecord {
                     ek_hash: ek.into(),
-                    node_id: node.clone(),
+                    node_id: st.naming.agent_id(ek),
                     dmi_uuid: Uuid::new_v4(),
                     hostname: format!("pool-{ek}"),
                     provider: None,
@@ -8716,7 +8797,7 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            let mut rec = claim(&[AUDIENCE], Some(node));
+            let mut rec = claim(&[AUDIENCE], Some(st.naming.agent_id(ek)));
             rec.policy_uid = Some(p.uid.clone());
             rec.bundle_version = Some(2);
             stored(st, rec).await

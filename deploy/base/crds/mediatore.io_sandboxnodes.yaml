@@ -34,10 +34,12 @@ spec:
     name: v1alpha1
     schema:
       openAPIV3Schema:
-        description: "SandboxNode is one attested node mediatore knows (ADR-0034 decision 3): named by its EK hash, with its SPIRE agent identity, DMI UUID, hostname and whether it is banned."
+        description: "SandboxNode is one attested node mediatore knows (ADR-0034 decision 3): named by its node key (a TPM node's EK hash, an x509pop node's hash of its agent ID), with its SPIRE agent identity, DMI UUID, hostname and whether it is banned."
         properties:
           spec:
-            description: An attested node mediatore knows (ADR-0034 decision 3), named by its EK hash.
+            description: |-
+              An attested node mediatore knows (ADR-0034 decision 3), named by its node key: a TPM
+              node's EK hash, an x509pop node's hash of its agent ID (ADR-0049 decision 7).
             properties:
               banned:
                 default: false
@@ -47,13 +49,18 @@ spec:
                 description: The guest's DMI UUID, matched against banlieue's `providerID`; also a label.
                 type: string
               ekHash:
-                description: The EK public-key hash, also the resource's name.
+                description: |-
+                  The node key, also the resource's name: 64 lowercase hex. A TPM node's EK public-key
+                  hash; an x509pop node's SHA-256 of its agent ID (ADR-0049 decision 7). The field keeps
+                  the name it had when every node had an EK.
                 type: string
               hostname:
                 description: Informational.
                 type: string
               nodeId:
-                description: The SPIRE agent's SPIFFE ID.
+                description: |-
+                  The SPIRE agent's SPIFFE ID: `spire/agent/tpm/<ek hash>` or
+                  `spire/agent/x509pop/<issuer CN>/<subject CN>`.
                 type: string
               provider:
                 description: Informational.

@@ -27,6 +27,9 @@
 # the shards' suites is `make kind-e2e`, in its order: a suite added to that aggregate is
 # added to a shard here.
 #
+# The x509pop attestation path (ADR-0049, `make kind-e2e-x509pop`) is in the core shard: it
+# needs no device, the host CA and the guest's certificate being made with openssl for the run.
+#
 # Not here: the TPM attestation path (ADR-0018, `make kind-e2e-tpm`) needs a vTPM
 # behind the kind node, which is swtpm through the kernel's tpm_vtpm_proxy module. The
 # Azure kernels of GitHub-hosted runners do not ship that module (checked against
@@ -141,7 +144,7 @@ jobs:
           # cargo: the entries suite is a cargo test (`make live-admission-test`), so this
           # shard keeps a toolchain and its cache; the gateway shards compile nothing.
           - shard: core
-            suites: kind-e2e-entries kind-e2e-mtls kind-e2e-watcher kind-e2e-sandbox kind-e2e-dex kind-e2e-policy
+            suites: kind-e2e-entries kind-e2e-mtls kind-e2e-watcher kind-e2e-sandbox kind-e2e-dex kind-e2e-policy kind-e2e-x509pop
             cargo: true
           - shard: gateway
             suites: kind-e2e-gateway
