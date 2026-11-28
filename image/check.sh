@@ -113,12 +113,18 @@ check "no private key material (banlieue ADR-0108 decision 2)" \
 # Kairos base's file named two, and resolved imported them as global servers.
 check "no resolver but the link's: the base's resolved drop-in empties DNS (so a foreign /etc/resolv.conf is never imported as global servers) and FallbackDNS, turns LLMNR and mDNS off and keeps the stub listener, sorts after every other drop-in, and nothing in the image sets a global or fallback server; resolved is enabled" \
   'f=/usr/lib/systemd/resolved.conf.d/60-mediatore.conf; for l in "[Resolve]" "DNS=" "FallbackDNS=" "DNSStubListener=yes" "LLMNR=no" "MulticastDNS=no"; do grep -qxF "$l" $f || exit 1; done && test "$(ls /usr/lib/systemd/resolved.conf.d /etc/systemd/resolved.conf.d 2>/dev/null | grep "\.conf$" | sort | tail -1)" = 60-mediatore.conf && ! grep -rqsE "^(DNS|FallbackDNS)=." /etc/systemd/resolved.conf /etc/systemd/resolved.conf.d /usr/lib/systemd/resolved.conf.d && test "$(systemctl is-enabled systemd-resolved.service)" = enabled'
-# The image's own /etc/resolv.conf, as the layer holds it: a container run mounts the runtime's over it, so it is read from a created,
-# never started, container.
-image_file() { local c; c=$("$CLI" create --entrypoint sh "$IMAGE") || return 1; "$CLI" cp "$c:$1" - | tar -xO; local r=$?; "$CLI" rm "$c" >/dev/null; return $r; }
-rc=$(image_file /etc/resolv.conf 2>/dev/null || true)
+# The image's own /etc/resolv.conf, as its layers hold it (image/image-file.py over `save`). Not from a container: Docker
+# bind-mounts its own resolv.conf into a container as soon as it is created, so `docker cp` returns the runtime's file and
+# the check failed under Docker while the layer was right (podman mounts it only at start). The container's reading is
+# printed beside the layer's when they differ, and the layer's alone decides.
+image_file() { "$CLI" save "$IMAGE" | python3 -I "$(dirname "$0")/image-file.py" "$1"; }
+container_file() { local c; c=$("$CLI" create --entrypoint sh "$IMAGE") || return 1; "$CLI" cp "$c:$1" - | tar -xO; local r=$?; "$CLI" rm "$c" >/dev/null; return $r; }
+rc=$(image_file /etc/resolv.conf || true)
+cc=$(container_file /etc/resolv.conf 2>/dev/null || true)
+[ "$cc" = "$rc" ] || printf '  note: a created %s container shows another /etc/resolv.conf than the layers (the runtime'"'"'s own):\n%s\n' "$CLI" "$(printf '%s\n' "$cc" | sed 's/^/    | /')"
 if [ "$(printf '%s\n' "$rc" | grep -E '^(nameserver|search|domain)')" = "nameserver 127.0.0.53" ]; then
   echo "✓ the image's /etc/resolv.conf names resolved's stub alone, never the public resolvers the Kairos base's named, until Kairos links it at boot"
-else echo "✗ the image's /etc/resolv.conf names resolved's stub alone, never the public resolvers the Kairos base's named, until Kairos links it at boot"; fail=1; fi
+else echo "✗ the image's /etc/resolv.conf names resolved's stub alone, never the public resolvers the Kairos base's named, until Kairos links it at boot"
+  printf '  the layers hold:\n%s\n' "$(printf '%s\n' "${rc:-(nothing)}" | sed 's/^/    | /')"; fail=1; fi
 
 [ "$fail" -eq 0 ] && echo "image ok" || { echo "image check failed"; exit 1; }
