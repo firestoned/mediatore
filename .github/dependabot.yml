@@ -37,6 +37,12 @@ updates:
       # (Cargo.toml). #173 moved jiff alone to 1.0 and main stopped compiling.
       - dependency-name: "jiff"
         update-types: ["version-update:semver-major"]
+      # notaio's crates are git dependencies pinned to one signed release tag, and the two move
+      # together, by hand, with that release's conformance vectors (ADR-0026 decision 1).
+      # Dependabot reads git tags out of order: #194 proposed v0.9.0 -> v0.7.0 for one of them
+      # and split the pair across two notaio releases.
+      - dependency-name: "sandboxpolicy-bundle"
+      - dependency-name: "sandboxpolicy-types"
 
   # Container base images (Dockerfile FROM lines): the server image, the VM base image
   # (the Kairos pin, ADR-0067) and its two overlays, the sandbox and gateway VM images.
