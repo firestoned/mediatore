@@ -29,6 +29,15 @@ ExecStartPre=/bin/sh -c 'u=$${MEDIATORE_URL%%/}; a="https://$$BROKER_ADDRESS"; [
 # neither Envoy's group. An inject deployment's drop-in adds the INJECT socket's directory
 # beside it, never inside it (image/gateway/cloud-config-deployment.example.yaml).
 ExecStartPre=+/usr/bin/install -d -m 2750 -o mediatore-gateway -g envoy /run/mediatore-gateway/check
+# The gateway's name in what it reports to the broker (ADR-0062 decision 3, amended
+# 2026-11-27): MEDIATORE_GATEWAY_NAME where an env file sets it (vm.env, per VM), else the VM's
+# SMBIOS UUID, which the hypervisor sets per VM (libvirt's domain UUID, the machine's uid on
+# Cloud Hypervisor), so one cloud-config for every gateway still names each apart. The kernel
+# shows it to root alone, so root copies it at every start into a file this unit's group reads
+# (0640, root's) and this user cannot write. "-": a VM without one (a Cloud Hypervisor guest
+# made before its host's provider set it) is named by its host name, with a warning when that
+# is the distribution's default (kairos).
+ExecStartPre=-+/bin/sh -c 'umask 027; u=$$(cat /sys/class/dmi/id/product_uuid) && printf "%%s\n" "$$u" > /run/mediatore-gateway/machine-uuid && chgrp mediatore-gateway /run/mediatore-gateway/machine-uuid'
 # Envoy dials what AUTHORIZER_ENDPOINT says and the host table opens what CHECK_TCP_ELEMENTS
 # says; the authorizer listens where the same two keys say, read as image/gateway/render reads
 # them (an absent key is the check socket and no loopback port). An env file updated by half,
@@ -79,7 +88,8 @@ RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 # nothing there but the path below, so file permissions, not the mount, keep it out of the rest.
 # A ReadOnlyPaths=/run here is not added until a booted gateway proves it.
 ReadOnlyPaths=-/run/spire/sockets
-# The runtime directory holds the check socket's directory; the table's unit made it, root's and 0755, so this user writes only below.
+# The runtime directory holds the check socket's directory; the image's tmpfiles.d entry made it
+# at boot (the table's unit keeps it), root's and 0755, so this user writes only below.
 ReadWritePaths=/run/mediatore-gateway
 
 [Install]

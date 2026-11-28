@@ -71,8 +71,9 @@ this path carries `x-mediatore-refusal: <code>`, so the guest can tell the gatew
 Each tunnel and inject decision about a claim is also reported to the broker (ADR-0062):
 `POST /v1/gateway/decisions`, over the same mutual TLS as the ask, in batches every two seconds or of 256. A decision
 carries the claim, `tunnel` or `inject`, the authority, the audience of a matched inject route, the verdict, the refusal
-code and where the allowlist came from, and the batch carries the gateway's name (`--name`, `MEDIATORE_GATEWAY_NAME`, by
-default the host name). The broker writes one `gateway decision` line for each and stores nothing, so its log alone says
+code and where the allowlist came from, and the batch carries the gateway's name (`--name`, `MEDIATORE_GATEWAY_NAME`; by
+default the VM's SMBIOS UUID, which the hypervisor sets per VM, then the host name, with a warning when that is a
+distribution's default such as `kairos`; ADR-0062 decision 3, amended 2026-11-27). The broker writes one `gateway decision` line for each and stores nothing, so its log alone says
 which gateway carried a claim to which host.
 
 The name is attribution, not authentication: every gateway's authorizer has the one identity. Reporting is never on the

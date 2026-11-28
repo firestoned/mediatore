@@ -55,26 +55,30 @@
 # The ConfigMap comes first: the binding sets parameterNotFoundAction: Deny,
 # so it must exist or every AgentSandbox is rejected.
 #
-# The ConfigMap is also where the three policies that name the broker read its
-# username (ADR-0056 decision 4): this one, agentsandbox-status.yaml and
-# clusterstaticentry-mediatore.yaml are each bound to it, with
-# parameterNotFoundAction: Deny, and each reads the key `broker`. One value, in
-# place of a literal in three files. Without the ConfigMap, or without the key,
-# all three refuse: no AgentSandbox, no status write and no ClusterStaticEntry
-# (the gateway's included) is admitted until it is back.
+# The ConfigMap is also where the four policies that name the broker read its
+# username (ADR-0056 decision 4, ADR-0075): this one, agentsandbox-status.yaml,
+# clusterstaticentry-mediatore.yaml and clusterspiffeid.yaml are each bound to
+# it, with parameterNotFoundAction: Deny, and each reads the key `broker`. One
+# value, in place of a literal in four files. Without the ConfigMap, or without
+# the key, the first three refuse: no AgentSandbox, no status write and no
+# ClusterStaticEntry (the gateway's included) is admitted until it is back.
+# Without the ConfigMap no ClusterSPIFFEID in the cluster is created or changed
+# either; without the key, none that renders /mediatore.
 #
 # AN OVERLAY THAT RENAMES THE ServiceAccount OR MOVES THE BROKER TO ANOTHER
 # NAMESPACE patches what a kustomize `namespace:` does not rewrite:
 #
 #   1. the value of `broker` below (a string, not object metadata);
-#   2. `paramRef.namespace` in the three bindings (this file, the status policy
-#      and the entries policy), which must be the namespace this ConfigMap is in;
+#   2. `paramRef.namespace` in the four bindings (this file, the status policy,
+#      the entries policy and the ClusterSPIFFEID policy), which must be the
+#      namespace this ConfigMap is in;
 #   3. `namespaceSelector` in clusterspiffeid.yaml.
 #
 # Forgetting 1 or 2 fails closed and loudly: the broker's entries and status
 # writes are refused, and the broker says so when it starts (its self-check,
 # crates/mediatore-spire/src/kube.rs) instead of serving. Forgetting 3 leaves
-# the broker without an SVID, which also stops it at start.
+# the broker without an SVID, which also stops it at start; with 1 patched, the
+# ClusterSPIFFEID policy refuses the unpatched object, so the apply says so first.
 apiVersion: v1
 kind: ConfigMap
 metadata:

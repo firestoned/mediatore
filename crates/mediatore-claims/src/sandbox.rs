@@ -1795,7 +1795,9 @@ impl Watcher {
     /// ADR-0035: a sandbox under a delegated audience runs on the requester's own
     /// credential and nothing else. One whose delegation never reached the record (swept
     /// after its hour, or never sent) would bind a VM to run with nothing to place: refused
-    /// here, the claim deleted before a member is consumed, never recreated.
+    /// here, the claim deleted before a member is consumed, never recreated. Only while the
+    /// record is live: a released one has had its delegations cleared by the release, which
+    /// is not a delegation that never arrived ([`Self::delegation_missing`]).
     async fn refuse_without_delegation(
         &self,
         sb: &AgentSandbox,
@@ -1956,6 +1958,13 @@ impl Watcher {
     /// The first audience of the sandbox served from a delegated credential (ADR-0035)
     /// that the record holds no delegation for.
     fn delegation_missing(&self, sb: &AgentSandbox, record: &ClaimRecord) -> Option<String> {
+        // A released record holds no credential whatever it once held: every release clears
+        // the delegations with the refresh material (`revoke_claim`). Its sandbox ended for
+        // the reason that released it (a deadline, a refused bind, a trap, a deletion), and
+        // says that one; `delegation_required` is about a live record only.
+        if record.revoked_at.is_some() {
+            return None;
+        }
         let namespace = sb.namespace().unwrap_or_default();
         sb.spec
             .audiences
@@ -2505,6 +2514,69 @@ mod tests {
             .await
             .unwrap();
         assert!(rec.delegations.contains_key("api.example"));
+    }
+
+    /// Found live (2026-11-27): a delegated sandbox reached its deadline while the guest was
+    /// still pulling. The release cleared the record's delegations, as every release does
+    /// (`MemoryStore` and `KubeStore` alike), and the next sandbox pass took the empty map for
+    /// a credential that never arrived: `delegation_required`, and the claim deleted by the
+    /// sandbox reconciler. A released record says nothing about a delegation: the sandbox
+    /// mirrors its claim to the end and fails as any ended sandbox does.
+    #[tokio::test]
+    async fn a_delegated_sandbox_released_at_its_deadline_is_not_reported_as_undelegated() {
+        let r = rig(WatcherConfig {
+            delegated_audiences: ["api.example".to_owned()].into_iter().collect(),
+            ..cfg()
+        });
+        r.store
+            .put_session(mediatore_store::SessionRecord {
+                audience: Some("api.example".into()),
+                ..parked_session()
+            })
+            .await
+            .unwrap();
+        let (sb, uid) = bound(&r).await;
+        assert!(
+            r.store
+                .get_claim(uid)
+                .await
+                .unwrap()
+                .delegations
+                .contains_key("api.example"),
+            "the delegation reached the record"
+        );
+
+        // The deadline: banlieue moves the claim to Releasing and the claim watcher releases
+        // the record first, which takes the delegated credential with it.
+        r.claims
+            .patch_claim_status("sandboxes", "sb-1", &json!({ "phase": "Releasing" }));
+        let claim = r.claims.claim("sandboxes", "sb-1").unwrap();
+        r.watcher.reconcile_claim(&claim).await.unwrap();
+        let rec = r.store.get_claim(uid).await.unwrap();
+        assert!(rec.revoked_at.is_some() && rec.delegations.is_empty());
+
+        // The sandbox pass that follows sees no credential on a released record.
+        r.watcher.reconcile_sandbox(&sb).await.unwrap();
+        let sb = r.claims.sandbox("sandboxes", "sb-1").unwrap();
+        let st = sb.status.clone().unwrap();
+        assert_eq!(st.phase, SandboxPhase::Releasing, "mirrored, not refused");
+        assert!(st.reason.is_none(), "{:?}", st.reason);
+        assert!(
+            r.claims.claim("sandboxes", "sb-1").is_some(),
+            "the claim is banlieue's to destroy at its deadline, not the sandbox reconciler's"
+        );
+
+        // banlieue destroys it: the sandbox fails as any ended one does, never as undelegated.
+        r.claims.remove_claim("sandboxes", "sb-1");
+        r.watcher.reconcile_sandbox(&sb).await.unwrap();
+        let st = r
+            .claims
+            .sandbox("sandboxes", "sb-1")
+            .unwrap()
+            .status
+            .unwrap();
+        assert_eq!(st.phase, SandboxPhase::Failed);
+        assert_eq!(st.reason.as_deref(), Some("claim gone"));
     }
 
     const OTHER_UID: &str = "1b2c3d4e-5f60-4718-892a-3b4c5d6e7f80";
@@ -3851,6 +3923,373 @@ mod tests {
         assert_eq!(
             gateway[0]["spec"]["matchConditions"][0]["expression"],
             "has(object.spec.spiffeID) && object.spec.spiffeID.matches('^spiffe://[^/]+/gateway(/.*)?$')"
+        );
+    }
+
+    /// The `ClusterSPIFFEID` policy (ADR-0075) and its variables, by name.
+    fn clusterspiffeid_policy() -> (serde_json::Value, serde_json::Value) {
+        let docs = admission_docs("clusterspiffeid.yaml");
+        let policy = docs
+            .iter()
+            .find(|d| d["kind"] == "ValidatingAdmissionPolicy")
+            .expect("the policy")
+            .clone();
+        let binding = docs
+            .iter()
+            .find(|d| d["kind"] == "ValidatingAdmissionPolicyBinding")
+            .expect("the binding")
+            .clone();
+        (policy, binding)
+    }
+
+    /// The single-quoted CEL string literals of an expression, in order.
+    fn cel_literals(expression: &str) -> Vec<String> {
+        expression
+            .split('\'')
+            .skip(1)
+            .step_by(2)
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// What the policy's regular expressions decide about a template, evaluated with the
+    /// expressions read from the file (CEL's `matches` is an unanchored RE2 search, as
+    /// `Regex::is_match` is): a wholly literal first segment, and which of the reserved
+    /// first segments it is. The selectors of decision 4 are not judged here.
+    // Four independent CEL variables, mirrored one to one: an enum would hide which one said what.
+    #[allow(clippy::struct_excessive_bools)]
+    struct TemplateVerdict {
+        literal: bool,
+        reserved: bool,
+        broker_path: bool,
+        broker_exact: bool,
+    }
+
+    fn judge_template(policy: &serde_json::Value, template: &str) -> TemplateVerdict {
+        let variable = |name: &str| {
+            policy["spec"]["variables"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|v| v["name"] == name)
+                .unwrap_or_else(|| panic!("no variable {name}"))["expression"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        let authority = cel_literals(&variable("authority")).concat();
+        let matches = |suffix: &str| {
+            regex::Regex::new(&format!("{authority}{suffix}"))
+                .unwrap()
+                .is_match(template)
+        };
+        // Each variable is `variables.template.matches(variables.authority + '<suffix>')`,
+        // `literal` two of them: the shape and the dot segment it refuses.
+        let literal = cel_literals(&variable("literal"));
+        let [shape, dots] = literal.as_slice() else {
+            panic!("literal: {literal:?}");
+        };
+        let one = |name: &str| {
+            let l = cel_literals(&variable(name));
+            assert_eq!(l.len(), 1, "{name}: {l:?}");
+            matches(&l[0])
+        };
+        TemplateVerdict {
+            literal: matches(shape) && !matches(dots),
+            reserved: one("reserved"),
+            broker_path: one("brokerPath"),
+            broker_exact: one("brokerExact"),
+        }
+    }
+
+    /// The live template of 2026-11-27, which let a pod choose its own SPIFFE ID.
+    const ANNOTATION_TEMPLATE: &str =
+        r#"spiffe://{{ .TrustDomain }}{{ index .PodMeta.Annotations "x/id" }}"#;
+    /// The SPIRE chart's three default `ClusterSPIFFEID`s (fallback, OIDC discovery
+    /// provider, test keys) all render this.
+    const CHART_TEMPLATE: &str = "spiffe://{{ .TrustDomain }}/ns/{{ .PodMeta.Namespace }}/sa/{{ .PodSpec.ServiceAccountName }}";
+
+    /// ADR-0075 decisions 2 to 4: the policy's own regular expressions, read from the file and
+    /// run here, admit a template whose path begins with a wholly literal segment that is not
+    /// reserved, and refuse the broker's, the gateways' and a templated first segment. The
+    /// validations combine the variables as this test does, word for word.
+    #[test]
+    fn the_clusterspiffeid_policy_refuses_the_reserved_paths_and_any_templated_first_segment() {
+        let (policy, _) = clusterspiffeid_policy();
+        let admitted = |t: &str| {
+            let v = judge_template(&policy, t);
+            v.literal && !v.reserved && (!v.broker_path || v.broker_exact)
+        };
+        for t in [
+            CHART_TEMPLATE,
+            "spiffe://{{.TrustDomain}}/ns/x/sa/y",
+            "spiffe://{{- .TrustDomain -}}/workload",
+            "spiffe://example.org/ns/{{ .PodMeta.Namespace }}",
+            "spiffe://{{ .TrustDomain }}/intruder",
+            "spiffe://{{ .TrustDomain }}/banlieue-tools/x",
+            "spiffe://{{ .TrustDomain }}/gateways",
+            "spiffe://{{ .TrustDomain }}/ns/banlieue/sa/gateway",
+            // The broker's own path: admitted here, then held to its selectors (decision 4).
+            "spiffe://{{ .TrustDomain }}/mediatore",
+        ] {
+            assert!(admitted(t), "refused: {t}");
+        }
+        for t in [
+            "spiffe://{{ .TrustDomain }}/banlieue/claim/6b0a3e9c-1f4d-4c2e-9a7b-0d1e2f3a4b5c",
+            "spiffe://{{ .TrustDomain }}/banlieue/node/ec00000000000000000000000000000000000000000000000000000000000007",
+            "spiffe://{{ .TrustDomain }}/banlieue",
+            "spiffe://{{ .TrustDomain }}/banlieue/{{ .PodMeta.Name }}",
+            "spiffe://{{ .TrustDomain }}/gateway",
+            "spiffe://{{ .TrustDomain }}/gateway/authorizer",
+            "spiffe://other.example/banlieue/claim/6b0a3e9c-1f4d-4c2e-9a7b-0d1e2f3a4b5c",
+            "spiffe://{{ .TrustDomain }}/mediatore/x",
+            ANNOTATION_TEMPLATE,
+            "spiffe://{{ .TrustDomain }}/{{ .PodMeta.Namespace }}/x",
+            "spiffe://{{ .TrustDomain }}/ns-{{ .PodMeta.Namespace }}/x",
+            r#"spiffe://{{ .TrustDomain }}/banlieue{{ "/claim/x" }}"#,
+            "spiffe://{{ .TrustDomain }}/./banlieue/claim/x",
+            "spiffe://{{ .TrustDomain }}/../gateway",
+            "spiffe://{{ .TrustDomain }}//banlieue/claim/x",
+            "spiffe://{{ .TrustDomain }}",
+            "spiffe://{{ .NodeMeta.Name }}/ns/x",
+            "spiffe://{{ .TrustDomain }}/ns/x\n/banlieue",
+            "",
+        ] {
+            assert!(!admitted(t), "admitted: {t:?}");
+        }
+        let v = judge_template(&policy, "spiffe://{{ .TrustDomain }}/mediatore");
+        assert!(v.broker_path && v.broker_exact);
+
+        // The validations say what `admitted` says, in this order, from these variables.
+        let validations = policy["spec"]["validations"].as_array().unwrap();
+        let expressions: Vec<&str> = validations
+            .iter()
+            .map(|v| v["expression"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            expressions,
+            [
+                "variables.literal",
+                "!variables.reserved",
+                "!variables.brokerPath || (variables.brokerExact && variables.selectsTheBroker)",
+            ]
+        );
+        for v in validations {
+            assert_eq!(v["reason"], "Forbidden");
+        }
+        assert_eq!(
+            policy["spec"]["variables"][0],
+            json!({
+                "name": "template",
+                "expression": "has(object.spec) && has(object.spec.spiffeIDTemplate) ? object.spec.spiffeIDTemplate : ''",
+            }),
+            "an absent template is the empty string, which no shape admits"
+        );
+    }
+
+    /// ADR-0075 decisions 1, 4, 5 and 6: every principal, CREATE and UPDATE, failing closed,
+    /// an unchanged spec left alone, the broker's path held to the broker's namespace and
+    /// `ServiceAccount` from the one parameter, and a base binding with no exclusion.
+    #[test]
+    fn the_clusterspiffeid_policy_judges_every_principal_and_holds_the_brokers_path_to_the_parameter()
+     {
+        let (policy, binding) = clusterspiffeid_policy();
+        assert_eq!(policy["metadata"]["name"], "mediatore-clusterspiffeid");
+        assert_eq!(policy["spec"]["failurePolicy"], "Fail");
+        assert_eq!(
+            policy["spec"]["paramKind"],
+            json!({"apiVersion": "v1", "kind": "ConfigMap"})
+        );
+        assert_eq!(
+            policy["spec"]["matchConstraints"]["resourceRules"],
+            json!([{
+                "apiGroups": ["spire.spiffe.io"],
+                "apiVersions": ["v1alpha1"],
+                "operations": ["CREATE", "UPDATE"],
+                "resources": ["clusterspiffeids"],
+            }])
+        );
+        assert_eq!(
+            policy["spec"]["matchConditions"],
+            json!([{
+                "name": "declares-something",
+                "expression": "request.operation == 'CREATE' || oldObject.spec != object.spec",
+            }]),
+            "one condition, and none on the requester"
+        );
+        let variable = |name: &str| {
+            policy["spec"]["variables"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|v| v["name"] == name)
+                .unwrap_or_else(|| panic!("no variable {name}"))["expression"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        assert_eq!(
+            variable("broker"),
+            "params.data.broker.trim().split(':')",
+            "the one parameter the other three policies read"
+        );
+        assert_eq!(
+            variable("selectsTheBroker"),
+            "size(variables.broker) == 4 && variables.broker[0] == 'system' && variables.broker[1] == 'serviceaccount' && \
+has(object.spec.namespaceSelector) && has(object.spec.namespaceSelector.matchLabels) && \
+'kubernetes.io/metadata.name' in object.spec.namespaceSelector.matchLabels && \
+object.spec.namespaceSelector.matchLabels['kubernetes.io/metadata.name'] == variables.broker[2] && \
+has(object.spec.workloadSelectorTemplates) && \
+object.spec.workloadSelectorTemplates.exists(s, s == 'k8s:sa:' + variables.broker[3]) && \
+(!has(object.spec.admin) || !object.spec.admin) && \
+(!has(object.spec.downstream) || !object.spec.downstream)"
+        );
+        let policy_text = serde_json::to_string(&policy["spec"]).unwrap();
+        assert!(!policy_text.contains("system:serviceaccount:"));
+        assert!(!policy_text.contains("request.userInfo"));
+
+        assert_eq!(binding["spec"]["policyName"], "mediatore-clusterspiffeid");
+        assert_eq!(binding["spec"]["validationActions"], json!(["Deny"]));
+        assert_eq!(
+            binding["spec"]["paramRef"],
+            json!({
+                "name": "mediatore-agentsandbox-subject-policy",
+                "namespace": HOME,
+                "parameterNotFoundAction": "Deny",
+            })
+        );
+        assert!(
+            binding["spec"]["matchResources"].is_null(),
+            "no exclusion in the base (decision 7)"
+        );
+    }
+
+    /// ADR-0075 decision 4: the base's own `ClusterSPIFFEID` is what the policy admits for
+    /// `/mediatore`, against the base's own parameter.
+    #[test]
+    fn the_bases_clusterspiffeid_is_the_one_the_policy_admits_for_the_brokers_path() {
+        let (policy, _) = clusterspiffeid_policy();
+        let path = format!(
+            "{}/../../deploy/base/clusterspiffeid.yaml",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let base: serde_json::Value =
+            serde_saphyr::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let template = base["spec"]["spiffeIDTemplate"].as_str().unwrap();
+        let v = judge_template(&policy, template);
+        assert!(v.literal && !v.reserved && v.broker_path && v.broker_exact);
+        let parameter = admission_docs("agentsandbox-subject.yaml")
+            .into_iter()
+            .find(|d| d["kind"] == "ConfigMap")
+            .expect("the parameter");
+        let broker: Vec<String> = parameter["data"]["broker"]
+            .as_str()
+            .unwrap()
+            .trim()
+            .split(':')
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(broker.len(), 4);
+        assert_eq!(
+            base["spec"]["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"],
+            broker[2]
+        );
+        let selectors = base["spec"]["workloadSelectorTemplates"]
+            .as_array()
+            .unwrap();
+        assert!(selectors.contains(&json!(format!("k8s:sa:{}", broker[3]))));
+        assert!(base["spec"]["admin"].is_null() && base["spec"]["downstream"].is_null());
+    }
+
+    /// ADR-0075 decision 7: the kind cluster excludes its fixtures by name in its binding, and
+    /// nothing else. Every `ClusterSPIFFEID` a kind tier declares whose template the policy
+    /// refuses is in the list, and every name in the list is a `mediatore-e2e-` fixture. The
+    /// migration overlay moves this binding's parameter with the other three.
+    #[test]
+    fn the_kind_binding_excludes_exactly_the_fixtures_that_need_a_reserved_identity() {
+        let (policy, base_binding) = clusterspiffeid_policy();
+        let kind = format!("{}/../../dev/kind", env!("CARGO_MANIFEST_DIR"));
+        let binding: serde_json::Value = serde_saphyr::from_str(
+            &std::fs::read_to_string(format!("{kind}/broker/clusterspiffeid-fixtures.yaml"))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            binding["metadata"]["name"],
+            base_binding["metadata"]["name"]
+        );
+        assert_eq!(
+            binding["spec"]["paramRef"],
+            base_binding["spec"]["paramRef"]
+        );
+        assert_eq!(binding["spec"]["validationActions"], json!(["Deny"]));
+        let rules = binding["spec"]["matchResources"]["excludeResourceRules"]
+            .as_array()
+            .unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0]["resources"], json!(["clusterspiffeids"]));
+        let excluded: Vec<&str> = rules[0]["resourceNames"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n.as_str().unwrap())
+            .collect();
+        for name in &excluded {
+            assert!(name.starts_with("mediatore-e2e-"), "{name}");
+        }
+
+        // Every ClusterSPIFFEID the tiers declare, in YAML files and in the scripts' heredocs.
+        let mut files = Vec::new();
+        let mut dirs = vec![std::path::PathBuf::from(&kind)];
+        while let Some(dir) = dirs.pop() {
+            for e in std::fs::read_dir(dir).unwrap() {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    dirs.push(p);
+                } else if p.extension().is_some_and(|x| x == "yaml" || x == "sh") {
+                    files.push(p);
+                }
+            }
+        }
+        let mut refused = Vec::new();
+        for file in files {
+            let text = std::fs::read_to_string(&file).unwrap();
+            for chunk in text.split("kind: ClusterSPIFFEID").skip(1) {
+                let field = |key: &str| {
+                    chunk.lines().find_map(|l| {
+                        l.trim()
+                            .strip_prefix(key)
+                            .map(|v| v.trim().trim_matches('"').to_owned())
+                    })
+                };
+                let (Some(name), Some(template)) = (
+                    field("name:"),
+                    field("spiffeIDTemplate:").filter(|t| t.starts_with("spiffe://")),
+                ) else {
+                    continue;
+                };
+                let v = judge_template(&policy, &template);
+                // `/mediatore` outside the base is a second broker: refused by its selectors.
+                if !v.literal || v.reserved || v.broker_path {
+                    refused.push(name);
+                }
+            }
+        }
+        assert!(
+            refused.iter().any(|n| n == "mediatore-e2e-impersonator"),
+            "{refused:?}"
+        );
+        for name in &refused {
+            assert!(
+                excluded.contains(&name.as_str()),
+                "a kind fixture the policy refuses is not excluded: {name}"
+            );
+        }
+        let migration =
+            std::fs::read_to_string(format!("{kind}/migration/kustomization.yaml")).unwrap();
+        assert!(
+            migration.contains("|clusterspiffeid)"),
+            "the migration overlay does not move this binding's paramRef"
         );
     }
 

@@ -79,10 +79,15 @@ ARG TPM_PLUGIN_AGENT_SHA
 # time, rather than on a gateway: the tools the units and the build call, the packages the
 # base layer installs (tpm2-tools for the EK export, qemu-guest-agent for the libvirt
 # channel, cut to what that takes by image/gateway/qemu-ga.conf below, nftables for the
-# host table, ADR-0027 decision 5), the TPM device group, and no sshd (ADR-0028 decision 8,
-# banlieue ADR-0109 decision 8).
+# host table, ADR-0027 decision 5), the TPM device group, the base's resolver drop-in
+# (image/base/resolved/60-mediatore.conf: no global, fallback or multicast resolution, the stub
+# on; the Envoys ask that stub alone), and no sshd (ADR-0028 decision 8, banlieue ADR-0109
+# decision 8).
 RUN command -v systemctl && command -v useradd && command -v nft \
     && command -v tpm2_nvread && command -v qemu-ga && getent group tss \
+    && grep -qx "DNS=" /usr/lib/systemd/resolved.conf.d/60-mediatore.conf \
+    && grep -qx "FallbackDNS=" /usr/lib/systemd/resolved.conf.d/60-mediatore.conf \
+    && test "$(systemctl is-enabled systemd-resolved.service)" = enabled \
     && ! command -v sshd
 
 # The agent in the TPM device group (image/systemd/spire-agent.service); the four service
@@ -122,6 +127,12 @@ COPY image/gateway/systemd/spire-agent.service \
      image/gateway/systemd/mediatore-gateway-probes.timer \
      /etc/systemd/system/
 COPY image/gateway/sysctl/99-mediatore-gateway.conf /etc/sysctl.d/99-mediatore-gateway.conf
+# The runtime directories the units name bare in their mount options, made at boot before any
+# unit starts (a missing one fails a unit's start with 226/NAMESPACE, even its "+" steps).
+COPY image/gateway/tmpfiles.d/mediatore-gateway.conf /usr/lib/tmpfiles.d/mediatore-gateway.conf
+# The resolver (2026-11-28): the resolv.conf the two Envoys' units bind over /run/systemd/resolve,
+# naming resolved's stub alone. resolved's own settings are the base's (checked above).
+COPY image/gateway/resolve/resolv.conf image/gateway/resolve/stub-resolv.conf /usr/share/mediatore-gateway/resolve/
 # The guest agent answers the commands banlieue's provider sends and no other: no exec, no
 # file write (threat model R-43).
 COPY image/gateway/qemu-ga.conf /etc/qemu/qemu-ga.conf

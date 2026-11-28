@@ -239,6 +239,12 @@ What already exists and shapes the answer:
      setgid bit, which `RestrictSUIDSGID=yes` forbids the reader itself. A runtime directory
      owned by the unit would take the reader's own group, or put the reader in the authorizer's
      group, which "in no group but its own" refuses.*
+   - *Amended 2026-11-27, after the first boot of a gateway: the step above is gone. systemd
+     sets a unit's mount namespace up before its first `ExecStartPre`, even a `+` one, and the
+     unit's `ReadWritePaths=` named the directory that step was to make, so the reader failed
+     every run with `226/NAMESPACE`. The directory is made at boot by the image's `tmpfiles.d`
+     entry (`image/gateway/tmpfiles.d/mediatore-gateway.conf`, `d /run/mediatore-gateway/probes
+     2750 mediatore-probes mediatore-gateway`), and the reader's unit has no root step.*
    - *The authorizer opens the summary with `O_NONBLOCK | O_NOFOLLOW` and checks what it opened
      (a regular file of at most 64 KiB, by `fstat` on the descriptor), so a link or a FIFO put
      in its place is refused at once and never stalls the authorizer
@@ -361,6 +367,25 @@ What already exists and shapes the answer:
    `segment_events_from_a_node_with_a_live_claim_are_never_put_on_its_summary`). So the status
    bullet above is for `protocol` events alone, and a report of `segment` events alone logs no
    mode mismatch.*
+
+   *Amended 2026-11-27, after the live run: a report of `segment` events alone is taken under
+   `policy.traps: off` too. The pool VM's host table is loaded wherever the pool has gateways,
+   whatever `policy.traps` says, and the guest's segment reader runs for the guest's life in any
+   mode (`segment::spawn`, `crates/mediatore-guest/src/guest.rs`); but the broker answered the
+   route `501` under `off` before it read the body, and the reader drops a refused report. So
+   with tripwires on the VM off, the default, `pool_inbound` and `pool_output` were never
+   recorded, while `shadow` recorded them live. Now, under `off`, the body is read first: a
+   report whose every event is `segment` goes on exactly as under `shadow` (the peer must be a
+   registered node, the per-claim or per-node limit of two reports a second holds, one audit
+   line at `warn` per event, never put on a claim, nothing ended), and any other body, a report
+   with an ADR-0069 event in it or no report at all, is the `501` it was, whoever sent it
+   (`trip::trip`, `crates/mediatore-api/src/trip.rs`;
+   `a_segment_only_report_under_off_is_accepted_as_an_audit_line_and_nothing_more`,
+   `a_report_with_any_adr_0069_event_under_off_is_still_501_and_nothing_is_recorded`,
+   `segment_reports_under_off_keep_the_per_node_rate_limit`, and in `e2e_dev.rs`
+   `the_pools_segment_events_are_taken_under_off_and_any_trap_event_is_still_501`). Decision 1's
+   amendment still holds for those: a foreign peer's report that is not `segment` alone is the
+   `501` under `off`, unclassified; one that is `segment` alone is refused as under `shadow`.*
 
 9. **Never log what the peer sent.** ADR-0069 decision 12 holds here: the canary test plants a
    token, a path and a header on every classified route and asserts none appears in a log line,

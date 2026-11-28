@@ -155,7 +155,18 @@ say "step 6 (claims not drained): the store's Secrets and the bound SandboxNodes
 echo "the copied session of $SANDBOX carries no owner reference"
 
 say "step 7: the base in $NEW, the parameter naming the new username"
-"${K[@]}" apply -k dev/kind/broker >/dev/null
+# As the guide says: the ClusterSPIFFEID can be judged against the old parameter in the
+# moment before the moved binding is enforced (ADR-0075), and that one refusal is answered
+# by applying again. Any other refusal, or this one past the deadline, fails the step.
+for ((try = 1; ; try++)); do
+  if out=$("${K[@]}" apply -k dev/kind/broker 2>&1 >/dev/null); then break; fi
+  if ((try < 15)) && grep -q "ValidatingAdmissionPolicy 'mediatore-clusterspiffeid'" <<<"$out"; then
+    echo "  the ClusterSPIFFEID was judged against the old parameter; applying again ($try)"
+    sleep 2
+    continue
+  fi
+  fail "step 7's apply: $out"
+done
 "${K[@]}" -n "$NEW" scale deploy/mediatore --replicas=1 >/dev/null
 "${K[@]}" -n "$NEW" rollout restart deploy/mediatore >/dev/null
 "${K[@]}" -n "$NEW" rollout status deploy/mediatore --timeout=300s >/dev/null

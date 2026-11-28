@@ -10,7 +10,7 @@
 #
 # It is also the worked example of what an overlay that moves the broker must patch,
 # because a kustomize `namespace:` rewrites object metadata and nothing else: the
-# `broker` value, the three bindings' `paramRef.namespace`, the ClusterSPIFFEID's
+# `broker` value, the four bindings' `paramRef.namespace`, the ClusterSPIFFEID's
 # `namespaceSelector`, and the `subjects[].namespace` of the ClusterRoleBinding and the
 # three RoleBindings (a subject that names its namespace is left as it is). The Namespace object the base ships is dropped: banlieue's
 # namespace is not the broker's to create or to label.
@@ -36,7 +36,7 @@ patches:
         broker: system:serviceaccount:banlieue-system:mediatore
   - target:
       kind: ValidatingAdmissionPolicyBinding
-      name: mediatore-(agentsandbox-subject|agentsandbox-status|clusterstaticentry)
+      name: mediatore-(agentsandbox-subject|agentsandbox-status|clusterstaticentry|clusterspiffeid)
     patch: |-
       - op: replace
         path: /spec/paramRef/namespace

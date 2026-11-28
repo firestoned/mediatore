@@ -65,6 +65,16 @@ and anything decided before it and written after it is refused. In every write t
 written before the Secrets, and an update never creates a Secret, so once a release has
 returned no session Secret of the sandbox exists and none can come back.
 
+A released record therefore holds no delegated credential, whatever it held before: the
+release clears `delegations` with the refresh material. The reconciler reads an empty map as
+`delegation_required` (a credential that never reached the record) only while the record is
+live. A sandbox whose record was released first (its deadline, a refused bind, a trap, a
+deletion) keeps the status of that end: `Releasing` while its claim goes, then `Failed`
+with `claim gone` or the reason it already had. Up to v0.5.0-rc.1 a delegated sandbox that
+reached its deadline was reported as `delegation_required: no delegated credential ... reached
+the record`, and the reconciler deleted its claim; that line on an expired sandbox was this,
+not a lost delegation.
+
 What an operator sees of it:
 
 - A guest's report or a session refresh that lost four times in a row answers

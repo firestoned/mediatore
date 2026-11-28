@@ -28,8 +28,8 @@
 #
 # The ServiceAccount is matched by its full username, read from the key
 # `broker` of the ConfigMap mediatore-agentsandbox-subject-policy
-# (agentsandbox-subject.yaml), the one place the three policies that name the
-# broker read it (ADR-0056 decision 4). An overlay that renames the
+# (agentsandbox-subject.yaml), the one place the four policies that name the
+# broker read it (ADR-0056 decision 4, ADR-0075). An overlay that renames the
 # ServiceAccount or moves it to another namespace patches that value and the
 # `paramRef.namespace` below, or the broker's own status writes are refused:
 # sandboxes then stay Pending with the denial in the broker's log, which is

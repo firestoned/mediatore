@@ -278,10 +278,13 @@ fn audit(
 }
 
 /// `POST /v1/me/trip` (ADR-0069 decision 8): a guest, over its node SVID, reports the use of
-/// a trap. In order: `501` under `policy.traps: off`; the peer must be a registered node, as
-/// on `POST /v1/me/exit`; a body that is off in any part is `400 invalid_trip` and nothing of
-/// it is recorded; two reports a second per claim, `429 too_many_trips` with `Retry-After`
-/// beyond. Then, for each event not seen before by its `id`: one audit line, and an entry in
+/// a trap. In order: `501` under `policy.traps: off`, for any body but a report of `segment`
+/// events alone (ADR-0070 decision 8, amended 2026-11-27: the pool's host table exists with
+/// gateways whatever `policy.traps` says, so its drops are recorded under `off` too, as audit
+/// lines on no claim and nothing more); the peer must be a registered node, as on
+/// `POST /v1/me/exit`; a body that is off in any part is `400 invalid_trip` and nothing of it is
+/// recorded; two reports a second per claim, `429 too_many_trips` with `Retry-After` beyond,
+/// under every mode. Then, for each event not seen before by its `id`: one audit line, and an entry in
 /// the claim's trip summary, but for a `segment` event, which is the audit line alone and
 /// names no claim. Under `enforce` the first event that ends the claim puts `tripped` on its
 /// record and the claim is released ([`end_claim`]), before the summary is written.
@@ -300,14 +303,25 @@ pub(crate) async fn trip(
     peer: Option<Extension<PeerSpiffeId>>,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    let Some(configured) = st.tripwires.mode.trip_mode() else {
-        return Err(ApiError::not_implemented(
-            "tripwires are off on this broker (policy.traps)",
-        ));
+    let configured = st.tripwires.mode.trip_mode();
+    // Under off the body decides the answer before the peer is looked at: a report of segment
+    // events alone goes on as under shadow, and anything else (an ADR-0069 event, a body that
+    // is no report) is the `501` it always was, so the off broker's answer to every other body
+    // is unchanged.
+    let segments_under_off = match configured {
+        Some(_) => None,
+        None => match parse(&body) {
+            Ok(report) if report.is_segment_only() => Some(report),
+            _ => {
+                return Err(ApiError::not_implemented(
+                    "tripwires are off on this broker (policy.traps)",
+                ));
+            }
+        },
     };
     let peer = peer.as_ref().map(|e| &e.0);
     let node = node_of_peer(&st, &headers, peer, crate::route::ME_TRIP).await?;
-    let report = match parse(&body) {
+    let report = match segments_under_off.map_or_else(|| parse(&body), Ok) {
         Ok(report) => report,
         Err(refused) => {
             tracing::debug!(node = %node.node_id, fault = refused.body.detail.as_deref().unwrap_or_default(), "trip report refused: nothing of it is recorded");
@@ -322,14 +336,19 @@ pub(crate) async fn trip(
         tracing::info!(node = %node.node_id, events = report.events.len(), "trip report rate-limited (ADR-0069 decision 8)");
         return Ok(too_many());
     }
-    match claim {
-        Some(claim) => record(&st, configured, &node, &claim, &report).await?,
-        None => record_without_a_claim(&st, &node, &report),
+    match (configured, claim) {
+        (Some(configured), Some(claim)) => {
+            record(&st, configured, &node, &claim, &report).await?;
+        }
+        // Under off the report is segment events alone (checked above): unattributed audit
+        // lines, whether or not the node has a claim, exactly as `record` writes them.
+        (None, _) | (Some(_), None) => record_without_a_claim(&st, &node, &report),
     }
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
-/// A report from a node that never had a claim, or whose every record was swept: `segment`
+/// A report from a node that never had a claim, or whose every record was swept, and any
+/// report under `policy.traps: off` (which is `segment` events alone by then): `segment`
 /// events are one audit line each at `warn` (ADR-0070 decision 8) and nothing else is kept;
 /// a report with any other kind in it is dropped whole.
 fn record_without_a_claim(st: &AppState, node: &NodeRecord, report: &TripReport) {
@@ -795,6 +814,105 @@ pub(crate) mod tests {
         // Another method on the path is axum's 405, as on every route here.
         let (status, ..) = call(&r.st, "GET", "/v1/me/trip", Some(&r.node), body).await;
         assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn a_segment_only_report_under_off_is_accepted_as_an_audit_line_and_nothing_more() {
+        // ADR-0070 decision 8, amended 2026-11-27 (the pool's segment classes under off): the
+        // host table exists with gateways whatever `policy.traps` says, so its drops are
+        // recorded under off as under shadow, one audit line each, on no claim.
+        capture_logs();
+        let r = rig(TrapsMode::Off).await;
+        let (status, ..) = r
+            .post(report("shadow", &[segment_event(Uuid::new_v4())]))
+            .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let logged = captured();
+        let line = logged
+            .lines()
+            .find(|l| l.contains("trip reported"))
+            .expect("an audit line");
+        assert!(line.contains("WARN"), "said at warn, as under shadow");
+        for field in [
+            "kind=\"segment\"",
+            "class=\"pool_inbound\"",
+            "effect=\"reported\"",
+            "claim_uid= ",
+            "subject= ",
+        ] {
+            assert!(line.contains(field), "the line lacks {field}");
+        }
+        assert!(r.untouched().await, "nothing is put on the claim");
+        assert!(r.store.calls().is_empty(), "and nothing is written");
+
+        // From a node with no claim: the same.
+        let other = register(&r.st, OTHER_EK).await;
+        let resp = raw(
+            &r.st,
+            &other,
+            &report("shadow", &[segment_event(Uuid::new_v4())]).to_string(),
+            &[],
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        // Any peer but a registered node is refused, as under shadow: never recorded.
+        let unregistered =
+            r.st.naming
+                .node_id("e0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff00");
+        for peer in [
+            gateway_peer(),
+            r.st.naming.claim_id(r.rec.uid),
+            unregistered,
+        ] {
+            let resp = raw(
+                &r.st,
+                &peer,
+                &report("shadow", &[segment_event(Uuid::new_v4())]).to_string(),
+                &[],
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_report_with_any_adr_0069_event_under_off_is_still_501_and_nothing_is_recorded() {
+        capture_logs();
+        let r = rig(TrapsMode::Off).await;
+        for events in [
+            vec![segment_event(Uuid::new_v4()), port_event(Uuid::new_v4())],
+            vec![credential_event(Uuid::new_v4())],
+            vec![unknown_host_event(Uuid::new_v4())],
+            vec![],
+        ] {
+            let (status, answer, _) = r.post(report("shadow", &events)).await;
+            assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+            assert_eq!(code(&answer), "not_implemented");
+        }
+        assert!(!captured().contains("trip reported"), "nothing is audited");
+        assert!(r.untouched().await);
+        assert_eq!(r.store.calls(), Vec::<&str>::new(), "nothing is written");
+    }
+
+    #[tokio::test]
+    async fn segment_reports_under_off_keep_the_per_node_rate_limit() {
+        let r = rig(TrapsMode::Off).await;
+        let segment = || report("shadow", &[segment_event(Uuid::new_v4())]).to_string();
+        for _ in 0..2 {
+            let resp = raw(&r.st, &r.node, &segment(), &[]).await;
+            assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        }
+        let resp = raw(&r.st, &r.node, &segment(), &[]).await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        // A node with no claim, keyed by its EK hash: its own bucket, limited the same way.
+        let other = register(&r.st, OTHER_EK).await;
+        for _ in 0..2 {
+            let resp = raw(&r.st, &other, &segment(), &[]).await;
+            assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        }
+        let resp = raw(&r.st, &other, &segment(), &[]).await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 
     #[tokio::test]
@@ -1712,6 +1830,71 @@ pub(crate) mod tests {
             "released through the AgentSandbox"
         );
         assert!(r.held().await.exit.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_pull_failure_exit_is_recorded_with_its_reason_and_releases_the_claim() {
+        // ADR-0076 decision 4: the guest that could not pull the image ends the claim on the
+        // exit route, with a reason from a closed set; the claim is released as for any exit.
+        capture_logs();
+        let (r, front) = kube_rig().await;
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/v1/me/exit")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "restarts": 0,
+                    "reason": { "kind": "pull_failed", "attempts": 3, "error": "unreachable" },
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        req.extensions_mut().insert(PeerSpiffeId(r.node.clone()));
+        let status = sandbox_router(r.st.clone())
+            .oneshot(req)
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(!sandbox_kept(&r, &front).await, "released");
+        let exit = r.held().await.exit.expect("the exit is on the record").exit;
+        assert_eq!(
+            exit.reason,
+            Some(mediatore_proto::ExitReason::PullFailed {
+                attempts: 3,
+                error: mediatore_proto::PullError::Unreachable,
+            })
+        );
+        assert_eq!((exit.code, exit.signal), (None, None));
+        let logged = captured();
+        let line = logged
+            .lines()
+            .find(|l| l.contains("could not be pulled"))
+            .expect("the broker's line");
+        assert!(line.contains("WARN") && line.contains("error=\"unreachable\""));
+        assert!(line.contains("attempts=3"));
+
+        // A reason outside the closed set is no exit: refused, nothing ends.
+        let (r, front) = kube_rig().await;
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/v1/me/exit")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({ "restarts": 0, "reason": { "kind": "pull_failed", "attempts": 1, "error": "see https://registry.example/v2/?token=x" } })
+                    .to_string(),
+            ))
+            .unwrap();
+        req.extensions_mut().insert(PeerSpiffeId(r.node.clone()));
+        let status = sandbox_router(r.st.clone())
+            .oneshot(req)
+            .await
+            .unwrap()
+            .status();
+        assert!(status.is_client_error(), "refused: {status}");
+        assert!(sandbox_kept(&r, &front).await);
+        assert!(r.held().await.exit.is_none());
     }
 
     #[tokio::test]

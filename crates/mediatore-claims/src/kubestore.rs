@@ -4313,6 +4313,7 @@ mod tests {
                     code: Some(0),
                     signal: None,
                     restarts: 1,
+                    reason: None,
                 },
             }),
             delegations: BTreeMap::new(),

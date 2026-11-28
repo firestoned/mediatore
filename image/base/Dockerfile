@@ -27,3 +27,12 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && ! command -v sshd \
     && systemctl mask ssh.service ssh.socket sshd.service
+
+# The resolver (2026-11-28): resolved asks the link's servers and nobody else (no global
+# servers, no fallback, no LLMNR or mDNS), and /etc/resolv.conf names resolved's stub until
+# Kairos links it to resolved's own file at boot. The Kairos base's file named two public
+# resolvers, which resolved imported as global servers and a process reading the file asked
+# directly. COPY, not RUN: a build mounts its own /etc/resolv.conf over the image's during RUN.
+COPY image/base/resolved/60-mediatore.conf /usr/lib/systemd/resolved.conf.d/60-mediatore.conf
+COPY image/base/resolv.conf /etc/resolv.conf
+RUN test "$(systemctl is-enabled systemd-resolved.service)" = enabled

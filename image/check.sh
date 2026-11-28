@@ -108,4 +108,17 @@ check "the datasource reads local devices only, no cloud metadata address (ADR-0
 check "no private key material (banlieue ADR-0108 decision 2)" \
   '! grep -rl "PRIVATE KEY" /etc /usr/share/mediatore /var/lib 2>/dev/null | grep -q .'
 
+# The resolver (2026-11-28): the VM base's. A pool without gateways (the Direct shape) puts the nameserver lines of /etc/resolv.conf in
+# the sandbox uid's DNS set and the proxy resolves through them, so the file and resolved must never name a public resolver: the
+# Kairos base's file named two, and resolved imported them as global servers.
+check "no resolver but the link's: the base's resolved drop-in empties DNS (so a foreign /etc/resolv.conf is never imported as global servers) and FallbackDNS, turns LLMNR and mDNS off and keeps the stub listener, sorts after every other drop-in, and nothing in the image sets a global or fallback server; resolved is enabled" \
+  'f=/usr/lib/systemd/resolved.conf.d/60-mediatore.conf; for l in "[Resolve]" "DNS=" "FallbackDNS=" "DNSStubListener=yes" "LLMNR=no" "MulticastDNS=no"; do grep -qxF "$l" $f || exit 1; done && test "$(ls /usr/lib/systemd/resolved.conf.d /etc/systemd/resolved.conf.d 2>/dev/null | grep "\.conf$" | sort | tail -1)" = 60-mediatore.conf && ! grep -rqsE "^(DNS|FallbackDNS)=." /etc/systemd/resolved.conf /etc/systemd/resolved.conf.d /usr/lib/systemd/resolved.conf.d && test "$(systemctl is-enabled systemd-resolved.service)" = enabled'
+# The image's own /etc/resolv.conf, as the layer holds it: a container run mounts the runtime's over it, so it is read from a created,
+# never started, container.
+image_file() { local c; c=$("$CLI" create --entrypoint sh "$IMAGE") || return 1; "$CLI" cp "$c:$1" - | tar -xO; local r=$?; "$CLI" rm "$c" >/dev/null; return $r; }
+rc=$(image_file /etc/resolv.conf 2>/dev/null || true)
+if [ "$(printf '%s\n' "$rc" | grep -E '^(nameserver|search|domain)')" = "nameserver 127.0.0.53" ]; then
+  echo "✓ the image's /etc/resolv.conf names resolved's stub alone, never the public resolvers the Kairos base's named, until Kairos links it at boot"
+else echo "✗ the image's /etc/resolv.conf names resolved's stub alone, never the public resolvers the Kairos base's named, until Kairos links it at boot"; fail=1; fi
+
 [ "$fail" -eq 0 ] && echo "image ok" || { echo "image check failed"; exit 1; }

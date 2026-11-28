@@ -192,6 +192,7 @@ pub(crate) async fn a_claim_round_trips_every_field(s: &dyn ClaimStore) {
             code: Some(0),
             signal: None,
             restarts: 2,
+            reason: None,
         },
     });
     s.put_claim(rec.clone()).await.unwrap();

@@ -17,8 +17,9 @@
 # with two selectors and every other path under /gateway.
 #
 # What this is not: a bound on a cluster administrator, who can delete it, nor on SPIRE's
-# own admin API, nor on a ClusterSPIFFEID template that renders the same ID (the kind
-# tier's fixture). RBAC on clusterstaticentries and on this policy is the platform team's.
+# own admin API. A ClusterSPIFFEID template that renders a path under /gateway is refused by
+# clusterspiffeid.yaml since ADR-0075 (the kind tier's fixtures are excluded by name in its
+# kind binding). RBAC on clusterstaticentries and on this policy is the platform team's.
 # A policy does not judge objects that already exist but does refuse an update to one, so
 # apply it once the last entry of the old shape has been replaced (ADR-0053 decision 7).
 # The broker's own policy (clusterstaticentry-mediatore.yaml) refuses its ServiceAccount both

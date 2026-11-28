@@ -524,7 +524,9 @@ kind-spire: kind-create kind-openbao ## Apply SPIRE (server, controller manager,
 kind-deploy: kind-create ## Apply the broker's CRD, ServiceAccount, RBAC and admission policies; mint its kubeconfig
 	@# The base's own Namespace (Pod Security restricted, ADR-0056), not a bare `create ns`.
 	$(KIND_KUBECTL) apply -f deploy/base/namespace.yaml
-	$(KIND_KUBECTL) apply -n mediatore-system -f deploy/base/crds -f deploy/base/serviceaccount.yaml -f deploy/base/rbac.yaml -f deploy/base/admission/clusterstaticentry-mediatore.yaml -f deploy/base/admission/clusterstaticentry-gateway.yaml -f deploy/base/admission/agentsandbox-subject.yaml -f deploy/base/admission/agentsandbox-status.yaml
+	$(KIND_KUBECTL) apply -n mediatore-system -f deploy/base/crds -f deploy/base/serviceaccount.yaml -f deploy/base/rbac.yaml -f deploy/base/admission/clusterstaticentry-mediatore.yaml -f deploy/base/admission/clusterstaticentry-gateway.yaml -f deploy/base/admission/agentsandbox-subject.yaml -f deploy/base/admission/agentsandbox-status.yaml -f deploy/base/admission/clusterspiffeid.yaml
+	@# The ClusterSPIFFEID policy's binding as kind runs it: the tiers' fixtures excluded by name (ADR-0075 decision 7).
+	$(KIND_KUBECTL) apply -f dev/kind/broker/clusterspiffeid-fixtures.yaml
 	@./dev/kind/sa-kubeconfig.sh $(KIND_KUBECONFIG) $(KIND_SA_KUBECONFIG)
 	@./dev/kind/admission-settled.sh $(KIND_SA_KUBECONFIG) $(SPIRE_TRUST_DOMAIN)
 
@@ -570,11 +572,12 @@ kind-broker: kind-up kind-images kind-dex kind-openbao ## deploy/base in kind on
 	$(KIND_KUBECTL) -n mediatore-system rollout restart deploy/mediatore
 	$(KIND_KUBECTL) -n mediatore-system rollout status deploy/mediatore --timeout=300s
 
-kind-e2e-entries: kind-up ## Live entries round trip (ADR-0006) as the broker ServiceAccount against SPIRE in kind
+kind-e2e-entries: kind-up ## Live entries round trip (ADR-0006) as the broker ServiceAccount against SPIRE in kind; the ClusterSPIFFEID policy's dry runs (ADR-0075)
 	MEDIATORE_LIVE_KUBECONFIG=$(CURDIR)/$(KIND_SA_KUBECONFIG) MEDIATORE_LIVE_IDENTITY=self \
 	MEDIATORE_LIVE_ADMIN_KUBECONFIG=$(CURDIR)/$(KIND_KUBECONFIG) \
 	MEDIATORE_LIVE_TRUST_DOMAIN=$(SPIRE_TRUST_DOMAIN) MEDIATORE_LIVE_CLASS_NAME=$(SPIRE_CLASS_NAME) \
 	$(MAKE) live-admission-test
+	./dev/kind/clusterspiffeid-admission.sh $(KIND_KUBECONFIG)
 
 kind-e2e-mtls: kind-broker ## ADR-0007 live: broker SVID over the CSI driver, agent-issued client SVIDs over SPIFFE mTLS, the refusals
 	./dev/kind/mtls-e2e.sh $(KIND_KUBECONFIG) $(SPIRE_TRUST_DOMAIN)

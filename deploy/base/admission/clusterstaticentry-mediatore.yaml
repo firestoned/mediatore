@@ -57,7 +57,8 @@
 # agentsandbox-status.yaml read (ADR-0056 decision 4). A kustomize `namespace:`
 # does not rewrite a string inside a ConfigMap's data, nor `paramRef.namespace`:
 # AN OVERLAY THAT RENAMES THE ServiceAccount OR MOVES IT TO ANOTHER NAMESPACE
-# PATCHES THE `broker` VALUE AND THE THREE BINDINGS' `paramRef.namespace`.
+# PATCHES THE `broker` VALUE AND THE FOUR BINDINGS' `paramRef.namespace`
+# (clusterspiffeid.yaml's is the fourth, ADR-0075).
 # Forgetting to used to leave the broker's entries unjudged, with no error
 # anywhere (the policy matched nothing the broker sent). It now refuses them:
 # the entries are still claimed by their names, the sender validation fails, no

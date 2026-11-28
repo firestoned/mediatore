@@ -29,9 +29,12 @@ AmbientCapabilities=CAP_NET_ADMIN
 NoNewPrivileges=yes
 # The summary's directory: this user's, 2750, group mediatore-gateway. The authorizer's user
 # reads it through its group and cannot write there, and no other user can enter it. Setgid so
-# the summary takes the directory's group without a chown; made here with full privileges
-# because RestrictSUIDSGID=yes below forbids this unit that bit.
-ExecStartPre=+/usr/bin/install -d -m 2750 -o mediatore-probes -g mediatore-gateway /run/mediatore-gateway/probes
+# the summary takes the directory's group without a chown. It is made at boot by the image's
+# tmpfiles.d entry (/usr/lib/tmpfiles.d/mediatore-gateway.conf), not here: systemd sets this
+# unit's mount namespace up before any ExecStartPre, even a "+" one, and the ReadWritePaths=
+# below, on a directory an ExecStartPre=+ of this unit was to make, failed every run with
+# 226/NAMESPACE on a booted gateway (2026-11-27). RestrictSUIDSGID=yes below would forbid this
+# unit the setgid bit anyway.
 ExecStart=/usr/bin/mediatore gateway-probes --dir /run/mediatore-gateway/probes
 # One read is two short nft processes (about 4 ms each; 122 ms for a full set of sources).
 TimeoutStartSec=30
@@ -69,6 +72,7 @@ InaccessiblePaths=-/run/spire
 # ProtectSystem=strict does not make /run read-only once a unit also sets an option that
 # mounts the API file systems (ProtectKernelTunables=, ProtectProc= and others): seen on the
 # build host with systemd 257, where /run stayed writable under exactly these lines. So /run is
-# named here, and the one directory this unit writes is named after it.
+# named here, and the one directory this unit writes is named after it, bare: tmpfiles.d made it
+# before sysinit.target, and a missing one fails the run rather than being skipped.
 ReadOnlyPaths=/run
 ReadWritePaths=/run/mediatore-gateway/probes
