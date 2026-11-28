@@ -47,14 +47,15 @@ path, the query or the body) does.
 
 | Mode | The guest | The broker |
 | --- | --- | --- |
-| `off` (the default) | arms nothing; the jail, its environment, its home and the claim's table are byte for byte what they were before ADR-0069 | `POST /v1/me/trip` answers `501`; `GET /v1/me` carries no `traps` |
+| `off` (the default) | arms nothing; the jail, its environment, its home and the claim's table are byte for byte what they were before ADR-0069 | `POST /v1/me/trip` answers `501`, except for a report of `segment` events alone (the pool's host table, ADR-0070), which is recorded as under `shadow`; `GET /v1/me` carries no `traps` |
 | `shadow` | arms every trap; a use is reported and ends nothing; nothing is refused that `off` would forward | records each event as `would_trip` (or `reported` for a `denied` class at `report`) and ends nothing |
 | `enforce` | a use is refused, the network cut and the jail killed, then reported | records the event, writes `tripped` on the record and releases the claim |
 
 `policy.traps` lives in the `policy` section, which requires `policy.trusted_keys` (notaio's
 signing keys): **a deployment with no signed policy cannot turn tripwires on the VM on at all.**
 That is how it is built; it changes when the mode moves to a top-level key (ADR-0069 open
-question 8). The ADR-0070 section, `tripwires`, is top-level and needs nothing.
+question 8). The ADR-0070 section, `tripwires`, is top-level and needs nothing: the pool's
+segment classes are recorded whatever `policy.traps` says.
 
 Roll out in this order:
 
@@ -115,8 +116,13 @@ Under `shadow` and `enforce`, and never under `off`:
   drawn) to one trap listener on loopback, outside the jail, on a port drawn per claim; the
   listener answers as the decoy the connection was made to. A direct connection to the trap
   listener's port is refused for every uid, and Landlock refuses it to the jail. The jail
-  cannot list the decoy ports; it can see that one loopback listener exists in its own
-  `/proc/self/net/tcp`, and so that traps are armed, not where they are.
+  cannot list the decoy ports. In its own `/proc/self/net/tcp` it can see the loopback listeners
+  beside the proxy's port: the proxy's pull listener (`MEDIATORE_EGRESS_PULL_PORT`, default
+  18129) when the claim's image is pulled through the proxy, and, when traps are armed, the trap
+  listener on its drawn port. So it can tell that traps are armed, not where the decoys are.
+- **Decoy names.** A generated decoy port is named `dev-server` (the first port of every draw is
+  one, and each later port about half the time), so a record or a log reading `trap=dev-server`
+  several times for one claim is several generated ports, not one port tripped again.
 - **The connect ports.** Landlock admits the decoy ports beside the proxy's (and 80 with the
   metadata decoy). The jail's `confinement applied; exec` line, which reaches the owner with the
   workload's output, then reads `connect_ports=<n> ports`: the number of admitted ports, not
@@ -308,9 +314,12 @@ and `gateway_output_{sandbox,imds,wireserver,broker,authorizer,relay,agent,loopb
 on the output chains' dropping rules. The unit `mediatore-gateway-probes.service`, started every
 30 s by `mediatore-gateway-probes.timer`, runs `mediatore gateway-probes --dir
 /run/mediatore-gateway/probes` as the user `mediatore-probes` with `CAP_NET_ADMIN` alone and no
-socket family but netlink. One setup step of the unit runs as root: a fixed
-`ExecStartPre=+/usr/bin/install -d -m 2750 ...` that makes its directory with the setgid bit the
-reader itself may not set. The reader reads and zeroes the set and the counters
+socket family but netlink. Its directory, `2750` and setgid, the reader's user's and the
+authorizer's group's, comes from the image's tmpfiles.d entry
+(`/usr/lib/tmpfiles.d/mediatore-gateway.conf`), made at boot before any unit starts: the unit
+names it in `ReadWritePaths=`, and systemd sets the unit's mount namespace up before any setup
+step, so a directory the unit made itself would not exist in time (the reader of v0.5.0-rc.1
+failed every run that way, `226/NAMESPACE`). The unit has no step that runs as root. The reader reads and zeroes the set and the counters
 (`nft -j -n reset`) and writes `summary.json` into its own directory. The authorizer
 (`mediatore gateway --probes-dir`, that directory by default) opens it without following a link
 and without waiting on a FIFO, takes only a regular file of at most 64 KiB, never writes it, and
@@ -327,7 +336,9 @@ and `pool_output` (with the set `output_ports` by port, 1024 elements), each on 
 front of its chain's last drop. The guest reads them every 60 s and reports what moved as
 `segment` events on `POST /v1/me/trip`, which a registered node may send with no claim. The
 broker writes each as one audit line with no claim, never on the node's claim even when it has
-one, since a source address on the segment can be forged. A pool
+one, since a source address on the segment can be forged. This holds under `policy.traps: off` too
+since the amendment of 2026-11-27: the route takes a report of `segment` events alone in every
+mode and answers `501` under `off` to anything else. A pool
 with no gateways loads no host table, and the reader then has nothing to read.
 
 Limits: TCP only for `gateway_port` and the pool's classes; a full set still counts but names
@@ -481,7 +492,7 @@ Built and `off` or `report` by default: everything above but the items below.
 | What | How |
 | --- | --- |
 | The draw, the matcher, containment against a fake `nft`, the proxy's refusals, the route, the record, the summary, every class, the canary scans | hermetic: unit and e2e tests in `make check` |
-| Every drawn port trips from a real jail, through the redirect to the trap listener; nothing open under `off`; after a trip nothing of the uid leaves and no jail process remains; containment with the broker unreachable; bait files and `env` trip nothing; a closed port Landlock refuses trips nothing; the jail cannot read its connect ports, and lists no decoy port in any table it can read (the one listener it sees is the trap listener, which Landlock refuses it); the metadata redirect | live on the build host: nine tests of `crates/mediatore/tests/jail_exec_live.rs` in a throwaway namespace, a debug build ([testing](testing.md#tripwires-by-hand-on-the-build-host)) |
+| Every drawn port trips from a real jail, through the redirect to the trap listener; nothing open under `off`; after a trip nothing of the uid leaves and no jail process remains; containment with the broker unreachable; bait files and `env` trip nothing; a closed port Landlock refuses trips nothing; the jail cannot read its connect ports, and lists no decoy port in any table it can read (the listeners it sees are the trap listener, which Landlock refuses it, and the proxy's); the metadata redirect | live on the build host: nine tests of `crates/mediatore/tests/jail_exec_live.rs` in a throwaway namespace, a debug build ([testing](testing.md#tripwires-by-hand-on-the-build-host)) |
 | The host tables' counters move per class and not for honest traffic; the reader holds `CAP_NET_ADMIN` alone | live on the build host's kernel, in fresh network namespaces; the image checks |
 | `status.tripwires` in both served versions and a `tripped` record failing its sandbox | kind: `make kind-e2e-sandbox` (the status written by hand, as the broker writes it) |
 
@@ -498,9 +509,10 @@ on the homelab; the matcher's latency and memory.
   traps have a limit of the same kind: such a workload can tell which ports are admitted to it
   without touching a listener, and so which to leave alone. A follow-up ADR adds chaff ports,
   admitted with nothing listening, any use of which trips.
-- **The jail can tell that traps are armed.** It cannot list the decoy ports, but it sees one
-  loopback listener on a random port in its own `/proc/self/net/tcp`, the trap listener, which
-  exists only when traps are armed.
+- **The jail can tell that traps are armed.** It cannot list the decoy ports, but it sees in its
+  own `/proc/self/net/tcp` a loopback listener on a random port, the trap listener, which exists
+  only when traps are armed (beside the proxy's pull listener, default port 18129, when the image
+  is pulled through the proxy, which is no trap).
 - **A body already streaming** when the guest decides a decoy-port or `denied` trip keeps
   flowing until the cut lands, about 50 ms; a body the proxy itself matched never forwards the
   bait.

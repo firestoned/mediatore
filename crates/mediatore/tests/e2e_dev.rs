@@ -712,6 +712,7 @@ async fn a_workloads_output_is_shipped_by_its_node_and_read_by_its_owner_alone()
         code: Some(0),
         signal: None,
         restarts: 0,
+        reason: None,
     };
     let resp = h
         .http
@@ -1041,6 +1042,7 @@ async fn follow_streams_output_as_it_arrives_and_ends_with_the_claim() {
             code: Some(0),
             signal: None,
             restarts: 0,
+            reason: None,
         })
         .send()
         .await
@@ -1113,6 +1115,7 @@ async fn a_one_shot_workload_ends_its_claim_at_the_broker() {
         code: Some(0),
         signal: None,
         restarts: 0,
+        reason: None,
     };
     // Not the node: refused, nothing ends.
     let resp = h
@@ -2698,6 +2701,75 @@ impl Harness {
 }
 
 #[tokio::test]
+async fn a_claim_whose_image_could_not_be_pulled_ends_with_the_reason_its_owner_reads() {
+    // ADR-0076 decision 4: the guest ends the claim on the exit route with a reason; the claim
+    // is released and the owner reads why on the claim, with no workload code.
+    let h = Harness::start_traps(TrapsMode::Off, DeniedSwitches::default()).await;
+    h.register_node().await;
+    let user = h.login("octocat");
+    let (status, claim) = h.create_claim(&user).await;
+    assert_eq!(status, 201);
+    let uid = claim.uid.expect("uid");
+    let exit = mediatore_proto::GuestExit {
+        code: None,
+        signal: None,
+        restarts: 0,
+        reason: Some(mediatore_proto::ExitReason::PullFailed {
+            attempts: 3,
+            error: mediatore_proto::PullError::Unreachable,
+        }),
+    };
+    let resp = h
+        .http
+        .post(format!("{}/v1/me/exit", h.sandbox_url))
+        .header(PEER_HEADER, node_svid())
+        .json(&exit)
+        .send()
+        .await
+        .expect("exit as the node");
+    assert_eq!(resp.status(), 204);
+    let ended = h.claim_named(&user, &claim.name).await;
+    assert_ne!(ended.phase, mediatore_proto::ClaimPhase::Bound, "released");
+    assert_eq!(ended.exit.expect("the exit is on the record").exit, exit);
+    let resp = h.token_for(&claim_svid(&uid), AUDIENCE).await;
+    assert_eq!(resp.status(), 403, "no token for a released claim");
+}
+
+#[tokio::test]
+async fn the_pools_segment_events_are_taken_under_off_and_any_trap_event_is_still_501() {
+    // ADR-0070 decision 8, amended 2026-11-27: with tripwires on the VM off (the default), the
+    // pool VM's host table still drops, and its segment reader's report is recorded; a report
+    // with any ADR-0069 event in it is refused as before, and the claim is never touched.
+    let h = Harness::start_traps(TrapsMode::Off, DeniedSwitches::default()).await;
+    h.register_node().await;
+    let user = h.login("octocat");
+    let (status, claim) = h.create_claim(&user).await;
+    assert_eq!(status, 201);
+    let segment = trip_event(
+        uuid::Uuid::new_v4(),
+        &serde_json::json!({ "kind": "segment", "class": "pool_inbound", "target": { "port": 22 }, "source": "peer", "source_address": "192.0.2.7", "count": 1 }),
+    );
+    let resp = h
+        .trip(&node_svid(), "shadow", std::slice::from_ref(&segment))
+        .await;
+    assert_eq!(resp.status(), 204, "the segment report is taken");
+    let resp = h
+        .trip(
+            &node_svid(),
+            "shadow",
+            &[segment, port_trip(uuid::Uuid::new_v4())],
+        )
+        .await;
+    assert_eq!(resp.status(), 501, "a trap event under off");
+    let held = h.claim_named(&user, &claim.name).await;
+    assert_eq!(held.phase, mediatore_proto::ClaimPhase::Bound);
+    assert!(
+        held.tripped.is_none() && held.tripwires.is_none(),
+        "nothing on the claim"
+    );
+}
+
+#[tokio::test]
 async fn a_trip_ends_the_claim_and_the_owner_sees_it() {
     let h = Harness::start_traps(TrapsMode::Enforce, DeniedSwitches::default()).await;
     h.register_node().await;
@@ -2777,6 +2849,7 @@ async fn a_trip_ends_the_claim_and_the_owner_sees_it() {
             code: Some(137),
             signal: None,
             restarts: 0,
+            reason: None,
         })
         .send()
         .await

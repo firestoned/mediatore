@@ -139,7 +139,7 @@ Suites today:
 
 | Target | ADR | Suite |
 | --- | --- | --- |
-| `make kind-e2e-entries` | 0006 | the live entries round trip above |
+| `make kind-e2e-entries` | 0006, 0075 | the live entries round trip above; then `dev/kind/clusterspiffeid-admission.sh`, server-side dry runs as an administrator against the `ClusterSPIFFEID` policy (ADR-0075): the chart's `ns/sa` template and the base's broker object admitted, the reserved paths, a template over a pod annotation, a templated first segment, `/mediatore` for another namespace and `/mediatore/x` refused, an excluded fixture name admitted |
 | `make kind-e2e-mtls` | 0007 | the broker image on the CSI socket, agent-issued client SVIDs over SPIFFE mTLS, below |
 | `make kind-e2e-watcher` | 0011 | the watcher Lease, a member's certificate becoming a node entry, a claim without a record binding nothing, below |
 | `make kind-e2e-sandbox` | 0008, 0034, 0069, 0072 | the `AgentSandbox` CRD and its subject policy (with `issuerPrefixes` set: an unlisted issuer and an unsound list refused; the broker's `mediatore.io/front-door` mark refused to anybody else and immutable; a listed broker's sandbox at an undeclared issuer `Failed` by the reconciler), a sandbox becoming an owned claim and a record on its own status, the claim bound end to end to a claim entry and the guest fetching the subject, a broker restart on the Kubernetes store with the sandbox staying `Ready`, deletion through the finalizer, the released sandbox held and then swept at resync; since ADR-0069 `status.tripwires` in both served versions and a tripped record failing its sandbox with `Tripped=True`, never claimed again, below |
@@ -364,7 +364,7 @@ and that `nft list tables` on the host is unchanged.
 | `reading_the_bait_files_and_running_env_trips_nothing` | discovery is not use; no bait value in the redacted output; a file the workload wrote in its home persists |
 | `a_closed_loopback_port_is_refused_by_landlock_and_trips_nothing` | a port Landlock does not admit fails in the syscall, so no `loopback_port` event, even with the class at `trip` |
 | `the_jail_cannot_read_its_connect_ports_or_list_the_listeners` | the jail sees no command line with the `--connect-port` list, no `/proc/net` and no `ss` listing |
-| `the_jail_cannot_list_the_decoys_through_its_own_proc_net` | no decoy port in any per-process table the jail can read (`/proc/self/net/tcp`, `/proc/1/net/tcp`, `/proc/thread-self/net/tcp` and their `tcp6`); the one listener listed is the trap listener, which Landlock refuses the jail; a direct connection to it is refused to the sandbox uid and to root; nothing is reported |
+| `the_jail_cannot_list_the_decoys_through_its_own_proc_net` | no decoy port in any per-process table the jail can read (`/proc/self/net/tcp`, `/proc/1/net/tcp`, `/proc/thread-self/net/tcp` and their `tcp6`); the listeners listed are the trap listener and, when the image is pulled through the proxy, the proxy's pull listener, both of which Landlock refuses the jail; a direct connection to it is refused to the sandbox uid and to root; nothing is reported |
 | `the_metadata_address_trips_from_the_jail_where_it_is_routed` | the `nat` redirect carries the jail's connect to the trap listener, which trips as `metadata` |
 
 The run of 2026-11-27 on the merged tree (kernel 6.12, nftables 1.1.3, a debug build): 9 passed; `containment_ms=54`,

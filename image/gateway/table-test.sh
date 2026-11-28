@@ -104,6 +104,15 @@ while IFS= read -r line; do
 done <<< "$added"
 echo "✓ the table carries the probe set, the eleven named counters and the one probe rule, each once"
 
+# 2026-11-28, after ADR-0070: one accept, both Envoys to resolved's stub on loopback port 53 (image/gateway/resolve), the first
+# line of output_listener, ahead of its loopback drop; the table otherwise as above. Pinned here, then taken away with the rest.
+stub='    oif "lo" ip daddr 127.0.0.53 meta l4proto { tcp, udp } th dport 53 accept'
+[ "$(printf '%s\n' "$got" | grep -cxF -- "$stub")" = 1 ] \
+  && printf '%s\n' "$got" | grep -A1 -xF '  chain output_listener {' | tail -1 | grep -qxF -- "$stub" \
+  || { echo "✗ the stub rule is not once, the first line of output_listener: $stub"; exit 1; }
+echo "✓ both Envoys reach resolved's stub, loopback port 53, ahead of output_listener's loopback drop, and no other loopback address"
+got=$(printf '%s\n' "$got" | grep -vxF -- "$stub")
+
 # Take them away: drop the added lines, and turn each named counter on a dropping rule back
 # into the anonymous one it replaced.
 without=$(printf '%s\n' "$got" | grep -vxF -f <(printf '%s\n' "$added") \
@@ -156,12 +165,17 @@ for l in 'Type=oneshot' 'User=mediatore-probes' 'Group=mediatore-probes' 'Capabi
   'ProtectKernelTunables=yes' 'ProtectKernelModules=yes' 'ProtectKernelLogs=yes' 'ProtectControlGroups=yes' 'ProtectClock=yes' \
   'ProtectHostname=yes' 'RestrictNamespaces=yes' 'RestrictRealtime=yes' 'RestrictSUIDSGID=yes' 'LockPersonality=yes' \
   'MemoryDenyWriteExecute=yes' 'SystemCallArchitectures=native' 'ReadOnlyPaths=/run' 'ReadWritePaths=/run/mediatore-gateway/probes' \
-  'ExecStartPre=+/usr/bin/install -d -m 2750 -o mediatore-probes -g mediatore-gateway /run/mediatore-gateway/probes' \
   'ExecStart=/usr/bin/mediatore gateway-probes --dir /run/mediatore-gateway/probes' \
   'Requisite=mediatore-gateway-nft.service' 'After=mediatore-gateway-nft.service'; do has "$u" "$l"; done
 for k in CapabilityBoundingSet AmbientCapabilities RestrictAddressFamilies IPAddressDeny ExecStart User Group ReadOnlyPaths ReadWritePaths; do
   [ "$(grep -c "^$k=" "$u")" = 1 ] || { echo "✗ the reader's unit sets $k more than once (a second line would add to the first)"; exit 1; }
 done
+# Its directory comes from tmpfiles.d at boot, never from a step of its own: systemd sets the mount namespace up before any
+# ExecStartPre, and a ReadWritePaths= on a directory not yet made failed every run with 226/NAMESPACE (2026-11-27).
+has "$here/tmpfiles.d/mediatore-gateway.conf" 'd /run/mediatore-gateway/probes 2750 mediatore-probes mediatore-gateway -'
+grep -q '^ExecStartPre=' "$u" && { echo "✗ the reader's unit has an ExecStartPre: its directory is the tmpfiles.d entry's"; exit 1; } || true
+grep -q '^COPY image/gateway/tmpfiles.d/mediatore-gateway.conf /usr/lib/tmpfiles.d/mediatore-gateway.conf$' "$here/Dockerfile" \
+  || { echo "✗ the image does not install the tmpfiles.d entry"; exit 1; }
 grep -Eq '^(IPAddressAllow|PrivateNetwork|Restart|WantedBy|SupplementaryGroups)=' "$u" && { echo "✗ the reader's unit opens an address, restarts, is wanted by a target or takes another group"; exit 1; } || true
 grep -q 'useradd .* mediatore-probes$' "$here/Dockerfile" || { echo "✗ the image does not create the reader's user"; exit 1; }
 # Every hardening line of the authorizer's unit is in the reader's too, but for the three that differ on purpose.
@@ -172,6 +186,6 @@ has "$a" 'CapabilityBoundingSet='; has "$a" 'AmbientCapabilities='; has "$a" 'Us
 has "$t" 'OnUnitActiveSec=30s'; has "$t" 'Unit=mediatore-gateway-probes.service'; has "$t" 'WantedBy=timers.target'
 grep -q 'mediatore-gateway-probes.service' "$here/Dockerfile" && grep -q '^ *mediatore-gateway-probes.timer \\$' "$here/Dockerfile" \
   || { echo "✗ the image does not install the reader's unit or enable its timer"; exit 1; }
-echo "✓ the reader's unit: its own user with CAP_NET_ADMIN alone, netlink alone, no address, the authorizer's hardening, /run read-only but for one directory; the authorizer still holds no capability"
+echo "✓ the reader's unit: its own user with CAP_NET_ADMIN alone, netlink alone, no address, the authorizer's hardening, /run read-only but for one directory made by tmpfiles.d; the authorizer still holds no capability"
 
 echo "gateway table-test: ok"

@@ -2493,7 +2493,8 @@ fn node_report_allowed(st: &AppState, claim_uid: Uuid) -> Result<(), ApiError> {
 }
 
 /// `POST /v1/me/exit` (ADR-0033 decision 2): the guest, over the node SVID, says the
-/// workload exited and its restart policy ends the claim. The exit goes on the record (and
+/// workload exited and its restart policy ends the claim, or, with a `reason` (ADR-0076), that
+/// the claim's image could not be pulled and no workload ran. The exit goes on the record (and
 /// the audit line with it), and the claim is released as `DELETE /v1/claims/{name}` releases
 /// it: through the `AgentSandbox` with a cluster, directly in `dev_mode`. A node with no
 /// live claim (the guest late, the claim already released) is `204` all the same.
@@ -2518,15 +2519,28 @@ async fn exit(
         }
         Err(e) => return Err(e),
     };
-    tracing::info!(
-        claim_uid = %rec.uid,
-        subject = %rec.subject.id,
-        code = ?body.code,
-        signal = ?body.signal,
-        restarts = body.restarts,
-        restart = %rec.workload.restart,
-        "workload exited and its restart policy ends the claim (ADR-0033)"
-    );
+    match body.reason {
+        // The guest ended the claim before any workload ran (ADR-0076): the reason is a closed
+        // set, so the line carries the kind of the failure and nothing the registry said.
+        Some(mediatore_proto::ExitReason::PullFailed { attempts, error }) => tracing::warn!(
+            claim_uid = %rec.uid,
+            subject = %rec.subject.id,
+            reason = "pull_failed",
+            attempts,
+            error = error.as_str(),
+            image = %rec.workload.image,
+            "the claim's image could not be pulled and the guest ends the claim (ADR-0076)"
+        ),
+        None => tracing::info!(
+            claim_uid = %rec.uid,
+            subject = %rec.subject.id,
+            code = ?body.code,
+            signal = ?body.signal,
+            restarts = body.restarts,
+            restart = %rec.workload.restart,
+            "workload exited and its restart policy ends the claim (ADR-0033)"
+        ),
+    }
     let exited = WorkloadExit {
         exited_at: Timestamp::now(),
         exit: body,

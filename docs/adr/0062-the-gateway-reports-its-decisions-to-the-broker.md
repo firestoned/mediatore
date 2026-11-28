@@ -76,6 +76,27 @@ deployment without the collector has no answer, and the claim's owner never has 
    by anything but what it says. That is enough for the readers above, and it is why the name
    decides nothing.
 
+   *Amended 2026-11-27: the default is no longer the host name first. Nothing in the gateway image
+   set a name, Kairos boots every VM as `kairos`, and the unit's `ProtectHostname=yes` freezes
+   whatever the host name was at start, so every gateway of v0.5.0-rc.1 reported as `kairos` and
+   the broker's log could not tell them apart. All gateways of a deployment share one
+   cloud-config, so a per-deployment value cannot fix it. The name is now the first of:
+   `--name` (`MEDIATORE_GATEWAY_NAME`, which `vm.env`, the per-VM `userData`, may set), used as
+   given and refused at start if the broker would refuse it; the VM's SMBIOS system UUID,
+   lowercase and hyphenated, which the hypervisor sets per VM (the libvirt domain UUID; the
+   machine's `metadata.uid` on Cloud Hypervisor since banlieue v0.6.1), a nil or all-ones UUID
+   counting as none; the host name, lowercased, every character outside `a-z`, `0-9`, `-` and
+   `.` made a `-`, cut to 63 and never ending in `-` or `.`, with a `warn` at start when it is a
+   distribution's default (`kairos`, `localhost`). The kernel shows the UUID to root alone; the
+   authorizer stays unprivileged, and its unit copies the UUID at every start, as root and
+   allowed to fail, into `/run/mediatore-gateway/machine-uuid`, `0640`, root's and the
+   authorizer's group's, which the authorizer reads by default (`--machine-uuid-file`). The
+   UUID was preferred over the host name a provider could set (a Kairos guest reads no
+   `local-hostname` from the seed) and over `/etc/machine-id` (which systemd asks be kept
+   confidential, and which an operator cannot look up from the cluster). The name stays
+   attribution, not authentication: anything holding the authorizer identity can still report
+   under any name. `derive_gateway_name`, `crates/mediatore-gateway/src/report.rs`.*
+
 4. **Reporting is never on the decision's path.** A decision is handed to a bounded queue (1024)
    without waiting; a full queue drops the decision and counts it, and the count is logged with
    the next batch that goes. A batch goes every two seconds, or at 256 decisions, in one attempt

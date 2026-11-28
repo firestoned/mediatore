@@ -19,7 +19,9 @@ The split is [ADR-0067](../adr/0067-the-vm-images-are-overlays-on-a-replaceable-
 quay.io/kairos/debian:13-core-...@sha256:...      Kairos + Debian 13 (pinned by digest)
   └── mediatore-vm-base                            image/base/Dockerfile
         tpm2-tools, qemu-guest-agent, nftables;
-        openssh, snmpd, lldpd, fail2ban, rpcbind, nfs-common purged; ssh masked
+        openssh, snmpd, lldpd, fail2ban, rpcbind, nfs-common purged; ssh masked;
+        resolved: the link's resolver alone (no global, fallback, LLMNR or mDNS),
+        /etc/resolv.conf naming its stub until Kairos links it at boot
         ├── mediatore-guest                         image/Dockerfile (overlay)
         │     /usr/bin/mediatore   <- COPY --from the mediatore image
         │     spire-agent, TPM plugin <- COPY --from their images
@@ -33,7 +35,22 @@ quay.io/kairos/debian:13-core-...@sha256:...      Kairos + Debian 13 (pinned by 
 The base is the operating system and nothing of mediatore's. The overlays start
 `ARG VM_BASE` / `FROM ${VM_BASE}` and only add mediatore's pieces. Their first step checks
 the base has what they rely on (`systemctl`, `useradd`, `nft`, `tpm2_nvread`, `qemu-ga`, the
-`tss` group, no `sshd`, and `apt-get` for the sandbox overlay) and fails the build if not.
+`tss` group, the resolver drop-in, no `sshd`, and `apt-get` for the sandbox overlay) and fails
+the build if not.
+
+**The resolver.** The Kairos base ships `/etc/resolv.conf` as a plain file naming two public
+resolvers, and systemd-resolved imports a file like that as global servers, used for every name
+beside the link's. A gateway sent private names to them after its host rebooted (2026-11-28).
+The VM base fixes it in two files: `image/base/resolved/60-mediatore.conf`, installed as
+`/usr/lib/systemd/resolved.conf.d/60-mediatore.conf` (`DNS=` and `FallbackDNS=` empty,
+`LLMNR=no`, `MulticastDNS=no`, the stub on `127.0.0.53`), and `image/base/resolv.conf` as
+`/etc/resolv.conf`, naming the stub alone until Kairos replaces it at boot with a link to
+resolved's own file. Both overlays refuse a base without the drop-in, and both image checks read
+the two files. On the pool this matters to the `Direct` shape (a pool without gateways): the
+guest puts the `nameserver` lines of `/etc/resolv.conf` in the sandbox user's DNS set and the
+egress proxy resolves through them, so they are now the link's resolver, or the stub, and never
+a public one. A pool with gateways resolves nothing (its segment has no resolver). Your own base
+must carry the same drop-in.
 
 ## What the images carry for tripwires
 
@@ -44,10 +61,14 @@ and no honest machine sends; nothing new is accepted in either image.
   `mediatore-gateway-probes.timer` (`OnBootSec=30s`, `OnUnitActiveSec=30s`, enabled) starts
   `mediatore-gateway-probes.service`, a oneshot running `mediatore gateway-probes --dir /run/mediatore-gateway/probes`
   with `CAP_NET_ADMIN` as its whole bounding and ambient set, no address family but `AF_NETLINK`, every address denied,
-  and one writable directory. Its `ExecStartPre` makes that directory `2750`, owned by `mediatore-probes` and group
-  `mediatore-gateway`, so the authorizer reads the summary and cannot change it. The table
+  and one writable directory. The image's tmpfiles.d entry (`/usr/lib/tmpfiles.d/mediatore-gateway.conf`) makes that
+  directory at boot, before any unit starts, `2750`, owned by `mediatore-probes` and group `mediatore-gateway`, so the
+  authorizer reads the summary and cannot change it. (In v0.5.0-rc.1 the unit's own `ExecStartPre=+` made it, too late:
+  systemd sets a unit's mount namespace up first, and every run failed with `226/NAMESPACE`.) The same entry makes
+  `/run/mediatore-gateway` and `/run/spire/sockets`, which other units name in their mount options. The table
   (`image/gateway/nftables.conf.in`) gains the set `probe_sources` and eleven named counters (`gateway_port`,
-  `gateway_output_*`). `make gateway-image-check` pins the unit's lines and the user;
+  `gateway_output_*`). `make gateway-image-check` pins the unit's lines and the user, runs the tmpfiles.d entry in the
+  built image, and checks that every path a unit names bare in its mount options exists before it starts;
   `make gateway-render-check` runs `image/gateway/table-test.sh`, which requires every verdict of the table unchanged.
 - **The sandbox image** gains no unit: the guest, already root and already driving `nft`, reads the pool's host table
   every 60 s. The table (`image/host-table`, on a pool with gateways) gains the counters `pool_inbound` and `pool_output`

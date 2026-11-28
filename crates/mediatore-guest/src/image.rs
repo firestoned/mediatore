@@ -15,7 +15,7 @@ use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use mediatore_proto::image::{ImageReference, is_sha256_digest as is_digest};
-use mediatore_proto::{RegistryCredential, Secret};
+use mediatore_proto::{PullError, RegistryCredential, Secret};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
@@ -125,6 +125,74 @@ pub struct Pulled {
     pub layers: usize,
     /// Bytes fetched for the layers.
     pub bytes: u64,
+}
+
+/// A registry, or the claim's proxy in front of it, answered a request of the pull with a status
+/// that is not success: the status, and what kind of failure it is (ADR-0076 decision 2).
+#[derive(Debug, thiserror::Error)]
+#[error("{what} refused: {status}")]
+pub struct Answered {
+    what: String,
+    status: reqwest::StatusCode,
+    kind: PullError,
+}
+
+/// The whole pull did not finish within its deadline (ADR-0063 decision 9).
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct DeadlinePassed(pub(crate) String);
+
+/// The codes the claim's egress proxy answers a pull request with when no gateway carried it
+/// (`egress::refuse`, a `502` with `{"error": code}`), and what kind of failure each is. Any
+/// other code, or a body that is not the proxy's, is read by its status alone.
+const PROXY_CODES: [(&str, PullError); 4] = [
+    ("gateway_refused", PullError::Refused),
+    ("gateway_unreachable", PullError::Unreachable),
+    ("upstream_unreachable", PullError::Unreachable),
+    ("inject_unavailable", PullError::Unreachable),
+];
+
+/// What kind of failure a status is, with the proxy's code when the pull went through it.
+fn kind_of_status(status: reqwest::StatusCode, proxy_code: Option<&str>) -> PullError {
+    if let Some(kind) = proxy_code.and_then(|c| {
+        PROXY_CODES
+            .iter()
+            .find(|(code, _)| *code == c)
+            .map(|(_, k)| *k)
+    }) {
+        return kind;
+    }
+    match status.as_u16() {
+        404 => PullError::NotFound,
+        429 | 500..=599 => PullError::Unavailable,
+        _ => PullError::Refused,
+    }
+}
+
+/// What kind of failure a failed pull is (ADR-0076 decision 2), from the error's chain: a status
+/// the registry or the proxy answered, a bound that passed, a transport that failed, the guest's
+/// own file system; anything else is what the registry served not being usable.
+#[must_use]
+pub fn kind_of(e: &anyhow::Error) -> PullError {
+    for cause in e.chain() {
+        if let Some(a) = cause.downcast_ref::<Answered>() {
+            return a.kind;
+        }
+        if cause.downcast_ref::<DeadlinePassed>().is_some() {
+            return PullError::Timeout;
+        }
+        if let Some(r) = cause.downcast_ref::<reqwest::Error>() {
+            return if r.is_timeout() {
+                PullError::Timeout
+            } else {
+                PullError::Unreachable
+            };
+        }
+        if cause.downcast_ref::<std::io::Error>().is_some() {
+            return PullError::Failed;
+        }
+    }
+    PullError::Invalid
 }
 
 /// How long a pull may take (ADR-0063 decision 9): a connection that does not open, a read that brings nothing, or a
@@ -330,10 +398,14 @@ impl Puller {
                 !resp.status().is_redirection(),
                 "{url}: the registry redirected the request; a redirect would leave the gateway, refused (ADR-0043)"
             );
-            anyhow::ensure!(
-                resp.status() != reqwest::StatusCode::UNAUTHORIZED,
-                "{url}: the registry refused the credential the gateway placed (401)"
-            );
+            if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+                return Err(Answered {
+                    what: format!("{url}: the credential the gateway placed"),
+                    status: resp.status(),
+                    kind: PullError::Refused,
+                }
+                .into());
+            }
             return Ok(resp);
         }
         let registry = reqwest::Url::parse(url)?;
@@ -450,6 +522,35 @@ impl Puller {
             .ok_or_else(|| anyhow::anyhow!("token endpoint {} returned no token", c.realm))
     }
 
+    /// A response that is not success, as an [`Answered`]. Through the claim's proxy a `502`
+    /// carries the proxy's code in a small JSON body, read here (at most 1 KiB) to tell a gateway
+    /// that refused from none that answered; a registry's own body is never read.
+    async fn answered(&self, resp: reqwest::Response, what: String) -> Answered {
+        let status = resp.status();
+        let through_proxy = self
+            .placed
+            .as_ref()
+            .is_some_and(|p| resp.url().as_str().starts_with(&format!("{}/", p.base)));
+        let mut code = None;
+        if through_proxy && status == reqwest::StatusCode::BAD_GATEWAY {
+            #[derive(Deserialize)]
+            struct Refusal {
+                error: String,
+            }
+            if let Ok(Ok(body)) = tokio::time::timeout(self.bounds.idle, resp.bytes()).await
+                && body.len() <= 1024
+                && let Ok(r) = serde_json::from_slice::<Refusal>(&body)
+            {
+                code = Some(r.error);
+            }
+        }
+        Answered {
+            kind: kind_of_status(status, code.as_deref()),
+            what,
+            status,
+        }
+    }
+
     async fn manifest(
         &self,
         session: &mut Session,
@@ -458,11 +559,12 @@ impl Puller {
     ) -> anyhow::Result<(String, Manifest)> {
         let url = format!("{}/manifests/{by}", self.base(reference));
         let resp = self.get(session, &url, Some(ACCEPT)).await?;
-        anyhow::ensure!(
-            resp.status().is_success(),
-            "{reference}: manifest {by} refused: {}",
-            resp.status()
-        );
+        if !resp.status().is_success() {
+            return Err(self
+                .answered(resp, format!("{reference}: manifest {by}"))
+                .await
+                .into());
+        }
         let content_type = resp
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
@@ -509,23 +611,25 @@ impl Puller {
         )
         .await
         .map_err(|_| {
-            anyhow::anyhow!(
+            DeadlinePassed(format!(
                 "{reference}: the pull from {} did not finish within {} s (MEDIATORE_PULL_DEADLINE_SECS); refused (ADR-0063 decision 9)",
                 reference.registry,
                 deadline.as_secs_f64()
-            )
+            ))
         })?;
         pulled.map_err(|e| {
             if e.chain().any(|c| {
                 c.downcast_ref::<reqwest::Error>()
                     .is_some_and(reqwest::Error::is_timeout)
             }) {
-                anyhow::anyhow!(
+                // The cause stays in the chain, so that [`kind_of`] reads it.
+                let message = format!(
                     "{reference}: {} sent nothing for {} s (MEDIATORE_PULL_IDLE_SECS) or could not be reached within {} s; refused (ADR-0063 decision 9): {e}",
                     reference.registry,
                     self.bounds.idle.as_secs_f64(),
                     self.bounds.connect.as_secs_f64()
-                )
+                );
+                e.context(message)
             } else {
                 e
             }
@@ -645,12 +749,12 @@ impl Puller {
     ) -> anyhow::Result<u64> {
         let url = format!("{}/blobs/{}", self.base(reference), d.digest);
         let mut resp = self.get(session, &url, None).await?;
-        anyhow::ensure!(
-            resp.status().is_success(),
-            "{reference}: blob {} refused: {}",
-            d.digest,
-            resp.status()
-        );
+        if !resp.status().is_success() {
+            return Err(self
+                .answered(resp, format!("{reference}: blob {}", d.digest))
+                .await
+                .into());
+        }
         // Buffered: a network chunk is a few kibibytes, and each write to the file is a hop to the blocking pool.
         // The flush below empties the buffer into the file before the size and the digest are judged; on an
         // error the buffer is dropped with what it holds, and the file is removed.
@@ -1187,6 +1291,117 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(got.digest, want);
+    }
+
+    /// The error of a pull of `reference` with `puller`, into fresh directories.
+    async fn failed(puller: &Puller, reference: &ImageReference) -> anyhow::Error {
+        let s = scratch();
+        puller
+            .pull(reference, None, &s.rootfs, &s.scratch)
+            .await
+            .unwrap_err()
+    }
+
+    #[tokio::test]
+    async fn each_failed_pull_says_what_kind_of_failure_it_is() {
+        // ADR-0076 decision 2: the kind, not the text, is what the owner and the record get.
+        let reg = FakeRegistry::start().await;
+        reg.push("team/tool", "v1", &tiny());
+        let p = puller(&reg);
+        // No such tag.
+        let e = failed(&p, &reference(&reg, "team/tool:v2")).await;
+        assert_eq!(kind_of(&e), PullError::NotFound, "{e:#}");
+        assert!(
+            e.to_string().contains("refused: 404"),
+            "the text reads as before: {e}"
+        );
+        // Nothing listening.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = closed.local_addr().unwrap().to_string();
+        drop(closed);
+        let e = failed(
+            &Puller::new(std::slice::from_ref(&addr)).unwrap(),
+            &r(&format!("{addr}/team/tool:v1")),
+        )
+        .await;
+        assert_eq!(kind_of(&e), PullError::Unreachable, "{e:#}");
+        // The idle bound and the deadline.
+        let stalled = FakeRegistry::start().await;
+        stalled.push("team/tool", "v1", &tiny());
+        stalled.stall_blobs_after(8);
+        let e = failed(
+            &puller(&stalled).with_bounds(short(300, 30_000)).unwrap(),
+            &reference(&stalled, "team/tool:v1"),
+        )
+        .await;
+        assert_eq!(kind_of(&e), PullError::Timeout, "{e:#}");
+        assert!(e.to_string().contains("MEDIATORE_PULL_IDLE_SECS"));
+        let trickle = FakeRegistry::start().await;
+        trickle.push("team/tool", "v1", &tiny());
+        trickle.trickle_blobs(std::time::Duration::from_millis(20));
+        let e = failed(
+            &puller(&trickle).with_bounds(short(2_000, 400)).unwrap(),
+            &reference(&trickle, "team/tool:v1"),
+        )
+        .await;
+        assert_eq!(kind_of(&e), PullError::Timeout, "{e:#}");
+        // Bytes that are not what the digest says.
+        let tampered = FakeRegistry::start().await;
+        let img = tiny();
+        tampered.push("team/tool", "v1", &img);
+        tampered.tamper(&img.layers[0].digest());
+        let e = failed(&puller(&tampered), &reference(&tampered, "team/tool:v1")).await;
+        assert_eq!(kind_of(&e), PullError::Invalid, "{e:#}");
+        // The gateway's credential refused by the registry, through the proxy.
+        let proxy = FakeRegistry::start_under("registry.home.example").await;
+        proxy.push("team/tool", "v1", &tiny());
+        proxy.require_token(true);
+        let e = failed(
+            &placed_puller(&proxy),
+            &r("registry.home.example/team/tool:v1"),
+        )
+        .await;
+        assert_eq!(kind_of(&e), PullError::Refused, "{e:#}");
+    }
+
+    #[test]
+    fn a_status_is_a_kind_and_the_proxys_code_decides_its_502() {
+        use reqwest::StatusCode as S;
+        for (status, code, kind) in [
+            (S::NOT_FOUND, None, PullError::NotFound),
+            (S::UNAUTHORIZED, None, PullError::Refused),
+            (S::FORBIDDEN, None, PullError::Refused),
+            (S::TOO_MANY_REQUESTS, None, PullError::Unavailable),
+            (S::SERVICE_UNAVAILABLE, None, PullError::Unavailable),
+            (S::BAD_GATEWAY, None, PullError::Unavailable),
+            (S::BAD_GATEWAY, Some("gateway_refused"), PullError::Refused),
+            (
+                S::BAD_GATEWAY,
+                Some("gateway_unreachable"),
+                PullError::Unreachable,
+            ),
+            (
+                S::BAD_GATEWAY,
+                Some("upstream_unreachable"),
+                PullError::Unreachable,
+            ),
+            (
+                S::BAD_GATEWAY,
+                Some("inject_unavailable"),
+                PullError::Unreachable,
+            ),
+            (
+                S::BAD_GATEWAY,
+                Some("anything else"),
+                PullError::Unavailable,
+            ),
+        ] {
+            assert_eq!(kind_of_status(status, code), kind, "{status} {code:?}");
+        }
+        // An error with no status, bound or transport in it: what was served is not usable.
+        assert_eq!(kind_of(&anyhow::anyhow!("no layers")), PullError::Invalid);
+        let io = anyhow::Error::from(std::io::Error::other("no space left"));
+        assert_eq!(kind_of(&io.context("writing the layer")), PullError::Failed);
     }
 
     #[tokio::test]

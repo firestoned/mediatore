@@ -19,5 +19,6 @@ resources:
   - clusterspiffeid.yaml
   - admission/clusterstaticentry-mediatore.yaml
   - admission/clusterstaticentry-gateway.yaml
+  - admission/clusterspiffeid.yaml
   - admission/agentsandbox-subject.yaml
   - admission/agentsandbox-status.yaml

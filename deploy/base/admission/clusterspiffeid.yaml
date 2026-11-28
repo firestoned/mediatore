@@ -1,0 +1,137 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+#
+# What a ClusterSPIFFEID may render (ADR-0075). The broker trusts SPIFFE IDs by their
+# path: /banlieue/claim/<uuid> is a claim, /banlieue/node/<key> a pool member,
+# /gateway and /gateway/authorizer the egress gateways, /mediatore the broker itself.
+# The first four are declared as ClusterStaticEntry under their own policies
+# (clusterstaticentry-mediatore.yaml, clusterstaticentry-gateway.yaml). A ClusterSPIFFEID
+# is the controller manager's other way to make an entry, a template rendered per pod,
+# and before this policy nothing looked at it: a template that took the path from a pod
+# annotation let ordinary pods choose to be a live claim, or the gateways' authorizer.
+#
+# The policy sees spec.spiffeIDTemplate as a string; the rendering happens later, per pod.
+# Text outside {{ ... }} is copied to the output unchanged, and a SPIFFE ID has no empty,
+# "." or ".." segment, so a template whose path begins with a wholly literal segment
+# renders that segment whatever the pod carries. So, from EVERY principal, on CREATE and
+# on an UPDATE that changes spec:
+#
+#   - the template is spiffe://{{ .TrustDomain }} (or a literal trust domain), then "/",
+#     then a literal segment of letters, digits, ".", "-" and "_" ending at "/" or at the
+#     end; anything else (a path that begins with a template action, a partly templated
+#     first segment, a "." or ".." segment, no template at all) is refused;
+#   - a first segment of banlieue or gateway is refused: those identities are VM entries,
+#     never a pod's;
+#   - a first segment of mediatore is admitted only as exactly /mediatore, selecting the
+#     broker's namespace (namespaceSelector.matchLabels kubernetes.io/metadata.name) and
+#     its ServiceAccount (k8s:sa:<name> among workloadSelectorTemplates), neither admin
+#     nor downstream. The namespace and the name are read from the key `broker` of the
+#     ConfigMap mediatore-agentsandbox-subject-policy, system:serviceaccount:<ns>:<name>,
+#     the parameter the three other policies read (ADR-0056 decision 4). That admits the
+#     base's own clusterspiffeid.yaml, by what it selects and not by its name or by who
+#     applies it. Extra labels or selectors only narrow, and are admitted.
+#
+# What follows the first segment is free: the SPIRE chart's fallback,
+# spiffe://{{ .TrustDomain }}/ns/{{ .PodMeta.Namespace }}/sa/{{ .PodSpec.ServiceAccountName }},
+# and its OIDC discovery provider's and test keys' objects (the same template) are admitted.
+#
+# Fail closed. Without the ConfigMap (parameterNotFoundAction: Deny), EVERY create and
+# update of a ClusterSPIFFEID in the cluster is refused, the chart's included, because the
+# parameter is resolved before anything else: restore it (agentsandbox-subject.yaml).
+# Without the key, or with a value that is not a ServiceAccount username, a /mediatore
+# template is refused (the expression errors, failurePolicy: Fail) and the rest is judged
+# as before. AN OVERLAY THAT MOVES THE BROKER PATCHES THIS BINDING'S paramRef.namespace
+# with the three others. DELETE is not matched, nor the status subresource the controller
+# manager writes. A policy does not judge an object that already exists: list them before
+# applying this to a running cluster (docs/guides/deploying.md).
+#
+# No exemption list. A test cluster that gives pods a reserved identity as a fixture
+# excludes those objects by name in its binding (matchResources.excludeResourceRules
+# resourceNames, dev/kind/broker/clusterspiffeid-fixtures.yaml); editing a binding takes
+# the rights that could delete it. The base's binding excludes nothing, and a unit test
+# in crates/mediatore-claims/src/sandbox.rs holds that, and runs this file's regular
+# expressions against admitted and refused templates. Not a bound on a cluster
+# administrator, who can delete it, nor on SPIRE's own admin API. Requires Kubernetes
+# 1.30+.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: mediatore-clusterspiffeid
+  labels:
+    app.kubernetes.io/name: mediatore
+    app.kubernetes.io/component: admission
+spec:
+  failurePolicy: Fail
+  paramKind:
+    apiVersion: v1
+    kind: ConfigMap
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["spire.spiffe.io"]
+        apiVersions: ["v1alpha1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["clusterspiffeids"]
+  # Every principal. An update that leaves spec as it was (a label, an annotation, a
+  # finalizer) declares nothing and is not judged.
+  matchConditions:
+    - name: declares-something
+      expression: "request.operation == 'CREATE' || oldObject.spec != object.spec"
+  variables:
+    # An absent template is the empty string, which no shape admits.
+    - name: template
+      expression: "has(object.spec) && has(object.spec.spiffeIDTemplate) ? object.spec.spiffeIDTemplate : ''"
+    # spiffe:// and the trust domain: the controller manager's {{ .TrustDomain }} (spaces and
+    # trim markers allowed) or a literal one. Character classes, not backslashes: a CEL
+    # string literal has no escape for "{" or ".".
+    - name: authority
+      expression: "'^spiffe://([{][{]-? *[.]TrustDomain *-?[}][}]|[a-z0-9.-]+)'"
+    # The path begins with a wholly literal segment, and it is not "." or "..".
+    - name: literal
+      expression: >-
+        variables.template.matches(variables.authority + '/[A-Za-z0-9._-]+(/.*)?$') &&
+        !variables.template.matches(variables.authority + '/[.]{1,2}(/|$)')
+    # The claims', the nodes' and the gateways' first segments.
+    - name: reserved
+      expression: "variables.template.matches(variables.authority + '/(banlieue|gateway)(/|$)')"
+    - name: brokerPath
+      expression: "variables.template.matches(variables.authority + '/mediatore(/|$)')"
+    - name: brokerExact
+      expression: "variables.template.matches(variables.authority + '/mediatore$')"
+    # system:serviceaccount:<namespace>:<name>, from the one parameter.
+    - name: broker
+      expression: "params.data.broker.trim().split(':')"
+    - name: selectsTheBroker
+      expression: >-
+        size(variables.broker) == 4 && variables.broker[0] == 'system' && variables.broker[1] == 'serviceaccount' &&
+        has(object.spec.namespaceSelector) && has(object.spec.namespaceSelector.matchLabels) &&
+        'kubernetes.io/metadata.name' in object.spec.namespaceSelector.matchLabels &&
+        object.spec.namespaceSelector.matchLabels['kubernetes.io/metadata.name'] == variables.broker[2] &&
+        has(object.spec.workloadSelectorTemplates) &&
+        object.spec.workloadSelectorTemplates.exists(s, s == 'k8s:sa:' + variables.broker[3]) &&
+        (!has(object.spec.admin) || !object.spec.admin) &&
+        (!has(object.spec.downstream) || !object.spec.downstream)
+  validations:
+    - expression: "variables.literal"
+      message: "spiffeIDTemplate must be spiffe://{{ .TrustDomain }}/<literal segment>[/...]: a path whose first segment is templated, or not wholly literal, can render any identity, the broker's and its claims' included (ADR-0075)"
+      reason: Forbidden
+    - expression: "!variables.reserved"
+      message: "a ClusterSPIFFEID may not render a path under /banlieue or /gateway: those are the claims', the nodes' and the egress gateways' identities, declared as ClusterStaticEntry under their own policies (ADR-0075)"
+      reason: Forbidden
+    - expression: "!variables.brokerPath || (variables.brokerExact && variables.selectsTheBroker)"
+      message: "spiffe://<td>/mediatore is the broker's identity: only exactly /mediatore, selecting the broker's namespace and k8s:sa:<its ServiceAccount> as the parameter mediatore-agentsandbox-subject-policy names them, never admin or downstream (ADR-0075)"
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: mediatore-clusterspiffeid
+  labels:
+    app.kubernetes.io/name: mediatore
+    app.kubernetes.io/component: admission
+spec:
+  policyName: mediatore-clusterspiffeid
+  validationActions: ["Deny"]
+  paramRef:
+    name: mediatore-agentsandbox-subject-policy
+    namespace: mediatore-system
+    parameterNotFoundAction: Deny

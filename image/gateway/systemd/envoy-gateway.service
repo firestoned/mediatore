@@ -11,6 +11,12 @@ Description=Envoy, the egress gateway's data plane (ADR-0028)
 Requires=mediatore-gateway-nft.service mediatore-gateway-network.service spire-agent.service
 After=mediatore-gateway-nft.service mediatore-gateway-network.service spire-agent.service network-online.target mediatore-gateway.service
 Wants=network-online.target mediatore-gateway.service
+# Names are resolved by systemd-resolved's stub alone (image/gateway/resolve/resolv.conf): the
+# stub is started first, and this unit sees a resolv.conf that names it and nothing else, checked
+# before Envoy starts (a base whose /etc/resolv.conf does not point into /run/systemd/resolve
+# fails here, visibly, rather than resolving through whatever that file lists).
+Wants=systemd-resolved.service
+After=systemd-resolved.service
 ConditionPathExists=|/run/cos/active_mode
 ConditionPathExists=|/run/cos/passive_mode
 
@@ -21,6 +27,7 @@ Group=envoy
 # directory the table's unit created; the templates are the image's, the values the
 # deployment's and the VM's (ADR-0028 decision 10).
 ExecStartPre=+/usr/libexec/mediatore-gateway/render /usr/share/mediatore-gateway/envoy/gateway.yaml.in /run/mediatore-gateway/gateway.yaml /etc/mediatore-gateway/env /etc/mediatore-gateway/vm.env
+ExecStartPre=/bin/sh -c 'grep -qx "nameserver 127.0.0.53" /etc/resolv.conf && test "$$(grep -c "^nameserver" /etc/resolv.conf)" = 1 || { echo "/etc/resolv.conf does not name the resolved stub alone: Envoy would not resolve through the egress link (image/gateway/resolve)" >&2; exit 1; }'
 ExecStartPre=/usr/bin/envoy --mode validate -c /run/mediatore-gateway/gateway.yaml
 ExecStart=/usr/bin/envoy -c /run/mediatore-gateway/gateway.yaml --log-level info --disable-hot-restart
 Restart=on-failure
@@ -56,6 +63,12 @@ RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 # /run file ownership and modes bound this user. (The inject Envoy Requires= the authorizer, whose health check
 # has by then answered on that socket.)
 ReadOnlyPaths=/run/mediatore-gateway -/run/spire/sockets
+# The resolver: /run/systemd/resolve, where /etc/resolv.conf points on Kairos, is the image's
+# directory here, whose resolv.conf names the stub on 127.0.0.53 alone. The directory, not the
+# file: resolved replaces its files by rename, and a rename detaches a bind of the file itself in
+# every other mount namespace, which would hand Envoy the link's servers (or the fallback ones)
+# again at its resolver's next reinitialisation.
+BindReadOnlyPaths=/usr/share/mediatore-gateway/resolve:/run/systemd/resolve
 
 [Install]
 WantedBy=multi-user.target

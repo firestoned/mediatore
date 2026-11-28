@@ -145,7 +145,7 @@ namespace is its bound: keep it to the broker.
   | What | Where | Unpatched |
   | --- | --- | --- |
   | the value of `broker`, `system:serviceaccount:<namespace>:<name>` | ConfigMap `mediatore-agentsandbox-subject-policy` (`deploy/base/admission/agentsandbox-subject.yaml`) | the broker's entries and status writes are refused; it stops at start saying the policy does not name it |
-  | `paramRef.namespace` | the three bindings `mediatore-agentsandbox-subject`, `mediatore-agentsandbox-status`, `mediatore-clusterstaticentry` | no parameter is found: every `AgentSandbox`, status write and `ClusterStaticEntry` is refused, and the broker stops at start saying the policy cannot be evaluated |
+  | `paramRef.namespace` | the four bindings `mediatore-agentsandbox-subject`, `mediatore-agentsandbox-status`, `mediatore-clusterstaticentry`, `mediatore-clusterspiffeid` | no parameter is found: every `AgentSandbox`, status write, `ClusterStaticEntry` and `ClusterSPIFFEID` is refused, and the broker stops at start saying the policy cannot be evaluated |
   | `subjects[0].namespace` | the `ClusterRoleBinding` `mediatore` and the three `RoleBinding`s in `deploy/base/rbac.yaml` (a subject that names its namespace is left as it is) | the broker has no verb: it stops at start on RBAC |
   | `namespaceSelector` | the `ClusterSPIFFEID` `mediatore` (`deploy/base/clusterspiffeid.yaml`) | the broker is issued no SVID and does not start |
   | the subject's namespace | the `RoleBinding`s of `deploy/policy-bundles` and `deploy/audience-credentials` in each namespace that has one | bundles and credentials there are not read |
@@ -153,13 +153,51 @@ namespace is its bound: keep it to the broker.
   Every row fails closed. `dev/kind/migration/kustomization.yaml` is a worked overlay with
   the first four patches (it is what the migration rehearsal runs the broker under).
 
-One parameter names the broker to three admission policies: the key `broker` of that
+One parameter names the broker to four admission policies: the key `broker` of that
 ConfigMap, read by the subject policy (the broker's exemption), the status policy (the one
-writer) and the entries policy (the one sender of the broker's SPIRE entries). Whoever may
+writer), the entries policy (the one sender of the broker's SPIRE entries) and the
+`ClusterSPIFFEID` policy (the one workload that may be `/mediatore`). Whoever may
 edit the ConfigMap can name another account as the broker, so keep `update` on ConfigMaps in
 `mediatore-system` to whoever deploys the broker, and audit changes to it. Without the
-ConfigMap, or without the key, all three policies refuse everything they govern, the
-gateways' `ClusterStaticEntry` resources included: restore it before declaring anything.
+ConfigMap, or without the key, the first three policies refuse everything they govern, the
+gateways' `ClusterStaticEntry` resources included; without the ConfigMap the fourth refuses
+every `ClusterSPIFFEID` in the cluster, the SPIRE chart's own included: restore it before
+declaring anything.
+
+### What a `ClusterSPIFFEID` may render
+
+The broker trusts SPIFFE IDs by their path, and the SPIRE controller manager makes
+registration entries from two kinds: `ClusterStaticEntry`, which the two entries policies
+judge, and `ClusterSPIFFEID`, a template rendered per pod. The base's fifth policy,
+`mediatore-clusterspiffeid` (`deploy/base/admission/clusterspiffeid.yaml`,
+[ADR-0075](../adr/0075-a-clusterspiffeid-renders-none-of-the-identities-the-broker-trusts.md)),
+judges every create and every spec-changing update of a `ClusterSPIFFEID`, from anyone:
+
+| A `spiffeIDTemplate` whose path | is |
+| --- | --- |
+| begins with a wholly literal segment that is not reserved: `/ns/{{ .PodMeta.Namespace }}/sa/{{ .PodSpec.ServiceAccountName }}`, `/workload/{{ .PodMeta.Name }}` | admitted |
+| begins with a template action, or a partly templated segment: `{{ index .PodMeta.Annotations "x/id" }}`, `/{{ .PodMeta.Namespace }}/x`, `/ns-{{ .PodMeta.Name }}` | refused: the first segment could render anything, a claim's included |
+| is `/banlieue` or under it, `/gateway` or under it | refused: those are the claims', the nodes' and the gateways' identities, declared only as `ClusterStaticEntry` |
+| is exactly `/mediatore`, with `namespaceSelector.matchLabels` `kubernetes.io/metadata.name` and `k8s:sa:<name>` naming the broker as the parameter's `broker` does, neither `admin` nor `downstream` | admitted: the base's own `ClusterSPIFFEID` |
+| is `/mediatore` for anything else, or under `/mediatore` | refused |
+
+**Before applying the base to a cluster that already runs workloads, list what it has:**
+
+```sh
+kubectl get clusterspiffeids -o custom-columns=NAME:.metadata.name,TEMPLATE:.spec.spiffeIDTemplate
+```
+
+A policy does not judge an object that exists, so nothing stops working, but an object the
+table refuses cannot be changed until it is rewritten. The SPIRE chart's three defaults
+(`spire-server-spire-default`, the fallback; `spire-server-spire-oidc-discovery-provider`;
+`spire-server-spire-test-keys`), all
+`spiffe://{{ .TrustDomain }}/ns/{{ .PodMeta.Namespace }}/sa/{{ .PodSpec.ServiceAccountName }}`,
+are admitted on create and on update. A template that begins with a template action is the
+one to rewrite: give it a literal first segment. An object that renders a reserved path
+gives some pod an identity the broker trusts: find out why before anything else. A test
+cluster that needs such fixtures excludes them by name in the binding
+(`matchResources.excludeResourceRules[].resourceNames`, as
+`dev/kind/broker/clusterspiffeid-fixtures.yaml` does); the base's binding excludes nothing.
 
 ## 2. Create the Secrets the overlay expects
 
@@ -944,10 +982,28 @@ env file predates them:
 - `CHECK_TCP_ELEMENTS` (default empty): the tunnel Envoy's one loopback port, only for a
   gateway that keeps the authorizer's check on loopback TCP (next paragraph). Empty, there
   is no loopback exception at all.
-- `RESOLVER_ELEMENTS` (default empty): the Envoys' resolver, only where the rules would
-  refuse it, as `elements = { 127.0.0.53 }` for a stub on loopback or an address inside a
-  range you denied. Read `/etc/resolv.conf` on a booted gateway before you rely on the
-  default: with a loopback stub and this key empty, no tunnel resolves a name.
+- `RESOLVER_ELEMENTS` (default empty): a further resolver the Envoys may reach, only where
+  the rules would refuse it, as `elements = { <address> }` for an address inside a range you
+  denied. The stub on `127.0.0.53` needs no entry: the table admits it to both Envoys whatever
+  this key holds (next paragraph).
+
+**How a gateway resolves names.** Both Envoys ask systemd-resolved's stub on `127.0.0.53`
+and nothing else: their units bind the image's `resolv.conf` (`image/gateway/resolve`) over
+`/run/systemd/resolve` and refuse to start unless `/etc/resolv.conf` then names the stub
+alone, and the stub asks the resolver of the egress link, `DNS=` in your `10-egress.network`
+(or what DHCP hands out, on Azure). The VM base sets `DNS=` and `FallbackDNS=` empty
+(`/usr/lib/systemd/resolved.conf.d/60-mediatore.conf`, `image/base/resolved/`; the gateway's
+build refuses a base without it), so the stub knows the link's
+resolver and nothing else, and a gateway whose egress link has no resolver fails its lookups
+(the stub answers `SERVFAIL` and the tunnel fails) instead of sending your names to a public
+resolver. Before 2026-11-28 the Envoys read `/etc/resolv.conf` themselves, once, at start, and
+resolved imported the Kairos base's own `/etc/resolv.conf` (a plain file naming two public
+resolvers) as global servers whenever it found that file in place: a gateway could then send
+private names to a public resolver and keep doing so for the life of its Envoy (seen after a
+host reboot, every VM booting at once). On a booted gateway, `resolvectl status` shows no global
+`DNS Servers` and no `Fallback DNS Servers`, the egress link with your resolver, and
+`resolvectl query <a name your allowlists hold>` answers. A base image other than Kairos must
+point `/etc/resolv.conf` into `/run/systemd/resolve` too, or the Envoys do not start.
 
 **Where the tunnel Envoy asks the authorizer.** On a unix socket, by default and with or
 without the inject Envoy (ADR-0053 open question 7, built 2026-11-26):
@@ -979,6 +1035,24 @@ internal address you did not list; a name that resolves to a public address you 
 intend (the TLS inside the tunnel is the control there); and unix sockets, so the agent's
 socket stays reachable to both Envoys, whose SVID now opens no route at the broker. A
 deployment that renders its own copy of the table has none of this until its copy follows.
+
+**Telling the gateways apart.** Each gateway reports its decisions and its probes to the broker
+under a name of its own (`gateway decision ... gateway=<name>`, `gateway probe ... gateway=<name>`,
+[ADR-0062](../adr/0062-the-gateway-reports-its-decisions-to-the-broker.md) decision 3). Every
+gateway of a deployment shares one cloud-config, so the image needs no setting for it: the name is
+the VM's SMBIOS system UUID, which the hypervisor sets per VM and the authorizer's unit copies
+from `/sys/class/dmi/id/product_uuid` at every start. Map it back to a VM with
+`kubectl get libvirtmachines -A -o custom-columns=NAME:.metadata.name,UUID:.status.domainUuid`
+on libvirt (or `virsh domuuid <domain>` on the host), and with
+`kubectl get cloudhypervisormachines -A -o custom-columns=NAME:.metadata.name,UUID:.metadata.uid`
+on Cloud Hypervisor, where a machine has one only when it was created after its host's provider
+reached banlieue v0.6.1. A gateway with no UUID falls back to its host name, which on Kairos is
+`kairos` on every VM unless you set one; its authorizer then logs a `warn` at start
+(`reporting under the distribution's default host name`). To choose a name, set
+`MEDIATORE_GATEWAY_NAME` (1 to 63 of `a-z`, `0-9`, `-` and `.`) in the VM's `vm.env`, its
+`userData`, which is per VM: it wins over the UUID, and a value the broker would refuse stops
+the authorizer at start. The authorizer's journal says which it used
+(`reporting decisions to the broker under this name`, with `from=`).
 
 **Moving gateways that predate ADR-0053.** Before it, the authorizer held the listeners'
 ID. The broker, the entries and the image cannot change at one instant, so the order is:
@@ -1076,8 +1150,16 @@ challenge through the proxy, so a registry whose anonymous pull needs a token fr
 is served only with a placed credential, and one that redirects its layers to another host
 needs that host in the audience's `egress`. Name images by digest: a tag is the registry's
 word. A pull is bounded (`MEDIATORE_PULL_IDLE_SECS`, 60, and `MEDIATORE_PULL_DEADLINE_SECS`,
-900, in the guest's env): a registry that stalls fails the claim before the jail, the
-registry named.
+900, in the guest's env): a registry that stalls fails the attempt before the jail, the
+registry named. The pull is attempted at most three times, 5 s and then 15 s apart, all inside
+the deadline (ADR-0076); a gateway that refuses a pull request or cannot carry it is followed
+by the next gateway before the attempt counts as failed. Each failed attempt is one line on the
+claim's output for its owner (with `workload.logs`), giving the attempt, the registry and the
+kind of failure (`unreachable`, `timeout`, `refused`, `not_found`, `unavailable`, `invalid`,
+`failed`), never the error's text. After the last one the guest ends the claim: the exit on the
+claim carries `reason=pull_failed attempts=N error=<kind>` in `mediatore sandbox get`, the
+broker logs `the claim's image could not be pulled` at `warn`, and the guest stops without
+systemd starting it again. The guest's journal keeps the whole error.
 
 Under `policy.audience_definitions.mode: bundles` no registry is granted yet: notaio's
 `SandboxAudience` carries no `role` (ADR-0063, implementation notes), so with gateways every
@@ -1315,7 +1397,10 @@ copied() {   # a kubectl JSON list on stdin, the copies for $1 on stdout
 7. **Apply the base in `mediatore-system`**, your overlay now with `namespace:
    mediatore-system` and none of step 1's patches: the `ServiceAccount`, the `Role`s and
    bindings, the `ClusterRoleBinding`'s subject, the `ClusterSPIFFEID`'s selector, the
-   parameter's `broker` and the bindings' `paramRef.namespace` all move with it. Give the
+   parameter's `broker` and the bindings' `paramRef.namespace` all move with it. If the
+   apply says the `ClusterSPIFFEID` `mediatore` was denied by `mediatore-clusterspiffeid`, it
+   was judged against the old parameter in the moment before the moved binding was enforced:
+   apply again. Give the
    new `mediatore-sandbox` Service the address the old one had (release it from the old
    Service first), since the pool's members and the gateways' relay dial it; the user API
    keeps its host.

@@ -2061,6 +2061,7 @@ dependencies = [
  "mediatore-store",
  "mediatore-testkit",
  "rcgen",
+ "regex",
  "sandboxpolicy-bundle",
  "schemars 1.2.3",
  "serde",

@@ -20,8 +20,8 @@ use uuid::Uuid;
 
 use crate::client::SandboxClient;
 use crate::{
-    arm, egress, identity, image, jail, logs, net, ready, report, sandboxfs, segment, supervise,
-    trip, user,
+    arm, egress, identity, image, jail, logs, net, pull, ready, report, sandboxfs, segment,
+    supervise, trip, user,
 };
 
 /// Seconds between registration retries while mediatore is unreachable.
@@ -506,7 +506,100 @@ pub async fn run(args: GuestArgs) -> anyhow::Result<()> {
     .await;
     // After a trip the claim's table is the cut and stays (ADR-0069 decision 7).
     supervise::teardown_after(&args.sandbox_root, &username, tripped).await;
-    result
+    match result {
+        // The pull failed and the broker has the exit that ends the claim (ADR-0076 decision 4):
+        // the guest stops without a failure, so systemd does not start it again to pull for a
+        // claim that is being released.
+        Err(e)
+            if e.downcast_ref::<PullEnded>()
+                .is_some_and(|p| p.acknowledged) =>
+        {
+            tracing::error!(error = %format!("{e:#}"), "the claim's image could not be pulled; the claim was ended (ADR-0076)");
+            Ok(())
+        }
+        other => other,
+    }
+}
+
+/// The pull failed for good and the guest ended the claim for it (ADR-0076 decision 4), on top
+/// of the last pull error. `acknowledged`: the broker has the exit.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "the claim's image could not be pulled after {attempts} attempts ({error}); {}",
+    if *acknowledged { "the claim was ended with that reason" } else { "the broker was not told, the claim ends at its deadline" }
+)]
+pub struct PullEnded {
+    /// Attempts made.
+    pub attempts: u32,
+    /// The last one's kind.
+    pub error: mediatore_proto::PullError,
+    /// Whether `POST /v1/me/exit` was taken.
+    pub acknowledged: bool,
+}
+
+/// The pull's attempts (ADR-0076 decision 1): `rootfs` and the staging directory emptied before
+/// each attempt after the first, and each failure said on the claim's output stream when the
+/// claim ships it (`lines`).
+#[allow(clippy::too_many_arguments)] // the pull's own inputs and the plan; a struct would only rename them
+async fn pull_attempts(
+    client: &image::Puller,
+    credential: Option<&mediatore_proto::RegistryCredential>,
+    me: &Me,
+    reference: &mediatore_proto::image::ImageReference,
+    layout: &sandboxfs::Layout,
+    plan: &pull::Plan,
+    lines: &mut Option<logs::GuestLines>,
+) -> Result<image::Pulled, pull::Failure> {
+    let mut say = |line: &str| {
+        if let Some(lines) = lines.as_mut() {
+            lines.say(line);
+        }
+    };
+    pull::attempts(plan, &reference.registry, &mut say, |n| async move {
+        if n > 1 {
+            pull::empty_dir(&layout.rootfs)?;
+            pull::empty_dir(&layout.layers)?;
+        }
+        pull_image(client, credential, me, reference, layout).await
+    })
+    .await
+}
+
+/// End the claim for a pull that failed for good (ADR-0076 decision 4): what was said of it on
+/// the output stream goes first (bounded), then `POST /v1/me/exit` with the reason. Always an
+/// error, [`PullEnded`] over the last pull error, so that the teardown runs and `run` decides
+/// how the guest stops.
+async fn end_for_pull(
+    client: &SandboxClient,
+    me: &Me,
+    failure: pull::Failure,
+    shipping: Option<(Arc<logs::Queue>, logs::Shipping)>,
+) -> anyhow::Result<()> {
+    if let Some((_, shipping)) = shipping {
+        let flushed = shipping.flush(logs::FLUSH_TIMEOUT).await;
+        tracing::info!(claim_uid = %me.claim_uid, flushed, "the pull's lines flushed");
+    }
+    let exit = mediatore_proto::GuestExit {
+        code: None,
+        signal: None,
+        restarts: 0,
+        reason: Some(failure.reason()),
+    };
+    let acknowledged = match report::send_exit(client, &exit).await {
+        Ok(()) => {
+            tracing::warn!(claim_uid = %me.claim_uid, attempts = failure.attempts, error = failure.error.as_str(), "the image could not be pulled: the broker has the exit and releases the claim (ADR-0076)");
+            true
+        }
+        Err(e) => {
+            tracing::warn!(claim_uid = %me.claim_uid, error = %e, "the pull's exit did not reach the broker; the claim ends at its deadline");
+            false
+        }
+    };
+    Err(failure.last.context(PullEnded {
+        attempts: failure.attempts,
+        error: failure.error,
+        acknowledged,
+    }))
 }
 
 /// Pull the claim's image and say so. `credential` is the operator's pull credential (ADR-0022), `None` for a
@@ -557,13 +650,28 @@ async fn serve_claim(
     };
     tmpfs.mount().await?;
     let layout = sandboxfs::prepare(&args.sandbox_root, uid, gid)?;
-    let registry_client = puller(&args.plain_http_registries, args.registry_ca.as_deref())?
-        .with_bounds(pull_bounds(
-            args.pull_idle_secs,
-            args.pull_deadline_secs,
-            me.expires_at,
-            jiff::Timestamp::now(),
-        )?)?;
+    let bounds = pull_bounds(
+        args.pull_idle_secs,
+        args.pull_deadline_secs,
+        me.expires_at,
+        jiff::Timestamp::now(),
+    )?;
+    let registry_client =
+        puller(&args.plain_http_registries, args.registry_ca.as_deref())?.with_bounds(bounds)?;
+    // Every attempt at the pull shares its deadline (ADR-0076 decision 1).
+    let plan = pull::Plan::new(bounds.deadline);
+    // The claim's output, when it asked for it (ADR-0045 decision 1), is shipped from before the
+    // pull: what the pull did is the owner's first lines (ADR-0076 decision 2).
+    let shipping = me.workload.logs.then(|| {
+        let queue = Arc::new(logs::Queue::default());
+        let sink: Arc<dyn logs::LogSink> =
+            Arc::new(logs::BrokerSink::new(client.clone(), me.claim_uid));
+        let shipping = logs::Shipping::start(queue.clone(), sink, logs::ShipperConfig::default());
+        (queue, shipping)
+    });
+    let mut lines = shipping
+        .as_ref()
+        .map(|(queue, _)| logs::GuestLines::new(queue.clone()));
     // The gateways (ADR-0028 decision 6, ADR-0027 decision 4): the broker's list, or the
     // pool's bootstrap file when the broker has none, or neither and the proxy dials
     // directly. Which one decides the ruleset's shape and the proxy's dialer alike.
@@ -599,16 +707,20 @@ async fn serve_claim(
         source != net::GatewaySource::None,
     )?;
     let early = if pull_host.is_none() {
-        Some(
-            pull_image(
-                &registry_client,
-                me.registry_credential.as_ref(),
-                me,
-                reference,
-                &layout,
-            )
-            .await?,
+        match pull_attempts(
+            &registry_client,
+            me.registry_credential.as_ref(),
+            me,
+            reference,
+            &layout,
+            &plan,
+            &mut lines,
         )
+        .await
+        {
+            Ok(pulled) => Some(pulled),
+            Err(failure) => return end_for_pull(client, me, failure, shipping).await,
+        }
     } else {
         None
     };
@@ -741,21 +853,29 @@ async fn serve_claim(
         pulled
     } else {
         let host = pull_host.as_deref().unwrap_or_default();
-        let pulled = match registry_client
+        let placed = match registry_client
             .clone()
             .with_placed_registry(host, pull_addr)
         {
-            // No credential: the gateway places it. Whatever fails ends the claim, with the proxy.
-            Ok(client) => pull_image(&client, None, me, reference, &layout).await,
-            Err(e) => Err(e),
-        };
-        match pulled {
-            Ok(p) => p,
+            Ok(placed) => placed,
             Err(e) => {
                 let _ = proxy.start_kill();
                 let _ = proxy.wait().await;
-                *tripped = loaded.cause().is_some();
                 return Err(e);
+            }
+        };
+        // No credential: the gateway places it. A pull that fails for good ends the claim, with the proxy.
+        match pull_attempts(&placed, None, me, reference, &layout, &plan, &mut lines).await {
+            Ok(p) => p,
+            Err(failure) => {
+                let _ = proxy.start_kill();
+                let _ = proxy.wait().await;
+                *tripped = loaded.cause().is_some();
+                if *tripped {
+                    // A trip ended the claim during the pull: its report ends it, and no exit is sent (ADR-0069).
+                    return Err(failure.last);
+                }
+                return end_for_pull(client, me, failure, shipping).await;
             }
         }
     };
@@ -793,11 +913,11 @@ async fn serve_claim(
     // The workload's output, when the claim asked for it (ADR-0045 decision 1): tee'd,
     // redacted (the phantom and every other credential the jail was given, decision 2) and
     // shipped over the node SVID; without the opt-in the jail inherits the console as before.
-    let shipping = me.workload.logs.then(|| {
-        let queue = Arc::new(logs::Queue::default());
-        let capture = Arc::new(logs::Capture::new(spec.secret_values(), queue.clone()));
-        let sink: Arc<dyn logs::LogSink> = Arc::new(logs::BrokerSink::new(client.clone(), me.claim_uid));
-        let shipping = logs::Shipping::start(queue, sink, logs::ShipperConfig::default());
+    // The guest's own lines (the pull's) took the first `seq`s; the workload's continue after them.
+    let after = lines.as_ref().map_or(0, logs::GuestLines::last_seq);
+    let shipping = shipping.map(|(queue, shipping)| {
+        let capture =
+            Arc::new(logs::Capture::new(spec.secret_values(), queue).continuing_after(after));
         tracing::info!(claim_uid = %me.claim_uid, logs = true, "workload output captured, redacted and shipped to the broker (ADR-0045)");
         (capture, shipping)
     });
@@ -870,6 +990,7 @@ async fn serve_claim(
             code: status.code(),
             signal: status.signal(),
             restarts: *restarts,
+            reason: None,
         };
         match report::send_exit(client, &exit).await {
             Ok(()) => {

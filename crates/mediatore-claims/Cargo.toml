@@ -57,6 +57,9 @@ sandboxpolicy-bundle.workspace = true
 tower-test.workspace = true
 http.workspace = true
 http-body-util.workspace = true
+# The ClusterSPIFFEID admission policy's own regular expressions, run against templates
+# (ADR-0075): RE2 syntax, which the expressions keep to.
+regex = "1"
 
 [lints]
 workspace = true

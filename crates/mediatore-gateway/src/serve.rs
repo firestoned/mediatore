@@ -106,9 +106,14 @@ pub struct GatewayArgs {
     #[arg(long, default_value_t = 4096)]
     pub max_claims: usize,
     /// This gateway's name in the decisions it reports to the broker (ADR-0062); default: the
-    /// host name. Attribution, not authentication: every gateway has the one authorizer identity
+    /// VM's SMBIOS UUID (`--machine-uuid-file`, then sysfs), else the host name. Attribution,
+    /// not authentication: every gateway has the one authorizer identity
     #[arg(long, env = "MEDIATORE_GATEWAY_NAME")]
     pub name: Option<String>,
+    /// A copy of the VM's SMBIOS UUID that this user can read (sysfs keeps it to root); the
+    /// gateway image's unit makes it at every start. Read only when `--name` is not given
+    #[arg(long, value_name = "PATH", default_value = crate::report::MACHINE_UUID_FILE)]
+    pub machine_uuid_file: PathBuf,
     /// Where the probes reader (`mediatore gateway-probes`) leaves its summary of what the host
     /// table dropped, for the next batch of decisions (ADR-0070). Read, never written; absent
     /// off the gateway image, and then no probe is reported
@@ -541,6 +546,29 @@ async fn broker_for(args: &GatewayArgs) -> anyhow::Result<Broker> {
     Broker::connect(&args.mediatore_url, &args.workload_api_socket).await
 }
 
+/// The name this gateway reports under (ADR-0062 decision 3), logged with where it came from.
+fn gateway_name(args: &GatewayArgs) -> anyhow::Result<String> {
+    let (name, named_by) = crate::report::gateway_name(
+        args.name.as_deref(),
+        &[
+            args.machine_uuid_file.as_path(),
+            std::path::Path::new(crate::report::DMI_PRODUCT_UUID),
+        ],
+    )?;
+    if named_by == crate::report::NameSource::DefaultHostName {
+        tracing::warn!(
+            gateway = name,
+            "no --name and no SMBIOS UUID: reporting under the distribution's default host name, which other gateways may share; set MEDIATORE_GATEWAY_NAME (ADR-0062 decision 3)"
+        );
+    }
+    tracing::info!(
+        gateway = name,
+        from = ?named_by,
+        "reporting decisions to the broker under this name (ADR-0062)"
+    );
+    Ok(name)
+}
+
 /// `mediatore gateway`: the authorizer, its identity from the Workload API. The tunnel check
 /// on loopback TCP or a unix socket, and, with `--inject-socket`, the inject check on its own.
 pub async fn run(args: GatewayArgs) -> anyhow::Result<()> {
@@ -588,7 +616,7 @@ pub async fn run(args: GatewayArgs) -> anyhow::Result<()> {
         max_claims: args.max_claims,
         ..CacheConfig::default()
     };
-    let name = crate::report::gateway_name(args.name.as_deref())?;
+    let name = gateway_name(&args)?;
     let broker = Arc::new(broker);
     let (reporter, _reporting) = crate::report::Reporter::spawn(
         name.clone(),
@@ -598,10 +626,6 @@ pub async fn run(args: GatewayArgs) -> anyhow::Result<()> {
     );
     let mut authorizer =
         Authorizer::new(&trust_domain, broker.clone(), cfg).with_reporter(reporter);
-    tracing::info!(
-        gateway = name,
-        "reporting decisions to the broker under this name (ADR-0062)"
-    );
     if inject_socket.is_some() {
         authorizer = authorizer.with_credentials(broker);
     }

@@ -78,9 +78,14 @@ ARG TPM_PLUGIN_AGENT_SHA
 
 # What this overlay needs of its base, checked so a site's own base fails here, at build
 # time, rather than on a member: the tools the units and the build call, the packages the
-# base layer installs, the TPM device group, and no sshd (ADR-0010 decision 2).
+# base layer installs, the TPM device group, the base's resolver drop-in
+# (image/base/resolved/60-mediatore.conf: the link's resolver alone, no global, fallback or
+# multicast resolution), and no sshd (ADR-0010 decision 2).
 RUN command -v apt-get && command -v systemctl && command -v useradd && command -v nft \
     && command -v tpm2_nvread && command -v qemu-ga && getent group tss \
+    && grep -qx "DNS=" /usr/lib/systemd/resolved.conf.d/60-mediatore.conf \
+    && grep -qx "FallbackDNS=" /usr/lib/systemd/resolved.conf.d/60-mediatore.conf \
+    && test "$(systemctl is-enabled systemd-resolved.service)" = enabled \
     && ! command -v sshd
 
 # The guest's own packages, beside the base's:

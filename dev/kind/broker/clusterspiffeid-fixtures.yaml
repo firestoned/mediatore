@@ -1,0 +1,45 @@
+# Copyright (c) 2026 Erick Bourgeois, mediatore
+# SPDX-License-Identifier: Apache-2.0
+#
+# kind only, never shipped: the base's ClusterSPIFFEID binding (deploy/base/admission/
+# clusterspiffeid.yaml) with the live tiers' fixtures excluded by name (ADR-0075 decision 7).
+# Each of these gives a test pod an identity the policy refuses from a ClusterSPIFFEID: a
+# claim, a node, the gateway's two, or the broker's from another pod (the impersonator the
+# sandbox listener must refuse). Applied whole by `make kind-deploy` after the base file, and
+# as a patch of the base by dev/kind/broker, so the exclusion survives `kubectl apply -k`.
+# A unit test (crates/mediatore-claims/src/sandbox.rs) holds that every fixture the policy
+# refuses is listed here and that nothing but a mediatore-e2e-* name is; anything else in
+# the cluster, the chart's objects and the base's own, is judged as in production.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: mediatore-clusterspiffeid
+  labels:
+    app.kubernetes.io/name: mediatore
+    app.kubernetes.io/component: admission
+spec:
+  policyName: mediatore-clusterspiffeid
+  validationActions: ["Deny"]
+  paramRef:
+    name: mediatore-agentsandbox-subject-policy
+    namespace: mediatore-system
+    parameterNotFoundAction: Deny
+  matchResources:
+    excludeResourceRules:
+      - apiGroups: ["spire.spiffe.io"]
+        apiVersions: ["v1alpha1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["clusterspiffeids"]
+        resourceNames:
+          - mediatore-e2e-claim
+          - mediatore-e2e-node
+          - mediatore-e2e-impersonator
+          - mediatore-e2e-sandbox-node
+          - mediatore-e2e-gateway
+          - mediatore-e2e-gateway-authorizer
+          - mediatore-e2e-gateway-listener-probe
+          - mediatore-e2e-gateway-node
+          - mediatore-e2e-gateway-claim
+          - mediatore-e2e-gateway-claim-b
+          - mediatore-e2e-dex-claim
+          - mediatore-e2e-dex-node

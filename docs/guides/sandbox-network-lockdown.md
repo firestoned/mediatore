@@ -165,7 +165,8 @@ chain nat_out {
   connection made to the trap port itself, by any uid, is dropped, so a connection the trap listener accepts is the
   sandbox uid's, redirected. Landlock in the jail admits the decoy ports (and 80 with the metadata decoy), not the trap
   port, at any address: for those ports the table is the only bound. The jail cannot list the decoy ports; its own
-  `/proc/self/net/tcp` shows the one trap listener, so it can tell that traps are armed.
+  `/proc/self/net/tcp` shows the trap listener (and, when the claim's image is pulled through the proxy, the proxy's pull
+  listener, default port 18129, which is no trap), so it can tell that traps are armed.
 - **The `denied` sets** keep each new TCP connection the chain's end drops, by destination, for the guest to read every
   250 ms: loopback is the class `loopback_port`, private and link-local addresses `private_range`, anything else no class.
   The `update` comes before the log, so with a set full the chain's last rule still drops and logs.
@@ -218,6 +219,9 @@ loading it, which is how to test a change on a live VM first.
   like `d-wxr----x` on a real VM: the `systemd-resolved` user could not read its drop-in directory, so `LLMNR=no` was never applied, and
   an existing system directory was changed too. Do not list a directory that already exists, and check `ls -ld` after the first boot.
 - **A listener is a defect even when the input chain drops it.** Read `ss -tuln` on a booted VM, not the unit files.
+- **A client that binds before it connects fails in the jail.** Landlock refuses every `bind()` to the workload, including the
+  local-port bind some clients make before `connect()`: busybox `nc` does, and fails before any packet leaves, which looks like a
+  network fault. `wget` and `curl` do not bind, so test reachability from the jail with them.
 
 ## What this does not cover
 

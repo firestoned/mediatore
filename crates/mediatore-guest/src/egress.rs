@@ -1523,15 +1523,19 @@ impl Proxy {
         B::Error: Into<BodyError>,
     {
         if forward.route.placed_at_gateway() {
-            return self.handle_at_gateway(req, &forward, guard).await;
+            return self
+                .handle_at_gateway(&self.dialer, req, &forward, guard)
+                .await;
         }
-        self.handle_tunnelled(req, forward, guard).await
+        self.handle_tunnelled(&self.dialer, req, forward, guard)
+            .await
     }
 
     /// A request on a route the proxy places itself (or sends bare), through a gateway's tunnel or, without gateways,
     /// directly (ADR-0025, ADR-0028). It has been judged.
     async fn handle_tunnelled<B>(
         &self,
+        dialer: &Dialer,
         req: Request<B>,
         forward: Forward<'_>,
         guard: &Guard,
@@ -1554,14 +1558,7 @@ impl Proxy {
             _ => None,
         };
         let upstream = rewrite(req, &forward, placed.as_ref(), self.routes.owned_headers());
-        match connect_and_send(
-            &self.dialer,
-            &route.endpoint,
-            self.tls_for(&route),
-            upstream,
-        )
-        .await
-        {
+        match connect_and_send(dialer, &route.endpoint, self.tls_for(&route), upstream).await {
             Ok((resp, via)) => {
                 // The path alone is logged, never the query, and no path for a request a trap
                 // matched.
@@ -1680,22 +1677,66 @@ impl Proxy {
                 return refuse(&r);
             }
         };
-        if forward.route.placed_at_gateway() {
-            return self
-                .handle_at_gateway(req, &forward, &Guard::default())
-                .await;
-        }
-        if !forward.route.pull_only {
+        let placed = forward.route.placed_at_gateway();
+        if !placed && !forward.route.pull_only {
             tracing::warn!(host, "the pull host's route is not a registry's; refused");
             return refuse(&Refusal::new(StatusCode::FORBIDDEN, "not_a_pull_route"));
         }
         // The puller presents no phantom (it is root's, outside the jail): the route's own credential goes in when it
         // has one, as the workload's would.
         let forward = Forward {
-            inject: forward.route.injects(),
+            inject: if placed {
+                forward.inject
+            } else {
+                forward.route.injects()
+            },
             ..forward
         };
-        self.handle_tunnelled(req, forward, &Guard::default()).await
+        // The puller's requests carry no body, so one can be sent again: a gateway that refuses it or cannot carry it
+        // is followed by the next, once each, in one pass (ADR-0076 decision 5). Each gateway still decides it.
+        let (parts, body) = req.into_parts();
+        if hyper::body::Body::size_hint(&body).exact() != Some(0) {
+            tracing::warn!(
+                method = method_for_log(&method),
+                "a pull request with a body refused"
+            );
+            return refuse(&Refusal::new(StatusCode::BAD_REQUEST, "bad_request"));
+        }
+        let dialers = self.dialer.one_by_one();
+        let last = dialers.len().saturating_sub(1);
+        for (i, dialer) in dialers.iter().enumerate() {
+            let mut again = Request::new(Full::new(Bytes::new()));
+            *again.method_mut() = parts.method.clone();
+            *again.uri_mut() = parts.uri.clone();
+            *again.version_mut() = parts.version;
+            *again.headers_mut() = parts.headers.clone();
+            let resp = if placed {
+                self.handle_at_gateway(dialer, again, &forward, &Guard::default())
+                    .await
+            } else {
+                self.handle_tunnelled(dialer, again, forward.clone(), &Guard::default())
+                    .await
+            };
+            let next = resp
+                .extensions()
+                .get::<Refused>()
+                .is_some_and(|r| PULL_NEXT_GATEWAY.contains(&r.0));
+            if i < last && next {
+                tracing::warn!(
+                    host,
+                    code = resp.extensions().get::<Refused>().map_or("", |r| r.0),
+                    tried = i + 1,
+                    of = dialers.len(),
+                    "a gateway did not carry the pull request; the next is asked (ADR-0076)"
+                );
+                continue;
+            }
+            return resp;
+        }
+        refuse(&Refusal::new(
+            StatusCode::BAD_GATEWAY,
+            "gateway_unreachable",
+        ))
     }
 }
 
@@ -1710,6 +1751,7 @@ impl Proxy {
     /// gateway marked it as its own refusal ([`GATEWAY_REFUSAL_HEADER`]).
     async fn handle_at_gateway<B>(
         &self,
+        dialer: &Dialer,
         req: Request<B>,
         forward: &Forward<'_>,
         guard: &Guard,
@@ -1729,7 +1771,7 @@ impl Proxy {
             return refuse(&Refusal::new(StatusCode::BAD_GATEWAY, "inject_unavailable"));
         };
         let upstream = rewrite_for_gateway(req, forward, self.routes.owned_headers());
-        match send_to_gateway(&self.dialer, port, upstream).await {
+        match send_to_gateway(dialer, port, upstream).await {
             Ok((resp, via)) => {
                 if let Some(code) = resp.headers().get(GATEWAY_REFUSAL_HEADER) {
                     // The environment's verdict (the authorizer's code), not the upstream's answer.
@@ -1931,7 +1973,7 @@ where
 /// A refusal as the workload sees it: the status and a JSON body with the code.
 fn refuse(r: &Refusal) -> Response<Body> {
     let body = serde_json::json!({ "error": r.code }).to_string();
-    Response::builder()
+    let mut resp = Response::builder()
         .status(r.status)
         .header(header::CONTENT_TYPE, "application/json")
         .body(
@@ -1945,8 +1987,24 @@ fn refuse(r: &Refusal) -> Response<Body> {
                     .map_err(|never| match never {})
                     .boxed(),
             )
-        })
+        });
+    resp.extensions_mut().insert(Refused(r.code));
+    resp
 }
+
+/// The proxy's own refusal, by its code, on the response it built: read by the pull listener,
+/// never sent (an extension is not a header).
+#[derive(Debug, Clone, Copy)]
+struct Refused(&'static str);
+
+/// The refusals after which the pull listener asks the next gateway (ADR-0076 decision 5): one
+/// gateway refused the request, could not be reached, or could not reach the registry. Any
+/// other answer, the registry's own included, is the answer.
+const PULL_NEXT_GATEWAY: [&str; 3] = [
+    "gateway_refused",
+    "gateway_unreachable",
+    "upstream_unreachable",
+];
 
 /// The files the guest writes for the proxy, under the sandbox's `egress/` directory.
 #[derive(Debug, Clone)]
@@ -3288,6 +3346,12 @@ mod tests {
 
     impl FakeGateway {
         async fn start(ca: &TestCa, script: Script) -> Self {
+            Self::start_at(ca, script, "127.0.0.1:0").await
+        }
+
+        /// A fake on `addr`: another loopback address on the same port as another fake, as the
+        /// gateways of one pool share their inject port.
+        async fn start_at(ca: &TestCa, script: Script, addr: &str) -> Self {
             mediatore_proto::tls::ensure_provider();
             let material = ca.svid(GATEWAY_ID);
             let authorizer: Authorizer = Arc::new(|peer: &SpiffeId| {
@@ -3296,7 +3360,7 @@ mod tests {
             });
             let config = TlsConfigs::build(&material, &authorizer).expect("gateway config");
             let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
-            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let listener = TcpListener::bind(addr).await.expect("bind");
             let addr = listener.local_addr().expect("addr");
             let seen: Arc<Mutex<Vec<Seen>>> = Arc::default();
             let script = Arc::new(script);
@@ -3592,6 +3656,118 @@ mod tests {
         assert_eq!(resp.status(), 403);
         assert!(fake.seen().is_empty());
         assert_eq!(h.tokens.0.load(Ordering::SeqCst), 0);
+    }
+
+    /// A gateway whose authorizer refuses at the inject port, as one that cannot reach the
+    /// broker does (`broker_unreachable`), on `addr`.
+    async fn refusing_gateway(ca: &TestCa, addr: &str) -> FakeGateway {
+        FakeGateway::start_at(
+            ca,
+            Script::Fixed {
+                status: 403,
+                headers: vec![(GATEWAY_REFUSAL_HEADER, "broker_unreachable")],
+                body: "broker_unreachable",
+            },
+            addr,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn the_pull_listener_asks_the_next_gateway_when_one_refuses_or_is_down() {
+        // ADR-0076 decision 5: one gateway that refuses the pull (its authorizer cannot reach the
+        // broker) or cannot be reached does not fail the pull while another carries it. The two
+        // gateways share the inject port on two loopback addresses; the walk starts at random.
+        let ca = TestCa::new(TD);
+        let carries = FakeGateway::start(&ca, Script::Echo).await;
+        let port = carries.addr.port();
+        let refuses = refusing_gateway(&ca, &format!("[::1]:{port}")).await;
+        let routes = vec![placed(
+            "registry.home.example:443",
+            Some(port),
+            &[("GET", "/v2/**")],
+        )];
+        let (_h, pull) = harness_with_pull(
+            &ca,
+            routes,
+            vec![gw("[::1]:1"), gw("127.0.0.1:1")],
+            "registry.home.example",
+        )
+        .await;
+        for _ in 0..8 {
+            let resp = workload()
+                .get(format!(
+                    "{pull}/registry.home.example/v2/team/tool/manifests/v1"
+                ))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200, "whichever gateway the walk starts at");
+        }
+        assert_eq!(
+            carries.seen().len(),
+            8,
+            "each request reached the gateway that carries it"
+        );
+        assert!(
+            refuses.seen().len() <= 8,
+            "the refusing one was asked at most once each"
+        );
+        // A gateway that is down: skipped the same way.
+        drop(refuses);
+        let resp = workload()
+            .get(format!(
+                "{pull}/registry.home.example/v2/team/tool/manifests/v1"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn the_pull_listener_answers_the_last_refusal_when_every_gateway_refuses() {
+        let ca = TestCa::new(TD);
+        let first = refusing_gateway(&ca, "127.0.0.1:0").await;
+        let port = first.addr.port();
+        let second = refusing_gateway(&ca, &format!("[::1]:{port}")).await;
+        let routes = vec![placed(
+            "registry.home.example:443",
+            Some(port),
+            &[("GET", "/v2/**")],
+        )];
+        let (_h, pull) = harness_with_pull(
+            &ca,
+            routes,
+            vec![gw("[::1]:1"), gw("127.0.0.1:1")],
+            "registry.home.example",
+        )
+        .await;
+        let resp = workload()
+            .get(format!(
+                "{pull}/registry.home.example/v2/team/tool/manifests/v1"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 502);
+        assert!(resp.text().await.unwrap().contains("gateway_refused"));
+        assert_eq!(
+            (first.seen().len(), second.seen().len()),
+            (1, 1),
+            "each gateway asked once, in one pass"
+        );
+        // A pull request with a body is not one the puller sends: refused, nothing sent.
+        let resp = workload()
+            .get(format!(
+                "{pull}/registry.home.example/v2/team/tool/manifests/v1"
+            ))
+            .body("x")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        assert_eq!((first.seen().len(), second.seen().len()), (1, 1));
     }
 
     #[tokio::test]

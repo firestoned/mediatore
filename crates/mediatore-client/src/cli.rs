@@ -634,7 +634,7 @@ async fn create(args: CreateArgs) -> anyhow::Result<()> {
 fn report_lines(claim: &mediatore_proto::ClaimResponse) -> Vec<String> {
     let mut lines = Vec::new();
     if let Some(x) = &claim.exit {
-        lines.push(format!(
+        let mut line = format!(
             "exited_at={}\tcode={}\tsignal={}\trestarts={}",
             x.exited_at,
             x.exit
@@ -644,7 +644,15 @@ fn report_lines(claim: &mediatore_proto::ClaimResponse) -> Vec<String> {
                 .signal
                 .map_or_else(|| "-".to_owned(), |s| s.to_string()),
             x.exit.restarts
-        ));
+        );
+        // The guest ended the claim before any workload ran (ADR-0076).
+        if let Some(mediatore_proto::ExitReason::PullFailed { attempts, error }) = x.exit.reason {
+            let _ = std::fmt::Write::write_fmt(
+                &mut line,
+                format_args!("\treason=pull_failed\tattempts={attempts}\terror={error}"),
+            );
+        }
+        lines.push(line);
     }
     if let Some(r) = &claim.report {
         let host = match &r.report.host_table {
@@ -1465,6 +1473,18 @@ mod tests {
             ]
         );
         assert_eq!(trip_lines(&claim), Vec::<String>::new());
+        // A claim whose image could not be pulled (ADR-0076): the reason after the exit.
+        let failed = claim_of(&serde_json::json!({
+            "name": "sb-1", "phase": "Releasing",
+            "exit": {
+                "exited_at": "2026-11-27T10:05:00Z", "restarts": 0,
+                "reason": { "kind": "pull_failed", "attempts": 3, "error": "timeout" },
+            },
+        }));
+        assert_eq!(
+            report_lines(&failed),
+            ["exited_at=2026-11-27T10:05:00Z\tcode=-\tsignal=-\trestarts=0\treason=pull_failed\tattempts=3\terror=timeout".to_owned()]
+        );
         // And a claim with nothing to report prints nothing after its first line.
         let bare = claim_of(&serde_json::json!({ "name": "sb-1", "phase": "Pending" }));
         assert_eq!(report_lines(&bare), Vec::<String>::new());

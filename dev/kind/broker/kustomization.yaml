@@ -3,7 +3,8 @@
 #
 # The broker in kind (`make kind-broker`): deploy/base as shipped, with only what a
 # throwaway cluster lacks patched out. The Deployment's CSI volume, ServiceAccount,
-# ClusterSPIFFEID, RBAC and admission policy are untouched; they are what the tier
+# ClusterSPIFFEID, RBAC and admission policies are untouched, but for the
+# ClusterSPIFFEID policy's binding, which excludes the tiers' fixtures by name; they are what the tier
 # verifies (ADR-0007). The trust domain in mediatore.yaml is the Makefile's
 # SPIRE_TRUST_DOMAIN placeholder.
 apiVersion: kustomize.config.k8s.io/v1beta1
@@ -32,6 +33,10 @@ patches:
       data:
         brokers: |
           e2e-broker
+  # The tiers give pods fixture identities (a claim, a node, a gateway, a broker
+  # impersonator) through ClusterSPIFFEIDs the base's policy refuses: excluded here by
+  # name, in the binding, and in no shipped file (ADR-0075 decision 7).
+  - path: clusterspiffeid-fixtures.yaml
   # The base's NetworkPolicy admits placeholder sources only, so an unpatched install lets
   # nothing in. The tiers' clients come from namespaces created per run, and what they prove
   # is the listeners' own authentication, so the policy is left out here rather than widened.

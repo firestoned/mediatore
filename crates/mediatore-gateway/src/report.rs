@@ -184,22 +184,125 @@ async fn flush(
     }
 }
 
-/// The gateway's name (ADR-0062 decision 3): `given`, or the kernel's host name, lowercased.
-/// Refused unless it is 1 to 63 of `a-z`, `0-9`, `-` and `.`, the shape the broker accepts.
-pub fn gateway_name(given: Option<&str>) -> anyhow::Result<String> {
-    let name = match given {
-        Some(n) => n.trim().to_owned(),
-        None => std::fs::read_to_string("/proc/sys/kernel/hostname")
-            .or_else(|_| std::fs::read_to_string("/etc/hostname"))
-            .map_err(|e| anyhow::anyhow!("no --name and no host name to use: {e}"))?
-            .trim()
-            .to_ascii_lowercase(),
+/// Where a gateway's name came from (ADR-0062 decision 3, amended 2026-11-27).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NameSource {
+    /// `--name` or `MEDIATORE_GATEWAY_NAME`.
+    Given,
+    /// The VM's SMBIOS system UUID, which the hypervisor sets per VM.
+    MachineUuid,
+    /// A host name somebody set.
+    HostName,
+    /// A host name a distribution boots with when nobody set one: the same on every VM.
+    DefaultHostName,
+}
+
+/// The copy of the VM's SMBIOS UUID the gateway image's unit makes for the authorizer.
+pub const MACHINE_UUID_FILE: &str = "/run/mediatore-gateway/machine-uuid";
+
+/// The VM's SMBIOS UUID as the kernel shows it: readable by root alone.
+pub const DMI_PRODUCT_UUID: &str = "/sys/class/dmi/id/product_uuid";
+
+/// Host names a distribution boots with when nobody set one (Kairos's is `kairos`): a name
+/// every gateway of a deployment would share, so the last resort and logged as such.
+const DEFAULT_HOST_NAMES: &[&str] = &["kairos", "localhost", "localhost.localdomain", "none"];
+
+/// The longest name the broker accepts (`gateway_name_ok`).
+const MAX_NAME: usize = 63;
+
+/// The gateway's name (ADR-0062 decision 3, amended 2026-11-27), from the first of:
+///
+/// 1. `given` (`--name`, `MEDIATORE_GATEWAY_NAME`), trimmed and otherwise as it is: one the
+///    broker would refuse is refused here, at start, never rewritten;
+/// 2. the VM's SMBIOS system UUID, lowercase and hyphenated, unless it is the nil or the
+///    all-ones UUID or not a UUID at all: the hypervisor sets it per VM (the libvirt domain
+///    UUID; the machine's uid on Cloud Hypervisor), so every gateway of a deployment has its
+///    own with no setting of any kind, and the operator finds the VM by it;
+/// 3. the host name, lowercased, every character the broker refuses made a `-`, cut to 63
+///    and never ending in `-` or `.`; a distribution's default ([`NameSource::DefaultHostName`])
+///    only when nothing else is there.
+///
+/// # Errors
+///
+/// A given name the broker would refuse, or nothing to name the gateway by.
+pub fn derive_gateway_name(
+    given: Option<&str>,
+    machine_uuid: Option<&str>,
+    host_name: Option<&str>,
+) -> anyhow::Result<(String, NameSource)> {
+    if let Some(given) = given {
+        let name = given.trim().to_owned();
+        anyhow::ensure!(
+            gateway_name_ok(&name),
+            "gateway name {name:?} is not 1 to 63 of a-z, 0-9, '-' and '.': give one with --name"
+        );
+        return Ok((name, NameSource::Given));
+    }
+    if let Some(name) = machine_uuid.and_then(uuid_name) {
+        return Ok((name, NameSource::MachineUuid));
+    }
+    let name = host_name
+        .map(sanitised)
+        .filter(|n| !n.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!("no --name, no SMBIOS UUID and no host name to name this gateway by")
+        })?;
+    let from = if DEFAULT_HOST_NAMES.contains(&name.as_str()) {
+        NameSource::DefaultHostName
+    } else {
+        NameSource::HostName
     };
-    anyhow::ensure!(
-        gateway_name_ok(&name),
-        "gateway name {name:?} is not 1 to 63 of a-z, 0-9, '-' and '.': give one with --name"
-    );
-    Ok(name)
+    Ok((name, from))
+}
+
+/// The SMBIOS UUID as a name, or `None` for one that names no VM.
+fn uuid_name(text: &str) -> Option<String> {
+    let id = uuid::Uuid::parse_str(text.trim()).ok()?;
+    (!id.is_nil() && id != uuid::Uuid::from_u128(u128::MAX)).then(|| id.hyphenated().to_string())
+}
+
+/// A host name as a name the broker accepts.
+fn sanitised(host_name: &str) -> String {
+    let mapped: String = host_name
+        .trim()
+        .chars()
+        .map(|c| {
+            let c = c.to_ascii_lowercase();
+            if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let trimmed = mapped.trim_start_matches(['-', '.']);
+    let cut = &trimmed[..trimmed.len().min(MAX_NAME)];
+    cut.trim_end_matches(['-', '.']).to_owned()
+}
+
+/// The gateway's name, as [`derive_gateway_name`] picks it: the first of `machine_uuid_files`
+/// that reads as a UUID (the image's copy, then sysfs, which only root reads), and the kernel's
+/// host name (`/etc/hostname` where `/proc` has none). The files are read only when no name
+/// is given.
+///
+/// # Errors
+///
+/// As [`derive_gateway_name`].
+pub fn gateway_name(
+    given: Option<&str>,
+    machine_uuid_files: &[&std::path::Path],
+) -> anyhow::Result<(String, NameSource)> {
+    if given.is_some() {
+        return derive_gateway_name(given, None, None);
+    }
+    let machine_uuid = machine_uuid_files
+        .iter()
+        .filter_map(|f| std::fs::read_to_string(f).ok())
+        .find(|t| uuid_name(t).is_some());
+    let host_name = std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .or_else(|_| std::fs::read_to_string("/etc/hostname"))
+        .ok();
+    derive_gateway_name(None, machine_uuid.as_deref(), host_name.as_deref())
 }
 
 #[cfg(test)]
@@ -454,10 +557,128 @@ mod tests {
         assert_eq!(r.dropped.load(Ordering::Relaxed), 3);
     }
 
+    const UUID: &str = "6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b";
+
     #[test]
     fn a_given_name_is_used_as_it_is_and_one_the_broker_would_refuse_is_refused_at_start() {
-        assert_eq!(gateway_name(Some("gateway-02")).unwrap(), "gateway-02");
-        assert!(gateway_name(Some("Gateway 02")).is_err());
-        assert!(gateway_name(Some("")).is_err());
+        let given = |n: &str| derive_gateway_name(Some(n), Some(UUID), Some("gateway-01"));
+        assert_eq!(
+            given("gateway-02").unwrap(),
+            ("gateway-02".into(), NameSource::Given)
+        );
+        assert_eq!(given(" gateway-02\n").unwrap().0, "gateway-02");
+        // Not sanitised: an operator's typo is refused at start, not quietly rewritten.
+        assert!(given("Gateway 02").is_err());
+        assert!(given("Gateway-02").is_err());
+        assert!(given("").is_err());
+        assert!(given(&"g".repeat(64)).is_err());
+        assert_eq!(given(&"g".repeat(63)).unwrap().0.len(), 63);
+    }
+
+    #[test]
+    fn with_no_name_given_the_vms_uuid_comes_before_any_host_name() {
+        assert_eq!(
+            derive_gateway_name(None, Some(UUID), Some("gateway-01")).unwrap(),
+            (UUID.into(), NameSource::MachineUuid)
+        );
+        assert_eq!(
+            derive_gateway_name(None, Some(UUID), Some("kairos")).unwrap(),
+            (UUID.into(), NameSource::MachineUuid)
+        );
+    }
+
+    #[test]
+    fn the_uuid_is_read_as_sysfs_prints_it_and_sent_lowercase_and_hyphenated() {
+        let upper = format!("{}\n", UUID.to_ascii_uppercase());
+        let (name, from) = derive_gateway_name(None, Some(&upper), None).unwrap();
+        assert_eq!((name.as_str(), from), (UUID, NameSource::MachineUuid));
+        assert_eq!(name.len(), 36);
+        assert!(gateway_name_ok(&name));
+    }
+
+    #[test]
+    fn a_uuid_that_names_no_vm_is_skipped_for_the_host_name() {
+        for bad in [
+            "00000000-0000-0000-0000-000000000000",
+            "FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF",
+            "not a uuid",
+            "",
+            "Not Settable",
+        ] {
+            assert_eq!(
+                derive_gateway_name(None, Some(bad), Some("gateway-01")).unwrap(),
+                ("gateway-01".into(), NameSource::HostName),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_host_name_is_lowercased_and_what_the_broker_refuses_becomes_a_hyphen() {
+        let name = |h| derive_gateway_name(None, None, Some(h)).unwrap();
+        assert_eq!(
+            name("Gateway_02.Home.Example\n"),
+            ("gateway-02.home.example".into(), NameSource::HostName)
+        );
+        assert_eq!(name("-gw 03-").0, "gw-03");
+        assert_eq!(name("gw\u{e9}04").0, "gw-04");
+    }
+
+    #[test]
+    fn a_long_host_name_is_cut_to_63_and_never_ends_in_a_hyphen_or_a_dot() {
+        let long = format!("{}-{}", "a".repeat(62), "b".repeat(10));
+        let (name, _) = derive_gateway_name(None, None, Some(&long)).unwrap();
+        assert_eq!(name, "a".repeat(62));
+        let dotted = format!("{}.{}", "a".repeat(62), "b".repeat(10));
+        assert_eq!(
+            derive_gateway_name(None, None, Some(&dotted)).unwrap().0,
+            "a".repeat(62)
+        );
+        let (name, _) = derive_gateway_name(None, None, Some(&"x".repeat(200))).unwrap();
+        assert_eq!(name.len(), 63);
+        assert!(gateway_name_ok(&name));
+    }
+
+    #[test]
+    fn a_distribution_default_host_name_is_the_last_resort_and_says_so() {
+        for d in [
+            "kairos",
+            "KAIROS",
+            "localhost",
+            "localhost.localdomain",
+            "(none)",
+        ] {
+            let (_, from) = derive_gateway_name(None, None, Some(d)).unwrap();
+            assert_eq!(from, NameSource::DefaultHostName, "{d:?}");
+        }
+        assert_eq!(
+            derive_gateway_name(None, None, Some("kairos")).unwrap().0,
+            "kairos"
+        );
+    }
+
+    #[test]
+    fn nothing_to_name_the_gateway_by_refuses_the_start() {
+        assert!(derive_gateway_name(None, None, None).is_err());
+        assert!(derive_gateway_name(None, Some("garbage"), Some("___")).is_err());
+        assert!(derive_gateway_name(None, None, Some("")).is_err());
+    }
+
+    #[test]
+    fn the_uuid_files_are_tried_in_order_and_a_missing_or_empty_one_is_passed_over() {
+        let dir = mediatore_testkit::tempdir();
+        let missing = dir.join("missing");
+        let empty = dir.join("empty");
+        let copy = dir.join("machine-uuid");
+        std::fs::write(&empty, "").unwrap();
+        std::fs::write(&copy, format!("{UUID}\n")).unwrap();
+        assert_eq!(
+            gateway_name(None, &[&missing, &empty, &copy]).unwrap(),
+            (UUID.into(), NameSource::MachineUuid)
+        );
+        assert_eq!(
+            gateway_name(Some("gateway-02"), &[&copy]).unwrap(),
+            ("gateway-02".into(), NameSource::Given)
+        );
     }
 }

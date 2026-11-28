@@ -250,6 +250,8 @@ nav:
       - "ADR-0072: A hand-created sandbox names only an issuer its creator can come from": adr/0072-a-hand-created-sandbox-names-only-an-issuer-its-creator-can-come-from.md
       - "ADR-0073: groups qualified by issuer when the broker trusts several": adr/0073-groups-qualified-by-issuer-when-the-broker-trusts-several.md
       - "ADR-0074: A namespace's groups are read only from the issuers it names": adr/0074-a-namespaces-groups-read-only-from-the-issuers-it-names.md
+      - "ADR-0075: A ClusterSPIFFEID renders none of the identities the broker trusts": adr/0075-a-clusterspiffeid-renders-none-of-the-identities-the-broker-trusts.md
+      - "ADR-0076: A failed image pull is retried, shown to the owner, and ends the claim with a reason": adr/0076-a-failed-image-pull-is-retried-shown-to-the-owner-and-ends-the-claim-with-a-reason.md
   - Security:
       - Threat model: security/threat-model.md
       - NIST AI 800-1 crosswalk: security/nist-ai-800-1.md

@@ -19,7 +19,9 @@ import yaml
 # operator's and deliberately not in the manifest. Three CRDs since ADR-0034 (AgentSandbox,
 # SandboxNode, PolicyFloor); the broker's own Namespace and three Roles in it since ADR-0056
 # (the watcher Lease, the session Secrets, the store's two kinds); the one NetworkPolicy,
-# whose placeholder peers admit nothing until an overlay patches them.
+# whose placeholder peers admit nothing until an overlay patches them. Five admission
+# policies, each with its binding: the subject, status and two entries policies, and the
+# ClusterSPIFFEID policy since ADR-0075.
 EXPECTED_KINDS = {
     "Namespace": 1,
     "CustomResourceDefinition": 3,
@@ -33,8 +35,8 @@ EXPECTED_KINDS = {
     "NetworkPolicy": 1,
     "ClusterSPIFFEID": 1,
     "ConfigMap": 1,
-    "ValidatingAdmissionPolicy": 4,
-    "ValidatingAdmissionPolicyBinding": 4,
+    "ValidatingAdmissionPolicy": 5,
+    "ValidatingAdmissionPolicyBinding": 5,
 }
 
 

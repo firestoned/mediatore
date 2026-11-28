@@ -424,6 +424,83 @@ pub struct GuestExit {
     /// How many times the supervisor had restarted it before this exit.
     #[serde(default)]
     pub restarts: u32,
+    /// Why the guest ended the claim when it was not the workload's own exit (ADR-0076): the
+    /// image could not be pulled, so no workload ran, and `code`, `signal` and `restarts` say
+    /// nothing. Absent for the workload's exit, as before; an older broker ignores it and still
+    /// releases the claim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<ExitReason>,
+}
+
+/// Why a guest ended its claim before the workload ran (ADR-0076 decision 4). A closed set,
+/// with no free text: nothing the registry, the gateway or the error said reaches the record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ExitReason {
+    /// Every attempt at the image pull failed, or the pull's deadline passed.
+    PullFailed {
+        /// How many attempts were made.
+        attempts: u32,
+        /// What the last one failed with.
+        error: PullError,
+    },
+}
+
+impl ExitReason {
+    /// The reason's name, as on the wire.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::PullFailed { .. } => "pull_failed",
+        }
+    }
+}
+
+/// What an image pull attempt failed with (ADR-0076 decision 2): a closed set, so that a line
+/// the owner reads and the record carry the kind of the failure and never its text (which can
+/// name a URL path, a token realm or a gateway's answer).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PullError {
+    /// No connection to the registry: the connect failed, or no gateway carried the request,
+    /// or the registry behind the gateways could not be reached.
+    Unreachable,
+    /// The connect or idle bound, or the whole pull's deadline, passed (ADR-0063 decision 9).
+    Timeout,
+    /// The registry refused the credential, or a gateway refused the request (`401`, `403`,
+    /// `gateway_refused`).
+    Refused,
+    /// The registry has no such image (`404`).
+    NotFound,
+    /// The registry answered with its own trouble (`429`, a `5xx`).
+    Unavailable,
+    /// What the registry served could not be used: a digest or size that does not match, a
+    /// media type or platform not supported, an entry outside the rootfs, a body over its cap.
+    Invalid,
+    /// The guest failed on its own side (writing the rootfs).
+    Failed,
+}
+
+impl PullError {
+    /// The kind's name, as on the wire.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Unreachable => "unreachable",
+            Self::Timeout => "timeout",
+            Self::Refused => "refused",
+            Self::NotFound => "not_found",
+            Self::Unavailable => "unavailable",
+            Self::Invalid => "invalid",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+impl std::fmt::Display for PullError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// [`GuestExit`] as the broker recorded it.
@@ -1686,6 +1763,55 @@ mod tests {
             verdict: DecisionVerdict::Allow,
             reason: None,
             served: Some("cache".into()),
+        }
+    }
+
+    #[test]
+    fn a_pull_failure_exit_is_on_the_wire_as_adr_0076_writes_it_and_an_old_exit_reads_as_before() {
+        let exit = GuestExit {
+            code: None,
+            signal: None,
+            restarts: 0,
+            reason: Some(ExitReason::PullFailed {
+                attempts: 3,
+                error: PullError::Unreachable,
+            }),
+        };
+        let wire = serde_json::to_value(&exit).unwrap();
+        assert_eq!(
+            wire,
+            serde_json::json!({
+                "restarts": 0,
+                "reason": { "kind": "pull_failed", "attempts": 3, "error": "unreachable" },
+            })
+        );
+        assert_eq!(serde_json::from_value::<GuestExit>(wire).unwrap(), exit);
+        // The workload's exit, as an older guest sends it: no reason, and none on the wire.
+        let old: GuestExit =
+            serde_json::from_value(serde_json::json!({ "code": 0, "restarts": 1 })).unwrap();
+        assert_eq!(old.reason, None);
+        assert!(!serde_json::to_string(&old).unwrap().contains("reason"));
+        // A reason outside the closed set, or an error kind outside it, is no exit.
+        for refused in [
+            serde_json::json!({ "restarts": 0, "reason": { "kind": "oom" } }),
+            serde_json::json!({ "restarts": 0, "reason": { "kind": "pull_failed", "attempts": 1, "error": "it broke" } }),
+        ] {
+            assert!(serde_json::from_value::<GuestExit>(refused).is_err());
+        }
+        // Every kind's name is its wire spelling.
+        for kind in [
+            PullError::Unreachable,
+            PullError::Timeout,
+            PullError::Refused,
+            PullError::NotFound,
+            PullError::Unavailable,
+            PullError::Invalid,
+            PullError::Failed,
+        ] {
+            assert_eq!(
+                serde_json::to_value(kind).unwrap(),
+                serde_json::json!(kind.as_str())
+            );
         }
     }
 

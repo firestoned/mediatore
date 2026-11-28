@@ -271,6 +271,15 @@ impl Capture {
         }
     }
 
+    /// Number this capture's records after `seq`, the last one the guest's own lines took
+    /// ([`GuestLines`]): one claim has one `seq`, and the broker keeps a record whose `seq` it
+    /// has seen once only.
+    #[must_use]
+    pub fn continuing_after(mut self, seq: u64) -> Self {
+        self.seq = AtomicU64::new(seq);
+        self
+    }
+
     /// Wait `idle`, not [`PARTIAL_IDLE`], on a line that has not ended: for tests.
     #[must_use]
     pub fn with_partial_idle(mut self, idle: Duration) -> Self {
@@ -428,6 +437,48 @@ impl Capture {
             text,
             partial,
         });
+    }
+}
+
+/// The guest's own lines on the claim's output stream before the workload runs (ADR-0076
+/// decision 2): what the image pull did, for an owner who would otherwise see nothing until the
+/// deadline. On stderr, from `seq` 1; the workload's [`Capture`] continues after the last
+/// ([`Capture::continuing_after`]). The guest writes every word of them from its own closed
+/// set, so they are not redacted; they are cut to [`MAX_LOG_RECORD_BYTES`] and neutralised all
+/// the same.
+pub struct GuestLines {
+    queue: Arc<Queue>,
+    seq: u64,
+}
+
+impl GuestLines {
+    /// Lines queued into `queue`, the one the claim's shipping posts from.
+    #[must_use]
+    pub fn new(queue: Arc<Queue>) -> Self {
+        Self { queue, seq: 0 }
+    }
+
+    /// Queue `text` as one stderr record under the next `seq`.
+    pub fn say(&mut self, text: &str) {
+        let text = neutralise_controls(text);
+        let mut end = text.len().min(MAX_LOG_RECORD_BYTES);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        self.seq += 1;
+        self.queue.push(LogRecord {
+            seq: self.seq,
+            stream: LogStream::Stderr,
+            ts: Timestamp::now(),
+            text: text[..end].to_owned(),
+            partial: false,
+        });
+    }
+
+    /// The last `seq` a line took, `0` for none.
+    #[must_use]
+    pub fn last_seq(&self) -> u64 {
+        self.seq
     }
 }
 
@@ -952,6 +1003,37 @@ mod tests {
                 crate::redact::REDACTED
             );
         assert!(intact, "the value was cut in two and let through");
+    }
+
+    #[tokio::test]
+    async fn the_guests_lines_and_the_workloads_share_one_seq() {
+        // ADR-0076 decision 2: the pull's lines go first, on stderr, and the workload's
+        // records continue after them, so the broker drops none as a repeat.
+        let q = Arc::new(Queue::default());
+        let mut lines = GuestLines::new(q.clone());
+        lines.say("mediatore: image pull attempt 1 of 3 failed (unreachable)");
+        lines.say("mediatore: \u{1b}]52;c;eA==\u{7} a control is written out");
+        assert_eq!(lines.last_seq(), 2);
+        let c = Capture::new(Vec::new(), q.clone())
+            .continuing_after(lines.last_seq())
+            .without_console();
+        c.read_stream(&b"hello\n"[..], LogStream::Stdout).await;
+        let batch = q.take_batch(usize::MAX);
+        let got: Vec<(u64, LogStream)> = batch.records.iter().map(|r| (r.seq, r.stream)).collect();
+        assert_eq!(
+            got,
+            [
+                (1, LogStream::Stderr),
+                (2, LogStream::Stderr),
+                (3, LogStream::Stdout)
+            ]
+        );
+        assert!(!batch.records[1].text.contains('\u{1b}'), "neutralised");
+        // A line longer than a record is cut to one, on a char boundary.
+        let mut long = GuestLines::new(q.clone());
+        long.say(&"é".repeat(MAX_LOG_RECORD_BYTES));
+        let batch = q.take_batch(usize::MAX);
+        assert!(batch.records[0].text.len() <= MAX_LOG_RECORD_BYTES);
     }
 
     #[tokio::test]

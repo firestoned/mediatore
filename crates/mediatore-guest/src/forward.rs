@@ -147,6 +147,16 @@ impl Dialer {
         }
     }
 
+    /// One dialer per gateway, in one pass's order from a random start ([`Forwarder::one_by_one`]),
+    /// or this dialer alone when it dials directly.
+    #[must_use]
+    pub fn one_by_one(&self) -> Vec<Self> {
+        match self {
+            Self::Direct => vec![Self::Direct],
+            Self::Gateways(f) => f.one_by_one().into_iter().map(Self::Gateways).collect(),
+        }
+    }
+
     /// Whether upstreams are dialled directly, with no gateway to send anything through.
     #[must_use]
     pub fn is_direct(&self) -> bool {
@@ -166,6 +176,7 @@ impl fmt::Display for Dialer {
 
 /// The sandbox leg of the gateway (ADR-0028 decision 3): the gateways in the broker's
 /// order, the claim SVID to present, the identity every gateway must prove.
+#[derive(Clone)]
 pub struct Forwarder {
     gateways: Vec<Endpoint>,
     material: Arc<dyn MaterialSource>,
@@ -218,6 +229,21 @@ impl Forwarder {
     #[must_use]
     pub fn gateways(&self) -> &[Endpoint] {
         &self.gateways
+    }
+
+    /// One forwarder for each gateway, in the order one pass walks the list from a random start:
+    /// for the pull listener, which asks the next gateway when one refuses or cannot carry a
+    /// request (ADR-0076 decision 5). Each holds that gateway alone, so its dial fails over to
+    /// no other.
+    #[must_use]
+    pub fn one_by_one(&self) -> Vec<Self> {
+        let start = random_start(self.gateways.len());
+        (0..self.gateways.len())
+            .map(|i| Self {
+                gateways: vec![self.gateways[(start + i) % self.gateways.len()].clone()],
+                ..self.clone()
+            })
+            .collect()
     }
 
     /// The identity every gateway must prove.

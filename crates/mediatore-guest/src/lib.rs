@@ -33,6 +33,7 @@ pub mod jail;
 pub mod logs;
 pub mod net;
 pub mod nodecert;
+pub mod pull;
 pub mod ready;
 pub mod redact;
 pub mod report;

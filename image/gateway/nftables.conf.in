@@ -58,9 +58,9 @@ table inet mediatore_gateway {
   # purpose: "elements = { 9001 }". Empty by default, the key absent included: the data plane
   # asks the check socket, and the rule in output_envoy below then matches nothing.
   set check_tcp { type inet_service; @CHECK_TCP_ELEMENTS:-@ }
-  # The Envoys' resolver, only where the rules below would refuse it: a stub on loopback, or
-  # an address inside a denied range ("elements = { 127.0.0.53 }"). Empty by default: a
-  # resolver on the egress side outside the refused set needs no entry.
+  # A further resolver the Envoys may ask, only where the rules below would refuse it: an
+  # address inside a denied range. Empty by default. The image's Envoys ask resolved's stub
+  # (127.0.0.53, admitted in output_listener whatever this set holds) and nothing else.
   set resolvers { type ipv4_addr; @RESOLVER_ELEMENTS:-@ }
   set relay_ports { type inet_service; elements = { @RELAY_SPIRE_PORT@, @RELAY_BROKER_PORT@, @RELAY_BUNDLE_PORT@@INJECT_PORT_ELEMENT@ } }
   # One element per sandbox source address, counting its connections to the relay.
@@ -144,6 +144,10 @@ table inet mediatore_gateway {
     jump output_listener
   }
   chain output_listener {
+    # systemd-resolved's stub, the one resolver both Envoys' units let them read in resolv.conf
+    # (image/gateway/resolve): loopback, port 53 alone. The stub asks the egress link's servers as
+    # its own user, which no row here names (2026-11-28: no fallback, no lookup past the link).
+    oif "lo" ip daddr 127.0.0.53 meta l4proto { tcp, udp } th dport 53 accept
     ip daddr @resolvers meta l4proto { tcp, udp } th dport 53 accept
     oif "lo" counter name "gateway_output_loopback" log prefix "mediatore-gateway out loopback: " drop
     meta nfproto ipv6 counter name "gateway_output_ipv6" log prefix "mediatore-gateway out ipv6: " drop
