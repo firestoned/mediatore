@@ -20,6 +20,12 @@
     - a refused claim is a `403`, the groups are not kept on the claim record, and a running claim
       is not checked again when it follows a new bundle (sections 4.3 to 4.5).
 
+    **Built in shadow only (2026-11-28).** ADR-0066 is accepted and built as
+    `policy.eligibility: off | shadow` (`enforce` is not built and does not start): each claim is
+    judged and recorded in one log line, nothing is refused. notaio's v4 `subjects` carries groups
+    only, no user subject and no issuer per group. See the ADR's amendments of 2026-11-28 and
+    [the policy bundle guide](../guides/the-policy-bundle.md).
+
     The producer side is notaio's ADR-0024 (the groups in the bundle) and ADR-0026 (bundle schema
     v4 and its rollout: a verifier that reads v3 and v4 in one release, then
     `NOTAIO_BUNDLE_SCHEMA` switches the producer), planned in notaio's roadmap 05.

@@ -66,9 +66,9 @@ testkit             = $(if $(KIND_PREBUILT),./dist/$(1)$(if $(2), $(2)),cargo ru
 # the version, and the SHA-256 of each manifest from the release's checksums.sha256
 # (itself sigstore-signed; `cosign verify-blob` by hand after a bump, notaio's install
 # guide has the identity). A bump is these three lines.
-NOTAIO_VERSION         ?= 0.8.0
-NOTAIO_CRDS_SHA256     := 250daf74913135d1c97c38c01185e2e8dd0d9c29af5563c21c24882033857ff6
-NOTAIO_MANIFEST_SHA256 := d975ab91462ab6d09e03afbaeb6c52afce44491dd831a4e59a9e28d81264e792
+NOTAIO_VERSION         ?= 0.9.0
+NOTAIO_CRDS_SHA256     := bac529be6c39516cd2a00f3ed5b7e469a8849453c16febbbb2bf8760d51f7a84
+NOTAIO_MANIFEST_SHA256 := 1567516bebe0b023a2d719e06d74706bb58b0beff04ff366065e2b0bcb6f5862
 
 # cargo-cyclonedx, what `make sbom` installs when the host has none: an exact version,
 # built with its own lockfile, in the job that uploads the release binary.
@@ -606,6 +606,9 @@ kind-notaio: kind-create kind-openbao ## notaio from its release manifests (vers
 kind-e2e-policy: kind-banlieue-crds kind-broker kind-notaio ## ADR-0026 live: notaio's signed bundle admitted and recorded, the PolicyConformant verdicts and codes, a newer version followed, a replay refused by the floor across a restart, nothing refused
 	./dev/kind/policy-e2e.sh $(KIND_KUBECONFIG) $(KIND_SA_KUBECONFIG) $(KIND_DIR)
 
+kind-e2e-policy-v4: kind-banlieue-crds kind-broker kind-notaio ## The policy tier with notaio signing schema v4 (NOTAIO_BUNDLE_SCHEMA=v4, put back after): every bundle asserted v4 and carrying its groups, admitted exactly as v3, the ADR-0066 shadow lines not_judged (no_groups), nothing refused
+	MEDIATORE_NOTAIO_BUNDLE_SCHEMA=v4 ./dev/kind/policy-e2e.sh $(KIND_KUBECONFIG) $(KIND_SA_KUBECONFIG) $(KIND_DIR)
+
 kind-gateway: kind-broker gateway-render-check ## The egress gateway in kind (ADR-0028): Envoy from its official image, pinned by digest in dev/kind/gateway, on the gateway SVID over SDS, mediatore gateway beside it, and the TLS destination the tier reaches through it (its certificate minted here)
 	$(call testkit,tls-fixture,--out-dir $(KIND_DIR)/gateway --dns destination.mediatore-e2e-gateway.svc.cluster.local)
 	@$(KIND_KUBECTL) get ns mediatore-e2e-gateway >/dev/null 2>&1 || $(KIND_KUBECTL) create ns mediatore-e2e-gateway
@@ -652,7 +655,7 @@ kind-rehearse-migration: kind-banlieue-crds kind-broker ## ADR-0056 decision 7 r
 kind-e2e-x509pop: kind-banlieue-crds kind-broker ## ADR-0049 live: an agent attesting with x509pop on the image's agent-x509pop.conf under a host CA made for the run, refused without it in the bundle and under its name on another key, the node entry from the Provider's host CA and the machine's subject for a listed pool, the guest registering with --node-attestation x509pop, re-attestation, an unlisted pool still tpm
 	UPSTREAM_ROOT=$(KIND_DIR)/openbao/upstream-root.pem ./dev/kind/x509pop-e2e.sh $(KIND_KUBECONFIG) $(SPIRE_TRUST_DOMAIN) $(KIND_DIR)/x509pop $(KIND_DIR)/ek.pem $(KIND_DIR)/ek.hash
 
-kind-e2e: kind-e2e-entries kind-e2e-mtls kind-e2e-watcher kind-e2e-sandbox kind-e2e-dex kind-e2e-policy kind-e2e-x509pop kind-e2e-gateway kind-e2e-gateway-audience ## Every live suite against kind that needs nothing of the host (grows with the roadmap); kind-e2e-tpm needs a vTPM
+kind-e2e: kind-e2e-entries kind-e2e-mtls kind-e2e-watcher kind-e2e-sandbox kind-e2e-dex kind-e2e-policy kind-e2e-policy-v4 kind-e2e-x509pop kind-e2e-gateway kind-e2e-gateway-audience ## Every live suite against kind that needs nothing of the host (grows with the roadmap); kind-e2e-tpm needs a vTPM
 
 kind-e2e-ci: ## CI shape: $(KIND_E2E_SUITES), cluster state on failure, cluster deleted after
 	@$(MAKE) $(KIND_E2E_SUITES) || { $(MAKE) kind-e2e-logs; $(MAKE) kind-delete; exit 1; }

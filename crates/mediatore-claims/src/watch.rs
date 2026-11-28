@@ -99,6 +99,10 @@ pub struct WatcherConfig {
     /// `policy.audiences` (ADR-0053 decisions 9 to 16): under `Enforce` a sandbox is refused unless
     /// its policy resolves to a verified bundle that grants what it asks for.
     pub audiences_mode: crate::policy::EgressMode,
+    /// `policy.eligibility` (ADR-0066, built in shadow only): under `Shadow` a sandbox created
+    /// through the Kubernetes API is recorded as not judged, the broker holding no groups of
+    /// its creator; under `Off` nothing is written.
+    pub eligibility_mode: crate::eligibility::EligibilityMode,
     /// `policy.sources` (ADR-0054): which policy namespaces each sandbox namespace draws
     /// from. The default maps nothing, so every namespace draws from itself alone.
     pub policy_sources: crate::policy::PolicySources,
@@ -265,6 +269,7 @@ impl Default for WatcherConfig {
             retention: Duration::from_hours(1),
             egress_mode: crate::policy::EgressMode::default(),
             audiences_mode: crate::policy::EgressMode::default(),
+            eligibility_mode: crate::eligibility::EligibilityMode::default(),
             policy_sources: crate::policy::PolicySources::default(),
             delegated_audiences: std::collections::BTreeSet::new(),
             catalog: None,

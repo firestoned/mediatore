@@ -164,7 +164,7 @@ own install guide and `dev/kind/notaio-install.sh` as the reference.
 | Signing key | OpenBao transit key `notaio`, `ed25519`, `exportable=false`; policy `notaio-sign` allowing `transit/sign/notaio` and nothing else; Kubernetes auth role `notaio` bound to the `notaio` ServiceAccount, audience `openbao`, 15 min tokens |
 | What consumers trust | the key's public half, read from OpenBao once (`notaio:v1 <base64>`), never from the cluster: `policy.trusted_keys` on the broker |
 | Per policy namespace | Role `notaio-bundles` (ConfigMaps `get`, `create`, `patch`) for notaio; Role `mediatore-policy-bundles` (`deploy/policy-bundles`, `get`, `list`, `watch`) for the broker |
-| The bundle | ConfigMap `<policy>-bundle` beside the policy, key `bundle.dsse.json`, annotations `sandbox.firestoned.io/bundle-version` and `bundle-digest`; payload type `application/vnd.firestoned.sandboxpolicy.bundle.v3+json` |
+| The bundle | ConfigMap `<policy>-bundle` beside the policy, key `bundle.dsse.json`, annotations `sandbox.firestoned.io/bundle-version` and `bundle-digest`; payload type `application/vnd.firestoned.sandboxpolicy.bundle.v3+json` (schema v3, notaio's default), or `...bundle.v4+json` once notaio signs schema v4; the broker admits both |
 | Profiles that matter | `standard`: K5.3 at R1, one audience, write allowed, tokens of at most 900 s. `lab`: K5.3 at R2, several audiences, but `LabOnly` data scope, so every audience it names must carry `dataScope: LabOnly` on its ceiling (notaio ADR-0017) |
 | Lints that bite here | `L005` the audience set does not fit K5.3; `L006` write without K5.2 or TTL over K5.1; `L014` the policy's exposure exceeds its approved ceiling |
 

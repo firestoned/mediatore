@@ -68,6 +68,17 @@ the bundle of that audience. A valid bundle copied under another name, or into a
 notaio would not have written, is refused with `WrongSubject` and the broker's log names the
 object; nothing is cached and no floor moves. Copy nothing by hand: notaio writes these.
 
+Both bundle schemas notaio writes are accepted (the pin is notaio v0.9.0, its ADR-0026):
+schema v3, which notaio signs by default, and schema v4, which it signs once an operator sets
+`NOTAIO_BUNDLE_SCHEMA=v4`. Each travels under its own payload type, and a v4 bundle is admitted
+and read exactly as its v3 twin: the same grants, the same egress, the same comparison. v4 adds
+the groups that may use the policy (`subjects.groups`); the broker reads them only under
+`policy.eligibility: shadow`, to record who would be eligible, and refuses nothing on their account
+(see "Who may use a policy, in shadow" below,
+[ADR-0066](../adr/0066-eligibility-by-group-from-the-signed-bundle.md)), and v4 is not required. Any other schema or payload type is refused (`Schema` or
+`PayloadType`), with nothing cached and no floor moved. Turn v4 on in notaio only once every
+broker runs this pin: an older broker refuses every v4 bundle.
+
 ## The keys the broker trusts
 
 The broker trusts exactly the keys in its own configuration, never a key read from the
@@ -457,10 +468,62 @@ What a deployment has today:
 The work waits on a notaio release that carries the section and the mark. See
 [Tripwires](tripwires.md).
 
+## Who may use a policy, in shadow (ADR-0066)
+
+A schema v4 bundle lists the identity provider groups whose members may claim a sandbox under the
+policy (`subjects.groups`, notaio's ADR-0024; `[]` means nobody). ADR-0066 makes that list a rule
+the broker applies at the front door. It is **built in shadow only**: the broker judges every claim
+and writes what it found, and refuses, delays or changes nothing. The switch is
+`policy.eligibility`:
+
+```yaml
+policy:
+  trusted_keys: [...]
+  eligibility: shadow   # off (the default) | shadow; enforce is not built and does not start
+```
+
+Under `shadow`, each `POST /v1/claims` writes one line, after the namespace check:
+
+```text
+INFO policy eligibility decision (ADR-0066, shadow): recorded, nothing refused mode=shadow eligibility="not_eligible" code=P015 reason="none" path="front_door" namespace=team-a sandbox=None policy="agent" policy_namespace="policies" bundle_version=Some(7) issuer=https://dex.example.com subject=octocat matched_group="none" policy_groups=Some(2)
+```
+
+- `eligibility="eligible"` names in `matched_group` the one group of the policy's list the
+  requester holds (a value of the signed bundle);
+- `eligibility="not_eligible"`, `code=P015`: the requester holds none of them. `policy_groups`
+  says how many the policy lists, so `Some(0)` is the empty list, nobody;
+- `eligibility="not_judged"` with a `reason`: `no_policy_ref`, `policy_not_resolved`,
+  `v3_bundle` (`code=P016`: the bundle carries no list), or `no_groups` with
+  `path="declarative"`, below.
+
+`sandbox` is `None` at the front door, which names the sandbox after the check, and the
+sandbox's name on the declarative path.
+
+The line never carries a token, the requester's own group list, or the policy's list.
+
+**Spelling.** The groups compared are the validated token's, exactly as its issuer spells them,
+the same list the issuer's gate and `sandboxes.namespaces` read. The `subject_prefix` is never
+added or stripped (ADR-0073 qualifies groups in minted tokens only). A policy that lists
+`dex:platform` does not admit a Dex token's `platform`: list the spelling the issuer sends, and
+both spellings where two connectors send different ones. Under a namespace map the token's issuer is
+one the namespace entry lists (ADR-0074); under the single-namespace form a name is read from every
+issuer the broker trusts, and the line's `issuer` says which one matched.
+
+**The declarative path is not covered.** A sandbox created through the Kubernetes API carries no
+groups the broker could read. Under `shadow` the reconciler writes one line for it, before its claim
+exists, with `path="declarative"` and `reason="no_groups"` (or `v3_bundle`); that path stays governed
+by Kubernetes RBAC and the admission policy.
+
+**Rolling it out.** Upgrade every broker to this build first (it reads v3 and v4), set
+`policy.eligibility: shadow`, then set `NOTAIO_BUNDLE_SCHEMA=v4` on notaio. Read the lines: every
+`not_eligible` is a claim `enforce` would refuse once it is built, and every `v3_bundle` a policy
+still signed as v3. There is no metric: the broker has no metrics facility yet (roadmap 15), so the
+log line is the signal.
+
 ## What comes next
 
 `policy.audiences` enforces a claim's audiences, rules, endpoints and lifetimes (above), and `policy.sources` decides which namespace may
-name which policy (above, ADR-0054). Still shadow-only: eligibility by group from the bundle (ADR-0054 decision 7, not built), a default
+name which policy (above, ADR-0054). Still shadow-only: eligibility by group from the bundle (ADR-0066, above: recorded, `enforce` not built), a default
 policy per namespace applied without being named, and removing `egress` and `rules` from the broker's configuration (the audience's
 `rules` stay as the ceiling for now). Until `policy.audiences` is `enforce` in your environment, the condition on the sandbox is the
 list of what would break.

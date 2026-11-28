@@ -1370,8 +1370,8 @@ mod tests {
         let mut b = mediatore_testkit::policy::fresh_bundle(Timestamp::now(), 1).payload;
         b.content.egress = entries
             .iter()
-            .map(
-                |(endpoint, with_rules)| mediatore_policy::types::EgressRule {
+            .map(|(endpoint, with_rules)| {
+                mediatore_policy::types::EgressRule {
                     endpoint: (*endpoint).into(),
                     rules: if *with_rules {
                         vec![mediatore_policy::types::EndpointRule {
@@ -1381,8 +1381,9 @@ mod tests {
                     } else {
                         vec![]
                     },
-                },
-            )
+                }
+                .into()
+            })
             .collect();
         b
     }
@@ -1473,6 +1474,7 @@ mod tests {
             .payload
             .content
             .audiences[0]
+            .grant
             .clone();
         g.rules = rules
             .iter()
@@ -1554,5 +1556,70 @@ mod tests {
             "a grant listing no endpoint admits none"
         );
         assert_eq!(e.ttl_cap, None);
+    }
+
+    /// notaio v0.9.0 reads schema v3 and v4 and nothing else (its ADR-0026 decision 4): a
+    /// bundle of a schema notaio does not write, signed under a trusted key, is refused by the
+    /// reflector with nothing cached and no floor moved, whichever payload type it travels
+    /// under. The same bytes saying `v4` are admitted, so each refusal is the schema's alone.
+    #[tokio::test]
+    async fn a_bundle_of_a_schema_notaio_does_not_write_is_refused_and_moves_nothing() {
+        use mediatore_testkit::policy::{bundle_configmap, signed_bundle_v4, signed_raw};
+        use sandboxpolicy_bundle::{PAYLOAD_TYPE_V3, PAYLOAD_TYPE_V4, SCHEMA_V4};
+
+        let now = Timestamp::now();
+        let v4 = signed_bundle_v4(
+            now,
+            1,
+            mediatore_testkit::policy::fresh_bundle(now, 1)
+                .payload
+                .content,
+            &["team-a"],
+        );
+        let policy = v4.payload.content.policy.clone();
+        let store = Arc::new(MemoryStore::default());
+        let reflector =
+            BundleReflector::new(store.clone(), v4.keys, vec![policy.namespace.clone()]);
+        let object = format!("{}-bundle", policy.name);
+        let mut payload = serde_json::to_value(&v4.payload).unwrap();
+        payload["schema"] = "sandbox.firestoned.io/bundle/v5".into();
+        let v5 = serde_json::to_vec(&payload).unwrap();
+        for (payload_type, code) in [
+            (PAYLOAD_TYPE_V4, "Schema"),
+            (PAYLOAD_TYPE_V3, "Schema"),
+            (
+                "application/vnd.firestoned.sandboxpolicy.bundle.v5+json",
+                "PayloadType",
+            ),
+        ] {
+            let cm = bundle_configmap(&policy.namespace, &object, &signed_raw(payload_type, &v5));
+            assert_eq!(
+                reflector.applied_at(&cm, now).await,
+                Outcome::Refused { code },
+                "{payload_type}"
+            );
+            assert!(reflector.cache().is_empty(), "{payload_type}");
+            assert_eq!(
+                store
+                    .get_policy_floor(&policy.namespace, &policy.name)
+                    .await
+                    .unwrap(),
+                None,
+                "{payload_type}"
+            );
+        }
+        payload["schema"] = SCHEMA_V4.into();
+        let cm = bundle_configmap(
+            &policy.namespace,
+            &object,
+            &signed_raw(PAYLOAD_TYPE_V4, &serde_json::to_vec(&payload).unwrap()),
+        );
+        assert!(
+            matches!(
+                reflector.applied_at(&cm, now).await,
+                Outcome::Admitted { version: 1, .. }
+            ),
+            "the control: the same bytes as v4"
+        );
     }
 }

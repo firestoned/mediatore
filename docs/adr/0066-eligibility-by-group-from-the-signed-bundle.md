@@ -3,8 +3,9 @@
 
 # ADR-0066: Eligibility by group, from the signed policy bundle
 
-**Status:** Proposed (no implementation yet; it needs notaio ADR-0024, the bundle that carries the
-groups; CALM, the tests and the threat-model pass are owed before it is accepted) · **Date:** 2026-11-25
+**Status:** Accepted 2026-11-28, built in shadow only: decision 1's `off` and `shadow` (`enforce` does
+not start), and decisions 2 to 4, 6 to 8 as findings that refuse nothing; decision 5's refusal is not
+built. See the amendments of 2026-11-28 · **Date:** 2026-11-25
 
 Completes [ADR-0054](0054-which-policies-a-namespace-may-name.md) decision 7, which left eligibility
 by subject "to an ADR of its own", and the group-spelling question of
@@ -105,6 +106,90 @@ lists; where the entry lists one issuer that is sufficient, and where it lists s
 bundle's names are read from each, as ADR-0074 decision 4 says of the map. That is the floor this
 ADR inherits. Whether a bundle should carry an issuer per group is decided here, with notaio's
 schema, before this ADR is implemented.
+
+## Amendments of 2026-11-28: built in shadow only
+
+The maintainer accepted this ADR on 2026-11-28, to be built in shadow only. Where the build differs
+from the text above, these amendments say how, and they win.
+
+1. **The mode key is `policy.eligibility: off | shadow`, default `off`.** As decision 1, minus
+   `enforce`: `enforce` is not built, and a configuration that sets it does not start, with
+   `policy.eligibility: enforce is not built: ADR-0066 is built in shadow only; set off or shadow`.
+   Any other value does not start either. `off` reads nothing and writes nothing: no bundle is
+   looked up for eligibility and no line is written. The default stays `off`, as decision 1 says,
+   so an upgrade changes no log volume; an operator turns `shadow` on per environment. Every
+   mention of refusing, `403`, or "refuse under `enforce`" above (decisions 1, 3, 5 and 8, the
+   security analysis, Consequences) is **not built; shadow only**.
+
+   Control: `EligibilityMode` (`crates/mediatore-claims/src/eligibility.rs`), read as
+   `PolicySection::eligibility` (`crates/mediatore/src/config.rs`) and named in the start line of
+   `policy_egress` (`crates/mediatore/src/main.rs`).
+
+2. **What notaio's schema v4 carries (notaio v0.9.0, `sandboxpolicy-bundle`).** `content.subjects`
+   is `Option<Subjects>`, and `Subjects` is `{ groups: Vec<String> }` (`members.rs`): identity
+   provider group names, sorted, matched exactly, `[]` meaning nobody (notaio ADR-0024 decision 1).
+   It holds **no user subject and no issuer per group.** So:
+   - eligibility is by group only; there is no "by subject" rule to build;
+   - the question of the 2026-11-27 note is answered by the schema: a bundle's group carries no
+     issuer, and the broker reads each name against the groups of the token it validated, in the
+     issuer's own spelling (amendment 3);
+   - a v4 bundle without `subjects` is refused by the verifier (`Malformed`), so a verified v4
+     bundle always carries the statement. The check still reads a v4 payload without it as not
+     judged (`P016`), never as open.
+   - a v3 bundle is read as before and is not judged (`P016`), as decision 3 says for `shadow`.
+
+3. **The spelling: the upstream's, unchanged (decision 4, ADR-0073 decision 4, ADR-0074).** The
+   requester's groups are `Validated.groups`, the groups of the validated token byte for byte: the
+   same list the issuer gate and the namespace gate read. The `subject_prefix` is never added or
+   stripped: ADR-0073 qualifies groups in the tokens the broker mints and nowhere else ("the
+   broker's own decisions keep the upstream spelling"), and this is one of the broker's own
+   decisions. A bundle listing `dex:team-a` does not match a Dex token's `team-a`, nor the reverse.
+   The check runs after the namespace gate, so under `sandboxes.namespaces` the token's issuer is
+   one the entry lists (ADR-0074 decision 1), and a name listed by the bundle is read from each of
+   those issuers (ADR-0074 decision 4). Under the single-namespace form there is no per-namespace
+   issuer list, and a bundle's name is read from every issuer the broker trusts: recorded as a
+   residual in the threat model until the bundle carries an issuer per group or `enforce` is built.
+   The line names the token's issuer beside the subject, so the operator sees which issuer matched.
+
+4. **What is recorded, and where.** At the front door (`create_claim`), after the namespace gate
+   and the check of ADR-0054 decision 4, before a session is built: one line per claim request,
+   `policy eligibility decision (ADR-0066, shadow): recorded, nothing refused`, carrying
+   `eligibility` (`eligible`, `not_eligible`, `not_judged`), `code` (`P015` for not eligible,
+   `P016` for a bundle without subjects, else `none`), `reason` for a request not judged
+   (`no_policy_ref`, `policy_not_resolved`, `v3_bundle`, `no_subjects`, `no_groups`), `path`
+   (`front_door` or `declarative`), the sandbox namespace, the sandbox's name on the declarative
+   path (`None` at the front door, which names it after the check), the policy's name, namespace and bundle
+   version, the requester's `issuer` and `subject`, `matched_group`, and `policy_groups` (how many
+   groups the policy lists). The verdict changes no status, header or body: the answer is the same
+   byte for byte with the check judging "not eligible" and with the check off. Never a token.
+
+   Control: `eligibility::judge` and `eligibility::record`
+   (`crates/mediatore-claims/src/eligibility.rs`), called by `record_eligibility`
+   (`crates/mediatore-api/src/lib.rs`).
+
+5. **Decision 5, for the line.** The line names the one group of the policy's list the requester
+   holds, as ADR-0046 decision 13's namespace audit line names the configured group it matched: a
+   value of the signed bundle, never the requester's list. A "not eligible" line names no group and
+   carries `policy_groups` instead, so `policy_groups=0` reads as the empty list (nobody, decision
+   2). The refusal body of decision 5 is not built.
+
+6. **Decision 7, the declarative path, recorded as not judged.** A sandbox created through the
+   Kubernetes API (no front-door mark, ADR-0072 decision 3) is recorded by the reconciler before its
+   claim exists, with `path=declarative` and `reason=no_groups` (or `v3_bundle`): the broker holds
+   no creator groups there. A sandbox the front door created is judged at the front door only and
+   never again by the reconciler.
+
+   Control: `SandboxReconciler::record_declarative_eligibility`
+   (`crates/mediatore-claims/src/sandbox.rs`).
+
+7. **No metric.** The broker has no metrics facility: roadmap 15's OpenTelemetry foundations are
+   not built. The log line is the signal, as ADR-0069 decision 11 and ADR-0070 have it for trips;
+   a counter by `eligibility` and `code` (both enums) joins roadmap 15's schema when it exists.
+
+8. **Bounded.** The check walks the bundle's list (bounded by notaio) against the token's groups,
+   the list the namespace gate already walks, and stops at the first match. Nothing grows with a
+   value the requester chooses beyond those two lists, and the bundle is the one the cache already
+   holds: no read leaves the process.
 
 ## Security analysis
 

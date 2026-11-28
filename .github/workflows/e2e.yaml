@@ -144,7 +144,7 @@ jobs:
           # cargo: the entries suite is a cargo test (`make live-admission-test`), so this
           # shard keeps a toolchain and its cache; the gateway shards compile nothing.
           - shard: core
-            suites: kind-e2e-entries kind-e2e-mtls kind-e2e-watcher kind-e2e-sandbox kind-e2e-dex kind-e2e-policy kind-e2e-x509pop
+            suites: kind-e2e-entries kind-e2e-mtls kind-e2e-watcher kind-e2e-sandbox kind-e2e-dex kind-e2e-policy kind-e2e-policy-v4 kind-e2e-x509pop
             cargo: true
           - shard: gateway
             suites: kind-e2e-gateway

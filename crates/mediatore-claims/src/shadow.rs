@@ -71,6 +71,13 @@ pub enum Code {
     /// A `policyRef` held by more than one of this namespace's sources (ADR-0054 decision 3):
     /// the order of the list never decides between them.
     P012,
+    /// The requester holds none of the policy's groups (ADR-0066 decision 8,
+    /// `policy_not_eligible`). Reported by the eligibility line in shadow, never on a
+    /// sandbox's condition.
+    P015,
+    /// The policy's verified bundle carries no `subjects`: schema v3 (ADR-0066 decision 8,
+    /// `policy_without_subjects`). Reported by the eligibility line in shadow.
+    P016,
 }
 
 impl fmt::Display for Code {
@@ -86,6 +93,8 @@ impl fmt::Display for Code {
             Self::P010 => "P010",
             Self::P011 => "P011",
             Self::P012 => "P012",
+            Self::P015 => "P015",
+            Self::P016 => "P016",
         })
     }
 }
@@ -426,10 +435,13 @@ mod tests {
         let mut sb = spec(&["internal-git", "api://elsewhere"], Some("agent"));
         sb.ttl_seconds = 86_400;
         let mut b = bundle();
-        b.content.egress.push(EgressRule {
-            endpoint: "pypi.org:443".into(),
-            rules: vec![],
-        });
+        b.content.egress.push(
+            EgressRule {
+                endpoint: "pypi.org:443".into(),
+                rules: vec![],
+            }
+            .into(),
+        );
         let findings = compare(&sb, &[looser], Some(&b));
         assert_eq!(
             codes(&findings),
@@ -508,14 +520,17 @@ mod tests {
             vec![]
         );
         // Listed by the bundle under another grant shape still finds it.
-        b.content.audiences.push(AudienceGrant {
-            name: "api://other".into(),
-            access: Access::Read,
-            scopes: vec![],
-            ttl_seconds: Some(10),
-            endpoints: vec![],
-            rules: vec![],
-        });
+        b.content.audiences.push(
+            AudienceGrant {
+                name: "api://other".into(),
+                access: Access::Read,
+                scopes: vec![],
+                ttl_seconds: Some(10),
+                endpoints: vec![],
+                rules: vec![],
+            }
+            .into(),
+        );
         let other = Audience {
             name: "api://other".into(),
             max_ttl: 11,
@@ -577,11 +592,13 @@ mod tests {
             EgressRule {
                 endpoint: "repo.home.example:443".into(),
                 rules: vec![],
-            },
+            }
+            .into(),
             EgressRule {
                 endpoint: "192.0.2.7:443".into(),
                 rules: vec![],
-            },
+            }
+            .into(),
         ];
         let sb = spec(&["internal-git"], Some("agent"));
         let shadow = compare_with(&sb, &[conformant()], Some(&b), EgressMode::Shadow);
@@ -594,5 +611,114 @@ mod tests {
         b.content.egress.truncate(1);
         let left = compare_with(&sb, &[conformant()], Some(&b), EgressMode::Enforce);
         assert_eq!(codes(&left), Vec::<Code>::new(), "{left:?}");
+    }
+
+    /// notaio v0.9.0 (its ADR-0026): a schema v4 bundle goes through the broker's own admission
+    /// (the reflector, `admit`, the floor) and is read exactly as its v3 twin is: the same
+    /// grants, the same direct egress, the same verdicts. v4 adds `subjects`, which the broker
+    /// carries and does not enforce yet (mediatore ADR-0066).
+    #[tokio::test]
+    async fn a_v4_bundle_is_admitted_and_read_exactly_like_its_v3_twin() {
+        use std::sync::Arc;
+
+        use mediatore_store::MemoryStore;
+        use sandboxpolicy_bundle::{SchemaVersion, Subjects};
+
+        use crate::policy::{BundleReflector, Outcome, direct_egress, effective_grant};
+
+        let now = Timestamp::now();
+        let mut content = bundle().content;
+        content.egress = vec![
+            EgressRule {
+                endpoint: "pypi.org:443".into(),
+                rules: vec![],
+            }
+            .into(),
+            EgressRule {
+                endpoint: "192.0.2.7:443".into(),
+                rules: vec![],
+            }
+            .into(),
+        ];
+        let twins = [
+            (
+                SchemaVersion::V3,
+                mediatore_testkit::policy::signed_bundle(now, 2, content.clone()),
+            ),
+            (
+                SchemaVersion::V4,
+                mediatore_testkit::policy::signed_bundle_v4(now, 2, content, &["team-a"]),
+            ),
+        ];
+        let mut read = Vec::new();
+        for (schema, signed) in twins {
+            let policy = signed.payload.content.policy.clone();
+            let reflector = BundleReflector::new(
+                Arc::new(MemoryStore::default()),
+                signed.keys,
+                vec![policy.namespace.clone()],
+            );
+            let cm = mediatore_testkit::policy::bundle_configmap(
+                &policy.namespace,
+                &format!("{}-bundle", policy.name),
+                &signed.envelope,
+            );
+            assert_eq!(
+                reflector.applied_at(&cm, now).await,
+                Outcome::Admitted {
+                    policy: format!("{}/{}", policy.namespace, policy.name),
+                    version: 2,
+                },
+                "{schema:?}"
+            );
+            let cached = reflector
+                .cache()
+                .get(&policy.namespace, &policy.name, now)
+                .expect("the admitted bundle is cached");
+            assert_eq!(cached.schema_version(), Some(schema));
+            read.push(cached);
+        }
+        let (v3, v4) = (&read[0], &read[1]);
+
+        // The content is the same but for the subjects v4 states.
+        assert_eq!(v3.content.subjects, None);
+        assert_eq!(
+            v4.content.subjects,
+            Some(Subjects {
+                groups: vec!["team-a".into()]
+            })
+        );
+        let mut read_as_v3 = v4.content.clone();
+        read_as_v3.subjects = None;
+        assert_eq!(read_as_v3, v3.content);
+        assert_eq!(v4.meta, v3.meta);
+
+        // The same grants and the same direct egress, read the way the broker reads them.
+        assert_eq!(direct_egress(v4), direct_egress(v3));
+        let egress: [Endpoint; 1] = ["git.foo.io:443".parse().unwrap()];
+        let ceiling = [rule("GET", "/**")];
+        for (a3, a4) in v3.content.audiences.iter().zip(&v4.content.audiences) {
+            assert_eq!(
+                effective_grant(&ceiling, None, &egress, a4),
+                effective_grant(&ceiling, None, &egress, a3)
+            );
+        }
+
+        // The same verdicts, and verdicts that say something.
+        let mut long = spec(&["internal-git", "api://elsewhere"], Some("agent"));
+        long.ttl_seconds = 86_400;
+        let fits = spec(&["internal-git"], Some("agent"));
+        for (sb, mode) in [
+            (&fits, EgressMode::Shadow),
+            (&fits, EgressMode::Enforce),
+            (&long, EgressMode::Shadow),
+        ] {
+            let (on3, on4) = (
+                compare_with(sb, &[conformant()], Some(v3), mode),
+                compare_with(sb, &[conformant()], Some(v4), mode),
+            );
+            assert!(!on3.is_empty(), "{mode:?}: a verdict with something in it");
+            assert_eq!(on4, on3, "{mode:?}");
+        }
     }
 }

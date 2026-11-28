@@ -308,11 +308,13 @@ fn policy_egress(
     tracing::info!(mode = %policy.egress, namespaces = ?policy.namespaces, "policy.egress: a bundle's direct egress is served under enforce, logged under shadow (ADR-0030)");
     tracing::info!(mode = %policy.audiences, "policy.audiences: a claim must be under a verified bundle that grants what it asks for under enforce, each refusal logged under shadow (ADR-0053)");
     tracing::info!(mode = %policy.follow, enforced = policy.follow == mediatore_claims::policy::EgressMode::Enforce && policy.audiences == mediatore_claims::policy::EgressMode::Enforce, "policy.follow: a running claim follows a newer bundle only while it is still inside it, refused under enforce, recorded under shadow (ADR-0061)");
+    tracing::info!(mode = %policy.eligibility, "policy.eligibility: whether a claim's requester holds one of the groups of the policy's signed v4 bundle, recorded under shadow and acted on nowhere; enforce is not built (ADR-0066)");
     Some(mediatore_api::PolicyEgress {
         bundles: reflector.cache(),
         mode: policy.egress,
         audiences: policy.audiences,
         follow: policy.follow,
+        eligibility: policy.eligibility,
         // Which policy namespaces a record's namespace draws from (ADR-0054): the same
         // mapping the watcher resolves with, checked again when a bundle is served.
         sources: cfg.policy_sources(),
@@ -497,6 +499,12 @@ async fn claim_watcher(
             logs_retention: cfg.log_retention(),
             egress_mode: cfg.policy.as_ref().map(|p| p.egress).unwrap_or_default(),
             audiences_mode: cfg.policy.as_ref().map(|p| p.audiences).unwrap_or_default(),
+            // ADR-0066 in shadow: a hand-created sandbox recorded as not judged.
+            eligibility_mode: cfg
+                .policy
+                .as_ref()
+                .map(|p| p.eligibility)
+                .unwrap_or_default(),
             policy_sources: cfg.policy_sources(),
             delegated_audiences: cfg
                 .audiences

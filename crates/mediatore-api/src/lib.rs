@@ -1096,6 +1096,8 @@ async fn create_claim(
     // A policy that does not resolve in the namespace's sources (ADR-0054 decision 4): said
     // now, before a session is built or parked. The reconciler remains the control.
     refuse_unresolved_policy(&st, &validated, &namespace, req.policy_ref.as_deref())?;
+    // ADR-0066 in shadow: recorded, never acted on. It returns nothing the answer could use.
+    record_eligibility(&st, &validated, &namespace, req.policy_ref.as_deref());
     let session = session_for(&st, &validated, &req, &namespace, &bearer_token).await?;
     let delegations = delegations_for(&st, &req, &namespace)?;
     let sealer = match (
@@ -1188,6 +1190,49 @@ fn refuse_unresolved_policy(
             Ok(())
         }
     }
+}
+
+/// ADR-0066, built in shadow only (amendments of 2026-11-28): under `policy.eligibility:
+/// shadow`, whether the requester's validated groups hold one of the groups the policy's
+/// verified v4 bundle lists, in one line ([`mediatore_claims::eligibility::record`]). Runs
+/// after the namespace gate, so under a namespace map the token's issuer is one the entry
+/// lists (ADR-0074); the groups are the token's, in the issuer's own spelling (ADR-0073
+/// decision 4). Returns nothing: no verdict can reach the answer, which is the same byte for
+/// byte with the check off. Under `off`, without a `policy` section, nothing is read.
+fn record_eligibility(st: &AppState, validated: &Validated, namespace: &str, policy: Option<&str>) {
+    use mediatore_claims::eligibility::{EligibilityMode, Lookup, Path, Requester, record};
+    use mediatore_claims::policy::Resolution;
+    let Some(pe) = st
+        .policy_egress
+        .as_ref()
+        .filter(|pe| pe.eligibility != EligibilityMode::Off)
+    else {
+        return;
+    };
+    let found = policy.map(|name| {
+        pe.bundles
+            .resolve(&pe.sources, namespace, name, Timestamp::now())
+    });
+    let lookup = match &found {
+        None => Lookup::NoPolicy,
+        Some(Resolution::Found(bundle)) => Lookup::Found(bundle),
+        Some(Resolution::NotFound | Resolution::Ambiguous | Resolution::NotRead) => {
+            Lookup::NotResolved
+        }
+    };
+    record(
+        pe.eligibility,
+        Path::FrontDoor,
+        namespace,
+        None,
+        &Requester {
+            issuer: &validated.subject.issuer,
+            subject: &validated.subject.id,
+            groups: Some(&validated.groups),
+        },
+        policy,
+        lookup,
+    );
 }
 
 /// Resolve a create's namespace and write the audit line (ADR-0046 decision 13): subject,
@@ -2856,6 +2901,10 @@ pub struct PolicyEgress {
     /// `policy.sources` (ADR-0054): which policy namespaces each sandbox namespace draws
     /// from. What a record is served is checked against it again at the time it is served.
     pub sources: mediatore_claims::policy::PolicySources,
+    /// `policy.eligibility` (ADR-0066, built in shadow only): under `Shadow` every claim
+    /// request's eligibility by the policy's signed groups is recorded in one line and acted
+    /// on nowhere; under `Off` nothing is read or written.
+    pub eligibility: mediatore_claims::eligibility::EligibilityMode,
 }
 
 /// The claim's bundle, usable for what the broker serves (ADR-0030 decision 2, ADR-0054
@@ -5158,9 +5207,12 @@ mod tests {
         if let Some(direct) = direct {
             content.egress = direct
                 .iter()
-                .map(|endpoint| mediatore_policy::types::EgressRule {
-                    endpoint: (*endpoint).into(),
-                    rules: vec![],
+                .map(|endpoint| {
+                    mediatore_policy::types::EgressRule {
+                        endpoint: (*endpoint).into(),
+                        rules: vec![],
+                    }
+                    .into()
                 })
                 .collect();
         }
@@ -5189,6 +5241,7 @@ mod tests {
         );
         (
             PolicyEgress {
+                eligibility: mediatore_claims::eligibility::EligibilityMode::Off,
                 follow: mediatore_claims::policy::EgressMode::Shadow,
                 bundles: reflector.cache(),
                 mode,
@@ -5560,6 +5613,7 @@ mod tests {
             .payload
             .content
             .audiences[0]
+            .grant
             .clone();
         g.name = "internal-git".into();
         g.rules = rules
@@ -5595,7 +5649,7 @@ mod tests {
             let mut content = mediatore_testkit::policy::fresh_bundle(now, 1)
                 .payload
                 .content;
-            content.audiences = vec![grant];
+            content.audiences = vec![grant.into()];
             let signed = mediatore_testkit::policy::signed_bundle(now, 2, content);
             let uid = signed.payload.content.policy.uid.clone();
             let namespace = signed.payload.content.policy.namespace.clone();
@@ -5621,6 +5675,7 @@ mod tests {
                 ceiling.iter().map(|(m, p)| rule(m, p)).collect(),
             );
             st.policy_egress = Some(PolicyEgress {
+                eligibility: mediatore_claims::eligibility::EligibilityMode::Off,
                 follow: mediatore_claims::policy::EgressMode::Shadow,
                 bundles: reflector.cache(),
                 mode: mediatore_claims::policy::EgressMode::Shadow,
@@ -5640,7 +5695,7 @@ mod tests {
         /// The same policy at `version`, `grant` replacing the old one.
         async fn tighten(&self, version: u64, grant: mediatore_policy::types::AudienceGrant) {
             let mut content = self.payload.content.clone();
-            content.audiences = vec![grant];
+            content.audiences = vec![grant.into()];
             let now = Timestamp::now();
             let signed = mediatore_testkit::policy::signed_bundle(now, version, content);
             let cm = mediatore_testkit::policy::bundle_configmap(
@@ -7966,6 +8021,7 @@ mod tests {
             let nowhere = with_policy(
                 broker(tenant_map(), false).await,
                 PolicyEgress {
+                    eligibility: mediatore_claims::eligibility::EligibilityMode::Off,
                     follow: mediatore_claims::policy::EgressMode::Shadow,
                     bundles: Arc::new(BundleCache::watching(vec![POLICY_NS.to_owned()])),
                     mode: EgressMode::Enforce,
@@ -7997,6 +8053,7 @@ mod tests {
             let b = with_policy(
                 broker(tenant_map(), false).await,
                 PolicyEgress {
+                    eligibility: mediatore_claims::eligibility::EligibilityMode::Off,
                     follow: mediatore_claims::policy::EgressMode::Shadow,
                     bundles: Arc::new(BundleCache::watching(vec!["team-a".to_owned()])),
                     mode: EgressMode::Enforce,
@@ -8052,6 +8109,358 @@ mod tests {
             let logs = captured();
             assert!(logs.contains("outside its namespace's policy sources"));
             assert!(logs.contains("the bundle would not admit this audience"));
+        }
+    }
+
+    // ----- ADR-0066: eligibility by group, built in shadow only --------------------------------------------------
+
+    mod eligibility_shadow {
+        use super::*;
+        use mediatore_claims::eligibility::EligibilityMode;
+        use mediatore_claims::policy::{EgressMode, PolicySources};
+
+        /// The conformance policy's name.
+        const POLICY: &str = "agent";
+        /// The message of the eligibility line.
+        const LINE: &str = mediatore_claims::eligibility::LINE;
+
+        /// The conformance policy signed for `conformance` as schema v4 listing `groups` (or v3
+        /// when `None`), admitted, with `sandboxes` and `team-a` drawing from `conformance`.
+        async fn policy(groups: Option<&[&str]>, eligibility: EligibilityMode) -> PolicyEgress {
+            let now = Timestamp::now();
+            let content = mediatore_testkit::policy::fresh_bundle(now, 1)
+                .payload
+                .content;
+            let signed = match groups {
+                Some(g) => mediatore_testkit::policy::signed_bundle_v4(now, 2, content, g),
+                None => mediatore_testkit::policy::signed_bundle(now, 2, content),
+            };
+            let namespace = signed.payload.content.policy.namespace.clone();
+            let reflector = mediatore_claims::policy::BundleReflector::new(
+                mediatore_store::MemoryStore::shared(),
+                signed.keys,
+                vec![namespace.clone()],
+            );
+            let cm = mediatore_testkit::policy::bundle_configmap(
+                &namespace,
+                "agent-bundle",
+                &signed.envelope,
+            );
+            let outcome = reflector.applied_at(&cm, now).await;
+            assert!(
+                matches!(outcome, mediatore_claims::policy::Outcome::Admitted { .. }),
+                "{outcome:?}"
+            );
+            reflector.resynced(
+                &namespace,
+                &std::collections::HashSet::from(["agent-bundle".to_owned()]),
+            );
+            PolicyEgress {
+                bundles: reflector.cache(),
+                mode: EgressMode::Shadow,
+                audiences: EgressMode::Shadow,
+                follow: EgressMode::Shadow,
+                sources: PolicySources::new(BTreeMap::from([
+                    ("sandboxes".to_owned(), vec![namespace.clone()]),
+                    ("team-a".to_owned(), vec![namespace]),
+                ])),
+                eligibility,
+            }
+        }
+
+        fn with(mut b: Broker, pe: PolicyEgress) -> Broker {
+            Arc::get_mut(&mut b.st)
+                .expect("the state is not shared yet")
+                .policy_egress = Some(pe);
+            b
+        }
+
+        /// A create body naming `policy` with `ttl` in `namespace`.
+        fn body(namespace: Option<&str>, policy: Option<&str>, ttl: u32) -> serde_json::Value {
+            let mut body = request(namespace);
+            if let Some(p) = policy {
+                body["policy_ref"] = p.into();
+            }
+            body["ttl_seconds"] = ttl.into();
+            body
+        }
+
+        /// The whole answer to one create: status, every header, every byte of the body.
+        async fn answer(
+            b: &Broker,
+            token: &str,
+            body: &serde_json::Value,
+        ) -> (StatusCode, HeaderMap, Vec<u8>) {
+            let req = Request::builder()
+                .method("POST")
+                .uri("/v1/claims")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            let resp = user_router(b.st.clone()).oneshot(req).await.unwrap();
+            let status = resp.status();
+            let headers = resp.headers().clone();
+            let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+                .await
+                .unwrap()
+                .to_vec();
+            (status, headers, bytes)
+        }
+
+        /// The body with the values the broker draws fresh for each claim (the name and the
+        /// UIDs) put back to one spelling: the only bytes two creates may differ in.
+        fn drawn_fresh(body: &[u8]) -> String {
+            let mut text = String::from_utf8(body.to_vec()).unwrap();
+            let v: serde_json::Value = serde_json::from_slice(body).unwrap();
+            for key in ["name", "uid", "sandbox_uid"] {
+                if let Some(fresh) = v[key].as_str() {
+                    text = text.replace(fresh, &"x".repeat(fresh.len()));
+                }
+            }
+            text
+        }
+
+        fn decision_lines() -> Vec<String> {
+            captured()
+                .lines()
+                .filter(|l| l.contains(LINE))
+                .map(str::to_owned)
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn the_answer_is_byte_identical_with_the_check_judging_not_eligible_and_with_it_off()
+        {
+            capture_logs();
+            let single = || Namespaces::Single("sandboxes".into());
+            let judged = with(
+                broker(single(), false).await,
+                policy(Some(&["team-a"]), EligibilityMode::Shadow).await,
+            );
+            let absent = with(
+                broker(single(), false).await,
+                policy(Some(&["team-a"]), EligibilityMode::Off).await,
+            );
+            let mut answers = Vec::new();
+            // A claim that is created, and one refused after the check ran (`ttl_seconds: 0`).
+            for (req, created) in [
+                (body(None, Some(POLICY), 600), true),
+                (body(None, Some(POLICY), 0), false),
+            ] {
+                let a = answer(&judged, &judged.token("mallory", &["team-b"]), &req).await;
+                let b = answer(&absent, &absent.token("mallory", &["team-b"]), &req).await;
+                assert_eq!(a.0, b.0, "status");
+                assert_eq!(a.1, b.1, "every header");
+                if created {
+                    assert_eq!(a.0, StatusCode::CREATED, "not eligible, and created");
+                    assert_eq!(drawn_fresh(&a.2), drawn_fresh(&b.2), "the body");
+                    assert_eq!(a.2.len(), b.2.len());
+                } else {
+                    assert_eq!(a.0, StatusCode::BAD_REQUEST);
+                    assert_eq!(a.2, b.2, "the body, byte for byte");
+                }
+                answers.push((a, b));
+            }
+            // The check judged both requests, and the broker with it off wrote nothing.
+            let lines = decision_lines();
+            assert_eq!(lines.len(), 2, "{lines:#?}");
+            for line in &lines {
+                assert!(
+                    line.contains("eligibility=\"not_eligible\"") && line.contains("code=P015"),
+                    "{line}"
+                );
+            }
+            // And the same was created on each side: one sandbox, nothing more.
+            assert_eq!(judged.front.all().len(), 1);
+            assert_eq!(absent.front.all().len(), 1);
+        }
+
+        #[tokio::test]
+        async fn each_create_is_one_line_with_its_verdict_and_never_a_token_or_the_callers_groups()
+        {
+            capture_logs();
+            let b = with(
+                broker(Namespaces::Single("sandboxes".into()), false).await,
+                policy(Some(&["team-a", "team-z"]), EligibilityMode::Shadow).await,
+            );
+            let eligible = b.token("alice", &["CALLER-GROUP-CANARY", "team-a"]);
+            let outside = b.token("mallory", &["CALLER-GROUP-CANARY"]);
+            for (token, policy) in [
+                (&eligible, Some(POLICY)),
+                (&outside, Some(POLICY)),
+                (&eligible, None),
+                (&eligible, Some("no-such-policy")),
+            ] {
+                let (status, _, text) = b
+                    .user("POST", "/v1/claims", token, &[], body(None, policy, 600))
+                    .await;
+                assert_eq!(
+                    status,
+                    StatusCode::CREATED,
+                    "shadow refuses nothing: {text}"
+                );
+            }
+            let lines = decision_lines();
+            assert_eq!(lines.len(), 4, "{lines:#?}");
+            let want = [
+                ("eligibility=\"eligible\"", "matched_group=\"team-a\""),
+                ("eligibility=\"not_eligible\"", "code=P015"),
+                ("eligibility=\"not_judged\"", "reason=\"no_policy_ref\""),
+                (
+                    "eligibility=\"not_judged\"",
+                    "reason=\"policy_not_resolved\"",
+                ),
+            ];
+            for (line, (verdict, detail)) in lines.iter().zip(want) {
+                assert!(line.contains(verdict) && line.contains(detail), "{line}");
+                assert!(line.contains(&format!("issuer={}", b.idp.issuer)), "{line}");
+                assert!(line.contains("path=\"front_door\""), "{line}");
+                assert!(!line.contains("CALLER-GROUP-CANARY"), "{line}");
+                assert!(!line.contains("team-z"), "the policy's list: {line}");
+            }
+            assert!(lines[0].contains("subject=alice") && lines[1].contains("subject=mallory"));
+            assert!(lines[0].contains("policy_groups=Some(2)"), "{}", lines[0]);
+            let logs = captured();
+            for token in [&eligible, &outside] {
+                assert!(!logs.contains(token.as_str()), "a token reached a log line");
+            }
+        }
+
+        #[tokio::test]
+        async fn a_v3_bundle_is_not_judged_and_off_writes_nothing() {
+            capture_logs();
+            let v3 = with(
+                broker(Namespaces::Single("sandboxes".into()), false).await,
+                policy(None, EligibilityMode::Shadow).await,
+            );
+            let token = v3.token("alice", &["team-a"]);
+            created(
+                &v3.user(
+                    "POST",
+                    "/v1/claims",
+                    &token,
+                    &[],
+                    body(None, Some(POLICY), 600),
+                )
+                .await,
+            );
+            let lines = decision_lines();
+            assert_eq!(lines.len(), 1);
+            assert!(
+                lines[0].contains("reason=\"v3_bundle\"") && lines[0].contains("code=P016"),
+                "{}",
+                lines[0]
+            );
+            capture_logs();
+            let off = with(
+                broker(Namespaces::Single("sandboxes".into()), false).await,
+                policy(Some(&["team-a"]), EligibilityMode::Off).await,
+            );
+            let token = off.token("alice", &["team-a"]);
+            created(
+                &off.user(
+                    "POST",
+                    "/v1/claims",
+                    &token,
+                    &[],
+                    body(None, Some(POLICY), 600),
+                )
+                .await,
+            );
+            assert_eq!(decision_lines(), Vec::<String>::new(), "off writes nothing");
+        }
+
+        #[tokio::test]
+        async fn two_prefixed_issuers_are_read_in_their_own_spelling_and_the_line_names_the_issuer()
+        {
+            capture_logs();
+            // Both issuers qualify minted tokens (`dex:`, `gh:`); neither prefix is in the
+            // groups the broker decides on (ADR-0073 decision 4). The entry lists both issuers,
+            // so the bundle's names are read from each (ADR-0074 decision 4).
+            let both = Namespaces::Map(BTreeMap::from([(
+                "team-a".to_owned(),
+                grant(&["sandbox-users"], &[FIXTURE_ISSUER, SECOND_ISSUER]),
+            )]));
+            let (mut b, second) = with_second_issuer(broker(both, false).await).await;
+            {
+                let st = Arc::get_mut(&mut b.st).expect("the state is not shared yet");
+                let issuer = |url: &str, prefix: &str| IssuerConfig {
+                    url: url.to_owned(),
+                    backend: Backend::Sts,
+                    client_id: "mediatore".into(),
+                    subject_claim: "preferred_username".into(),
+                    required_group: None,
+                    required_groups: None,
+                    allow_any_authenticated: true,
+                    session: None,
+                    ca_file: None,
+                    entra: None,
+                    groups_claim: None,
+                    subject_prefix: Some(prefix.to_owned()),
+                };
+                st.validator = Validator::new(vec![
+                    issuer(&b.idp.issuer, "dex:"),
+                    issuer(&second.issuer, "gh:"),
+                ]);
+            }
+            let b = with(
+                b,
+                policy(Some(&["dex:platform", "platform"]), EligibilityMode::Shadow).await,
+            );
+            let at_second = second.token(serde_json::json!({
+                "aud": "mediatore",
+                "sub": "bob",
+                "preferred_username": "bob",
+                "groups": ["sandbox-users", "platform"],
+            }));
+            for token in [b.token("alice", &["sandbox-users", "platform"]), at_second] {
+                created(
+                    &b.user(
+                        "POST",
+                        "/v1/claims",
+                        &token,
+                        &[],
+                        body(Some("team-a"), Some(POLICY), 600),
+                    )
+                    .await,
+                );
+            }
+            let lines = decision_lines();
+            assert_eq!(lines.len(), 2, "{lines:#?}");
+            // The bare name matched, never the qualified twin, at either issuer.
+            for (line, issuer, subject) in [
+                (&lines[0], &b.idp.issuer, "alice"),
+                (&lines[1], &second.issuer, "bob"),
+            ] {
+                assert!(line.contains("matched_group=\"platform\""), "{line}");
+                assert!(line.contains(&format!("issuer={issuer}")), "{line}");
+                assert!(line.contains(&format!("subject={subject}")), "{line}");
+                assert!(line.contains("namespace=team-a"), "{line}");
+            }
+            // A bundle listing only the qualified spelling admits neither.
+            capture_logs();
+            let only_qualified = with(
+                broker(Namespaces::Single("sandboxes".into()), false).await,
+                policy(Some(&["dex:platform"]), EligibilityMode::Shadow).await,
+            );
+            let token = only_qualified.token("alice", &["platform"]);
+            created(
+                &only_qualified
+                    .user(
+                        "POST",
+                        "/v1/claims",
+                        &token,
+                        &[],
+                        body(None, Some(POLICY), 600),
+                    )
+                    .await,
+            );
+            let lines = decision_lines();
+            assert!(
+                lines.len() == 1 && lines[0].contains("eligibility=\"not_eligible\""),
+                "{lines:#?}"
+            );
         }
     }
 
@@ -9094,6 +9503,7 @@ mod tests {
                 st.egress.insert(AUDIENCE.into(), vec![endpoint]);
                 st.no_credential.insert(AUDIENCE.into());
                 st.policy_egress = Some(PolicyEgress {
+                    eligibility: mediatore_claims::eligibility::EligibilityMode::Off,
                     bundles: self.reflector.cache(),
                     mode: EgressMode::Shadow,
                     audiences,

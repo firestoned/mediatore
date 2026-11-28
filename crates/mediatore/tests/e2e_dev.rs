@@ -2325,6 +2325,16 @@ async fn bundle_policy(
     audiences: mediatore_claims::policy::EgressMode,
     synced: bool,
 ) -> (mediatore_api::PolicyEgress, String) {
+    bundle_policy_of(audiences, synced, None).await
+}
+
+/// [`bundle_policy`] signed as schema v4 with `subjects.groups` when `subjects` is given
+/// (notaio ADR-0026), as v3 otherwise.
+async fn bundle_policy_of(
+    audiences: mediatore_claims::policy::EgressMode,
+    synced: bool,
+    subjects: Option<&[&str]>,
+) -> (mediatore_api::PolicyEgress, String) {
     let now = jiff::Timestamp::now();
     let mut content = mediatore_testkit::policy::fresh_bundle(now, 1)
         .payload
@@ -2338,7 +2348,10 @@ async fn bundle_policy(
     }];
     grant.ttl_seconds = None;
     content.audiences = vec![grant];
-    let signed = mediatore_testkit::policy::signed_bundle(now, 2, content);
+    let signed = match subjects {
+        Some(groups) => mediatore_testkit::policy::signed_bundle_v4(now, 2, content, groups),
+        None => mediatore_testkit::policy::signed_bundle(now, 2, content),
+    };
     let policy = signed.payload.content.policy.clone();
     let reflector = mediatore_claims::policy::BundleReflector::new(
         MemoryStore::shared(),
@@ -2356,6 +2369,7 @@ async fn bundle_policy(
     reflector.applied_at(&cm, now).await;
     (
         mediatore_api::PolicyEgress {
+            eligibility: mediatore_claims::eligibility::EligibilityMode::Off,
             follow: mediatore_claims::policy::EgressMode::Shadow,
             bundles: reflector.cache(),
             mode: mediatore_claims::policy::EgressMode::Shadow,
@@ -2463,6 +2477,109 @@ async fn under_enforce_a_claim_needs_a_known_policy_that_grants_what_it_asks_for
         ok.status(),
         201,
         "a named policy that grants it, inside its lease"
+    );
+}
+
+// ----- ADR-0066: eligibility by group, built in shadow only, through the front door ----------------
+
+/// The broker over real listeners with the policy of [`bundle_policy_of`] (`policy.audiences`
+/// in shadow) and `policy.eligibility` at `eligibility`.
+async fn eligibility_harness(
+    subjects: Option<&[&str]>,
+    eligibility: mediatore_claims::eligibility::EligibilityMode,
+) -> (Harness, String) {
+    let (mut pe, policy) =
+        bundle_policy_of(mediatore_claims::policy::EgressMode::Shadow, true, subjects).await;
+    pe.eligibility = eligibility;
+    let h = Harness::start_full(
+        Namespaces::Single("sandboxes".into()),
+        None,
+        std::collections::BTreeMap::new(),
+        Some(pe),
+    )
+    .await;
+    (h, policy)
+}
+
+fn eligibility_lines() -> Vec<String> {
+    logs::captured()
+        .lines()
+        .filter(|l| l.contains(mediatore_claims::eligibility::LINE))
+        .map(str::to_owned)
+        .collect()
+}
+
+#[tokio::test]
+async fn eligibility_in_shadow_is_recorded_for_each_claim_and_refuses_none() {
+    use mediatore_claims::eligibility::EligibilityMode::Shadow;
+    logs::capture();
+    let (h, policy) = eligibility_harness(Some(&["team-a", "team-b"]), Shadow).await;
+    let eligible = h.login_in("alice", &["team-b"]);
+    let outside = h.login_in("mallory", &["team-c"]);
+    for token in [&eligible, &outside] {
+        let resp = h
+            .create_body(token, claim_body(AUDIENCE, Some(&policy), 3600))
+            .await;
+        assert_eq!(resp.status(), 201, "shadow refuses nothing");
+    }
+    let lines = eligibility_lines();
+    assert_eq!(lines.len(), 2, "one line per claim: {lines:#?}");
+    assert!(
+        lines[0].contains("eligibility=\"eligible\"")
+            && lines[0].contains("matched_group=\"team-b\"")
+            && lines[0].contains("subject=alice"),
+        "{}",
+        lines[0]
+    );
+    assert!(
+        lines[1].contains("eligibility=\"not_eligible\"")
+            && lines[1].contains("code=P015")
+            && lines[1].contains("subject=mallory"),
+        "{}",
+        lines[1]
+    );
+    let all = logs::captured();
+    for token in [&eligible, &outside] {
+        assert!(!all.contains(token.as_str()), "a token reached a log line");
+    }
+    for line in &lines {
+        assert!(
+            !line.contains(REQUIRED_GROUP) && !line.contains("team-c"),
+            "the caller's groups reached the line: {line}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn eligibility_in_shadow_does_not_judge_a_v3_bundle_and_off_writes_nothing() {
+    use mediatore_claims::eligibility::EligibilityMode::{Off, Shadow};
+    logs::capture();
+    let (h, policy) = eligibility_harness(None, Shadow).await;
+    let token = h.login_in("alice", &["team-a"]);
+    let resp = h
+        .create_body(&token, claim_body(AUDIENCE, Some(&policy), 3600))
+        .await;
+    assert_eq!(resp.status(), 201);
+    let lines = eligibility_lines();
+    assert!(
+        lines.len() == 1
+            && lines[0].contains("eligibility=\"not_judged\"")
+            && lines[0].contains("reason=\"v3_bundle\"")
+            && lines[0].contains("code=P016"),
+        "{lines:#?}"
+    );
+
+    logs::capture();
+    let (h, policy) = eligibility_harness(Some(&["team-a"]), Off).await;
+    let token = h.login_in("mallory", &["team-c"]);
+    let resp = h
+        .create_body(&token, claim_body(AUDIENCE, Some(&policy), 3600))
+        .await;
+    assert_eq!(resp.status(), 201);
+    assert_eq!(
+        eligibility_lines(),
+        Vec::<String>::new(),
+        "off writes nothing"
     );
 }
 

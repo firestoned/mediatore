@@ -27,7 +27,7 @@ Every value in the example is a placeholder.
 | `store` | `retention_secs` (at 900 or less the `no_record` class of ADR-0070 is not judged), `node_grace_secs`, `sealing` (`key_file` or `transit`) | [The store and the sealing](store-and-sealing.md) |
 | `token` | `rate_per_minute`: the per-claim limit on `POST /v1/token` | [Broker API](broker-api.md) |
 | `logs` | `enabled` (default `false`), `max_bytes` (the newest output kept per claim, 64 KiB to 4 MiB, default 1 MiB), `retention_secs` (default `store.retention_secs`): the workload output ring of ADR-0045, written only for a sandbox that opted in with `workload.logs` | [The store and the sealing](store-and-sealing.md), [the store guide](../guides/the-store.md#workload-output) |
-| `policy` | `trusted_keys[]`, `namespaces[]`, `egress` (`shadow` or `enforce`); `traps` (`off`, the default, `shadow` or `enforce`) and `traps_denied` (`loopback_port`, `private_range`, `unknown_host`, each `report`, the default, or `trip`): tripwires on the VM, ADR-0069 | [Policy](policy.md), [Tripwires](../guides/tripwires.md) |
+| `policy` | `trusted_keys[]`, `namespaces[]`, `egress` (`shadow` or `enforce`); `traps` (`off`, the default, `shadow` or `enforce`) and `traps_denied` (`loopback_port`, `private_range`, `unknown_host`, each `report`, the default, or `trip`): tripwires on the VM, ADR-0069; `eligibility` (`off`, the default, or `shadow`): whether each claim's requester holds one of the groups of the policy's signed v4 bundle, recorded in one log line and acted on nowhere, ADR-0066 (built in shadow only) | [Policy](policy.md), [Tripwires](../guides/tripwires.md), [The policy bundle](../guides/the-policy-bundle.md) |
 | `tripwires` | the twelve classes of ADR-0070 (`identity_shape`, `foreign_route`, `unknown_route`, `no_record`, `audience_outside_rendered`, `claim_never_issued`, `credential_outside_inject`, `deny_outside_rendered`, `gateway_port`, `gateway_output`, `pool_inbound`, `pool_output`), each `report` (the default) or `trip`; only `foreign_route`, `unknown_route` and `audience_outside_rendered` may be `trip` (`deny_outside_rendered` records only: the claim it names is the authorizer's word) | [Tripwires](../guides/tripwires.md#past-the-jail-the-twelve-classes-of-adr-0070) |
 | `dev_mode` | `true` for a local run only | everywhere a peer identity could be read from a header |
 
@@ -178,6 +178,8 @@ These rules live in `Config::parse` and the section types, so a bad file never r
 - a value of `policy.traps` other than `off`, `shadow` and `enforce`, an unknown class or value in `policy.traps_denied` or
   `tripwires`, and `policy.traps: enforce` under `policy.audience_definitions.mode: bundles`, where no audience can be
   marked `traps_body: skip` (ADR-0069 decision 5);
+- `policy.eligibility: enforce`, refused as `policy.eligibility: enforce is not built: ADR-0066 is built in shadow only;
+  set off or shadow`, and any value other than `off` and `shadow` (ADR-0066, amendment 1);
 - `trip` on a class of `tripwires` that records only: the four `segment` classes, the authorizer's two
   (`claim_never_issued`, `credential_outside_inject`), `deny_outside_rendered` (a claim named on the authorizer's word)
   and the two scoped to nothing (`identity_shape`, `no_record`), refused as `tripwires.<class>: trip is refused, this

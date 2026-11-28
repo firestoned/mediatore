@@ -3,7 +3,7 @@
 
 # 11: A policy's direct egress at the gateway
 
-**Status: in progress** (ADR-0030 accepted and implemented 2026-11-05; the live proof and the rollout are open; ADR-0054 accepted and implemented 2026-11-19, its live migration and its check by subject open). The first enforcing step of
+**Status: in progress** (ADR-0030 accepted and implemented 2026-11-05; the live proof and the rollout are open; ADR-0054 accepted and implemented 2026-11-19, its live migration open; its check by group, ADR-0066, built 2026-11-28 in shadow only, its live run and `enforce` open). The first enforcing step of
 [ADR-0026](../../docs/adr/0026-notaio-bundles-verified-in-shadow.md): the verified bundle's
 direct `egress[]` joins the audience endpoints in the claim's gateway allowlist, behind a
 `policy.egress: shadow | enforce` switch that defaults to shadow.
@@ -67,8 +67,14 @@ in the namespaces the sandbox's own namespace draws from: itself alone by defaul
       sandbox's sources" line that was not expected
       ([the policy bundle](../../docs/guides/the-policy-bundle.md#which-policies-a-namespace-may-name))
 - [ ] The migration walked on a live cluster that keeps policies apart from sandboxes
-- [ ] Eligibility by subject (ADR-0054 decision 7): not built. It waits on notaio's bundle
-      carrying `subjects.groups`, and gets an ADR of its own
+- [x] Eligibility by group (ADR-0054 decision 7), its ADR: ADR-0066, accepted 2026-11-28 and
+      built in shadow only (`policy.eligibility: off | shadow`, one log line per claim, nothing
+      refused), reading `subjects.groups` from notaio v0.9.0's schema v4 bundle
+- [ ] ADR-0066 in `shadow` on a live cluster: `policy.eligibility: shadow` on every broker, then
+      notaio's `NOTAIO_BUNDLE_SCHEMA=v4`, and the lines read until every `not_eligible` is
+      expected
+- [ ] ADR-0066 `enforce` (the `403`, `P015` and `P016` refusing): not built, its own change after
+      the shadow run
 
 ## A running claim and a newer bundle (ADR-0061)
 

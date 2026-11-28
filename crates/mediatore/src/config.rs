@@ -764,6 +764,12 @@ pub struct PolicySection {
     /// refuses, and only while `audiences` is `enforce` too.
     #[serde(default)]
     pub follow: mediatore_claims::policy::EgressMode,
+    /// Whether each claim request's eligibility by the policy's signed groups is recorded
+    /// (ADR-0066, built in shadow only): `off` (the default) reads and writes nothing,
+    /// `shadow` writes one line per request and refuses nothing. `enforce` is not built and
+    /// does not start, nor does any other value.
+    #[serde(default)]
+    pub eligibility: mediatore_claims::eligibility::EligibilityMode,
     /// Sandbox namespace to the policy namespaces it draws from (ADR-0054 decision 2).
     /// Optional: a namespace with no entry finds a policy in itself and nowhere else, and an
     /// entry is the whole of that namespace's sources (its own included only if listed).
@@ -3392,6 +3398,41 @@ listen: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }
             (EgressMode::Enforce, EgressMode::Shadow)
         );
         assert!(with_policy(&format!("policy:\n{keys}  follow: enforced\n")).is_err());
+    }
+
+    #[test]
+    fn the_policy_eligibility_switch_defaults_to_off_and_enforce_does_not_start() {
+        use mediatore_claims::eligibility::EligibilityMode;
+        let k = conformance_key();
+        let keys = format!("  trusted_keys: [{{ id: \"notaio:v1\", public_key: \"{k}\" }}]\n");
+        let default = with_policy(&format!("policy:\n{keys}"))
+            .unwrap()
+            .policy
+            .unwrap();
+        assert_eq!(
+            default.eligibility,
+            EligibilityMode::Off,
+            "ADR-0066 decision 1"
+        );
+        let on = with_policy(&format!("policy:\n{keys}  eligibility: shadow\n"))
+            .unwrap()
+            .policy
+            .unwrap();
+        assert_eq!(
+            (on.eligibility, on.audiences),
+            (
+                EligibilityMode::Shadow,
+                mediatore_claims::policy::EgressMode::Shadow
+            )
+        );
+        // Not built: refused at start, naming the ADR, never read as shadow.
+        let refused = with_policy(&format!("policy:\n{keys}  eligibility: enforce\n")).unwrap_err();
+        let said = format!("{refused:#}");
+        assert!(
+            said.contains("ADR-0066") && said.contains("enforce is not built"),
+            "{said}"
+        );
+        assert!(with_policy(&format!("policy:\n{keys}  eligibility: shadowed\n")).is_err());
     }
 
     #[test]

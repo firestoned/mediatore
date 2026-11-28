@@ -7,7 +7,7 @@
 binaries inside the jail that may use it: `git` reaches the Git host, `node` (Claude Code)
 reaches the Anthropic API, and `curl` in the same sandbox reaches neither. The decision is the
 guest's egress proxy's, made per connection from the process that holds the socket, against
-digests taken from the sandbox's image. Needs an ADR (ADR-0066, not yet written): it changes
+digests taken from the sandbox's image. Needs an ADR (not yet written, and without a number: ADR-0066, once meant for it, went to eligibility by group): it changes
 what the policy bundle carries, what `GET /v1/me` serves and what the jail trusts about a
 process.
 
@@ -37,7 +37,7 @@ calling binary.
 - A shared library is loaded with `mmap`, which Landlock's execute right does not cover:
   `LD_PRELOAD` of a file in `/work` runs inside any binary the workload starts.
 
-## The design questions for ADR-0066
+## The design questions for its ADR
 
 1. **Where the decision is made.** In the guest's egress proxy, the only enforcement point that
    can see processes. The gateway is unchanged: it still enforces the claim's whole allowlist,
@@ -76,7 +76,7 @@ calling binary.
 
 ### Phase 0: design
 
-- [ ] ADR-0066 written and accepted, the questions above decided. Phase 1 may become an ADR of
+- [ ] Its ADR written and accepted, the questions above decided. Phase 1 may become an ADR of
       its own that amends ADR-0024 and ADR-0051, if it lands before the rest.
 - [ ] CALM: the egress proxy's reading of the jail's processes and the image digests;
       `make calm-validate` and `make calm-diagrams`.

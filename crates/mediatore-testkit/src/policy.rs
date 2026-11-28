@@ -9,14 +9,16 @@
 
 use std::collections::BTreeMap;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use jiff::{SignedDuration, Timestamp};
 use k8s_openapi::api::core::v1::ConfigMap;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use sandboxpolicy_bundle::conformance;
 use sandboxpolicy_bundle::{
     AudienceBundleContent, AudienceBundlePayload, AudienceRef, BundleContent, BundleMeta,
-    BundlePayload, Ed25519Signer, Envelope, TrustedKeys, VerifyOptions, sign_audience_bundle,
-    sign_bundle, verify_bundle,
+    BundlePayload, Ed25519Signer, Envelope, Signature, Signer as _, Subjects, TrustedKeys,
+    VerifyOptions, sign_audience_bundle, sign_bundle, verify_bundle,
 };
 use sandboxpolicy_types::AudienceDefinition;
 
@@ -67,16 +69,74 @@ pub fn fresh_bundle(now: Timestamp, version: u64) -> FreshBundle {
 /// any edit of its integers never has.
 #[must_use]
 pub fn signed_bundle(now: Timestamp, version: u64, content: BundleContent) -> FreshBundle {
-    let payload = BundlePayload::new(
-        BundleMeta {
-            version,
-            issued_at: now - SignedDuration::from_hours(1),
-            not_after: now + SignedDuration::from_hours(1),
-        },
-        content,
+    let payload = BundlePayload::new(window(now, version), content)
+        .expect("the conformance content is canonical");
+    signed(payload)
+}
+
+/// `content` as a schema v4 bundle (notaio ADR-0026) at `version`, stating `groups` as its
+/// subjects, in the same window and under the same key as [`signed_bundle`]: the v4 twin of
+/// the v3 bundle that function signs for the same content.
+///
+/// # Panics
+/// As [`signed_bundle`], and if `content` already carries v4 members that make it
+/// non-canonical, which the conformance content never does.
+#[must_use]
+pub fn signed_bundle_v4(
+    now: Timestamp,
+    version: u64,
+    mut content: BundleContent,
+    groups: &[&str],
+) -> FreshBundle {
+    content.subjects = Some(Subjects {
+        groups: groups.iter().map(|g| (*g).to_owned()).collect(),
+    });
+    let payload = BundlePayload::new_v4(window(now, version), content)
+        .expect("v4 content with subjects is canonical");
+    signed(payload)
+}
+
+/// An envelope of `payload_type` carrying `payload` exactly as given, signed under [`KEY_ID`]
+/// over its DSSE pre-authentication encoding: a bundle of a schema or payload type notaio
+/// does not write, with a signature a reflector trusting [`fresh_bundle`]'s keys accepts, so
+/// whatever refuses it is the schema check and not the signature.
+///
+/// # Panics
+/// Never: the signer is in process.
+#[must_use]
+pub fn signed_raw(payload_type: &str, payload: &[u8]) -> Envelope {
+    let mut message = format!(
+        "DSSEv1 {} {payload_type} {} ",
+        payload_type.len(),
+        payload.len()
     )
-    .expect("the conformance content is canonical");
-    let signer = Ed25519Signer::from_seed(KEY_ID, [0x42; 32]);
+    .into_bytes();
+    message.extend_from_slice(payload);
+    let sig = signer().sign(&message).expect("signs");
+    Envelope {
+        payload_type: payload_type.to_owned(),
+        payload: STANDARD.encode(payload),
+        signatures: vec![Signature {
+            keyid: KEY_ID.to_owned(),
+            sig: STANDARD.encode(sig),
+        }],
+    }
+}
+
+fn window(now: Timestamp, version: u64) -> BundleMeta {
+    BundleMeta {
+        version,
+        issued_at: now - SignedDuration::from_hours(1),
+        not_after: now + SignedDuration::from_hours(1),
+    }
+}
+
+fn signer() -> Ed25519Signer {
+    Ed25519Signer::from_seed(KEY_ID, [0x42; 32])
+}
+
+fn signed(payload: BundlePayload) -> FreshBundle {
+    let signer = signer();
     let mut keys = TrustedKeys::new();
     keys.insert(KEY_ID, signer.verifying_key_bytes())
         .expect("a 32-byte key");

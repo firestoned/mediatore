@@ -8,7 +8,8 @@
 `PolicyFloor` resource, moved by compare-and-set on `resourceVersion`) · 2026-11-19 by
 [ADR-0054](0054-which-policies-a-namespace-may-name.md) (decision 6: a `policyRef` is resolved
 in the sources of the sandbox's namespace; the resolution across the watched namespaces is
-withdrawn)
+withdrawn) · 2026-11-28 (decision 1: the pin is notaio v0.9.0, bundle schema v3 and v4 both
+admitted, v4 not required)
 
 Roadmap 09, the first step of notaio's roadmap 00 (M3, "integrate the consumers"), phase 1.
 Decides notaio's question D3 (where a sandbox names its policy) for this phase. Amends
@@ -52,6 +53,15 @@ where they disagree is from refused sandboxes. This ADR reads the bundle first a
    dependency change, reviewed with the release notes of the notaio version it moves to. The
    conformance vectors run in this repository's tests through the same calls the broker makes,
    so the broker is shown to reach notaio's verdict on every vector, at the pinned tag.
+
+   *Amended 2026-11-28: the pin is notaio v0.9.0, the release that verifies bundle schema v3
+   and v4 (notaio ADR-0026, release N of its rollout). Both are admitted through the same
+   `admit`, each under its own payload type; `min_schema` stays at notaio's default, v3, so v4
+   is not required, and a v4 bundle is read exactly as its v3 twin (the `subjects` it adds are
+   carried, not enforced: that is [ADR-0066](0066-eligibility-by-group-from-the-signed-bundle.md)).
+   Any other schema or payload type is refused. The conformance tests run notaio's v3 and v4
+   vectors separately and check every accepted vector against the kit's schema of its version
+   (`crates/mediatore-policy/src/lib.rs`).*
 
 2. **The trusted keys are configuration, never cluster state.** A new `policy` section:
 

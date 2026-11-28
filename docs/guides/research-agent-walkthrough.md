@@ -203,7 +203,7 @@ kubectl -n sandboxes get sbpolicy research-agent
 # NAME             PROFILE    VERSION   READY   AGE
 # research-agent   standard   3         True    41s
 kubectl -n sandboxes get configmap research-agent-bundle -o jsonpath='{.data.bundle\.dsse\.json}' | jq .payloadType
-# "application/vnd.firestoned.sandboxpolicy.bundle.v3+json"
+# "application/vnd.firestoned.sandboxpolicy.bundle.v3+json"   (bundle.v4+json once notaio signs schema v4; the broker accepts both)
 ```
 
 The ConfigMap is named after the policy, carries one key, `bundle.dsse.json`, and the
