@@ -2886,6 +2886,121 @@ async fn the_pools_segment_events_are_taken_under_off_and_any_trap_event_is_stil
     );
 }
 
+// ---------- ADR-0078: a probe's source address named from the machine cache ----------
+
+/// A pool member `name` in `sandboxes` at `address`, publishing the test kit's endorsement
+/// certificate (the node registered under [`EK_HASH`]), as banlieue writes it.
+pub(crate) fn member_vm(name: &str, address: &str) -> banlieue_api::banlieue::VirtualMachine {
+    serde_json::from_value(serde_json::json!({
+        "metadata": {
+            "name": name, "namespace": "sandboxes", "uid": uuid::Uuid::new_v4().to_string(),
+            "labels": { "banlieue.io/pool": "pool" }
+        },
+        "spec": { "classRef": { "name": "small" }, "imageRef": { "name": "sandbox" } },
+        "status": {
+            "tpmEndorsementCertificates": [mediatore_testkit::ek::RSA_EK_PEM],
+            "addresses": [{ "type": "InternalIP", "address": address }]
+        }
+    }))
+    .expect("a VirtualMachine")
+}
+
+/// The managed claim with UID `uid`, `Bound` to `machine` in `sandboxes`.
+pub(crate) fn bound_vm_claim(
+    machine: &str,
+    uid: uuid::Uuid,
+) -> banlieue_api::banlieue::VirtualMachineClaim {
+    serde_json::from_value(serde_json::json!({
+        "metadata": {
+            "name": "sb-1", "namespace": "sandboxes", "uid": uid.to_string(),
+            "labels": { "app.kubernetes.io/managed-by": "mediatore" }
+        },
+        "spec": {
+            "poolRef": { "name": "pool" },
+            "subject": { "issuer": "https://issuer.example.com", "id": "octocat" },
+            "ttlSeconds": 600
+        },
+        "status": { "phase": "Bound", "virtualMachineRef": { "name": machine } }
+    }))
+    .expect("a VirtualMachineClaim")
+}
+
+/// ADR-0078 over the real listener: a pool VM reports an inbound probe from another member's
+/// address; its line names that member, its node and its bound claim, and that claim is not
+/// touched: no trip, no summary, still bound. An address nobody holds reads `unattributed`.
+#[tokio::test]
+async fn a_segment_events_source_is_named_on_its_line_and_the_named_claim_is_untouched() {
+    logs::capture();
+    let tripwires = mediatore_api::Tripwires {
+        mode: TrapsMode::Shadow,
+        ..mediatore_api::Tripwires::default()
+    };
+    let machines = tripwires.machines.clone();
+    let h = Harness::start_tripwires(
+        Namespaces::Single("sandboxes".into()),
+        None,
+        std::collections::BTreeMap::new(),
+        None,
+        None,
+        tripwires,
+    )
+    .await;
+    h.register_node().await;
+    let user = h.login("octocat");
+    let (status, claim) = h.create_claim(&user).await;
+    assert_eq!(status, 201);
+    let uid = claim.uid.expect("uid");
+    // The reporter is another pool VM, with no claim of its own.
+    h.register_node_as(OTHER_EK_HASH).await;
+    machines.replace_machines(&[member_vm("member-1", "192.0.2.7")]);
+    machines.replace_claims(&[bound_vm_claim("member-1", uid)]);
+
+    let (named, nobody) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let inbound = |id, address: &str| {
+        trip_event(
+            id,
+            &serde_json::json!({ "kind": "segment", "class": "pool_inbound", "target": { "port": 22 }, "source": "peer", "source_address": address, "count": 1 }),
+        )
+    };
+    let resp = h
+        .trip(
+            &node_svid_of(OTHER_EK_HASH),
+            "shadow",
+            &[inbound(named, "192.0.2.7"), inbound(nobody, "192.0.2.99")],
+        )
+        .await;
+    assert_eq!(resp.status(), 204);
+    let lines = logs::captured();
+    let line_of = |id: uuid::Uuid| {
+        lines
+            .lines()
+            .find(|l| l.contains("trip reported") && l.contains(&id.to_string()))
+            .expect("the event's line")
+    };
+    let line = line_of(named);
+    for want in [
+        "attribution=\"member\"".to_owned(),
+        "source_vm=member-1".to_owned(),
+        "source_namespace=sandboxes".to_owned(),
+        format!("source_node=spiffe://{TRUST_DOMAIN}/spire/agent/tpm/{EK_HASH}"),
+        format!("source_claim_uid={uid}"),
+        format!("node=spiffe://{TRUST_DOMAIN}/spire/agent/tpm/{OTHER_EK_HASH}"),
+        "claim_uid= ".to_owned(),
+    ] {
+        assert!(line.contains(&want), "{want} in {line}");
+    }
+    let line = line_of(nobody);
+    assert!(line.contains("attribution=\"unattributed\""), "{line}");
+    assert!(line.contains("source_claim_uid= "), "{line}");
+
+    let held = h.claim_named(&user, &claim.name).await;
+    assert_eq!(held.phase, mediatore_proto::ClaimPhase::Bound);
+    assert!(
+        held.tripped.is_none() && held.tripwires.is_none(),
+        "the named claim is not touched"
+    );
+}
+
 #[tokio::test]
 async fn a_trip_ends_the_claim_and_the_owner_sees_it() {
     let h = Harness::start_traps(TrapsMode::Enforce, DeniedSwitches::default()).await;

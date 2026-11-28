@@ -161,6 +161,7 @@ flowchart LR
     service-guest-agent -->|mTLS| service-mediatore-sandbox-api
     service-mediatore-sandbox-api -->|HTTPS| data-asset-claim-store
     service-egress-gateway --> service-egress-gateway
+    service-mediatore-sandbox-api -->|HTTPS| service-kubernetes-api
 ```
 
 <sub>Source: nodes and relationships in `architecture.json`.</sub>

@@ -834,6 +834,7 @@ os._exit(0 if os.read(r, 1) == b"x" else 4)
             decoy_ports: std::collections::BTreeSet::new(),
             metadata: false,
             trap_port: None,
+            chaff_ports: std::collections::BTreeSet::new(),
         }
     }
 

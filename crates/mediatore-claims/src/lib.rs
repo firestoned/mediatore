@@ -30,6 +30,7 @@ pub(crate) mod fakes;
 pub mod follow;
 pub mod kubestore;
 pub mod lease;
+pub mod machines;
 pub mod nodegc;
 pub mod policy;
 pub mod sandbox;

@@ -10,6 +10,10 @@ guest's egress proxy's, made per connection from the process that holds the sock
 digests taken from the sandbox's image. Needs an ADR (not yet written, and without a number: ADR-0066, once meant for it, went to eligibility by group): it changes
 what the policy bundle carries, what `GET /v1/me` serves and what the jail trusts about a
 process.
+[ADR-0081](../../docs/adr/0081-a-trip-names-the-executable-that-took-the-bait.md) (Proposed
+2026-11-28) would build phase 2's attribution (peer address, socket inode, holders, identity)
+for a trip alone, where nothing is refused on its account; this roadmap's ADR would then decide
+enforcement and the schema only.
 
 Builds on roadmap 06 (the jail's three layers: nsjail, Landlock, seccomp), roadmap 07 (the
 egress proxy, its routes and rules), roadmap 09 and 11 (the signed bundle and how a claim
@@ -107,6 +111,8 @@ Each item is test-first in `confine.rs` or `seccomp.rs`, and proven live in
       is never more permissive than the kernel (`rules/testing.md`, rule 2): a socket with no
       holder, two holders of one identity, two of different identities, a holder that has
       exited.
+      *2026-11-28: ADR-0081 (Proposed) would build this module first for a trip, where nothing is
+      refused on its account.*
 - [ ] Each request on a kept-alive connection checked again (question 5).
 - [ ] A live test on the build host: two binaries from one image, only one attributed to the
       route.

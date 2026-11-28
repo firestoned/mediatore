@@ -1284,6 +1284,22 @@ pub fn denied_cause(denied: &Denied, at: Timestamp) -> Option<Cause> {
     })
 }
 
+/// The use a connection to a chaff port is (ADR-0077 decision 4): kind `port`, the trap
+/// [`crate::draw::CHAFF_TRAP`], the chaff port as the target and `drawn` as its source, the
+/// port being the guest's own value. The address the workload dialled is not kept. No `denied`
+/// switch applies: it ends the run under `enforce` as any `port` use does.
+#[must_use]
+pub fn chaff_cause(port: u16, at: Timestamp) -> Cause {
+    Cause {
+        at,
+        kind: TripKind::Port,
+        trap: Some(crate::draw::CHAFF_TRAP.to_owned()),
+        class: None,
+        target: Some(TripTarget::Port(port)),
+        source: TripSource::Drawn,
+    }
+}
+
 /// The running reader of what the chain dropped: dropping it stops it. Drop it before the
 /// claim's table is unloaded.
 #[derive(Debug)]
@@ -1297,31 +1313,33 @@ impl Drop for DeniedReader {
     }
 }
 
-/// Read the `denied` sets of the claim's table every `every` with the VM's `nft` and note
-/// each destination that is a class on `trips`. The table must be loaded, with its draw.
+/// Read the `denied` sets and the chaff set of the claim's table every `every` with the VM's
+/// `nft` and note each destination that is a class, and each chaff port tried (ADR-0077), on
+/// `trips`. The table must be loaded, with its draw.
 #[must_use]
 pub fn watch_denied(trips: Trips, every: Duration) -> DeniedReader {
     watch_denied_with(Arc::new(SystemNft), trips, every)
 }
 
-/// [`watch_denied`] through `nft`. A read that fails is logged (the first, then one in 256)
-/// and tried again: the classes it feeds are observations, and the chain drops with or
-/// without a reader. It ends at a trip, when the table is the cut's.
+/// One read of the chaff set and the `denied` sets at a time, each bounded by this.
+const READ_WITHIN: Duration = Duration::from_secs(2);
+
+/// [`watch_denied`] through `nft`. A read that fails is logged (the first, then one in 256,
+/// for each of the two reads) and tried again: the chain drops with or without a reader, and
+/// the use of a chaff port stays counted in the kernel until it is read. It ends at a trip,
+/// when the table is the cut's.
 #[must_use]
 pub fn watch_denied_with(nft: Arc<dyn NftRunner>, trips: Trips, every: Duration) -> DeniedReader {
     let task = tokio::spawn(async move {
-        let mut failures: u64 = 0;
+        let (mut failures, mut chaff_failures): (u64, u64) = (0, 0);
         loop {
             tokio::time::sleep(every).await;
             if trips.is_tripped() {
                 return;
             }
-            let read = tokio::time::timeout(
-                Duration::from_secs(2),
-                crate::net::read_denied(nft.as_ref()),
-            )
-            .await
-            .unwrap_or_else(|_| Err(anyhow::anyhow!("nft did not answer in time")));
+            let read = tokio::time::timeout(READ_WITHIN, crate::net::read_denied(nft.as_ref()))
+                .await
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("nft did not answer in time")));
             match read {
                 Ok(denied) => {
                     failures = 0;
@@ -1337,6 +1355,27 @@ pub fn watch_denied_with(nft: Arc<dyn NftRunner>, trips: Trips, every: Duration)
                         tracing::warn!(error = %e, failures, "what the sandbox uid's chain dropped could not be read: the loopback_port and private_range classes see nothing");
                     }
                     failures = failures.saturating_add(1);
+                }
+            }
+            if trips.is_tripped() {
+                return;
+            }
+            let chaff = tokio::time::timeout(READ_WITHIN, crate::net::read_chaff(nft.as_ref()))
+                .await
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("nft did not answer in time")));
+            match chaff {
+                Ok(used) => {
+                    chaff_failures = 0;
+                    let at = Timestamp::now();
+                    for (port, packets) in used {
+                        trips.note_many(chaff_cause(port, at), packets);
+                    }
+                }
+                Err(e) => {
+                    if chaff_failures.is_multiple_of(256) && !trips.is_tripped() {
+                        tracing::warn!(error = %e, failures = chaff_failures, "the chaff ports' uses could not be read: they stay counted until a read succeeds");
+                    }
+                    chaff_failures = chaff_failures.saturating_add(1);
                 }
             }
         }
@@ -2482,6 +2521,96 @@ table inet mediatore_sandbox {\n  chain output {\n    type filter hook output pr
         tokio::time::sleep(Duration::from_millis(60)).await;
         assert!(noted.try_recv().is_err(), "the public address is no class");
         assert!(nft.calls().len() > 2, "it reads again after a failed read");
+        drop(reader);
+    }
+
+    #[test]
+    fn a_chaff_use_is_a_drawn_port_named_chaff_that_trips_whatever_the_denied_switches_say() {
+        let c = chaff_cause(45_001, Timestamp::now());
+        assert_eq!(
+            (
+                c.kind,
+                c.trap.as_deref(),
+                c.class,
+                c.target.clone(),
+                c.source
+            ),
+            (
+                TripKind::Port,
+                Some(crate::draw::CHAFF_TRAP),
+                None,
+                Some(TripTarget::Port(45_001)),
+                TripSource::Drawn
+            )
+        );
+        assert_eq!(crate::draw::CHAFF_TRAP, "chaff");
+        assert_eq!(c.reportable(TripMode::Enforce), Ok(()));
+        let report = TripReport {
+            mode: TripMode::Enforce,
+            events: vec![c.event(Uuid::new_v4(), 1, Some(12))],
+        };
+        assert_eq!(report.validate(), Ok(()), "the broker takes it as it is");
+        // Every `denied` class at `report` (the default) or at `trip`: a chaff use is no class.
+        for denied in [
+            DeniedSwitches::default(),
+            DeniedSwitches {
+                loopback_port: ClassAction::Trip,
+                private_range: ClassAction::Trip,
+                unknown_host: ClassAction::Trip,
+            },
+        ] {
+            let enforce = Shared::new(TripMode::Enforce, denied, Duration::from_secs(1));
+            assert_eq!(enforce.effect_of(&c), TripEffect::Tripped);
+            let shadow = Shared::new(TripMode::Shadow, denied, Duration::from_secs(1));
+            assert_eq!(shadow.effect_of(&c), TripEffect::WouldTrip);
+        }
+        // The last line names the trap, never the port.
+        let line = c.final_line();
+        assert!(
+            line.contains("trap chaff") && !line.contains("45001"),
+            "{line}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_reader_of_the_chain_notes_a_chaff_use_as_a_port_trip_with_its_count() {
+        let listing = |name: &str, elem: &str| {
+            format!(
+                r#"{{"nftables": [{{"metainfo": {{"json_schema_version": 1}}}}, {{"set": {{"family": "inet", "name": "{name}", "table": "mediatore_sandbox", "size": 1024{elem}}}}}]}}"#
+            )
+        };
+        let four = listing("denied4", "");
+        let six = listing("denied6", "");
+        let chaff = listing(
+            "chaff_used",
+            r#", "elem": [{"elem": {"val": 52000, "counter": {"packets": 0, "bytes": 0}}}, {"elem": {"val": 45001, "counter": {"packets": 2, "bytes": 120}}}]"#,
+        );
+        let nft = Arc::new(FakeNft::answering([
+            four.as_str(),
+            six.as_str(),
+            chaff.as_str(),
+        ]));
+        let (trips, mut noted) = Trips::recording(TripMode::Enforce);
+        let reader = watch_denied_with(nft.clone(), trips, Duration::from_millis(10));
+        let (cause, count) = tokio::time::timeout(Duration::from_secs(5), noted.recv())
+            .await
+            .unwrap()
+            .expect("a noted cause");
+        assert_eq!(cause.kind, TripKind::Port);
+        assert_eq!(cause.trap.as_deref(), Some("chaff"));
+        assert_eq!(cause.target, Some(TripTarget::Port(45_001)));
+        assert_eq!(cause.source, TripSource::Drawn);
+        assert_eq!(count, 2);
+        let calls = nft.calls();
+        assert!(
+            calls
+                .iter()
+                .any(|(args, _)| args.iter().any(|a| a == crate::net::CHAFF_USED)),
+            "the chaff set is read"
+        );
+        // The idle port is skipped, and a failing read of the chaff set notes nothing.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(noted.try_recv().is_err());
         drop(reader);
     }
 

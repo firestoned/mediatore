@@ -24,7 +24,7 @@ the proxy stopped at the guest's word; logs taken for a minute after a trip; an 
 a trip deletes nothing. Proven hermetically by `make check`; in kind by `make kind-e2e-sandbox`
 (the `status.tripwires` schema in both served versions and a tripped record failing its
 sandbox, with the status written by hand, not by the broker), on the merged tree:
-on slate after `make kind-delete`, `kind-e2e-tpm` PASS (attested as `spiffe://sandbox.test/spire/agent/tpm/e4f28760dd09942c82dc86b03248494247007215cd35a9173734e14865e354c9`), `kind-e2e-x509pop`, `kind-e2e-sandbox` (the tripped path: Failed with `Tripped=True`, no second claim) and `kind-e2e-gateway` PASS, and every suite of the default `kind-e2e` set PASS, 2026-11-27; live on the build host by the nine tripwire tests of
+on the build host after `make kind-delete`, `kind-e2e-tpm` PASS (attested as `spiffe://sandbox.test/spire/agent/tpm/e4f28760dd09942c82dc86b03248494247007215cd35a9173734e14865e354c9`), `kind-e2e-x509pop`, `kind-e2e-sandbox` (the tripped path: Failed with `Tripped=True`, no second claim) and `kind-e2e-gateway` PASS, and every suite of the default `kind-e2e` set PASS, 2026-11-27; live on the build host by the nine tripwire tests of
 `crates/mediatore/tests/jail_exec_live.rs` in a throwaway namespace (containment 54 ms, a debug
 build). Not proven: anything on a booted VM, the real guest end to end, `POST /v1/me/trip` and
 the broker's own status write against a real API server, the homelab soaks (*What must be
@@ -140,6 +140,14 @@ What already exists and shapes the answer:
    `a_connection_that_names_no_decoy_is_still_a_use_and_is_answered_nothing`, `decoy.rs`).*
 
    A file trap (tripping on read) is rejected: it fires on every agent that greps its home.
+
+   *Amended 2026-11-28, by [ADR-0077](0077-chaff-ports-a-probe-of-the-ports-the-jail-admits-is-a-use.md): the `port` row gains the chaff ports, 16 to 32 a
+   claim, admitted by Landlock beside the decoys, with nothing listening, nothing redirected
+   and nothing answering. The sandbox uid's new TCP connection to one, at any address and in
+   either family, is the use: the claim's table drops it and counts it by port in the set
+   `chaff_used`, which the guest reads every 250 ms, and the event is `kind: port`,
+   `trap: chaff`, the chaff port as the target, `source: drawn`. No handshake is needed and
+   other uids are untouched.*
 
 3. **The draw: random per claim, generated, and never off the VM.** At boot the guest draws, from
    the OS CSPRNG, how many traps of each kind (`port` two to five, `route` one to three,
@@ -615,6 +623,12 @@ What already exists and shapes the answer:
     them. Proven live: a connect to a closed loopback port that Landlock does not admit fails
     in the syscall and trips nothing, even with `loopback_port` at `trip`.*
 
+    *Amended 2026-11-28, by [ADR-0077](0077-chaff-ports-a-probe-of-the-ports-the-jail-admits-is-a-use.md): Landlock also admits the claim's chaff ports, and
+    the chaff rule comes before the `denied` rules, so a chaff port is never `loopback_port` or
+    `private_range`; at a public address, where a dropped connection was no class, it is now a
+    `port` use. The ports below 1024, the seeds and the ports common tools try on their own are
+    never chaff, so `loopback_port` still sees what it saw on every other admitted port.*
+
 11. **The broker instruments trips with OpenTelemetry, inside roadmap 15's invariants.** The
     audit line and the status are complete without any of this; OTel is the extra copy roadmap
     15 I-12 allows, and with no `telemetry` section (I-11) nothing below exists.
@@ -724,6 +738,14 @@ What already exists and shapes the answer:
   live (`the_jail_cannot_list_the_decoys_through_its_own_proc_net`,
   `crates/mediatore/tests/jail_exec_live.rs`). So the jail cannot list the decoy ports, but it
   can tell that traps are armed: accepted (R-94). The connect-port list is still unreadable.*
+
+  *Amended 2026-11-28: the follow-up is built, [ADR-0077](0077-chaff-ports-a-probe-of-the-ports-the-jail-admits-is-a-use.md). The admitted ports are now the
+  proxy's, the decoys, 80 with the metadata decoy, and 16 to 32 chaff ports, any connection to
+  which trips, so a sweep that tells admitted ports from refused ones by their errors is a use at
+  its first chaff port. The limit narrows and does not close: a probe that fails before any
+  packet (an address with no route) still shows which ports are admitted, and what it shows is
+  decoys and chaff mixed; a workload that connects to nothing but the proxy is caught by no
+  port trap. The confinement line's count is now of decoys and chaff together.*
 - **A third party can end a run.** A planted README that steers an agent into a decoy ends a run
   its requester wanted. That is the intended outcome and the cost; a workload that wants its own
   sandbox ended could already exit.
@@ -855,7 +877,7 @@ What already exists and shapes the answer:
     "the jail cannot read its connect ports or list the listeners" above holds for the
     connect-port list and the system-wide tables only (the consequences, corrected); the
     redirect carried every drawn port and the metadata address to the trap listener. In kind:
-    on slate after `make kind-delete`, `kind-e2e-tpm` PASS (attested as `spiffe://sandbox.test/spire/agent/tpm/e4f28760dd09942c82dc86b03248494247007215cd35a9173734e14865e354c9`), `kind-e2e-x509pop`, `kind-e2e-sandbox` (the tripped path: Failed with `Tripped=True`, no second claim) and `kind-e2e-gateway` PASS, and every suite of the default `kind-e2e` set PASS, 2026-11-27.*
+    on the build host after `make kind-delete`, `kind-e2e-tpm` PASS (attested as `spiffe://sandbox.test/spire/agent/tpm/e4f28760dd09942c82dc86b03248494247007215cd35a9173734e14865e354c9`), `kind-e2e-x509pop`, `kind-e2e-sandbox` (the tripped path: Failed with `Tripped=True`, no second claim) and `kind-e2e-gateway` PASS, and every suite of the default `kind-e2e` set PASS, 2026-11-27.*
 - *Added 2026-11-27: the red-team check is a SIMULATION, not the live number:
   `a_prober_that_avoids_every_seed_still_trips_within_n_probes_with_a_deployment_catalogue`
   (`draw.rs`) over 5000 seeded draws. With a hand-built deployment catalogue, a prober that
@@ -873,15 +895,21 @@ What already exists and shapes the answer:
 1. Whether `mediatore.io/trip-acknowledged` should require a role beyond `update` on the sandbox.
    *Amended 2026-11-27: moot while the annotation is struck (decision 9).*
 2. Whether a separate, narrower-read source for the deployment catalogue is worth its cost.
-3. Quarantine, if a responder's need for a live VM proves real.
+   *Amended 2026-11-28: proposed in
+   [ADR-0080](0080-the-deployments-trap-catalogue-read-by-the-broker-alone-each-claim-handed-a-slice.md),
+   which would supersede decision 4.*
+3. Quarantine, if a responder's need for a live VM proves real. *Amended 2026-11-28: proposed
+   in [ADR-0079](0079-a-tripped-vm-held-for-its-operator-running-and-cut-for-a-bounded-time.md).*
 4. Whether roadmap 16's attribution should add the tripping binary to the event, and under which
-   `source`.
+   `source`. *Amended 2026-11-28: proposed in
+   [ADR-0081](0081-a-trip-names-the-executable-that-took-the-bait.md).*
 5. *Added 2026-11-27.* The `traps` section and `traps.body` in notaio's bundles (decisions 4 and
    6), and with them `enforce` under bundle-defined audiences (decision 5).
 6. *Added 2026-11-27.* Whether Landlock should admit more ports so that `loopback_port` and
    `private_range` see more (decision 10). *Amended 2026-11-27: the maintainer's follow-up is
    an ADR for chaff ports, admitted by Landlock with nothing listening, any use of which
-   trips, which also answers the limit stated under "What it does not catch".*
+   trips, which also answers the limit stated under "What it does not catch". *Answered
+   2026-11-28 by [ADR-0077](0077-chaff-ports-a-probe-of-the-ports-the-jail-admits-is-a-use.md).**
 7. *Added 2026-11-27.* A record at the broker of a body the proxy refused because it could not
    scan it (decision 6, amended): it needs a change to the wire types, such as a `denied`
    class of its own.

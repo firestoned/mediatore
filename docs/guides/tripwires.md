@@ -29,7 +29,7 @@ on the VM the secret is each claim's draw, never the method; past the jail there
 
 | Kind | The trap | Decided by | Can end a sandbox |
 | --- | --- | --- | --- |
-| `port` | a drawn loopback port that answers with a plausible first line (an SSH banner, a Redis `-NOAUTH`, an HTTP `401`, ...), or `169.254.169.254:80`; nothing listens on either: the claim's table redirects the sandbox uid's connection to one trap listener, which answers as the decoy reached | the guest | yes, under `enforce` |
+| `port` | a drawn loopback port that answers with a plausible first line (an SSH banner, a Redis `-NOAUTH`, an HTTP `401`, ...), or `169.254.169.254:80`; nothing listens on either: the claim's table redirects the sandbox uid's connection to one trap listener, which answers as the decoy reached. And the chaff ports (ADR-0077, trap `chaff`): ports the jail may connect to that nothing answers on, at any address | the guest | yes, under `enforce` |
 | `route` | a drawn host the proxy carries as a route that is no audience, advertised in a variable such as `VAULT_ADDR` | the proxy | yes, under `enforce` |
 | `credential` | drawn values in a provider's shape, in the environment and in the files tools read them from, in the sandbox user's home (never `/work`) | the proxy, when a value appears in a request | yes, under `enforce` |
 | `denied` | none: the space no honest run reaches, by class (`loopback_port`, `private_range`, `unknown_host`) | the claim's table and the proxy | only for a class switched to `trip` |
@@ -37,8 +37,8 @@ on the VM the secret is each claim's draw, never the method; past the jail there
 | `segment` | a connection a host table dropped, by class (below) | the gateway's and the pool VM's host tables | never |
 
 A trap trips on **use**, never on discovery: listing the home, reading a bait file, `env`,
-`grep -r ~` trip nothing. Completing a handshake on a decoy port, naming a decoy route at the
-proxy, or sending a bait value in a request (as the method, in a header's name or value, the
+`grep -r ~` trip nothing. Completing a handshake on a decoy port, trying to connect to a chaff
+port at any address, naming a decoy route at the proxy, or sending a bait value in a request (as the method, in a header's name or value, the
 path, the query or the body) does.
 
 ## The modes, and the order to roll them out
@@ -86,10 +86,11 @@ broker holds when the report arrives.
 | Class | What it sees | Limit |
 | --- | --- | --- |
 | `unknown_host` | a request at the proxy for a host that is no route (still `404 no_route` to the workload, the same bytes as before) | sees every attempt: it is decided at the proxy |
-| `loopback_port` | a new TCP connection from the sandbox uid to a loopback port that is neither the proxy nor a decoy, dropped by the claim's table | only on a port Landlock admits: every other connect fails in the syscall and reaches no table |
+| `loopback_port` | a new TCP connection from the sandbox uid to a loopback port that is neither the proxy nor a decoy nor chaff, dropped by the claim's table | only on a port Landlock admits: every other connect fails in the syscall and reaches no table; a chaff port is a `port` use, never this class |
 | `private_range` | the same, to a private or link-local address | the same |
 
-A dropped connection to any other address is refused and logged by the chain and is no class.
+A dropped connection to any other address is refused and logged by the chain and is no class,
+unless its port is a chaff port, which is a `port` use at every address (ADR-0077).
 A `denied` count is packets (a SYN and its retransmissions).
 
 ## What the workload sees
@@ -120,13 +121,26 @@ Under `shadow` and `enforce`, and never under `off`:
   beside the proxy's port: the proxy's pull listener (`MEDIATORE_EGRESS_PULL_PORT`, default
   18129) when the claim's image is pulled through the proxy, and, when traps are armed, the trap
   listener on its drawn port. So it can tell that traps are armed, not where the decoys are.
+- **Chaff ports** ([ADR-0077](../adr/0077-chaff-ports-a-probe-of-the-ports-the-jail-admits-is-a-use.md)).
+  Beside the decoys the guest draws 16 to 32 chaff ports per claim, from 1024 to 65535, never a
+  seed port, never a port common tools try on their own (`HONEST_PROBES` in
+  `crates/mediatore-guest/src/draw.rs`: an OpenTelemetry exporter's 4317, a local model server's
+  11434, a debugger's 9229, the usual development servers' ports, ...) and never a port the claim
+  uses. The jail may connect to them; nothing listens, nothing is redirected and nothing answers:
+  the SYN is dropped and the connect waits. The sandbox uid's new connection to a chaff port at
+  **any address, in either family**, is counted by the claim's table in the set `chaff_used` and
+  read by the guest within 250 ms as a `port` use with the trap `chaff`. So a workload that sweeps
+  the ports to find which ones the jail admits (and so which are decoys) is caught by the sweep.
+  Other uids are untouched. What chaff does not catch: a workload that connects to nothing but
+  the proxy, and a probe that fails before any packet (an address with no route), which shows
+  which ports are admitted, decoys and chaff mixed, and not which are which.
 - **Decoy names.** A generated decoy port is named `dev-server` (the first port of every draw is
   one, and each later port about half the time), so a record or a log reading `trap=dev-server`
   several times for one claim is several generated ports, not one port tripped again.
-- **The connect ports.** Landlock admits the decoy ports beside the proxy's (and 80 with the
-  metadata decoy). The jail's `confinement applied; exec` line, which reaches the owner with the
-  workload's output, then reads `connect_ports=<n> ports`: the number of admitted ports, not
-  which.
+- **The connect ports.** Landlock admits the decoy ports and the chaff ports beside the proxy's
+  (and 80 with the metadata decoy). The jail's `confinement applied; exec` line, which reaches the
+  owner with the workload's output, then reads `connect_ports=<n> ports`: the number of admitted
+  ports, decoys and chaff together, not which.
 - **Bodies** on a route whose audience is not marked `traps_body: skip` pass through the
   proxy's matcher, which holds back a few bytes of each body until it is sure they are not part
   of a bait value. A body in an encoding the matcher cannot read is `415 unsupported_encoding`
@@ -208,6 +222,10 @@ tripwire counts are a lower bound of what was reported, not a ledger
   claim is never evicted.
 - **The counts are a lower bound, not a ledger.** A retry that lands on another broker replica
   may count twice, and a fold that fails is not retried; the audit line is the record.
+- `trap=chaff` (kind `port`) is a chaff port: nothing any tool has a reason to try, so a scan of
+  the ports, or a tool connecting on its own to a port it was never told about. Under `shadow` a
+  scan shows one entry per chaff port it touched. If the soak shows an honest tool tripping one,
+  the port belongs in `HONEST_PROBES`: open an issue.
 - An event's id is never shown. For a `credential` the trap is the catalogue entry's name
   (`aws`, `github`), never the value; the rest of the draw is never shown.
 
@@ -298,7 +316,9 @@ a start-up refusal would change that (ADR-0070 open question 5).
   the authorizer identity, which is why the class only records.
 - **`gateway_port`, `pool_inbound`.** A dropped SYN proves nothing about its sender, and the source
   address can be forged on a shared segment. Their worth is the pattern: one source reported by
-  several machines.
+  several machines. The line names who holds the source address, where exactly one live pool
+  member or declared host does ([below](#who-holds-a-probes-source-address)): read it as a hint,
+  never as proof of who sent the packet.
 - **`gateway_output`.** A gateway user dialled outside its lane. `gateway_output_refused` and
   `gateway_output_ipv6` can also move for an honest claim whose allowed name resolves to a
   refused or an IPv6 address.
@@ -341,11 +361,56 @@ since the amendment of 2026-11-27: the route takes a report of `segment` events 
 mode and answers `501` under `off` to anything else. A pool
 with no gateways loads no host table, and the reader then has nothing to read.
 
+### Who holds a probe's source address
+
+Since ADR-0078 the `gateway probe` line and the `trip reported` line of a `segment` event say who
+holds the source address, from a machine cache every broker replica keeps in memory: two watches,
+outside the Lease, on the `VirtualMachine`s labelled `banlieue.io/pool` and on the
+`VirtualMachineClaim`s mediatore created, in every namespace (the `list` and `watch` the claim
+watcher already has; no new verb). A member's addresses are its `status.addresses` of type
+`InternalIP` and its `status.heldAddresses`. A member is a candidate only while it is live: not
+being deleted, and powered on or with no observed power state.
+
+| `attribution` | When | The other fields |
+| --- | --- | --- |
+| `member` | exactly one live pool member holds the address, and no declared host | `source_vm`, `source_namespace`, `source_node` (the SPIRE agent ID of a TPM member, as the line's `node` field spells it; empty for a member of a `watcher.x509pop_pools` pool), `source_claim_uid` (the managed claim `Bound` to it, if exactly one) |
+| `host` | exactly one declared host holds it, and no live member | `source_host`, the declared name |
+| `ambiguous` | several candidates hold it | none: no candidate is named, not even the newest |
+| `unattributed` | nobody holds it, the event has no source address (`pool_output`, `gateway_output`, the remainder of a full set), or the cache has not completed its first listing | none |
+
+A `trip reported` line for any kind but `segment` has an empty `attribution`.
+
+An address banlieue gave to a newer member, while the old one is stopped or being deleted, names
+the newer member; two live members reporting one address are `ambiguous`. The cache follows the
+watches: a relist replaces it only when complete, a failed watch keeps the last complete view and
+logs `machine cache watch failed; the last complete view still answers (ADR-0078)` at `warn`, and
+a member's status that lags its guest is read as it stands. Without a cluster (`dev_mode`) the
+cache lists nothing, so only declared hosts are named.
+
+The hosts' bridges and the gateways are not pool members. Declare them so that a probe from the
+host itself reads as such:
+
+```yaml
+tripwires:
+  segment_hosts:
+    host-a: [192.0.2.1]
+    gateway-01: [192.0.2.11]
+```
+
+A name is `[a-z0-9.-]`, 1 to 63 bytes, with at most 16 addresses; at most 64 names; an address
+that does not parse, a name with no address, or an address under two names refuses the start.
+
+Attribution is on the line and nowhere else. It changes no answer of either route, ends nothing,
+and puts nothing on a claim: the named claim's `status.tripwires`, its record and its summary are
+not touched, and `source_claim_uid` is a field of its own beside the event's empty `claim_uid`. A
+forged source names whoever holds that address; that is why it is a hint.
+
 Limits: TCP only for `gateway_port` and the pool's classes; a full set still counts but names
 nothing, and what it could not name is a count with no port (logged, never reported under an
 invented port); the resets of a set and of the counters are separate dumps, so a remainder may
-be off by a packet; the source address is never mapped to a node yet (every probe is
-unattributed); root on the gateway or the pool VM can silence the reader. No probe ends anything,
+be off by a packet; the holder of a probe's source address is named from a machine cache
+(ADR-0078), a hint that a forged address or a status lagging its guest can make wrong, and never
+acted on; root on the gateway or the pool VM can silence the reader. No probe ends anything,
 whatever the configuration says.
 
 ## Configuration reference
@@ -356,6 +421,7 @@ whatever the configuration says.
 | `policy.traps_denied` | a map of `loopback_port`, `private_range`, `unknown_host` to `report` or `trip` | `report` for each | an unknown class or value (`unknown field`, `unknown variant`) |
 | `audiences[].traps_body` | `match`, `skip` | `match` | an unknown value; only for audiences defined in the broker's file |
 | `tripwires` | a map of the twelve classes above to `report` or `trip` | `report` for each | an unknown class or value; `trip` on a class that may not trip |
+| `tripwires.segment_hosts` | a map of a name (`[a-z0-9.-]`, 1 to 63 bytes) to the addresses it holds on the sandbox segment (ADR-0078) | empty | an address that does not parse; a name outside the grammar or with no address; an address under two names; more than 64 names or 16 addresses under one |
 | `store.retention_secs` | seconds | 3600 | nothing: at 900 or less `no_record` is not judged, and the start says so |
 
 The refusals, verbatim:
@@ -363,6 +429,7 @@ The refusals, verbatim:
 ```text
 policy.traps is enforce but policy.audience_definitions.mode is bundles: a bundle-defined audience cannot be marked traps_body: skip yet, so an agent that quoted a bait value to its model API would end its own run; run shadow, or define the audiences in this file (ADR-0069 decision 5)
 tripwires.<class>: trip is refused, this class records only: a segment class proves nothing about its sender, a class of the authorizer's or on its word (a reported deny names a claim any holder of the shared authorizer identity could name) must not end one, and a class with no scope has no claim to end (ADR-0070 decisions 5 and 6); set it to report or leave it out
+tripwires.segment_hosts: <why> (ADR-0078 decision 5)
 ```
 
 Mark a model API `traps_body: skip`, so an agent that read a bait file and quoted it to its model
@@ -409,7 +476,7 @@ broker's request span names the method and the matched route template only
 
 | Line | Level |
 | --- | --- |
-| `trip reported` (claim_uid, subject, node, id, mode, effect, kind, trap, class, target, source, source_address, count, containment_ms, at): the audit line of ADR-0069; for a `segment` event `claim_uid` and `subject` are empty, since it is never put on a claim | `warn` when either mode is `enforce` or the kind is `segment`, else `info` |
+| `trip reported` (claim_uid, subject, node, id, mode, effect, kind, trap, class, target, source, source_address, attribution, source_vm, source_namespace, source_node, source_claim_uid, source_host, count, containment_ms, at): the audit line of ADR-0069; for a `segment` event `claim_uid` and `subject` are empty, since it is never put on a claim, and the `source_*` fields name who holds its source address (ADR-0078) | `warn` when either mode is `enforce` or the kind is `segment`, else `info` |
 | `claim ended by a trip: entry retracted, record revoked (ADR-0069 decision 9)` | `warn` |
 | `tripped could not be put on the record; the claim is released all the same` | `warn` |
 | `release after a trip failed; the claim is not released` | `error` |
@@ -425,7 +492,10 @@ broker's request span names the method and the matched route template only
 | `a refusal no honest build earns (ADR-0070 decision 8)` (class, scope, action, peer, route, claim_uid, audience, authority, count, first_at, last_at): the audit line of ADR-0070, one a minute per class, peer and claim | `warn` |
 | `classified refusals of more peers than the table holds: counted, their peers not kept (ADR-0070 decision 8)` | `warn` |
 | `the claim of a node could not be read for a classified refusal; nothing is recorded on it` | `warn` |
-| `gateway probe` (kind, class, gateway, count, port, source_address, user, at) | `warn` |
+| `gateway probe` (kind, class, gateway, count, port, source_address, attribution, source_vm, source_namespace, source_node, source_claim_uid, source_host, user, at): who holds the source address as in [Who holds a probe's source address](#who-holds-a-probes-source-address) | `warn` |
+| `machine cache watch failed; the last complete view still answers (ADR-0078)` (what, error) | `warn` |
+| `machine cache running: probes' source addresses are named from it (ADR-0078)` | `info` |
+| `a probe's source address is named from the machine cache and these declared hosts, a hint on its line that ends nothing (tripwires.segment_hosts, ADR-0078)` (segment_hosts) | `info` |
 
 **The guest and the proxy, on the VM** (`journalctl -u mediatore-guest`):
 
@@ -484,7 +554,6 @@ Built and `off` or `report` by default: everything above but the items below.
   `SandboxAudience` bundle** and the admission code `P017`: the bundle schemas are notaio's. A draw
   is made from the public seeds, generated entries and entries derived from the claim's routes;
   see [the policy bundle](the-policy-bundle.md#traps-not-yet-in-the-bundle).
-- **The mapping of a probe's source address to a node**: deferred; every probe is unattributed.
 - **Chaff ports** (below): a follow-up ADR.
 
 **Proven, and how:**
@@ -495,11 +564,12 @@ Built and `off` or `report` by default: everything above but the items below.
 | Every drawn port trips from a real jail, through the redirect to the trap listener; nothing open under `off`; after a trip nothing of the uid leaves and no jail process remains; containment with the broker unreachable; bait files and `env` trip nothing; a closed port Landlock refuses trips nothing; the jail cannot read its connect ports, and lists no decoy port in any table it can read (the listeners it sees are the trap listener, which Landlock refuses it, and the proxy's); the metadata redirect | live on the build host: nine tests of `crates/mediatore/tests/jail_exec_live.rs` in a throwaway namespace, a debug build ([testing](testing.md#tripwires-by-hand-on-the-build-host)) |
 | The host tables' counters move per class and not for honest traffic; the reader holds `CAP_NET_ADMIN` alone | live on the build host's kernel, in fresh network namespaces; the image checks |
 | `status.tripwires` in both served versions and a `tripped` record failing its sandbox | kind: `make kind-e2e-sandbox` (the status written by hand, as the broker writes it) |
+| Who holds a probe's source address (ADR-0078): one, none, several, a reused address, a member not live, an incomplete listing; the fields on both lines; no answer changed, no claim touched | hermetic: `crates/mediatore-claims/src/machines.rs`, the route tests, `e2e_dev.rs` and `e2e_gateway.rs` over the real listeners |
 
 **Not proven:** anything on a booted VM; the real guest end to end with the real proxy;
 `POST /v1/me/trip`, the classifier and the broker's own status write against a real API server
 (no kind tier runs with traps on); the gateway's probes and the request span outside the
-process; a release-build containment figure; Azure; the shadow soak; `enforce` with Claude Code
+process; the machine cache's watches against a real API server and a probe named from them; a release-build containment figure; Azure; the shadow soak; `enforce` with Claude Code
 on the homelab; the matcher's latency and memory.
 
 ## Known limits

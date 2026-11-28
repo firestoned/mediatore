@@ -3,7 +3,7 @@
 
 # 17: Tripwires: a decoy the workload takes ends its sandbox
 
-**Status: in progress: built 2026-11-27, `off` by default; the live proof on a VM and the homelab soaks remain** (opened 2026-11-26). A sandbox carries decoys that no honest run of its
+**Status: in progress: built 2026-11-27, `off` by default, chaff ports added 2026-11-28 (ADR-0077); the live proof on a VM and the homelab soaks remain** (opened 2026-11-26). A sandbox carries decoys that no honest run of its
 task has a reason to use: a loopback port that looks like a service, a route on the egress proxy
 that looks like an internal API, a credential that looks real. Every trap lives on the VM and is
 decided there, before anything leaves it: the gateway never sees a decoy, a bait value or the
@@ -22,7 +22,8 @@ ADR-0025), roadmap 08 (the `AgentSandbox` status), and roadmaps 09 and 11 (the s
 Roadmap 10's gateway is not changed. Uses ADR-0033's ending of a claim from the
 guest, ADR-0045's log stream and ADR-0064's status summary. The OpenTelemetry part waits on
 roadmap 15's export ADR and phase 1 foundations. Roadmap 16, when it lands, lets a trip name the binary that took
-the bait.
+the bait ([ADR-0081](../../docs/adr/0081-a-trip-names-the-executable-that-took-the-bait.md), Proposed 2026-11-28, would
+build that attribution for trips first).
 
 ## Why
 
@@ -484,6 +485,19 @@ by default (decision 10); the canaries are not kept or hashed after the claim.
       (`a_prober_that_avoids_every_seed_still_trips_within_n_probes_with_a_deployment_catalogue`, 5000 seeded draws:
       worst 6 probes, mean 1.59 with a hand-built catalogue). The live number needs a deployment catalogue, which needs
       notaio. A follow-up ADR on chaff ports is owed first (ADR-0069, "What it does not catch").*
+      *2026-11-28: the chaff-ports ADR is built (ADR-0077, the item below); the live red-team number still needs a
+      deployment catalogue.*
+- [x] Chaff ports: 16 to 32 ports per claim that Landlock admits and nothing listens on, a new connection of the
+      sandbox uid to one at any address and in either family a `port` use named `chaff`, so a probe of the admitted
+      ports is itself a use (ADR-0077, closing the limit ADR-0069 names under "What it does not catch" in part; R-83
+      narrowed, not closed).
+      (2026-11-28: `chaff_is_drawn_within_its_bounds_and_off_every_reserved_port`,
+      `a_sweep_of_the_admitted_ports_meets_chaff_before_it_learns_the_decoys` (a simulation: chaff first in 87 % of
+      20,000 draws) in `draw.rs`; `the_chaff_ports_are_dropped_and_counted_for_the_sandbox_uid_at_every_address`,
+      `the_chaff_set_is_read_and_zeroed_and_idle_ports_are_skipped` in `net.rs`;
+      `a_chaff_use_is_a_drawn_port_named_chaff_that_trips_whatever_the_denied_switches_say` in `trip.rs`; `nft -c` on
+      the build host; live in a throwaway namespace on the build host, `a_connect_to_a_chaff_port_is_a_use_at_any_address`
+      and `a_probe_of_a_chaff_port_ends_the_run_under_enforce`. Not run on a VM.)
 
 ### Phase 4: decoy routes and bait credentials at the proxy
 

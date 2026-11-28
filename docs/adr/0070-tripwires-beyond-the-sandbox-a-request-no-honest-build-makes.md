@@ -15,7 +15,9 @@ list on ADR-0062's batch (`image/gateway/nftables.conf.in`,
 segment reader (`image/host-table`, `crates/mediatore-guest/src/segment.rs`), the wire types
 (`crates/mediatore-proto/src/trip.rs`). **Not built:** the OpenTelemetry of decision 8 (no
 exporter, roadmap 15) and the mapping of a probe's source address to a node (deferred,
-decision 8). Proven hermetically by `make check` (`e2e_dev.rs` for each claim-scoped class at
+decision 8; *built 2026-11-28 by
+[ADR-0078](0078-a-probes-source-address-named-from-a-machine-cache-a-hint-never-a-verdict.md),
+as a hint on the line*). Proven hermetically by `make check` (`e2e_dev.rs` for each claim-scoped class at
 both values, `e2e_gateway.rs` for the probes over the real listener); the tables' renders by
 `make host-table-test` and `make gateway-render-check`, and on the build host's kernel in fresh
 network namespaces (the counters move per class and not for honest traffic, the reader's unit
@@ -23,7 +25,7 @@ holds `CAP_NET_ADMIN` alone); both images built and checked. A fix round of the 
 (decisions 3, 4, 6 and 8 amended again): `deny_outside_rendered` records only, a `segment`
 event is never put on a claim, the decisions route is limited per gateway identity and in the
 batches it judges at once, and the probes summary is opened without following a link or
-waiting on a FIFO. In kind, on the merged tree: on slate after `make kind-delete`, `kind-e2e-tpm` PASS (attested as `spiffe://sandbox.test/spire/agent/tpm/e4f28760dd09942c82dc86b03248494247007215cd35a9173734e14865e354c9`), `kind-e2e-x509pop`, `kind-e2e-sandbox` (the tripped path: Failed with `Tripped=True`, no second claim) and `kind-e2e-gateway` PASS, and every suite of the default `kind-e2e` set PASS, 2026-11-27. Not proven: a booted gateway
+waiting on a FIFO. In kind, on the merged tree: on the build host after `make kind-delete`, `kind-e2e-tpm` PASS (attested as `spiffe://sandbox.test/spire/agent/tpm/e4f28760dd09942c82dc86b03248494247007215cd35a9173734e14865e354c9`), `kind-e2e-x509pop`, `kind-e2e-sandbox` (the tripped path: Failed with `Tripped=True`, no second claim) and `kind-e2e-gateway` PASS, and every suite of the default `kind-e2e` set PASS, 2026-11-27. Not proven: a booted gateway
 or pool VM, the classifier and the broker's status write against a real API server, the soak
 across an upgrade (*What must be proven*). Threat-model pass 2026-11-27 (A-39 to A-43, R-78 to
 R-95) · **Date:** 2026-11-26
@@ -387,6 +389,17 @@ What already exists and shapes the answer:
    amendment still holds for those: a foreign peer's report that is not `segment` alone is the
    `501` under `off`, unclassified; one that is `segment` alone is refused as under `shadow`.*
 
+   *Amended 2026-11-28 by
+   [ADR-0078](0078-a-probes-source-address-named-from-a-machine-cache-a-hint-never-a-verdict.md):
+   the source address is now named, where exactly one holder is known, from a machine cache every
+   replica keeps by watching the pool members and the managed claims (no API read on either
+   route). The `gateway probe` line and the `trip reported` line of a `segment` event gain
+   `attribution` (`member`, `host`, `unattributed`, `ambiguous`) and `source_vm`,
+   `source_namespace`, `source_node`, `source_claim_uid`, `source_host`. "Maps to a node where the
+   `VirtualMachine` reports that address" above holds only for exactly one live holder. Nothing
+   else of this decision changes: the event is still on no claim (its `claim_uid` stays empty),
+   folded nowhere, `report` only, and no answer of either route changes.*
+
 9. **Never log what the peer sent.** ADR-0069 decision 12 holds here: the canary test plants a
    token, a path and a header on every classified route and asserts none appears in a log line,
    a status or an exported signal.
@@ -531,6 +544,8 @@ What already exists and shapes the answer:
    to ADR-0069's draw if it is built.
 4. Whether `pool_inbound` reports from several VMs naming one source should raise a condition on
    that source's `AgentSandbox`, and at what count. *Amended 2026-11-27: it needs the mapping of
-   a source address to a node first, deferred (decision 8).*
+   a source address to a node first, deferred (decision 8).* *Amended 2026-11-28: that mapping exists
+   (ADR-0078), as a hint on the line; the condition is still not decided, and nothing is written
+   on an attribution.*
 5. *Added 2026-11-27.* A scope of its own for `unknown_route`, or a start-up refusal, so that it
    cannot be set to `trip` while version skew is its known honest source (decision 7, amended).

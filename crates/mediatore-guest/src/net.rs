@@ -24,8 +24,11 @@
 //! sockets names no decoy); every other uid refused a new connection to a decoy port, logged
 //! and counted (decision 2, amended: a connection the trap listener accepts is therefore the
 //! sandbox uid's, to a decoy, with no lookup); and two sets that hold what the chain's end
-//! dropped, which the guest reads for the `denied` classes (decision 10). With no decoy none
-//! of it is rendered and the script is, byte for byte, what it was before the ADR.
+//! dropped, which the guest reads for the `denied` classes (decision 10). Beside the decoys,
+//! the claim's chaff ports (ADR-0077, [`Ruleset::with_chaff`]): nothing listens on them and
+//! nothing is redirected; the sandbox uid's new connection to one, at any address, is dropped
+//! and counted by port in a set the guest reads as a use. With no decoy none of it is rendered
+//! and the script is, byte for byte, what it was before the ADR.
 //!
 //! Every `nft` process goes through an [`NftRunner`], so the scripts and the reads are tested
 //! against a recorder and the guest runs [`SystemNft`].
@@ -64,6 +67,13 @@ const LOG_DECOY_OTHER_UID: &str = "mediatore-sandbox decoy other uid: ";
 const LOG_TRAP_DIRECT: &str = "mediatore-sandbox trap port direct: ";
 /// The set of the decoy ports on loopback. Nothing listens on them.
 pub const DECOYS: &str = "decoys";
+/// The set of the claim's chaff ports (ADR-0077). Nothing listens on them.
+pub const CHAFF: &str = "chaff";
+/// The set the sandbox uid's chain counts a use of a chaff port in, by port (ADR-0077 decision
+/// 3): keyed by the port alone, so nothing but a chaff port can fill it.
+pub const CHAFF_USED: &str = "chaff_used";
+/// How many elements [`CHAFF_USED`] holds: every chaff port a claim may have, and more.
+const CHAFF_USED_SIZE: usize = 64;
 /// The sets the chain's end keeps what it dropped in, for the `denied` classes (ADR-0069
 /// decision 10): a new TCP connection's destination address and port, IPv4 and IPv6.
 pub const DENIED4: &str = "denied4";
@@ -219,6 +229,11 @@ pub struct Ruleset {
     /// 2026-11-27): reached only through the redirect, never by a connection made to it, so a
     /// listing of the VM's sockets names this port and no decoy.
     pub trap_port: Option<u16>,
+    /// The claim's chaff ports (ADR-0077): admitted by Landlock beside the decoys, nothing
+    /// listening and nothing redirected. A new connection of the sandbox uid to one, at any
+    /// address and in either family, is dropped and counted in [`CHAFF_USED`], which the
+    /// guest reads as a use. Empty with no traps armed.
+    pub chaff_ports: BTreeSet<u16>,
 }
 
 impl Ruleset {
@@ -309,6 +324,7 @@ impl Ruleset {
             decoy_ports: BTreeSet::new(),
             metadata: false,
             trap_port: None,
+            chaff_ports: BTreeSet::new(),
         })
     }
 
@@ -415,6 +431,59 @@ impl Ruleset {
         self.decoy_ports = ports.iter().copied().collect();
         self.metadata = metadata;
         self.trap_port = Some(trap_port);
+        Ok(self)
+    }
+
+    /// The list with the claim's chaff ports (ADR-0077 decisions 2 and 3): a new connection of
+    /// the sandbox uid to one, at any address and in either family, is dropped and counted in
+    /// [`CHAFF_USED`] by the chain only the sandbox uid jumps to. Nothing listens on a chaff
+    /// port and nothing is redirected from one; every other uid is untouched. No port returns
+    /// the list unchanged.
+    ///
+    /// # Errors
+    /// Chaff on a list that carries no draw, or a second time; a port below 1024, twice, on a
+    /// port the list uses ([`Self::ports`], the trap listener's among them), on a decoy port,
+    /// or on 80 with the metadata decoy: each would be a use of something real or of another
+    /// trap. More ports than [`CHAFF_USED`] holds. A draw that names such a port was made
+    /// without them reserved; it is refused, never trimmed.
+    pub fn with_chaff(mut self, ports: &[u16]) -> anyhow::Result<Self> {
+        if ports.is_empty() {
+            return Ok(self);
+        }
+        anyhow::ensure!(
+            self.is_armed(),
+            "chaff on a ruleset that carries no draw (ADR-0077 decision 2)"
+        );
+        anyhow::ensure!(
+            self.chaff_ports.is_empty(),
+            "the ruleset already carries chaff (ADR-0077 decision 2: one draw a claim)"
+        );
+        anyhow::ensure!(
+            ports.len() <= CHAFF_USED_SIZE,
+            "more chaff ports than the claim's table counts (ADR-0077 decision 3)"
+        );
+        let mut taken: BTreeSet<u16> = self.ports().into_iter().collect();
+        taken.extend(&self.decoy_ports);
+        taken.extend(self.trap_port);
+        if self.metadata {
+            taken.insert(METADATA_PORT);
+        }
+        let mut chaff = BTreeSet::new();
+        for &port in ports {
+            anyhow::ensure!(
+                port >= 1024,
+                "a chaff port below 1024 (ADR-0077 decision 2)"
+            );
+            anyhow::ensure!(
+                !taken.contains(&port),
+                "a chaff port on a port this claim or its draw already uses (ADR-0077 decision 2)"
+            );
+            anyhow::ensure!(
+                chaff.insert(port),
+                "a chaff port drawn twice (ADR-0077 decision 2)"
+            );
+        }
+        self.chaff_ports = chaff;
         Ok(self)
     }
 
@@ -536,6 +605,14 @@ impl Ruleset {
                 let _ = writeln!(out, "    {rule}");
             }
         }
+        if !self.chaff_ports.is_empty() {
+            // ADR-0077 decision 3: the SYN is the use, at any address and in either family,
+            // counted by port before `connect` returns; nothing logged, nothing answered.
+            let _ = writeln!(
+                out,
+                "    tcp dport @{CHAFF} ct state new update @{CHAFF_USED} {{ tcp dport }} counter drop"
+            );
+        }
         if armed {
             render_denied_rules(&mut out);
         }
@@ -558,6 +635,19 @@ impl Ruleset {
             .collect::<Vec<_>>()
             .join(", ");
         set(out, DECOYS, "inet_service", &decoys);
+        if !self.chaff_ports.is_empty() {
+            let chaff = self
+                .chaff_ports
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            set(out, CHAFF, "inet_service", &chaff);
+            let _ = writeln!(
+                out,
+                "  set {CHAFF_USED} {{ type inet_service; size {CHAFF_USED_SIZE}; flags dynamic; counter; }}"
+            );
+        }
         for (name, ty) in [(DENIED4, "ipv4_addr"), (DENIED6, "ipv6_addr")] {
             let _ = writeln!(
                 out,
@@ -573,9 +663,9 @@ impl Ruleset {
     }
 
     /// SHA-256 of the script with the draw left out, hex: the decoy ports, their loopback
-    /// admissions, the rule that keeps other uids off them, the metadata redirect and the
-    /// `denied` sets elided, so it is the hash of the script the same claim would have with
-    /// no tripwire. This is the hash the guest reports to the broker and logs (ADR-0069
+    /// admissions, the rule that keeps other uids off them, the metadata redirect, the
+    /// `denied` sets and the chaff (ADR-0077 decision 9) elided, so it is the hash of the
+    /// script the same claim would have with no tripwire. This is the hash the guest reports to the broker and logs (ADR-0069
     /// decision 13, amended): the whole script's hash would let whoever reads the report
     /// search for the few drawn ports offline. With no decoy it is [`Self::sha256`].
     #[must_use]
@@ -586,6 +676,7 @@ impl Ruleset {
             public.allow.remove(&(loopback, trap));
         }
         public.decoy_ports.clear();
+        public.chaff_ports.clear();
         public.metadata = false;
         public.trap_port = None;
         public.sha256()
@@ -766,7 +857,13 @@ pub async fn load_with(nft: &dyn NftRunner, rs: &Ruleset) -> anyhow::Result<Stri
 /// that is a port of `rs`'s draw replaced by `<drawn>`: the error is logged, and a discarded
 /// draw's ports must not be (a NIT of the review).
 fn without_the_draw(text: &str, rs: &Ruleset) -> String {
-    let drawn: BTreeSet<u16> = rs.decoy_ports.iter().copied().chain(rs.trap_port).collect();
+    let drawn: BTreeSet<u16> = rs
+        .decoy_ports
+        .iter()
+        .chain(&rs.chaff_ports)
+        .copied()
+        .chain(rs.trap_port)
+        .collect();
     if drawn.is_empty() {
         return text.to_owned();
     }
@@ -930,6 +1027,38 @@ pub async fn read_denied(nft: &dyn NftRunner) -> anyhow::Result<Vec<Denied>> {
     Ok(denied)
 }
 
+/// Which chaff ports the sandbox uid tried since the last read (ADR-0077 decision 3): the set
+/// [`CHAFF_USED`], read and zeroed with `nft reset` in a process of its own, each port with
+/// the packets counted since the last read (a SYN and its retransmissions). A port that saw
+/// nothing since is skipped; an element of another shape, or port `0`, is left out.
+///
+/// # Errors
+/// `nft` could not be run, refused (the table is gone, or carries no chaff), or printed
+/// something that is not the set.
+pub async fn read_chaff(nft: &dyn NftRunner) -> anyhow::Result<Vec<(u16, u64)>> {
+    let out = nft
+        .run(
+            &["-j", "-n", "reset", "set", "inet", TABLE, CHAFF_USED],
+            None,
+        )
+        .await
+        .with_context(|| format!("running {NFT}"))?;
+    anyhow::ensure!(
+        out.success,
+        "{NFT} could not read the set {CHAFF_USED}: {}",
+        out.stderr
+    );
+    Ok(parse_set(&out.stdout, TABLE, CHAFF_USED)?
+        .elements
+        .iter()
+        .filter(|(_, packets)| *packets > 0)
+        .filter_map(|(key, packets)| {
+            let port = u16::try_from(key.as_u64()?).ok().filter(|p| *p != 0)?;
+            Some((port, *packets))
+        })
+        .collect())
+}
+
 /// A recorder in `nft`'s place, for this crate's tests.
 #[cfg(test)]
 pub(crate) mod testing {
@@ -1064,6 +1193,7 @@ mod tests {
             decoy_ports: BTreeSet::new(),
             metadata: false,
             trap_port: None,
+            chaff_ports: BTreeSet::new(),
         }
     }
 
@@ -1113,7 +1243,7 @@ mod tests {
             let text = unarmed.render();
             assert_eq!(text, rs.render());
             for word in [
-                "decoy", "denied", "nat", "169.254", "dnat", "update", "40404",
+                "decoy", "denied", "nat", "169.254", "dnat", "update", "40404", "chaff",
             ] {
                 assert!(
                     !text.contains(word),
@@ -1425,6 +1555,141 @@ table inet mediatore_sandbox {
         }
     }
 
+    // ----- Chaff (ADR-0077) ------------------------------------------------------------------
+
+    const CHAFF_RULE: &str =
+        "    tcp dport @chaff ct state new update @chaff_used { tcp dport } counter drop\n";
+
+    #[test]
+    fn the_chaff_ports_are_dropped_and_counted_for_the_sandbox_uid_at_every_address() {
+        for base in [drawn(), full().with_decoys(&[6379], false, 41_001).unwrap()] {
+            let rs = base.clone().with_chaff(&[45_001, 33_333]).unwrap();
+            assert_eq!(rs.chaff_ports, BTreeSet::from([33_333, 45_001]));
+            let text = rs.render();
+            assert!(
+                text.contains("  set chaff { type inet_service; elements = { 33333, 45001 } }\n"),
+                "{text}"
+            );
+            assert!(text.contains(
+                "  set chaff_used { type inet_service; size 64; flags dynamic; counter; }\n"
+            ));
+            assert_eq!(text.matches(CHAFF_RULE).count(), 1, "{text}");
+            assert_eq!(text.matches("tcp dport @chaff ").count(), 1);
+            // In the chain the sandbox uid alone jumps to, after its allowlist and before the
+            // `denied` rules, so a chaff port is never `loopback_port` or `private_range`.
+            let output = text.find("  chain output {").unwrap();
+            let sandbox = text.find("  chain sandbox {").unwrap();
+            let at = text.find(CHAFF_RULE).unwrap();
+            assert!(at > sandbox);
+            assert!(at > text.find("@allow6 accept").unwrap());
+            assert!(at < text.find("update @denied4").unwrap());
+            assert!(
+                !text[output..sandbox].contains("chaff"),
+                "other uids are untouched"
+            );
+            assert!(text.contains("    meta skuid 1234 jump sandbox\n"));
+            // At every address and in either family: no address in the rule; nothing
+            // redirected, nothing logged to the console, no chaff port a destination.
+            assert!(!CHAFF_RULE.contains("daddr") && !CHAFF_RULE.contains("log"));
+            let nat = &text[text.find("  chain nat_out {").unwrap()..];
+            assert!(!nat.contains("chaff") && !nat.contains("33333"));
+            assert!(rs.allow.iter().all(|(_, p)| ![33_333, 45_001].contains(p)));
+            // Everything else is what the draw alone renders.
+            assert_eq!(
+                text.replace(CHAFF_RULE, "")
+                    .replace("  set chaff { type inet_service; elements = { 33333, 45001 } }\n", "")
+                    .replace(
+                        "  set chaff_used { type inet_service; size 64; flags dynamic; counter; }\n",
+                        ""
+                    ),
+                base.render()
+            );
+        }
+    }
+
+    #[test]
+    fn chaff_is_refused_beside_no_draw_and_on_any_port_the_claim_or_the_draw_uses() {
+        assert!(
+            gateways().with_chaff(&[45_001]).is_err(),
+            "chaff beside no draw"
+        );
+        // `drawn()`: decoys 41000 and 6379, the metadata decoy, the trap listener on 41001; the
+        // relay on 3130, the gateways on 8443, the proxy on 3128.
+        let d = drawn();
+        for bad in [
+            &[0][..],
+            &[3128],
+            &[3130],
+            &[8443],
+            &[41_000],
+            &[6379],
+            &[41_001],
+            &[80],
+            &[1023],
+            &[45_001, 45_001],
+        ] {
+            assert!(d.clone().with_chaff(bad).is_err(), "{bad:?} was taken");
+        }
+        let once = d.clone().with_chaff(&[45_001]).unwrap();
+        assert!(
+            once.with_chaff(&[45_002]).is_err(),
+            "one chaff draw a claim"
+        );
+        let too_many: Vec<u16> = (50_000..50_065).collect();
+        assert!(
+            d.clone().with_chaff(&too_many).is_err(),
+            "more than the set holds"
+        );
+        let most: Vec<u16> = (50_000..50_064).collect();
+        assert!(d.clone().with_chaff(&most).is_ok());
+        assert_eq!(d.clone().with_chaff(&[]).unwrap(), d, "no chaff, no change");
+    }
+
+    #[test]
+    fn the_public_hash_and_a_refusal_leave_the_chaff_out() {
+        let rs = drawn().with_chaff(&[45_001, 33_333]).unwrap();
+        assert_ne!(rs.sha256(), drawn().sha256());
+        assert_eq!(rs.public_sha256(), gateways().sha256());
+        let elided = without_the_draw("set chaff { elements = { 33333, 45001 } } 8443", &rs);
+        assert_eq!(elided, "set chaff { elements = { <drawn>, <drawn> } } 8443");
+    }
+
+    /// `nft -j -n reset set inet <table> chaff_used` as captured on the build host (Debian 13,
+    /// nftables 1.1.3, 2026-11-28): the chaff rule of ADR-0077 in a fresh network namespace,
+    /// and one connect to a chaff port on loopback that waited a second (its SYN sent twice).
+    const CHAFF_USED_CAPTURED: &str = r#"{"nftables": [{"metainfo": {"version": "1.1.3", "release_name": "Commodore Bullmoose #4", "json_schema_version": 1}}, {"set": {"family": "inet", "name": "chaff_used", "table": "mediatore_sandbox", "type": "inet_service", "handle": 4, "size": 64, "flags": ["dynamic"], "elem": [{"elem": {"val": 41000, "counter": {"packets": 2, "bytes": 120}}}], "stmt": [{"counter": null}]}}]}"#;
+    /// The same with an idle element, two of shapes this does not know, and port zero.
+    const CHAFF_USED_ODD: &str = r#"{"nftables": [{"set": {"family": "inet", "name": "chaff_used", "table": "mediatore_sandbox", "type": "inet_service", "size": 64, "elem": [{"elem": {"val": 52000, "counter": {"packets": 0, "bytes": 0}}}, {"elem": {"val": 33333, "counter": {"packets": 3, "bytes": 180}}}, {"elem": {"val": "x", "counter": {"packets": 1, "bytes": 60}}}, {"elem": {"val": 70000, "counter": {"packets": 1, "bytes": 60}}}, {"elem": {"val": 0, "counter": {"packets": 1, "bytes": 60}}}]}}]}"#;
+
+    #[tokio::test]
+    async fn the_chaff_set_is_read_and_zeroed_and_idle_ports_are_skipped() {
+        let nft = testing::FakeNft::answering([CHAFF_USED_CAPTURED]);
+        assert_eq!(read_chaff(&nft).await.unwrap(), [(41_000, 2)]);
+        assert_eq!(
+            nft.calls(),
+            [(
+                ["-j", "-n", "reset", "set", "inet", TABLE, CHAFF_USED]
+                    .map(str::to_owned)
+                    .to_vec(),
+                None
+            )]
+        );
+        let odd = testing::FakeNft::answering([CHAFF_USED_ODD]);
+        assert_eq!(read_chaff(&odd).await.unwrap(), [(33_333, 3)]);
+        assert!(read_chaff(&testing::FakeNft::absent()).await.is_err());
+        assert!(
+            read_chaff(&testing::FakeNft::refusing("No such file"))
+                .await
+                .is_err()
+        );
+        assert!(
+            read_chaff(&testing::FakeNft::answering([DENIED6_JSON]))
+                .await
+                .is_err(),
+            "another set is not the chaff set"
+        );
+    }
+
     fn gateways() -> Ruleset {
         Ruleset {
             uid: 1234,
@@ -1443,6 +1708,7 @@ table inet mediatore_sandbox {
             decoy_ports: BTreeSet::new(),
             metadata: false,
             trap_port: None,
+            chaff_ports: BTreeSet::new(),
         }
     }
 
@@ -1604,6 +1870,7 @@ table inet mediatore_sandbox {
             decoy_ports: BTreeSet::new(),
             metadata: false,
             trap_port: None,
+            chaff_ports: BTreeSet::new(),
             ..gateways()
         };
         let err = direct
@@ -1705,6 +1972,7 @@ table inet mediatore_sandbox {
             decoy_ports: BTreeSet::new(),
             metadata: false,
             trap_port: None,
+            chaff_ports: BTreeSet::new(),
         };
         let text = rs.render();
         assert!(text.contains(
@@ -2031,6 +2299,7 @@ table inet mediatore_sandbox {
             decoy_ports: BTreeSet::new(),
             metadata: false,
             trap_port: None,
+            chaff_ports: BTreeSet::new(),
         };
         for rs in [full(), empty, gateways()] {
             check(program, &args, &rs.render()).await;
@@ -2082,6 +2351,12 @@ table inet mediatore_sandbox {
             gateways().with_decoys(&[2222], false, 40_404).unwrap(),
             full().with_decoys(&[6379, 41_000], true, 41_001).unwrap(),
             full().with_decoys(&[], true, 41_001).unwrap(),
+            drawn().with_chaff(&[45_001, 33_333]).unwrap(),
+            full()
+                .with_decoys(&[6379, 41_000], true, 41_001)
+                .unwrap()
+                .with_chaff(&[50_000, 1024, 65_535])
+                .unwrap(),
         ] {
             check(&program, &args, &rs.render()).await;
         }
