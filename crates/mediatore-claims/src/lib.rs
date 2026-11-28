@@ -24,6 +24,7 @@ use uuid::Uuid;
 pub mod audience;
 pub mod crd_formats;
 pub mod credential;
+pub mod eligibility;
 #[cfg(test)]
 pub(crate) mod fakes;
 pub mod follow;

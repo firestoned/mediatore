@@ -946,8 +946,8 @@ async fn cache_with_direct_egress_in(
     }
     content.egress = entries
         .iter()
-        .map(
-            |(endpoint, with_rules)| mediatore_policy::types::EgressRule {
+        .map(|(endpoint, with_rules)| {
+            mediatore_policy::types::EgressRule {
                 endpoint: (*endpoint).into(),
                 rules: if *with_rules {
                     vec![mediatore_policy::types::EndpointRule {
@@ -957,8 +957,9 @@ async fn cache_with_direct_egress_in(
                 } else {
                     vec![]
                 },
-            },
-        )
+            }
+            .into()
+        })
         .collect();
     let signed = mediatore_testkit::policy::signed_bundle(now, 2, content);
     let uid = signed.payload.content.policy.uid.clone();
@@ -1017,6 +1018,7 @@ async fn enforcing_serves_a_policys_direct_egress_and_shadow_serves_none_of_it()
             // The claims live in `sandboxes` and the policy in its own namespace: the
             // operator's `policy.sources` entry says the one draws from the other (ADR-0054).
             Some(mediatore_api::PolicyEgress {
+                eligibility: mediatore_claims::eligibility::EligibilityMode::Off,
                 follow: mediatore_claims::policy::EgressMode::Shadow,
                 bundles,
                 mode,
@@ -1117,6 +1119,7 @@ async fn a_claim_with_no_policy_or_a_bundle_the_cache_does_not_hold_gets_the_aud
             CacheConfig::default(),
             None,
             Some(mediatore_api::PolicyEgress {
+                eligibility: mediatore_claims::eligibility::EligibilityMode::Off,
                 follow: mediatore_claims::policy::EgressMode::Shadow,
                 bundles,
                 mode: mediatore_claims::policy::EgressMode::Enforce,
@@ -1163,6 +1166,7 @@ async fn team_a_under_a_policy_of_team_b(
         CacheConfig::default(),
         None,
         Some(mediatore_api::PolicyEgress {
+            eligibility: mediatore_claims::eligibility::EligibilityMode::Off,
             follow: mediatore_claims::policy::EgressMode::Shadow,
             bundles,
             mode: mediatore_claims::policy::EgressMode::Enforce,
@@ -1248,6 +1252,7 @@ async fn under_enforce_a_claim_naming_a_policy_outside_its_sources_is_400_and_pa
         CacheConfig::default(),
         None,
         Some(mediatore_api::PolicyEgress {
+            eligibility: mediatore_claims::eligibility::EligibilityMode::Off,
             follow: mediatore_claims::policy::EgressMode::Shadow,
             bundles,
             mode: mediatore_claims::policy::EgressMode::Enforce,

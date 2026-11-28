@@ -1486,6 +1486,7 @@ impl Watcher {
         sb: &AgentSandbox,
         current: &AgentSandboxStatus,
     ) -> Result<Option<Action>, WatchError> {
+        self.record_declarative_eligibility(sb);
         let Some(resolution) = self.bundle_of(sb) else {
             return Ok(None);
         };
@@ -1504,6 +1505,47 @@ impl Watcher {
             return self.hold_until_read(sb, current).await.map(Some);
         }
         self.refuse_policy(sb, current).await.map(Some)
+    }
+
+    /// ADR-0066 decision 7, built in shadow only (amendment 6 of 2026-11-28): under
+    /// `policy.eligibility: shadow`, a sandbox created through the Kubernetes API (no front-door
+    /// mark, ADR-0072 decision 3) is recorded as not judged, before its claim exists: the
+    /// broker holds no groups of its creator, and an admission policy cannot read a signed
+    /// bundle. A sandbox the front door created was judged there and is not recorded again.
+    /// Nothing is refused and nothing is returned.
+    fn record_declarative_eligibility(&self, sb: &AgentSandbox) {
+        use crate::eligibility::{EligibilityMode, Lookup, Path, Requester, record};
+        if self.cfg.eligibility_mode == EligibilityMode::Off || created_through_the_api(sb) {
+            return;
+        }
+        let Some(bundles) = self.bundles.as_ref() else {
+            return;
+        };
+        let namespace = crate::kubestore::namespace_of(sb);
+        let policy = sb.spec.policy_ref.as_ref().map(|p| p.name.as_str());
+        let found = policy.map(|name| {
+            bundles.resolve(&self.cfg.policy_sources, &namespace, name, Timestamp::now())
+        });
+        let lookup = match &found {
+            None => Lookup::NoPolicy,
+            Some(Resolution::Found(bundle)) => Lookup::Found(bundle),
+            Some(Resolution::NotFound | Resolution::Ambiguous | Resolution::NotRead) => {
+                Lookup::NotResolved
+            }
+        };
+        record(
+            self.cfg.eligibility_mode,
+            Path::Declarative,
+            &namespace,
+            Some(&sb.name_any()),
+            &Requester {
+                issuer: &sb.spec.subject.issuer,
+                subject: &sb.spec.subject.id,
+                groups: None,
+            },
+            policy,
+            lookup,
+        );
     }
 
     /// Whether the sandbox's owned claim exists and its record was written: the request was
@@ -5738,6 +5780,81 @@ object.spec.workloadSelectorTemplates.exists(s, s == 'k8s:sa:' + variables.broke
             .unwrap();
         assert_eq!(st.phase, SandboxPhase::Pending);
         assert!(st.reason.is_none());
+    }
+
+    #[tokio::test]
+    async fn under_eligibility_shadow_a_hand_created_sandbox_is_recorded_not_judged_and_admitted() {
+        use crate::eligibility::{EligibilityMode, test_logs};
+        test_logs::capture();
+        let a = admitted_bundle(5).await;
+        let namespace = a.sb.namespace().unwrap();
+        let shadow = WatcherConfig {
+            eligibility_mode: EligibilityMode::Shadow,
+            ..cfg_with_git()
+        };
+        // Under a v3 bundle: no statement to read.
+        let r = rig_with(shadow.clone(), Some(a.cache()));
+        let v3 = a.sb.clone();
+        r.claims.put_sandbox(v3.clone());
+        r.watcher.reconcile_sandbox(&v3).await.unwrap();
+        // The same policy at v4 (ADR-0066 decision 7): the broker holds no creator groups.
+        let content = a.payload.content.clone();
+        let fresh =
+            mediatore_testkit::policy::signed_bundle_v4(Timestamp::now(), 6, content, &["team-a"]);
+        let cm = mediatore_testkit::policy::bundle_configmap(
+            &namespace,
+            &format!("{}-bundle", fresh.payload.content.policy.name),
+            &fresh.envelope,
+        );
+        assert!(matches!(
+            a.reflector.applied(&cm).await,
+            Outcome::Admitted { version: 6, .. }
+        ));
+        let mut v4 = a.sb.clone();
+        v4.metadata.name = Some("sb-2".into());
+        v4.metadata.uid = Some(Uuid::new_v4().to_string());
+        r.claims.put_sandbox(v4.clone());
+        r.watcher.reconcile_sandbox(&v4).await.unwrap();
+        // One the front door created was judged there and is not recorded again.
+        let mut api = a.sb.clone();
+        api.metadata.name = Some("sb-3".into());
+        api.metadata.uid = Some(Uuid::new_v4().to_string());
+        api.metadata.annotations = Some(BTreeMap::from([(
+            FRONT_DOOR_ANNOTATION.to_owned(),
+            FRONT_DOOR_API.to_owned(),
+        )]));
+        r.claims.put_sandbox(api.clone());
+        r.watcher.reconcile_sandbox(&api).await.unwrap();
+        let lines = test_logs::decisions();
+        assert_eq!(lines.len(), 2, "{lines:#?}");
+        for (line, reason) in lines.iter().zip(["v3_bundle", "no_groups"]) {
+            for needle in [
+                "path=\"declarative\"",
+                "eligibility=\"not_judged\"",
+                &format!("reason=\"{reason}\""),
+                "subject=octocat",
+                &format!("issuer={ISSUER}"),
+            ] {
+                assert!(line.contains("sandbox=Some(\"sb-"), "{line}");
+                assert!(line.contains(needle), "{needle} in {line}");
+            }
+        }
+        assert!(lines[0].contains("code=P016"), "{}", lines[0]);
+        assert!(lines[1].contains("bundle_version=Some(6)"), "{}", lines[1]);
+        // Nothing refused: each gets its claim.
+        for name in ["sb-1", "sb-2", "sb-3"] {
+            assert!(r.claims.claim(&namespace, name).is_some(), "{name}");
+        }
+        // Under `off` nothing is written.
+        test_logs::capture();
+        let off = rig_with(cfg_with_git(), Some(a.cache()));
+        let mut quiet = a.sb.clone();
+        quiet.metadata.name = Some("sb-4".into());
+        quiet.metadata.uid = Some(Uuid::new_v4().to_string());
+        off.claims.put_sandbox(quiet.clone());
+        off.watcher.reconcile_sandbox(&quiet).await.unwrap();
+        assert_eq!(test_logs::decisions(), Vec::<String>::new());
+        assert!(off.claims.claim(&namespace, "sb-4").is_some());
     }
 
     #[tokio::test]

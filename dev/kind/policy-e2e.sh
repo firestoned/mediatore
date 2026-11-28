@@ -14,7 +14,7 @@
 # admits; the earlier bundle written back into the policy's own object is refused by the
 # version floor, and still refused after a broker restart, because the floor lives in the
 # store with the claims; a valid bundle copied under another policy's name is refused as
-# `WrongSubject` and its deletion drops nothing (notaio v0.8.0).
+# `WrongSubject` and its deletion drops nothing (since notaio v0.8.0).
 # Then ADR-0053 phase 2: the broker is restarted with `policy.audiences: enforce`, and a
 # sandbox with no policyRef, one naming a policy with no bundle, one asking for an audience
 # the bundle lacks and one asking for more than the policy's lease are each Failed with
@@ -25,6 +25,17 @@
 # entry a sandbox naming it reports P011 in shadow (and is still created), and is Failed
 # with policy_not_resolved under enforce, with no claim and the same reason as a policy
 # that exists nowhere; with the entry and a restart it is admitted and recorded.
+#
+# ADR-0066 throughout, in shadow: every broker configuration here sets policy.eligibility:
+# shadow, and each sandbox (all created through the Kubernetes API, so the declarative path)
+# writes one eligibility line before its claim, `not_judged`; no claim is refused for it.
+# Every bundle the tier reads is checked for its payload type, so a run cannot pass on the
+# other schema by mistake.
+#
+# MEDIATORE_NOTAIO_BUNDLE_SCHEMA=v4 (`make kind-e2e-policy-v4`) runs the same tier with notaio
+# signing schema v4 (its NOTAIO_BUNDLE_SCHEMA, notaio ADR-0026 decision 5): every assertion
+# above holds unchanged, each bundle carries the policy's subjects.groups, and the eligibility
+# lines say `no_groups` where v3 says `v3_bundle`. notaio is put back on v3 on exit.
 #
 #   policy-e2e.sh <admin kubeconfig> <broker SA kubeconfig> <state dir>
 set -euo pipefail
@@ -48,6 +59,20 @@ BUNDLE_CM=$POLICY-bundle
 REPLAY_CM=$POLICY-bundle-replay
 VERSION_ANN='sandbox\.firestoned\.io/bundle-version'
 DIR=$STATE/notaio
+# Where notaio-install.sh installs the controller.
+NOTAIO_NS=notaio-system
+SCHEMA=${MEDIATORE_NOTAIO_BUNDLE_SCHEMA:-v3}
+case "$SCHEMA" in
+  v3|v4) ;;
+  *) echo "MEDIATORE_NOTAIO_BUNDLE_SCHEMA must be v3 or v4, not $SCHEMA" >&2; exit 1 ;;
+esac
+PAYLOAD_TYPE=application/vnd.firestoned.sandboxpolicy.bundle.$SCHEMA+json
+# The policy's groups, which a v4 bundle carries as subjects.groups (notaio ADR-0024).
+GROUPS_JSON='["00000000-0000-0000-0000-000000000000"]'
+# What the eligibility line says for a sandbox naming a policy that resolves (ADR-0066):
+# a v3 bundle has no list to read, and on the declarative path the broker holds no groups.
+if [ "$SCHEMA" = v4 ]; then RESOLVED_REASON=no_groups; else RESOLVED_REASON=v3_bundle; fi
+ELIGIBILITY_LINE='policy eligibility decision (ADR-0066, shadow)'
 
 say()  { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 fail() { printf '\033[31mFAIL: %s\033[0m\n' "$*"; dump; exit 1; }
@@ -67,7 +92,7 @@ bundle_version() { "${K[@]}" -n "$NS" get configmap "$BUNDLE_CM" -o jsonpath="{.
 
 dump() {
   printf '\n--- broker (last 60 lines)\n'; broker_logs | tail -60
-  printf '\n--- notaio (last 30 lines)\n'; "${K[@]}" -n notaio-system logs deploy/notaio --tail=30 2>/dev/null | plain || true
+  printf '\n--- notaio (last 30 lines)\n'; "${K[@]}" -n "$NOTAIO_NS" logs deploy/notaio --tail=30 2>/dev/null | plain || true
   printf '\n--- %s\n' "$NS"; "${K[@]}" -n "$NS" get sandboxpolicies,exposureceilings,configmaps,agentsandboxes,virtualmachineclaims 2>/dev/null || true
   printf '\n--- %s\n' "$NSP"; "${K[@]}" -n "$NSP" get sandboxpolicies,exposureceilings,configmaps 2>/dev/null || true
   printf '\n--- verdicts\n'
@@ -76,7 +101,19 @@ dump() {
   done
 }
 
+# notaio signing <schema>: its NOTAIO_BUNDLE_SCHEMA, v3 being the default it is installed with.
+notaio_schema() {
+  if [ "$1" = v3 ]; then
+    "${K[@]}" -n "$NOTAIO_NS" set env deploy/notaio NOTAIO_BUNDLE_SCHEMA- >/dev/null
+  else
+    "${K[@]}" -n "$NOTAIO_NS" set env deploy/notaio NOTAIO_BUNDLE_SCHEMA="$1" >/dev/null
+  fi
+  "${K[@]}" -n "$NOTAIO_NS" rollout status deploy/notaio --timeout=300s >/dev/null
+}
+
 cleanup() {
+  # notaio back on its default for the tiers after this one.
+  [ "$SCHEMA" = v3 ] || notaio_schema v3 >/dev/null 2>&1 || true
   "${K[@]}" -n "$NS" delete configmap "$REPLAY_CM" --ignore-not-found --wait=false >/dev/null 2>&1 || true
   "${K[@]}" delete namespace "$NS" --ignore-not-found --wait=false >/dev/null 2>&1 || true
   "${K[@]}" delete namespace "$NSP" --ignore-not-found --wait=false >/dev/null 2>&1 || true
@@ -122,6 +159,39 @@ restart_broker() {
   wait_for "$TIMEOUT" "'claim watcher running' in the broker log" log_has "claim watcher running"
 }
 
+if [ "$SCHEMA" = v4 ]; then
+  say "notaio: signing schema v4 (NOTAIO_BUNDLE_SCHEMA=v4 on deploy/notaio in $NOTAIO_NS)"
+  notaio_schema v4
+  "${K[@]}" -n "$NOTAIO_NS" get deploy/notaio -o json \
+    | jq -e '[.spec.template.spec.containers[].env[]? | select(.name == "NOTAIO_BUNDLE_SCHEMA" and .value == "v4")] | length == 1' >/dev/null \
+    || fail "deploy/notaio does not carry NOTAIO_BUNDLE_SCHEMA=v4"
+  echo "notaio rolled out with NOTAIO_BUNDLE_SCHEMA=v4"
+fi
+
+# The envelope of the bundle in <namespace>/<configmap> carries the payload type of $SCHEMA, and
+# a v4 bundle the policy's groups as subjects.groups. Prints the payloadType line it read.
+assert_schema() {
+  local env pt groups
+  env=$("${K[@]}" -n "$1" get configmap "$2" -o jsonpath='{.data.bundle\.dsse\.json}')
+  pt=$(echo "$env" | jq -r .payloadType)
+  [ "$pt" = "$PAYLOAD_TYPE" ] || fail "$1/$2 carries payloadType $pt, expected $PAYLOAD_TYPE"
+  groups=$(echo "$env" | jq -r .payload | base64 -d | jq -c '.content.subjects.groups // null')
+  if [ "$SCHEMA" = v4 ]; then
+    [ "$groups" = "$GROUPS_JSON" ] || fail "$1/$2: subjects.groups is $groups, expected $GROUPS_JSON"
+  else
+    [ "$groups" = null ] || fail "$1/$2 is v3 and carries subjects: $groups"
+  fi
+  echo "$1/$2: payloadType $pt, subjects.groups $groups"
+}
+
+# The broker logged the eligibility line for <sandbox> with each further needle.
+eligibility_has() {
+  local sb=$1 line; shift
+  line=$(broker_logs | grep -F "$ELIGIBILITY_LINE" | grep -F "sandbox=Some(\"$sb\")" | tail -1)
+  [ -n "$line" ] || return 1
+  for needle in "$@"; do echo "$line" | grep -qF -- "$needle" || return 1; done
+}
+
 say "fixtures: the namespace, notaio's bundle Role and the broker's read Role in it"
 "${K[@]}" delete namespace "$NS" --ignore-not-found --wait=true >/dev/null
 "${K[@]}" create namespace "$NS" >/dev/null
@@ -138,7 +208,7 @@ read -r KEY_ID PUBLIC_KEY < "$DIR/public-key.txt"
 policy_config() {
   {
     cat dev/kind/broker/mediatore.yaml
-    printf 'policy:\n  trusted_keys:\n    - { id: "%s", public_key: "%s" }\n  namespaces: [%s]\n' "$KEY_ID" "$PUBLIC_KEY" "$1"
+    printf 'policy:\n  trusted_keys:\n    - { id: "%s", public_key: "%s" }\n  namespaces: [%s]\n  eligibility: shadow\n' "$KEY_ID" "$PUBLIC_KEY" "$1"
     [ -n "${2:-}" ] && printf '%s\n' "$2"
   } > "$DIR/mediatore.yaml"
   "${K[@]}" -n "$BROKER_NS" create configmap mediatore-config --from-file=mediatore.yaml="$DIR/mediatore.yaml" \
@@ -147,6 +217,7 @@ policy_config() {
 }
 policy_config "$NS"
 echo "reflector running on ${BROKER_POD#pod/} trusting $KEY_ID"
+log_has "policy.eligibility" "mode=shadow" || fail "the broker did not log policy.eligibility mode=shadow"
 
 say "notaio: a policy and its ceiling publish a signed bundle"
 "${K[@]}" -n "$NS" apply -f - >/dev/null <<YAML
@@ -174,7 +245,7 @@ metadata:
 spec:
   profileRef: hardened
   subjects:
-    groups: ["00000000-0000-0000-0000-000000000000"]
+    groups: $GROUPS_JSON
   audiences:
     - name: internal-git
       access: Read
@@ -191,6 +262,7 @@ V1=$(bundle_version)
 "${K[@]}" -n "$NS" get configmap "$BUNDLE_CM" -o jsonpath='{.data.bundle\.dsse\.json}' > "$DIR/bundle-v$V1.json"
 [ -s "$DIR/bundle-v$V1.json" ] || fail "the bundle ConfigMap carries no envelope"
 wait_for "$TIMEOUT" "'policy bundle admitted' version=$V1 in the broker log" log_has "policy bundle admitted" "version=$V1"
+assert_schema "$NS" "$BUNDLE_CM"
 echo "bundle v$V1 of $NS/$POLICY published by notaio and admitted by the broker"
 
 say "sandboxes: conformant, a gap, no policyRef, a policy with no bundle; all admitted"
@@ -219,6 +291,19 @@ expect sb-orphan "False Gaps" "P011"
 wait_for "$TIMEOUT" "'policy gap' with code P001 in the broker log" log_has "policy gap" "P001"
 wait_for "$TIMEOUT" "'record created' naming bundle version $V1 in the broker log" log_has "record created" "bundle_version=Some($V1)"
 echo "four claims, nothing refused; the gaps logged"
+# ADR-0066 in shadow: one line per sandbox, the declarative path, nothing judged and nothing refused.
+for sb in sb-ok sb-gap; do
+  wait_for "$TIMEOUT" "the eligibility line of $sb ($RESOLVED_REASON)" eligibility_has "$sb" \
+    'eligibility="not_judged"' "reason=\"$RESOLVED_REASON\"" 'path="declarative"' "policy=\"$POLICY\"" "bundle_version=Some($V1)"
+done
+wait_for "$TIMEOUT" "the eligibility line of sb-none (no_policy_ref)" eligibility_has sb-none 'eligibility="not_judged"' 'reason="no_policy_ref"'
+wait_for "$TIMEOUT" "the eligibility line of sb-orphan (policy_not_resolved)" eligibility_has sb-orphan 'eligibility="not_judged"' 'reason="policy_not_resolved"'
+for sb in sb-ok sb-gap sb-none sb-orphan; do
+  printf 'eligibility %s: %s\n' "$sb" "$(broker_logs | grep -F "$ELIGIBILITY_LINE" | grep -F "sandbox=Some(\"$sb\")" | tail -1 | grep -oE 'eligibility="[a-z_]+" code=[A-Za-z0-9]+ reason="[a-z_0-9]+"')"
+done
+broker_logs | grep -F "$ELIGIBILITY_LINE" | grep -qE 'eligibility="(eligible|not_eligible)"' \
+  && fail "a declarative sandbox was judged: the broker holds no creator groups"
+echo "ADR-0066 shadow: each sandbox recorded not_judged, every claim created"
 
 say "a newer bundle: the policy changes, v$V1 gives way, the verdicts follow"
 "${K[@]}" -n "$NS" patch sandboxpolicy "$POLICY" --type=merge -p '{"spec":{"audiences":[{"name":"internal-git","access":"Read","scopes":["repo:read","repo:status"],"endpoints":["git.foo.io:443"],"rules":[{"method":"GET","path":"/repos/**"}]}]}}' >/dev/null
@@ -227,6 +312,7 @@ wait_for "$TIMEOUT" "a bundle version after $V1" newer
 V2=$(bundle_version)
 [ "$V2" -gt "$V1" ] || fail "bundle version went from $V1 to $V2"
 wait_for "$TIMEOUT" "'policy bundle admitted' version=$V2 in the broker log" log_has "policy bundle admitted" "version=$V2"
+assert_schema "$NS" "$BUNDLE_CM"
 ok_on_v2() { verdict sb-ok | grep -qF "v$V2"; }
 wait_for "$TIMEOUT" "sb-ok compared with v$V2" ok_on_v2
 expect sb-ok "True Conformant" "v$V2"
@@ -236,7 +322,7 @@ echo "v$V2 admitted; every sandbox compared again"
 [ -s "$DIR/bundle-v$V2.json" ] || fail "the bundle ConfigMap carries no envelope at v$V2"
 
 say "the floor: v$V1 written back into the policy's own object is refused, before and after a broker restart"
-# What a ConfigMap writer can still do (notaio v0.8.0): put an older signed bundle into the object notaio
+# What a ConfigMap writer can still do (since notaio v0.8.0): put an older signed bundle into the object notaio
 # writes for the policy. The floor refuses it; the copy is put back after, as notaio would on its next write.
 put_bundle() { # <envelope file>
   "${K[@]}" -n "$NS" patch configmap "$BUNDLE_CM" --type merge \
@@ -279,7 +365,7 @@ echo "still refused on ${BROKER_POD#pod/}: the floor came back from the store"
 say "ADR-0053 phase 2: policy.audiences: enforce, the bundle decides what a sandbox may have"
 {
   cat dev/kind/broker/mediatore.yaml
-  printf 'policy:\n  trusted_keys:\n    - { id: "%s", public_key: "%s" }\n  namespaces: [%s]\n  audiences: enforce\n' "$KEY_ID" "$PUBLIC_KEY" "$NS"
+  printf 'policy:\n  trusted_keys:\n    - { id: "%s", public_key: "%s" }\n  namespaces: [%s]\n  audiences: enforce\n  eligibility: shadow\n' "$KEY_ID" "$PUBLIC_KEY" "$NS"
 } > "$DIR/mediatore-enforce.yaml"
 "${K[@]}" -n "$BROKER_NS" create configmap mediatore-config --from-file=mediatore.yaml="$DIR/mediatore-enforce.yaml" \
   --dry-run=client -o yaml | "${K[@]}" apply -f - >/dev/null
@@ -341,6 +427,7 @@ policy_config "$NS, $NSP" "  egress: shadow"
 other_published() { [ -n "$("${K[@]}" -n "$NSP" get configmap "$OTHER-bundle" -o jsonpath="{.metadata.annotations.$VERSION_ANN}" 2>/dev/null)" ]; }
 wait_for "$TIMEOUT" "ConfigMap $NSP/$OTHER-bundle with a bundle version" other_published
 wait_for "$TIMEOUT" "'policy bundle admitted' for $OTHER in the broker log" log_has "policy bundle admitted" "policy=$OTHER"
+assert_schema "$NSP" "$OTHER-bundle"
 
 say "ADR-0054 shadow, no sources entry: P011, the sandbox still created, the log names where the policy is held"
 manifest sb-elsewhere '["internal-git"]' "$OTHER" | "${KSA[@]}" create -f - >/dev/null
@@ -383,4 +470,4 @@ expect sb-mapped "True Conformant" "v"
 wait_for "$TIMEOUT" "'record created' for sb-mapped with a bundle version" log_has "record created" "bundle_version=Some("
 echo "mapped: admitted under $NSP/$OTHER"
 
-say "PASS: ADR-0026 holds against a real cluster (notaio from its release signing with OpenBao, the bundle admitted and recorded, the comparison's verdicts and codes, a newer version followed, a replay refused by the floor across a restart, nothing refused on the bundle's account), ADR-0053 phase 2 (under policy.audiences: enforce the bundle decides what a sandbox may have) and ADR-0054 (another namespace's policy P011 in shadow, refused under enforce with the reason of a policy nowhere, admitted once policy.sources maps it)"
+say "PASS ($SCHEMA, $PAYLOAD_TYPE): ADR-0066 in shadow (one not_judged line per sandbox, nothing refused), ADR-0026 holds against a real cluster (notaio from its release signing with OpenBao, the bundle admitted and recorded, the comparison's verdicts and codes, a newer version followed, a replay refused by the floor across a restart, nothing refused on the bundle's account), ADR-0053 phase 2 (under policy.audiences: enforce the bundle decides what a sandbox may have) and ADR-0054 (another namespace's policy P011 in shadow, refused under enforce with the reason of a policy nowhere, admitted once policy.sources maps it)"

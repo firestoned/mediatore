@@ -145,6 +145,7 @@ Suites today:
 | `make kind-e2e-sandbox` | 0008, 0034, 0069, 0072 | the `AgentSandbox` CRD and its subject policy (with `issuerPrefixes` set: an unlisted issuer and an unsound list refused; the broker's `mediatore.io/front-door` mark refused to anybody else and immutable; a listed broker's sandbox at an undeclared issuer `Failed` by the reconciler), a sandbox becoming an owned claim and a record on its own status, the claim bound end to end to a claim entry and the guest fetching the subject, a broker restart on the Kubernetes store with the sandbox staying `Ready`, deletion through the finalizer, the released sandbox held and then swept at resync; since ADR-0069 `status.tripwires` in both served versions and a tripped record failing its sandbox with `Tripped=True`, never claimed again, below |
 | `make kind-e2e-dex` | 0013, 0073, 0074 | the real CLI logging in at a real Dex from inside the cluster and delegating the session, a refresh at Dex before every issue, the minted `groups` behind `dex:`, a two-namespace map admitting the Dex group in the namespace that lists Dex and refusing it in the one that lists the other issuer, the claim released when the user leaves the gated group in the directory and when the refresh token is deleted at Dex, below |
 | `make kind-e2e-policy` | 0026 | notaio installed from its release manifests and signing with the kind OpenBao, its bundle admitted by the broker and recorded on each claim, the `PolicyConformant` verdicts and codes on four sandboxes, a newer bundle followed, the earlier one delivered again refused by the version floor before and after a broker restart, nothing refused on the bundle's account, below |
+| `make kind-e2e-policy-v4` | 0026, 0066 | the policy tier with notaio signing bundle schema v4 (`NOTAIO_BUNDLE_SCHEMA=v4` on its Deployment for the run, put back after): every bundle the tier reads asserted to carry the v4 payload type and the policy's `subjects.groups`, then every assertion of `make kind-e2e-policy` unchanged; the ADR-0066 shadow lines `not_judged` (`no_groups`, the declarative path) and no claim refused, below |
 | `make kind-e2e-gateway` | 0028 | the real egress proxy tunnelling a claim's requests through a real Envoy on the gateway SVID to its one destination and nothing else, the authorizer's cache through a broker outage, the cut-off on release, below |
 | `make kind-e2e-gateway-policy` | 0030 | the gateway tier under a notaio bundle: a direct egress entry refused under `policy.egress: shadow` and opened at the real Envoy under `enforce`, an entry with rules never served, below |
 | `make kind-e2e-gateway-audience` | 0055 | the gateway-policy tier, then notaio's audience bundles serving under `policy.audience_definitions.mode: bundles`: a team `SandboxAudience`'s Secret reaching the claim's destination through the real Envoy and rotated with no broker restart (the destination logs a fingerprint of the credential, never the value), a platform audience read from OpenBao KV, the team audience refused from another namespace; replaces `kind-e2e-gateway-policy` in `make kind-e2e`, below |
@@ -497,8 +498,9 @@ probe's tunnel then reaches the destination with the team Secret (the destinatio
 `credential_sha256=` and the first 16 hex digits, never the value); the Secret is rotated and the
 next tunnel carries the new one with the broker pod and its restart count unchanged; a sandbox in the
 second namespace naming the team audience is `Failed` with `audience e2e-egress is not configured` and
-no claim; and neither credential appears in the broker's log. The kind notaio is v0.8.0 (both
-tiers green on it and on its rc.1 on 2026-11-23; on v0.7.0 and its rc.2 on 2026-11-21; rc.1, the first with
+no claim; and neither credential appears in the broker's log. The kind notaio is v0.9.0, which
+reads bundle schema v3 and v4 and still signs v3 by default (both tiers green on it on 2026-11-28;
+on v0.8.0 and its rc.1 on 2026-11-23; on v0.7.0 and its rc.2 on 2026-11-21; rc.1, the first with
 `SandboxAudience`, on 2026-11-20). Since v0.8.0-rc.1 `make kind-e2e-policy` also writes the older
 bundle back into the policy's own object for the floor to refuse (`Downgrade`), and puts a valid
 copy under another name for the subject check to refuse (`WrongSubject`), its deletion dropping
@@ -709,6 +711,24 @@ newer bundle is admitted and every verdict names it; the earlier envelope is del
 again under another ConfigMap name and refused as a downgrade, its deletion leaves the
 cache alone, and after a broker restart on the Kubernetes store the same replay is refused
 again, because the floor came back from the store.
+
+Every broker configuration the tier writes sets `policy.eligibility: shadow`
+([ADR-0066](../adr/0066-eligibility-by-group-from-the-signed-bundle.md), built in shadow only),
+and the tier asserts one eligibility line per sandbox, read by the sandbox's name: `not_judged`
+with `reason="v3_bundle"` for the two naming the policy, `no_policy_ref` and `policy_not_resolved`
+for the other two, never `eligible` or `not_eligible` (each sandbox is created through the
+Kubernetes API, whose creator's groups the broker never holds), and every claim created. It also
+asserts the payload type of every bundle it reads, so it cannot pass on the wrong schema.
+
+`make kind-e2e-policy-v4` is the same script with `MEDIATORE_NOTAIO_BUNDLE_SCHEMA=v4`: after notaio
+is installed it sets `NOTAIO_BUNDLE_SCHEMA=v4` on `deploy/notaio` in `notaio-system` (the namespace
+`notaio-install.sh` installs into) and waits for the rollout, before any policy exists, so every
+bundle is signed v4. Each bundle is asserted to carry
+`application/vnd.firestoned.sandboxpolicy.bundle.v4+json` and the policy's `subjects.groups`; every
+other assertion is the v3 tier's, unchanged; the eligibility lines say `no_groups` where v3 says
+`v3_bundle`. On exit notaio is put back on its default (v3) for the tiers after it. The judged
+verdicts (`eligible`, `not_eligible`) need a requester through `POST /v1/claims` with groups, which
+this tier has none of: they are proven over real listeners in `crates/mediatore/tests/e2e_dev.rs`.
 
 ### TPM attestation with a vTPM behind the node
 

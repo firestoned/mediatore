@@ -2073,6 +2073,7 @@ dependencies = [
  "tokio",
  "tower-test",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
@@ -2214,6 +2215,7 @@ dependencies = [
  "sandboxpolicy-bundle",
  "sandboxpolicy-types",
  "serde",
+ "serde_json",
  "thiserror",
  "tokio",
 ]
@@ -3131,8 +3133,8 @@ dependencies = [
 
 [[package]]
 name = "sandboxpolicy-bundle"
-version = "0.8.0"
-source = "git+https://github.com/firestoned/notaio?tag=v0.8.0#93a863adc5beee551a847e9978a2861e521ae3b4"
+version = "0.9.0"
+source = "git+https://github.com/firestoned/notaio?tag=v0.9.0#f2dc781e1bc8ab87d7a25f8e325c300daf328b4e"
 dependencies = [
  "base64 0.23.1",
  "ed25519-dalek",
@@ -3146,8 +3148,8 @@ dependencies = [
 
 [[package]]
 name = "sandboxpolicy-types"
-version = "0.8.0"
-source = "git+https://github.com/firestoned/notaio?tag=v0.8.0#93a863adc5beee551a847e9978a2861e521ae3b4"
+version = "0.9.0"
+source = "git+https://github.com/firestoned/notaio?tag=v0.9.0#f2dc781e1bc8ab87d7a25f8e325c300daf328b4e"
 dependencies = [
  "serde",
  "serde_json",

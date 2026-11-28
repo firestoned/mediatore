@@ -57,8 +57,8 @@ banlieue-api = { git = "https://github.com/firestoned/banlieue", tag = "v0.6.0",
 # notaio's bundle verifier, version floor and conformance vectors (ADR-0026 decision 1), pinned
 # to a signed release tag (notaio ADR-0014). No kube, no schemars: the `schema` feature stays off.
 # cargo deny allows this git source too. A bump is reviewed with that release's notes.
-sandboxpolicy-bundle = { git = "https://github.com/firestoned/notaio", tag = "v0.8.0", default-features = false }
-sandboxpolicy-types = { git = "https://github.com/firestoned/notaio", tag = "v0.8.0", default-features = false }
+sandboxpolicy-bundle = { git = "https://github.com/firestoned/notaio", tag = "v0.9.0", default-features = false }
+sandboxpolicy-types = { git = "https://github.com/firestoned/notaio", tag = "v0.9.0", default-features = false }
 
 # async + web
 tokio        = { version = "1", features = ["rt-multi-thread", "macros", "signal", "process", "fs", "time", "sync", "net", "io-util"] }
@@ -133,7 +133,7 @@ uuid         = { version = "1", features = ["v4", "serde"] }
 # The refresh envelope's AES-256-GCM (ADR-0012): the provider rustls already runs on.
 aws-lc-rs    = "1"
 # Follows notaio: `sandboxpolicy-bundle` takes and returns `jiff::Timestamp`, so the major here is
-# the one that crate is built on (0.2 at notaio v0.8.0). The two move together, never jiff alone.
+# the one that crate is built on (0.2 at notaio v0.9.0). The two move together, never jiff alone.
 jiff         = { version = "0.2", default-features = false, features = ["std", "serde"] }
 
 

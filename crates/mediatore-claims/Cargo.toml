@@ -47,6 +47,8 @@ base64.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# The eligibility line read back in its own tests (ADR-0066).
+tracing-subscriber.workspace = true
 mediatore-testkit.workspace = true
 # The basicConstraints of the host CA fixtures (ADR-0049 decision 2).
 rcgen.workspace = true

@@ -24,7 +24,7 @@ use serde::Deserialize;
 
 pub use sandboxpolicy_bundle::{
     AUDIENCE_PAYLOAD_TYPE, AudienceBundlePayload, BundleContent, BundlePayload, Envelope,
-    TrustedKeys,
+    SchemaVersion, TrustedKeys,
 };
 /// The parts of a bundle's content (an audience grant, an egress rule, a lease), notaio's.
 pub use sandboxpolicy_types as types;
@@ -355,12 +355,31 @@ mod tests {
         }
     }
 
+    /// notaio names its schema v4 vectors `v4-...` (its ADR-0026 decision 8); every other
+    /// vector is schema v3.
+    fn is_v4(v: &Vector) -> bool {
+        v.name.starts_with("v4-")
+    }
+
+    /// Every vector of one schema through [`check`]: the names of those whose verdict the broker
+    /// did not reach.
+    async fn failures(suite: &Suite, keys: &TrustedKeys, v4: bool) -> Vec<String> {
+        let mut failed = Vec::new();
+        for v in suite.vectors.iter().filter(|v| is_v4(v) == v4) {
+            if let Err(why) = check(suite, keys, v).await {
+                failed.push(format!("{}: {why}", v.name));
+            }
+        }
+        failed
+    }
+
     #[tokio::test]
     async fn the_broker_reaches_notaios_verdict_on_every_conformance_vector() {
         let suite = suite();
         let keys = trusted_keys(&configured(&suite)).expect("the suite's keys");
-        // v0.8.0-rc.1 ships 17; a tag bump that ships fewer is worth a look before it passes.
-        assert!(suite.vectors.len() >= 17, "{} vectors", suite.vectors.len());
+        // v0.9.0 ships 17 v3 vectors; a tag bump that ships fewer is worth a look before it passes.
+        let v3 = suite.vectors.iter().filter(|v| !is_v4(v)).count();
+        assert!(v3 >= 17, "{v3} v3 vectors");
         // notaio's security review (v0.8.0-rc.1): a bundle signed to outlive a day is refused, whatever it says.
         assert!(
             suite
@@ -369,13 +388,103 @@ mod tests {
                 .any(|v| v.name == "refused-lifetime-too-long"),
             "the lifetime bound has its vector"
         );
-        let mut failed = Vec::new();
-        for v in &suite.vectors {
-            if let Err(why) = check(&suite, &keys, v).await {
-                failed.push(format!("{}: {why}", v.name));
+        let failed = failures(&suite, &keys, false).await;
+        assert!(failed.is_empty(), "{failed:#?}");
+    }
+
+    /// notaio v0.9.0 (its ADR-0026): the broker admits a schema v4 bundle as it admits a v3 one,
+    /// and refuses every v4 vector notaio refuses, with notaio's reason. `min_schema` stays v3,
+    /// so neither schema is required.
+    #[tokio::test]
+    async fn the_broker_reaches_notaios_verdict_on_every_v4_conformance_vector() {
+        let suite = suite();
+        let keys = trusted_keys(&configured(&suite)).expect("the suite's keys");
+        let names: Vec<&str> = suite
+            .vectors
+            .iter()
+            .filter(|v| is_v4(v))
+            .map(|v| v.name.as_str())
+            .collect();
+        // v0.9.0 ships 7: one accepted, six refused.
+        assert!(names.len() >= 7, "{names:?}");
+        for name in [
+            "v4-accepted",
+            "v4-refused-under-v3-type",
+            "v4-refused-v3-under-v4-type",
+            "v4-refused-v3-with-v4-member",
+            "v4-refused-without-subjects",
+            "v4-refused-null-member",
+            "v4-refused-unmodelled-member",
+        ] {
+            assert!(names.contains(&name), "no vector {name}");
+        }
+        let failed = failures(&suite, &keys, true).await;
+        assert!(failed.is_empty(), "{failed:#?}");
+    }
+
+    /// The payload of every vector notaio accepts has the shape of its schema's JSON Schema in
+    /// the kit (`bundle-v3.schema.json`, `bundle-v4.schema.json`): the members the schema
+    /// requires, nothing it does not model, and the schema string it pins. A structural check,
+    /// not a validator: the verdicts above are what decide admission.
+    #[test]
+    fn every_accepted_vector_has_the_shape_of_its_schema() {
+        use base64::Engine as _;
+        use sandboxpolicy_bundle::{SCHEMA_V3, SCHEMA_V4};
+
+        let schema = |text: &str| -> serde_json::Value {
+            serde_json::from_str(text).expect("the kit's schema parses")
+        };
+        let (v3, v4) = (
+            schema(conformance::PAYLOAD_SCHEMA_JSON),
+            schema(conformance::PAYLOAD_SCHEMA_V4_JSON),
+        );
+        let names = |v: &serde_json::Value| -> Vec<String> {
+            v.as_array()
+                .expect("a list of names")
+                .iter()
+                .map(|n| n.as_str().expect("a name").to_owned())
+                .collect()
+        };
+        let mut seen = [0_usize; 2];
+        for v in &suite().vectors {
+            if !matches!(v.expect, Expect::Accepted { .. }) {
+                continue;
+            }
+            let (kit, schema, i) = if is_v4(v) {
+                (&v4, SCHEMA_V4, 1)
+            } else {
+                (&v3, SCHEMA_V3, 0)
+            };
+            seen[i] += 1;
+            let bytes = STANDARD.decode(&v.envelope.payload).expect("base64");
+            let payload: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON");
+            assert_eq!(payload["schema"], schema, "{}", v.name);
+            if let Some(pinned) = kit["properties"]["schema"].get("const") {
+                assert_eq!(pinned, schema, "{}", v.name);
+            }
+            for required in names(&kit["required"]) {
+                assert!(payload.get(&required).is_some(), "{}: {required}", v.name);
+            }
+            let content = payload["content"].as_object().expect("content");
+            let modelled = kit["$defs"]["BundleContent"]["properties"]
+                .as_object()
+                .expect("BundleContent's members");
+            for member in content.keys() {
+                assert!(modelled.contains_key(member), "{}: {member}", v.name);
+            }
+            for required in names(&kit["$defs"]["BundleContent"]["required"]) {
+                assert!(content.contains_key(&required), "{}: {required}", v.name);
             }
         }
-        assert!(failed.is_empty(), "{failed:#?}");
+        assert!(seen[0] >= 4 && seen[1] >= 1, "accepted v3, v4: {seen:?}");
+        // v3 knows nothing of subjects; v4 requires them.
+        assert!(
+            !v3["$defs"]["BundleContent"]["properties"]
+                .as_object()
+                .unwrap()
+                .contains_key("subjects")
+        );
+        assert!(names(&v4["$defs"]["BundleContent"]["required"]).contains(&"subjects".to_owned()));
     }
 
     #[tokio::test]
