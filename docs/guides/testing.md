@@ -331,10 +331,13 @@ ADR-0069's traps are proven in `make check` against fakes: the draw, the matcher
 (`crates/mediatore/tests/e2e_egress.rs`), containment against a fake `nft` and a broker that never answers
 (`crates/mediatore-guest/src/trip.rs`), the route, the record and the summary (`crates/mediatore/tests/e2e_dev.rs`,
 `crates/mediatore-api`). ADR-0070's classes are proven the same way (`crates/mediatore-api/src/classify.rs`, the
-claim-scoped classes at both values in `e2e_dev.rs`, the gateway's probes over the real listener in `e2e_gateway.rs`).
-What the kernel does is the question nine ignored tests in `crates/mediatore/tests/jail_exec_live.rs` answer: a real
+claim-scoped classes at both values in `e2e_dev.rs`, the gateway's probes over the real listener in `e2e_gateway.rs`). ADR-0078's naming of a probe's source from the machine
+cache is proven the same way (`crates/mediatore-claims/src/machines.rs` against fake machines and claims, the lines and the
+unchanged answers in `crates/mediatore-api/src/trip.rs` and `classify.rs`, end to end in `e2e_dev.rs` and `e2e_gateway.rs`);
+no kind tier runs its watches with traps on, so they are not proven against a real API server.
+What the kernel does is the question eleven ignored tests in `crates/mediatore/tests/jail_exec_live.rs` answer: a real
 jail (`nsjail`, `jail-exec`, Landlock and seccomp) beside a claim's armed tripwire, with the real draw, the real ruleset
-loaded by the real `nft` (the decoy ports redirected to the trap listener), the real trap listener, the real cut and the
+loaded by the real `nft` (the decoy ports redirected to the trap listener, the chaff ports counted), the real trap listener, the real cut and the
 real kill. A process of the sandbox uid that
 answers `armed` on the trap socket stands in for the proxy (the real one needs a claim SVID), and a recorder, or nothing,
 for the broker.
@@ -367,11 +370,15 @@ and that `nft list tables` on the host is unchanged.
 | `the_jail_cannot_read_its_connect_ports_or_list_the_listeners` | the jail sees no command line with the `--connect-port` list, no `/proc/net` and no `ss` listing |
 | `the_jail_cannot_list_the_decoys_through_its_own_proc_net` | no decoy port in any per-process table the jail can read (`/proc/self/net/tcp`, `/proc/1/net/tcp`, `/proc/thread-self/net/tcp` and their `tcp6`); the listeners listed are the trap listener and, when the image is pulled through the proxy, the proxy's pull listener, both of which Landlock refuses the jail; a direct connection to it is refused to the sandbox uid and to root; nothing is reported |
 | `the_metadata_address_trips_from_the_jail_where_it_is_routed` | the `nat` redirect carries the jail's connect to the trap listener, which trips as `metadata` |
+| `a_connect_to_a_chaff_port_is_a_use_at_any_address` | under `shadow`, a connect from the jail to a chaff port (ADR-0077) on loopback, at `192.0.2.10` (routed through loopback in the namespace) and at `::1` is each reported `port`/`chaff` with source `drawn`, none as a `denied` class; root reaches a listener of its own on a chaff port and nothing is reported |
+| `a_probe_of_a_chaff_port_ends_the_run_under_enforce` | under `enforce`, a probe of a chaff port at `192.0.2.10` is noted by the reader of the claim's table and ends the run: the cut, the kill and the report |
 
 The run of 2026-11-27 on the merged tree (kernel 6.12, nftables 1.1.3, a debug build): 9 passed; `containment_ms=54`,
 every process of the uid gone 242 ms after the verdict, 256 ms with the broker unreachable. An earlier run of the same
 day showed the eighth test's reading too narrow: the jail could list every decoy listener in its own
-`/proc/self/net/tcp`, which the ninth test now pins and the redirect to one trap listener closed. That is a namespace, not a VM: the guest binary
+`/proc/self/net/tcp`, which the ninth test now pins and the redirect to one trap listener closed. The run of 2026-11-28 with the chaff (same kernel and nftables, a debug build): 11 passed; a chaff probe under `enforce`
+cut in 43 and 61 ms in two runs, every process of the uid gone 263 and 272 ms after the reader's verdict, which comes up to
+250 ms after the SYN. That is a namespace, not a VM: the guest binary
 end to end as root, the real proxy over the socket, a pool VM beside its host table and Azure are not proven by it.
 
 The host tables' counters (ADR-0070) were proven the same way, by hand in fresh network namespaces on the build host:

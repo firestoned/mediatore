@@ -227,6 +227,16 @@ live!(
     the_metadata_address_trips_from_the_jail_where_it_is_routed
 );
 live!(
+    /// ADR-0077: under `shadow` a connect from the jail to a chaff port, on loopback, at another routed address and
+    /// over IPv6, is reported as `port` with the trap `chaff`; root's connection to the same port is untouched.
+    a_connect_to_a_chaff_port_is_a_use_at_any_address
+);
+live!(
+    /// ADR-0077: under `enforce` a probe of an admitted port at an address the decoys' redirect does not cover ends
+    /// the run at its first chaff port, as the sweep of ADR-0069's R-83 would.
+    a_probe_of_a_chaff_port_ends_the_run_under_enforce
+);
+live!(
     /// The per-process views of the network namespace (`/proc/self/net`, `/proc/<pid>/net`,
     /// `/proc/thread-self/net`) list no decoy port to the jail: `subset=pid` hides `/proc/net`, and these are
     /// the other doors to the same tables.
@@ -472,6 +482,7 @@ while True:
                 decoy_ports: BTreeSet::new(),
                 metadata: false,
                 trap_port: None,
+                chaff_ports: BTreeSet::new(),
             }
         }
 
@@ -719,6 +730,10 @@ while True:
         assert!(
             !listing.contains("decoys") && !listing.contains("nat_out"),
             "no decoy in the table"
+        );
+        assert!(
+            !listing.contains("chaff"),
+            "no chaff in the table (ADR-0077)"
         );
         assert!(!live.root.join("home").exists(), "no home was planted");
         assert!(
@@ -1048,9 +1063,23 @@ while True:
                 .any(|l| l.starts_with("ss:") && l.contains("LISTEN")),
             "the jail listed the listeners"
         );
-        // And the line jail-exec writes on the workload's stderr names how many ports, never which.
+        // Nor a chaff port (ADR-0077), as a whole number anywhere in it.
+        let chaff = chaff_ports(&loaded);
+        let numbers: BTreeSet<&str> = output
+            .split(|c: char| !c.is_ascii_digit())
+            .filter(|n| !n.is_empty())
+            .collect();
+        for port in &chaff {
+            assert!(
+                !numbers.contains(port.to_string().as_str()),
+                "a chaff port is named in what the jail can read"
+            );
+        }
+        // And the line jail-exec writes on the workload's stderr names how many ports, never which: the proxy's,
+        // the decoys, 80 with the metadata decoy, and the chaff.
+        let admitted = 1 + ports.len() + usize::from(loaded.ruleset.metadata) + chaff.len();
         assert!(
-            output.contains(&format!("connect_ports={} ports", ports.len() + 1)),
+            output.contains(&format!("connect_ports={admitted} ports")),
             "the confinement line is not the counted one"
         );
         println!(
@@ -1193,6 +1222,148 @@ while True:
         );
         println!(
             "LIVE the_metadata_address_trips_from_the_jail_where_it_is_routed: the redirect carried the jail's connect to the drawn listener; tripped as `metadata`"
+        );
+        supervise::teardown_after(&live.root, &live.user, true).await;
+    }
+
+    /// The chaff ports of the loaded ruleset.
+    fn chaff_ports(loaded: &Loaded) -> Vec<u16> {
+        loaded.ruleset.chaff_ports.iter().copied().collect()
+    }
+
+    /// An address of the documentation range, routed through loopback in this namespace so that a connect to it
+    /// reaches the output hook (with no route it fails before any, ADR-0077's residual).
+    const ROUTED_ELSEWHERE: &str = "192.0.2.10";
+
+    fn route_elsewhere() {
+        let routed = sh("ip", &["route", "replace", "192.0.2.0/24", "dev", "lo"]);
+        assert!(
+            routed.status.success(),
+            "the route could not be added in this namespace"
+        );
+    }
+
+    pub async fn a_connect_to_a_chaff_port_is_a_use_at_any_address() {
+        let live = Live::start().await;
+        route_elsewhere();
+        let broker = Arc::new(Broker::default());
+        let (mut loaded, mut proxy) = live
+            .load(Some(TripMode::Shadow), DeniedSwitches::default(), &broker)
+            .await;
+        let chaff = chaff_ports(&loaded);
+        assert!(
+            (16..=32).contains(&chaff.len()),
+            "{} chaff ports",
+            chaff.len()
+        );
+        let listing = table();
+        assert!(
+            listing.contains("chaff_used"),
+            "the chaff set is not in the loaded table"
+        );
+        // Three chaff ports, three ways: loopback, another routed address, IPv6 loopback. A dropped SYN leaves the
+        // connect waiting, so each is a background connect, killed after a moment.
+        let tried = [
+            ("127.0.0.1", chaff[0]),
+            (ROUTED_ELSEWHERE, chaff[1]),
+            ("::1", chaff[2]),
+        ];
+        let mut script = String::new();
+        for (address, port) in tried {
+            use std::fmt::Write as _;
+            let _ = write!(
+                script,
+                "(exec 3<>/dev/tcp/{address}/{port}) 2>/dev/null & pid=$!; /usr/bin/sleep 1; kill $pid 2>/dev/null; echo tried {port};"
+            );
+        }
+        script.push_str(" echo done");
+        let (outcome, lines) = live.jail(&mut loaded, &mut proxy, &script).await;
+        assert!(
+            matches!(outcome, Outcome::WorkloadDone { status, .. } if status.success()),
+            "under shadow the jail runs to its end"
+        );
+        assert!(lines.iter().any(|l| l == "done"));
+        // Longer than the reader's interval: every use was read.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(loaded.flush().await, "the events reached the broker");
+        let events = broker.events();
+        for (address, port) in tried {
+            assert!(
+                events.iter().any(|e| e.kind == TripKind::Port
+                    && e.trap.as_deref() == Some("chaff")
+                    && e.target == Some(TripTarget::Port(port))
+                    && e.source == mediatore_proto::trip::TripSource::Drawn),
+                "a chaff port tried at {address} was not reported"
+            );
+        }
+        assert!(
+            !events.iter().any(|e| e.kind == TripKind::Denied),
+            "a chaff port was taken for a denied class"
+        );
+        assert!(loaded.cause().is_none(), "nothing is ended under shadow");
+        // Root is untouched: a listener of root's on a chaff port is reached, and nothing is reported.
+        let before = broker.events().len();
+        let root_port = chaff[3];
+        let listener =
+            std::net::TcpListener::bind(("127.0.0.1", root_port)).expect("a free chaff port");
+        assert!(
+            live.connects(root_port, false),
+            "root was refused a chaff port"
+        );
+        drop(listener);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(loaded.flush().await);
+        assert_eq!(broker.events().len(), before, "root's connection was a use");
+        println!(
+            "LIVE a_connect_to_a_chaff_port_is_a_use_at_any_address: {} chaff ports; loopback, {ROUTED_ELSEWHERE} and ::1 each reported as port/chaff under shadow; root untouched",
+            chaff.len()
+        );
+        drop(loaded);
+        let _ = proxy.start_kill();
+        supervise::teardown_after(&live.root, &live.user, false).await;
+    }
+
+    pub async fn a_probe_of_a_chaff_port_ends_the_run_under_enforce() {
+        let live = Live::start().await;
+        route_elsewhere();
+        let broker = Arc::new(Broker::default());
+        let (mut loaded, mut proxy) = live
+            .load(Some(TripMode::Enforce), DeniedSwitches::default(), &broker)
+            .await;
+        let chaff = chaff_ports(&loaded);
+        // The probe of R-83: an admitted port at an address the decoys' redirect does not cover. It would go on.
+        let script = format!(
+            "/usr/bin/sleep 300 & echo started; (exec 3<>/dev/tcp/{ROUTED_ELSEWHERE}/{}) 2>/dev/null & while true; do /usr/bin/sleep 1; echo alive; done",
+            chaff[0]
+        );
+        let started = Instant::now();
+        let (outcome, lines) = live.jail(&mut loaded, &mut proxy, &script).await;
+        let ended = started.elapsed();
+        assert_eq!(outcome, Outcome::Tripped, "the probe did not end the run");
+        assert!(lines.iter().any(|l| l == "started"));
+        let cause = loaded.cause().expect("the cause of the trip");
+        assert_eq!(cause.kind, TripKind::Port);
+        assert_eq!(cause.trap.as_deref(), Some("chaff"));
+        assert_eq!(cause.target, Some(TripTarget::Port(chaff[0])));
+        let killed_ms = jiff::Timestamp::now().duration_since(cause.at).as_millis();
+        let _ = proxy.wait().await;
+        assert_eq!(
+            live.processes(),
+            0,
+            "a process of the sandbox uid survived the trip"
+        );
+        tokio::time::timeout(Duration::from_secs(10), loaded.reported())
+            .await
+            .expect("the broker has the report");
+        let containment = broker
+            .events()
+            .iter()
+            .find(|e| e.trap.as_deref() == Some("chaff") && e.containment_ms.is_some())
+            .and_then(|e| e.containment_ms)
+            .expect("the event that ended the run, with its figure");
+        println!(
+            "LIVE a_probe_of_a_chaff_port_ends_the_run_under_enforce: tripped as port/chaff; containment_ms={containment}; every process of the uid gone {killed_ms} ms after the reader's verdict; the run ended {} ms after it started",
+            ended.as_millis()
         );
         supervise::teardown_after(&live.root, &live.user, true).await;
     }

@@ -1611,6 +1611,115 @@ pub fn trap_port(rng: &mut dyn Entropy, taken: &[u16]) -> anyhow::Result<u16> {
     anyhow::bail!("no trap listener port free of the claim's own after {ATTEMPTS} draws")
 }
 
+// ----- Chaff ports (ADR-0077) ----------------------------------------------------------------
+
+/// The trap name a chaff port's use is reported under (ADR-0077 decision 4): kind `port`,
+/// this trap, the chaff port as the target, source `drawn`.
+pub const CHAFF_TRAP: &str = "chaff";
+/// The fewest chaff ports a claim gets (ADR-0077 decision 2).
+pub const CHAFF_MIN: u32 = 16;
+/// The most chaff ports a claim gets.
+pub const CHAFF_MAX: u32 = 32;
+
+/// Ports common tools connect to on their own, without being told (ADR-0077 decision 2): never
+/// chaff, so that an honest tool's probe of one meets Landlock's refusal as before and never a
+/// trip. Public, like the seeds: a port here or among the seeds is never chaff.
+pub const HONEST_PROBES: [u16; 50] = [
+    1080,   // SOCKS proxy
+    1234,   // a local model server (LM Studio)
+    1433,   // SQL Server
+    1521,   // Oracle
+    1883,   // MQTT
+    2181,   // ZooKeeper
+    2379,   // etcd
+    3000,   // development servers
+    3001,   // development servers
+    3128,   // HTTP proxy
+    3389,   // RDP
+    4000,   // development servers
+    4040,   // Spark UI
+    4200,   // Angular
+    4317,   // OpenTelemetry, gRPC
+    4318,   // OpenTelemetry, HTTP
+    4444,   // Selenium
+    5005,   // the JVM's debugger
+    5037,   // adb
+    5173,   // Vite
+    5601,   // Kibana
+    5900,   // VNC
+    6006,   // TensorBoard
+    7687,   // Neo4j
+    7860,   // Gradio
+    8000,   // development servers
+    8001,   // `kubectl proxy`
+    8008,   // development servers
+    8086,   // InfluxDB
+    8088,   // development servers
+    8265,   // Ray
+    8443,   // HTTPS on a high port
+    8787,   // RStudio
+    8888,   // Jupyter
+    9090,   // Prometheus
+    9092,   // Kafka
+    9222,   // a browser's debugging port
+    9229,   // Node's inspector
+    9411,   // Zipkin
+    9418,   // `git://`
+    11_371, // a PGP key server
+    11_434, // a local model server (Ollama)
+    14_268, // Jaeger
+    16_686, // Jaeger UI
+    18_080, // development servers
+    19_000, // development servers
+    24_678, // Vite's HMR
+    35_729, // LiveReload
+    50_051, // gRPC's example port
+    63_342, // an IDE's built-in server
+];
+
+/// Draw one claim's chaff ports (ADR-0077 decision 2): how many, from [`CHAFF_MIN`] to
+/// [`CHAFF_MAX`], then each in 1024 to 65535, never a seed port, an honest probe
+/// ([`HONEST_PROBES`]), a port of `taken` (the claim's list, the VM's listeners, the proxy's,
+/// the pull listener's, the decoys', the metadata decoy's, the trap listener's), or a port of
+/// any of `routes` (its endpoint's and its inject port), and never twice. Its own draw, after
+/// the claim's: the claim's draw is what it was. Returned sorted: nothing of the order is the
+/// draw's.
+///
+/// # Errors
+/// The random source fails, or a port still collides after [`ATTEMPTS`] tries: a failure to
+/// arm, and never a shorter list.
+pub fn chaff_ports(
+    rng: &mut dyn Entropy,
+    routes: &[Route],
+    taken: &[u16],
+) -> anyhow::Result<Vec<u16>> {
+    let mut rng = Rng(rng);
+    let count = rng.between(CHAFF_MIN, CHAFF_MAX)?;
+    let reserved = |port: u16| {
+        taken.contains(&port)
+            || HONEST_PROBES.contains(&port)
+            || routes
+                .iter()
+                .any(|r| r.endpoint.port == port || r.inject_port == Some(port))
+    };
+    let mut chaff = std::collections::BTreeSet::new();
+    for _ in 0..count {
+        let mut placed = false;
+        for _ in 0..ATTEMPTS {
+            let port = rng.high_port()?;
+            if !reserved(port) && chaff.insert(port) {
+                placed = true;
+                break;
+            }
+        }
+        anyhow::ensure!(
+            placed,
+            "no chaff port free of the claim's own after {ATTEMPTS} draws"
+        );
+    }
+    Ok(chaff.into_iter().collect())
+}
+
 impl Draw {
     /// What the proxy is handed: the decoy routes and the bait values, never the ports.
     #[must_use]
@@ -3078,6 +3187,126 @@ mod tests {
         assert!(
             avoided_bare * 3 < traps_bare * 2,
             "the seeds are nearly all of a draw"
+        );
+    }
+
+    // ----- Chaff (ADR-0077) ------------------------------------------------------------------
+
+    fn chaff(seed: u64, routes: &[Route], taken: &[u16]) -> Vec<u16> {
+        chaff_ports(&mut Seeded::new(seed), routes, taken).expect("chaff")
+    }
+
+    #[test]
+    fn chaff_is_drawn_within_its_bounds_and_off_every_reserved_port() {
+        let mut gated = route("git.example", 8443);
+        gated.inject_port = Some(15_443);
+        let routes = [route("api.example", 443), gated];
+        // The claim's list, the VM's listeners, the decoys, the metadata decoy's and the trap
+        // listener's ports, the proxy's and the pull listener's: what arming hands over.
+        let taken: Vec<u16> = vec![3128, 18_129, 443, 41_000, 6379, 52_001, 40_404, 2222];
+        let mut counts = BTreeSet::new();
+        for seed in 0..3000 {
+            let drawn = chaff(seed, &routes, &taken);
+            let n = u32::try_from(drawn.len()).unwrap();
+            assert!((CHAFF_MIN..=CHAFF_MAX).contains(&n), "{n} chaff ports");
+            counts.insert(n);
+            let distinct: BTreeSet<u16> = drawn.iter().copied().collect();
+            assert_eq!(distinct.len(), drawn.len(), "a chaff port drawn twice");
+            for port in drawn {
+                assert!(port >= 1024, "chaff below 1024");
+                assert!(!is_seed_port(port), "chaff on a seed port");
+                assert!(!HONEST_PROBES.contains(&port), "chaff on an honest probe");
+                assert!(!taken.contains(&port), "chaff on a taken port");
+                assert!(
+                    ![443, 8443, 15_443].contains(&port),
+                    "chaff on a route's port or its inject port"
+                );
+            }
+        }
+        // The count is drawn, not fixed: it tells nothing of the decoys beside it.
+        assert_eq!(
+            counts.len(),
+            usize::try_from(CHAFF_MAX - CHAFF_MIN + 1).unwrap()
+        );
+        // Two claims differ.
+        assert_ne!(
+            chaff_ports(&mut OsEntropy, &routes, &taken).unwrap(),
+            chaff_ports(&mut OsEntropy, &routes, &taken).unwrap()
+        );
+    }
+
+    #[test]
+    fn the_honest_probes_are_ports_tools_use_and_none_is_a_seed() {
+        for port in [
+            4317, 4318, 11_434, 9229, 5005, 3000, 5173, 8000, 8888, 1080, 9418, 9222,
+        ] {
+            assert!(
+                HONEST_PROBES.contains(&port),
+                "{port} is not an honest probe"
+            );
+        }
+        for port in HONEST_PROBES {
+            assert!(port >= 1024 && !is_seed_port(port), "{port}");
+        }
+        let distinct: BTreeSet<u16> = HONEST_PROBES.iter().copied().collect();
+        assert_eq!(distinct.len(), HONEST_PROBES.len());
+    }
+
+    #[test]
+    fn a_chaff_draw_that_cannot_place_a_port_fails_and_is_never_shortened() {
+        let every: Vec<u16> = (1..=u16::MAX).collect();
+        let refused = chaff_ports(&mut Seeded::new(1), &[], &every).expect_err("no free port");
+        assert!(refused.to_string().contains("no chaff port"), "{refused}");
+        // A source that answers one number for ever cannot place a second distinct port.
+        for byte in [0x00, 0x55, 0xff] {
+            assert!(chaff_ports(&mut Stuck(byte), &[], &[]).is_err());
+        }
+        assert!(chaff_ports(&mut Failing, &[], &[]).is_err());
+    }
+
+    /// A simulation, not a measurement: a sweep that reads which ports the jail admits off the
+    /// errors (ADR-0077's context) touches the admitted ports in a random order. Returns
+    /// whether its first touch was chaff, and whether it touched every decoy before any chaff.
+    fn sweep(d: &Draw, chaff: &[u16], order: &mut Rng<'_>) -> (bool, bool) {
+        let mut admitted: Vec<(u16, bool)> = d
+            .ports
+            .iter()
+            .map(|p| (p.port, false))
+            .chain(d.metadata_port.map(|_| (80, false)))
+            .chain(chaff.iter().map(|p| (*p, true)))
+            .collect();
+        order.shuffle(&mut admitted).expect("an order");
+        let decoys = admitted.iter().filter(|(_, is_chaff)| !is_chaff).count();
+        let first_chaff = admitted.iter().position(|(_, is_chaff)| *is_chaff);
+        (admitted[0].1, first_chaff.is_some_and(|at| at >= decoys))
+    }
+
+    #[test]
+    fn a_sweep_of_the_admitted_ports_meets_chaff_before_it_learns_the_decoys() {
+        let mut source = Seeded::new(0xc4af);
+        let mut order = Rng(&mut source);
+        let runs: u64 = 20_000;
+        let (mut chaff_first, mut every_decoy_first) = (0_u64, 0_u64);
+        for seed in 0..runs {
+            let d = seeded(seed, &inputs());
+            let mut taken = d.connect_ports();
+            taken.extend([3128, 3129]);
+            let c = chaff(seed, &[], &taken);
+            let (first, all) = sweep(&d, &c, &mut order);
+            chaff_first += u64::from(first);
+            every_decoy_first += u64::from(all);
+        }
+        println!(
+            "simulation, {runs} draws: the first admitted port touched is chaff in {chaff_first}; every decoy before any chaff in {every_decoy_first}"
+        );
+        // At least 16 in 22 for every draw (16 chaff beside 5 decoys and 80), more on average.
+        assert!(
+            chaff_first * 100 > runs * 80,
+            "chaff first in {chaff_first} of {runs}"
+        );
+        assert!(
+            every_decoy_first * 1000 < runs,
+            "every decoy first in {every_decoy_first} of {runs}"
         );
     }
 }

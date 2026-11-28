@@ -3160,9 +3160,11 @@ async fn gateway_decisions(
         );
     }
     // ADR-0070 decisions 4, 5 and 8: what the gateway's host table dropped, one line a probe,
-    // the word of whoever holds the authorizer's identity. Recorded unattributed, folded
-    // nowhere, and no class here ends anything whatever the configuration says.
+    // the word of whoever holds the authorizer's identity. Folded nowhere, on no claim, and no
+    // class here ends anything whatever the configuration says. ADR-0078: the line names the
+    // holder of the source address from the machine cache, a hint read from memory alone.
     for p in &batch.probes {
+        let who = tripwires::Who::of(&st, p.source_address.as_deref());
         tracing::warn!(
             kind = "segment",
             class = p.class.as_str(),
@@ -3170,6 +3172,12 @@ async fn gateway_decisions(
             count = p.count,
             port = %p.port.map(|port| port.to_string()).unwrap_or_default(),
             source_address = p.source_address.as_deref().unwrap_or_default(),
+            attribution = who.attribution,
+            source_vm = %who.vm,
+            source_namespace = %who.namespace,
+            source_node = %who.node,
+            source_claim_uid = %who.claim_uid,
+            source_host = %who.host,
             user = p.user.as_deref().unwrap_or_default(),
             at = %p.at,
             "gateway probe"

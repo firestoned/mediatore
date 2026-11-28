@@ -750,7 +750,7 @@
     },
     {
       "unique-id": "rel-gateway-mediatore-decisions",
-      "description": "POST /v1/gateway/decisions over the same SPIFFE mTLS and the same authorizer SVID as the claim-egress ask (ADR-0062): the gateway's tunnel and inject decisions about claims, batched every two seconds or at 256, off the decision's path (a bounded queue, no retry), under a gateway name the gateway declares itself (attribution, not authentication: every authorizer has the one identity). The broker refuses a batch of the wrong shape whole (400 invalid_decisions), writes one info line per decision otherwise, and stores nothing. Never a path, a query, a header or a credential. ADR-0070 decision 8 (implemented 2026-11-27): the batch gains probes, at most 64, the host table's drop counts read on the gateway since its last batch (the class gateway_port or gateway_output, a count, the port, the source address for gateway_port, the local user for gateway_output), each one warn line at the broker, recorded unattributed and never ending anything. And a reported deny whose authority is in no route or destination of the claim's rendered is classified deny_outside_rendered (a claim with nothing rendered is not judged, a deny for a route rendered and since narrowed is not a class): it records only, since the claim it names is the authorizer's word, and trip on it refuses the start. At most 20 batches a second per gateway identity (429 too_many_batches beyond, nothing logged or judged) and at most 4 batches judged at once. The channel stays lossy.",
+      "description": "POST /v1/gateway/decisions over the same SPIFFE mTLS and the same authorizer SVID as the claim-egress ask (ADR-0062): the gateway's tunnel and inject decisions about claims, batched every two seconds or at 256, off the decision's path (a bounded queue, no retry), under a gateway name the gateway declares itself (attribution, not authentication: every authorizer has the one identity). The broker refuses a batch of the wrong shape whole (400 invalid_decisions), writes one info line per decision otherwise, and stores nothing. Never a path, a query, a header or a credential. ADR-0070 decision 8 (implemented 2026-11-27): the batch gains probes, at most 64, the host table's drop counts read on the gateway since its last batch (the class gateway_port or gateway_output, a count, the port, the source address for gateway_port, the local user for gateway_output), each one warn line at the broker, never ending anything; since ADR-0078 (2026-11-28) the line names the source address's holder from the machine cache (rel-sandbox-api-machine-cache) when exactly one live pool member or declared host holds it, and says unattributed or ambiguous otherwise, a hint on the line alone. And a reported deny whose authority is in no route or destination of the claim's rendered is classified deny_outside_rendered (a claim with nothing rendered is not judged, a deny for a route rendered and since narrowed is not a class): it records only, since the claim it names is the authorizer's word, and trip on it refuses the start. At most 20 batches a second per gateway identity (429 too_many_batches beyond, nothing logged or judged) and at most 4 batches judged at once. The channel stays lossy.",
       "relationship-type": {
         "connects": {
           "source": {
@@ -1218,7 +1218,7 @@
     },
     {
       "unique-id": "rel-guest-agent-trip",
-      "description": "POST /v1/me/trip over the node SVID through the control relay, as exit and report (ADR-0069 decision 8, implemented 2026-11-27): mode and up to 32 distinct events a minute, each a random id (idempotent on retry), the time, the kind (port, route, credential, denied), the trap's name, the target (a host, a port or an address; never a path, a query, a header, a body or the bait value), whether the target was drawn or the workload's, the containment time and a repeat count. The broker checks the node is the claim's, the shape and the rate; 501 under policy.traps off. Retried with capped backoff until 204, the guest waiting at most 120 s for it before its teardown. A denied event carries its class (loopback_port, private_range, unknown_host) in a field of its own and no trap. ADR-0070 decision 8: a registered node with no claim may send a report of kind segment events alone (pool_inbound with the source address, pool_output), which are recorded and end nothing; a segment event is an audit line only and is never put on a claim, a node's live claim included; a protocol event is the broker's own and is refused on this route. The OpenTelemetry part of ADR-0069 decision 11 is not built: no exporter exists (roadmap 15).",
+      "description": "POST /v1/me/trip over the node SVID through the control relay, as exit and report (ADR-0069 decision 8, implemented 2026-11-27): mode and up to 32 distinct events a minute, each a random id (idempotent on retry), the time, the kind (port, route, credential, denied), the trap's name, the target (a host, a port or an address; never a path, a query, a header, a body or the bait value), whether the target was drawn or the workload's, the containment time and a repeat count. The broker checks the node is the claim's, the shape and the rate; 501 under policy.traps off. Retried with capped backoff until 204, the guest waiting at most 120 s for it before its teardown. A denied event carries its class (loopback_port, private_range, unknown_host) in a field of its own and no trap. ADR-0070 decision 8: a registered node with no claim may send a report of kind segment events alone (pool_inbound with the source address, pool_output), which are recorded and end nothing; a segment event is an audit line only and is never put on a claim, a node's live claim included; since ADR-0078 its line names the holder of its source address from the machine cache (a member with its node and bound claim, a declared host, unattributed or ambiguous), which changes nothing else; a protocol event is the broker's own and is refused on this route. The OpenTelemetry part of ADR-0069 decision 11 is not built: no exporter exists (roadmap 15).",
       "relationship-type": {
         "connects": {
           "source": {
@@ -1263,6 +1263,24 @@
           ]
         }
       },
+      "metadata": {
+        "status": "implemented"
+      }
+    },
+    {
+      "unique-id": "rel-sandbox-api-machine-cache",
+      "description": "ADR-0078 (implemented 2026-11-28): on every replica, outside the Lease, the machine cache behind the sandbox API watches VirtualMachine labelled banlieue.io/pool and VirtualMachineClaim labelled app.kubernetes.io/managed-by=mediatore in every namespace (list and watch, already granted to the broker's ServiceAccount; no new verb). It keeps, per pool member, its name and namespace, whether it is live, its InternalIP and held addresses, its node key (the EK hash of a TPM member; none for an x509pop pool's member) and the UID of the managed claim Bound to it. The trip route and the decisions route read it from memory to name the source address of a segment event or a gateway probe on its audit line (member, host from tripwires.segment_hosts, unattributed, or ambiguous): a hint, since the address can be forged on the segment, which changes no answer, ends nothing and is put on no claim. No request reads the Kubernetes API or the store for it; until both listings complete every address is unattributed.",
+      "relationship-type": {
+        "connects": {
+          "source": {
+            "node": "service-mediatore-sandbox-api"
+          },
+          "destination": {
+            "node": "service-kubernetes-api"
+          }
+        }
+      },
+      "protocol": "HTTPS",
       "metadata": {
         "status": "implemented"
       }

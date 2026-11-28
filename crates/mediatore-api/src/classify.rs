@@ -2585,6 +2585,106 @@ mod tests {
         assert!(!logs.contains(CANARY_PATH));
     }
 
+    #[tokio::test]
+    async fn a_probes_source_is_named_from_the_cache_and_the_answer_is_unchanged() {
+        // ADR-0078: the holder of a probe's source address is named on its line where exactly
+        // one live member or declared host holds it. The answer is byte for byte the one
+        // without a cache, and nothing is folded, written or ended.
+        let batch = serde_json::json!({
+            "gateway": "gateway-02",
+            "decisions": [],
+            "probes": [
+                { "at": "2026-11-28T10:00:00Z", "class": "gateway_port", "count": 7,
+                  "port": 22, "source_address": "198.51.100.9" },
+                { "at": "2026-11-28T10:00:01Z", "class": "gateway_port", "count": 1,
+                  "port": 23, "source_address": "198.51.100.10" },
+                { "at": "2026-11-28T10:00:02Z", "class": "gateway_port", "count": 1,
+                  "port": 24, "source_address": "198.51.100.11" },
+                { "at": "2026-11-28T10:00:03Z", "class": "gateway_output", "count": 1,
+                  "port": 443, "user": "envoy-inject" },
+            ],
+        })
+        .to_string();
+        let mut answers = Vec::new();
+        for filled in [false, true] {
+            capture_logs();
+            let s = scene(&all_tripping()).await;
+            if filled {
+                crate::trip::tests::list(
+                    &s.st,
+                    &[
+                        crate::trip::tests::member_vm("member-1", &["198.51.100.9"]),
+                        crate::trip::tests::member_vm("member-2", &["198.51.100.10"]),
+                        crate::trip::tests::member_vm("member-3", &["198.51.100.10"]),
+                    ],
+                    &[crate::trip::tests::bound_claim("member-1", s.rec.uid)],
+                );
+            }
+            answers.push(
+                send(
+                    &s.st,
+                    "POST",
+                    "/v1/gateway/decisions",
+                    &s.authorizer,
+                    &batch,
+                )
+                .await,
+            );
+            settle().await;
+            let logs = captured();
+            let lines: Vec<&str> = logs
+                .lines()
+                .filter(|l| l.contains("gateway probe"))
+                .collect();
+            assert_eq!(lines.len(), 4, "one line a probe");
+            if filled {
+                for want in [
+                    "attribution=\"member\"".to_owned(),
+                    "source_vm=member-1".to_owned(),
+                    "source_namespace=sandboxes".to_owned(),
+                    format!(
+                        "source_node={}",
+                        s.st.naming.agent_id(mediatore_testkit::ek::RSA_EK_HASH)
+                    ),
+                    format!("source_claim_uid={}", s.rec.uid),
+                ] {
+                    assert!(lines[0].contains(&want), "{want} in {}", lines[0]);
+                }
+                assert!(
+                    lines[1].contains("attribution=\"ambiguous\""),
+                    "{}",
+                    lines[1]
+                );
+                assert!(lines[1].contains("source_vm= "), "{}", lines[1]);
+            } else {
+                assert!(
+                    lines[0].contains("attribution=\"unattributed\""),
+                    "{}",
+                    lines[0]
+                );
+                assert!(
+                    lines[1].contains("attribution=\"unattributed\""),
+                    "{}",
+                    lines[1]
+                );
+            }
+            assert!(
+                lines[2].contains("attribution=\"unattributed\""),
+                "{}",
+                lines[2]
+            );
+            assert!(
+                lines[3].contains("attribution=\"unattributed\""),
+                "{}",
+                lines[3]
+            );
+            // On no claim, in no table, nothing ended.
+            assert_eq!(noted(&s.st), []);
+            assert!(s.untouched().await);
+        }
+        assert_eq!(answers[0], answers[1], "attribution changes no answer");
+    }
+
     // ---------- the grammar of what a line may carry ----------
 
     #[test]

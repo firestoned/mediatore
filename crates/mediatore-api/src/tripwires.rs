@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use jiff::Timestamp;
+use mediatore_claims::machines::{Attribution, MachineCache};
 use mediatore_proto::trip::{
     ClassAction, DeniedSwitches, TrapCatalogue, TrapsBody, TrapsMode, TrapsPolicy, TripClass,
 };
@@ -91,6 +92,9 @@ pub struct Tripwires {
     /// `store.retention_secs` is not above the claim SVID's lifetime: an honest claim released
     /// a moment ago then has no record while its SVID is still valid, and would read as one.
     pub no_record_judged: bool,
+    /// The machine cache (ADR-0078): who holds a probe's source address, named on its audit
+    /// line and nowhere else. The default has listed nothing and names nothing.
+    pub machines: Arc<MachineCache>,
 }
 
 impl Default for Tripwires {
@@ -108,6 +112,7 @@ impl Default for Tripwires {
             seen: SeenIds::default(),
             fold: Arc::new(ClassFold::default()),
             no_record_judged: true,
+            machines: Arc::new(MachineCache::default()),
         }
     }
 }
@@ -378,6 +383,48 @@ impl ClassFold {
                 .collect(),
             overflow: taken.overflow,
         }
+    }
+}
+
+/// The attribution fields of an audit line (ADR-0078 decision 7): who holds the source address
+/// of a `segment` event or a gateway probe, as the machine cache says. A hint, never a verdict:
+/// nothing reads these but the line.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct Who {
+    /// `member`, `host`, `unattributed` or `ambiguous`; empty where nothing is attributed (an
+    /// event that is not `segment`).
+    pub attribution: &'static str,
+    pub vm: String,
+    pub namespace: String,
+    pub node: String,
+    pub claim_uid: String,
+    pub host: String,
+}
+
+impl Who {
+    /// Who holds `address`, from memory alone.
+    pub(crate) fn of(st: &crate::AppState, address: Option<&str>) -> Self {
+        let found = st.tripwires.machines.attribute(address);
+        let mut who = Self {
+            attribution: found.as_str(),
+            ..Self::default()
+        };
+        match found {
+            Attribution::Member(m) => {
+                // The node as the broker's lines spell it: the SPIRE agent ID of a TPM node,
+                // the `node` field of the same line.
+                who.node = m
+                    .node_key
+                    .map(|key| st.naming.agent_id(&key))
+                    .unwrap_or_default();
+                who.claim_uid = m.claim_uid.map(|u| u.to_string()).unwrap_or_default();
+                who.vm = m.name;
+                who.namespace = m.namespace;
+            }
+            Attribution::Host(name) => who.host = name,
+            Attribution::Unattributed | Attribution::Ambiguous => {}
+        }
+        who
     }
 }
 

@@ -801,7 +801,7 @@ pub struct PolicySection {
 /// class or value does not start, and neither does `trip` on a class that decisions 5 and 6
 /// hold to `report` ([`TripClass::may_trip`]): the four `segment` classes, the authorizer's
 /// two, `deny_outside_rendered` (a claim the authorizer names), and the two scoped to nothing.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TripwiresSection {
     /// A handshake under a valid SVID of no admitted shape. `report` only.
@@ -841,6 +841,14 @@ pub struct TripwiresSection {
     /// A connection from a pool VM that its host table drops. `report` only.
     #[serde(default)]
     pub pool_output: ClassAction,
+    /// ADR-0078 decision 5: the machines on the sandbox segment that are not pool members (the
+    /// hosts' bridges, the gateways), by a name of `[a-z0-9.-]` to the addresses it holds there.
+    /// A probe from one of these addresses reads `attribution=host` with that name. Empty by
+    /// default; an address that does not parse, a name outside the grammar, a name with no
+    /// address, an address under two names, more than 64 names or more than 16 addresses under
+    /// one refuse the start.
+    #[serde(default)]
+    pub segment_hosts: std::collections::BTreeMap<String, Vec<std::net::IpAddr>>,
 }
 
 impl TripwiresSection {
@@ -1732,6 +1740,7 @@ impl Config {
                 );
             }
         }
+        self.machine_cache()?;
         if self.traps_mode() == TrapsMode::Enforce && self.audience_mode() == AudienceMode::Bundles
         {
             anyhow::bail!(
@@ -1764,6 +1773,7 @@ impl Config {
                 .map(|a| a.name.clone())
                 .collect(),
             no_record_judged: self.no_record_judged(),
+            machines: std::sync::Arc::new(self.machine_cache()?),
             ..Tripwires::default()
         };
         for class in TripClass::PROTOCOL.into_iter().chain(TripClass::SEGMENT) {
@@ -1773,6 +1783,19 @@ impl Config {
                 .map_err(|why| anyhow::anyhow!("tripwires.{}: {why}", class.as_str()))?;
         }
         Ok(wired)
+    }
+
+    /// The machine cache of ADR-0078, empty until its watches list: the pools whose members
+    /// have no node key here (`watcher.x509pop_pools`) and the declared segment hosts.
+    ///
+    /// # Errors
+    /// `tripwires.segment_hosts` out of bounds (decision 5), naming the key.
+    fn machine_cache(&self) -> anyhow::Result<mediatore_claims::machines::MachineCache> {
+        mediatore_claims::machines::MachineCache::new(
+            self.watcher.x509pop_pools.iter().cloned().collect(),
+            &self.tripwires.segment_hosts,
+        )
+        .map_err(|why| anyhow::anyhow!("tripwires.segment_hosts: {why} (ADR-0078 decision 5)"))
     }
 
     /// The start lines of tripwires: the mode, one line per class that ends a claim, and one
@@ -1815,6 +1838,10 @@ impl Config {
                 "the no_record class is not judged: store.retention_secs is not above the claim SVID's lifetime, so a claim released a moment ago has no record while its SVID is still valid (ADR-0070 decision 3)"
             );
         }
+        tracing::info!(
+            segment_hosts = ?self.tripwires.segment_hosts.keys().collect::<Vec<_>>(),
+            "a probe's source address is named from the machine cache and these declared hosts, a hint on its line that ends nothing (tripwires.segment_hosts, ADR-0078)"
+        );
     }
 
     /// ADR-0046 decision 19: every issuer carries exactly one written gate. Refused at start
@@ -5117,6 +5144,47 @@ listen: { user: 127.0.0.1:8080, sandbox: 127.0.0.1:8443 }
             wired.classes.tripping().collect::<Vec<_>>(),
             [TripClass::ForeignRoute]
         );
+    }
+
+    #[test]
+    fn declared_segment_hosts_are_named_and_a_host_out_of_bounds_refuses_the_start() {
+        // ADR-0078 decision 5: the hosts' bridges and the gateways, named on a probe's line.
+        let cfg = with(
+            "tripwires: { segment_hosts: { host-a: [192.0.2.1, \"2001:db8::1\"], gw-1: [192.0.2.2] } }\n",
+        )
+        .unwrap();
+        let wired = cfg.tripwires().unwrap();
+        wired.machines.replace_machines(&[]);
+        wired.machines.replace_claims(&[]);
+        assert_eq!(
+            wired.machines.attribute(Some("192.0.2.1")),
+            mediatore_claims::machines::Attribution::Host("host-a".into())
+        );
+        assert_eq!(
+            wired.machines.attribute(Some("192.0.2.2")),
+            mediatore_claims::machines::Attribution::Host("gw-1".into())
+        );
+        // None by default, and the default names nothing.
+        let wired = with("").unwrap().tripwires().unwrap();
+        wired.machines.replace_machines(&[]);
+        wired.machines.replace_claims(&[]);
+        assert_eq!(
+            wired.machines.attribute(Some("192.0.2.1")),
+            mediatore_claims::machines::Attribution::Unattributed
+        );
+        for off in [
+            "tripwires: { segment_hosts: { host-a: [not-an-address] } }\n",
+            "tripwires: { segment_hosts: { host-a: [192.0.2.300] } }\n",
+            "tripwires: { segment_hosts: { Host-A: [192.0.2.1] } }\n",
+            "tripwires: { segment_hosts: { host-a: [] } }\n",
+            "tripwires: { segment_hosts: { host-a: [192.0.2.1], host-b: [192.0.2.1] } }\n",
+            "tripwires: { segment_hosts: [192.0.2.1] }\n",
+        ] {
+            assert!(with(off).is_err(), "{off}");
+        }
+        let err =
+            refused("tripwires: { segment_hosts: { host-a: [192.0.2.1], host-b: [192.0.2.1] } }\n");
+        assert!(err.contains("tripwires.segment_hosts"), "{err}");
     }
 
     #[test]

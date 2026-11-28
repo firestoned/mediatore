@@ -26,6 +26,7 @@ use mediatore_store::{ClaimRecord, Modified, NodeRecord, StoreError, modify_clai
 use mediatore_tls::PeerSpiffeId;
 use uuid::Uuid;
 
+use crate::tripwires::Who;
 use crate::{ApiError, AppState, Shared, node_of_peer, reconciler, store_error};
 
 /// What [`end_claim`] found and did.
@@ -233,12 +234,16 @@ fn effect_of(st: &AppState, enforcing: bool, event: &TripEvent) -> TripEffect {
 /// The audit line of one accepted event (ADR-0069 decision 9, ADR-0070 decision 8): the
 /// record of it. At `warn` when `loud`, else at `info`. Every field is the broker's own or
 /// was checked against its grammar: no path, query, header, body or bait value has a field.
+/// `who` names the holder of a `segment` event's source address (ADR-0078), and is empty for
+/// any other kind.
+#[allow(clippy::too_many_arguments)] // one line's fields, each from its own place
 fn audit(
     node: &NodeRecord,
     claim: Option<&ClaimRecord>,
     mode: TripMode,
     effect: TripEffect,
     event: &TripEvent,
+    who: &Who,
     loud: bool,
 ) {
     let claim_uid = claim.map(|c| c.uid.to_string()).unwrap_or_default();
@@ -263,6 +268,12 @@ fn audit(
                 target = %target,
                 source = event.source.as_str(),
                 source_address = event.source_address.as_deref().unwrap_or_default(),
+                attribution = who.attribution,
+                source_vm = %who.vm,
+                source_namespace = %who.namespace,
+                source_node = %who.node,
+                source_claim_uid = %who.claim_uid,
+                source_host = %who.host,
                 count = event.count,
                 containment_ms = %containment_ms,
                 at = %event.at,
@@ -347,6 +358,14 @@ pub(crate) async fn trip(
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
+/// The line of a `segment` event: at `warn`, `reported`, on no claim (ADR-0070 decision 8),
+/// naming the holder of its source address from the machine cache where exactly one holds it
+/// (ADR-0078). The name is the line's alone: no claim, record, summary or fold is touched.
+fn segment_line(st: &AppState, node: &NodeRecord, mode: TripMode, event: &TripEvent) {
+    let who = Who::of(st, event.source_address.as_deref());
+    audit(node, None, mode, TripEffect::Reported, event, &who, true);
+}
+
 /// A report from a node that never had a claim, or whose every record was swept, and any
 /// report under `policy.traps: off` (which is `segment` events alone by then): `segment`
 /// events are one audit line each at `warn` (ADR-0070 decision 8) and nothing else is kept;
@@ -358,7 +377,7 @@ fn record_without_a_claim(st: &AppState, node: &NodeRecord, report: &TripReport)
     }
     for event in &report.events {
         if st.tripwires.seen.first_sight(event.id) {
-            audit(node, None, report.mode, TripEffect::Reported, event, true);
+            segment_line(st, node, report.mode, event);
         }
     }
 }
@@ -397,7 +416,7 @@ async fn record(
     for event in &report.events {
         if event.kind == TripKind::Segment {
             if st.tripwires.seen.first_sight(event.id) {
-                audit(node, None, report.mode, TripEffect::Reported, event, true);
+                segment_line(st, node, report.mode, event);
             }
             continue;
         }
@@ -412,7 +431,15 @@ async fn record(
         if !st.tripwires.seen.first_sight(event.id) {
             continue;
         }
-        audit(node, Some(rec), report.mode, effect, event, enforcing);
+        audit(
+            node,
+            Some(rec),
+            report.mode,
+            effect,
+            event,
+            &Who::default(),
+            enforcing,
+        );
         entries.push(TripEntry::of(event, effect));
     }
     // The end first, then the summary (ADR-0069 decision 9's order is `tripped`, then the
@@ -436,7 +463,9 @@ pub(crate) mod tests {
 
     use axum::body::Body;
     use axum::http::Request;
+    use banlieue_api::banlieue::{VirtualMachine, VirtualMachineClaim};
     use jiff::SignedDuration;
+    use mediatore_claims::machines::MachineCache;
     use mediatore_claims::sandbox::SandboxFrontDoor;
     use mediatore_proto::trip::{DeniedSwitches, TrapsBody, TrapsMode, TripSource, TripTarget};
     use mediatore_proto::{LogBatch, Me};
@@ -444,6 +473,7 @@ pub(crate) mod tests {
         ClaimStore, LogAppend, LogChunk, LogLimits, LogStore, MemoryStore, PolicyFloor,
         SessionRecord,
     };
+    use mediatore_testkit::ek::{RSA_EK_HASH, RSA_EK_PEM};
     use tower::ServiceExt as _;
 
     use super::*;
@@ -778,6 +808,73 @@ pub(crate) mod tests {
 
     fn report(mode: &str, events: &[serde_json::Value]) -> serde_json::Value {
         serde_json::json!({ "mode": mode, "events": events })
+    }
+
+    // ---------- ADR-0078: the machine cache's fixtures ----------
+
+    /// A pool member `name` in `sandboxes` holding `addresses` (`InternalIP`), publishing the
+    /// test kit's endorsement certificate, as banlieue writes it.
+    pub(crate) fn member_vm(name: &str, addresses: &[&str]) -> VirtualMachine {
+        serde_json::from_value(serde_json::json!({
+            "metadata": {
+                "name": name, "namespace": "sandboxes", "uid": Uuid::new_v4().to_string(),
+                "labels": { "banlieue.io/pool": "pool" }
+            },
+            "spec": { "classRef": { "name": "small" }, "imageRef": { "name": "sandbox" } },
+            "status": {
+                "tpmEndorsementCertificates": [RSA_EK_PEM],
+                "addresses": addresses.iter().map(|a| serde_json::json!({ "type": "InternalIP", "address": a })).collect::<Vec<_>>()
+            }
+        }))
+        .unwrap()
+    }
+
+    /// The managed claim with UID `uid`, `Bound` to `machine` in `sandboxes`.
+    pub(crate) fn bound_claim(machine: &str, uid: Uuid) -> VirtualMachineClaim {
+        serde_json::from_value(serde_json::json!({
+            "metadata": {
+                "name": format!("sb-{machine}"), "namespace": "sandboxes", "uid": uid.to_string(),
+                "labels": { "app.kubernetes.io/managed-by": "mediatore" }
+            },
+            "spec": {
+                "poolRef": { "name": "pool" },
+                "subject": { "issuer": "https://issuer.example.com", "id": "octocat" },
+                "ttlSeconds": 600
+            },
+            "status": { "phase": "Bound", "virtualMachineRef": { "name": machine } }
+        }))
+        .unwrap()
+    }
+
+    /// The cache of `st` lists exactly these members and claims.
+    pub(crate) fn list(st: &AppState, vms: &[VirtualMachine], claims: &[VirtualMachineClaim]) {
+        st.tripwires.machines.replace_machines(vms);
+        st.tripwires.machines.replace_claims(claims);
+    }
+
+    /// The trip line that names `id`.
+    fn line_of(logged: &str, id: Uuid) -> String {
+        logged
+            .lines()
+            .find(|l| l.contains("trip reported") && l.contains(&id.to_string()))
+            .expect("the event's line")
+            .to_owned()
+    }
+
+    /// The whole of an answer, for "attribution changes no answer".
+    async fn whole(resp: Response) -> (StatusCode, Vec<(String, Vec<u8>)>, Vec<u8>) {
+        let status = resp.status();
+        let mut headers: Vec<(String, Vec<u8>)> = resp
+            .headers()
+            .iter()
+            .map(|(k, v)| (k.as_str().to_owned(), v.as_bytes().to_vec()))
+            .collect();
+        headers.sort();
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap()
+            .to_vec();
+        (status, headers, body)
     }
 
     /// `POST /v1/me/trip` with the body and the headers as given, for what `call` does not
@@ -1278,6 +1375,7 @@ pub(crate) mod tests {
             "target=22",
             "source=\"peer\"",
             "source_address=\"192.0.2.7\"",
+            "attribution=\"unattributed\"",
             "count=3",
         ] {
             assert!(line.contains(field), "the line lacks a field");
@@ -2095,5 +2193,170 @@ pub(crate) mod tests {
             "a claim the store never held"
         );
         assert_eq!(r.store.calls(), vec!["tripped", "release"]);
+    }
+
+    // ---------- ADR-0078: a segment event's source address named from the machine cache ----------
+
+    #[tokio::test]
+    async fn a_segment_events_source_is_named_from_the_cache_on_the_line_and_never_on_a_claim() {
+        for mode in [TrapsMode::Off, TrapsMode::Shadow, TrapsMode::Enforce] {
+            capture_logs();
+            let r = rig(mode).await;
+            // The holder is bound to the rig's own live claim: the strongest case for
+            // "never on a claim", since that claim exists, is live and could be written.
+            list(
+                &r.st,
+                &[member_vm("member-1", &["192.0.2.7"])],
+                &[bound_claim("member-1", r.rec.uid)],
+            );
+            let id = Uuid::new_v4();
+            let (status, ..) = r.post(report("shadow", &[segment_event(id)])).await;
+            assert_eq!(status, StatusCode::NO_CONTENT);
+            let line = line_of(&captured(), id);
+            assert!(line.contains("WARN"), "{line}");
+            for field in [
+                "attribution=\"member\"".to_owned(),
+                "source_vm=member-1".to_owned(),
+                "source_namespace=sandboxes".to_owned(),
+                format!("source_node={}", r.st.naming.agent_id(RSA_EK_HASH)),
+                format!("source_claim_uid={}", r.rec.uid),
+                "source_host= ".to_owned(),
+                "source_address=\"192.0.2.7\"".to_owned(),
+                "effect=\"reported\"".to_owned(),
+            ] {
+                assert!(line.contains(&field), "{field} in {line}");
+            }
+            assert!(
+                line.contains("claim_uid= ") && line.contains("subject= "),
+                "the event itself is still on no claim: {line}"
+            );
+            assert!(
+                r.untouched().await,
+                "{mode:?}: the named claim is not touched"
+            );
+            assert!(r.store.calls().is_empty(), "{mode:?}: nothing is written");
+            assert_eq!(r.held().await.revoked_at, None, "nothing is ended");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_source_held_by_none_or_by_several_names_nothing_and_a_declared_host_reads_so() {
+        capture_logs();
+        let r = rig_with(TrapsMode::Shadow, |st| {
+            let hosts = [("host-a".to_owned(), vec!["192.0.2.1".parse().unwrap()])]
+                .into_iter()
+                .collect();
+            st.tripwires.machines =
+                Arc::new(MachineCache::new(std::collections::BTreeSet::new(), &hosts).unwrap());
+        })
+        .await;
+        list(
+            &r.st,
+            &[
+                member_vm("member-1", &["192.0.2.20"]),
+                member_vm("member-2", &["192.0.2.20"]),
+            ],
+            &[bound_claim("member-1", r.rec.uid)],
+        );
+        let at = |id: Uuid, address: &str| {
+            let mut e = segment_event(id);
+            e["source_address"] = address.into();
+            e
+        };
+        let (nobody, several, host, outbound) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        let pool_output = event(
+            outbound,
+            &serde_json::json!({ "kind": "segment", "class": "pool_output", "target": { "port": 25 }, "source": "peer", "count": 1 }),
+        );
+        let (status, ..) = r
+            .post(report(
+                "shadow",
+                &[
+                    at(nobody, "192.0.2.99"),
+                    at(several, "192.0.2.20"),
+                    at(host, "192.0.2.1"),
+                    pool_output,
+                ],
+            ))
+            .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let logged = captured();
+        let empty = [
+            "source_vm= ",
+            "source_namespace= ",
+            "source_node= ",
+            "source_claim_uid= ",
+        ];
+        for (id, attribution) in [
+            (nobody, "unattributed"),
+            (several, "ambiguous"),
+            (outbound, "unattributed"),
+        ] {
+            let line = line_of(&logged, id);
+            assert!(
+                line.contains(&format!("attribution=\"{attribution}\"")),
+                "{line}"
+            );
+            for field in empty.iter().chain(&["source_host= "]) {
+                assert!(line.contains(field), "{field} in {line}");
+            }
+        }
+        let line = line_of(&logged, host);
+        assert!(line.contains("attribution=\"host\"") && line.contains("source_host=host-a"));
+        for field in empty {
+            assert!(line.contains(field), "{field} in {line}");
+        }
+        assert!(r.untouched().await);
+        // An event that is not segment has no attribution at all.
+        capture_logs();
+        let id = Uuid::new_v4();
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        let (status, ..) = r.post(report("shadow", &[port_event(id)])).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let line = line_of(&captured(), id);
+        assert!(line.contains("attribution=\"\""), "{line}");
+    }
+
+    #[tokio::test]
+    async fn attribution_changes_no_answer_byte_for_byte() {
+        let segment = report("shadow", &[segment_event(Uuid::nil())]).to_string();
+        let mixed = report(
+            "shadow",
+            &[segment_event(Uuid::nil()), port_event(Uuid::from_u128(1))],
+        )
+        .to_string();
+        for mode in [TrapsMode::Off, TrapsMode::Shadow, TrapsMode::Enforce] {
+            for body in [&segment, &mixed, &"not json".to_owned()] {
+                let mut answers = Vec::new();
+                for filled in [false, true] {
+                    let r = rig(mode).await;
+                    if filled {
+                        list(
+                            &r.st,
+                            &[member_vm("member-1", &["192.0.2.7"])],
+                            &[bound_claim("member-1", r.rec.uid)],
+                        );
+                    }
+                    answers.push(
+                        whole(
+                            raw(
+                                &r.st,
+                                &r.node,
+                                body,
+                                &[("content-type", "application/json")],
+                            )
+                            .await,
+                        )
+                        .await,
+                    );
+                }
+                assert_eq!(answers[0], answers[1], "{mode:?} {body}");
+            }
+        }
     }
 }

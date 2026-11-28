@@ -3,7 +3,7 @@
 
 # 18: Tripwires beyond the sandbox: a request no honest build makes
 
-**Status: in progress: built 2026-11-27, every class at `report` by default; the live proof on booted VMs and the soak remain** (opened 2026-11-26). Roadmap 17 traps the jailed workload on its VM. This
+**Status: in progress: built 2026-11-27, every class at `report` by default, a probe's source named from a machine cache 2026-11-28 (ADR-0078); the live proof on booted VMs and the soak remain** (opened 2026-11-26). Roadmap 17 traps the jailed workload on its VM. This
 one covers what has already got past the jail: a process outside it holding the claim SVID, root
 on a pool VM, a compromised gateway process, an identity SPIRE issued that the broker never
 declared. Past the jail both ends of every boundary are mediatore's own code, so the set of honest
@@ -120,6 +120,15 @@ deciders are the guest and the proxy, which are what an escape or a root comprom
       *2026-11-27: deferred (ADR-0070 decision 8, amended): the API replicas hold no machine cache, and a list per probe
       would be a Kubernetes API call any holder of the authorizer identity could drive. Every probe is unattributed.
       Revisit when the API side has a machine cache.*
+      *2026-11-28: built (ADR-0078): a `MachineCache` on every replica, filled by watches of pool `VirtualMachine`s
+      and managed `VirtualMachineClaim`s (`crates/mediatore-claims/src/machines.rs`), names the one live member (VM,
+      namespace, node, bound claim) or declared host (`tripwires.segment_hosts`) on the `trip reported` (segment) and
+      `gateway probe` lines, `ambiguous` for several, a hint that changes no answer and is put on no claim. Proven
+      hermetically (`attribution_changes_no_answer_byte_for_byte` in `trip.rs`;
+      `a_segment_events_source_is_named_on_its_line_and_the_named_claim_is_untouched` in `e2e_dev.rs`;
+      `a_probes_source_is_named_from_the_machine_cache_and_its_claim_is_untouched` in `e2e_gateway.rs`). Left open: the
+      watches against a real API server, and a live probe from the host reading `attribution=host` and from one member
+      to another reading `attribution=member`.*
 - [x] `image/gateway/check.sh` and `image/check.sh`: the reader's one capability, no new accept.
       (2026-11-27: both images built with podman on the build host and both checks passed; `make gateway-render-check`
       (`image/gateway/table-test.sh`) and `make host-table-test` require every verdict unchanged on every platform.

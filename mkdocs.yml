@@ -252,6 +252,11 @@ nav:
       - "ADR-0074: A namespace's groups are read only from the issuers it names": adr/0074-a-namespaces-groups-read-only-from-the-issuers-it-names.md
       - "ADR-0075: A ClusterSPIFFEID renders none of the identities the broker trusts": adr/0075-a-clusterspiffeid-renders-none-of-the-identities-the-broker-trusts.md
       - "ADR-0076: A failed image pull is retried, shown to the owner, and ends the claim with a reason": adr/0076-a-failed-image-pull-is-retried-shown-to-the-owner-and-ends-the-claim-with-a-reason.md
+      - "ADR-0077: Chaff ports: a probe of the ports the jail admits is a use": adr/0077-chaff-ports-a-probe-of-the-ports-the-jail-admits-is-a-use.md
+      - "ADR-0078: A probe's source address named from a machine cache, a hint never a verdict": adr/0078-a-probes-source-address-named-from-a-machine-cache-a-hint-never-a-verdict.md
+      - "ADR-0079: A tripped VM held for its operator, running and cut, for a bounded time": adr/0079-a-tripped-vm-held-for-its-operator-running-and-cut-for-a-bounded-time.md
+      - "ADR-0080: The deployment's trap catalogue read by the broker alone, each claim handed a slice": adr/0080-the-deployments-trap-catalogue-read-by-the-broker-alone-each-claim-handed-a-slice.md
+      - "ADR-0081: A trip names the executable that took the bait": adr/0081-a-trip-names-the-executable-that-took-the-bait.md
   - Security:
       - Threat model: security/threat-model.md
       - NIST AI 800-1 crosswalk: security/nist-ai-800-1.md

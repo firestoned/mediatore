@@ -4,10 +4,11 @@
 //! Arming a claim's tripwire (ADR-0069), in the one order that never leaves a trap reachable
 //! by the wrong uid or a jail running beside a proxy that is not armed:
 //!
-//! 1. the draw ([`crate::draw`]), from the OS's random source, and the trap listener's port
-//!    ([`crate::draw::trap_port`]);
+//! 1. the draw ([`crate::draw`]), from the OS's random source, the trap listener's port
+//!    ([`crate::draw::trap_port`]) and the chaff ports ([`crate::draw::chaff_ports`],
+//!    ADR-0077);
 //! 2. the claim's ruleset with the decoy ports redirected to that listener
-//!    ([`Ruleset::with_decoys`]);
+//!    ([`Ruleset::with_decoys`]) and the chaff ports counted ([`Ruleset::with_chaff`]);
 //! 3. the home, planted before anything runs as the sandbox user
 //!    ([`crate::sandboxfs::plant_home`]);
 //! 4. the tripwire's tasks ([`crate::trip::start`]);
@@ -16,7 +17,8 @@
 //!    decoy (nothing listens on a decoy port);
 //! 7. the trap socket ([`crate::trip::serve_socket`]);
 //! 8. the egress proxy with `--trap-socket`, and its `armed` answer;
-//! 9. the reader of what the chain dropped ([`crate::trip::watch_denied`]).
+//! 9. the reader of what the chain dropped and of the chaff ports' uses
+//!    ([`crate::trip::watch_denied`]).
 //!
 //! Only then does the guest start the jail, with what the draw plants in it
 //! ([`crate::jail::JailTraps`]).
@@ -282,9 +284,14 @@ async fn arm_once(
     taken.extend(drawn.metadata_port);
     taken.extend([arming.proxy_port, arming.pull_port]);
     let trap_port = draw::trap_port(&mut OsEntropy, &taken)?;
+    // The chaff (ADR-0077 decision 2): drawn last, off everything above and the trap
+    // listener's port, so neither the claim's draw nor the trap port changes.
+    taken.push(trap_port);
+    let chaff = draw::chaff_ports(&mut OsEntropy, arming.routes, &taken)?;
     let ruleset = unarmed
         .clone()
-        .with_decoys(&ports, drawn.metadata_port.is_some(), trap_port)?;
+        .with_decoys(&ports, drawn.metadata_port.is_some(), trap_port)?
+        .with_chaff(&chaff)?;
     let files: Vec<(&str, &[u8])> = drawn
         .credentials
         .iter()
@@ -297,7 +304,8 @@ async fn arm_once(
             &drawn,
             &format!("http://127.0.0.1:{}", arming.proxy_port),
             home.clone(),
-        )?;
+        )?
+        .with_chaff(&chaff);
         let wire = trip::start_with(
             arming.mode,
             arming.policy.denied,
@@ -722,6 +730,7 @@ mod tests {
             decoy_ports: std::collections::BTreeSet::new(),
             metadata: false,
             trap_port: None,
+            chaff_ports: std::collections::BTreeSet::new(),
         }
     }
 
@@ -872,6 +881,47 @@ mod tests {
             cause.map(|c| c.kind),
             Some(mediatore_proto::trip::TripKind::Port)
         );
+    }
+
+    #[tokio::test]
+    async fn arming_draws_chaff_into_the_ruleset_and_the_jail_off_every_port_the_claim_uses() {
+        let _one = ONE_ARMING.lock().await;
+        let fixture = Fixture::new(TrapsMode::Shadow);
+        let plain = unarmed(fixture.uid);
+        let armed = arm_with(
+            &fixture.arming(TripMode::Shadow),
+            &plain,
+            &test_vm(),
+            Arc::new(FakeNft::default()),
+            Timing::default(),
+        )
+        .await
+        .expect("armed");
+        let rs = armed.ruleset();
+        let n = rs.chaff_ports.len();
+        assert!(
+            (16..=32).contains(&n),
+            "{n} chaff ports (ADR-0077 decision 2)"
+        );
+        let vm = test_vm();
+        for port in &rs.chaff_ports {
+            assert!(*port >= 1024);
+            assert!(!rs.decoy_ports.contains(port), "chaff on a decoy port");
+            assert_ne!(Some(*port), rs.trap_port, "chaff on the trap listener");
+            assert!(!plain.ports().contains(port), "chaff on the claim's own");
+            assert!(![3128, 18_129, 443].contains(port));
+            assert!(!vm.listening.contains(port), "chaff on a VM listener");
+        }
+        // The jail admits every chaff port beside the decoys: a count, never a port.
+        let printed = format!("{:?}", armed.jail_traps());
+        let admitted = rs.decoy_ports.len() + usize::from(rs.metadata) + n;
+        assert!(
+            printed.contains(&format!("connect_ports: {admitted}")),
+            "{printed}"
+        );
+        // And what is reported is still the hash of the claim with no tripwire.
+        assert_eq!(armed.ruleset_sha256(), plain.public_sha256());
+        assert!(rs.render().contains("update @chaff_used"));
     }
 
     #[tokio::test]

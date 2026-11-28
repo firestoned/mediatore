@@ -155,6 +155,8 @@ struct Harness {
     check_url: String,
     /// The broker's store, to give a claim the policy uid a sandbox's record would carry.
     store: Arc<dyn mediatore_store::ClaimStore>,
+    /// The broker's machine cache (ADR-0078), to list the members a probe's source is named from.
+    machines: Arc<mediatore_claims::machines::MachineCache>,
 }
 
 impl Harness {
@@ -188,6 +190,7 @@ impl Harness {
         let idp = FakeIdp::start().await;
         let st = state_in(&idp, namespace, policy_egress);
         let store = st.store.clone();
+        let machines = st.tripwires.machines.clone();
 
         let user = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -231,6 +234,7 @@ impl Harness {
             http: reqwest::Client::new(),
             check_url,
             store,
+            machines,
         }
     }
 
@@ -1380,18 +1384,93 @@ async fn the_broker_writes_one_line_a_probe_naming_only_what_a_probe_is() {
             keys,
             [
                 "at",
+                "attribution",
                 "class",
                 "count",
                 "gateway",
                 "kind",
                 "port",
                 "source_address",
+                "source_claim_uid",
+                "source_host",
+                "source_namespace",
+                "source_node",
+                "source_vm",
                 "user"
             ]
         );
     }
 
     // A probe is on no claim: the owner reads no trip and no summary, and the claim lives.
+    let held: ClaimResponse = h
+        .http
+        .get(format!("{}/v1/claims/{}", h.user_url, claim.name))
+        .bearer_auth(&user)
+        .send()
+        .await
+        .expect("get claim")
+        .json()
+        .await
+        .expect("claim body");
+    assert!(held.tripped.is_none() && held.tripwires.is_none());
+    assert_eq!(held.phase, mediatore_proto::ClaimPhase::Bound);
+}
+
+/// ADR-0078 over the real listener: a probe whose source address one live member holds names
+/// that member, its node and its bound claim on its line; the claim is not touched.
+#[tokio::test]
+async fn a_probes_source_is_named_from_the_machine_cache_and_its_claim_is_untouched() {
+    use crate::e2e_dev::{bound_vm_claim, logs, member_vm};
+    use mediatore_proto::trip::{GatewayProbe, TripClass};
+
+    logs::capture();
+    let h = Harness::start(&authorizer_svid(), CacheConfig::default(), None).await;
+    let (user, claim) = h.bound_claim().await;
+    let uid = claim.uid.expect("uid");
+    h.machines
+        .replace_machines(&[member_vm("member-1", "198.51.100.9")]);
+    h.machines
+        .replace_claims(&[bound_vm_claim("member-1", uid)]);
+    let (watched, _reporter, dir) = probes_reporter(&h);
+    leave_summary(
+        &dir,
+        &[
+            GatewayProbe {
+                port: Some(2375),
+                source_address: Some("198.51.100.9".into()),
+                ..probe(TripClass::GatewayPort, 2)
+            },
+            GatewayProbe {
+                port: Some(2376),
+                source_address: Some("198.51.100.10".into()),
+                ..probe(TripClass::GatewayPort, 1)
+            },
+        ],
+    );
+    let got = watched
+        .wait(|sent| sent.iter().any(|(b, _)| !b.probes.is_empty()))
+        .await;
+    assert!(got.iter().any(|(b, took)| !b.probes.is_empty() && *took));
+    let lines = logs::captured();
+    let written: Vec<&str> = lines
+        .lines()
+        .filter(|l| l.contains("gateway probe"))
+        .collect();
+    assert_eq!(written.len(), 2, "one line a probe");
+    for want in [
+        "attribution=\"member\"".to_owned(),
+        "source_vm=member-1".to_owned(),
+        "source_namespace=sandboxes".to_owned(),
+        format!("source_node=spiffe://{TRUST_DOMAIN}/spire/agent/tpm/{EK_HASH}"),
+        format!("source_claim_uid={uid}"),
+    ] {
+        assert!(written[0].contains(&want), "{want} in {}", written[0]);
+    }
+    assert!(
+        written[1].contains("attribution=\"unattributed\""),
+        "{}",
+        written[1]
+    );
     let held: ClaimResponse = h
         .http
         .get(format!("{}/v1/claims/{}", h.user_url, claim.name))

@@ -279,13 +279,19 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
                 .await
                 .map_err(std::io::Error::other)
         };
+        let machines_client = client.clone();
         let w = async {
             claim_watcher(&cfg, client, &state, bundles)
                 .await
                 .map_err(std::io::Error::other)
         };
-        tokio::try_join!(u, s, w, p, aud)?;
+        let cache = machine_cache(machines_client, state.tripwires.machines.clone());
+        tokio::try_join!(u, s, w, p, aud, cache)?;
     } else {
+        // No cluster to watch (ADR-0078 decision 1): the cache lists nothing at once, so only the
+        // declared segment hosts are named.
+        state.tripwires.machines.replace_machines(&[]);
+        state.tripwires.machines.replace_claims(&[]);
         if cfg.policy.is_some() {
             tracing::warn!("policy configured but no cluster client (dev_mode): no bundle is read");
         }
@@ -453,6 +459,19 @@ async fn policy_reflector(
     };
     tokio::select! {
         r = mediatore_claims::policy::run(client, reflector) => r,
+        () = shutdown() => Ok(()),
+    }
+}
+
+/// The machine cache's watches (ADR-0078 decision 1) on every replica, outside the Lease: the
+/// routes of every replica name a probe's source from it. Until shutdown. A watch that ends is
+/// an error, so the pod restarts with the cause in its log.
+async fn machine_cache(
+    client: kube::Client,
+    cache: Arc<mediatore_claims::machines::MachineCache>,
+) -> std::io::Result<()> {
+    tokio::select! {
+        r = mediatore_claims::machines::run(client, cache) => r.map_err(std::io::Error::other),
         () = shutdown() => Ok(()),
     }
 }

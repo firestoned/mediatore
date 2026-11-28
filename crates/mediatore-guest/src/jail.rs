@@ -8,8 +8,8 @@
 //!
 //! Under an armed tripwire (ADR-0069) the jail also gets what the guest drew for the claim
 //! ([`JailTraps`]): the decoy routes' and the bait's variables, a home prepared by the guest
-//! with the bait files in it, and the decoy ports as ports it may connect to. With no
-//! tripwire nothing of that exists and the jail is what it always was.
+//! with the bait files in it, and the decoy ports and the chaff ports (ADR-0077) as ports it may
+//! connect to. With no tripwire nothing of that exists and the jail is what it always was.
 
 use std::path::PathBuf;
 
@@ -25,8 +25,8 @@ pub struct JailTraps {
     /// The planted variables, each decoy route's and each bait's: names on `nsjail`'s
     /// argument list, values through its environment ([`JailSpec::env`]), never its argv.
     env: Vec<(String, String)>,
-    /// The TCP ports the workload may connect to beside the proxy's: the decoy listeners',
-    /// and 80 when the metadata decoy was drawn (decision 10).
+    /// The TCP ports the workload may connect to beside the proxy's: the decoy ports, 80 when
+    /// the metadata decoy was drawn (decision 10), and the chaff ports (ADR-0077).
     connect_ports: Vec<u16>,
     /// The guest-prepared home on the claim's tmpfs, with the bait files in it
     /// ([`crate::sandboxfs::plant_home`]), bound at [`JAIL_HOME`] in place of the tmpfs.
@@ -69,6 +69,19 @@ impl JailTraps {
             home,
             secrets: draw.secret_values(),
         })
+    }
+}
+
+impl JailTraps {
+    /// The same, with the claim's chaff ports admitted beside the decoys (ADR-0077 decision 5),
+    /// and the whole list sorted, so that a place in it tells a decoy from chaff no more than
+    /// the count does.
+    #[must_use]
+    pub fn with_chaff(mut self, chaff: &[u16]) -> Self {
+        self.connect_ports.extend(chaff);
+        self.connect_ports.sort_unstable();
+        self.connect_ports.dedup();
+        self
     }
 }
 
@@ -455,6 +468,44 @@ mod tests {
             draw.metadata_port.is_some(),
             "port 80 only with the metadata decoy"
         );
+    }
+
+    #[test]
+    fn chaff_ports_are_connect_ports_beside_the_decoys_in_an_order_that_says_nothing() {
+        let draw = drawn();
+        let chaff = [45_001, 2049, 33_333];
+        let base = spec();
+        let traps = JailTraps::new(&draw, &base.proxy_url(), "/mnt/sandbox/home".into())
+            .unwrap()
+            .with_chaff(&chaff);
+        let printed = format!("{traps:?}");
+        let spec = JailSpec {
+            traps: Some(traps),
+            ..base
+        };
+        let a = spec.to_args();
+        let first = a.iter().position(|x| x == "--").unwrap();
+        let listed: Vec<u16> = a[first..]
+            .windows(2)
+            .filter(|w| w[0] == "--connect-port")
+            .map(|w| w[1].parse().unwrap())
+            .collect();
+        // The proxy's port first, as always; then the decoys, 80 and the chaff, sorted, so
+        // a place in the list tells a decoy from chaff no more than the count does.
+        assert_eq!(listed[0], 3128);
+        let mut expected: Vec<u16> = draw.connect_ports();
+        expected.extend(chaff);
+        expected.sort_unstable();
+        assert_eq!(listed[1..], expected[..]);
+        // What the traps print is a count, never a port.
+        let n = draw.connect_ports().len() + chaff.len();
+        assert!(
+            printed.contains(&format!("connect_ports: {n}")),
+            "{printed}"
+        );
+        for port in chaff {
+            assert!(!printed.contains(&port.to_string()));
+        }
     }
 
     #[test]
