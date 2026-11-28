@@ -167,12 +167,18 @@ check "both Envoys resolve through resolved's stub alone: their units start afte
 check "the host table lets both Envoys reach the stub on loopback port 53 and no other loopback address, whatever RESOLVER_ELEMENTS holds (an env file that sets it empty included)" \
   'cd /usr/share/mediatore-gateway && mkdir -p /tmp/r && printf "RESOLVER_ELEMENTS=\n" > /tmp/r/res.env && for e in "" /tmp/r/res.env; do l=$(/usr/libexec/mediatore-gateway/render nftables.conf.in - $e env.example vm.env.example | sed -n "/chain output_listener {/,/^  }/p" | grep -v "^[[:space:]]*#") && test "$(printf "%s\n" "$l" | sed -n 2p)" = "    oif \"lo\" ip daddr 127.0.0.53 meta l4proto { tcp, udp } th dport 53 accept" && test "$(printf "%s\n" "$l" | grep -c "oif \"lo\".*accept")" = 1 || exit 1; done'
 
-# The image's own /etc/resolv.conf, as the layer holds it: a container run mounts the runtime's over it, so it is read from a created,
-# never started, container.
-image_file() { local c; c=$("$CLI" create --entrypoint sh "$IMAGE") || return 1; "$CLI" cp "$c:$1" - | tar -xO; local r=$?; "$CLI" rm "$c" >/dev/null; return $r; }
-rc=$(image_file /etc/resolv.conf 2>/dev/null || true)
+# The image's own /etc/resolv.conf, as its layers hold it (image/image-file.py over `save`). Not from a container: Docker
+# bind-mounts its own resolv.conf into a container as soon as it is created, so `docker cp` returns the runtime's file and
+# the check failed under Docker while the layer was right (podman mounts it only at start). The container's reading is
+# printed beside the layer's when they differ, and the layer's alone decides.
+image_file() { "$CLI" save "$IMAGE" | python3 -I "$(dirname "$0")/../image-file.py" "$1"; }
+container_file() { local c; c=$("$CLI" create --entrypoint sh "$IMAGE") || return 1; "$CLI" cp "$c:$1" - | tar -xO; local r=$?; "$CLI" rm "$c" >/dev/null; return $r; }
+rc=$(image_file /etc/resolv.conf || true)
+cc=$(container_file /etc/resolv.conf 2>/dev/null || true)
+[ "$cc" = "$rc" ] || printf '  note: a created %s container shows another /etc/resolv.conf than the layers (the runtime'"'"'s own):\n%s\n' "$CLI" "$(printf '%s\n' "$cc" | sed 's/^/    | /')"
 if [ "$(printf '%s\n' "$rc" | grep -E '^(nameserver|search|domain)')" = "nameserver 127.0.0.53" ]; then
   echo "✓ the image's /etc/resolv.conf names resolved's stub alone, never the public resolvers the Kairos base's named, until Kairos links it at boot"
-else echo "✗ the image's /etc/resolv.conf names resolved's stub alone, never the public resolvers the Kairos base's named, until Kairos links it at boot"; fail=1; fi
+else echo "✗ the image's /etc/resolv.conf names resolved's stub alone, never the public resolvers the Kairos base's named, until Kairos links it at boot"
+  printf '  the layers hold:\n%s\n' "$(printf '%s\n' "${rc:-(nothing)}" | sed 's/^/    | /')"; fail=1; fi
 
 [ "$fail" -eq 0 ] && echo "image ok" || { echo "image check failed"; exit 1; }

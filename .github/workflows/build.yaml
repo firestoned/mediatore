@@ -528,7 +528,9 @@ jobs:
   # ───────────────────────────────────────────────────────────────────────────
   guest-image-check:
     name: 🖥️ Sandbox VM Image
-    if: github.event_name == 'pull_request'
+    # On main too: the (publish) job below does not run the check, so a check that only a pull
+    # request ran could fail on every PR while main stayed green (the resolv.conf check, #191).
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
     runs-on: ubuntu-latest
     needs: [test, clippy, dist]
     # A pull request builds and checks and nothing else: no registry login, no write
@@ -661,7 +663,9 @@ jobs:
   # ───────────────────────────────────────────────────────────────────────────
   gateway-image-check:
     name: 🚪 Gateway VM Image
-    if: github.event_name == 'pull_request'
+    # On main too: the (publish) job below does not run the check, so a check that only a pull
+    # request ran could fail on every PR while main stayed green (the resolv.conf check, #191).
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
     runs-on: ubuntu-latest
     needs: [test, clippy, dist]
     # A pull request builds and checks and nothing else: no registry login, no write

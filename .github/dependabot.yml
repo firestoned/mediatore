@@ -43,6 +43,10 @@ updates:
       # and split the pair across two notaio releases.
       - dependency-name: "sandboxpolicy-bundle"
       - dependency-name: "sandboxpolicy-types"
+      # banlieue-api is a git dependency pinned to one banlieue release tag, and kube's major follows it
+      # (Cargo.toml): moved by hand with that release. Bumped alone, the first run after #196 failed to
+      # select a kube version for it.
+      - dependency-name: "banlieue-api"
 
   # Container base images (Dockerfile FROM lines): the server image, the VM base image
   # (the Kairos pin, ADR-0067) and its two overlays, the sandbox and gateway VM images.
