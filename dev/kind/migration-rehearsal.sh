@@ -69,6 +69,24 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Apply an overlay that moves the broker between namespaces. As the guide says, one apply
+# changes both the parameter that names the broker and the ClusterSPIFFEID that selects it,
+# and the ClusterSPIFFEID can be judged against the old parameter in the moment before the
+# new one is seen (ADR-0075); that one refusal is answered by applying again, in either
+# direction. Any other refusal, or this one past the deadline, fails the step.
+apply_moving() {
+  local dir=$1 step=$2 out try
+  for ((try = 1; ; try++)); do
+    if out=$("${K[@]}" apply -k "$dir" 2>&1 >/dev/null); then return 0; fi
+    if ((try < 15)) && grep -q "ValidatingAdmissionPolicy 'mediatore-clusterspiffeid'" <<<"$out"; then
+      echo "  the ClusterSPIFFEID was judged against the old parameter; applying again ($try)"
+      sleep 2
+      continue
+    fi
+    fail "$step's apply: $out"
+  done
+}
+
 say "before: the broker as it stood, in $OLD (step 1: this build and base, the parameter naming the old username)"
 "${K[@]}" -n "$NEW" scale deploy/mediatore --replicas=0 >/dev/null
 wait_no_pods "$NEW"
@@ -83,7 +101,7 @@ for cm in mediatore-dex-ca mediatore-openbao-ca; do
   "${K[@]}" -n "$NEW" get configmap "$cm" -o json | jq '{items: [.]}' | copied "$OLD" | "${K[@]}" apply -f - >/dev/null
 done
 bao_role "$OLD"
-"${K[@]}" apply -k dev/kind/migration >/dev/null
+apply_moving dev/kind/migration "step 1"
 "${K[@]}" -n "$OLD" rollout restart deploy/mediatore >/dev/null
 "${K[@]}" -n "$OLD" rollout status deploy/mediatore --timeout=300s >/dev/null
 wait_log "$OLD" "claim watcher running"
@@ -155,18 +173,7 @@ say "step 6 (claims not drained): the store's Secrets and the bound SandboxNodes
 echo "the copied session of $SANDBOX carries no owner reference"
 
 say "step 7: the base in $NEW, the parameter naming the new username"
-# As the guide says: the ClusterSPIFFEID can be judged against the old parameter in the
-# moment before the moved binding is enforced (ADR-0075), and that one refusal is answered
-# by applying again. Any other refusal, or this one past the deadline, fails the step.
-for ((try = 1; ; try++)); do
-  if out=$("${K[@]}" apply -k dev/kind/broker 2>&1 >/dev/null); then break; fi
-  if ((try < 15)) && grep -q "ValidatingAdmissionPolicy 'mediatore-clusterspiffeid'" <<<"$out"; then
-    echo "  the ClusterSPIFFEID was judged against the old parameter; applying again ($try)"
-    sleep 2
-    continue
-  fi
-  fail "step 7's apply: $out"
-done
+apply_moving dev/kind/broker "step 7"
 "${K[@]}" -n "$NEW" scale deploy/mediatore --replicas=1 >/dev/null
 "${K[@]}" -n "$NEW" rollout restart deploy/mediatore >/dev/null
 "${K[@]}" -n "$NEW" rollout status deploy/mediatore --timeout=300s >/dev/null
